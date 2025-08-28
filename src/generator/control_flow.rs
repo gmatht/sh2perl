@@ -212,6 +212,9 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
 pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> String {
     let mut output = String::new();
     
+    // Don't track for loop variables in declared_locals since they should be available globally
+    // generator.declared_locals.insert(for_loop.variable.clone());
+    
     // Generate for loop using the actual variable name from the AST
     output.push_str(&format!("for my ${} (", for_loop.variable));
     

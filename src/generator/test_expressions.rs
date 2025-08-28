@@ -15,7 +15,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
             let pattern = parts[1].trim();
             
             // Convert to Perl regex matching
-            format!("({} =~ /{}/)", var, pattern)
+            format!("{} =~ /{}/", var, pattern)
         } else {
             "0".to_string()
         }
@@ -30,19 +30,19 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
                 // Handle extglob patterns
                 let regex_pattern = generator.convert_extglob_to_perl_regex(pattern);
                 if modifiers.nocasematch {
-                    format!("({} =~ /{}/i)", var, regex_pattern)
+                    format!("{} =~ /{}/i", var, regex_pattern)
                 } else {
-                    format!("({} =~ /{}/)", var, regex_pattern)
+                    format!("{} =~ /{}/", var, regex_pattern)
                 }
             } else {
                 // Regular glob pattern matching - convert glob to regex
                 let regex_pattern = generator.convert_glob_to_regex(pattern);
                 if modifiers.nocasematch {
                     // Case-insensitive matching
-                    format!("({} =~ /^{}$/i)", var, regex_pattern)
+                    format!("{} =~ /^{}$/i", var, regex_pattern)
                 } else {
                     // Case-sensitive matching
-                    format!("({} =~ /^{}$/)", var, regex_pattern)
+                    format!("{} =~ /^{}$/", var, regex_pattern)
                 }
             }
         } else {
@@ -69,7 +69,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
                 } else {
                     value.to_string()
                 };
-                format!("($ENV{{'HOME'}} eq {})", clean_value)
+                format!("$ENV{{'HOME'}} eq {}", clean_value)
             } else if var.starts_with("~/") {
                 let path = var[2..].to_string();
                 // Remove quotes from value if it's a shell variable reference
@@ -105,7 +105,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
                 }
             } else {
                 // Regular variable equality
-                format!("({} eq {})", var, value)
+                format!("{} eq {}", var, value)
             }
         } else {
             "0".to_string()
@@ -116,7 +116,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         if parts.len() == 2 {
             let var = parts[0].trim();
             let value = parts[1].trim();
-            format!("({} ne {})", var, value)
+            format!("{} ne {}", var, value)
         } else {
             "0".to_string()
         }
@@ -126,7 +126,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         if parts.len() == 2 {
             let var = parts[0].trim();
             let value = parts[1].trim();
-            format!("({} == {})", var, value)
+            format!("{} == {}", var, value)
         } else {
             "0".to_string()
         }
@@ -136,7 +136,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         if parts.len() == 2 {
             let var = parts[0].trim();
             let value = parts[1].trim();
-            format!("({} != {})", var, value)
+            format!("{} != {}", var, value)
         } else {
             "0".to_string()
         }
@@ -146,7 +146,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         if parts.len() == 2 {
             let var = parts[0].trim();
             let value = parts[1].trim();
-            format!("({} < {})", var, value)
+            format!("{} < {}", var, value)
         } else {
             "0".to_string()
         }
@@ -156,7 +156,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         if parts.len() == 2 {
             let var = parts[0].trim();
             let value = parts[1].trim();
-            format!("({} <= {})", var, value)
+            format!("{} <= {}", var, value)
         } else {
             "0".to_string()
         }
@@ -166,7 +166,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         if parts.len() == 2 {
             let var = parts[0].trim();
             let value = parts[1].trim();
-            format!("({} > {})", var, value)
+            format!("{} > {}", var, value)
         } else {
             "0".to_string()
         }
@@ -176,18 +176,18 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         if parts.len() == 2 {
             let var = parts[0].trim();
             let value = parts[1].trim();
-            format!("({} >= {})", var, value)
+            format!("{} >= {}", var, value)
         } else {
             "0".to_string()
         }
     } else if expr.contains(" -z ") {
         // String is empty: [[ -z $var ]]
         let var = expr.replace("-z ", "").trim().to_string();
-        format!("({} eq '')", var)
+        format!("{} eq ''", var)
     } else if expr.contains(" -n ") {
         // String is not empty: [[ -n $var ]]
         let var = expr.replace("-n ", "").trim().to_string();
-        format!("({} ne '')", var)
+        format!("{} ne ''", var)
     } else if expr.contains(" -f ") || expr.starts_with("-f ") {
         // File exists and is regular file: [[ -f $var ]]
         let var = expr.replace("-f ", "").trim().to_string();

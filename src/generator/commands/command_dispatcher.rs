@@ -3,8 +3,14 @@ use crate::generator::Generator;
 use super::cat::generate_cat_command;
 
 pub fn generate_command_impl(generator: &mut Generator, command: &Command) -> String {
+    eprintln!("DEBUG: generate_command_impl called with command: {:?}", command);
     match command {
-        Command::Simple(cmd) => generator.generate_simple_command(cmd),
+        Command::Simple(cmd) => {
+            eprintln!("DEBUG: Dispatching Simple command: {:?}", cmd);
+            let result = generator.generate_simple_command(cmd);
+            eprintln!("DEBUG: Simple command result: {}", result);
+            result
+        },
         Command::ShoptCommand(cmd) => generator.generate_shopt_command(cmd),
         Command::TestExpression(test_expr) => {
             generator.generate_test_expression(test_expr)

@@ -193,13 +193,49 @@ impl Parser {
                 Some(Token::Break) => parse_break_statement(self)?,
                 Some(Token::Continue) => parse_continue_statement(self)?,
                 Some(Token::Return) => parse_return_statement(self)?,
+                Some(Token::Shopt) => self.parse_shopt_command()?,
                 // Bash arithmetic evaluation: (( ... ))
                 Some(Token::ParenOpen) if matches!(self.lexer.peek_n(1), Some(Token::ParenOpen)) => {
                     self.parse_double_paren_command()?
                 }
                 Some(Token::ParenOpen) => self.parse_subshell()?,
                 Some(Token::BraceOpen) => parse_block(self)?,
-                Some(Token::TestBracket) => self.parse_test_expression()?,
+                Some(Token::TestBracket) => {
+                    // Check for double-bracket test [[ ... ]] before parsing as single bracket
+                    if matches!(self.lexer.peek_n(1), Some(Token::TestBracket)) {
+                        eprintln!("DEBUG: Found double brackets in parse_command, parsing as test expression");
+                        // Consume the first two [[ tokens
+                        self.lexer.next();
+                        self.lexer.next();
+                        let test_command = self.parse_test_expression()?;
+                        // After parsing the test expression, check if there's a pipeline operator
+                        self.lexer.skip_whitespace_and_comments();
+                        let next_token = self.lexer.peek();
+                        eprintln!("DEBUG: After test expression, next token: {:?}", next_token);
+                        if let Some(token) = next_token {
+                            match token {
+                                Token::And | Token::Or | Token::Pipe => {
+                                    eprintln!("DEBUG: Found pipeline operator {:?}, parsing as pipeline", token);
+                                    // This is part of a pipeline, parse it as such
+                                    let result = self.parse_pipeline_from_command(test_command)?;
+                                    eprintln!("DEBUG: Pipeline parsing result: {:?}", result);
+                                    result
+                                }
+                                _ => {
+                                    eprintln!("DEBUG: No pipeline operator, returning test expression");
+                                    // Just a test expression, return it
+                                    test_command
+                                }
+                            }
+                        } else {
+                            eprintln!("DEBUG: No more tokens, returning test expression");
+                            test_command
+                        }
+                    } else {
+                        // Single bracket test
+                        self.parse_test_expression()?
+                    }
+                }
                 Some(Token::Semicolon) => {
                     // Skip semicolon and continue parsing
                     self.lexer.next();
@@ -299,15 +335,22 @@ impl Parser {
         }
         
         if commands.len() == 1 {
-            Ok(commands.remove(0))
+            let result = commands.remove(0);
+            eprintln!("DEBUG: parse_pipeline_from_command returning single command: {:?}", result);
+            Ok(result)
         } else {
-            Ok(Command::Pipeline(Pipeline { commands, operators }))
+            let result = Command::Pipeline(Pipeline { commands, operators });
+            eprintln!("DEBUG: parse_pipeline_from_command returning pipeline: {:?}", result);
+            Ok(result)
         }
     }
 
     fn parse_simple_command(&mut self) -> Result<Command, ParserError> {
         // Skip whitespace and comments at the beginning
         self.lexer.skip_whitespace_and_comments();
+        
+
+
         
         let mut args = Vec::new();
         let redirects = Vec::new();
@@ -400,20 +443,7 @@ impl Parser {
             }
         }
         
-        // Check for double-bracket test [[ ... ]] - must handle this BEFORE parsing command name
-        eprintln!("DEBUG: Checking for double brackets at position {}", self.lexer.current_position());
-        eprintln!("DEBUG: Current token: {:?}", self.lexer.peek());
-        eprintln!("DEBUG: Next token: {:?}", self.lexer.peek_n(1));
-        if matches!(self.lexer.peek(), Some(Token::TestBracket)) 
-            && matches!(self.lexer.peek_n(1), Some(Token::TestBracket)) {
-            eprintln!("DEBUG: Found double brackets, capturing expression");
-            let expr = self.lexer.capture_double_bracket_expression()?;
-            eprintln!("DEBUG: Captured expression: '{}'", expr);
-            return Ok(Command::TestExpression(TestExpression {
-                expression: expr,
-                modifiers: self.get_current_shopt_state(),
-            }));
-        }
+
 
         // Parse the command name first
         let name = parse_word(&mut self.lexer)?;
@@ -534,6 +564,8 @@ impl Parser {
                 }
             }
         }
+        
+
         
 
         
@@ -675,23 +707,88 @@ impl Parser {
         Err(ParserError::InvalidSyntax("Double paren commands not yet implemented".to_string()))
     }
 
+    fn parse_shopt_command(&mut self) -> Result<Command, ParserError> {
+        // Consume the 'shopt' token
+        self.lexer.next();
+        
+        // Skip whitespace
+        self.lexer.skip_whitespace_and_comments();
+        
+        // Parse the option (e.g., -s, -u)
+        let option = if let Some(token) = self.lexer.peek() {
+            match token {
+                Token::Size => {
+                    self.lexer.next();
+                    "-s".to_string()
+                }
+                _ => {
+                    return Err(ParserError::InvalidSyntax(format!("Expected option after shopt, got: {:?}", token)));
+                }
+            }
+        } else {
+            return Err(ParserError::InvalidSyntax("Expected option after shopt".to_string()));
+        };
+        
+        // Skip whitespace
+        self.lexer.skip_whitespace_and_comments();
+        
+        // Parse the option name (e.g., extglob, nocasematch)
+        let option_name = if let Some(Token::Identifier) = self.lexer.peek() {
+            let name = self.lexer.get_identifier_text()?;
+            self.lexer.next();
+            name
+        } else {
+            return Err(ParserError::InvalidSyntax("Expected option name after shopt option".to_string()));
+        };
+        
+        Ok(Command::ShoptCommand(ShoptCommand {
+            option,
+            enable: true, // -s means set (enable)
+        }))
+    }
+
     fn parse_test_expression(&mut self) -> Result<Command, ParserError> {
         use crate::ast::{TestExpression, TestModifiers};
         
-        // Consume the opening [
-        if !matches!(self.lexer.peek(), Some(Token::TestBracket)) {
-            return Err(ParserError::InvalidSyntax("Expected '[' for test expression".to_string()));
-        }
-        self.lexer.next(); // consume '['
+                            // Check if this is being called for double brackets (already consumed) or single bracket
+                    // If we're called from double bracket detection, the [[ tokens have already been consumed
+                    // If we're called for single bracket, we should see a [ token
+                    let is_double_bracket = !matches!(self.lexer.peek(), Some(Token::TestBracket));
+                    eprintln!("DEBUG: parse_test_expression called, is_double_bracket: {}, current token: {:?}", is_double_bracket, self.lexer.peek());
+                    
+                    // If this is a double bracket test, we don't need to consume the opening brackets
+                    // If this is a single bracket test, we need to consume the opening [
+                    if !is_double_bracket {
+                        self.lexer.next(); // consume the [
+                    }
         
-        // Capture the content between [ and ]
+
+        
+        // Capture the content between brackets
         let mut expression_parts = Vec::new();
         
+        eprintln!("DEBUG: Starting to capture expression content, current token: {:?}", self.lexer.peek());
+        
         loop {
-            match self.lexer.peek() {
+            let current_token = self.lexer.peek();
+            eprintln!("DEBUG: Processing token in loop: {:?}", current_token);
+            match current_token {
                 Some(Token::TestBracketClose) => {
-                    self.lexer.next(); // consume ']'
-                    break;
+                    if is_double_bracket {
+                        // For [[ ]], we need to consume two closing brackets
+                        self.lexer.next(); // consume first ']'
+                        if matches!(self.lexer.peek(), Some(Token::TestBracketClose)) {
+                            self.lexer.next(); // consume second ']'
+                            break;
+                        } else {
+                            // Add the first ] to the expression and continue
+                            expression_parts.push("]".to_string());
+                        }
+                    } else {
+                        // For [ ], consume one closing bracket
+                        self.lexer.next(); // consume ']'
+                        break;
+                    }
                 }
                 Some(Token::File) => {
                     expression_parts.push("-f".to_string());
@@ -769,24 +866,43 @@ impl Parser {
                     expression_parts.push("\\".to_string());
                     self.lexer.next();
                 }
+                Some(Token::Dollar) => {
+                    // Handle variable reference: $variable or regex anchor: $
+                    eprintln!("DEBUG: Found $ token, checking if followed by identifier");
+                    if let Some(Token::Identifier) = self.lexer.peek_n(1) {
+                        // This is a variable reference: $variable
+                        eprintln!("DEBUG: Found identifier after $, treating as variable reference");
+                        self.lexer.next(); // consume the $
+                        let identifier = self.lexer.get_identifier_text()?;
+                        eprintln!("DEBUG: Found identifier after $: {}", identifier);
+                        expression_parts.push(format!("${}", identifier));
+                        self.lexer.next();
+                    } else {
+                        // This is a regex anchor: $
+                        eprintln!("DEBUG: No identifier after $, treating as regex anchor");
+                        expression_parts.push("$".to_string());
+                        self.lexer.next();
+                    }
+                }
+                Some(Token::DoubleQuotedString) | Some(Token::SingleQuotedString) => {
+                    let string_text = self.lexer.get_string_text()?;
+                    expression_parts.push(string_text);
+                    self.lexer.next(); // consume the string token
+                }
+                Some(Token::Space) | Some(Token::Tab) => {
+                    self.lexer.next(); // skip whitespace
+                }
                 Some(Token::Identifier) => {
                     let identifier = self.lexer.get_identifier_text()?;
                     expression_parts.push(identifier);
-                    self.lexer.next(); // consume the identifier token
-                }
-                 Some(Token::DoubleQuotedString) | Some(Token::SingleQuotedString) => {
-                     let string_text = self.lexer.get_string_text()?;
-                     expression_parts.push(string_text);
-                     self.lexer.next(); // consume the string token
-                 }
-                Some(Token::Space) | Some(Token::Tab) => {
-                    self.lexer.next(); // skip whitespace
+                    self.lexer.next();
                 }
                 None => {
                     return Err(ParserError::InvalidSyntax("Unexpected end of input in test expression".to_string()));
                 }
                 _ => {
-                    return Err(ParserError::InvalidSyntax("Unexpected token in test expression".to_string()));
+                    let token_str = format!("{:?}", self.lexer.peek());
+                    return Err(ParserError::InvalidSyntax(format!("Unexpected token in test expression: {}", token_str)));
                 }
             }
         }
