@@ -1,5 +1,5 @@
 use crate::ast::*;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 
 pub mod commands;
 pub mod control_flow;
@@ -14,6 +14,9 @@ pub struct Generator {
     pub declared_locals: HashSet<String>,
     pub declared_functions: HashSet<String>,
     pub file_handle_counter: usize,
+    pub extglob_enabled: bool,
+    pub nocasematch_enabled: bool,
+    pub process_sub_files: HashMap<String, String>,
 }
 
 impl Generator {
@@ -23,6 +26,9 @@ impl Generator {
             declared_locals: HashSet::new(),
             declared_functions: HashSet::new(),
             file_handle_counter: 0,
+            extglob_enabled: false,
+            nocasematch_enabled: false,
+            process_sub_files: HashMap::new(),
         }
     }
 
@@ -32,7 +38,8 @@ impl Generator {
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
         output.push_str("use strict;\n");
-        output.push_str("use warnings;\n\n");
+        output.push_str("use warnings;\n");
+        output.push_str("use File::Basename;\n\n");
         
         for command in ast {
             // Reset indentation level for each top-level command to prevent staircase effect
@@ -50,7 +57,11 @@ impl Generator {
     }
 
     pub fn generate_command(&mut self, command: &Command) -> String {
-        commands::generate_command_impl(self, command)
+        commands::generate_command_impl(self, command, false)
+    }
+
+    pub fn generate_command_in_stdout_context(&mut self, command: &Command) -> String {
+        commands::generate_command_impl(self, command, true)
     }
 
     // Delegate to submodules
@@ -156,6 +167,11 @@ impl Generator {
 
     pub fn get_unique_file_handle(&mut self) -> String {
         utils::get_unique_file_handle_impl(self)
+    }
+
+    pub fn get_unique_id(&mut self) -> String {
+        self.file_handle_counter += 1;
+        format!("{}", self.file_handle_counter)
     }
 
     // Additional helper methods that are needed

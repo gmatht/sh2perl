@@ -7,7 +7,7 @@ mod cache;
 mod execution;
 mod utils;
 mod testing;
-mod commands;
+mod cli_commands;
 mod help;
 
 use std::env;
@@ -21,7 +21,7 @@ use debashl::{Parser, Generator};
 use crate::utils::generate_unified_diff;
 use crate::testing::{test_all_examples, test_all_examples_next_fail, find_uses_of_system,
                     test_file_equivalence, AstFormatOptions};
-use crate::commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, 
+use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, 
                      parse_file_to_perl, interactive_mode};
 use crate::help::show_help;
 

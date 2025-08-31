@@ -17,7 +17,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 "-f" | "--force" => force = true,
                 _ => {
                     if !arg_str.starts_with('-') {
-                        files.push(generator.word_to_perl(arg));
+                        files.push(format!("\"{}\"", arg_str));
                     }
                 }
             }
@@ -31,62 +31,178 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     } else {
         output.push_str("use File::Path qw(remove_tree);\n");
         
+        // Process each file/pattern
         for file in &files {
-            output.push_str(&format!("if (-e {}) {{\n", file));
+            // Check if this is a glob pattern (contains * or ?)
+            let is_glob = file.contains('*') || file.contains('?');
             
-            if recursive {
-                // Recursive removal
-                output.push_str(&format!("if (-d {}) {{\n", file));
-                output.push_str(&format!("remove_tree({}, {{error => \\$err}});\n", file));
-                output.push_str("if (@$err) {\n");
-                if force {
-                    output.push_str(&format!("warn \"rm: warning: could not remove {}: $err->[0]\\n\";\n", file));
+            if is_glob {
+                // For glob patterns, expand them first
+                output.push_str(&format!("my @files_to_remove = glob({});\n", file));
+                output.push_str("foreach my $file_to_remove (@files_to_remove) {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("if (-e $file_to_remove) {\n");
+                generator.indent_level += 1;
+                
+                if recursive {
+                    // Recursive removal
+                    output.push_str(&generator.indent());
+                    output.push_str("if (-d $file_to_remove) {\n");
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("remove_tree($file_to_remove, {error => \\$err});\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("if (@$err) {\n");
+                    generator.indent_level += 1;
+                    if force {
+                        output.push_str(&generator.indent());
+                        output.push_str("warn \"rm: warning: could not remove \", $file_to_remove, \": $err->[0]\\n\";\n");
+                    } else {
+                        output.push_str(&generator.indent());
+                        output.push_str("die \"rm: cannot remove \", $file_to_remove, \": $err->[0]\\n\";\n");
+                    }
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("} else {\n");
+                    // Silent operation - no output unless error
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("} else {\n");
+                    // File removal
+                    output.push_str(&generator.indent());
+                    output.push_str("if (unlink($file_to_remove)) {\n");
+                    // Silent operation - no output unless error
+                    output.push_str(&generator.indent());
+                    output.push_str("} else {\n");
+                    generator.indent_level += 1;
+                    if force {
+                        output.push_str(&generator.indent());
+                        output.push_str("warn \"rm: warning: could not remove \", $file_to_remove, \": $!\\n\";\n");
+                    } else {
+                        output.push_str(&generator.indent());
+                        output.push_str("die \"rm: cannot remove \", $file_to_remove, \": $!\\n\";\n");
+                    }
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
                 } else {
-                    output.push_str(&format!("die \"rm: cannot remove {}: $err->[0]\\n\";\n", file));
+                    // Non-recursive removal
+                    output.push_str(&generator.indent());
+                    output.push_str("if (-d $file_to_remove) {\n");
+                    generator.indent_level += 1;
+                    if force {
+                        output.push_str(&generator.indent());
+                        output.push_str("warn \"rm: warning: \", $file_to_remove, \" is a directory (use -r to remove recursively)\\n\";\n");
+                    } else {
+                        output.push_str(&generator.indent());
+                        output.push_str("die \"rm: \", $file_to_remove, \" is a directory (use -r to remove recursively)\\n\";\n");
+                    }
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("} else {\n");
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("if (unlink($file_to_remove)) {\n");
+                    // Silent operation - no output unless error
+                    output.push_str(&generator.indent());
+                    output.push_str("} else {\n");
+                    generator.indent_level += 1;
+                    if force {
+                        output.push_str(&generator.indent());
+                        output.push_str("warn \"rm: warning: could not remove \", $file_to_remove, \": $!\\n\";\n");
+                    } else {
+                        output.push_str(&generator.indent());
+                        output.push_str("die \"rm: cannot remove \", $file_to_remove, \": $!\\n\";\n");
+                    }
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
                 }
+                
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("} else {\n");
-                output.push_str(&format!("print \"rm: removed directory {}\\n\";\n", file));
-                output.push_str("}\n");
-                output.push_str("} else {\n");
-                // File removal
-                output.push_str(&format!("if (unlink({})) {{\n", file));
-                output.push_str(&format!("print \"rm: removed file {}\\n\";\n", file));
-                output.push_str("} else {\n");
+                generator.indent_level += 1;
                 if force {
-                    output.push_str(&format!("warn \"rm: warning: could not remove {}: $!\\n\";\n", file));
+                    output.push_str(&generator.indent());
+                    output.push_str("warn \"rm: warning: \", $file_to_remove, \": No such file or directory\\n\";\n");
                 } else {
-                    output.push_str(&format!("die \"rm: cannot remove {}: $!\\n\";\n", file));
+                    output.push_str(&generator.indent());
+                    output.push_str("die \"rm: \", $file_to_remove, \": No such file or directory\\n\";\n");
                 }
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
+                
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
             } else {
-                // Non-recursive removal
-                output.push_str(&format!("if (-d {}) {{\n", file));
-                if force {
-                    output.push_str(&format!("warn \"rm: warning: {} is a directory (use -r to remove recursively)\\n\";\n", file));
+                // For non-glob patterns, use the original logic
+                output.push_str(&format!("if (-e {}) {{\n", file));
+                
+                if recursive {
+                    // Recursive removal
+                    output.push_str(&format!("if (-d {}) {{\n", file));
+                    output.push_str(&format!("remove_tree({}, {{error => \\$err}});\n", file));
+                    output.push_str("if (@$err) {\n");
+                    if force {
+                        output.push_str(&format!("warn \"rm: warning: could not remove \", {}, \": $err->[0]\\n\";\n", file));
+                    } else {
+                        output.push_str(&format!("die \"rm: cannot remove \", {}, \": $err->[0]\\n\";\n", file));
+                    }
+                    output.push_str("} else {\n");
+                    // Silent operation - no output unless error
+                    output.push_str("}\n");
+                    output.push_str("} else {\n");
+                    // File removal
+                    output.push_str(&format!("if (unlink({})) {{\n", file));
+                    // Silent operation - no output unless error
+                    output.push_str("} else {\n");
+                    if force {
+                        output.push_str(&format!("warn \"rm: warning: could not remove \", {}, \": $!\\n\";\n", file));
+                    } else {
+                        output.push_str(&format!("die \"rm: cannot remove \", {}, \": $!\\n\";\n", file));
+                    }
+                    output.push_str("}\n");
+                    output.push_str("}\n");
                 } else {
-                    output.push_str(&format!("die \"rm: {} is a directory (use -r to remove recursively)\\n\";\n", file));
+                    // Non-recursive removal
+                    output.push_str(&format!("if (-d {}) {{\n", file));
+                    if force {
+                        output.push_str(&format!("warn \"rm: warning: \", {}, \" is a directory (use -r to remove recursively)\\n\";\n", file));
+                    } else {
+                        output.push_str(&format!("die \"rm: \", {}, \" is a directory (use -r to remove recursively)\\n\";\n", file));
+                    }
+                    output.push_str("} else {\n");
+                    output.push_str(&format!("if (unlink({})) {{\n", file));
+                    // Silent operation - no output unless error
+                    output.push_str("} else {\n");
+                    if force {
+                        output.push_str(&format!("warn \"rm: warning: could not remove \", {}, \": $!\\n\";\n", file));
+                    } else {
+                        output.push_str(&format!("die \"rm: cannot remove \", {}, \": $!\\n\";\n", file));
+                    }
+                    output.push_str("}\n");
+                    output.push_str("}\n");
                 }
-                output.push_str("} else {\n");
-                output.push_str(&format!("if (unlink({})) {{\n", file));
-                output.push_str(&format!("print \"rm: removed file {}\\n\";\n", file));
+                
                 output.push_str("} else {\n");
                 if force {
-                    output.push_str(&format!("warn \"rm: warning: could not remove {}: $!\\n\";\n", file));
+                    output.push_str(&format!("warn \"rm: warning: \", {}, \": No such file or directory\\n\";\n", file));
                 } else {
-                    output.push_str(&format!("die \"rm: cannot remove {}: $!\\n\";\n", file));
+                    output.push_str(&format!("die \"rm: \", {}, \": No such file or directory\\n\";\n", file));
                 }
                 output.push_str("}\n");
-                output.push_str("}\n");
             }
-            
-            output.push_str("} else {\n");
-            if force {
-                output.push_str(&format!("warn \"rm: warning: {}: No such file or directory\\n\";\n", file));
-            } else {
-                output.push_str(&format!("die \"rm: {}: No such file or directory\\n\";\n", file));
-            }
-            output.push_str("}\n");
         }
     }
     

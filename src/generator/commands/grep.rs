@@ -1,7 +1,7 @@
 use crate::generator::Generator;
 use crate::ast::*;
 
-pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize) -> String {
+pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize, should_print: bool) -> String {
     let mut output = String::new();
     
     // Parse grep options and pattern
@@ -11,6 +11,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     let mut ignore_case = false;
     let mut invert_match = false;
     let mut word_match = false;
+    let mut only_matching = false;
     
     for arg in &cmd.args {
         if let Word::Literal(s) = arg {
@@ -20,6 +21,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 if s.contains('i') { ignore_case = true; }
                 if s.contains('v') { invert_match = true; }
                 if s.contains('w') { word_match = true; }
+                if s.contains('o') { only_matching = true; }
             } else {
                 pattern = s.clone();
             }
@@ -33,8 +35,15 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         output.push_str("warn \"grep: no pattern specified\";\n");
         output.push_str("exit(1);\n");
     } else {
+        // Use the provided input variable as source
+        let input_source = if input_var.starts_with('$') {
+            input_var.to_string()
+        } else {
+            format!("${}", input_var)
+        };
+        
         // Split input into lines and apply grep logic
-        output.push_str(&format!("my @grep_lines_{} = split(/\\n/, {});\n", command_index, input_var));
+        output.push_str(&format!("my @grep_lines_{} = split(/\\n/, {});\n", command_index, input_source));
         
         // Escape the pattern for Perl regex
         // For patterns like "\.txt$", the backslash is escaping the dot in shell
@@ -46,6 +55,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         } else {
             &escaped_pattern
         };
+        
         if invert_match {
             // Negative grep: exclude lines that match the pattern
             output.push_str(&format!("my @grep_filtered_{} = grep !/{}/, @grep_lines_{};\n", command_index, regex_pattern, command_index));
@@ -55,7 +65,11 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         }
         
         if count_only {
-            output.push_str(&format!("{} = scalar(@grep_filtered_{});\n", input_var, command_index));
+            output.push_str(&format!("{} = scalar(@grep_filtered_{});\n", input_source, command_index));
+            if should_print {
+                output.push_str(&format!("print {};\n", input_source));
+                output.push_str("print \"\\n\";\n");
+            }
         } else if line_numbers {
             output.push_str(&format!("my @grep_numbered_{};\n", command_index));
             output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
@@ -63,9 +77,30 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             output.push_str(&format!("        push @grep_numbered_{}, sprintf(\"%d:%s\", $i + 1, $grep_lines_{}[$i]);\n", command_index, command_index));
             output.push_str("    }\n");
             output.push_str("}\n");
-            output.push_str(&format!("{} = join(\"\\n\", @grep_numbered_{});\n", input_var, command_index));
+            output.push_str(&format!("{} = join(\"\\n\", @grep_numbered_{});\n", input_source, command_index));
+            if should_print {
+                output.push_str(&format!("print {};\n", input_source));
+                output.push_str("print \"\\n\";\n");
+            }
+        } else if only_matching {
+            // Handle -o flag: only output the matching part
+            output.push_str(&format!("my @grep_matches_{};\n", command_index));
+            output.push_str(&format!("foreach my $line (@grep_filtered_{}) {{\n", command_index));
+            output.push_str(&format!("    if ($line =~ /({})/) {{\n", regex_pattern));
+            output.push_str(&format!("        push @grep_matches_{}, $1;\n", command_index));
+            output.push_str("    }\n");
+            output.push_str("}\n");
+            output.push_str(&format!("{} = join(\"\\n\", @grep_matches_{});\n", input_source, command_index));
+            if should_print {
+                output.push_str(&format!("print {};\n", input_source));
+                output.push_str("print \"\\n\";\n");
+            }
         } else {
-            output.push_str(&format!("{} = join(\"\\n\", @grep_filtered_{});\n", input_var, command_index));
+            output.push_str(&format!("{} = join(\"\\n\", @grep_filtered_{});\n", input_source, command_index));
+            if should_print {
+                output.push_str(&format!("print {};\n", input_source));
+                output.push_str("print \"\\n\";\n");
+            }
         }
     }
     

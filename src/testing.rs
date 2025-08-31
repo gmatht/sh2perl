@@ -373,7 +373,10 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
                     lexer_output.push_str("... (lexer output truncated at 1000 tokens)");
                 }
                 
-                return Err(format!("Failed to parse {}: {:?}\n\nLexer output:\n{}", filename, e, lexer_output)); 
+                // Check if this is a lexer error vs parser error
+                let is_lexer_error = format!("{:?}", e).contains("Lexer error:");
+                let error_type = if is_lexer_error { "lexer" } else { "parser" };
+                return Err(format!("Failed to {} {}: {:?}\n\nLexer output:\n{}", error_type, filename, e, lexer_output)); 
             }
         };
 
@@ -535,6 +538,23 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
         ast,
         _lexer_output: String::new(), // No lexer output for detailed test
     })
+}
+
+/// Count the number of lines that match before the first mismatch in stdout
+fn count_matching_stdout_lines(shell_stdout: &str, translated_stdout: &str) -> usize {
+    let shell_lines: Vec<&str> = shell_stdout.lines().collect();
+    let translated_lines: Vec<&str> = translated_stdout.lines().collect();
+    
+    let min_lines = std::cmp::min(shell_lines.len(), translated_lines.len());
+    
+    for i in 0..min_lines {
+        if shell_lines[i] != translated_lines[i] {
+            return i;
+        }
+    }
+    
+    // If we get here, all lines up to the minimum length match
+    min_lines
 }
 
 pub fn test_all_examples() {
@@ -865,10 +885,15 @@ pub fn test_all_examples_next_fail(generators: &[String], test_number: Option<us
                         // Write the passed test count to first_n_tests_passed.txt
                         println!("Writing test count {} to first_n_tests_passed.txt", passed_tests);
                         println!("Current working directory: {:?}", std::env::current_dir().unwrap_or_default());
-                        if let Err(e) = std::fs::write("first_n_tests_passed.txt", passed_tests.to_string()) {
+                        
+                        // Count matching stdout lines before first mismatch
+                        let matching_lines = count_matching_stdout_lines(&result.shell_stdout, &result.translated_stdout);
+                        let file_content = format!("{}\n{}", passed_tests, matching_lines);
+                        
+                        if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
                             println!("Warning: Failed to write test count to first_n_tests_passed.txt: {}", e);
                         } else {
-                            println!("Successfully wrote test count to first_n_tests_passed.txt");
+                            println!("Successfully wrote test count {} and matching stdout lines {} to first_n_tests_passed.txt", passed_tests, matching_lines);
                         }
                         
                         // Show how to run the test again
@@ -916,10 +941,18 @@ pub fn test_all_examples_next_fail(generators: &[String], test_number: Option<us
                     // Write the passed test count to first_n_tests_passed.txt even for parsing errors
                     println!("Writing test count {} to first_n_tests_passed.txt (parsing error)", passed_tests);
                     println!("Current working directory: {:?}", std::env::current_dir().unwrap_or_default());
-                    if let Err(e) = std::fs::write("first_n_tests_passed.txt", passed_tests.to_string()) {
+                    
+                    // Check if this is a lexer error vs parser error
+                    let is_lexer_error = e.contains("Failed to lex");
+                    let error_code = if is_lexer_error { -2 } else { -1 };
+                    let error_type = if is_lexer_error { "lexer" } else { "parser" };
+                    
+                    let file_content = format!("{}\n{}", passed_tests, error_code);
+                    
+                    if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
                         println!("Warning: Failed to write test count to first_n_tests_passed.txt: {}", e);
                     } else {
-                        println!("Successfully wrote test count to first_n_tests_passed.txt");
+                        println!("Successfully wrote test count {} and matching stdout lines {} ({} error) to first_n_tests_passed.txt", passed_tests, error_code, error_type);
                     }
                     
                     // Show how to run the test again
@@ -943,10 +976,14 @@ pub fn test_all_examples_next_fail(generators: &[String], test_number: Option<us
         // Write the total passed test count to first_n_tests_passed.txt
         println!("Writing total test count {} to first_n_tests_passed.txt", passed_tests);
         println!("Current working directory: {:?}", std::env::current_dir().unwrap_or_default());
-        if let Err(e) = std::fs::write("first_n_tests_passed.txt", passed_tests.to_string()) {
+        
+        // When all tests pass, we can't determine matching lines, so write -2 (no failure to analyze)
+        let file_content = format!("{}\n-2", passed_tests);
+        
+        if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
             println!("Warning: Failed to write test count to first_n_tests_passed.txt: {}", e);
         } else {
-            println!("Successfully wrote total test count to first_n_tests_passed.txt");
+            println!("Successfully wrote total test count {} and matching stdout lines -2 to first_n_tests_passed.txt", passed_tests);
         }
     }
 }

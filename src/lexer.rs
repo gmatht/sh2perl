@@ -298,8 +298,8 @@ pub enum Token {
     Float,
     #[regex(r"0x[0-9a-fA-F]+")]
     HexNumber,
-    #[regex(r"0[0-7]+")]
-    OctalNumber,
+    #[regex(r"0+[0-9]+")]
+    PaddedNumber,
 
     // Special characters
     #[token("!")]
@@ -362,7 +362,7 @@ pub enum Token {
     Comment,
     
     // Regex pattern content (for bash test expressions)
-    #[regex(r"\^[0-9\-\[\]\+\.\$\*\(\)\?\\|]+", priority = 1)]
+    #[regex(r"\^[a-zA-Z0-9\-\[\]\+\.\$\*\(\)\?\\|]+", priority = 1)]
     RegexPattern,
 }
 
@@ -488,6 +488,27 @@ impl Lexer {
         })
     }
     
+    pub fn get_position(&self) -> usize {
+        self.current
+    }
+    
+    pub fn has_newline_before_current_token(&self) -> bool {
+        if self.current == 0 {
+            return false;
+        }
+        
+        // Look at the previous tokens to see if there was a newline
+        for i in (0..self.current).rev() {
+            if let Some((token, _, _)) = self.tokens.get(i) {
+                match token {
+                    Token::Newline | Token::CarriageReturn => return true,
+                    Token::Space | Token::Tab | Token::Comment => continue, // Skip whitespace
+                    _ => return false, // Found a non-whitespace token before newline
+                }
+            }
+        }
+        false
+    }
 
 }
 

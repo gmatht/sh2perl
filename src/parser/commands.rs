@@ -73,6 +73,21 @@ impl Parser {
                 }
             }
             
+            // After parsing a command, look ahead for pipeline operators
+            // Skip whitespace and comments
+            self.lexer.skip_whitespace_and_comments();
+            
+            // Check if the next token is a pipeline operator
+            if let Some(token) = self.lexer.peek() {
+                match token {
+                    Token::And | Token::Or | Token::Pipe => {
+                        // This command is part of a pipeline, parse the rest
+                        command = self.parse_pipeline_from_command(command)?;
+                    }
+                    _ => {}
+                }
+            }
+            
             commands.push(command);
             
             // Handle separators and comments after command
@@ -194,6 +209,29 @@ impl Parser {
                 Some(Token::Continue) => parse_continue_statement(self)?,
                 Some(Token::Return) => parse_return_statement(self)?,
                 Some(Token::Shopt) => self.parse_shopt_command()?,
+                // Handle builtin commands
+                Some(Token::Set) | Some(Token::Unset) | Some(Token::Export) | 
+                Some(Token::Readonly) | Some(Token::Declare) | Some(Token::Typeset) |
+                Some(Token::Local) | Some(Token::Shift) | Some(Token::Eval) |
+                Some(Token::Exec) | Some(Token::Source) | Some(Token::Trap) |
+                Some(Token::Wait) | Some(Token::Exit) => self.parse_pipeline()?,
+                // Handle redirects at the beginning of a command (e.g., process substitution)
+                Some(Token::RedirectIn) | Some(Token::RedirectOut) | Some(Token::RedirectAppend) |
+                Some(Token::RedirectInOut) | Some(Token::Heredoc) | Some(Token::HeredocTabs) |
+                Some(Token::HereString) | Some(Token::RedirectOutErr) | Some(Token::RedirectInErr) |
+                Some(Token::RedirectOutClobber) | Some(Token::RedirectAll) | Some(Token::RedirectAllAppend) => {
+                    // Parse as a redirect command with an empty base command
+                    let redirects = vec![parse_redirect(&mut self.lexer)?];
+                    Command::Redirect(RedirectCommand {
+                        command: Box::new(Command::Simple(SimpleCommand {
+                            name: Word::Literal("".to_string()),
+                            args: vec![],
+                            redirects: vec![],
+                            env_vars: HashMap::new(),
+                        })),
+                        redirects,
+                    })
+                }
                 // Bash arithmetic evaluation: (( ... ))
                 Some(Token::ParenOpen) if matches!(self.lexer.peek_n(1), Some(Token::ParenOpen)) => {
                     self.parse_double_paren_command()?
@@ -292,7 +330,9 @@ impl Parser {
 
     fn parse_pipeline(&mut self) -> Result<Command, ParserError> {
         let first_command = self.parse_simple_command()?;
-        self.parse_pipeline_from_command(first_command)
+        // Parse redirects for the first command
+        let first_command_with_redirects = self.parse_command_redirects(first_command)?;
+        self.parse_pipeline_from_command(first_command_with_redirects)
     }
 
     pub fn parse_pipeline_from_command(&mut self, first_command: Command) -> Result<Command, ParserError> {
@@ -310,19 +350,28 @@ impl Parser {
                     self.lexer.next();
                     operators.push(PipeOperator::Pipe);
                     self.lexer.skip_whitespace_and_comments();
-                    commands.push(self.parse_simple_command()?);
+                    let command = self.parse_simple_command()?;
+                    // Parse redirects for this command
+                    let command_with_redirects = self.parse_command_redirects(command)?;
+                    commands.push(command_with_redirects);
                 }
                 Token::And => {
                     self.lexer.next();
                     operators.push(PipeOperator::And);
                     self.lexer.skip_whitespace_and_comments();
-                    commands.push(self.parse_simple_command()?);
+                    let command = self.parse_simple_command()?;
+                    // Parse redirects for this command
+                    let command_with_redirects = self.parse_command_redirects(command)?;
+                    commands.push(command_with_redirects);
                 }
                 Token::Or => {
                     self.lexer.next();
                     operators.push(PipeOperator::Or);
                     self.lexer.skip_whitespace_and_comments();
-                    commands.push(self.parse_simple_command()?);
+                    let command = self.parse_simple_command()?;
+                    // Parse redirects for this command
+                    let command_with_redirects = self.parse_command_redirects(command)?;
+                    commands.push(command_with_redirects);
                 }
                 Token::Semicolon | Token::Newline => {
                     // Stop parsing pipeline when we hit a command separator
@@ -555,15 +604,34 @@ impl Parser {
                             // Pipeline operators should break argument parsing
                             break;
                         }
+                        Token::Identifier => {
+                            // Check if we're at a newline boundary - if so, this identifier
+                            // might be the start of a new command, not an argument
+                            let current_pos = self.lexer.get_position();
+                            
+                            // Look backwards to see if there was a newline before this identifier
+                            // This is a heuristic to detect command boundaries
+                            if self.lexer.has_newline_before_current_token() {
+                                // This identifier is likely the start of a new command
+                                break;
+                            }
+                            
+                            // Otherwise, treat it as an argument
+                            args.push(parse_word_no_newline_skip(&mut self.lexer)?);
+                        }
                         _ => {
                             // For any other token, try to parse it as a word
-                            // This handles cases like quoted strings, identifiers, etc.
+                            // This handles cases like quoted strings, etc.
                             args.push(parse_word_no_newline_skip(&mut self.lexer)?);
                         }
                     }
                 }
             }
         }
+        
+
+        
+
         
 
         
@@ -715,11 +783,15 @@ impl Parser {
         self.lexer.skip_whitespace_and_comments();
         
         // Parse the option (e.g., -s, -u)
-        let option = if let Some(token) = self.lexer.peek() {
+        let enable = if let Some(token) = self.lexer.peek() {
             match token {
                 Token::Size => {
                     self.lexer.next();
-                    "-s".to_string()
+                    true  // -s means set (enable)
+                }
+                Token::Unset => {
+                    self.lexer.next();
+                    false // -u means unset (disable)
                 }
                 _ => {
                     return Err(ParserError::InvalidSyntax(format!("Expected option after shopt, got: {:?}", token)));
@@ -741,9 +813,12 @@ impl Parser {
             return Err(ParserError::InvalidSyntax("Expected option name after shopt option".to_string()));
         };
         
+        // Update the parser's shell option state
+        self.update_shopt_state(&option_name, enable);
+        
         Ok(Command::ShoptCommand(ShoptCommand {
-            option,
-            enable: true, // -s means set (enable)
+            option: option_name,  // Store the option name, not the flag
+            enable,               // true for -s, false for -u
         }))
     }
 
@@ -897,6 +972,11 @@ impl Parser {
                     expression_parts.push(identifier);
                     self.lexer.next();
                 }
+                Some(Token::RegexPattern) => {
+                    let pattern_text = self.lexer.get_raw_token_text()?;
+                    expression_parts.push(pattern_text);
+                    self.lexer.next();
+                }
                 None => {
                     return Err(ParserError::InvalidSyntax("Unexpected end of input in test expression".to_string()));
                 }
@@ -907,18 +987,11 @@ impl Parser {
             }
         }
         
-        let expression = expression_parts.join(" ");
+        let expression = expression_parts.join("");
         
         Ok(Command::TestExpression(TestExpression {
             expression,
-            modifiers: TestModifiers {
-                extglob: false,
-                nocasematch: false,
-                globstar: false,
-                nullglob: false,
-                failglob: false,
-                dotglob: false,
-            },
+            modifiers: self.get_current_shopt_state(),
         }))
     }
 

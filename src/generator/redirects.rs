@@ -1,10 +1,13 @@
 use crate::ast::*;
 use super::Generator;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) -> String {
     let mut output = String::new();
     
-    match redirect.operator {
+    match &redirect.operator {
         RedirectOperator::Input => {
             // Input redirection: command < file
             output.push_str(&format!("open(STDIN, '<', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
@@ -31,6 +34,45 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 output.push_str("open(STDIN, '<', '/tmp/heredoc_temp') or die \"Cannot open temp file: $!\\n\";\n");
             }
         }
+        RedirectOperator::ProcessSubstitutionInput(cmd) => {
+            let global_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temp_file = format!("/tmp/process_sub_{}.tmp", global_counter);
+            let temp_var = format!("temp_file_ps_{}", global_counter);
+            let output_var = format!("output_ps_{}", global_counter);
+            let fh_var = format!("fh_ps_{}", global_counter);
+            
+            output.push_str(&format!("my ${} = '{}';\n", temp_var, temp_file));
+            
+            if let Command::Pipeline(_) = &**cmd {
+                output.push_str(&format!("my ${};\n", output_var));
+                output.push_str(&format!("{{\n"));
+                output.push_str(&format!("    local $/;  # Read entire input at once\n"));
+                // For pipelines, we need to generate a proper bash command string
+                let bash_cmd = generate_bash_command_string(cmd);
+                output.push_str(&format!("    open(my $pipe, '-|', 'bash', '-c', '{}') or die \"Cannot execute command: $!\\n\";\n", 
+                    bash_cmd));
+                output.push_str(&format!("    ${} = <$pipe>;\n", output_var));
+                output.push_str(&format!("    close($pipe);\n"));
+                output.push_str(&format!("}}\n"));
+            } else {
+                let cmd_str = generate_bash_command_string(cmd);
+                output.push_str(&format!("my ${} = `{}`;\n", output_var, cmd_str));
+            }
+            
+            output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
+            output.push_str(&format!("print ${} ${};\n", fh_var, output_var));
+            output.push_str(&format!("close(${});\n", fh_var));
+            
+            generator.process_sub_files.insert(temp_file.clone(), temp_var.clone());
+        }
+        RedirectOperator::ProcessSubstitutionOutput(_cmd) => {
+            output.push_str("# Redirect ProcessSubstitutionOutput not yet implemented\n");
+        }
+        RedirectOperator::HereString => {
+            // Here-strings are now handled in the command dispatcher
+            // This case should not be reached
+            output.push_str("# Here-string handling moved to command dispatcher\n");
+        }
         _ => {
             // Other redirects not yet implemented
             output.push_str(&format!("# Redirect {:?} not yet implemented\n", redirect.operator));
@@ -40,16 +82,160 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
     output
 }
 
-pub fn generate_shopt_command_impl(_generator: &mut Generator, cmd: &ShoptCommand) -> String {
+// Helper function to generate bash command strings for process substitution
+fn generate_bash_command_string(cmd: &Command) -> String {
+    match cmd {
+        Command::Simple(simple_cmd) => {
+            let args: Vec<String> = simple_cmd.args.iter()
+                .map(|arg| word_to_bash_string(arg))
+                .collect();
+            if args.is_empty() {
+                simple_cmd.name.to_string()
+            } else {
+                format!("{} {}", simple_cmd.name, args.join(" "))
+            }
+        }
+        Command::Pipeline(pipeline) => {
+            let commands: Vec<String> = pipeline.commands.iter()
+                .map(|cmd| generate_bash_command_string(cmd))
+                .collect();
+            
+            let mut result = String::new();
+            for (i, (command, operator)) in commands.iter().zip(pipeline.operators.iter()).enumerate() {
+                if i > 0 {
+                    match operator {
+                        PipeOperator::And => result.push_str(" && "),
+                        PipeOperator::Or => result.push_str(" || "),
+                        PipeOperator::Pipe => result.push_str(" | "),
+                    }
+                }
+                result.push_str(command);
+            }
+            result
+        }
+        Command::Subshell(subshell_cmd) => {
+            format!("({})", generate_bash_command_string(&**subshell_cmd))
+        }
+        Command::Redirect(redirect_cmd) => {
+            // For redirects, we need to generate the base command and redirects
+            let base_cmd = if let Command::Simple(cmd) = &*redirect_cmd.command {
+                if cmd.name.to_string().is_empty() {
+                    // Empty command with just redirects (like process substitution)
+                    String::new()
+                } else {
+                    generate_bash_command_string(&*redirect_cmd.command)
+                }
+            } else {
+                generate_bash_command_string(&*redirect_cmd.command)
+            };
+            
+            let mut result = base_cmd;
+            for redirect in &redirect_cmd.redirects {
+                match &redirect.operator {
+                    RedirectOperator::Input => {
+                        result.push_str(&format!(" < {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::Output => {
+                        result.push_str(&format!(" > {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::Append => {
+                        result.push_str(&format!(" >> {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::ProcessSubstitutionInput(cmd) => {
+                        result.push_str(&format!(" <({})", generate_bash_command_string(cmd)));
+                    }
+                    RedirectOperator::ProcessSubstitutionOutput(cmd) => {
+                        result.push_str(&format!(" >({})", generate_bash_command_string(cmd)));
+                    }
+                    RedirectOperator::HereString => {
+                        result.push_str(&format!(" <<< {}", word_to_bash_string(&redirect.target)));
+                    }
+                    _ => {
+                        // Skip other redirect types for now
+                    }
+                }
+            }
+            result
+        }
+        _ => {
+            // For other complex commands, generate a reasonable bash representation
+            format!("echo 'Complex command not supported in bash string generation'")
+        }
+    }
+}
+
+// Helper function to convert Word to bash string representation
+fn word_to_bash_string(word: &Word) -> String {
+    match word {
+        Word::Literal(s) => s.clone(),
+        Word::BraceExpansion(expansion) => {
+            let mut result = String::new();
+            if let Some(ref prefix) = expansion.prefix {
+                result.push_str(prefix);
+            }
+            result.push('{');
+            
+            let items_str = expansion.items.iter()
+                .map(|item| match item {
+                    BraceItem::Literal(s) => s.clone(),
+                    BraceItem::Range(range) => {
+                        if let Some(ref step) = range.step {
+                            format!("{}..{}..{}", range.start, range.end, step)
+                        } else {
+                            format!("{}..{}", range.start, range.end)
+                        }
+                    }
+                    BraceItem::Sequence(items) => items.join(","),
+                })
+                .collect::<Vec<String>>()
+                .join(",");
+            result.push_str(&items_str);
+            result.push('}');
+            
+            if let Some(ref suffix) = expansion.suffix {
+                result.push_str(suffix);
+            }
+            result
+        }
+        Word::ParameterExpansion(param) => {
+            format!("${{{}}}", param)
+        }
+        Word::StringInterpolation(parts) => {
+            let mut result = String::new();
+            for part in &parts.parts {
+                match part {
+                    StringPart::Literal(s) => result.push_str(&s),
+                    StringPart::Variable(var) => result.push_str(&format!("${{{}}}", var)),
+                    _ => result.push_str("$var"), // Placeholder for other types
+                }
+            }
+            result
+        }
+        Word::CommandSubstitution(cmd) => {
+            // This would need to be handled by the caller
+            format!("$({})", "command")
+        }
+        _ => format!("{:?}", word)
+    }
+}
+
+pub fn generate_shopt_command_impl(generator: &mut Generator, cmd: &ShoptCommand) -> String {
     let mut output = String::new();
     
     // Handle shopt command for shell options
-    let action = if cmd.enable { "enabled" } else { "disabled" };
-    let comment = match cmd.option.as_str() {
-        "extglob" | "nocasematch" => format!("# {} option {}", cmd.option, action),
-        _ => format!("# shopt -{} {} not implemented", if cmd.enable { "s" } else { "u" }, cmd.option),
-    };
-    output.push_str(&format!("{}\n", comment));
+    match cmd.option.as_str() {
+        "extglob" => {
+            generator.extglob_enabled = cmd.enable;
+            output.push_str(&format!("# extglob option {}\n", if cmd.enable { "enabled" } else { "disabled" }));
+        }
+        "nocasematch" => {
+            generator.nocasematch_enabled = cmd.enable;
+            output.push_str(&format!("# nocasematch option {}\n", if cmd.enable { "enabled" } else { "disabled" }));
+        }
+        _ => {
+            output.push_str(&format!("# shopt -{} {} not implemented\n", if cmd.enable { "s" } else { "u" }, cmd.option));
+        }
+    }
     
     // shopt commands always succeed (return true)
     output
@@ -136,7 +322,11 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         // Unset array element
                         output.push_str(&format!("delete ${}{{{}}};\n", array_name, key));
                     } else {
-                        // Unset variable
+                        // Unset variable - ensure it's declared first
+                        if !generator.declared_locals.contains(var_name) {
+                            output.push_str(&format!("my ${};\n", var_name));
+                            generator.declared_locals.insert(var_name.clone());
+                        }
                         output.push_str(&format!("undef ${};\n", var_name));
                         output.push_str(&format!("delete $ENV{{{}}};\n", var_name));
                     }

@@ -2652,27 +2652,67 @@ export function getExample(name) {
 }
 
 // Helper function to get examples grouped by category
-export function getExamplesByCategory() {
+export async function getExamplesByCategory() {
+  // Try to read test results from the server
+  return await getDynamicCategories();
+}
+
+// Function to get dynamic categories based on test results
+async function getDynamicCategories() {
+  try {
+    // Try to fetch test results from the server
+    const response = await fetch('/api/test-results');
+    if (response.ok) {
+      const testResults = await response.json();
+      return categorizeTests(testResults);
+    }
+  } catch (error) {
+    console.log('Could not fetch test results, using fallback categories');
+  }
+  
+  // Fallback to static categories if server is not available
+  return getFallbackCategories();
+}
+
+// Function to categorize tests based on test results
+function categorizeTests(testResults) {
   const categories = {
-    'ANSI Quoting': ['014_ansi_quoting.sh', '020_ansi_quoting_basic.sh', '021_ansi_quoting_escape.sh', '022_ansi_quoting_unicode.sh', '023_ansi_quoting_practical.sh'],
-    'Advanced Examples': ['062_03_complex_heredocs.sh', '062_05_nested_command_substitution.sh', '062_12_complex_string_interpolation.sh', '062_hard_to_lex.sh', '063_03_nested_command_substitutions.sh', '063_05_heredoc_with_complex_content.sh', '063_12_complex_eval.sh', '063_13_nested_subshells.sh', '063_14_complex_redirects.sh', '063_16_complex_test_expressions.sh', '063_18_complex_here_string.sh', '063_20_final_complex_construct.sh', '063_hard_to_parse.sh', '064_01_complex_nested_subshells.sh', '064_11_complex_test_expressions.sh', '064_13_complex_string_manipulation.sh', '064_20_nested_subshells_environment_variables.sh', '064_21_complex_string_interpolation_multiple_variables.sh', '064_23_complex_error_handling_traps.sh', '064_25_complex_command_chaining.sh', '064_hard_to_generate.sh'],
-    'Arithmetic & Math': ['051_primes.sh', '052_numeric_computations.sh', '053_gcd.sh', '054_fibonacci.sh', '055_factorize.sh', '062_04_nested_arithmetic.sh', '062_11_mixed_arithmetic.sh', '063_01_deeply_nested_arithmetic.sh', '064_06_nested_arithmetic_expressions.sh', '064_14_nested_command_substitution_arithmetic.sh'],
-    'Arrays': ['009_arrays.sh', '028_arrays_indexed.sh', '029_arrays_associative.sh', '062_14_complex_array_operations.sh', '063_02_complex_array_assignments.sh', '064_07_complex_array_operations.sh', '064_18_array_slicing_manipulation.sh'],
-    'Basic Examples': ['001_simple.sh', '004_test_quoted.sh', '005_args.sh', '006_misc.sh', '007_cat_EOF.sh', '008_simple_backup.sh', '045_shell_calling_perl.sh', '047_for_arithematic.sh', '050_test_ls_star_dot_sh.sh', '056_send_args.sh', '058_advanced_bash_idioms.sh', '062_01_ambiguous_operators.sh', '062_13_simple_test_expressions.sh', '064_04_extended_glob_patterns.sh', '064_08_heredocs_with_variable_interpolation.sh'],
-    'Brace Expansion': ['011_brace_expansion.sh', '033_brace_expansion_basic.sh', '034_brace_expansion_advanced.sh', '035_brace_expansion_practical.sh', '062_07_complex_brace_expansion.sh', '063_17_nested_brace_expansion.sh', '064_02_nested_brace_expansions.sh', '064_12_brace_expansion_nested_sequences.sh'],
-    'Control Flow': ['002_control_flow.sh', '024_parameter_expansion_case.sh', '030_control_flow_if.sh', '031_control_flow_loops.sh', '032_control_flow_function.sh', '038_pattern_matching_nocase.sh', '057_case.sh', '062_08_simple_case.sh', '062_09_complex_function.sh', '063_07_nested_if_statements.sh', '063_08_complex_case_statement.sh', '063_09_complex_function_parameter_handling.sh', '063_10_complex_for_loop.sh', '063_11_complex_while_loop.sh', '063_15_complex_function_definition.sh', '063_19_complex_function_call.sh', '064_05_complex_case_statement.sh', '064_10_nested_function_definitions.sh', '064_16_function_complex_argument_handling.sh', '064_17_complex_while_loop_nested_conditionals.sh', '064_22_function_returning_complex_data_structures.sh'],
-    'Data Files': ['file.txt'],
-    'File Operations': ['043_home.sh', '044_find_example.sh'],
-    'Grep Examples': ['015_grep_advanced.sh', '016_grep_basic.sh', '017_grep_context.sh', '018_grep_params.sh', '019_grep_regex.sh'],
-    'Issue Examples': ['059_issue3.sh', '060_issue5.sh'],
-    'Parameter Expansion': ['013_parameter_expansion.sh', '025_parameter_expansion_advanced.sh', '026_parameter_expansion_more.sh', '027_parameter_expansion_defaults.sh', '062_02_complex_parameter_expansions.sh', '063_04_complex_parameter_expansion.sh', '064_03_complex_parameter_expansion.sh', '064_24_advanced_parameter_expansion.sh'],
-    'Pattern Matching': ['010_pattern_matching.sh', '036_pattern_matching_basic.sh', '037_pattern_matching_extglob.sh', '064_19_complex_pattern_matching_extended_globs.sh'],
-    'Pipelines': ['003_pipeline.sh', '062_10_simple_pipeline.sh', '063_06_complex_pipeline_background.sh', '064_09_process_substitution_pipeline.sh', '064_15_complex_pipeline_multiple_redirects.sh'],
-    'Process Substitution': ['012_process_substitution.sh', '039_process_substitution_here.sh', '040_process_substitution_comm.sh', '041_process_substitution_mapfile.sh', '042_process_substitution_advanced.sh', '062_06_process_substitution.sh'],
-    'Shell Operations': ['046_cd..sh', '048_subprocess.sh', '049_local.sh', '061_test_local_names_preserved.sh', '062_15_complex_local_variables.sh']
+    'passed': [],
+    'can parse': [],
+    'can lex': [],
+    'failed': []
   };
   
+  // Categorize based on test results
+  if (testResults.passed) {
+    categories.passed = testResults.passed.map(file => file.replace('examples/', ''));
+  }
+  
+  if (testResults.failed) {
+    // Check if failed tests can be parsed or lexed
+    testResults.failed.forEach(file => {
+      const filename = file.replace('examples/', '');
+      if (filename.includes('hard_to_parse')) {
+        categories['can lex'].push(filename);
+      } else if (filename.includes('hard_to_generate')) {
+        categories['can parse'].push(filename);
+      } else {
+        categories.failed.push(filename);
+      }
+    });
+  }
+  
   return categories;
+}
+
+// Fallback categories when test results are not available
+function getFallbackCategories() {
+  return {
+    'passed': ['001_simple.sh', '005_args.sh', '013_parameter_expansion.sh', '020_ansi_quoting_basic.sh', '022_ansi_quoting_unicode.sh', '023_ansi_quoting_practical.sh', '024_parameter_expansion_case.sh', '025_parameter_expansion_advanced.sh', '026_parameter_expansion_more.sh', '027_parameter_expansion_defaults.sh', '029_arrays_associative.sh', '030_control_flow_if.sh', '033_brace_expansion_basic.sh', '034_brace_expansion_advanced.sh', '059_issue3.sh', '060_issue5.sh', '062_06_process_substitution.sh', '062_07_complex_brace_expansion.sh', '062_13_simple_test_expressions.sh', '063_01_deeply_nested_arithmetic.sh', '063_07_nested_if_statements.sh', '063_10_complex_for_loop.sh', '063_11_complex_while_loop.sh', '063_14_complex_redirects.sh', '063_16_complex_test_expressions.sh', '063_17_nested_brace_expansion.sh', '063_19_complex_function_call.sh', '063_20_final_complex_construct.sh', '064_04_extended_glob_patterns.sh', '064_08_heredocs_with_variable_interpolation.sh', '064_11_complex_test_expressions.sh', '064_12_brace_expansion_nested_sequences.sh', '064_19_complex_pattern_matching_extended_globs.sh', '064_25_complex_command_chaining.sh'],
+    'can parse': ['062_01_ambiguous_operators.sh', '062_02_complex_parameter_expansions.sh', '062_03_complex_heredocs.sh', '062_04_nested_arithmetic.sh', '062_05_nested_command_substitution.sh', '062_08_simple_case.sh', '062_09_complex_function.sh', '062_10_simple_pipeline.sh', '062_11_mixed_arithmetic.sh', '062_12_complex_string_interpolation.sh', '062_14_complex_array_operations.sh', '062_15_complex_local_variables.sh', '063_02_complex_array_assignments.sh', '063_03_nested_command_substitutions.sh', '063_04_complex_parameter_expansion.sh', '063_05_heredoc_with_complex_content.sh', '063_06_complex_pipeline_background.sh', '063_08_complex_case_statement.sh', '063_09_complex_function_parameter_handling.sh', '063_12_complex_eval.sh', '063_13_nested_subshells.sh', '063_15_complex_function_definition.sh', '063_18_complex_here_string.sh', '064_01_complex_nested_subshells.sh', '064_02_nested_brace_expansions.sh', '064_03_complex_parameter_expansion.sh', '064_05_complex_case_statement.sh', '064_06_nested_arithmetic_expressions.sh', '064_07_complex_array_operations.sh', '064_09_process_substitution_pipeline.sh', '064_10_nested_function_definitions.sh', '064_13_complex_string_manipulation.sh', '064_14_nested_command_substitution_arithmetic.sh', '064_15_complex_pipeline_multiple_redirects.sh', '064_16_function_complex_argument_handling.sh', '064_17_complex_while_loop_nested_conditionals.sh', '064_18_array_slicing_manipulation.sh', '064_20_nested_subshells_environment_variables.sh', '064_21_complex_string_interpolation_multiple_variables.sh', '064_22_function_returning_complex_data_structures.sh', '064_23_complex_error_handling_traps.sh', '064_24_advanced_parameter_expansion.sh'],
+    'can lex': ['062_hard_to_lex.sh'],
+    'failed': ['002_control_flow.sh', '003_pipeline.sh', '004_test_quoted.sh', '006_misc.sh', '007_cat_EOF.sh', '008_simple_backup.sh', '009_arrays.sh', '010_pattern_matching.sh', '011_brace_expansion.sh', '012_process_substitution.sh', '014_ansi_quoting.sh', '015_grep_advanced.sh', '016_grep_basic.sh', '017_grep_context.sh', '018_grep_params.sh', '019_grep_regex.sh', '021_ansi_quoting_escape.sh', '028_arrays_indexed.sh', '031_control_flow_loops.sh', '032_control_flow_function.sh', '035_brace_expansion_practical.sh', '036_pattern_matching_basic.sh', '037_pattern_matching_extglob.sh', '038_pattern_matching_nocase.sh', '039_process_substitution_here.sh', '040_process_substitution_comm.sh', '041_process_substitution_mapfile.sh', '042_process_substitution_advanced.sh', '043_home.sh', '044_find_example.sh', '045_shell_calling_perl.sh', '046_cd..sh', '047_for_arithematic.sh', '048_subprocess.sh', '049_local.sh', '050_test_ls_star_dot_sh.sh', '051_primes.sh', '052_numeric_computations.sh', '053_gcd.sh', '054_fibonacci.sh', '055_factorize.sh', '056_send_args.sh', '057_case.sh', '058_advanced_bash_idioms.sh', '061_test_local_names_preserved.sh', '063_hard_to_parse.sh', '064_hard_to_generate.sh']
+  };
 }
 
 // Helper function to get examples as JSON (for compatibility with existing code)

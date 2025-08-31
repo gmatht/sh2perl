@@ -54,8 +54,14 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
             // For loops need to be handled as Perl code, not system commands
             generator.generate_for_loop(for_loop)
         }
+        Command::Redirect(redirect_cmd) => {
+            // For RedirectCommand with process substitution, we can't generate a simple shell command
+            // Instead, we should not be called for these commands
+            eprintln!("WARNING: generate_command_string_for_system called with RedirectCommand");
+            "echo 'RedirectCommand cannot be converted to shell command'".to_string()
+        }
         _ => {
-            // For complex commands, generate proper Perl code instead of debug representation
+            // For other complex commands, generate proper Perl code instead of debug representation
             generator.generate_command(cmd)
         }
     }

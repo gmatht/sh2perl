@@ -23,7 +23,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         },
         Word::StringInterpolation(interp) => generator.convert_string_interpolation_to_perl(interp),
         Word::Arithmetic(expr) => generator.convert_arithmetic_to_perl(&expr.expression),
-        Word::BraceExpansion(expansion) => generator.handle_brace_expansion(expansion),
+        Word::BraceExpansion(expansion) => {
+            let expanded = generator.handle_brace_expansion(expansion);
+            // Quote the result since it's used in contexts where quotes are needed
+            format!("\"{}\"", expanded)
+        },
         Word::CommandSubstitution(cmd) => {
             // Execute the command and capture its output
             // For command substitution, we need to generate Perl code that produces the same output
@@ -143,21 +147,138 @@ pub fn handle_comma_expansion_impl(_generator: &Generator, s: &str) -> String {
 }
 
 pub fn handle_brace_expansion_impl(generator: &mut Generator, expansion: &BraceExpansion) -> String {
+    // Handle prefix and suffix
+    let prefix = expansion.prefix.as_deref().unwrap_or("");
+    let suffix = expansion.suffix.as_deref().unwrap_or("");
+    
     if expansion.items.len() == 1 {
-        generator.word_to_perl(&generator.brace_item_to_word(&expansion.items[0]))
+        let expanded = generator.word_to_perl(&generator.brace_item_to_word(&expansion.items[0]));
+        if !prefix.is_empty() || !suffix.is_empty() {
+            // Split the expanded items and add prefix/suffix to each
+            let items: Vec<String> = expanded.split_whitespace()
+                .map(|item| format!("{}{}{}", prefix, item, suffix))
+                .collect();
+            items.join(" ")
+        } else {
+            expanded
+        }
     } else {
-        let items: Vec<String> = expansion.items.iter()
-            .map(|item| generator.word_to_perl(&generator.brace_item_to_word(item)))
+        // Handle cartesian product for multiple brace items
+        let expanded_items: Vec<Vec<String>> = expansion.items.iter()
+            .map(|item| {
+                let word = generator.brace_item_to_word(item);
+                match word {
+                    Word::Literal(s) => vec![s],
+                    _ => vec![generator.word_to_perl(&word)],
+                }
+            })
             .collect();
+        
+        // Generate cartesian product
+        let cartesian = generate_cartesian_product(&expanded_items);
+        
+        // Add prefix and suffix to each item
+        let items: Vec<String> = cartesian.iter()
+            .map(|item| format!("{}{}{}", prefix, item, suffix))
+            .collect();
+        
+        // Join all combinations with spaces
         items.join(" ")
     }
+}
+
+fn generate_cartesian_product(items: &[Vec<String>]) -> Vec<String> {
+    if items.is_empty() {
+        return vec![];
+    }
+    if items.len() == 1 {
+        return items[0].clone();
+    }
+    
+    let mut result = Vec::new();
+    let first = &items[0];
+    let rest = generate_cartesian_product(&items[1..]);
+    
+    for item in first {
+        for rest_item in &rest {
+            result.push(format!("{}{}", item, rest_item));
+        }
+    }
+    
+    result
 }
 
 pub fn brace_item_to_word_impl(_generator: &Generator, item: &BraceItem) -> Word {
     match item {
         BraceItem::Literal(s) => Word::Literal(s.clone()),
-        BraceItem::Range(range) => Word::Literal(format!("{}..{}", range.start, range.end)),
+        BraceItem::Range(range) => {
+            // Expand the range to actual values
+            let expanded = expand_range(range);
+            Word::Literal(expanded)
+        },
         BraceItem::Sequence(seq) => Word::Literal(seq.join(" ")),
+    }
+}
+
+fn expand_range(range: &BraceRange) -> String {
+    // Check if this is a numeric range
+    if let (Ok(start_num), Ok(end_num)) = (range.start.parse::<i64>(), range.end.parse::<i64>()) {
+        let step = range.step.as_ref().and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+        
+        let mut values = Vec::new();
+        let mut current = start_num;
+        
+        if step > 0 {
+            while current <= end_num {
+                // Preserve leading zeros by formatting with the same width as the original
+                let formatted = if range.start.starts_with('0') && range.start.len() > 1 {
+                    format!("{:0width$}", current, width = range.start.len())
+                } else {
+                    current.to_string()
+                };
+                values.push(formatted);
+                current += step;
+            }
+        } else {
+            while current >= end_num {
+                // Preserve leading zeros by formatting with the same width as the original
+                let formatted = if range.start.starts_with('0') && range.start.len() > 1 {
+                    format!("{:0width$}", current, width = range.start.len())
+                } else {
+                    current.to_string()
+                };
+                values.push(formatted);
+                current += step;
+            }
+        }
+        
+        values.join(" ")
+    } else {
+        // Character range (e.g., a..c)
+        if let (Some(start_char), Some(end_char)) = (range.start.chars().next(), range.end.chars().next()) {
+            let step = range.step.as_ref().and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+            
+            let mut values = Vec::new();
+            let mut current = start_char as i64;
+            let end = end_char as i64;
+            
+            if step > 0 {
+                while current <= end {
+                    values.push((current as u8 as char).to_string());
+                    current += step;
+                }
+            } else {
+                while current >= end {
+                    values.push((current as u8 as char).to_string());
+                    current += step;
+                }
+            }
+            
+            values.join(" ")
+        } else {
+            // Fallback: just return the range as-is
+            format!("{}..{}", range.start, range.end)
+        }
     }
 }
 

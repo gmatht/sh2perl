@@ -20,7 +20,7 @@ fn escape_glob_pattern(pattern: &str) -> String {
     }).collect()
 }
 
-pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, generate_output: bool) -> String {
+pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, generate_output: bool, input_var: &str) -> String {
     let mut output = String::new();
     
     let mut path = ".";
@@ -99,7 +99,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     output.push_str(&format!("find_files('{}', '{}');\n", path, escape_glob_pattern(&pattern)));
     if generate_output {
         output.push_str(&generator.indent());
-        output.push_str("$output = join(\"\\n\", @find_files);\n");
+        output.push_str(&format!("{} = join(\"\\n\", @find_files);\n", input_var));
     }
     output.push_str("\n");
     

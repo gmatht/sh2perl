@@ -219,45 +219,140 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
     output.push_str(&format!("for my ${} (", for_loop.variable));
     
     // Handle different types of for loop items
-    let items: Vec<String> = for_loop.items.iter()
-        .map(|word| {
-            // Special handling for for loop items to avoid quoting array variables
-            match word {
-                Word::StringInterpolation(interp) => {
-                    // Check if this is just a single array variable like "$@" or "$*"
-                    if interp.parts.len() == 1 {
-                        if let StringPart::Variable(var) = &interp.parts[0] {
-                            match var.as_str() {
-                                "@" => "@ARGV".to_string(),  // $@ -> @ARGV (no quotes)
-                                "*" => "@ARGV".to_string(),  // $* -> @ARGV (no quotes)
-                                _ => generator.word_to_perl(word)
-                            }
-                        } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
-                            // Handle ${arr[@]} -> @arr for array iteration or ${!map[@]} -> keys %map for map keys
-                            if pe.operator == ParameterExpansionOperator::ArraySlice("@".to_string(), None) {
-                                if pe.variable.starts_with('!') {
-                                    // ${!map[@]} -> keys %map (map keys iteration)
-                                    let map_name = &pe.variable[1..]; // Remove ! prefix
-                                    format!("keys %{}", map_name)
-                                } else {
-                                    // ${arr[@]} -> @arr (array iteration)
-                                    format!("@{}", pe.variable)
-                                }
+    let mut all_items = Vec::new();
+    
+    for word in &for_loop.items {
+        match word {
+            Word::StringInterpolation(interp) => {
+                // Check if this is just a single array variable like "$@" or "$*"
+                if interp.parts.len() == 1 {
+                    if let StringPart::Variable(var) = &interp.parts[0] {
+                        match var.as_str() {
+                            "@" => all_items.push("@ARGV".to_string()),  // $@ -> @ARGV (no quotes)
+                            "*" => all_items.push("@ARGV".to_string()),  // $* -> @ARGV (no quotes)
+                            _ => all_items.push(generator.word_to_perl(word))
+                        }
+                    } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
+                        // Handle ${arr[@]} -> @arr for array iteration or ${!map[@]} -> keys %map for map keys
+                        if pe.operator == ParameterExpansionOperator::ArraySlice("@".to_string(), None) {
+                            if pe.variable.starts_with('!') {
+                                // ${!map[@]} -> keys %map (map keys iteration)
+                                let map_name = &pe.variable[1..]; // Remove ! prefix
+                                all_items.push(format!("keys %{}", map_name));
                             } else {
-                                generator.word_to_perl(word)
+                                // ${arr[@]} -> @arr (array iteration)
+                                all_items.push(format!("@{}", pe.variable));
                             }
                         } else {
-                            generator.word_to_perl(word)
+                            all_items.push(generator.word_to_perl(word));
                         }
                     } else {
-                        generator.word_to_perl(word)
+                        all_items.push(generator.word_to_perl(word));
+                    }
+                } else {
+                    all_items.push(generator.word_to_perl(word));
+                }
+            }
+            Word::BraceExpansion(expansion) => {
+                // Handle brace expansion directly
+                if expansion.items.len() == 1 {
+                    match &expansion.items[0] {
+                        BraceItem::Range(range) => {
+                            // Convert {1..5} to Perl range syntax (1..5)
+                            if let (Ok(start_num), Ok(end_num)) = (range.start.parse::<i64>(), range.end.parse::<i64>()) {
+                                let step = range.step.as_ref().and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+                                if step == 1 {
+                                    // Simple range: 1..5
+                                    all_items.push(format!("{}..{}", start_num, end_num));
+                                } else {
+                                    // Step range: use list with step
+                                    let mut values = Vec::new();
+                                    let mut current = start_num;
+                                    if step > 0 {
+                                        while current <= end_num {
+                                            values.push(current.to_string());
+                                            current += step;
+                                        }
+                                    } else {
+                                        while current >= end_num {
+                                            values.push(current.to_string());
+                                            current += step;
+                                        }
+                                    }
+                                    all_items.push(format!("({})", values.join(", ")));
+                                }
+                            } else {
+                                // Fallback for non-numeric ranges
+                                all_items.push(generator.word_to_perl(word));
+                            }
+                        }
+                        BraceItem::Literal(s) => {
+                            // Single literal item
+                            all_items.push(format!("\"{}\"", s));
+                        }
+                        BraceItem::Sequence(seq) => {
+                            // Convert {a,b,c} to separate quoted items
+                            for item in seq {
+                                all_items.push(format!("\"{}\"", item));
+                            }
+                        }
+                    }
+                } else {
+                    // Multiple brace items - expand each one
+                    for item in &expansion.items {
+                        match item {
+                            BraceItem::Literal(s) => all_items.push(format!("\"{}\"", s)),
+                            BraceItem::Range(range) => {
+                                if let (Ok(start_num), Ok(end_num)) = (range.start.parse::<i64>(), range.end.parse::<i64>()) {
+                                    let step = range.step.as_ref().and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+                                    if step == 1 {
+                                        all_items.push(format!("{}..{}", start_num, end_num));
+                                    } else {
+                                        let mut values = Vec::new();
+                                        let mut current = start_num;
+                                        if step > 0 {
+                                            while current <= end_num {
+                                                values.push(current.to_string());
+                                                current += step;
+                                            }
+                                        } else {
+                                            while current >= end_num {
+                                                values.push(current.to_string());
+                                                current += step;
+                                            }
+                                        }
+                                        all_items.push(format!("({})", values.join(", ")));
+                                    }
+                                } else {
+                                    all_items.push(format!("\"{}\"", range.start));
+                                }
+                            }
+                            BraceItem::Sequence(seq) => {
+                                for item in seq {
+                                    all_items.push(format!("\"{}\"", item));
+                                }
+                            }
+                        }
                     }
                 }
-                _ => generator.word_to_perl(word)
             }
-        })
-        .collect();
-    output.push_str(&items.join(", "));
+            Word::Literal(s) => {
+                // Check if this literal contains space-separated values (likely from brace expansion)
+                if s.contains(' ') && s.chars().all(|c| c.is_ascii_digit() || c.is_ascii_whitespace()) {
+                    // Split by whitespace and add each item separately
+                    let items: Vec<String> = s.split_whitespace()
+                        .map(|item| format!("\"{}\"", item))
+                        .collect();
+                    all_items.extend(items);
+                } else {
+                    all_items.push(generator.word_to_perl(word));
+                }
+            }
+            _ => all_items.push(generator.word_to_perl(word))
+        }
+    }
+    
+    output.push_str(&all_items.join(", "));
     
     output.push_str(") {\n");
     

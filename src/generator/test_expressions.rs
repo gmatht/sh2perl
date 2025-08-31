@@ -7,9 +7,9 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
     let modifiers = &test_expr.modifiers;
     
     // Parse the expression to determine the type of test
-    if expr.contains(" =~ ") {
+    if expr.contains("=~") {
         // Regex matching: [[ $var =~ pattern ]]
-        let parts: Vec<&str> = expr.split(" =~ ").collect();
+        let parts: Vec<&str> = expr.split("=~").collect();
         if parts.len() == 2 {
             let var = parts[0].trim();
             let pattern = parts[1].trim();
@@ -19,9 +19,9 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         } else {
             "0".to_string()
         }
-    } else if expr.contains(" == ") {
+    } else if expr.contains("==") {
         // Pattern matching: [[ $var == pattern ]]
-        let parts: Vec<&str> = expr.split(" == ").collect();
+        let parts: Vec<&str> = expr.split("==").collect();
         if parts.len() == 2 {
             let var = parts[0].trim();
             let pattern = parts[1].trim();
@@ -362,9 +362,12 @@ pub fn generate_test_command_impl(generator: &mut Generator, cmd: &SimpleCommand
 }
 
 // Helper methods for test expressions
-pub fn convert_extglob_to_perl_regex_impl(_generator: &Generator, pattern: &str) -> String {
+pub fn convert_extglob_to_perl_regex_impl(generator: &Generator, pattern: &str) -> String {
     // Convert extglob patterns to Perl regex
     let mut result = pattern.to_string();
+    
+    // Debug output
+    eprintln!("DEBUG: convert_extglob_to_perl_regex called with pattern: '{}'", pattern);
     
     // Handle @(pattern1|pattern2) - one of the patterns
     result = result.replace("@(", "(?:");
@@ -380,7 +383,89 @@ pub fn convert_extglob_to_perl_regex_impl(_generator: &Generator, pattern: &str)
     result = result.replace("?(pattern1|pattern2)", "(?:pattern1|pattern2)?");
     
     // Handle !(pattern1|pattern2) - anything except the patterns
-    result = result.replace("!(pattern1|pattern2)", "(?!(?:pattern1|pattern2))");
+    // This is the key fix: !(*.min).js should become (?!.*\.min\.js).*\.js
+    // Handle patterns with extra spaces like "! ( * . min . js"
+    if result.contains("!") && result.contains("(") {
+        eprintln!("DEBUG: Found ! and ( in pattern: '{}'", result);
+        // Find the ! and ( positions, handling extra spaces
+        if let Some(bang_pos) = result.find("!") {
+            // Look for ( after !, allowing for spaces
+            let after_bang = &result[bang_pos..];
+            if let Some(paren_open) = after_bang.find("(") {
+                let actual_open = bang_pos + paren_open;
+                
+                // Look for the closing parenthesis, but be more flexible
+                // The pattern might be incomplete due to parser issues
+                if let Some(paren_close) = result[actual_open..].find(")") {
+                    let actual_close = actual_open + paren_close;
+                    
+                    eprintln!("DEBUG: Found ! at {}, ( at {}, ) at {}", bang_pos, actual_open, actual_close);
+                    
+                    // Extract the pattern inside !(...) and after it
+                    let negated_pattern = &result[actual_open + 1..actual_close];
+                    let after_pattern = &result[actual_close + 1..];
+                    
+                    eprintln!("DEBUG: negated_pattern: '{}', after_pattern: '{}'", negated_pattern, after_pattern);
+                    
+                    // Convert the negated pattern to regex
+                    let negated_regex = convert_glob_to_regex_impl(generator, negated_pattern);
+                    let after_regex = convert_glob_to_regex_impl(generator, after_pattern);
+                    
+                    eprintln!("DEBUG: negated_regex: '{}', after_regex: '{}'", negated_regex, after_regex);
+                    
+                    // Create negative lookahead: (?!negated_pattern)after_pattern
+                    result = format!("(?!{}){}", negated_regex, after_regex);
+                    eprintln!("DEBUG: Final result: '{}'", result);
+                    return result;
+                } else {
+                    // No closing parenthesis found, but we have !(... pattern
+                    // This suggests the parser didn't complete the pattern
+                    eprintln!("DEBUG: No closing parenthesis found, treating as incomplete extglob");
+                    
+                    // Try to split the pattern to find the negated part and the after part
+                    // For example: "*.min.js" should be split into "*.min" and ".js"
+                    let pattern_after_open = &result[actual_open + 1..];
+                    
+                    // Look for common patterns like "*.min.js" -> split into "*.min" and ".js"
+                    if let Some(last_dot_pos) = pattern_after_open.rfind('.') {
+                        let negated_pattern = &pattern_after_open[..last_dot_pos];
+                        let after_pattern = &pattern_after_open[last_dot_pos..];
+                        
+                        eprintln!("DEBUG: Split pattern - negated_pattern: '{}', after_pattern: '{}'", negated_pattern, after_pattern);
+                        
+                        // Convert the negated pattern to regex
+                        let negated_regex = convert_glob_to_regex_impl(generator, negated_pattern);
+                        let after_regex = convert_glob_to_regex_impl(generator, after_pattern);
+                        
+                        eprintln!("DEBUG: negated_regex: '{}', after_regex: '{}'", negated_regex, after_regex);
+                        
+                        // Create negative lookahead with after pattern: ^(?!negated_pattern).*after_pattern$
+                        result = format!("^(?!{}).*{}$", negated_regex, after_regex);
+                        eprintln!("DEBUG: Final result: '{}'", result);
+                        return result;
+                    } else {
+                        // No dot found, treat the whole pattern as negated
+                        let negated_pattern = pattern_after_open;
+                        let after_pattern = "";
+                        
+                        eprintln!("DEBUG: No dot found - negated_pattern: '{}', after_pattern: '{}'", negated_pattern, after_pattern);
+                        
+                        // Convert the negated pattern to regex
+                        let negated_regex = convert_glob_to_regex_impl(generator, negated_pattern);
+                        
+                        eprintln!("DEBUG: negated_regex: '{}'", negated_regex);
+                        
+                        // Create negative lookahead: ^(?!negated_pattern).*$
+                        result = format!("^(?!{}).*$", negated_regex);
+                        eprintln!("DEBUG: Final result: '{}'", result);
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+    
+    eprintln!("DEBUG: No extglob pattern found, escaping special characters");
     
     // Escape regex special characters
     result = result.replace(".", "\\.");
@@ -395,14 +480,32 @@ pub fn convert_extglob_to_perl_regex_impl(_generator: &Generator, pattern: &str)
     result = result.replace(")", "\\)");
     result = result.replace("|", "\\|");
     
+    eprintln!("DEBUG: Final escaped result: '{}'", result);
     result
 }
 
 pub fn convert_glob_to_regex_impl(_generator: &Generator, pattern: &str) -> String {
     let mut result = pattern.to_string();
     
-    // Escape regex special characters first
-    result = result.replace("\\", "\\\\");
+    // Debug output
+    eprintln!("DEBUG: convert_glob_to_regex called with pattern: '{}'", pattern);
+    
+    // Normalize the pattern by removing extra spaces around glob characters
+    // This handles cases where the parser adds spaces like "* . txt" -> "*.txt"
+    result = result.replace(" * ", "*");
+    result = result.replace(" *", "*");
+    result = result.replace("* ", "*");
+    result = result.replace(" ? ", "?");
+    result = result.replace(" ?", "?");
+    result = result.replace("? ", "?");
+    result = result.replace(" . ", ".");
+    result = result.replace(" .", ".");
+    result = result.replace(". ", ".");
+    
+    eprintln!("DEBUG: After normalization: '{}'", result);
+    
+    // Escape regex special characters BEFORE converting glob patterns
+    // This ensures that literal dots and other special chars are escaped first
     result = result.replace(".", "\\.");
     result = result.replace("+", "\\+");
     result = result.replace("(", "\\(");
@@ -413,9 +516,14 @@ pub fn convert_glob_to_regex_impl(_generator: &Generator, pattern: &str) -> Stri
     result = result.replace("$", "\\$");
     result = result.replace("|", "\\|");
     
-    // Convert glob patterns to regex
+    eprintln!("DEBUG: After escaping: '{}'", result);
+    
+    // Convert glob patterns to regex AFTER escaping
+    // This ensures that * and ? are converted to regex patterns, not escaped
     result = result.replace("*", ".*");
     result = result.replace("?", ".");
+    
+    eprintln!("DEBUG: After glob conversion: '{}'", result);
     
     result
 }

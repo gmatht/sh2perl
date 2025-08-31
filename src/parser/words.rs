@@ -7,11 +7,11 @@ use std::collections::HashMap;
 pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots) into a single literal
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
-    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::OctalNumber) | Some(Token::Slash) | Some(Token::Dot)) {
+    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot)) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
-                Some(Token::Identifier) | Some(Token::Number) | Some(Token::OctalNumber) | Some(Token::Slash) | Some(Token::Dot) => {
+                Some(Token::Identifier) | Some(Token::Number) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -31,7 +31,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
     let result = match lexer.peek() {
         Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?)),
         Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?)),
-        Some(Token::OctalNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?)),
+        Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?)),
         Some(Token::DoubleQuotedString) => {
             // Always parse as string interpolation for double-quoted strings
             // This handles both strings and strings with variables
@@ -56,6 +56,61 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             // Treat standalone 'declare' as a normal word (e.g., `declare -a arr`)
             lexer.next();
             Ok(Word::Literal("declare".to_string()))
+        }
+        Some(Token::Unset) => {
+            // Treat standalone 'unset' as a normal word (e.g., `unset var`)
+            lexer.next();
+            Ok(Word::Literal("unset".to_string()))
+        }
+        Some(Token::Export) => {
+            // Treat standalone 'export' as a normal word (e.g., `export PATH`)
+            lexer.next();
+            Ok(Word::Literal("export".to_string()))
+        }
+        Some(Token::Readonly) => {
+            // Treat standalone 'readonly' as a normal word (e.g., `readonly VAR`)
+            lexer.next();
+            Ok(Word::Literal("readonly".to_string()))
+        }
+        Some(Token::Typeset) => {
+            // Treat standalone 'typeset' as a normal word (e.g., `typeset -i var`)
+            lexer.next();
+            Ok(Word::Literal("typeset".to_string()))
+        }
+        Some(Token::Local) => {
+            // Treat standalone 'local' as a normal word (e.g., `local var`)
+            lexer.next();
+            Ok(Word::Literal("local".to_string()))
+        }
+        Some(Token::Shift) => {
+            // Treat standalone 'shift' as a normal word (e.g., `shift 2`)
+            lexer.next();
+            Ok(Word::Literal("shift".to_string()))
+        }
+        Some(Token::Eval) => {
+            // Treat standalone 'eval' as a normal word (e.g., `eval $cmd`)
+            lexer.next();
+            Ok(Word::Literal("eval".to_string()))
+        }
+        Some(Token::Exec) => {
+            // Treat standalone 'exec' as a normal word (e.g., `exec cmd`)
+            lexer.next();
+            Ok(Word::Literal("exec".to_string()))
+        }
+        Some(Token::Trap) => {
+            // Treat standalone 'trap' as a normal word (e.g., `trap 'echo' INT`)
+            lexer.next();
+            Ok(Word::Literal("trap".to_string()))
+        }
+        Some(Token::Wait) => {
+            // Treat standalone 'wait' as a normal word (e.g., `wait $pid`)
+            lexer.next();
+            Ok(Word::Literal("wait".to_string()))
+        }
+        Some(Token::Exit) => {
+            // Treat standalone 'exit' as a normal word (e.g., `exit 0`)
+            lexer.next();
+            Ok(Word::Literal("exit".to_string()))
         }
         Some(Token::Range) => {
             // Treat standalone '..' as a literal (e.g., `cd ..`)
@@ -186,11 +241,11 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
 pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots) into a single literal
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
-    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::OctalNumber) | Some(Token::Slash) | Some(Token::Dot)) {
+    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot)) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
-                Some(Token::Identifier) | Some(Token::Number) | Some(Token::OctalNumber) | Some(Token::Slash) | Some(Token::Dot) => {
+                Some(Token::Identifier) | Some(Token::Number) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -210,7 +265,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
     let result = match lexer.peek() {
         Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?)),
         Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?)),
-        Some(Token::OctalNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?)),
+        Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?)),
         Some(Token::DoubleQuotedString) => {
             // Always parse as string interpolation for double-quoted strings
             // This handles both simple strings and strings with variables
@@ -235,6 +290,61 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             // Treat standalone 'declare' as a normal word (e.g., `declare -a arr`)
             lexer.next();
             Ok(Word::Literal("declare".to_string()))
+        }
+        Some(Token::Unset) => {
+            // Treat standalone 'unset' as a normal word (e.g., `unset var`)
+            lexer.next();
+            Ok(Word::Literal("unset".to_string()))
+        }
+        Some(Token::Export) => {
+            // Treat standalone 'export' as a normal word (e.g., `export PATH`)
+            lexer.next();
+            Ok(Word::Literal("export".to_string()))
+        }
+        Some(Token::Readonly) => {
+            // Treat standalone 'readonly' as a normal word (e.g., `readonly VAR`)
+            lexer.next();
+            Ok(Word::Literal("readonly".to_string()))
+        }
+        Some(Token::Typeset) => {
+            // Treat standalone 'typeset' as a normal word (e.g., `typeset -i var`)
+            lexer.next();
+            Ok(Word::Literal("typeset".to_string()))
+        }
+        Some(Token::Local) => {
+            // Treat standalone 'local' as a normal word (e.g., `local var`)
+            lexer.next();
+            Ok(Word::Literal("local".to_string()))
+        }
+        Some(Token::Shift) => {
+            // Treat standalone 'shift' as a normal word (e.g., `shift 2`)
+            lexer.next();
+            Ok(Word::Literal("shift".to_string()))
+        }
+        Some(Token::Eval) => {
+            // Treat standalone 'eval' as a normal word (e.g., `eval $cmd`)
+            lexer.next();
+            Ok(Word::Literal("eval".to_string()))
+        }
+        Some(Token::Exec) => {
+            // Treat standalone 'exec' as a normal word (e.g., `exec cmd`)
+            lexer.next();
+            Ok(Word::Literal("exec".to_string()))
+        }
+        Some(Token::Trap) => {
+            // Treat standalone 'trap' as a normal word (e.g., `trap 'echo' INT`)
+            lexer.next();
+            Ok(Word::Literal("trap".to_string()))
+        }
+        Some(Token::Wait) => {
+            // Treat standalone 'wait' as a normal word (e.g., `wait $pid`)
+            lexer.next();
+            Ok(Word::Literal("wait".to_string()))
+        }
+        Some(Token::Exit) => {
+            // Treat standalone 'exit' as a normal word (e.g., `exit 0`)
+            lexer.next();
+            Ok(Word::Literal("exit".to_string()))
         }
         Some(Token::Range) => {
             // Treat standalone '..' as a literal (e.g., `cd ..`)
@@ -785,16 +895,280 @@ fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion
         }
     }
     
-    // Simple variable reference
-    Ok(ParameterExpansion {
-        variable: content.to_string(),
-        operator: ParameterExpansionOperator::None,
-    })
+    // Check for parameter expansion operators
+    // Check longer patterns first to avoid partial matches
+    if content.ends_with("^^") {
+        let base_var = content.trim_end_matches("^^");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::UppercaseAll,
+        })
+    } else if content.ends_with(",,") {
+        let base_var = content.trim_end_matches(",,");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::LowercaseAll,
+        })
+    } else if content.ends_with("^") && !content.ends_with("^^") {
+        let base_var = content.trim_end_matches("^");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::UppercaseFirst,
+        })
+    } else if content.ends_with("##*/") {
+        let base_var = content.trim_end_matches("##*/");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::Basename,
+        })
+    } else if content.ends_with("%/*") {
+        let base_var = content.trim_end_matches("%/*");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::Dirname,
+        })
+    } else if content.contains("##") && !content.ends_with("##*/") {
+        let parts: Vec<&str> = content.split("##").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::RemoveLongestPrefix(parts[1].to_string()),
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+            })
+        }
+    } else if content.contains("%%") && !content.ends_with("%/*") {
+        let parts: Vec<&str> = content.split("%%").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::RemoveLongestSuffix(parts[1].to_string()),
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+            })
+        }
+    } else if content.contains("#") && !content.starts_with('#') && !content.contains("##") {
+        let parts: Vec<&str> = content.split("#").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::RemoveShortestPrefix(parts[1].to_string()),
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+            })
+        }
+    } else if content.contains("%") && !content.contains("%%") && !content.ends_with("%/*") {
+        let parts: Vec<&str> = content.split("%").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::RemoveShortestSuffix(parts[1].to_string()),
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+            })
+        }
+    } else if content.contains("//") {
+        let parts: Vec<&str> = content.split("//").collect();
+        if parts.len() == 2 {
+            // This is ${var//pattern/replacement} - split the second part by the first '/'
+            let pattern_replacement = parts[1];
+            if let Some(slash_pos) = pattern_replacement.find('/') {
+                let pattern = &pattern_replacement[..slash_pos];
+                let replacement = &pattern_replacement[slash_pos + 1..];
+                Ok(ParameterExpansion {
+                    variable: parts[0].to_string(),
+                    operator: ParameterExpansionOperator::SubstituteAll(pattern.to_string(), replacement.to_string()),
+                })
+            } else {
+                Ok(ParameterExpansion {
+                    variable: content.to_string(),
+                    operator: ParameterExpansionOperator::None,
+                })
+            }
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+            })
+        }
+    } else if content.contains(":-") {
+        let parts: Vec<&str> = content.split(":-").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+            })
+        }
+    } else if content.contains(":=") {
+        let parts: Vec<&str> = content.split(":=").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+            })
+        }
+    } else if content.contains(":?") {
+        let parts: Vec<&str> = content.split(":?").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::ErrorIfUnset(parts[1].to_string()),
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+            })
+        }
+    } else {
+        // Simple variable reference
+        Ok(ParameterExpansion {
+            variable: content.to_string(),
+            operator: ParameterExpansionOperator::None,
+        })
+    }
 }
 
-fn parse_ansic_quoted_string(_lexer: &mut Lexer) -> Result<Word, ParserError> {
-    // TODO: Implement ANSI C quoted string parsing
-    Err(ParserError::InvalidSyntax("ANSI C quoted strings not yet implemented".to_string()))
+fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    // Get the raw token text (e.g., "$'line1\nline2\tTabbed'")
+    let raw_text = lexer.get_raw_token_text()?;
+    
+    // Extract the content between $' and ' (remove the $' prefix and ' suffix)
+    if raw_text.len() < 3 || !raw_text.starts_with("$'") || !raw_text.ends_with("'") {
+        return Err(ParserError::InvalidSyntax("Invalid ANSI-C quoted string format".to_string()));
+    }
+    
+    let content = &raw_text[2..raw_text.len()-1]; // Remove $' and '
+    
+    // Process escape sequences
+    let mut result = String::new();
+    let mut chars = content.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next_ch) = chars.next() {
+                match next_ch {
+                    'a' => result.push('\x07'), // Bell
+                    'b' => result.push('\x08'), // Backspace
+                    'f' => result.push('\x0C'), // Form feed
+                    'n' => result.push('\n'),   // Newline
+                    'r' => result.push('\r'),   // Carriage return
+                    't' => result.push('\t'),   // Tab
+                    'v' => result.push('\x0B'), // Vertical tab
+                    '\\' => result.push('\\'),  // Backslash
+                    '\'' => result.push('\''),  // Single quote
+                    '"' => result.push('"'),   // Double quote
+                    '?' => result.push('?'),   // Question mark
+                    '0' => result.push('\0'),  // Null byte
+                    'x' => {
+                        // Hex escape: \xHH
+                        let mut hex_chars = String::new();
+                        for _ in 0..2 {
+                            if let Some(hex_ch) = chars.next() {
+                                if hex_ch.is_ascii_hexdigit() {
+                                    hex_chars.push(hex_ch);
+                                } else {
+                                    return Err(ParserError::InvalidSyntax(format!("Invalid hex escape: \\x{}", hex_ch)));
+                                }
+                            } else {
+                                return Err(ParserError::InvalidSyntax("Incomplete hex escape".to_string()));
+                            }
+                        }
+                        if let Ok(byte_val) = u8::from_str_radix(&hex_chars, 16) {
+                            result.push(byte_val as char);
+                        } else {
+                            return Err(ParserError::InvalidSyntax(format!("Invalid hex value: {}", hex_chars)));
+                        }
+                    }
+                    'u' => {
+                        // Unicode escape: \uHHHH
+                        let mut hex_chars = String::new();
+                        for _ in 0..4 {
+                            if let Some(hex_ch) = chars.next() {
+                                if hex_ch.is_ascii_hexdigit() {
+                                    hex_chars.push(hex_ch);
+                                } else {
+                                    return Err(ParserError::InvalidSyntax(format!("Invalid unicode escape: \\u{}", hex_ch)));
+                                }
+                            } else {
+                                return Err(ParserError::InvalidSyntax("Incomplete unicode escape".to_string()));
+                            }
+                        }
+                        if let Ok(unicode_val) = u32::from_str_radix(&hex_chars, 16) {
+                            if let Some(unicode_char) = char::from_u32(unicode_val) {
+                                result.push(unicode_char);
+                            } else {
+                                return Err(ParserError::InvalidSyntax(format!("Invalid unicode value: {}", unicode_val)));
+                            }
+                        } else {
+                            return Err(ParserError::InvalidSyntax(format!("Invalid unicode hex value: {}", hex_chars)));
+                        }
+                    }
+                    'U' => {
+                        // Extended unicode escape: \UHHHHHHHH
+                        let mut hex_chars = String::new();
+                        for _ in 0..8 {
+                            if let Some(hex_ch) = chars.next() {
+                                if hex_ch.is_ascii_hexdigit() {
+                                    hex_chars.push(hex_ch);
+                                } else {
+                                    return Err(ParserError::InvalidSyntax(format!("Invalid extended unicode escape: \\U{}", hex_ch)));
+                                }
+                            } else {
+                                return Err(ParserError::InvalidSyntax("Incomplete extended unicode escape".to_string()));
+                            }
+                        }
+                        if let Ok(unicode_val) = u32::from_str_radix(&hex_chars, 16) {
+                            if let Some(unicode_char) = char::from_u32(unicode_val) {
+                                result.push(unicode_char);
+                            } else {
+                                return Err(ParserError::InvalidSyntax(format!("Invalid extended unicode value: {}", unicode_val)));
+                            }
+                        } else {
+                            return Err(ParserError::InvalidSyntax(format!("Invalid extended unicode hex value: {}", hex_chars)));
+                        }
+                    }
+                    _ => {
+                        // Unknown escape sequence, treat as literal
+                        result.push('\\');
+                        result.push(next_ch);
+                    }
+                }
+            } else {
+                // Backslash at end of string, treat as literal
+                result.push('\\');
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    
+    // Consume the token
+    lexer.next();
+    
+    Ok(Word::Literal(result))
 }
 
 fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
@@ -815,32 +1189,105 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 lexer.next(); // consume '}'
                 break;
             }
-            Some(Token::Number) => {
+            Some(Token::Number) | Some(Token::PaddedNumber) => {
                 let start = lexer.get_number_text()?;
+                eprintln!("DEBUG: Found start number: {}", start);
+                eprintln!("DEBUG: After getting start number, current token: {:?}", lexer.peek());
                 
                 // Check if this is a range (look for ..)
                 if matches!(lexer.peek(), Some(Token::Range)) {
+                    eprintln!("DEBUG: Found '..' after start number");
                     lexer.next(); // consume '..'
                     
-                    if let Some(Token::Number) = lexer.peek() {
+                    if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                         let end = lexer.get_number_text()?;
-                        items.push(BraceItem::Range(BraceRange {
-                            start,
-                            end,
-                            step: None,
-                            format: None,
-                        }));
+                        eprintln!("DEBUG: Found end number: {}", end);
+                        eprintln!("DEBUG: After getting end number, current token: {:?}", lexer.peek());
+                        
+                        // Check if there's a step value (another ..)
+                        if matches!(lexer.peek(), Some(Token::Range)) {
+                            eprintln!("DEBUG: Found second '..' in number range, looking for step value");
+                            lexer.next(); // consume second '..'
+                            eprintln!("DEBUG: After consuming second '..', current token: {:?}", lexer.peek());
+                            
+                            if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
+                                let step = lexer.get_number_text()?;
+                                eprintln!("DEBUG: Found step value: {}", step);
+                                eprintln!("DEBUG: Added step range, continuing to next iteration");
+                                items.push(BraceItem::Range(BraceRange {
+                                    start,
+                                    end,
+                                    step: Some(step),
+                                    format: None,
+                                }));
+                                continue; // Continue to next iteration to look for closing brace or more items
+                            } else {
+                                eprintln!("DEBUG: Expected number after second '..', but got: {:?}", lexer.peek());
+                                return Err(ParserError::InvalidSyntax("Expected number after second '..' in brace range".to_string()));
+                            }
+                        } else {
+                            eprintln!("DEBUG: No step value, creating range from {} to {}", start, end);
+                            items.push(BraceItem::Range(BraceRange {
+                                start,
+                                end,
+                                step: None,
+                                format: None,
+                            }));
+                            eprintln!("DEBUG: Added simple range, continuing to next iteration");
+                            continue; // Continue to next iteration to look for closing brace or more items
+                        }
                     } else {
+                        eprintln!("DEBUG: Expected number after '..', but got: {:?}", lexer.peek());
                         return Err(ParserError::InvalidSyntax("Expected number after '..' in brace range".to_string()));
                     }
                 } else {
+                    eprintln!("DEBUG: No range, treating as literal number: {}", start);
                     // Just a literal number
                     items.push(BraceItem::Literal(start));
                 }
             }
             Some(Token::Identifier) => {
                 let text = lexer.get_identifier_text()?;
-                items.push(BraceItem::Literal(text));
+                
+                // Check if this is a range (look for ..)
+                if matches!(lexer.peek(), Some(Token::Range)) {
+                    lexer.next(); // consume '..'
+                    
+                    if let Some(Token::Identifier) = lexer.peek() {
+                        let end = lexer.get_identifier_text()?;
+                        
+                        // Check if there's a step value (another ..)
+                        if matches!(lexer.peek(), Some(Token::Range)) {
+                            lexer.next(); // consume second '..'
+                            
+                            if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
+                                let step = lexer.get_number_text()?;
+                                items.push(BraceItem::Range(BraceRange {
+                                    start: text,
+                                    end,
+                                    step: Some(step),
+                                    format: None,
+                                }));
+                                continue; // Continue to next iteration to look for closing brace or more items
+                            } else {
+                                return Err(ParserError::InvalidSyntax("Expected number after second '..' in identifier brace range".to_string()));
+                            }
+                        } else {
+                            items.push(BraceItem::Range(BraceRange {
+                                start: text,
+                                end,
+                                step: None,
+                                format: None,
+                            }));
+                            continue; // Continue to next iteration to look for closing brace or more items
+                        }
+                    } else {
+                        return Err(ParserError::InvalidSyntax("Expected identifier after '..' in brace range".to_string()));
+                    }
+                } else {
+                    // Just a literal identifier
+                    items.push(BraceItem::Literal(text));
+                }
             }
             Some(Token::Comma) => {
                 lexer.next(); // consume ','

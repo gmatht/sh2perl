@@ -2,6 +2,34 @@ use crate::ast::*;
 use crate::generator::Generator;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+fn generate_cartesian_product_for_echo(items: &[Vec<String>]) -> Vec<String> {
+    println!("DEBUG: generate_cartesian_product_for_echo called with {:?}", items);
+    if items.is_empty() {
+        println!("DEBUG: Empty items, returning empty vector");
+        return vec![];
+    }
+    if items.len() == 1 {
+        println!("DEBUG: Single item, returning {:?}", items[0]);
+        return items[0].clone();
+    }
+    
+    println!("DEBUG: Computing cartesian product for {} items", items.len());
+    let mut result = Vec::new();
+    let first = &items[0];
+    let rest = generate_cartesian_product_for_echo(&items[1..]);
+    
+    for item in first {
+        for rest_item in &rest {
+            let combined = format!("{}{}", item, rest_item);
+            println!("DEBUG: Combining '{}' + '{}' = '{}'", item, rest_item, combined);
+            result.push(combined);
+        }
+    }
+    
+    println!("DEBUG: Final cartesian product result: {:?}", result);
+    result
+}
+
 // Static counter for generating unique temp file names
 static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -16,9 +44,9 @@ fn generate_command_specific(generator: &mut Generator, cmd: &SimpleCommand, inp
     let default_input = if input_var.is_empty() { "input_data" } else { input_var };
     
     match cmd_name.as_str() {
-        "grep" => Some(super::grep::generate_grep_command(generator, cmd, default_input, 0)),
-        "cat" => Some(super::cat::generate_cat_command(generator, cmd, &cmd.redirects)),
-        "find" => Some(super::find::generate_find_command(generator, cmd, true)),
+        "grep" => Some(super::grep::generate_grep_command(generator, cmd, default_input, 0, true)),
+        "cat" => Some(super::cat::generate_cat_command(generator, cmd, &cmd.redirects, "$output")),
+        "find" => Some(super::find::generate_find_command(generator, cmd, true, "$output")),
         "ls" => Some(super::ls::generate_ls_command(generator, cmd, false)),
         "wc" => Some(super::wc::generate_wc_command(generator, cmd, default_input, 0)),
         "sort" => Some(super::sort::generate_sort_command(generator, cmd, default_input, 0)),
@@ -52,8 +80,11 @@ fn generate_command_specific(generator: &mut Generator, cmd: &SimpleCommand, inp
         "cp" => Some(super::cp::generate_cp_command(generator, cmd)),
         "mv" => Some(super::mv::generate_mv_command(generator, cmd)),
         "touch" => Some(super::touch::generate_touch_command(generator, cmd)),
+        "printf" => Some(super::printf::generate_printf_command(generator, cmd, default_input, 0)),
         "head" => Some(super::head::generate_head_command(generator, cmd, default_input, 0)),
         "tail" => Some(super::tail::generate_tail_command(generator, cmd, default_input, 0)),
+        "paste" => Some(super::paste::generate_paste_command(generator, cmd, &[])),
+        "diff" => Some(super::diff::generate_diff_command(generator, cmd, default_input, 0, true)),
         _ => None
     }
 }
@@ -100,9 +131,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     });
     
     if has_non_array_env {
-        output.push_str(&generator.indent());
-        output.push_str("{\n");
-        generator.indent_level += 1;
         for (var, value) in &cmd.env_vars {
             // Check if this is an associative array assignment like map[foo]=bar
             if let Some((array_name, key)) = generator.extract_array_key(var) {
@@ -162,9 +190,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 }
             }
         }
-        generator.indent_level -= 1;
-        output.push_str(&generator.indent());
-        output.push_str("}\n");
     }
 
     // Pre-process process substitution and here-string redirects to create temporary files
@@ -182,18 +207,37 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my ${} = '{}';\n", temp_var, temp_file));
                 
-                // Generate the command for system call
-                let cmd_str = generator.generate_command_string_for_system(&**cmd);
-                
-                // Clean up the command string for system call and properly escape it
-                let _clean_cmd = cmd_str.replace('\n', " ").replace("  ", " ");
-                // Use proper Perl system call syntax with list form to avoid shell interpretation
+                // Execute the command and capture its output
                 let fh_var = format!("fh_ps_{}_{}", global_counter, temp_file_counter);
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my ${};\n", fh_var));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("{{\n"));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("local $/;  # Read entire input at once\n"));
+                
+                // Store the command string in a local variable to avoid borrowing issues
+                let cmd_str = generator.generate_command_string_for_system(&**cmd);
+                output.push_str(&generator.indent());
+                output.push_str(&format!("open(my $pipe, '-|', 'bash', '-c', {});\n", 
+                    generator.perl_string_literal(&Word::Literal(cmd_str))));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my $output_ps_{} = <$pipe>;\n", global_counter));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("close($pipe);\n"));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("}}\n"));
+                
+                // Write the output to the temporary file
                 output.push_str(&generator.indent());
                 output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
                 output.push_str(&generator.indent());
+                output.push_str(&format!("print ${} $output_ps_{};\n", fh_var, global_counter));
+                output.push_str(&generator.indent());
                 output.push_str(&format!("close(${});\n", fh_var));
-                // For now, just create the file - the actual command execution would need more complex handling
+                
                 process_sub_files.push((temp_var, temp_file));
             }
             RedirectOperator::ProcessSubstitutionOutput(_cmd) => {
@@ -245,8 +289,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 let mut needs_comma_separated_print = false;
                 let mut processed_args: Vec<String> = Vec::new();
                 
-                for arg in &cmd.args {
-                    match arg {
+                let mut i = 0;
+                while i < cmd.args.len() {
+                    match &cmd.args[i] {
                         Word::Literal(s) => {
                             // Properly quote literal strings for Perl
                             // Check if the string is already quoted (starts and ends with same quote)
@@ -271,15 +316,18 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     processed_args.push(format!("\"{}\"", generator.escape_perl_string(s)));
                                 }
                             }
+                            i += 1;
                         },
                         Word::Variable(var) => {
                             // Convert shell variables to Perl variables
                             processed_args.push(format!("${}", var));
+                            i += 1;
                         },
                         Word::ParameterExpansion(pe) => {
                             // Handle parameter expansions as expressions, not strings
                             // This should generate code like $arr[1] or $map{foo}
                             processed_args.push(generator.generate_parameter_expansion(pe));
+                            i += 1;
                         },
                         Word::StringInterpolation(interp) => {
                             // Handle string interpolation specially for echo
@@ -371,7 +419,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         }
                                     } else {
                                         // Fall back to general conversion
-                                        processed_args.push(generator.word_to_perl(arg));
+                                        processed_args.push(generator.word_to_perl(&cmd.args[i]));
                                     }
                                 } else if needs_comma_separated_print {
                                     // Add the special variable as an unquoted expression
@@ -381,23 +429,75 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                 "#" => processed_args.push("scalar(@ARGV)".to_string()),
                                                 "@" => processed_args.push("@ARGV".to_string()),
                                                 "*" => processed_args.push("@ARGV".to_string()),
-                                                _ => {
-                                                    // For other variables, fall back to general conversion
-                                                    processed_args.push(generator.word_to_perl(arg));
-                                                }
+                                                                                            _ => {
+                                                // For other variables, fall back to general conversion
+                                                processed_args.push(generator.word_to_perl(&cmd.args[i]));
+                                            }
                                             }
                                             break;
                                         }
                                     }
                                 } else {
                                     // Fall back to general conversion
-                                    processed_args.push(generator.word_to_perl(arg));
+                                    processed_args.push(generator.word_to_perl(&cmd.args[i]));
                                 }
+                            }
+                            i += 1;
+                        },
+                        Word::BraceExpansion(_) => {
+                            // Collect consecutive brace expansions for cartesian product
+                            let mut brace_expansions = Vec::new();
+                            let start_i = i;
+                            while i < cmd.args.len() {
+                                if let Word::BraceExpansion(expansion) = &cmd.args[i] {
+                                    brace_expansions.push(expansion);
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            
+                            if brace_expansions.len() == 1 {
+                                // Single brace expansion - expand it normally
+                                let expanded = generator.handle_brace_expansion(brace_expansions[0]);
+                                processed_args.push(format!("\"{}\"", expanded));
+                            } else {
+                                // Multiple brace expansions - create cartesian product
+                                println!("DEBUG: Creating cartesian product for {} brace expansions", brace_expansions.len());
+                                
+                                // For each brace expansion, we need to get the individual items
+                                let expanded_items: Vec<Vec<String>> = brace_expansions.iter()
+                                    .map(|expansion| {
+                                        // Get the individual items from the brace expansion
+                                        let mut items = Vec::new();
+                                        for item in &expansion.items {
+                                            match item {
+                                                BraceItem::Literal(s) => items.push(s.clone()),
+                                                BraceItem::Range(range) => {
+                                                    // Expand the range
+                                                    let expanded = generator.handle_brace_expansion(expansion);
+                                                    items.extend(expanded.split_whitespace().map(|s| s.to_string()));
+                                                },
+                                                BraceItem::Sequence(seq) => items.extend(seq.clone()),
+                                            }
+                                        }
+                                        println!("DEBUG: Items from expansion: {:?}", items);
+                                        items
+                                    })
+                                    .collect();
+                                
+                                println!("DEBUG: Expanded items: {:?}", expanded_items);
+                                let cartesian = generate_cartesian_product_for_echo(&expanded_items);
+                                println!("DEBUG: Cartesian product result: {:?}", cartesian);
+                                let result = cartesian.join(" ");
+                                println!("DEBUG: Final result: '{}'", result);
+                                processed_args.push(format!("\"{}\"", result));
                             }
                         },
                         _ => {
                             // For other word types, use the general conversion
-                            processed_args.push(generator.word_to_perl(arg));
+                            processed_args.push(generator.word_to_perl(&cmd.args[i]));
+                            i += 1;
                         }
                     }
                 }
@@ -563,10 +663,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         eprintln!("DEBUG: Generating arithmetic assignment: ${} = {}", var, perl_expr);
                         // Check if variable is already declared in current scope
                         if !generator.declared_locals.contains(var) {
-                            // For now, assume this is a loop variable or already in scope
-                            // and just assign to it without redeclaring
+                            // Variable not declared yet, declare it with 'my'
                             output.push_str(&generator.indent());
-                            output.push_str(&format!("${} = {};\n", var, perl_expr));
+                            output.push_str(&format!("my ${} = {};\n", var, perl_expr));
+                            // Mark as declared in current scope
+                            generator.declared_locals.insert(var.clone());
                         } else {
                             // Variable already declared, just assign the value
                             output.push_str(&generator.indent());
@@ -578,10 +679,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         let val = generator.perl_string_literal(value);
                         eprintln!("DEBUG: Generating other assignment: ${} = {}", var, val);
                         if !generator.declared_locals.contains(var) {
-                            // For now, assume this is a loop variable or already in scope
-                            // and just assign to it without redeclaring
+                            // Variable not declared yet, declare it with 'my'
                             output.push_str(&generator.indent());
-                            output.push_str(&format!("${} = {};\n", var, val));
+                            output.push_str(&format!("my ${} = {};\n", var, val));
+                            // Mark as declared in current scope
+                            generator.declared_locals.insert(var.clone());
                         } else {
                             // Variable already declared, just assign the value
                             output.push_str(&generator.indent());
@@ -595,7 +697,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             let cmd_name = name;
             eprintln!("DEBUG: Processing Word::Literal with name: '{}'", name);
             
-            // First try to use command-specific generators
             if let Some(specific_output) = generate_command_specific(generator, cmd, "") {
                 eprintln!("DEBUG: Used command-specific generator for: {}", cmd_name);
                 output.push_str(&specific_output);
@@ -651,3 +752,4 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
 
     output
 }
+

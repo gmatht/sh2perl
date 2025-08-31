@@ -3,6 +3,7 @@ use crate::lexer::{Lexer, Token};
 use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::parse_word;
+use std::collections::HashMap;
 
 pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     let fd = if let Some(Token::Number) = lexer.peek() {
@@ -38,17 +39,51 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     // Skip whitespace before target
     lexer.skip_whitespace_and_comments();
 
-    // Process substitution as redirect target, allowing an optional extra '<' before '('
+    // Check for process substitution syntax: <(...)
+    if matches!(operator, RedirectOperator::Input) && matches!(lexer.peek(), Some(Token::ParenOpen)) {
+        eprintln!("DEBUG: Found process substitution: <(...)");
+        // This is a process substitution: <(...)
+        let inner_text = lexer.capture_parenthetical_text()?;
+        eprintln!("DEBUG: Inner text: '{}'", inner_text);
+        
+        // Parse the inner command text to extract command name and arguments
+        let inner_cmd = parse_command_from_text(lexer, &inner_text)?;
+        eprintln!("DEBUG: Parsed inner command: {:?}", inner_cmd);
+        
+        // Return a process substitution redirect
+        return Ok(Redirect {
+            fd,
+            operator: RedirectOperator::ProcessSubstitutionInput(Box::new(inner_cmd)),
+            target: Word::Literal("".to_string()), // Not used for process substitution
+            heredoc_body: None,
+        });
+    }
+    
+    // Check for process substitution with extra '<': < <(...)
+    if matches!(operator, RedirectOperator::Input) && matches!(lexer.peek(), Some(Token::RedirectIn)) && matches!(lexer.peek_n(1), Some(Token::ParenOpen)) {
+        eprintln!("DEBUG: Found process substitution with extra <: < <(...)");
+        // This is a process substitution: < <(...)
+        lexer.next(); // consume the extra '<'
+        let inner_text = lexer.capture_parenthetical_text()?;
+        eprintln!("DEBUG: Inner text: '{}'", inner_text);
+        
+        // Parse the inner command text to extract command name and arguments
+        let inner_cmd = parse_command_from_text(lexer, &inner_text)?;
+        eprintln!("DEBUG: Parsed inner command: {:?}", inner_cmd);
+        
+        // Return a process substitution redirect
+        return Ok(Redirect {
+            fd,
+            operator: RedirectOperator::ProcessSubstitutionInput(Box::new(inner_cmd)),
+            target: Word::Literal("".to_string()), // Not used for process substitution
+            heredoc_body: None,
+        });
+    }
+
     // For here-strings, parse the string content as the target
     let target = if matches!(operator, RedirectOperator::HereString) {
         // For here-strings, parse the string content that follows
         parse_word(lexer)?
-    } else if matches!(lexer.peek(), Some(Token::RedirectIn)) && matches!(lexer.peek_n(1), Some(Token::ParenOpen)) {
-        // consume the extra '<' and capture ( ... )
-        lexer.next();
-        Word::Literal(lexer.capture_parenthetical_text()?)
-    } else if matches!(lexer.peek(), Some(Token::ParenOpen)) {
-        Word::Literal(lexer.capture_parenthetical_text()?)
     } else {
         parse_word(lexer)?
     };
@@ -64,6 +99,17 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
             // We need to extract the string content from the target
             match &target {
                 Word::Literal(s) => Some(s.clone()),
+                Word::StringInterpolation(interp) => {
+                    // For string interpolation, concatenate all parts
+                    let mut content = String::new();
+                    for part in &interp.parts {
+                        match part {
+                            StringPart::Literal(s) => content.push_str(s),
+                            _ => content.push_str(&format!("{:?}", part)), // Fallback for non-literal parts
+                        }
+                    }
+                    Some(content)
+                }
                 _ => None,
             }
         }
@@ -207,8 +253,63 @@ pub fn parse_process_substitution(lexer: &mut Lexer, is_input: bool) -> Result<R
     })
 }
 
-// Placeholder function - this would need to be implemented
-fn parse_command_from_text(_lexer: &mut Lexer, _text: &str) -> Result<Command, ParserError> {
-    // TODO: Implement command parsing from text
-    Err(ParserError::InvalidSyntax("Command parsing from text not yet implemented".to_string()))
+// Parse command text into a Command AST node
+fn parse_command_from_text(_lexer: &mut Lexer, text: &str) -> Result<Command, ParserError> {
+    // Simple parsing of command text like "printf 'a\nb\n'" or "echo -e 'text' | sort"
+    let trimmed = text.trim();
+    
+    // Check if it contains a pipeline
+    if trimmed.contains('|') {
+        let parts: Vec<&str> = trimmed.split('|').collect();
+        let mut commands = Vec::new();
+        let mut operators = Vec::new();
+        
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                operators.push(PipeOperator::Pipe);
+            }
+            
+            let trimmed_part = part.trim();
+            if !trimmed_part.is_empty() {
+                let cmd_parts: Vec<&str> = trimmed_part.split_whitespace().collect();
+                if !cmd_parts.is_empty() {
+                    let name = Word::Literal(cmd_parts[0].to_string());
+                    let args: Vec<Word> = cmd_parts[1..].iter().map(|&s| Word::Literal(s.to_string())).collect();
+                    
+                    let cmd = Command::Simple(SimpleCommand {
+                        name,
+                        args,
+                        redirects: vec![],
+                        env_vars: HashMap::new(),
+                    });
+                    commands.push(cmd);
+                }
+            }
+        }
+        
+        if commands.len() == 1 {
+            Ok(commands.remove(0))
+        } else {
+            let pipeline = Command::Pipeline(Pipeline { commands, operators });
+            Ok(pipeline)
+        }
+    } else {
+        // Simple command without pipeline
+        let cmd_parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if cmd_parts.is_empty() {
+            return Err(ParserError::InvalidSyntax("Empty command in process substitution".to_string()));
+        }
+        
+        let name = Word::Literal(cmd_parts[0].to_string());
+        let args: Vec<Word> = cmd_parts[1..].iter().map(|&s| Word::Literal(s.to_string())).collect();
+        
+        let cmd = Command::Simple(SimpleCommand {
+            name,
+            args,
+            redirects: vec![],
+            env_vars: HashMap::new(),
+        });
+        
+        Ok(cmd)
+    }
 }
