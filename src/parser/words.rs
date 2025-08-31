@@ -37,7 +37,16 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             // This handles both strings and strings with variables
             Ok(parse_string_interpolation(lexer)?)
         },
-        Some(Token::SingleQuotedString) => Ok(Word::Literal(lexer.get_string_text()?)),
+        Some(Token::SingleQuotedString) => {
+            let quoted_text = lexer.get_string_text()?;
+            // Strip the outer quotes from single-quoted strings
+            let content = if quoted_text.starts_with("'") && quoted_text.ends_with("'") {
+                quoted_text[1..quoted_text.len()-1].to_string()
+            } else {
+                quoted_text
+            };
+            Ok(Word::Literal(content))
+        },
         Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
         Some(Token::DollarDoubleQuotedString) => Ok(parse_string_interpolation(lexer)?),
@@ -271,7 +280,16 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             // This handles both simple strings and strings with variables
             Ok(parse_string_interpolation(lexer)?)
         },
-        Some(Token::SingleQuotedString) => Ok(Word::Literal(lexer.get_string_text()?)),
+        Some(Token::SingleQuotedString) => {
+            let quoted_text = lexer.get_string_text()?;
+            // Strip the outer quotes from single-quoted strings
+            let content = if quoted_text.starts_with("'") && quoted_text.ends_with("'") {
+                quoted_text[1..quoted_text.len()-1].to_string()
+            } else {
+                quoted_text
+            };
+            Ok(Word::Literal(content))
+        },
         Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
         Some(Token::DollarDoubleQuotedString) => Ok(parse_string_interpolation(lexer)?),
@@ -1467,7 +1485,7 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
         if commands.len() == 1 {
             Ok(Word::CommandSubstitution(Box::new(commands.remove(0))))
         } else {
-            let pipeline = Command::Pipeline(Pipeline { commands });
+            let pipeline = Command::Pipeline(Pipeline { commands, source_text: None });
             Ok(Word::CommandSubstitution(Box::new(pipeline)))
         }
     } else {

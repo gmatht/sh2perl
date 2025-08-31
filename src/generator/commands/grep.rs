@@ -82,8 +82,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         
         let has_file_args = !file_args.is_empty();
         
-        // Declare the result variable
-        output.push_str(&format!("my $grep_result_{};\n", command_index));
+        // Result variable is declared at pipeline level
         
         if has_file_args {
             // File-based grep - read from files

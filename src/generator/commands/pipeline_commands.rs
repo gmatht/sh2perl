@@ -92,34 +92,113 @@ fn generate_simple_pipe_pipeline(generator: &mut Generator, pipeline: &Pipeline,
 fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, should_print: bool) -> String {
     let mut output = String::new();
     
-    // Generate streaming code that processes one line at a time
-    output.push_str(&generator.indent());
-    output.push_str("while (my $line = <STDIN>) {\n");
-    generator.indent_level += 1;
+    // Add original bash command as comment if available
+    if let Some(source_text) = &pipeline.source_text {
+        output.push_str(&generator.indent());
+        output.push_str(&format!("# Original bash: {}\n", source_text));
+    }
     
-    // Process each line through the entire pipeline
-    for (i, command) in pipeline.commands.iter().enumerate() {
-        if let Command::Simple(cmd) = command {
-            let cmd_name = match &cmd.name {
-                Word::Literal(s) => s,
-                _ => "unknown_command"
-            };
-            
-            // Generate line-by-line version of each command
-            output.push_str(&generator.indent());
-            output.push_str(&generate_linebyline_command(generator, cmd, "$line", i));
+    // Check if the first command is 'cat filename' and handle it specially
+    let mut start_index = 0;
+    if let Command::Simple(first_cmd) = &pipeline.commands[0] {
+        if let Word::Literal(name) = &first_cmd.name {
+            if name == "cat" && !first_cmd.args.is_empty() {
+                // First command is 'cat filename', so read from the file instead of STDIN
+                let filename = generator.perl_string_literal(&first_cmd.args[0]);
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (open(my $fh, '<', {})) {{\n", filename));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("while (my $line = <$fh>) {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("$line =~ s/\\r\\n?/\\n/g; # Normalize line endings\n");
+                output.push_str(&generator.indent());
+                output.push_str("chomp $line;\n");
+                start_index = 1; // Skip the cat command since we're handling it
+            }
         }
     }
     
-    // Output the processed line
-    if should_print {
+    if start_index == 0 {
+        // No special handling, read from STDIN
         output.push_str(&generator.indent());
-        output.push_str("print $line;\n");
+        output.push_str("while (my $line = <STDIN>) {\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str("chomp $line;\n");
+        
+        // No variable declarations needed for streaming pipeline - we process each line directly
+        
+        // Process each line through the remaining pipeline commands
+        for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+            if let Command::Simple(cmd) = command {
+                let cmd_name = match &cmd.name {
+                    Word::Literal(s) => s,
+                    _ => "unknown_command"
+                };
+                
+                // Generate line-by-line version of each command
+                output.push_str(&generator.indent());
+                output.push_str(&generate_linebyline_command(generator, cmd, "line", start_index + i));
+            }
+        }
+        
+        // Output the processed line
+        if should_print {
+            output.push_str(&generator.indent());
+            output.push_str("print $line . \"\\n\";\n");
+        }
+        
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     }
     
-    generator.indent_level -= 1;
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
+    if start_index == 1 {
+        // For cat commands, we need to add the command processing inside the while loop
+        // No variable declarations needed for streaming pipeline - we process each line directly
+        
+        // Process each line through the remaining pipeline commands
+        for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+            if let Command::Simple(cmd) = command {
+                let cmd_name = match &cmd.name {
+                    Word::Literal(s) => s,
+                    _ => "unknown_command"
+                };
+                
+                // Generate line-by-line version of each command
+                output.push_str(&generator.indent());
+                output.push_str(&generate_linebyline_command(generator, cmd, "line", start_index + i));
+            }
+        }
+        
+        // Output the processed line
+        if should_print {
+            output.push_str(&generator.indent());
+            output.push_str("print $line . \"\\n\";\n");
+        }
+        
+        // Close the while loop
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
+        
+        // Close the file handle if we opened one
+        output.push_str(&generator.indent());
+        output.push_str("close($fh);\n");
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("} else {\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str("warn \"cat: can't open file\";\n");
+        output.push_str(&generator.indent());
+        output.push_str("exit(1);\n");
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
+    }
     
     output
 }
@@ -141,7 +220,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             if let Some(pattern_arg) = cmd.args.iter().find(|arg| {
                 if let Word::Literal(s) = arg { !s.starts_with('-') } else { true }
             }) {
-                let pattern = generator.word_to_perl(pattern_arg);
+                let pattern = generator.strip_shell_quotes_for_regex(pattern_arg);
                 output.push_str(&format!("next unless $line =~ /{}/;\n", pattern));
             }
             output
@@ -187,6 +266,12 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
 fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, should_print: bool) -> String {
     let mut output = String::new();
     
+    // Add original bash command as comment if available
+    if let Some(source_text) = &pipeline.source_text {
+        output.push_str(&generator.indent());
+        output.push_str(&format!("# Original bash: {}\n", source_text));
+    }
+    
     if should_print {
         // Wrap the entire pipeline in a block scope to prevent variable contamination
         output.push_str("{\n");
@@ -196,6 +281,18 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         let unique_id = generator.get_unique_id();
         output.push_str(&generator.indent());
         output.push_str(&format!("my $output_{};\n", unique_id));
+        
+        // Declare all variables that will be used in this pipeline to avoid scope issues
+        for (i, command) in pipeline.commands.iter().enumerate() {
+            if let Command::Simple(cmd) = command {
+                if let Word::Literal(cmd_name) = &cmd.name {
+                    if matches!(cmd_name.as_str(), "grep" | "wc" | "tr" | "xargs" | "sort" | "uniq") {
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("my ${}_result_{}_{};\n", cmd_name, unique_id, i));
+                    }
+                }
+            }
+        }
         
         for (i, command) in pipeline.commands.iter().enumerate() {
             if i > 0 {

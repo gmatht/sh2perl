@@ -270,7 +270,7 @@ fn parse_command_from_text(_lexer: &mut Lexer, text: &str) -> Result<Command, Pa
         if commands.len() == 1 {
             Ok(commands.remove(0))
         } else {
-            let pipeline = Command::Pipeline(Pipeline { commands });
+            let pipeline = Command::Pipeline(Pipeline { commands, source_text: None });
             Ok(pipeline)
         }
     } else {

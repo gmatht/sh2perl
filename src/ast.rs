@@ -1,5 +1,21 @@
 use std::collections::HashMap;
 
+/// Represents a span of source code with start/end positions and original text
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceSpan {
+    pub start: usize,
+    pub end: usize,
+    pub original_text: String,
+}
+
+impl SourceSpan {
+    pub fn new(start: usize, end: usize, original_text: String) -> Self {
+        Self { start, end, original_text }
+    }
+}
+
+
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Simple(SimpleCommand),
@@ -49,6 +65,7 @@ pub struct ShoptCommand {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pipeline {
     pub commands: Vec<Command>,
+    pub source_text: Option<String>, // Original bash command text for comments
 }
 
 

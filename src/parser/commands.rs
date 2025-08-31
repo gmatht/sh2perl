@@ -82,7 +82,9 @@ impl Parser {
                 match token {
                     Token::And | Token::Or | Token::Pipe => {
                         // This command is part of a pipeline, parse the rest
-                        command = self.parse_pipeline_from_command(command)?;
+                        // For pipeline continuation, we don't need to capture source text again
+                        let dummy_start = 0;
+                        command = self.parse_pipeline_from_command(command, dummy_start)?;
                     }
                     _ => {}
                 }
@@ -255,7 +257,9 @@ impl Parser {
                                 Token::And | Token::Or | Token::Pipe => {
                                     eprintln!("DEBUG: Found pipeline operator {:?}, parsing as pipeline", token);
                                     // This is part of a pipeline, parse it as such
-                                    let result = self.parse_pipeline_from_command(test_command)?;
+                                    // For test expressions, we don't need to capture source text
+                                    let dummy_start = 0;
+                                    let result = self.parse_pipeline_from_command(test_command, dummy_start)?;
                                     eprintln!("DEBUG: Pipeline parsing result: {:?}", result);
                                     result
                                 }
@@ -329,13 +333,17 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Result<Command, ParserError> {
+        // Record the starting byte position for source text capture BEFORE parsing the first command
+        let start_span = self.lexer.get_span();
+        let start_pos = start_span.map(|(start, _)| start).unwrap_or(0);
+        
         let first_command = self.parse_simple_command()?;
         // Parse redirects for the first command
         let first_command_with_redirects = self.parse_command_redirects(first_command)?;
-        self.parse_pipeline_from_command(first_command_with_redirects)
+        self.parse_pipeline_from_command(first_command_with_redirects, start_pos)
     }
 
-    pub fn parse_pipeline_from_command(&mut self, first_command: Command) -> Result<Command, ParserError> {
+    pub fn parse_pipeline_from_command(&mut self, first_command: Command, start_byte_pos: usize) -> Result<Command, ParserError> {
         let mut commands = Vec::new();
         let mut pipe_operators = Vec::new();
         
@@ -392,7 +400,18 @@ impl Parser {
             eprintln!("DEBUG: parse_pipeline_from_command returning single command: {:?}", result);
             Ok(result)
         } else {
-            let result = Command::Pipeline(Pipeline { commands });
+            // Capture the source text from start to current position
+            let end_span = self.lexer.get_span();
+            let end_byte_pos = end_span.map(|(_, end)| end).unwrap_or(start_byte_pos);
+            let source_text = if start_byte_pos < end_byte_pos {
+                // Get the text from the lexer's input
+                let text = self.lexer.get_text(start_byte_pos, end_byte_pos);
+                Some(text.trim().to_string())
+            } else {
+                None
+            };
+            
+            let result = Command::Pipeline(Pipeline { commands, source_text });
             eprintln!("DEBUG: parse_pipeline_from_command returning pipeline: {:?}", result);
             Ok(result)
         }

@@ -53,7 +53,7 @@ pub fn generate_wc_command(_generator: &mut Generator, cmd: &SimpleCommand, inpu
     }
     
     // Format output
-    output.push_str(&format!("my $wc_result_{} = '';\n", command_index));
+    output.push_str(&format!("$wc_result_{} = '';\n", command_index));
     if count_lines {
         output.push_str(&format!("$wc_result_{} .= \"$wc_line_count_{} \";\n", command_index, command_index));
     }

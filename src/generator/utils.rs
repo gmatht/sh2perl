@@ -57,6 +57,68 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
     }
 }
 
+pub fn strip_shell_quotes_and_convert_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
+    match word {
+        Word::Literal(s) => {
+            // Strip shell quotes if present and convert to Perl string literal
+            let stripped = if (s.starts_with("'") && s.ends_with("'")) || (s.starts_with("\"") && s.ends_with("\"")) {
+                // Remove the outer quotes
+                &s[1..s.len()-1]
+            } else {
+                s
+            };
+            
+            // Escape quotes and backslashes for Perl string literals
+            let escaped = stripped.replace("\\", "\\\\")
+                                .replace("\"", "\\\"")
+                                .replace("\n", "\\n")
+                                .replace("\t", "\\t")
+                                .replace("\r", "\\r");
+            format!("\"{}\"", escaped)
+        }
+        Word::Arithmetic(expr) => {
+            // Handle arithmetic expressions by converting them to Perl
+            generator.convert_arithmetic_to_perl(&expr.expression)
+        }
+        Word::ParameterExpansion(pe) => {
+            // Handle parameter expansion
+            generator.generate_parameter_expansion(pe)
+        }
+        Word::StringInterpolation(interp) => {
+            // Handle string interpolation
+            generator.convert_string_interpolation_to_perl(interp)
+        }
+        _ => format!("{:?}", word)
+    }
+}
+
+pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word) -> String {
+    match word {
+        Word::Literal(s) => {
+            // Strip shell quotes if present and return the raw string for regex
+            if (s.starts_with("'") && s.ends_with("'")) || (s.starts_with("\"") && s.ends_with("\"")) {
+                // Remove the outer quotes
+                s[1..s.len()-1].to_string()
+            } else {
+                s.clone()
+            }
+        }
+        Word::Arithmetic(expr) => {
+            // Handle arithmetic expressions by converting them to Perl
+            generator.convert_arithmetic_to_perl(&expr.expression)
+        }
+        Word::ParameterExpansion(pe) => {
+            // Handle parameter expansion
+            generator.generate_parameter_expansion(pe)
+        }
+        Word::StringInterpolation(interp) => {
+            // Handle string interpolation
+            generator.convert_string_interpolation_to_perl(interp)
+        }
+        _ => format!("{:?}", word)
+    }
+}
+
 pub fn get_unique_file_handle_impl(generator: &mut Generator) -> String {
     generator.file_handle_counter += 1;
     format!("fh_{}", generator.file_handle_counter)

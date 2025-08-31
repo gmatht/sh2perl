@@ -531,7 +531,9 @@ pub fn parse_for_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     
     // If there's a pipe after 'done', parse the pipeline
     if let Some(Token::Pipe) = parser.lexer.peek() {
-        final_command = parser.parse_pipeline_from_command(final_command)?;
+        // For control flow, we don't need to capture source text
+        let dummy_start = 0;
+        final_command = parser.parse_pipeline_from_command(final_command, dummy_start)?;
     }
     
     Ok(final_command)

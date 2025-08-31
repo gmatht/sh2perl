@@ -169,6 +169,14 @@ impl Generator {
         utils::perl_string_literal_impl(self, word)
     }
 
+    pub fn strip_shell_quotes_and_convert_to_perl(&mut self, word: &Word) -> String {
+        utils::strip_shell_quotes_and_convert_to_perl_impl(self, word)
+    }
+
+    pub fn strip_shell_quotes_for_regex(&mut self, word: &Word) -> String {
+        utils::strip_shell_quotes_for_regex_impl(self, word)
+    }
+
     pub fn get_unique_file_handle(&mut self) -> String {
         utils::get_unique_file_handle_impl(self)
     }
