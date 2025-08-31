@@ -30,7 +30,7 @@ pub fn generate_wc_command(_generator: &mut Generator, cmd: &SimpleCommand, inpu
     }
     
     // Generate Perl code for wc
-    output.push_str(&format!("my @wc_lines_{} = split(/\\n/, {});\n", command_index, input_var));
+    output.push_str(&format!("my @wc_lines_{} = split(/\\n/, ${});\n", command_index, input_var));
     
     if count_lines {
         output.push_str(&format!("my $wc_line_count_{} = scalar(@wc_lines_{});\n", command_index, command_index));
@@ -67,7 +67,7 @@ pub fn generate_wc_command(_generator: &mut Generator, cmd: &SimpleCommand, inpu
         output.push_str(&format!("$wc_result_{} .= \"$wc_byte_count_{} \";\n", command_index, command_index));
     }
     output.push_str(&format!("$wc_result_{} =~ s/\\s+$//;\n", command_index)); // Remove trailing space
-    output.push_str(&format!("{} = $wc_result_{};\n", input_var, command_index));
+    output.push_str(&format!("${} = $wc_result_{};\n", input_var, command_index));
     
     output
 }

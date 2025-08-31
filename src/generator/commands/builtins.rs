@@ -6,13 +6,15 @@ use crate::generator::Generator;
 pub struct BuiltinCommand {
     pub name: &'static str,
     pub description: &'static str,
+    pub supports_linebyline: bool,
 }
 
 impl BuiltinCommand {
-    pub fn new(name: &'static str, description: &'static str) -> Self {
+    pub fn new(name: &'static str, description: &'static str, supports_linebyline: bool) -> Self {
         Self {
             name,
             description,
+            supports_linebyline,
         }
     }
 }
@@ -21,64 +23,64 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     let mut commands = HashMap::new();
     
     // File and directory operations
-    commands.insert("ls", BuiltinCommand::new("ls", "List directory contents"));
-    commands.insert("cat", BuiltinCommand::new("cat", "Concatenate and display files"));
-    commands.insert("find", BuiltinCommand::new("find", "Find files"));
-    commands.insert("grep", BuiltinCommand::new("grep", "Search for patterns in text"));
-    commands.insert("sed", BuiltinCommand::new("sed", "Stream editor"));
-    commands.insert("awk", BuiltinCommand::new("awk", "Pattern scanning and processing"));
-    commands.insert("sort", BuiltinCommand::new("sort", "Sort lines"));
-    commands.insert("uniq", BuiltinCommand::new("uniq", "Remove duplicate lines"));
-    commands.insert("wc", BuiltinCommand::new("wc", "Word, line, and byte count"));
-    commands.insert("head", BuiltinCommand::new("head", "Display first lines"));
-    commands.insert("tail", BuiltinCommand::new("tail", "Display last lines"));
-    commands.insert("cut", BuiltinCommand::new("cut", "Cut sections from lines"));
-    commands.insert("paste", BuiltinCommand::new("paste", "Merge lines from files"));
-    commands.insert("comm", BuiltinCommand::new("comm", "Compare sorted files"));
-    commands.insert("diff", BuiltinCommand::new("diff", "Compare files"));
-    commands.insert("tr", BuiltinCommand::new("tr", "Translate or delete characters"));
-    commands.insert("xargs", BuiltinCommand::new("xargs", "Execute command with arguments"));
+    commands.insert("ls", BuiltinCommand::new("ls", "List directory contents", false));
+    commands.insert("cat", BuiltinCommand::new("cat", "Concatenate and display files", true));
+    commands.insert("find", BuiltinCommand::new("find", "Find files", false));
+    commands.insert("grep", BuiltinCommand::new("grep", "Search for patterns in text", true));
+    commands.insert("sed", BuiltinCommand::new("sed", "Stream editor", true));
+    commands.insert("awk", BuiltinCommand::new("awk", "Pattern scanning and processing", true));
+    commands.insert("sort", BuiltinCommand::new("sort", "Sort lines", false));
+    commands.insert("uniq", BuiltinCommand::new("uniq", "Remove duplicate lines", false));
+    commands.insert("wc", BuiltinCommand::new("wc", "Word, line, and byte count", true));
+    commands.insert("head", BuiltinCommand::new("head", "Display first lines", false));
+    commands.insert("tail", BuiltinCommand::new("tail", "Display last lines", false));
+    commands.insert("cut", BuiltinCommand::new("cut", "Cut sections from lines", true));
+    commands.insert("paste", BuiltinCommand::new("paste", "Merge lines from files", false));
+    commands.insert("comm", BuiltinCommand::new("comm", "Compare sorted files", false));
+    commands.insert("diff", BuiltinCommand::new("diff", "Compare files", false));
+    commands.insert("tr", BuiltinCommand::new("tr", "Translate or delete characters", true));
+    commands.insert("xargs", BuiltinCommand::new("xargs", "Execute command with arguments", false));
     
     // File manipulation
-    commands.insert("cp", BuiltinCommand::new("cp", "Copy files"));
-    commands.insert("mv", BuiltinCommand::new("mv", "Move/rename files"));
-    commands.insert("rm", BuiltinCommand::new("rm", "Remove files"));
-    commands.insert("mkdir", BuiltinCommand::new("mkdir", "Create directories"));
-    commands.insert("touch", BuiltinCommand::new("touch", "Create empty files"));
+    commands.insert("cp", BuiltinCommand::new("cp", "Copy files", false));
+    commands.insert("mv", BuiltinCommand::new("mv", "Move/rename files", false));
+    commands.insert("rm", BuiltinCommand::new("rm", "Remove files", false));
+    commands.insert("mkdir", BuiltinCommand::new("mkdir", "Create directories", false));
+    commands.insert("touch", BuiltinCommand::new("touch", "Create empty files", false));
     
     // Text processing
-    commands.insert("echo", BuiltinCommand::new("echo", "Display text"));
-    commands.insert("printf", BuiltinCommand::new("printf", "Format and print data"));
-    commands.insert("basename", BuiltinCommand::new("basename", "Extract filename"));
-    commands.insert("dirname", BuiltinCommand::new("dirname", "Extract directory name"));
+    commands.insert("echo", BuiltinCommand::new("echo", "Display text", true));
+    commands.insert("printf", BuiltinCommand::new("printf", "Format and print data", true));
+    commands.insert("basename", BuiltinCommand::new("basename", "Extract filename", true));
+    commands.insert("dirname", BuiltinCommand::new("dirname", "Extract directory name", true));
     
     // System utilities
-    commands.insert("date", BuiltinCommand::new("date", "Display date and time"));
-    commands.insert("time", BuiltinCommand::new("time", "Time command execution"));
-    commands.insert("sleep", BuiltinCommand::new("sleep", "Delay execution"));
-    commands.insert("which", BuiltinCommand::new("which", "Locate command"));
-    commands.insert("yes", BuiltinCommand::new("yes", "Output string repeatedly"));
+    commands.insert("date", BuiltinCommand::new("date", "Display date and time", false));
+    commands.insert("time", BuiltinCommand::new("time", "Time command execution", false));
+    commands.insert("sleep", BuiltinCommand::new("sleep", "Delay execution", false));
+    commands.insert("which", BuiltinCommand::new("which", "Locate command", false));
+    commands.insert("yes", BuiltinCommand::new("yes", "Output string repeatedly", true));
     
     // Compression and archiving
-    commands.insert("gzip", BuiltinCommand::new("gzip", "Compress files"));
-    commands.insert("zcat", BuiltinCommand::new("zcat", "Decompress and display"));
+    commands.insert("gzip", BuiltinCommand::new("gzip", "Compress files", false));
+    commands.insert("zcat", BuiltinCommand::new("zcat", "Decompress and display", true));
     
     // Network and downloads
-    commands.insert("wget", BuiltinCommand::new("wget", "Download files"));
-    commands.insert("curl", BuiltinCommand::new("curl", "Transfer data"));
+    commands.insert("wget", BuiltinCommand::new("wget", "Download files", false));
+    commands.insert("curl", BuiltinCommand::new("curl", "Transfer data", false));
     
     // Process management
-    commands.insert("kill", BuiltinCommand::new("kill", "Terminate processes"));
-    commands.insert("nohup", BuiltinCommand::new("nohup", "Run command immune to hangups"));
-    commands.insert("nice", BuiltinCommand::new("nice", "Run command with modified priority"));
+    commands.insert("kill", BuiltinCommand::new("kill", "Terminate processes", false));
+    commands.insert("nohup", BuiltinCommand::new("nohup", "Run command immune to hangups", false));
+    commands.insert("nice", BuiltinCommand::new("nice", "Run command with modified priority", false));
     
     // Checksums and verification
-    commands.insert("sha256sum", BuiltinCommand::new("sha256sum", "Compute SHA256 checksums"));
-    commands.insert("sha512sum", BuiltinCommand::new("sha512sum", "Compute SHA512 checksums"));
-    commands.insert("strings", BuiltinCommand::new("strings", "Extract printable strings"));
+    commands.insert("sha256sum", BuiltinCommand::new("sha256sum", "Compute SHA256 checksums", false));
+    commands.insert("sha512sum", BuiltinCommand::new("sha512sum", "Compute SHA512 checksums", false));
+    commands.insert("strings", BuiltinCommand::new("strings", "Extract printable strings", false));
     
     // I/O redirection
-    commands.insert("tee", BuiltinCommand::new("tee", "Read from stdin, write to stdout and files"));
+    commands.insert("tee", BuiltinCommand::new("tee", "Read from stdin, write to stdout and files", true));
     
     //TODO: pkill and killall
     commands
@@ -88,9 +90,28 @@ pub fn is_builtin(command_name: &str) -> bool {
     get_builtin_commands().contains_key(command_name)
 }
 
+/// Check if all commands in a pipeline support line-by-line processing
+pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
+    pipeline.commands.iter().all(|cmd| {
+        if let Command::Simple(simple_cmd) = cmd {
+            if let Word::Literal(name) = &simple_cmd.name {
+                if let Some(builtin) = get_builtin_commands().get(name.as_str()) {
+                    builtin.supports_linebyline
+                } else {
+                    false // Non-builtin commands can't do line-by-line
+                }
+            } else {
+                false
+            }
+        } else {
+            false // Only simple commands can do line-by-line
+        }
+    })
+}
+
 /// Generate generic Perl code for a builtin command that doesn't need special handling
 /// This is a fallback for commands that don't have specialized modules
-pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, output_var: &str) -> String {
+pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, output_var: &str, command_index: &str) -> String {
     let command_name = match &cmd.name {
         Word::Literal(s) => s,
         _ => "unknown_command"
@@ -99,23 +120,23 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
     match command_name {
         "grep" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::grep::generate_grep_command(generator, cmd, input_var, "pipeline", false)
+            crate::generator::commands::grep::generate_grep_command(generator, cmd, input_var, command_index, false)
         },
         "wc" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::wc::generate_wc_command(generator, cmd, input_var, "pipeline")
+            crate::generator::commands::wc::generate_wc_command(generator, cmd, input_var, command_index)
         },
         "sort" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::sort::generate_sort_command(generator, cmd, input_var, "pipeline")
+            crate::generator::commands::sort::generate_sort_command(generator, cmd, input_var, command_index)
         },
         "uniq" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::uniq::generate_uniq_command(generator, cmd, input_var, "pipeline")
+            crate::generator::commands::uniq::generate_uniq_command(generator, cmd, input_var, command_index)
         },
         "tr" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::tr::generate_tr_command(generator, cmd, input_var, 0)
+            crate::generator::commands::tr::generate_tr_command(generator, cmd, input_var, 0, false)
         },
         "xargs" => {
             // For now, use the existing signature but we should standardize this
@@ -133,11 +154,11 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         },
         "cat" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::cat::generate_cat_command(generator, cmd, &[], input_var)
+            crate::generator::commands::cat::generate_cat_command(generator, cmd, &[], output_var)
         },
         "find" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::find::generate_find_command(generator, cmd, true, input_var)
+            crate::generator::commands::find::generate_find_command(generator, cmd, true, output_var)
         },
         "sed" => {
             // For now, use the existing signature but we should standardize this

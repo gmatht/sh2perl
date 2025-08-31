@@ -21,7 +21,7 @@ pub fn generate_sort_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         }
     }
     
-    output.push_str(&format!("my @sort_lines_{} = split(/\\n/, {});\n", command_index, input_var));
+    output.push_str(&format!("my @sort_lines_{} = split(/\\n/, ${});\n", command_index, input_var));
     if numeric {
         // For numeric sort, extract the first field (number) and sort by that
         // Use the entire line as secondary sort key for stable sort behavior
@@ -38,7 +38,7 @@ pub fn generate_sort_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     if reverse {
         output.push_str(&format!("@sort_sorted_{} = reverse(@sort_sorted_{});\n", command_index, command_index));
     }
-    output.push_str(&format!("{} = join(\"\\n\", @sort_sorted_{});\n", input_var, command_index));
+    output.push_str(&format!("${} = join(\"\\n\", @sort_sorted_{});\n", input_var, command_index));
     
     output
 }

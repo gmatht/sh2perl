@@ -31,7 +31,7 @@ pub fn generate_xargs_command(_generator: &mut Generator, cmd: &SimpleCommand, i
     
     if command == "grep" && args.contains(&"function".to_string()) {
         // Handle grep -l "function" on the input files
-        output.push_str(&format!("my @xargs_files_{} = split(/\\n/, {});\n", command_index, input_var));
+        output.push_str(&format!("my @xargs_files_{} = split(/\\n/, ${});\n", command_index, input_var));
         output.push_str(&format!("my @xargs_matching_files_{};\n", command_index));
         output.push_str(&format!("foreach my $file (@xargs_files_{}) {{\n", command_index));
         output.push_str("next unless $file && -f $file;\n");
@@ -50,7 +50,7 @@ pub fn generate_xargs_command(_generator: &mut Generator, cmd: &SimpleCommand, i
         output.push_str(&format!("my $xargs_result_{} = join(\"\\n\", @xargs_matching_files_{});\n", command_index, command_index));
     } else {
         // Fallback to system command for other cases
-        output.push_str(&format!("{} = `echo \"${}\" | {}`;\n", input_var, input_var, command));
+        output.push_str(&format!("${} = `echo \"${}\" | {}`;\n", input_var, input_var, command));
     }
     output.push_str("\n");
     
