@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_tr_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize, linebyline: bool) -> String {
+pub fn generate_tr_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, linebyline: bool) -> String {
     if linebyline {
         generate_tr_linebyline_impl(generator, cmd, input_var, command_index)
     } else {
@@ -9,7 +9,7 @@ pub fn generate_tr_command(generator: &mut Generator, cmd: &SimpleCommand, input
     }
 }
 
-fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize) -> String {
+fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
     let mut output = String::new();
     
     // tr command syntax: tr [OPTION]... SET1 [SET2]
@@ -48,7 +48,7 @@ fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, i
     output
 }
 
-fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize) -> String {
+fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
     let mut output = String::new();
     
     // tr command syntax: tr [OPTION]... SET1 [SET2]

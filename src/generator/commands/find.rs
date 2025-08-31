@@ -74,7 +74,8 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     output.push_str("if (-d $full_path) {\n");
     generator.indent_level += 1;
     output.push_str(&generator.indent());
-    output.push_str("find_files($full_path, $pattern);\n");
+    // Skip subdirectories for now - shell find is non-recursive by default
+    // output.push_str("find_files($full_path, $pattern);\n");
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("} elsif ($file =~ /^$pattern$/) {\n");

@@ -135,14 +135,12 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             crate::generator::commands::uniq::generate_uniq_command(generator, cmd, input_var, command_index)
         },
         "tr" => {
-            // Parse command_index string to get the numeric index
-            let index = command_index.parse::<usize>().unwrap_or(0);
-            crate::generator::commands::tr::generate_tr_command(generator, cmd, input_var, index, false)
+            // Pass the full command_index string
+            crate::generator::commands::tr::generate_tr_command(generator, cmd, input_var, command_index, false)
         },
         "xargs" => {
-            // Parse command_index string to get the numeric index
-            let index = command_index.parse::<usize>().unwrap_or(0);
-            crate::generator::commands::xargs::generate_xargs_command(generator, cmd, input_var, index)
+            // Pass the full command_index string
+            crate::generator::commands::xargs::generate_xargs_command(generator, cmd, input_var, command_index)
         },
         "ls" => {
             // For now, use the existing signature but we should standardize this
