@@ -31,13 +31,10 @@ fn generate_simple_pipe_pipeline(generator: &mut Generator, pipeline: &Pipeline,
     generator.indent_level += 1;
     
     if should_print {
-        // For printing pipelines, use array-based approach
+        // For printing pipelines, use proper command chaining
         let unique_id = generator.get_unique_id();
         output.push_str(&generator.indent());
         output.push_str(&format!("my $output_{};\n", unique_id));
-        
-        // Create a chain of output variables for the pipeline
-        let current_output_var = format!("$output_{}", unique_id);
         
         for (i, command) in pipeline.commands.iter().enumerate() {
             if i > 0 {
@@ -65,16 +62,141 @@ fn generate_simple_pipe_pipeline(generator: &mut Generator, pipeline: &Pipeline,
                     output.push_str(&generator.indent());
                     output.push_str("local *STDOUT;\n");
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("open(STDOUT, '>', \\{}) or die \"Cannot redirect STDOUT\";\n", current_output_var));
+                    output.push_str(&format!("open(STDOUT, '>', \\{}) or die \"Cannot redirect STDOUT\";\n", format!("$output_{}", unique_id)));
                     output.push_str(&generator.indent());
                     output.push_str(&generator.generate_command(command));
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
                 } else {
-                    output.push_str(&format!("{} = `echo \"$output_{}\" | ", current_output_var, unique_id));
-                    output.push_str(&generator.generate_command_string_for_system(command));
-                    output.push_str("`;\n");
+                    // Use proper command chaining without echo
+                    if let Command::Simple(cmd) = command {
+                        let cmd_name = match &cmd.name {
+                            Word::Literal(s) => s,
+                            _ => "unknown_command"
+                        };
+                        
+                        // Handle specific commands that need special processing
+                        if cmd_name == "grep" {
+                            let pattern = cmd.args.iter()
+                                .filter(|arg| !matches!(arg, Word::Literal(s) if s.starts_with('-')))
+                                .next()
+                                .map(|arg| generator.word_to_perl(arg))
+                                .unwrap_or_else(|| ".*".to_string());
+                            
+                            // Remove quotes if they exist around the pattern
+                            let regex_pattern = if pattern.starts_with('"') && pattern.ends_with('"') {
+                                &pattern[1..pattern.len()-1]
+                            } else {
+                                &pattern
+                            };
+                            
+                            let grep_unique_id = generator.get_unique_id();
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("my @lines_{} = split(/\\n/, $output_{});\n", grep_unique_id, unique_id));
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("my @filtered_{} = grep {{ $_ =~ /{}/ }} @lines_{};\n", grep_unique_id, regex_pattern, grep_unique_id));
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("$output_{} = join(\"\\n\", @filtered_{});\n", unique_id, grep_unique_id));
+                        } else if cmd_name == "wc" {
+                            let is_line_count = cmd.args.iter().any(|arg| matches!(arg, Word::Literal(s) if s == "-l"));
+                            let wc_unique_id = generator.get_unique_id();
+                            if is_line_count {
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("my @lines_{} = split(/\\n/, $output_{});\n", wc_unique_id, unique_id));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("$output_{} = scalar(@lines_{});\n", unique_id, wc_unique_id));
+                            } else {
+                                // Default to character count
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("$output_{} = length($output_{});\n", unique_id, unique_id));
+                            }
+                        } else if cmd_name == "sort" {
+                            let is_numeric = cmd.args.iter().any(|arg| matches!(arg, Word::Literal(s) if s == "-n"));
+                            let is_reverse = cmd.args.iter().any(|arg| matches!(arg, Word::Literal(s) if s == "-r"));
+                            
+                            let sort_unique_id = generator.get_unique_id();
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("my @lines_{} = split(/\\n/, $output_{});\n", sort_unique_id, unique_id));
+                            if is_numeric {
+                                if is_reverse {
+                                    output.push_str(&generator.indent());
+                                    output.push_str(&format!("@lines_{} = sort {{ $b <=> $a }} @lines_{};\n", sort_unique_id, sort_unique_id));
+                                } else {
+                                    output.push_str(&generator.indent());
+                                    output.push_str(&format!("@lines_{} = sort {{ $a <=> $b }} @lines_{};\n", sort_unique_id, sort_unique_id));
+                                }
+                            } else {
+                                if is_reverse {
+                                    output.push_str(&generator.indent());
+                                    output.push_str(&format!("@lines_{} = sort {{ $b cmp $a }} @lines_{};\n", sort_unique_id, sort_unique_id));
+                                } else {
+                                    output.push_str(&generator.indent());
+                                    output.push_str(&format!("@lines_{} = sort @lines_{};\n", sort_unique_id, sort_unique_id));
+                                }
+                            }
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("$output_{} = join(\"\\n\", @lines_{});\n", unique_id, sort_unique_id));
+                                                } else if cmd_name == "uniq" {
+                            let is_count = cmd.args.iter().any(|arg| matches!(arg, Word::Literal(s) if s == "-c"));
+                            
+                            let uniq_unique_id = generator.get_unique_id();
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("my @lines_{} = split(/\\n/, $output_{});\n", uniq_unique_id, unique_id));
+                            if is_count {
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("my %count_{};\n", uniq_unique_id));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("$count_{}{{$_}}++ for @lines_{};\n", uniq_unique_id, uniq_unique_id));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("$output_{} = join(\"\\n\", map {{ \"$count_{}{{$_}}\" }} keys %count_{});\n", unique_id, uniq_unique_id, uniq_unique_id));
+                            } else {
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("my %seen_{};\n", uniq_unique_id));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("my @unique_{} = grep {{ !$seen_{}{{$_}}++ }} @lines_{};\n", uniq_unique_id, uniq_unique_id, uniq_unique_id));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("$output_{} = join(\"\\n\", @unique_{});\n", unique_id, uniq_unique_id));
+                            }
+                        } else if cmd_name == "tr" {
+                            // Handle tr command for character translation
+                            let mut delete_chars = String::new();
+                            let mut is_delete = false;
+                            for arg in &cmd.args {
+                                if let Word::Literal(s) = arg {
+                                    if s == "-d" {
+                                        is_delete = true;
+                                    } else if !s.starts_with('-') {
+                                        delete_chars = s.clone();
+                                    }
+                                }
+                            }
+                            
+                            if is_delete && !delete_chars.is_empty() {
+                                // Remove quotes if they exist around the pattern
+                                let chars_to_delete = if delete_chars.starts_with('"') && delete_chars.ends_with('"') {
+                                    &delete_chars[1..delete_chars.len()-1]
+                                } else {
+                                    &delete_chars
+                                };
+                                
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("$output_{} =~ tr/{}/ /d;\n", unique_id, chars_to_delete));
+                            }
+                        } else {
+                            // Generic command - use system call
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("$output_{} = `echo \"$output_{}\" | ", unique_id, unique_id));
+                            output.push_str(&generator.generate_command_string_for_system(command));
+                            output.push_str("`;\n");
+                        }
+                    } else {
+                        // Non-simple command
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("$output_{} = `echo \"$output_{}\" | ", unique_id, unique_id));
+                        output.push_str(&generator.generate_command_string_for_system(command));
+                        output.push_str("`;\n");
+                    }
                 }
             }
         }
