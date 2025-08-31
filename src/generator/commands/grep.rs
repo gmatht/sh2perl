@@ -1,7 +1,7 @@
 use crate::generator::Generator;
 use crate::ast::*;
 
-pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize, should_print: bool) -> String {
+pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, should_print: bool) -> String {
     let mut output = String::new();
     
     // Parse grep options and pattern
