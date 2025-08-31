@@ -34,14 +34,14 @@ fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, i
         let set1 = generator.word_to_perl(&args[0]);
         
         // For line-by-line, process the line directly
-        output.push_str(&format!("{} =~ tr/{}/ /d;\n", input_var, set1));
+        output.push_str(&format!("${} =~ tr/{}/ /d;\n", input_var, set1));
     } else if args.len() >= 2 {
         // tr SET1 SET2: translate characters
         let set1 = generator.word_to_perl(&args[0]);
         let set2 = generator.word_to_perl(&args[1]);
         
         // For line-by-line, process the line directly
-        output.push_str(&format!("{} =~ tr/{}/{}/;\n", input_var, set1, set2));
+        output.push_str(&format!("${} =~ tr/{}/{}/;\n", input_var, set1, set2));
     }
     // No valid arguments - line passes through unchanged
     
@@ -73,7 +73,7 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
         let set1 = generator.word_to_perl(&args[0]);
         
         output.push_str(&format!("my $set1 = {};\n", set1));
-        output.push_str(&format!("my $input = {};\n", input_var));
+        output.push_str(&format!("my $input = ${};\n", input_var));
         
         // Delete characters in SET1 from input
         output.push_str(&format!("my $tr_result_{} = '';\n", command_index));
@@ -89,7 +89,7 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
         
         output.push_str(&format!("my $set1 = {};\n", set1));
         output.push_str(&format!("my $set2 = {};\n", set2));
-        output.push_str(&format!("my $input = {};\n", input_var));
+        output.push_str(&format!("my $input = ${};\n", input_var));
         
         // Character-by-character translation
         output.push_str(&format!("my $tr_result_{} = '';\n", command_index));
@@ -103,7 +103,7 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
         output.push_str("}\n");
     } else {
         // No valid arguments, just pass through input
-        output.push_str(&format!("{} = {};\n", input_var, input_var));
+        output.push_str(&format!("${} = ${};\n", input_var, input_var));
     }
     
     output
