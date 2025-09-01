@@ -8,7 +8,8 @@ fn generate_command_using_builtins(
     command: &Command, 
     input_var: &str, 
     output_var: &str,
-    command_index: &str
+    command_index: &str,
+    linebyline: bool
 ) -> String {
     if let Command::Simple(cmd) = command {
         let cmd_name = match &cmd.name {
@@ -20,27 +21,17 @@ fn generate_command_using_builtins(
             // Route to specialized modules via generate_generic_builtin
             if input_var.is_empty() {
                 // First command in pipeline - generate without input
-                generate_generic_builtin(generator, cmd, "", output_var, command_index)
+                generate_generic_builtin(generator, cmd, "", output_var, command_index, linebyline)
             } else {
                 // Subsequent command - use previous output as input
-                generate_generic_builtin(generator, cmd, input_var, output_var, command_index)
+                generate_generic_builtin(generator, cmd, input_var, output_var, command_index, linebyline)
             }
         } else {
-            // Non-builtin command - use system call
-            if input_var.is_empty() {
-                // First command in pipeline
-                format!("${} = `{}`;\n", 
-                    output_var, 
-                    generator.generate_command_string_for_system(command))
-            } else {
-                // Subsequent command
-                format!("${} = `echo \"${}\" | {}`;\n", 
-                    output_var, input_var, 
-                    generator.generate_command_string_for_system(command))
-            }
+            // Non-builtin command - use centralized fallback logic
+            generate_generic_builtin(generator, cmd, input_var, output_var, command_index, linebyline)
         }
     } else {
-        // Non-simple command - use system call
+        // Non-simple command - use system call fallback
         if input_var.is_empty() {
             // First command in pipeline
             format!("${} = `{}`;\n", 
@@ -94,8 +85,10 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
     
     // Add original bash command as comment if available
     if let Some(source_text) = &pipeline.source_text {
+        // Handle multiline source text by only taking the first line (the actual pipeline)
+        let first_line = source_text.lines().next().unwrap_or(source_text);
         output.push_str(&generator.indent());
-        output.push_str(&format!("# Original bash: {}\n", source_text));
+        output.push_str(&format!("# Original bash: {}\n", first_line));
     }
     
     // Check if the first command is 'cat filename' and handle it specially
@@ -105,14 +98,18 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
             if name == "cat" && !first_cmd.args.is_empty() {
                 // First command is 'cat filename', so read from the file instead of STDIN
                 let filename = generator.perl_string_literal(&first_cmd.args[0]);
+                // For relative filenames, use current directory
+                let adjusted_filename = if !filename.contains('/') && !filename.starts_with('.') && filename != "\"\"" {
+                    format!("\"./{}\"", filename.trim_matches('"'))
+                } else {
+                    filename.clone()
+                };
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (open(my $fh, '<', {})) {{\n", filename));
+                output.push_str(&format!("if (open(my $fh, '<', {})) {{\n", adjusted_filename));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str("while (my $line = <$fh>) {\n");
                 generator.indent_level += 1;
-                output.push_str(&generator.indent());
-                output.push_str("$line =~ s/\\r\\n?/\\n/g; # Normalize line endings\n");
                 output.push_str(&generator.indent());
                 output.push_str("chomp $line;\n");
                 start_index = 1; // Skip the cat command since we're handling it
@@ -268,8 +265,10 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
     
     // Add original bash command as comment if available
     if let Some(source_text) = &pipeline.source_text {
+        // Handle multiline source text by only taking the first line (the actual pipeline)
+        let first_line = source_text.lines().next().unwrap_or(source_text);
         output.push_str(&generator.indent());
-        output.push_str(&format!("# Original bash: {}\n", source_text));
+        output.push_str(&format!("# Original bash: {}\n", first_line));
     }
     
     if should_print {
@@ -308,7 +307,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     output.push_str(&format!("$output_{} = $output;\n", unique_id));
                 } else {
                                     // Use the builtins registry for the first command too
-                let command_output = generate_command_using_builtins(generator, command, "", &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i));
+                let command_output = generate_command_using_builtins(generator, command, "", &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
                     
                     // Split the output into lines and apply indentation
                     for line in command_output.lines() {
@@ -346,7 +345,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                         
                         // Use the builtins registry to handle command generation
                         // Pass the previous command's output as input to this command
-                        let command_output = generate_command_using_builtins(generator, command, &format!("output_{}", unique_id), &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i));
+                        let command_output = generate_command_using_builtins(generator, command, &format!("output_{}", unique_id), &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
                         
                         // Split the output into lines and apply indentation
                         for line in command_output.lines() {
@@ -376,13 +375,27 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                                 // No need to do anything
                             }
                         } else {
-                            // For non-builtin commands, use system call
-                            output.push_str(&generator.indent());
-                            output.push_str(&format!("$output_{} = `echo \"$output_{}\" | {}`;\n", 
-                                unique_id, unique_id, generator.generate_command_string_for_system(command)));
+                            // For non-builtin commands, use centralized fallback logic
+                            if let Command::Simple(cmd) = command {
+                                let fallback_output = generate_generic_builtin(generator, cmd, &format!("output_{}", unique_id), &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
+                                for line in fallback_output.lines() {
+                                    if !line.trim().is_empty() {
+                                        output.push_str(&generator.indent());
+                                        output.push_str(line);
+                                        if !line.ends_with('\n') {
+                                            output.push_str("\n");
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Non-simple command - use system call fallback
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("$output_{} = `echo \"$output_{}\" | {}`;\n", 
+                                    unique_id, unique_id, generator.generate_command_string_for_system(command)));
+                            }
                         }
                     } else {
-                        // Non-simple command
+                        // Non-simple command - use system call fallback
                         output.push_str(&generator.indent());
                         output.push_str(&format!("$output_{} = `echo \"$output_{}\" | ", unique_id, unique_id));
                         output.push_str(&generator.generate_command_string_for_system(command));
@@ -426,7 +439,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 output.push_str(&format!("my $output_{};\n", unique_id));
                 
                 // Generate ls command using builtins
-                let ls_output = generate_command_using_builtins(generator, &pipeline.commands[0], "", &format!("output_{}", unique_id), &format!("{}_0", unique_id));
+                let ls_output = generate_command_using_builtins(generator, &pipeline.commands[0], "", &format!("output_{}", unique_id), &format!("{}_0", unique_id), false);
                 for line in ls_output.lines() {
                     if !line.trim().is_empty() {
                         output.push_str(&generator.indent());
@@ -438,7 +451,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 }
                 
                 // Now apply grep filtering using builtins
-                let grep_output = generate_command_using_builtins(generator, &pipeline.commands[1], &format!("output_{}", unique_id), &format!("output_{}", unique_id), &format!("{}_1", unique_id));
+                let grep_output = generate_command_using_builtins(generator, &pipeline.commands[1], &format!("output_{}", unique_id), &format!("output_{}", unique_id), &format!("{}_1", unique_id), false);
                 for line in grep_output.lines() {
                     if !line.trim().is_empty() {
                         output.push_str(&generator.indent());
@@ -464,9 +477,17 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     output.push_str(&generator.indent());
                     output.push_str(&format!("$output_{} = $output;\n", unique_id));
                 } else {
-                    output.push_str(&format!("$output_{} = `", unique_id));
-                    output.push_str(&generator.generate_command_string_for_system(&pipeline.commands[0]));
-                    output.push_str("`;\n");
+                    // Use centralized fallback logic for the first command
+                    let fallback_output = generate_command_using_builtins(generator, &pipeline.commands[0], "", &format!("output_{}", unique_id), &format!("{}_0", unique_id), false);
+                    for line in fallback_output.lines() {
+                        if !line.trim().is_empty() {
+                            output.push_str(&generator.indent());
+                            output.push_str(line);
+                            if !line.ends_with('\n') {
+                                output.push_str("\n");
+                            }
+                        }
+                    }
                 }
                 
                 // Process remaining commands in the pipeline
@@ -478,7 +499,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                         };
                         
                         // Use the builtins registry for all commands
-                        let command_output = generate_command_using_builtins(generator, command, &format!("output_{}", unique_id), &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i + 1));
+                        let command_output = generate_command_using_builtins(generator, command, &format!("output_{}", unique_id), &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i + 1), false);
                         
                         // Split the output into lines and apply indentation
                         for line in command_output.lines() {

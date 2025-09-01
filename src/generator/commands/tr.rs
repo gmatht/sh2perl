@@ -31,14 +31,14 @@ fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, i
     
     if delete_mode && args.len() >= 1 {
         // tr -d SET1: delete characters in SET1
-        let set1 = generator.strip_shell_quotes_and_convert_to_perl(&args[0]);
+        let set1 = generator.strip_shell_quotes_for_regex(&args[0]);
         
         // For line-by-line, process the line directly
         output.push_str(&format!("${} =~ tr/{}/ /d;\n", input_var, set1));
     } else if args.len() >= 2 {
         // tr SET1 SET2: translate characters
-        let set1 = generator.strip_shell_quotes_and_convert_to_perl(&args[0]);
-        let set2 = generator.strip_shell_quotes_and_convert_to_perl(&args[1]);
+        let set1 = generator.strip_shell_quotes_for_regex(&args[0]);
+        let set2 = generator.strip_shell_quotes_for_regex(&args[1]);
         
         // For line-by-line, process the line directly
         output.push_str(&format!("${} =~ tr/{}/{}/;\n", input_var, set1, set2));
@@ -47,7 +47,6 @@ fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, i
     
     output
 }
-
 fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
     let mut output = String::new();
     
@@ -111,3 +110,4 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
     
     output
 }
+

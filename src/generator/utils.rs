@@ -112,8 +112,20 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
             generator.generate_parameter_expansion(pe)
         }
         Word::StringInterpolation(interp) => {
-            // Handle string interpolation
-            generator.convert_string_interpolation_to_perl(interp)
+            // For regex, we need the raw content without quotes
+            // For simple string interpolations with just literals, extract the raw content
+            if interp.parts.len() == 1 {
+                if let crate::ast::StringPart::Literal(s) = &interp.parts[0] {
+                    // Return the raw string content for regex
+                    s.clone()
+                } else {
+                    // Fall back to normal string interpolation handling
+                    generator.convert_string_interpolation_to_perl(interp)
+                }
+            } else {
+                // Fall back to normal string interpolation handling
+                generator.convert_string_interpolation_to_perl(interp)
+            }
         }
         _ => format!("{:?}", word)
     }

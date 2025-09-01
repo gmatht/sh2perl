@@ -25,11 +25,13 @@ pub fn generate_sort_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     if numeric {
         // For numeric sort, extract the first field (number) and sort by that
         // Use the entire line as secondary sort key for stable sort behavior
-        output.push_str(&format!("my @sort_sorted_{} = sort {{ \n", command_index));
-        output.push_str("    my @a_fields = grep { $_ ne '' } split(/\\s+/, $a);\n");
-        output.push_str("    my @b_fields = grep { $_ ne '' } split(/\\s+/, $b);\n");
-        output.push_str("    my $a_num = @a_fields > 0 ? $a_fields[0] : 0;\n");
-        output.push_str("    my $b_num = @b_fields > 0 ? $b_fields[0] : 0;\n");
+        output.push_str(&format!("my @sort_sorted_{} = sort {{\n", command_index));
+        output.push_str("    my @a_fields = split(/\\s+/, $a);\n");
+        output.push_str("    my @b_fields = split(/\\s+/, $b);\n");
+        output.push_str("    my $a_num = 0;\n");
+        output.push_str("    my $b_num = 0;\n");
+        output.push_str("    if (scalar(@a_fields) > 0 && $a_fields[0] =~ /^\\d+$/) { $a_num = $a_fields[0]; }\n");
+        output.push_str("    if (scalar(@b_fields) > 0 && $b_fields[0] =~ /^\\d+$/) { $b_num = $b_fields[0]; }\n");
         output.push_str("    $a_num <=> $b_num || $a cmp $b;\n");
         output.push_str(&format!("}} @sort_lines_{};\n", command_index));
     } else {

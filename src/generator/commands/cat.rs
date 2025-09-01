@@ -33,16 +33,21 @@ pub fn generate_cat_command(generator: &mut Generator, cmd: &SimpleCommand, redi
         };
         
         output.push_str(&format!("${} = '';\n", input_var));
-        output.push_str(&format!("if (open(my $fh, '<', '{}')) {{\n", filename));
+        // For relative filenames, use current directory
+        let adjusted_filename = if !filename.starts_with('/') && !filename.starts_with('.') && filename != "" {
+            format!("./{}", filename)
+        } else {
+            filename.clone()
+        };
+        output.push_str(&format!("if (open(my $fh, '<', '{}')) {{\n", adjusted_filename));
         output.push_str("while (my $line = <$fh>) {\n");
-        output.push_str("$line =~ s/\\r\\n?/\\n/g; # Normalize line endings\n");
         output.push_str(&format!("${} .= $line;\n", input_var));
         output.push_str("}\n");
         output.push_str("close($fh);\n");
         output.push_str(&format!("# Ensure content ends with newline to prevent line concatenation\n"));
         output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", input_var, input_var));
         output.push_str("} else {\n");
-        output.push_str(&format!("warn \"cat: {}: No such file or directory\";\n", filename));
+        output.push_str(&format!("warn \"cat: {}: No such file or directory\";\n", adjusted_filename));
         output.push_str("exit(1);\n");
         output.push_str("}\n");
         output.push_str("\n");

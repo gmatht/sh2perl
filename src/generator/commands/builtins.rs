@@ -111,7 +111,7 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
 
 /// Generate generic Perl code for a builtin command that doesn't need special handling
 /// This is a fallback for commands that don't have specialized modules
-pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, output_var: &str, command_index: &str) -> String {
+pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, output_var: &str, command_index: &str, linebyline: bool) -> String {
     let command_name = match &cmd.name {
         Word::Literal(s) => s,
         _ => "unknown_command"
@@ -135,8 +135,8 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             crate::generator::commands::uniq::generate_uniq_command(generator, cmd, input_var, command_index)
         },
         "tr" => {
-            // Pass the full command_index string
-            crate::generator::commands::tr::generate_tr_command(generator, cmd, input_var, command_index, false)
+            // Pass the full command_index string and linebyline parameter
+            crate::generator::commands::tr::generate_tr_command(generator, cmd, input_var, command_index, linebyline)
         },
         "xargs" => {
             // Pass the full command_index string
@@ -285,18 +285,27 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             crate::generator::commands::tee::generate_tee_command(generator, cmd, input_var)
         },
         _ => {
-            let args: Vec<String> = cmd.args.iter()
-                .filter_map(|arg| match arg {
-                    Word::Literal(s) => Some(s.clone()),
-                    _ => None
-                })
-                .collect();
-            let args_str = args.join(" ");
-            format!("${} = `echo \"${}\" | {} {}`;\n", output_var, input_var, command_name, args_str)
+            // Fallback for unknown commands - use system call
+            generate_system_call_fallback(command_name, cmd, input_var, output_var)
         }
     }
 }
 
-
-
-
+/// Generate a system call fallback for unknown commands
+fn generate_system_call_fallback(command_name: &str, cmd: &SimpleCommand, input_var: &str, output_var: &str) -> String {
+    let args: Vec<String> = cmd.args.iter()
+        .filter_map(|arg| match arg {
+            Word::Literal(s) => Some(s.clone()),
+            _ => None
+        })
+        .collect();
+    let args_str = args.join(" ");
+    
+    if input_var.is_empty() {
+        // First command in pipeline
+        format!("${} = `{} {}`;\n", output_var, command_name, args_str)
+    } else {
+        // Subsequent command
+        format!("${} = `echo \"${}\" | {} {}`;\n", output_var, input_var, command_name, args_str)
+    }
+}

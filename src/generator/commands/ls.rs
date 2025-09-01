@@ -8,13 +8,16 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
     output.push_str(&generator.indent());
     output.push_str(&format!("my @{};\n", array_name));
     
+    // For ls . command, search from current directory
+    let search_dir = if dir == "." { "." } else { dir };
+    
     // Check if this is a glob pattern (contains * or ?)
-    let is_glob = dir.contains('*') || dir.contains('?');
+    let is_glob = search_dir.contains('*') || search_dir.contains('?');
     
     if is_glob {
         // For glob patterns, use Perl's glob function
         output.push_str(&generator.indent());
-        output.push_str(&format!("@{} = glob('{}');\n", array_name, dir));
+        output.push_str(&format!("@{} = glob('{}');\n", array_name, search_dir));
         
         if sort_files {
             output.push_str(&generator.indent());
@@ -25,7 +28,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
         if sort_files {
             // For sorting, we still need to collect files first
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (opendir(my $dh, '{}')) {{\n", dir));
+            output.push_str(&format!("if (opendir(my $dh, '{}')) {{\n", search_dir));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str("while (my $file = readdir($dh)) {\n");
@@ -48,7 +51,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             // For non-sorting, collect to array instead of printing directly
             // This is needed for pipeline context where we need the array
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (opendir(my $dh, '{}')) {{\n", dir));
+            output.push_str(&format!("if (opendir(my $dh, '{}')) {{\n", search_dir));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str("while (my $file = readdir($dh)) {\n");

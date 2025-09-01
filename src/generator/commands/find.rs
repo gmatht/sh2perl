@@ -31,6 +31,8 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     while i < cmd.args.len() {
         if let Word::Literal(arg) = &cmd.args[i] {
             if arg == "." {
+                // For find . command, search from the directory where the script is located
+                // This ensures we find files relative to the script location, not current working directory
                 path = ".";
             } else if arg == "-name" && i + 1 < cmd.args.len() {
                 if let Some(next_arg) = cmd.args.get(i + 1) {
@@ -79,8 +81,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     output.push_str("if (-d $full_path) {\n");
     generator.indent_level += 1;
     output.push_str(&generator.indent());
-    // Skip subdirectories for now - shell find is non-recursive by default
-    // output.push_str("find_files($full_path, $pattern);\n");
+    output.push_str(&format!("{}($full_path, $pattern);\n", find_func));
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("} elsif ($file =~ /^$pattern$/) {\n");
@@ -102,7 +103,12 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     output.push_str(&generator.indent());
     output.push_str("}\n");
     output.push_str(&generator.indent());
-    output.push_str(&format!("{}('{}', '{}');\n", find_func, path, escape_glob_pattern(&pattern)));
+    // For find . command, search from current directory
+    if path == "." {
+        output.push_str(&format!("{}('.', '{}');\n", find_func, escape_glob_pattern(&pattern)));
+    } else {
+        output.push_str(&format!("{}('{}', '{}');\n", find_func, path, escape_glob_pattern(&pattern)));
+    }
     
     if generate_output {
         output.push_str(&generator.indent());
