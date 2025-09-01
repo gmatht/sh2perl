@@ -42,25 +42,39 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
     // OR operations should NEVER capture STDOUT - they're about conditional execution
     output.push_str(&generator.indent());
     
-    // Execute left command and check exit code
-    output.push_str(&generator.generate_command(left));
-    
-    // Execute right command if left command fails
-    // For diff commands, check $diff_exit_code; for others, check $?
-    let exit_code_var = if contains_diff_command(left) {
-        "$diff_exit_code"
+    // Check if left is a test expression
+    if let Command::TestExpression(_) = left {
+        // For test expressions, generate: if (!left) { right }
+        output.push_str("if (!(");
+        output.push_str(&generator.generate_command(left));
+        output.push_str(")) {\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&generator.generate_command(right));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     } else {
-        "$?"
-    };
-    
-    output.push_str(&generator.indent());
-    output.push_str(&format!("if ({} != 0) {{\n", exit_code_var));
-    generator.indent_level += 1;
-    output.push_str(&generator.indent());
-    output.push_str(&generator.generate_command(right));
-    generator.indent_level -= 1;
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
+        // Execute left command and check exit code
+        output.push_str(&generator.generate_command(left));
+        
+        // Execute right command if left command fails
+        // For diff commands, check $diff_exit_code; for others, check $?
+        let exit_code_var = if contains_diff_command(left) {
+            "$diff_exit_code"
+        } else {
+            "$?"
+        };
+        
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if ({} != 0) {{\n", exit_code_var));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&generator.generate_command(right));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
+    }
     
     output
 }

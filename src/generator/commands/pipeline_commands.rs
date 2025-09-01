@@ -11,37 +11,127 @@ fn generate_command_using_builtins(
     command_index: &str,
     linebyline: bool
 ) -> String {
-    if let Command::Simple(cmd) = command {
-        let cmd_name = match &cmd.name {
-            Word::Literal(s) => s,
-            _ => "unknown_command"
-        };
-        
-        if is_builtin(cmd_name) {
-            // Route to specialized modules via generate_generic_builtin
-            if input_var.is_empty() {
-                // First command in pipeline - generate without input
-                generate_generic_builtin(generator, cmd, "", output_var, command_index, linebyline)
+    match command {
+        Command::Simple(cmd) => {
+            let cmd_name = match &cmd.name {
+                Word::Literal(s) => s,
+                _ => "unknown_command"
+            };
+            
+            if is_builtin(cmd_name) {
+                // Route to specialized modules via generate_generic_builtin
+                if input_var.is_empty() {
+                    // First command in pipeline - generate without input
+                    generate_generic_builtin(generator, cmd, "", output_var, command_index, linebyline)
+                } else {
+                    // Subsequent command - use previous output as input
+                    generate_generic_builtin(generator, cmd, input_var, output_var, command_index, linebyline)
+                }
             } else {
-                // Subsequent command - use previous output as input
+                // Non-builtin command - use centralized fallback logic
                 generate_generic_builtin(generator, cmd, input_var, output_var, command_index, linebyline)
             }
-        } else {
-            // Non-builtin command - use centralized fallback logic
-            generate_generic_builtin(generator, cmd, input_var, output_var, command_index, linebyline)
-        }
-    } else {
-        // Non-simple command - use system call fallback
-        if input_var.is_empty() {
-            // First command in pipeline
-            format!("${} = `{}`;\n", 
-                output_var, 
-                generator.generate_command_string_for_system(command))
-        } else {
-            // Subsequent command
-            format!("${} = `echo \"${}\" | {}`;\n", 
-                output_var, input_var, 
-                generator.generate_command_string_for_system(command))
+        },
+        Command::For(for_loop) => {
+            // Handle for loops in pipeline context
+            if input_var.is_empty() {
+                // First command in pipeline - generate for loop that outputs to the output variable
+                let mut output = String::new();
+                output.push_str(&format!("${} = '';\n", output_var));
+                output.push_str(&format!("my @{}_items = (", output_var));
+                
+                // Generate the items list
+                let mut all_items = Vec::new();
+                for word in &for_loop.items {
+                    match word {
+                        Word::StringInterpolation(interp) => {
+                            if interp.parts.len() == 1 {
+                                if let StringPart::Variable(var) = &interp.parts[0] {
+                                    match var.as_str() {
+                                        "@" => all_items.push("@ARGV".to_string()),
+                                        "*" => all_items.push("@ARGV".to_string()),
+                                        _ => all_items.push(generator.word_to_perl(word))
+                                    }
+                                } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
+                                    if pe.operator == ParameterExpansionOperator::ArraySlice("@".to_string(), None) {
+                                        if pe.variable.starts_with('!') {
+                                            let map_name = &pe.variable[1..];
+                                            all_items.push(format!("keys %{}", map_name));
+                                        } else {
+                                            all_items.push(format!("@{}", pe.variable));
+                                        }
+                                    } else {
+                                        all_items.push(generator.word_to_perl(word));
+                                    }
+                                } else {
+                                    all_items.push(generator.word_to_perl(word));
+                                }
+                            } else {
+                                all_items.push(generator.word_to_perl(word));
+                            }
+                        }
+                        _ => all_items.push(generator.word_to_perl(word))
+                    }
+                }
+                output.push_str(&all_items.join(", "));
+                output.push_str(");\n");
+                
+                // Generate the for loop body that outputs to the output variable
+                output.push_str(&format!("for my ${} (@{}_items) {{\n", for_loop.variable, output_var));
+                generator.indent_level += 1;
+                
+                // Generate the body commands, but capture their output instead of printing
+                for cmd in &for_loop.body.commands {
+                    if let Command::Simple(simple_cmd) = cmd {
+                        if let Word::Literal(cmd_name) = &simple_cmd.name {
+                            if cmd_name == "echo" {
+                                // For echo commands, append to output variable
+                                let echo_args: Vec<String> = simple_cmd.args.iter()
+                                    .map(|arg| generator.perl_string_literal(arg))
+                                    .collect();
+                                let echo_output = echo_args.join(" . ");
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("${} .= {} . \"\\n\";\n", output_var, echo_output));
+                            } else {
+                                // For other commands, execute and capture output
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("${} .= `{}`;\n", output_var, generator.generate_command_string_for_system(cmd)));
+                            }
+                        } else {
+                            // For other command types, execute and capture output
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("${} .= `{}`;\n", output_var, generator.generate_command_string_for_system(cmd)));
+                        }
+                    } else {
+                        // For non-simple commands, execute and capture output
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("${} .= `{}`;\n", output_var, generator.generate_command_string_for_system(cmd)));
+                    }
+                }
+                
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                
+                output
+            } else {
+                // Subsequent command - this shouldn't happen for for loops, but handle gracefully
+                format!("# For loop as subsequent command in pipeline not supported\n")
+            }
+        },
+        _ => {
+            // Other non-simple commands - use system call fallback
+            if input_var.is_empty() {
+                // First command in pipeline
+                format!("${} = `{}`;\n", 
+                    output_var, 
+                    generator.generate_command_string_for_system(command))
+            } else {
+                // Subsequent command
+                format!("${} = `echo \"${}\" | {}`;\n", 
+                    output_var, input_var, 
+                    generator.generate_command_string_for_system(command))
+            }
         }
     }
 }
@@ -306,31 +396,16 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     output.push_str(&generator.indent());
                     output.push_str(&format!("$output_{} = $output;\n", unique_id));
                 } else {
-                    // Handle the first command
-                    if let Command::Simple(cmd) = command {
-                        if let Word::Literal(cmd_name) = &cmd.name {
-                            if cmd_name == "echo" {
-                                // For echo commands, just output the arguments directly
-                                let echo_args: Vec<String> = cmd.args.iter()
-                                    .map(|arg| generator.perl_string_literal(arg))
-                                    .collect();
-                                let echo_output = echo_args.join(" . ");
-                                output.push_str(&generator.indent());
-                                output.push_str(&format!("$output_{} = {};\n", unique_id, echo_output));
-                            } else {
-                                // Use the builtins registry for other commands
-                                let command_output = generate_command_using_builtins(generator, command, "", &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
-                                
-                                // Split the output into lines and apply indentation
-                                for line in command_output.lines() {
-                                    if !line.trim().is_empty() {
-                                        output.push_str(&generator.indent());
-                                        output.push_str(line);
-                                        if !line.ends_with('\n') {
-                                            output.push_str("\n");
-                                        }
-                                    }
-                                }
+                    // Handle the first command - use generate_command_using_builtins for all command types
+                    let command_output = generate_command_using_builtins(generator, command, "", &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
+                    
+                    // Split the output into lines and apply indentation
+                    for line in command_output.lines() {
+                        if !line.trim().is_empty() {
+                            output.push_str(&generator.indent());
+                            output.push_str(line);
+                            if !line.ends_with('\n') {
+                                output.push_str("\n");
                             }
                         }
                     }

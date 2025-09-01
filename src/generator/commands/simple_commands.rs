@@ -5,6 +5,61 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Static counter for generating unique temp file names
 static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Generate Perl code for echo command
+pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, output_var: &str) -> String {
+    let mut output = String::new();
+    
+    if cmd.args.is_empty() {
+        output.push_str(&format!("${} = \"\\n\";\n", output_var));
+    } else {
+        // Convert arguments to Perl format
+        let args: Vec<String> = cmd.args.iter()
+            .map(|arg| {
+                // For echo commands, handle special variables differently
+                match arg {
+                    Word::Variable(var) => {
+                        match var.as_str() {
+                            "#" => "scalar(@ARGV)".to_string(),
+                            "@" => "@ARGV".to_string(),
+                            _ => format!("${}", var)
+                        }
+                    }
+                    Word::StringInterpolation(interp) => {
+                        // Handle quoted variables like "$#" -> scalar(@ARGV)
+                        if interp.parts.len() == 1 {
+                            if let StringPart::Variable(var) = &interp.parts[0] {
+                                match var.as_str() {
+                                    "#" => "scalar(@ARGV)".to_string(),
+                                    "@" => "@ARGV".to_string(),
+                                    _ => format!("${}", var)
+                                }
+                            } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
+                                // Handle parameter expansion like "${#arr[@]}" -> scalar(@arr)
+                                generator.generate_parameter_expansion(pe)
+                            } else {
+                                generator.perl_string_literal(arg)
+                            }
+                        } else {
+                            generator.perl_string_literal(arg)
+                        }
+                    }
+                    _ => generator.perl_string_literal(arg)
+                }
+            })
+            .collect();
+        
+        if args.len() == 1 {
+            output.push_str(&format!("${} = {};\n", output_var, args[0]));
+        } else {
+            // For multiple arguments, join them with spaces
+            let args_str = args.join(" . \" \" . ");
+            output.push_str(&format!("${} = {};\n", output_var, args_str));
+        }
+    }
+    
+    output
+}
+
 pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
     
@@ -220,6 +275,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             "@" => "@ARGV".to_string(),
                                             _ => format!("${}", var)
                                         }
+                                    } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
+                                        // Handle parameter expansion like "${#arr[@]}" -> scalar(@arr)
+                                        generator.generate_parameter_expansion(pe)
                                     } else {
                                         generator.perl_string_literal(arg)
                                     }

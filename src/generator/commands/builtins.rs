@@ -148,9 +148,15 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         },
         // Echo is handled in simple_commands.rs, so use generic fallback
         // "echo" => { ... },
+        "echo" => {
+            // Use the echo command generator from simple_commands.rs
+            crate::generator::commands::simple_commands::generate_echo_command(generator, cmd, input_var, output_var)
+        },
         "printf" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::printf::generate_printf_command(generator, cmd, input_var, 0)
+            // Parse command_index to get the numeric part for printf
+            let index_num = command_index.split('_').next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+            crate::generator::commands::printf::generate_printf_command(generator, cmd, input_var, index_num)
         },
         "cat" => {
             // For now, use the existing signature but we should standardize this
