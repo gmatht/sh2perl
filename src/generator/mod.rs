@@ -45,6 +45,9 @@ impl Generator {
         output.push_str("use warnings;\n");
         output.push_str("use File::Basename;\n\n");
         
+        // Add main exit code variable for pipeline tracking
+        output.push_str("my $main_exit_code = 0;\n\n");
+        
         for command in ast {
             // Reset indentation level for each top-level command to prevent staircase effect
             self.indent_level = 0;
@@ -56,6 +59,9 @@ impl Generator {
                 output.push('\n');
             }
         }
+        
+        // Add final exit statement
+        output.push_str("\nexit($main_exit_code);\n");
         
         output
     }

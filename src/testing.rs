@@ -24,6 +24,7 @@ pub struct TestResult {
     pub translated_code: String,
     pub ast: String,
     pub _lexer_output: String, // Unused field, prefixed with underscore
+    pub failure_reason: String, // Reason for test failure
 }
 
 #[derive(Debug, Clone)]
@@ -519,9 +520,28 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
 
     // Determine success based on exit status AND output matching
     // Both exit status and output must match for success
-    let success = shell_success == _trans_success && 
-                  shell_stdout == trans_stdout && 
-                  shell_stderr == trans_stderr;
+    let exit_code_match = shell_success == _trans_success;
+    let stdout_match = shell_stdout == trans_stdout;
+    let stderr_match = shell_stderr == trans_stderr;
+    
+    let success = exit_code_match && stdout_match && stderr_match;
+    
+    // Generate detailed failure reason
+    let failure_reason = if !success {
+        let mut reasons = Vec::new();
+        if !exit_code_match {
+            reasons.push("exit code mismatch");
+        }
+        if !stdout_match {
+            reasons.push("stdout mismatch");
+        }
+        if !stderr_match {
+            reasons.push("stderr mismatch");
+        }
+        format!("Failed due to: {}", reasons.join(", "))
+    } else {
+        String::new()
+    };
 
     // Save cache if we made any updates
     cache.save();
@@ -538,6 +558,7 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
         translated_code,
         ast,
         _lexer_output: String::new(), // No lexer output for detailed test
+        failure_reason,
     })
 }
 
@@ -837,6 +858,12 @@ pub fn test_all_examples_next_fail(generators: &[String], test_number: Option<us
                         println!("Generator: {}", generator);
                         println!("Test: {}/{}", current_test, total_tests);
                         println!("Tests passed before failure: {}", passed_tests);
+                        
+                        // Show failure reason
+                        if !result.failure_reason.is_empty() {
+                            println!("Failure Reason: {}", result.failure_reason);
+                        }
+                        
                         println!("{}", "=".repeat(80));
                         
                         // Show exit code comparison (NOTE: Exit code differences are currently ignored - see TODO in code)

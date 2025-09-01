@@ -90,6 +90,7 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
         let set2 = generator.strip_shell_quotes_and_convert_to_perl(&args[1]);
         
         output.push_str(&format!("my $set1 = {};\n", set1));
+        output.push_str(&format!("my $set2 = {};\n", set2));
         output.push_str(&format!("my $input = ${};\n", input_var));
         
         // Character-by-character translation

@@ -1,0 +1,13 @@
+#!/bin/bash
+
+echo "To run this test: ./fail FAILING_TEST_NUMBER"
+echo "To run a specific test: ./fail TEST_NUMBER"
+
+git stash push examples ./f.bat ./fail.bat ./fail ./src/main.rs src/testing.rs src/execution.rs
+cargo run --bin debashc -- fail "$@"
+
+# Note: The Windows-specific powershell command for simulating keypresses
+# cannot be directly converted to shell script. If you need similar functionality
+# on Unix/Linux, you might need to use tools like xdotool or similar.
+# For now, this is commented out as it's not portable.
+# echo "Keypress simulation not available in shell script version"

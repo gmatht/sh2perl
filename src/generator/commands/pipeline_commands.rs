@@ -72,7 +72,18 @@ pub fn generate_pipeline_with_print_option(generator: &mut Generator, pipeline: 
 /// Generate a simple pipe pipeline (commands connected with |)
 fn generate_simple_pipe_pipeline(generator: &mut Generator, pipeline: &Pipeline, should_print: bool) -> String {
     // Check if we can use line-by-line processing
-    if pipeline_supports_linebyline(pipeline) {
+    // Force pipelines that start with 'cat' to use buffered approach for proper exit code handling
+    let force_buffered = if let Command::Simple(first_cmd) = &pipeline.commands[0] {
+        if let Word::Literal(name) = &first_cmd.name {
+            name == "cat"
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    
+    if !force_buffered && pipeline_supports_linebyline(pipeline) {
         generate_streaming_pipeline(generator, pipeline, should_print)
     } else {
         generate_buffered_pipeline(generator, pipeline, should_print)
@@ -293,6 +304,10 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
             }
         }
         
+        // Track pipeline success for proper exit code handling
+        output.push_str(&generator.indent());
+        output.push_str(&format!("my $pipeline_success_{} = 1;\n", unique_id));
+        
         for (i, command) in pipeline.commands.iter().enumerate() {
             if i > 0 {
                 output.push_str("\n");
@@ -316,6 +331,21 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                             output.push_str(line);
                             if !line.ends_with('\n') {
                                 output.push_str("\n");
+                            }
+                        }
+                    }
+                    
+                    // Check if the first command failed (e.g., cat with non-existent file)
+                    // If the output is empty, the command likely failed
+                    if let Command::Simple(cmd) = command {
+                        if let Word::Literal(cmd_name) = &cmd.name {
+                            if cmd_name == "cat" {
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("if ($output_{} eq '') {{\n", unique_id));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
+                                output.push_str(&generator.indent());
+                                output.push_str("}\n");
                             }
                         }
                     }
@@ -370,6 +400,16 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                                 let result_var = format!("{}_result_{}_{}", cmd_name, unique_id, i);
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("$output_{} = ${};\n", unique_id, result_var));
+                                
+                                // Track exit code for grep commands (exit 1 if no matches found)
+                                if cmd_name == "grep" {
+                                    output.push_str(&generator.indent());
+                                    output.push_str(&format!("if (scalar(@grep_filtered_{}_{}) == 0) {{\n", unique_id, i));
+                                    output.push_str(&generator.indent());
+                                    output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
+                                    output.push_str(&generator.indent());
+                                    output.push_str("}\n");
+                                }
                             } else {
                                 // For commands that modify input directly, the output is already in $output_{}
                                 // No need to do anything
@@ -414,6 +454,10 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
             output.push_str(&format!("print \"\\n\" unless $output_{} =~ /\\n$/;\n", unique_id));
         }
         
+        // Track pipeline success for overall script exit code
+        output.push_str(&generator.indent());
+        output.push_str(&format!("$main_exit_code = 1 unless $pipeline_success_{};\n", unique_id));
+        
         generator.indent_level -= 1;
         output.push_str("}\n");
     } else {
@@ -437,6 +481,10 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 let unique_id = generator.get_unique_id();
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $output_{};\n", unique_id));
+                
+                // Track pipeline success for proper exit code handling
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my $pipeline_success_{} = 1;\n", unique_id));
                 
                 // Generate ls command using builtins
                 let ls_output = generate_command_using_builtins(generator, &pipeline.commands[0], "", &format!("output_{}", unique_id), &format!("{}_0", unique_id), false);
@@ -462,13 +510,29 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     }
                 }
                 
+                // Track exit code for grep (exit 1 if no matches found)
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (scalar(@grep_filtered_{}_1) == 0) {{\n", unique_id));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
+                
+                // Track pipeline success for overall script exit code
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$main_exit_code = 1 unless $pipeline_success_{};\n", unique_id));
             } else {
                 // Generic 2-command pipeline
                 let unique_id = generator.get_unique_id();
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $output_{};\n", unique_id));
+                
+                // Track pipeline success for proper exit code handling
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my $pipeline_success_{} = 1;\n", unique_id));
                 
                 // Handle the first command
                 output.push_str(&generator.indent());
@@ -511,11 +575,25 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                                 }
                             }
                         }
+                        
+                        // Track exit code for grep commands (exit 1 if no matches found)
+                        if cmd_name == "grep" {
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("if (scalar(@grep_filtered_{}_{}) == 0) {{\n", unique_id, i + 1));
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
+                            output.push_str(&generator.indent());
+                            output.push_str("}\n");
+                        }
                     }
                 }
                 
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
+                
+                // Track pipeline success for overall script exit code
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$main_exit_code = 1 unless $pipeline_success_{};\n", unique_id));
             }
         }
         generator.indent_level -= 1;
