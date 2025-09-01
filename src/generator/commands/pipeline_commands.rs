@@ -367,11 +367,11 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         output.push_str(&generator.indent());
         output.push_str(&format!("my $output_{};\n", unique_id));
         
-        // Declare all variables that will be used in this pipeline to avoid scope issues
+        // Declare result variables only for commands that emit separate result vars
         for (i, command) in pipeline.commands.iter().enumerate() {
             if let Command::Simple(cmd) = command {
                 if let Word::Literal(cmd_name) = &cmd.name {
-                    if matches!(cmd_name.as_str(), "grep" | "wc" | "tr" | "xargs" | "sort" | "uniq") {
+                    if matches!(cmd_name.as_str(), "grep" | "wc" | "xargs" | "tr") {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("my ${}_result_{}_{};\n", cmd_name, unique_id, i));
                     }
@@ -463,20 +463,12 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                             }
                         }
                         
-                        // For builtin commands, we need to ensure the output is properly assigned to the main output variable
-                        // This ensures the next command in the pipeline uses this command's output
+                        // For builtin commands, ensure output assignment for those with separate result vars
                         if is_builtin(cmd_name) {
-                            // Some builtin commands create result variables, others modify input directly
-                            // Commands that create result variables: grep, wc, tr, xargs
-                            // Commands that modify input directly: sort, uniq
-                            if matches!(cmd_name, "grep" | "wc" | "tr" | "xargs") {
-                                // Extract the result variable name from the command output
-                                // The command generators create variables like tr_result_0_0, grep_result_1_1, etc.
+                            if matches!(cmd_name, "grep" | "wc" | "xargs" | "tr") {
                                 let result_var = format!("{}_result_{}_{}", cmd_name, unique_id, i);
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("$output_{} = ${};\n", unique_id, result_var));
-                                
-                                // Track exit code for grep commands (exit 1 if no matches found)
                                 if cmd_name == "grep" {
                                     output.push_str(&generator.indent());
                                     output.push_str(&format!("if (scalar(@grep_filtered_{}_{}) == 0) {{\n", unique_id, i));
@@ -485,9 +477,6 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                                     output.push_str(&generator.indent());
                                     output.push_str("}\n");
                                 }
-                            } else {
-                                // For commands that modify input directly, the output is already in $output_{}
-                                // No need to do anything
                             }
                         } else {
                             // For non-builtin commands, use centralized fallback logic

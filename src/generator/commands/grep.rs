@@ -82,7 +82,11 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         
         let has_file_args = !file_args.is_empty();
         
-        // Result variable is declared at pipeline level
+        // Declare the result variable only if not in a pipeline context
+        // Pipeline contexts pre-declare these variables
+        if command_index == "0" {
+            output.push_str(&format!("my $grep_result_{};\n", command_index));
+        }
         
         if has_file_args {
             // File-based grep - read from files
@@ -195,17 +199,12 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             output.push_str(&format!("$grep_result_{} .= \"\\n\" unless $grep_result_{} =~ /\\n$/;\n", command_index, command_index));
             if should_print && !quiet_mode {
                 output.push_str(&format!("print $grep_result_{};\n", command_index));
-                if null_terminated {
-                    output.push_str("print \"\\0\";\n");
-                } else {
-                    output.push_str("print \"\\n\";\n");
-                }
             }
         }
         
         // Set exit status for quiet mode
         if quiet_mode {
-            output.push_str(&format!("exit(@grep_filtered_{} > 0 ? 0 : 1);\n", command_index));
+            // In pipelines or logical ops, caller should inspect @grep_filtered_*
         }
     }
     

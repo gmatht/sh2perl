@@ -47,6 +47,7 @@ pub fn generate_xargs_command(_generator: &mut Generator, cmd: &SimpleCommand, i
         output.push_str(&format!("push @xargs_matching_files_{}, $file if $xargs_found_{};\n", command_index, command_index));
         output.push_str("}\n");
         output.push_str("}\n");
+        // Write into a result variable expected by the pipeline
         output.push_str(&format!("$xargs_result_{} = join(\"\\n\", @xargs_matching_files_{});\n", command_index, command_index));
         // Ensure output ends with newline to match shell behavior
         output.push_str(&format!("$xargs_result_{} .= \"\\n\" unless $xargs_result_{} =~ /\\n$/;\n", command_index, command_index));

@@ -119,8 +119,9 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
     
     match command_name {
         "grep" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::grep::generate_grep_command(generator, cmd, input_var, command_index, false)
+            // Print only for standalone grep (no pipeline input/output)
+            let should_print = input_var.is_empty() && output_var.is_empty();
+            crate::generator::commands::grep::generate_grep_command(generator, cmd, input_var, command_index, should_print)
         },
         "wc" => {
             // For now, use the existing signature but we should standardize this
