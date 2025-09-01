@@ -194,8 +194,9 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                         process_sub_files.push((temp_var, temp_file));
                     }
                     _ => {
-                        // Handle other redirect types, but not here-strings
-                        if !matches!(redirect.operator, RedirectOperator::HereString) {
+                        // Handle other redirect types, but not here-strings or output redirects
+                        if !matches!(redirect.operator, RedirectOperator::HereString) && 
+                           !matches!(redirect.operator, RedirectOperator::Output | RedirectOperator::Append) {
                             result.push_str(&generator.generate_redirect(redirect));
                         }
                     }
@@ -440,6 +441,22 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
             // For other commands, generate normally but don't call recursively
             // Instead, generate the base command directly
             eprintln!("DEBUG: Generating base command for redirect, has_here_string: {}, command: {:?}", has_here_string, &base_command);
+            
+            // Check if we have output redirects that need to be wrapped in a local STDOUT block
+            let has_output_redirect = all_redirects.iter().any(|r| {
+                matches!(r.operator, RedirectOperator::Output | RedirectOperator::Append)
+            });
+            
+            if has_output_redirect {
+                result.push_str(&generator.indent());
+                result.push_str("{\n");
+                generator.indent_level += 1;
+                result.push_str(&generator.indent());
+                result.push_str("open(my $original_stdout, '>&', STDOUT) or die \"Cannot save STDOUT: $!\";\n");
+                result.push_str(&generator.indent());
+                result.push_str("open(STDOUT, '>', 'temp_file.txt') or die \"Cannot open file: $!\";\n");
+            }
+            
             match &base_command {
                 Command::Simple(cmd) => {
                     result.push_str(&generator.generate_simple_command(cmd));
@@ -451,6 +468,16 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                     // For other command types, use the recursive call
                     result.push_str(&generate_command_impl(generator, &base_command, false));
                 }
+            }
+            
+            if has_output_redirect {
+                result.push_str(&generator.indent());
+                result.push_str("open(STDOUT, '>&', $original_stdout) or die \"Cannot restore STDOUT: $!\";\n");
+                result.push_str(&generator.indent());
+                result.push_str("close($original_stdout);\n");
+                generator.indent_level -= 1;
+                result.push_str(&generator.indent());
+                result.push_str("}\n");
             }
             eprintln!("DEBUG: Final redirect result: {}", result);
             result

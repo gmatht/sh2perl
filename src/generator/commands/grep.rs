@@ -25,6 +25,14 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     while let Some(arg) = args_iter.next() {
         if let Word::Literal(s) = arg {
             if s.starts_with('-') {
+                // Handle --color=always first (for now, we'll ignore color since it's complex)
+                if s.starts_with("--color") {
+                    // For now, just ignore the color flag since color output is complex
+                    // The grep will work normally but without color
+                    // Don't treat this as a pattern
+                    continue;
+                }
+                
                 // Parse options
                 if s.contains('c') { count_only = true; }
                 if s.contains('n') { line_numbers = true; }
@@ -44,12 +52,6 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     if let Some(Word::Literal(next_arg)) = args_iter.next() {
                         max_count = Some(next_arg.parse().unwrap_or(0));
                     }
-                }
-                
-                // Handle --color=always (for now, we'll ignore color since it's complex)
-                if s.starts_with("--color") {
-                    // For now, just ignore the color flag since color output is complex
-                    // The grep will work normally but without color
                 }
             } else if pattern.is_empty() {
                 // First non-option argument is the pattern
@@ -225,8 +227,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             if null_terminated {
                 output.push_str(&format!("$grep_result_{} =~ s/\\n/\\0/g;\n", command_index));
             } else {
-                // Ensure output ends with newline to match shell behavior
-                output.push_str(&format!("$grep_result_{} .= \"\\n\" unless $grep_result_{} =~ /\\n$/;\n", command_index, command_index));
+                // Ensure output ends with newline to match shell behavior, but only if there are matches
+                output.push_str(&format!("$grep_result_{} .= \"\\n\" unless $grep_result_{} =~ /\\n$/ || $grep_result_{} eq '';\n", command_index, command_index, command_index));
             }
             
             if should_print && !quiet_mode {

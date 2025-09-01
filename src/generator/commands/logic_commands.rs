@@ -48,10 +48,13 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
                 output.push_str(&generator.indent());
                 // Check if grep found matches by checking if the result is non-empty
                 if !grep_result_var.is_empty() {
+                    output.push_str(&format!("$? = {} ne '' ? 0 : 1;\n", grep_result_var));
                     output.push_str(&format!("{} ne ''\n", grep_result_var));
                 } else {
+                    output.push_str("$? = 1;\n");
                     output.push_str("1\n"); // Default to true if we can't find the variable
                 }
+                
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("}");
@@ -147,8 +150,21 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                     }
                     
                     // Set the exit code based on grep result
+                    // Extract the grep_filtered variable name from the generated grep code
+                    let mut grep_filtered_var = format!("@grep_filtered_{}", unique_id);
+                    for line in grep_result.lines() {
+                        if line.contains("@grep_filtered_") {
+                            if let Some(start) = line.find("@grep_filtered_") {
+                                let var_part = &line[start..];
+                                if let Some(end) = var_part.find([' ', ';', '=', ')', ',', '\n']) {
+                                    grep_filtered_var = var_part[..end].to_string();
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("$grep_exit_code_{} = $?;\n", unique_id));
+                    output.push_str(&format!("$grep_exit_code_{} = scalar({}) > 0 ? 0 : 1;\n", unique_id, grep_filtered_var));
                     
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());

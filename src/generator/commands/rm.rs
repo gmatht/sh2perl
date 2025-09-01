@@ -161,11 +161,13 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     }
                     output.push_str("} else {\n");
                     // Silent operation - no output unless error
+                    output.push_str("$main_exit_code = 0;\n");
                     output.push_str("}\n");
                     output.push_str("} else {\n");
                     // File removal
                     output.push_str(&format!("if (unlink({})) {{\n", file));
                     // Silent operation - no output unless error
+                    output.push_str("$main_exit_code = 0;\n");
                     output.push_str("} else {\n");
                     if force {
                         output.push_str(&format!("warn \"rm: warning: could not remove \", {}, \": $!\\n\";\n", file));
@@ -185,6 +187,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("} else {\n");
                     output.push_str(&format!("if (unlink({})) {{\n", file));
                     // Silent operation - no output unless error
+                    output.push_str("$main_exit_code = 0;\n");
                     output.push_str("} else {\n");
                     if force {
                         output.push_str(&format!("warn \"rm: warning: could not remove \", {}, \": $!\\n\";\n", file));

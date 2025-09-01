@@ -153,19 +153,74 @@ fn generate_command_using_builtins(
                             }
                         }
                         
+                        // Extract the grep_filtered variable name from the generated grep code
+                        let mut grep_filtered_var = format!("@grep_filtered_{}", unique_id);
+                        for line in grep_output.lines() {
+                            if line.contains("@grep_filtered_") {
+                                if let Some(start) = line.find("@grep_filtered_") {
+                                    let var_part = &line[start..];
+                                    if let Some(end) = var_part.find([' ', ';', '=', ')', ',', '\n']) {
+                                        grep_filtered_var = var_part[..end].to_string();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("$grep_exit_code_{} = $?;\n", unique_id));
+                        output.push_str(&format!("$grep_exit_code_{} = scalar({}) > 0 ? 0 : 1;\n", unique_id, grep_filtered_var));
+                        
+                        // Set the output based on grep result
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("if ($grep_exit_code_{} == 0) {{\n", unique_id));
+                        generator.indent_level += 1;
+                        output.push_str(&generator.indent());
+                        // Extract the actual grep result variable name from the generated grep code
+                        let mut grep_result_var = format!("$grep_result_{}_{}", unique_id, command_index);
+                        for line in grep_output.lines() {
+                            if line.contains("$grep_result_") {
+                                if let Some(start) = line.find("$grep_result_") {
+                                    let var_part = &line[start..];
+                                    if let Some(end) = var_part.find([' ', ';', '=', ')', ',', '\n']) {
+                                        grep_result_var = var_part[..end].to_string();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        output.push_str(&format!("${} = {};\n", output_var, grep_result_var));
+                        // Print the result immediately to avoid scoping issues
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("my $temp_result = {};\n", grep_result_var));
+                        output.push_str(&generator.indent());
+                        output.push_str("chomp($temp_result);\n");
+                        output.push_str(&generator.indent());
+                        output.push_str("print $temp_result;\n");
+                        output.push_str(&generator.indent());
+                        output.push_str("print \"\\n\";\n");
+                        // Don't add extra newline since grep result already has one
+                        // The grep result already contains a newline, so we don't need to add another
+                        // Clear the output variable to avoid double printing at the end
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("${} = '';\n", output_var));
+                        // Set the flag to indicate output has been printed
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("$output_printed_{} = 1;\n", output_var.replace("output_", "")));
                         generator.indent_level -= 1;
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("}}\n"));
-                        output.push_str(&generator.indent());
-                        output.push_str(&format!("if ($grep_exit_code_{} != 0) {{\n", unique_id));
+                        output.push_str("} else {\n");
                         generator.indent_level += 1;
                         output.push_str(&generator.indent());
                         output.push_str(&generator.generate_command(right));
                         generator.indent_level -= 1;
                         output.push_str(&generator.indent());
                         output.push_str("}\n");
+                        
+                        generator.indent_level -= 1;
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("}}\n"));
+                        // Set pipeline success to 1 since either grep succeeded or fallback was executed
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("$pipeline_success_{} = 1;\n", output_var.replace("output_", "")));
                         return output;
                     }
                 }
@@ -486,6 +541,8 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         let unique_id = generator.get_unique_id();
         output.push_str(&generator.indent());
         output.push_str(&format!("my $output_{};\n", unique_id));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("my $output_printed_{};\n", unique_id));
         
         // Individual commands will declare their own result variables as needed
         // No need to pre-declare them here to avoid variable masking
@@ -630,10 +687,16 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         // Output the final result
         if should_print {
             output.push_str(&generator.indent());
+            output.push_str(&format!("if ($output_{} ne '' && !defined($output_printed_{})) {{\n", unique_id, unique_id));
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
             output.push_str(&format!("print $output_{};\n", unique_id));
             // Ensure output ends with newline to match shell behavior
             output.push_str(&generator.indent());
             output.push_str(&format!("print \"\\n\" unless $output_{} =~ /\\n$/;\n", unique_id));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
         }
         
         // Track pipeline success for overall script exit code
