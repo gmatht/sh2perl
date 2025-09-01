@@ -5,61 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Static counter for generating unique temp file names
 static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Generate Perl code for echo command
-pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, output_var: &str) -> String {
-    let mut output = String::new();
-    
-    if cmd.args.is_empty() {
-        output.push_str(&format!("${} = \"\\n\";\n", output_var));
-    } else {
-        // Convert arguments to Perl format
-        let args: Vec<String> = cmd.args.iter()
-            .map(|arg| {
-                // For echo commands, handle special variables differently
-                match arg {
-                    Word::Variable(var) => {
-                        match var.as_str() {
-                            "#" => "scalar(@ARGV)".to_string(),
-                            "@" => "@ARGV".to_string(),
-                            _ => format!("${}", var)
-                        }
-                    }
-                    Word::StringInterpolation(interp) => {
-                        // Handle quoted variables like "$#" -> scalar(@ARGV)
-                        if interp.parts.len() == 1 {
-                            if let StringPart::Variable(var) = &interp.parts[0] {
-                                match var.as_str() {
-                                    "#" => "scalar(@ARGV)".to_string(),
-                                    "@" => "@ARGV".to_string(),
-                                    _ => format!("${}", var)
-                                }
-                            } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
-                                // Handle parameter expansion like "${#arr[@]}" -> scalar(@arr)
-                                generator.generate_parameter_expansion(pe)
-                            } else {
-                                generator.perl_string_literal(arg)
-                            }
-                        } else {
-                            generator.perl_string_literal(arg)
-                        }
-                    }
-                    _ => generator.perl_string_literal(arg)
-                }
-            })
-            .collect();
-        
-        if args.len() == 1 {
-            output.push_str(&format!("${} = {};\n", output_var, args[0]));
-        } else {
-            // For multiple arguments, join them with spaces
-            let args_str = args.join(" . \" \" . ");
-            output.push_str(&format!("${} = {};\n", output_var, args_str));
-        }
-    }
-    
-    output
-}
-
 pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
     
@@ -249,12 +194,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     // Generate the actual command
     if let Word::Literal(ref name) = cmd.name {
         if name == "echo" {
-            // Simplified echo command handling
+            // Use the echo command generator for non-pipeline echo commands
             if cmd.args.is_empty() {
                 output.push_str(&generator.indent());
                 output.push_str("print \"\\n\";\n");
             } else {
-                // Convert arguments to Perl format
+                // Convert arguments to Perl format using the dedicated echo function
                 let args: Vec<String> = cmd.args.iter()
                     .map(|arg| {
                         // For echo commands, handle special variables differently
@@ -285,6 +230,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     generator.perl_string_literal(arg)
                                 }
                             }
+                            Word::BraceExpansion(expansion) => {
+                                // Handle brace expansion like {1..5} -> "1 2 3 4 5"
+                                handle_brace_expansion_for_echo(generator, expansion)
+                            }
                             _ => generator.perl_string_literal(arg)
                         }
                     })
@@ -294,10 +243,20 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&generator.indent());
                     output.push_str(&format!("print {}. \"\\n\";\n", args[0]));
                 } else {
-                    // For multiple arguments, join them with spaces
-                    let args_str = args.join(", ");
-                    output.push_str(&generator.indent());
-                    output.push_str(&format!("print {}. \"\\n\";\n", args_str));
+                    // Check if we have multiple brace expansions that need cartesian product
+                    let brace_expansions: Vec<&Word> = cmd.args.iter()
+                        .filter(|arg| matches!(arg, Word::BraceExpansion(_)))
+                        .collect();
+                    
+                    if brace_expansions.len() > 1 {
+                        // Generate cartesian product for multiple brace expansions
+                        output.push_str(&generate_cartesian_product_for_echo(generator, &cmd.args));
+                    } else {
+                        // For multiple arguments, join them with spaces
+                        let args_str = args.join(" . \" \" . ");
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("print {}. \"\\n\";\n", args_str));
+                    }
                 }
             }
         } else if name == "true" && !cmd.env_vars.is_empty() && cmd.args.is_empty() {
@@ -331,18 +290,43 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 }
             }
         } else {
-            // Handle other commands - delegate to builtins system or use fallback
-            if generator.declared_functions.contains(name) || *name == "greet" {
+            // Check if this is a builtin command
+            if crate::generator::commands::builtins::is_builtin(name) {
+                // For standalone builtin commands, we need to handle them differently than pipeline commands
+                match name.as_str() {
+                    "ls" => {
+                        // Standalone ls command - print files directly
+                        output.push_str(&crate::generator::commands::ls::generate_ls_command(generator, cmd, false, None));
+                    }
+                    "rm" => {
+                        // Standalone rm command
+                        output.push_str(&crate::generator::commands::rm::generate_rm_command(generator, cmd));
+                    }
+                    _ => {
+                        // Route other builtins to the builtins system
+                        output.push_str(&crate::generator::commands::builtins::generate_generic_builtin(generator, cmd, "", "", "0", false));
+                    }
+                }
+            } else if generator.declared_functions.contains(name) || *name == "greet" {
                 // Function call
                 if cmd.args.is_empty() {
                     output.push_str(&generator.indent());
                     output.push_str(&format!("{}();\n", name));
                 } else {
                     let args: Vec<String> = cmd.args.iter()
-                        .map(|arg| generator.word_to_perl(arg))
+                        .map(|arg| {
+                            match arg {
+                                Word::BraceExpansion(expansion) => {
+                                    // Handle brace expansion for command arguments
+                                    handle_brace_expansion_for_command(generator, expansion)
+                                }
+                                _ => generator.word_to_perl(arg)
+                            }
+                        })
                         .collect();
+                    let args_str = args.join(", ");
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("{}({});\n", name, args.join(", ")));
+                    output.push_str(&format!("{}({});\n", name, args_str));
                 }
             } else {
                 // System call fallback
@@ -351,10 +335,19 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&format!("system('{}');\n", name));
                 } else {
                     let args: Vec<String> = cmd.args.iter()
-                        .map(|arg| generator.word_to_perl(arg))
+                        .map(|arg| {
+                            match arg {
+                                Word::BraceExpansion(expansion) => {
+                                    // Handle brace expansion for command arguments
+                                    handle_brace_expansion_for_command(generator, expansion)
+                                }
+                                _ => generator.word_to_perl(arg)
+                            }
+                        })
                         .collect();
+                    let args_str = args.join(", ");
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("system('{}', {});\n", name, args.join(", ")));
+                    output.push_str(&format!("system('{}', {});\n", name, args_str));
                 }
             }
         }
@@ -375,6 +368,332 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
         }
     }
 
+    output
+}
+
+/// Generate Perl code for echo command
+pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, output_var: &str) -> String {
+    let mut output = String::new();
+    
+    if cmd.args.is_empty() {
+        output.push_str(&format!("${} = \"\\n\";\n", output_var));
+    } else {
+        // Convert arguments to Perl format
+        let args: Vec<String> = cmd.args.iter()
+            .map(|arg| {
+                // For echo commands, handle special variables differently
+                match arg {
+                    Word::Variable(var) => {
+                        match var.as_str() {
+                            "#" => "scalar(@ARGV)".to_string(),
+                            "@" => "@ARGV".to_string(),
+                            _ => format!("${}", var)
+                        }
+                    }
+                    Word::StringInterpolation(interp) => {
+                        // Handle quoted variables like "$#" -> scalar(@ARGV)
+                        if interp.parts.len() == 1 {
+                            if let StringPart::Variable(var) = &interp.parts[0] {
+                                match var.as_str() {
+                                    "#" => "scalar(@ARGV)".to_string(),
+                                    "@" => "@ARGV".to_string(),
+                                    _ => format!("${}", var)
+                                }
+                            } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
+                                // Handle parameter expansion like "${#arr[@]}" -> scalar(@arr)
+                                generator.generate_parameter_expansion(pe)
+                            } else {
+                                generator.perl_string_literal(arg)
+                            }
+                        } else {
+                            generator.perl_string_literal(arg)
+                        }
+                    }
+                    Word::BraceExpansion(expansion) => {
+                        // Handle brace expansion like {1..5} -> "1 2 3 4 5"
+                        handle_brace_expansion_for_echo(generator, expansion)
+                    }
+                    _ => generator.perl_string_literal(arg)
+                }
+            })
+            .collect();
+        
+        if args.len() == 1 {
+            output.push_str(&format!("${} = {};\n", output_var, args[0]));
+        } else {
+            // For multiple arguments, join them with spaces
+            let args_str = args.join(" . \" \" . ");
+            output.push_str(&format!("${} = {};\n", output_var, args_str));
+        }
+    }
+    
+    output
+}
+
+/// Handle brace expansion for echo commands
+fn handle_brace_expansion_for_echo(_generator: &mut Generator, expansion: &BraceExpansion) -> String {
+    let mut items = Vec::new();
+    
+    for item in &expansion.items {
+        match item {
+            BraceItem::Range(range) => {
+                // Handle numeric ranges like {1..5} or {00..04..2}
+                if let (Ok(start), Ok(end)) = (range.start.parse::<i32>(), range.end.parse::<i32>()) {
+                    let step = range.step.as_ref().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                    let mut current = start;
+                    
+                    // Check if we need to preserve leading zeros
+                    let format_width = if range.start.starts_with('0') && range.start.len() > 1 {
+                        Some(range.start.len())
+                    } else {
+                        None
+                    };
+                    
+                    while if step > 0 { current <= end } else { current >= end } {
+                        let formatted = if let Some(width) = format_width {
+                            format!("{:0width$}", current, width = width)
+                        } else {
+                            current.to_string()
+                        };
+                        items.push(formatted);
+                        current += step;
+                    }
+                } else {
+                    // Handle character ranges like {a..c}
+                    if let (Some(start_char), Some(end_char)) = (range.start.chars().next(), range.end.chars().next()) {
+                        let step = range.step.as_ref().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                        let mut current = start_char as i32;
+                        let end_code = end_char as i32;
+                        while if step > 0 { current <= end_code } else { current >= end_code } {
+                            if let Some(c) = char::from_u32(current as u32) {
+                                items.push(c.to_string());
+                            }
+                            current += step;
+                        }
+                    }
+                }
+            }
+            BraceItem::Literal(s) => {
+                items.push(s.clone());
+            }
+            BraceItem::Sequence(seq) => {
+                // Handle sequence items like {one,two,three}
+                for item in seq {
+                    items.push(item.clone());
+                }
+            }
+        }
+    }
+    
+    if items.is_empty() {
+        "\"\"".to_string()
+    } else {
+        // Join all items with spaces for echo output
+        format!("\"{}\"", items.join(" "))
+    }
+}
+
+/// Handle brace expansion for command arguments
+fn handle_brace_expansion_for_command(_generator: &mut Generator, expansion: &BraceExpansion) -> String {
+    let mut items = Vec::new();
+    
+    for item in &expansion.items {
+        match item {
+            BraceItem::Range(range) => {
+                // Handle numeric ranges like {1..5} or {001..005}
+                if let (Ok(start), Ok(end)) = (range.start.parse::<i32>(), range.end.parse::<i32>()) {
+                    let step = range.step.as_ref().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                    let mut current = start;
+                    
+                    // Check if we need to preserve leading zeros
+                    let format_width = if range.start.starts_with('0') && range.start.len() > 1 {
+                        Some(range.start.len())
+                    } else {
+                        None
+                    };
+                    
+                    while if step > 0 { current <= end } else { current >= end } {
+                        let formatted = if let Some(width) = format_width {
+                            format!("{:0width$}", current, width = width)
+                        } else {
+                            current.to_string()
+                        };
+                        items.push(format!("\"{}\"", formatted));
+                        current += step;
+                    }
+                } else {
+                    // Handle character ranges like {a..c}
+                    if let (Some(start_char), Some(end_char)) = (range.start.chars().next(), range.end.chars().next()) {
+                        let step = range.step.as_ref().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                        let mut current = start_char as i32;
+                        let end_code = end_char as i32;
+                        while if step > 0 { current <= end_code } else { current >= end_code } {
+                            if let Some(c) = char::from_u32(current as u32) {
+                                items.push(format!("\"{}\"", c));
+                            }
+                            current += step;
+                        }
+                    }
+                }
+            }
+            BraceItem::Literal(s) => {
+                items.push(format!("\"{}\"", s));
+            }
+            BraceItem::Sequence(seq) => {
+                // Handle sequence items like {one,two,three}
+                for item in seq {
+                    items.push(format!("\"{}\"", item));
+                }
+            }
+        }
+    }
+    
+    if items.is_empty() {
+        "\"\"".to_string()
+    } else {
+        // For command arguments, return items separated by commas for system call
+        items.join(", ")
+    }
+}
+
+/// Generate cartesian product for multiple brace expansions in echo commands
+fn generate_cartesian_product_for_echo(
+    generator: &mut Generator,
+    args: &[Word],
+) -> String {
+    let mut output = String::new();
+    
+    // Collect all brace expansions and their expanded values
+    let mut expansions: Vec<Vec<String>> = Vec::new();
+    let mut non_brace_args: Vec<String> = Vec::new();
+    
+    for arg in args {
+        match arg {
+            Word::BraceExpansion(items) => {
+                let mut expanded = Vec::new();
+                for item in &items.items {
+                    match item {
+                        BraceItem::Range(range) => {
+                            // Handle numeric ranges like {1..5} or {001..005}
+                            if let (Ok(start), Ok(end)) = (range.start.parse::<i32>(), range.end.parse::<i32>()) {
+                                let step = range.step.as_ref().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                                let mut current = start;
+                                
+                                // Check if we need to preserve leading zeros
+                                let format_width = if range.start.starts_with('0') && range.start.len() > 1 {
+                                    Some(range.start.len())
+                                } else {
+                                    None
+                                };
+                                
+                                while if step > 0 { current <= end } else { current >= end } {
+                                    let formatted = if let Some(width) = format_width {
+                                        format!("{:0width$}", current, width = width)
+                                    } else {
+                                        current.to_string()
+                                    };
+                                    expanded.push(formatted);
+                                    current += step;
+                                }
+                            } else {
+                                // Handle character ranges like {a..c}
+                                if let (Some(start_char), Some(end_char)) = (range.start.chars().next(), range.end.chars().next()) {
+                                    let step = range.step.as_ref().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                                    let mut current = start_char as i32;
+                                    let end_code = end_char as i32;
+                                    while if step > 0 { current <= end_code } else { current >= end_code } {
+                                        if let Some(c) = char::from_u32(current as u32) {
+                                            expanded.push(c.to_string());
+                                        }
+                                        current += step;
+                                    }
+                                }
+                            }
+                        }
+                        BraceItem::Literal(s) => {
+                            expanded.push(s.clone());
+                        }
+                        BraceItem::Sequence(seq) => {
+                            // Handle sequence items like {one,two,three}
+                            for item in seq {
+                                expanded.push(item.clone());
+                            }
+                        }
+                    }
+                }
+                expansions.push(expanded);
+            }
+            _ => {
+                // Convert non-brace arguments to Perl strings
+                non_brace_args.push(generator.word_to_perl(arg));
+            }
+        }
+    }
+    
+    if expansions.is_empty() {
+        // No brace expansions, fall back to simple joining
+        let args_str = args.iter()
+            .map(|arg| generator.word_to_perl(arg))
+            .collect::<Vec<_>>()
+            .join(" . \" \" . ");
+        output.push_str(&generator.indent());
+        output.push_str(&format!("print {}. \"\\n\";\n", args_str));
+        return output;
+    }
+    
+    // Generate cartesian product
+    let mut combinations = vec![Vec::new()];
+    
+    for expansion in &expansions {
+        let mut new_combinations = Vec::new();
+        for combination in &combinations {
+            for item in expansion {
+                let mut new_combo = combination.clone();
+                new_combo.push(item.clone());
+                new_combinations.push(new_combo);
+            }
+        }
+        combinations = new_combinations;
+    }
+    
+    // Generate Perl code to print all combinations
+    output.push_str(&generator.indent());
+    output.push_str("my @combinations = (\n");
+    
+    for combination in &combinations {
+        output.push_str(&generator.indent());
+        output.push_str("    ");
+        
+        let mut combo_parts = Vec::new();
+        
+        // Add non-brace arguments at the beginning
+        for non_brace in &non_brace_args {
+            combo_parts.push(non_brace.clone());
+        }
+        
+        // Add brace expansion values
+        for item in combination {
+            combo_parts.push(format!("'{}'", item));
+        }
+        
+        output.push_str(&format!("[{}],\n", combo_parts.join(", ")));
+    }
+    
+    output.push_str(&generator.indent());
+    output.push_str(");\n");
+    
+    output.push_str(&generator.indent());
+    output.push_str("my @all_combinations;\n");
+    output.push_str(&generator.indent());
+    output.push_str("for my $combo (@combinations) {\n");
+    output.push_str(&generator.indent());
+    output.push_str(&generator.indent());
+    output.push_str("push @all_combinations, join(\"\", @$combo);\n");
+    output.push_str(&generator.indent());
+    output.push_str("}\n");
+    output.push_str(&generator.indent());
+    output.push_str("print join(\" \", @all_combinations) . \"\\n\";\n");
+    
     output
 }
 
