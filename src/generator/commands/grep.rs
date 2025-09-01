@@ -19,16 +19,18 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     let mut show_filename = false;
     let mut null_terminated = false;
     let mut list_only = false;
+    let mut color_always = false;
     
     // First pass: identify options and find the pattern
     let mut args_iter = cmd.args.iter();
     while let Some(arg) = args_iter.next() {
         if let Word::Literal(s) = arg {
             if s.starts_with('-') {
-                // Handle --color=always first (for now, we'll ignore color since it's complex)
+                // Handle --color=always first
                 if s.starts_with("--color") {
-                    // For now, just ignore the color flag since color output is complex
-                    // The grep will work normally but without color
+                    if s == "--color=always" {
+                        color_always = true;
+                    }
                     // Don't treat this as a pattern
                     continue;
                 }
@@ -220,7 +222,18 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_with_filename_{});\n", command_index, command_index));
             } else {
                 // Default: just output matching lines (handles -h flag implicitly by not adding filename)
-                output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_filtered_{});\n", command_index, command_index));
+                if color_always {
+                    // Add color support for --color=always
+                    output.push_str(&format!("my @grep_colored_{};\n", command_index));
+                    output.push_str(&format!("for my $line (@grep_filtered_{}) {{\n", command_index));
+                    output.push_str(&format!("    my $colored_line = $line;\n"));
+                    output.push_str(&format!("    $colored_line =~ s/({})/\\x1b[01;31m\\x1b[K$1\\x1b[m\\x1b[K/g;\n", regex_pattern));
+                    output.push_str(&format!("    push @grep_colored_{}, $colored_line;\n", command_index));
+                    output.push_str("}\n");
+                    output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_colored_{});\n", command_index, command_index));
+                } else {
+                    output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_filtered_{});\n", command_index, command_index));
+                }
             }
             
             // Handle null-terminated output (-Z flag)

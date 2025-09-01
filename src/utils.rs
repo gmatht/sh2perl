@@ -56,7 +56,18 @@ pub fn cleanup_tmp(lang: &str, tmp_file: &str) {
     }
 }
 
-/// Generate unified diff format for comparing two strings
+/// Convert string to show non-printable characters in hex format
+fn escape_non_printable(s: &str) -> String {
+    s.chars().map(|c| {
+        if c.is_ascii() && !c.is_ascii_control() {
+            c.to_string()
+        } else {
+            format!("\\x{:02x}", c as u32)
+        }
+    }).collect()
+}
+
+/// Generate unified diff format for comparing two strings with non-printable character highlighting
 pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str, actual_label: &str) -> String {
     let expected_lines: Vec<&str> = expected.lines().collect();
     let actual_lines: Vec<&str> = actual.lines().collect();
@@ -72,7 +83,7 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
     while i < expected_lines.len() && j < actual_lines.len() {
         if expected_lines[i] == actual_lines[j] {
             // Lines are identical - show with space prefix
-            diff.push_str(&format!(" {}\n", expected_lines[i]));
+            diff.push_str(&format!(" {}\n", escape_non_printable(expected_lines[i])));
             i += 1;
             j += 1;
         } else {
@@ -85,7 +96,7 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
                    expected_lines[look_ahead] == actual_lines[j] {
                     // Found a match ahead - the lines from i to look_ahead-1 were deleted
                     for k in i..look_ahead {
-                        diff.push_str(&format!("-{}\n", expected_lines[k]));
+                        diff.push_str(&format!("-{}\n", escape_non_printable(expected_lines[k])));
                     }
                     i = look_ahead;
                     found_match = true;
@@ -100,7 +111,7 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
                        expected_lines[i] == actual_lines[look_ahead] {
                         // Found a match ahead - the lines from j to look_ahead-1 were inserted
                         for k in j..look_ahead {
-                            diff.push_str(&format!("+{}\n", actual_lines[k]));
+                            diff.push_str(&format!("+{}\n", escape_non_printable(actual_lines[k])));
                         }
                         j = look_ahead;
                         found_match = true;
@@ -111,8 +122,8 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
             
             // If no match found ahead, treat as modification
             if !found_match {
-                diff.push_str(&format!("-{}\n", expected_lines[i]));
-                diff.push_str(&format!("+{}\n", actual_lines[j]));
+                diff.push_str(&format!("-{}\n", escape_non_printable(expected_lines[i])));
+                diff.push_str(&format!("+{}\n", escape_non_printable(actual_lines[j])));
                 i += 1;
                 j += 1;
             }
@@ -121,12 +132,12 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
     
     // Handle remaining lines
     while i < expected_lines.len() {
-        diff.push_str(&format!("-{}\n", expected_lines[i]));
+        diff.push_str(&format!("-{}\n", escape_non_printable(expected_lines[i])));
         i += 1;
     }
     
     while j < actual_lines.len() {
-        diff.push_str(&format!("+{}\n", actual_lines[j]));
+        diff.push_str(&format!("+{}\n", escape_non_printable(actual_lines[j])));
         j += 1;
     }
     

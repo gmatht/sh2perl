@@ -83,7 +83,7 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
         output.push_str("    }\n");
         output.push_str("}\n");
         // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("$tr_result_{} .= \"\\n\" unless $tr_result_{} =~ /\\n$/;\n", command_index, command_index));
+        output.push_str(&format!("$tr_result_{} .= \"\\n\" unless $tr_result_{} =~ /\\n$/ || $tr_result_{} eq '';\n", command_index, command_index, command_index));
     } else if args.len() >= 2 {
         // tr SET1 SET2: translate characters
         let set1 = generator.strip_shell_quotes_and_convert_to_perl(&args[0]);
@@ -103,8 +103,8 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
         output.push_str(&format!("        $tr_result_{} .= $char;\n", command_index));
         output.push_str("    }\n");
         output.push_str("}\n");
-        // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("$tr_result_{} .= \"\\n\" unless $tr_result_{} =~ /\\n$/;\n", command_index, command_index));
+        // Ensure output ends with newline to match shell behavior (but not for empty input)
+        output.push_str(&format!("$tr_result_{} .= \"\\n\" unless $tr_result_{} =~ /\\n$/ || $tr_result_{} eq '';\n", command_index, command_index, command_index));
     } else {
         // No valid arguments, just pass through input
         output.push_str(&format!("${} = ${};\n", input_var, input_var));
