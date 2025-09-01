@@ -374,7 +374,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     output.push_str(&format!("        $file_has_match_{}{{$grep_filenames_{}[$i]}} = 1;\n", command_index, command_index));
                     output.push_str("    }\n");
                     output.push_str("}\n");
-                    output.push_str(&format!("for my $file (keys %file_has_match_{}) {{\n", command_index));
+                    output.push_str(&format!("for my $file (sort keys %file_has_match_{}) {{\n", command_index));
                     output.push_str(&format!("    push @matching_files_{}, $file;\n", command_index));
                     output.push_str("}\n");
                     output.push_str(&format!("$grep_result_{} = join(\"\\n\", @matching_files_{});\n", command_index, command_index));
@@ -403,16 +403,23 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     output.push_str(&format!("my %file_has_match_{};\n", command_index));
                     output.push_str(&format!("my %all_files_{};\n", command_index));
                     
-                    // First, collect all files and mark which ones have matches
+                    // First, collect all files that match the glob pattern
+                    output.push_str(&format!("my @all_glob_files_{} = glob('{}');\n", command_index, file_args[0]));
+                    output.push_str(&format!("for my $file (@all_glob_files_{}) {{\n", command_index));
+                    output.push_str(&format!("    if (-f $file) {{\n"));
+                    output.push_str(&format!("        $all_files_{}{{$file}} = 1;\n", command_index));
+                    output.push_str("    }\n");
+                    output.push_str("}\n");
+                    
+                    // Then, mark which ones have matches
                     output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
-                    output.push_str(&format!("    $all_files_{}{{$grep_filenames_{}[$i]}} = 1;\n", command_index, command_index));
                     output.push_str(&format!("    if (grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
                     output.push_str(&format!("        $file_has_match_{}{{$grep_filenames_{}[$i]}} = 1;\n", command_index, command_index));
                     output.push_str("    }\n");
                     output.push_str("}\n");
                     
-                    // Then find files that don't have matches
-                    output.push_str(&format!("for my $file (keys %all_files_{}) {{\n", command_index));
+                    // Finally, find files that don't have matches (sorted alphabetically like Bash)
+                    output.push_str(&format!("for my $file (sort keys %all_files_{}) {{\n", command_index));
                     output.push_str(&format!("    if (!exists $file_has_match_{}{{$file}}) {{\n", command_index));
                     output.push_str(&format!("        push @non_matching_files_{}, $file;\n", command_index));
                     output.push_str("    }\n");
