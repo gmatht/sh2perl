@@ -28,6 +28,7 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         output.push_str("die \"mkdir: missing operand\\n\";\n");
     } else {
         output.push_str("use File::Path qw(make_path);\n");
+        output.push_str("my $err;\n");
         
         for dir in &directories {
             if create_parents {

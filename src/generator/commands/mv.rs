@@ -32,6 +32,7 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         
         output.push_str("use File::Copy qw(move);\n");
         output.push_str("use File::Path qw(make_path);\n");
+        output.push_str("my $err;\n");
         
         for source in &sources {
             output.push_str(&format!("if (-e {}) {{\n", source));

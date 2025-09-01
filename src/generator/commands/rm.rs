@@ -30,6 +30,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         output.push_str("die \"rm: missing operand\\n\";\n");
     } else {
         output.push_str("use File::Path qw(remove_tree);\n");
+        output.push_str("my $err;\n");
         
         // Process each file/pattern
         for file in &files {
