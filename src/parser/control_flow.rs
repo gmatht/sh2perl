@@ -1085,6 +1085,21 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                     return Err(ParserError::InvalidSyntax("Expected identifier after $ in test expression".to_string()));
                 }
             }
+            Some(Token::DollarHashSimple) => {
+                // Handle $# (number of positional parameters)
+                expression_parts.push("$#".to_string());
+                lexer.next();
+            }
+            Some(Token::DollarAtSimple) => {
+                // Handle $@ (all positional parameters)
+                expression_parts.push("$@".to_string());
+                lexer.next();
+            }
+            Some(Token::DollarStarSimple) => {
+                // Handle $* (all positional parameters as single word)
+                expression_parts.push("$*".to_string());
+                lexer.next();
+            }
             Some(Token::Number) => {
                 expression_parts.push(lexer.get_number_text()?);
             }

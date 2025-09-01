@@ -702,6 +702,8 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         // Track pipeline success for overall script exit code
         output.push_str(&generator.indent());
         output.push_str(&format!("$main_exit_code = 1 unless $pipeline_success_{};\n", unique_id));
+        output.push_str(&generator.indent());
+        output.push_str("exit(1) if $main_exit_code == 1;\n");
         
         generator.indent_level -= 1;
         output.push_str("}\n");
@@ -769,6 +771,8 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 // Track pipeline success for overall script exit code
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$main_exit_code = 1 unless $pipeline_success_{};\n", unique_id));
+                output.push_str(&generator.indent());
+                output.push_str("exit(1) if $main_exit_code == 1;\n");
             } else {
                 // Generic 2-command pipeline
                 let unique_id = generator.get_unique_id();
@@ -839,6 +843,8 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 // Track pipeline success for overall script exit code
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$main_exit_code = 1 unless $pipeline_success_{};\n", unique_id));
+                output.push_str(&generator.indent());
+                output.push_str("exit(1) if $main_exit_code == 1;\n");
             }
         }
         generator.indent_level -= 1;

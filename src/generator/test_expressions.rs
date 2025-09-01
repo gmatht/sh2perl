@@ -1,6 +1,23 @@
 use crate::ast::*;
 use super::Generator;
 
+// Helper function to convert shell variables to Perl equivalents
+fn convert_shell_var_to_perl(var: &str) -> String {
+    match var {
+        "$#" => "scalar(@ARGV)".to_string(),  // $# -> scalar(@ARGV) for argument count
+        "$@" => "@ARGV".to_string(),          // $@ -> @ARGV for arguments array
+        "$*" => "@ARGV".to_string(),          // $* -> @ARGV for arguments array
+        _ if var.starts_with('$') => {
+            // Regular variable - just return as is for now
+            var.to_string()
+        }
+        _ => {
+            // Not a variable - return as is
+            var.to_string()
+        }
+    }
+}
+
 pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &TestExpression) -> String {
     // Parse the test expression to extract components
     let expr = &test_expr.expression;
@@ -140,46 +157,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         } else {
             "0".to_string()
         }
-    } else if expr.contains(" -lt ") {
-        // Less than: [[ $var -lt value ]]
-        let parts: Vec<&str> = expr.split(" -lt ").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-            format!("{} < {}", var, value)
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains(" -le ") {
-        // Less than or equal: [[ $var -le value ]]
-        let parts: Vec<&str> = expr.split(" -le ").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-            format!("{} <= {}", var, value)
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains(" -gt ") {
-        // Greater than: [[ $var -gt value ]]
-        let parts: Vec<&str> = expr.split(" -gt ").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-            format!("{} > {}", var, value)
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains(" -ge ") {
-        // Greater than or equal: [[ $var -ge value ]]
-        let parts: Vec<&str> = expr.split(" -ge ").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-            format!("{} >= {}", var, value)
-        } else {
-            "0".to_string()
-        }
+
     } else if expr.contains(" -z ") {
         // String is empty: [[ -z $var ]]
         let var = expr.replace("-z ", "").trim().to_string();
@@ -329,6 +307,78 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
                 modifiers: modifiers.clone(),
             });
             format!("({})", parsed_subexpr)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" -lt ") {
+        // Numeric less than: [[ $var -lt 2 ]]
+        let parts: Vec<&str> = expr.split(" -lt ").collect();
+        if parts.len() == 2 {
+            let left = parts[0].trim();
+            let right = parts[1].trim();
+            let left_perl = convert_shell_var_to_perl(left);
+            let right_perl = convert_shell_var_to_perl(right);
+            format!("({} < {})", left_perl, right_perl)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" -le ") {
+        // Numeric less than or equal: [[ $var -le 2 ]]
+        let parts: Vec<&str> = expr.split(" -le ").collect();
+        if parts.len() == 2 {
+            let left = parts[0].trim();
+            let right = parts[1].trim();
+            let left_perl = convert_shell_var_to_perl(left);
+            let right_perl = convert_shell_var_to_perl(right);
+            format!("({} <= {})", left_perl, right_perl)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" -gt ") {
+        // Numeric greater than: [[ $var -gt 2 ]]
+        let parts: Vec<&str> = expr.split(" -gt ").collect();
+        if parts.len() == 2 {
+            let left = parts[0].trim();
+            let right = parts[1].trim();
+            let left_perl = convert_shell_var_to_perl(left);
+            let right_perl = convert_shell_var_to_perl(right);
+            format!("({} > {})", left_perl, right_perl)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" -ge ") {
+        // Numeric greater than or equal: [[ $var -ge 2 ]]
+        let parts: Vec<&str> = expr.split(" -ge ").collect();
+        if parts.len() == 2 {
+            let left = parts[0].trim();
+            let right = parts[1].trim();
+            let left_perl = convert_shell_var_to_perl(left);
+            let right_perl = convert_shell_var_to_perl(right);
+            format!("({} >= {})", left_perl, right_perl)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" -eq ") {
+        // Numeric equality: [[ $var -eq 2 ]]
+        let parts: Vec<&str> = expr.split(" -eq ").collect();
+        if parts.len() == 2 {
+            let left = parts[0].trim();
+            let right = parts[1].trim();
+            let left_perl = convert_shell_var_to_perl(left);
+            let right_perl = convert_shell_var_to_perl(right);
+            format!("({} == {})", left_perl, right_perl)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" -ne ") {
+        // Numeric inequality: [[ $var -ne 2 ]]
+        let parts: Vec<&str> = expr.split(" -ne ").collect();
+        if parts.len() == 2 {
+            let left = parts[0].trim();
+            let right = parts[1].trim();
+            let left_perl = convert_shell_var_to_perl(left);
+            let right_perl = convert_shell_var_to_perl(right);
+            format!("({} != {})", left_perl, right_perl)
         } else {
             "0".to_string()
         }

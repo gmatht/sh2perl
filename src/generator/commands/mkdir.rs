@@ -28,12 +28,15 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         output.push_str("die \"mkdir: missing operand\\n\";\n");
     } else {
         output.push_str("use File::Path qw(make_path);\n");
-        output.push_str("my $err;\n");
+        if !generator.declared_locals.contains("err") {
+            output.push_str("my $err;\n");
+            generator.declared_locals.insert("err".to_string());
+        }
         
         for dir in &directories {
             if create_parents {
-                output.push_str(&format!("if (!-d {}) {{\n", dir));
-                output.push_str(&format!("make_path({}, {{error => \\$err}});\n", dir));
+                output.push_str(&format!("if (!-d \"{}\") {{\n", dir));
+                output.push_str(&format!("make_path(\"{}\", {{error => \\$err}});\n", dir));
                 output.push_str("if (@$err) {\n");
                 output.push_str(&format!("die \"mkdir: cannot create directory {}: $err->[0]\\n\";\n", dir));
                 output.push_str("} else {\n");

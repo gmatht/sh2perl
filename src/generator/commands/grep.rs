@@ -242,7 +242,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     }
                 }
             }
-        } else if input_var != "input_data" {
+        } else if input_var != "input_data" && !input_var.is_empty() {
             // Pipeline-based grep with no file arguments - use the provided input variable
             let input_source = if input_var.starts_with('$') {
                 input_var.to_string()
