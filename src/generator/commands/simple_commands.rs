@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
+use crate::generator::utils::get_temp_dir;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Static counter for generating unique temp file names
@@ -117,10 +118,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 // Process substitution input: <(command)
                 temp_file_counter += 1;
                 let global_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let temp_file = format!("/tmp/process_sub_{}_{}.tmp", global_counter, temp_file_counter);
+                let temp_file = format!("{}/process_sub_{}_{}.tmp", get_temp_dir(), global_counter, temp_file_counter);
                 let temp_var = format!("temp_file_ps_{}_{}", global_counter, temp_file_counter);
                 output.push_str(&generator.indent());
-                output.push_str(&format!("my ${} = '{}';\n", temp_var, temp_file));
+                output.push_str(&format!("my ${} = {} . '/process_sub_{}_{}.tmp';\n", temp_var, get_temp_dir(), global_counter, temp_file_counter));
                 
                 // Execute the command and capture its output
                 let fh_var = format!("fh_ps_{}_{}", global_counter, temp_file_counter);
@@ -147,6 +148,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 
                 // Write the output to the temporary file
                 output.push_str(&generator.indent());
+                output.push_str(&format!("use File::Path qw(make_path);\n"));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my $temp_dir_{}_{} = dirname(${});\n", global_counter, temp_file_counter, temp_var));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("make_path($temp_dir_{}_{}) unless -d $temp_dir_{}_{};\n", global_counter, temp_file_counter, global_counter, temp_file_counter));
+                output.push_str(&generator.indent());
                 output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("print ${} $output_ps_{};\n", fh_var, global_counter));
@@ -159,17 +166,17 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 // Process substitution output: >(command)
                 temp_file_counter += 1;
                 let global_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let temp_file = format!("/tmp/process_sub_out_{}_{}.tmp", global_counter, temp_file_counter);
+                let temp_file = format!("{}/process_sub_out_{}_{}.tmp", get_temp_dir(), global_counter, temp_file_counter);
                 let temp_var = format!("temp_file_out_{}_{}", global_counter, temp_file_counter);
                 output.push_str(&generator.indent());
-                output.push_str(&format!("my ${} = '{}';\n", temp_var, temp_file));
-                process_sub_files.push((temp_var, temp_file));
+                output.push_str(&format!("my ${} = {} . '/process_sub_out_{}_{}.tmp';\n", temp_var, get_temp_dir(), global_counter, temp_file_counter));
+                process_sub_files.push((temp_var, format!("{} . '/process_sub_out_{}_{}.tmp'", get_temp_dir(), global_counter, temp_file_counter)));
             }
             RedirectOperator::HereString => {
                 // Here-string: <<< content
                 temp_file_counter += 1;
                 let global_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let temp_file = format!("/tmp/here_string_{}_{}.tmp", global_counter, temp_file_counter);
+                let temp_file = format!("{}/here_string_{}_{}.tmp", get_temp_dir(), global_counter, temp_file_counter);
                 let temp_var = format!("temp_file_hs_{}_{}", global_counter, temp_file_counter);
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my ${} = '{}';\n", temp_var, temp_file));

@@ -1,5 +1,6 @@
 use crate::ast::*;
 use super::Generator;
+use crate::generator::utils::get_temp_dir;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -28,20 +29,22 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 // Create a temporary file with the heredoc content
                 output.push_str(&format!("my $temp_content = {};\n", generator.perl_string_literal(&Word::Literal(body.clone()))));
                 let fh = generator.get_unique_file_handle();
-                output.push_str(&format!("open(my ${}, '>', '/tmp/heredoc_temp') or die \"Cannot create temp file: $!\\n\";\n", fh));
+                output.push_str(&format!("use File::Path qw(make_path);\n"));
+                output.push_str(&format!("make_path('{}') unless -d '{}';\n", get_temp_dir(), get_temp_dir()));
+                output.push_str(&format!("open(my ${}, '>', '{}heredoc_temp') or die \"Cannot create temp file: $!\\n\";\n", fh, get_temp_dir()));
                 output.push_str(&format!("print {} $temp_content;\n", fh));
                 output.push_str(&format!("close({});\n", fh));
-                output.push_str("open(STDIN, '<', '/tmp/heredoc_temp') or die \"Cannot open temp file: $!\\n\";\n");
+                output.push_str(&format!("open(STDIN, '<', '{}heredoc_temp') or die \"Cannot open temp file: $!\\n\";\n", get_temp_dir()));
             }
         }
         RedirectOperator::ProcessSubstitutionInput(cmd) => {
             let global_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let temp_file = format!("/tmp/process_sub_{}.tmp", global_counter);
+            let temp_file = format!("{}/process_sub_{}.tmp", get_temp_dir(), global_counter);
             let temp_var = format!("temp_file_ps_{}", global_counter);
             let output_var = format!("output_ps_{}", global_counter);
             let fh_var = format!("fh_ps_{}", global_counter);
             
-            output.push_str(&format!("my ${} = '{}';\n", temp_var, temp_file));
+            output.push_str(&format!("my ${} = {} . '/process_sub_{}.tmp';\n", temp_var, get_temp_dir(), global_counter));
             
             if let Command::Pipeline(_) = cmd.as_ref() {
                 output.push_str(&format!("my ${};\n", output_var));
@@ -65,11 +68,14 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 output.push_str(&format!("my ${} = `{}`;\n", output_var, cmd_str));
             }
             
+            output.push_str(&format!("use File::Path qw(make_path);\n"));
+            output.push_str(&format!("my $temp_dir_{} = dirname(${});\n", global_counter, temp_var));
+            output.push_str(&format!("make_path($temp_dir_{}) unless -d $temp_dir_{};\n", global_counter, global_counter));
             output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
             output.push_str(&format!("print ${} ${};\n", fh_var, output_var));
             output.push_str(&format!("close(${});\n", fh_var));
             
-            generator.process_sub_files.insert(temp_file.clone(), temp_var.clone());
+            generator.process_sub_files.insert(format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter), temp_var.clone());
             
             // Store the temp_var for use by commands that need it (like grep -f)
             generator.current_process_sub_file = Some(temp_var.clone());

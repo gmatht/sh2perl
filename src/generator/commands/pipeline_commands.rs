@@ -295,6 +295,17 @@ fn generate_command_using_builtins(
             output.push_str("}\n");
             output
         },
+        Command::Redirect(redirect_cmd) => {
+            // Handle Redirect commands in pipeline context
+            if input_var.is_empty() {
+                // First command in pipeline - generate the redirect command normally
+                generator.generate_command(command)
+            } else {
+                // Subsequent command - pass the pipeline input to the redirect command
+                // The redirect command should receive the pipeline input and generate its output
+                generator.generate_command(command)
+            }
+        },
         _ => {
             // Other non-simple commands - use system call fallback
             if input_var.is_empty() {
@@ -699,17 +710,20 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 // Handle subsequent commands - they should use the previous command's output
                 output.push_str(&generator.indent());
                 if matches!(command, Command::Redirect(_)) {
-                    output.push_str("{\n");
-                    generator.indent_level += 1;
-                    output.push_str(&generator.indent());
-                    output.push_str("local *STDOUT;\n");
-                    output.push_str(&generator.indent());
-                    output.push_str(&format!("open(STDOUT, '>', \\{}) or die \"Cannot redirect STDOUT\";\n", format!("$output_{}", unique_id)));
-                    output.push_str(&generator.indent());
-                    output.push_str(&generator.generate_command(command));
-                    generator.indent_level -= 1;
-                    output.push_str(&generator.indent());
-                    output.push_str("}\n");
+                    // For Redirect commands in pipelines, we need to pass the pipeline input
+                    // and let the command generate its output normally
+                    let command_output = generate_command_using_builtins(generator, command, &format!("output_{}", unique_id), &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
+                    
+                    // Split the output into lines and apply indentation
+                    for line in command_output.lines() {
+                        if !line.trim().is_empty() {
+                            output.push_str(&generator.indent());
+                            output.push_str(line);
+                            if !line.ends_with('\n') {
+                                output.push_str("\n");
+                            }
+                        }
+                    }
                 } else {
                     // Check if this is a logical operator command
                     match command {

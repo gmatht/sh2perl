@@ -2,6 +2,16 @@ use crate::ast::*;
 use super::Generator;
 use regex::Regex;
 
+/// Get the appropriate temporary directory for the current platform
+pub fn get_temp_dir() -> &'static str {
+    // On Windows, use $TEMP, otherwise use /tmp
+    if cfg!(target_os = "windows") {
+        "($ENV{TEMP} || $ENV{TMP} || \"C:\\\\temp\")"
+    } else {
+        "/tmp"
+    }
+}
+
 pub fn extract_array_key_impl(var: &str) -> Option<(String, String)> {
     // Check if this is an associative array assignment like map[foo]=bar
     if let Some(bracket_start) = var.find('[') {

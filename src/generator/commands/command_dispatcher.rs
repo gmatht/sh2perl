@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 use super::grep::generate_grep_command;
+use crate::generator::utils::get_temp_dir;
 use super::cat::generate_cat_command;
 use super::paste::generate_paste_command;
 
@@ -21,6 +22,10 @@ fn collect_all_redirects(command: &Command) -> (Vec<Redirect>, Command) {
 }
 
 pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_stdout_context: bool) -> String {
+    generate_command_impl_with_input(generator, command, in_stdout_context, None)
+}
+
+pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Command, in_stdout_context: bool, input_data: Option<&str>) -> String {
     eprintln!("DEBUG: generate_command_impl called with command: {:?}, in_stdout_context: {}", command, in_stdout_context);
     match command {
         Command::Simple(cmd) => {
@@ -151,11 +156,11 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                     RedirectOperator::ProcessSubstitutionInput(cmd) => {
                         // Process substitution input: <(command)
                         let global_counter = generator.get_unique_file_handle();
-                        let temp_file = format!("/tmp/process_sub_{}.tmp", global_counter);
+                        let temp_file = format!("{}/process_sub_{}.tmp", get_temp_dir(), global_counter);
                         let temp_var = format!("temp_file_ps_{}", global_counter);
                         
                         result.push_str(&generator.indent());
-                        result.push_str(&format!("my ${} = '{}';\n", temp_var, temp_file));
+                        result.push_str(&format!("my ${} = {} . '/process_sub_{}.tmp';\n", temp_var, get_temp_dir(), global_counter));
                         
                         // Execute the command and capture its output
                         // Check if this is a complex command that should use Perl code generation
@@ -185,13 +190,19 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                         // Write the output to the temporary file
                         let fh_var = format!("fh_ps_{}", global_counter);
                         result.push_str(&generator.indent());
+                        result.push_str(&format!("use File::Path qw(make_path);\n"));
+                        result.push_str(&generator.indent());
+                        result.push_str(&format!("my $temp_dir_{} = dirname(${});\n", global_counter, temp_var));
+                        result.push_str(&generator.indent());
+                        result.push_str(&format!("make_path($temp_dir_{}) unless -d $temp_dir_{};\n", global_counter, global_counter));
+                        result.push_str(&generator.indent());
                         result.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
                         result.push_str(&generator.indent());
                         result.push_str(&format!("print ${} $output_ps_{};\n", fh_var, global_counter));
                         result.push_str(&generator.indent());
                         result.push_str(&format!("close(${});\n", fh_var));
                         
-                        process_sub_files.push((temp_var, temp_file));
+                        process_sub_files.push((temp_var, format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter)));
                     }
                     _ => {
                         // Handle other redirect types, but not here-strings or output redirects
@@ -418,18 +429,21 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                             // Create a modified grep command that uses the temporary file as the pattern file
                             let mut modified_grep_cmd = cmd.clone();
                             
-                            // Replace the -f argument with the actual temporary file path
+                            // Insert the file argument after the -f flag
                             for i in 0..modified_grep_cmd.args.len() {
                                 if let Word::Literal(s) = &modified_grep_cmd.args[i] {
-                                    if s == "-f" && i + 1 < modified_grep_cmd.args.len() {
-                                        // Replace the next argument (which should be empty or a placeholder) with the temp file path
-                                        modified_grep_cmd.args[i + 1] = Word::Literal(format!("${}", pattern_file.0));
+                                    if s == "-f" {
+                                        // Insert the file argument after the -f flag
+                                        modified_grep_cmd.args.insert(i + 1, Word::Literal(format!("${}", pattern_file.0)));
+                                        eprintln!("DEBUG: Inserted file argument: ${} at position {}", pattern_file.0, i + 1);
                                         break;
                                     }
                                 }
                             }
                             
-                            let specific_output = generate_grep_command(generator, &modified_grep_cmd, "input_data", "0", true);
+                            let input_var = input_data.unwrap_or("input_data");
+                            eprintln!("DEBUG: Calling generate_grep_command with input_var: {}", input_var);
+                            let specific_output = generate_grep_command(generator, &modified_grep_cmd, input_var, "0", true);
                             result.push_str(&specific_output);
                             
                             eprintln!("DEBUG: Final grep -f result: {}", result);
@@ -446,9 +460,9 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                             
                             // Set environment variables for the diff command
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("$ENV{{DIFF_TEMP_FILE1}} = '{}';\n", file1.1));
+                            result.push_str(&format!("$ENV{{DIFF_TEMP_FILE1}} = {};\n", file1.1));
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("$ENV{{DIFF_TEMP_FILE2}} = '{}';\n", file2.1));
+                            result.push_str(&format!("$ENV{{DIFF_TEMP_FILE2}} = {};\n", file2.1));
                             
                             // Generate the actual diff command
                             let diff_output = super::diff::generate_diff_command(generator, cmd, "$output", 0, true);
@@ -522,6 +536,8 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                                 }
                             });
                             
+                            eprintln!("DEBUG: has_f_flag: {}, process_sub_files.len(): {}", has_f_flag, process_sub_files.len());
+                            
                             if has_f_flag && !process_sub_files.is_empty() {
                                 eprintln!("DEBUG: Handling grep -f redirect command with {} process substitution files", process_sub_files.len());
                                 let pattern_file = &process_sub_files[0];
@@ -529,10 +545,22 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                                 // Create a modified grep command that uses the temporary file as the pattern file
                                 let mut modified_grep_cmd = cmd.clone();
                                 
-                                // Add the temporary file path as an argument after -f
-                                modified_grep_cmd.args.push(Word::Literal(format!("${}", pattern_file.0)));
+                                // Find the -f flag and insert the file argument after it
+                                for i in 0..modified_grep_cmd.args.len() {
+                                    if let Word::Literal(s) = &modified_grep_cmd.args[i] {
+                                        if s == "-f" {
+                                            // Insert the file argument after the -f flag
+                                            modified_grep_cmd.args.insert(i + 1, Word::Literal(format!("${}", pattern_file.0)));
+                                            eprintln!("DEBUG: Inserted file argument: ${}", pattern_file.0);
+                                            eprintln!("DEBUG: Modified grep command args: {:?}", modified_grep_cmd.args);
+                                            break;
+                                        }
+                                    }
+                                }
                                 
-                                let specific_output = generate_grep_command(generator, &modified_grep_cmd, "input_data", "0", true);
+                                let input_var = input_data.unwrap_or("input_data");
+                                eprintln!("DEBUG: Calling generate_grep_command with input_var: {}", input_var);
+                                let specific_output = generate_grep_command(generator, &modified_grep_cmd, input_var, "0", true);
                                 result.push_str(&specific_output);
                                 
                                 eprintln!("DEBUG: Final grep -f redirect result: {}", result);
@@ -542,11 +570,11 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                                 // Look for temp_file_ps_ variables in the current result
                                 let lines: Vec<&str> = result.lines().collect();
                                 for line in &lines {
-                                    if line.contains("temp_file_ps_") && line.contains(" = ") {
+                                    if line.contains("temp_file_ps_") && line.contains("=") {
                                         eprintln!("DEBUG: Examining line for temp file: {}", line);
                                         if let Some(start) = line.find("$temp_file_ps_") {
                                             let var_part = &line[start..];
-                                            if let Some(end) = var_part.find([' ', ';', '\'']) {
+                                            if let Some(end) = var_part.find([' ', ';', '\'', '=']) {
                                                 let temp_var = &var_part[..end];
                                                 eprintln!("DEBUG: Found process substitution temp file variable: {}", temp_var);
                                                 
@@ -564,6 +592,11 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                                     }
                                 }
                                 eprintln!("DEBUG: No temp_file_ps_ variable found in result: {}", result);
+                                
+                                // If we can't find the temp file, fall back to generating an error
+                                result.push_str("warn \"grep: no pattern specified\";\n");
+                                result.push_str("exit(1);\n");
+                                return result;
                             }
                         }
                     }
@@ -575,7 +608,7 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
                 }
                 _ => {
                     // For other command types, use the recursive call
-                    result.push_str(&generate_command_impl(generator, &base_command, false));
+                    result.push_str(&generate_command_impl_with_input(generator, &base_command, false, input_data));
                 }
             }
             

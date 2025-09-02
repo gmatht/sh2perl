@@ -131,13 +131,23 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         // No pattern provided, return error
         output.push_str("warn \"grep: no pattern specified\";\n");
         output.push_str("exit(1);\n");
-    } else {
-        // Second pass: collect file arguments (arguments that are not options and not the pattern)
-        let mut file_args = Vec::new();
-        let mut i = 0;
-        while i < cmd.args.len() {
+        return output;
+    }
+    
+    // Second pass: collect file arguments (arguments that are not options and not the pattern)
+    let mut file_args = Vec::new();
+    let mut i = 0;
+    while i < cmd.args.len() {
             if let Word::Literal(s) = &cmd.args[i] {
                 if !s.starts_with('-') && s != &pattern {
+                    // Check if this is a pattern file (skip it from file_args)
+                    if let Some(ref pf) = pattern_file {
+                        if s == pf {
+                            i += 1; // Skip the pattern file argument
+                            continue;
+                        }
+                    }
+                    
                     // Check if this is a numeric value that follows a context flag
                     if i > 0 {
                         if let Word::Literal(prev) = &cmd.args[i - 1] {
@@ -615,7 +625,6 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         // Set exit status for all grep commands
         // For quiet mode, set exit code based on whether matches were found
         output.push_str(&format!("$? = scalar(@grep_filtered_{}) > 0 ? 0 : 1;\n", command_index));
-    }
     
     output
 }
