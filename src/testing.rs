@@ -186,7 +186,7 @@ pub fn test_file_equivalence(lang: &str, filename: &str) -> Result<(), String> {
             };
             out
         } else {
-            let mut cmd = Command::new(run_cmd[0]);
+            let mut cmd = Command::new(&run_cmd[0]);
             
             // For Perl scripts, handle the file path replacement
             if lang == "perl" {
@@ -457,7 +457,7 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
             };
             out
         } else {
-            let mut cmd = Command::new(run_cmd[0]);
+            let mut cmd = Command::new(&run_cmd[0]);
             
             // For Perl scripts, handle the file path replacement
             if lang == "perl" {
