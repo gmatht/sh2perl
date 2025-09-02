@@ -105,7 +105,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
             
             // Check if this is a cat command with heredocs
             if let Command::Simple(cat_cmd) = &base_command {
-                if let Word::Literal(cmd_name) = &cat_cmd.name {
+                if let Word::Literal(cmd_name, _) = &cat_cmd.name {
                     if cmd_name == "cat" {
                         // Check if any of the redirects are heredocs
                         let has_heredoc = all_redirects.iter().any(|r| {
@@ -137,7 +137,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                         } else {
                             // Fallback: try to extract from target
                             match &redirect.target {
-                                Word::Literal(s) => {
+                                Word::Literal(s, _) => {
                                     // Remove surrounding quotes if they exist
                                     let content = if (s.starts_with('"') && s.ends_with('"')) || 
                                                    (s.starts_with('\'') && s.ends_with('\'')) {
@@ -217,7 +217,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
             
             // Now handle the base command with redirect context
             if let Command::Simple(cmd) = &base_command {
-                if let Word::Literal(cmd_name) = &cmd.name {
+                if let Word::Literal(cmd_name, _) = &cmd.name {
                     if cmd_name.is_empty() {
                         // This is a process substitution command with no base command
                         // The redirects have already been processed above
@@ -295,7 +295,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                             
                             // Parse options
                             for arg in &cmd.args {
-                                if let Word::Literal(s) = arg {
+                                if let Word::Literal(s, _) = arg {
                                     if s.starts_with('-') {
                                         if s.contains('1') { suppress_col1 = true; }
                                         if s.contains('2') { suppress_col2 = true; }
@@ -361,7 +361,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                             let mut trim_trailing = false;
                             
                             for arg in &cmd.args {
-                                if let Word::Literal(s) = arg {
+                                if let Word::Literal(s, _) = arg {
                                     if s == "-t" {
                                         trim_trailing = true;
                                     } else if !s.starts_with('-') {
@@ -416,7 +416,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     if cmd_name == "grep" && !process_sub_files.is_empty() {
                         // Check if this is a grep -f command
                         let has_f_flag = cmd.args.iter().any(|arg| {
-                            if let Word::Literal(s) = arg {
+                            if let Word::Literal(s, _) = arg {
                                 s == "-f"
                             } else {
                                 false
@@ -432,10 +432,10 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                             
                             // Insert the file argument after the -f flag
                             for i in 0..modified_grep_cmd.args.len() {
-                                if let Word::Literal(s) = &modified_grep_cmd.args[i] {
+                                if let Word::Literal(s, _) = &modified_grep_cmd.args[i] {
                                     if s == "-f" {
                                         // Insert the file argument after the -f flag
-                                        modified_grep_cmd.args.insert(i + 1, Word::Literal(format!("${}", pattern_file.0)));
+                                        modified_grep_cmd.args.insert(i + 1, Word::literal(format!("${}", pattern_file.0)));
                                         eprintln!("DEBUG: Inserted file argument: ${} at position {}", pattern_file.0, i + 1);
                                         break;
                                     }
@@ -524,13 +524,37 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
             
             match &base_command {
                 Command::Simple(cmd) => {
+                    // Special handling for heredocs with perl commands
+                    if let Word::Literal(cmd_name, _) = &cmd.name {
+                        if cmd_name == "perl" {
+                            // Check if we have heredoc redirects
+                            let has_heredoc = all_redirects.iter().any(|r| {
+                                matches!(r.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs)
+                            });
+                            
+                            if has_heredoc {
+                                // For perl heredocs, execute the heredoc content directly as Perl code
+                                for redirect in &all_redirects {
+                                    if matches!(redirect.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs) {
+                                        if let Some(body) = &redirect.heredoc_body {
+                                            // Execute the heredoc content directly as Perl code
+                                            result.push_str(&generator.indent());
+                                            result.push_str(&format!("{}\n", body));
+                                            return result;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
                     // Special handling for grep -f with process substitution
-                    if let Word::Literal(cmd_name) = &cmd.name {
+                    if let Word::Literal(cmd_name, _) = &cmd.name {
                         eprintln!("DEBUG: Processing simple command: {}", cmd_name);
                         if cmd_name == "grep" {
                             // Check if this is a grep -f command
                             let has_f_flag = cmd.args.iter().any(|arg| {
-                                if let Word::Literal(s) = arg {
+                                if let Word::Literal(s, _) = arg {
                                     s == "-f"
                                 } else {
                                     false
@@ -548,10 +572,10 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                                 
                                 // Find the -f flag and insert the file argument after it
                                 for i in 0..modified_grep_cmd.args.len() {
-                                    if let Word::Literal(s) = &modified_grep_cmd.args[i] {
+                                    if let Word::Literal(s, _) = &modified_grep_cmd.args[i] {
                                         if s == "-f" {
                                             // Insert the file argument after the -f flag
-                                            modified_grep_cmd.args.insert(i + 1, Word::Literal(format!("${}", pattern_file.0)));
+                                            modified_grep_cmd.args.insert(i + 1, Word::literal(format!("${}", pattern_file.0)));
                                             eprintln!("DEBUG: Inserted file argument: ${}", pattern_file.0);
                                             eprintln!("DEBUG: Modified grep command args: {:?}", modified_grep_cmd.args);
                                             break;
@@ -581,7 +605,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                                                 
                                                 // Create a modified grep command that uses the temporary file
                                                 let mut modified_grep_cmd = cmd.clone();
-                                                modified_grep_cmd.args.push(Word::Literal(temp_var.to_string()));
+                                                modified_grep_cmd.args.push(Word::literal(temp_var.to_string()));
                                                 
                                                 let specific_output = generate_grep_command(generator, &modified_grep_cmd, "input_data", "0", true);
                                                 result.push_str(&specific_output);

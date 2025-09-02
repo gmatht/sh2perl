@@ -10,7 +10,7 @@ pub fn generate_tail_command(_generator: &mut Generator, cmd: &SimpleCommand, in
     
     // Parse tail options
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             match arg_str.as_str() {
                 "-f" | "--follow" => follow = true,
                 _ => {

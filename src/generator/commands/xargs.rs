@@ -10,7 +10,7 @@ pub fn generate_xargs_command(_generator: &mut Generator, cmd: &SimpleCommand, i
     
     // Parse xargs arguments
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             if arg_str == "grep" {
                 command = "grep";
             } else if arg_str == "-l" {
@@ -18,14 +18,16 @@ pub fn generate_xargs_command(_generator: &mut Generator, cmd: &SimpleCommand, i
             } else if arg_str == "function" {
                 args.push("function".to_string());
             }
-        } else if let Word::StringInterpolation(interp) = arg {
+        } else if let Word::StringInterpolation(interp, _) = arg {
             let pattern = interp.parts.iter()
                 .map(|part| match part {
                     StringPart::Literal(s) => s,
                     _ => ".*"
                 })
                 .collect::<Vec<_>>()
-                .join("");
+                .into_iter()
+                .map(|s| s.clone())
+                .collect::<String>();
             args.push(pattern);
         }
     }

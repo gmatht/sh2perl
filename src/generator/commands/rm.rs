@@ -11,7 +11,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     
     // Parse rm options
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             match arg_str.as_str() {
                 "-r" | "-R" | "--recursive" => recursive = true,
                 "-f" | "--force" => force = true,

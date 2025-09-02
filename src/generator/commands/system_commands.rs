@@ -1,11 +1,52 @@
 use crate::ast::*;
+use crate::mir::*;
 use crate::generator::Generator;
+
+// Helper function to convert Word to bash string representation for system commands
+fn word_to_bash_string_for_system(word: &Word) -> String {
+    match word {
+        Word::Literal(s, _) => {
+            // If the literal contains spaces or special characters, quote it
+            if s.contains(' ') || s.contains('"') || s.contains('\'') || s.contains(';') || s.contains('|') || s.contains('&') || s.contains('<') || s.contains('>') {
+                format!("'{}'", s.replace("'", "'\"'\"'"))
+            } else {
+                s.clone()
+            }
+        },
+        Word::StringInterpolation(interp, _) => {
+            // For string interpolation, we need to convert to a bash-compatible format
+            // This is a simplified version - for complex cases we might need more work
+            let mut result = String::new();
+            for part in &interp.parts {
+                match part {
+                    StringPart::Literal(s) => result.push_str(s),
+                    StringPart::Variable(var) => result.push_str(&format!("${}", var)),
+                    _ => result.push_str("UNSUPPORTED_INTERPOLATION"),
+                }
+            }
+            if result.contains(' ') || result.contains(';') {
+                format!("'{}'", result.replace("'", "'\"'\"'"))
+            } else {
+                result
+            }
+        },
+        _ => {
+            // For other word types, convert to string and quote if needed
+            let s = word.to_string();
+            if s.contains(' ') || s.contains(';') {
+                format!("'{}'", s.replace("'", "'\"'\"'"))
+            } else {
+                s
+            }
+        }
+    }
+}
 
 pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &Command) -> String {
     match cmd {
         Command::Simple(simple_cmd) => {
             let args: Vec<String> = simple_cmd.args.iter()
-                .map(|arg| generator.word_to_perl(arg))
+                .map(|arg| word_to_bash_string_for_system(arg))
                 .collect();
             if args.is_empty() {
                 simple_cmd.name.to_string()
@@ -18,7 +59,7 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                 .filter_map(|cmd| {
                     if let Command::Simple(simple_cmd) = cmd {
                         let args: Vec<String> = simple_cmd.args.iter()
-                            .map(|arg| generator.word_to_perl(arg))
+                            .map(|arg| word_to_bash_string_for_system(arg))
                             .collect();
                         if args.is_empty() {
                             Some(simple_cmd.name.to_string())

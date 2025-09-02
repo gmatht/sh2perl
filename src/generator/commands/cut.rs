@@ -11,7 +11,7 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
     // Parse cut options
     let mut i = 0;
     while i < cmd.args.len() {
-        if let Word::Literal(arg) = &cmd.args[i] {
+        if let Word::Literal(arg, _) = &cmd.args[i] {
             if arg == "-d" && i + 1 < cmd.args.len() {
                 if let Some(next_arg) = cmd.args.get(i + 1) {
                     delimiter = generator.word_to_perl(next_arg);

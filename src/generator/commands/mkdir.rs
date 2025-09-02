@@ -10,7 +10,7 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     
     // Parse mkdir options
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             match arg_str.as_str() {
                 "-p" | "--parents" => create_parents = true,
                 _ => {

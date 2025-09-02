@@ -10,7 +10,7 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     
     // Parse mv options
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             match arg_str.as_str() {
                 "-f" | "--force" => _force = true,
                 _ => {

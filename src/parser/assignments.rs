@@ -19,17 +19,17 @@ pub fn parse_environment_variable_value(lexer: &mut Lexer) -> Result<Word, Parse
             Token::ParenOpen => {
                 // Parse parenthetical text as a literal
                 let text = lexer.capture_parenthetical_text()?;
-                Ok(Word::Literal(text))
+                Ok(Word::literal(text))
             }
             Token::DoubleQuotedString | Token::SingleQuotedString => {
                 // Parse quoted string as a literal
                 let text = lexer.get_string_text()?;
-                Ok(Word::Literal(text))
+                Ok(Word::literal(text))
             }
             Token::BacktickString => {
                 // Parse backtick string as a literal
                 let text = lexer.get_raw_token_text()?;
-                Ok(Word::Literal(text))
+                Ok(Word::literal(text))
             }
             _ => {
                 // Parse as a literal string until separator
@@ -60,11 +60,11 @@ pub fn parse_environment_variable_value(lexer: &mut Lexer) -> Result<Word, Parse
                         }
                     }
                 }
-                Ok(Word::Literal(value))
+                Ok(Word::literal(value))
             }
         }
     } else {
-        Ok(Word::Literal(String::new()))
+        Ok(Word::literal(String::new()))
     }
 }
 
@@ -258,7 +258,7 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
     let expression = expression_parts.join("");
     
     // Return as an Arithmetic Word variant
-    Ok(Word::Arithmetic(ArithmeticExpression {
+          Ok(Word::arithmetic(ArithmeticExpression {
         expression,
         tokens: vec![], // We don't need to store individual tokens for now
     }))

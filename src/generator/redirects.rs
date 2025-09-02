@@ -28,14 +28,17 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
             // Heredoc: command << delimiter
             if let Some(body) = &redirect.heredoc_body {
                 // Create a temporary file with the heredoc content
-                output.push_str(&format!("my $temp_content = {};\n", generator.perl_string_literal(&Word::Literal(body.clone()))));
+                // Use single quotes to prevent variable interpolation in the heredoc content
+                let escaped_body = body.replace("'", "\\'");
+                output.push_str(&format!("my $temp_content = '{}';\n", escaped_body));
                 let fh = generator.get_unique_file_handle();
                 output.push_str(&format!("use File::Path qw(make_path);\n"));
-                output.push_str(&format!("make_path('{}') unless -d '{}';\n", get_temp_dir(), get_temp_dir()));
-                output.push_str(&format!("open(my ${}, '>', '{}heredoc_temp') or die \"Cannot create temp file: $!\\n\";\n", fh, get_temp_dir()));
-                output.push_str(&format!("print {} $temp_content;\n", fh));
-                output.push_str(&format!("close({});\n", fh));
-                output.push_str(&format!("open(STDIN, '<', '{}heredoc_temp') or die \"Cannot open temp file: $!\\n\";\n", get_temp_dir()));
+                let temp_dir = get_temp_dir();
+                output.push_str(&format!("make_path({}) unless -d {};\n", temp_dir, temp_dir));
+                output.push_str(&format!("open(my ${}, '>', {} . '/heredoc_temp') or die \"Cannot create temp file: $!\\n\";\n", fh, temp_dir));
+                output.push_str(&format!("print ${} $temp_content;\n", fh));
+                output.push_str(&format!("close(${});\n", fh));
+                output.push_str(&format!("open(STDIN, '<', {} . '/heredoc_temp') or die \"Cannot open temp file: $!\\n\";\n", temp_dir));
             }
         }
         RedirectOperator::ProcessSubstitutionInput(cmd) => {
@@ -180,11 +183,18 @@ fn generate_bash_command_string(cmd: &Command) -> String {
 // Helper function to convert Word to bash string representation
 fn word_to_bash_string(word: &Word) -> String {
     match word {
-        Word::Literal(s) => s.clone(),
-        Word::BraceExpansion(expansion) => {
+        Word::Literal(s, _) => {
+            // If the literal contains spaces or special characters, quote it
+            if s.contains(' ') || s.contains('"') || s.contains('\'') || s.contains(';') || s.contains('|') || s.contains('&') || s.contains('<') || s.contains('>') {
+                format!("'{}'", s.replace("'", "'\"'\"'"))
+            } else {
+                s.clone()
+            }
+        },
+        Word::BraceExpansion(expansion, _) => {
             let mut result = String::new();
-            if let Some(ref prefix) = expansion.prefix {
-                result.push_str(prefix);
+            if let Some(prefix) = &expansion.prefix {
+                result.push_str(&prefix);
             }
             result.push('{');
             
@@ -205,15 +215,15 @@ fn word_to_bash_string(word: &Word) -> String {
             result.push_str(&items_str);
             result.push('}');
             
-            if let Some(ref suffix) = expansion.suffix {
-                result.push_str(suffix);
+            if let Some(suffix) = &expansion.suffix {
+                result.push_str(&suffix);
             }
             result
         }
-        Word::ParameterExpansion(param) => {
+        Word::ParameterExpansion(param, _) => {
             format!("${{{}}}", param)
         }
-        Word::StringInterpolation(parts) => {
+        Word::StringInterpolation(parts, _) => {
             let mut result = String::new();
             for part in &parts.parts {
                 match part {
@@ -224,7 +234,7 @@ fn word_to_bash_string(word: &Word) -> String {
             }
             result
         }
-        Word::CommandSubstitution(cmd) => {
+        Word::CommandSubstitution(cmd, _) => {
             // This would need to be handled by the caller
             format!("$({})", "command")
         }
@@ -267,7 +277,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 let val = generator.perl_string_literal(value);
                 // For associative array assignments, generate $array{key} = value instead of $ENV{var}
                 output.push_str(&format!("${}{{{}}} = {};\n", array_name, key, val));
-            } else if let Word::Literal(s) = value {
+            } else if let Word::Literal(s, _) = value {
                 if let Some(elements) = generator.extract_array_elements(s) {
                     // Check if this is an indexed array assignment like arr=(one two three)
                     let elements_perl: Vec<String> = elements.iter()
@@ -307,14 +317,14 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
         "set" => {
             // Convert shell set options to Perl equivalents
             for arg in &cmd.args {
-                if let Word::Literal(opt) = arg {
+                if let Word::Literal(opt, _) = arg {
                     match opt.as_str() {
                         "-e" => output.push_str("$SIG{__DIE__} = sub { exit 1 };\n"),
                         "-u" => output.push_str("use strict;\n"),
                         "-o" => {
                             // Handle pipefail and other options
                             if let Some(next_arg) = cmd.args.get(cmd.args.iter().position(|a| a == arg).unwrap() + 1) {
-                                if let Word::Literal(opt_name) = next_arg {
+                                if let Word::Literal(opt_name, _) = next_arg {
                                     match opt_name.as_str() {
                                         "pipefail" => output.push_str("# set -o pipefail not implemented in Perl\n"),
                                         _ => output.push_str(&format!("# set -o {} not implemented\n", opt_name)),
@@ -330,7 +340,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
         "unset" => {
             // Handle unset command
             for arg in &cmd.args {
-                if let Word::Literal(var_name) = arg {
+                if let Word::Literal(var_name, _) = arg {
                     if let Some((array_name, key)) = generator.extract_array_key(var_name) {
                         // Unset array element
                         output.push_str(&format!("delete ${}{{{}}};\n", array_name, key));
@@ -349,7 +359,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
         "export" => {
             // Handle export command
             for arg in &cmd.args {
-                if let Word::Literal(var_name) = arg {
+                if let Word::Literal(var_name, _) = arg {
                     if let Some((array_name, key)) = generator.extract_array_key(var_name) {
                         // Export array element
                         output.push_str(&format!("$ENV{{{}}} = ${}{{{}}};\n", var_name, array_name, key));
@@ -363,7 +373,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
         "readonly" => {
             // Handle readonly command (not directly supported in Perl)
             for arg in &cmd.args {
-                if let Word::Literal(var_name) = arg {
+                if let Word::Literal(var_name, _) = arg {
                     output.push_str(&format!("# readonly {} not implemented in Perl\n", var_name));
                 }
             }
@@ -371,12 +381,12 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
         "declare" => {
             // Handle declare command
             for arg in &cmd.args {
-                if let Word::Literal(opt) = arg {
+                if let Word::Literal(opt, _) = arg {
                     match opt.as_str() {
                         "-a" => {
                             // Declare array
                             if let Some(next_arg) = cmd.args.get(cmd.args.iter().position(|a| a == arg).unwrap() + 1) {
-                                if let Word::Literal(var_name) = next_arg {
+                                if let Word::Literal(var_name, _) = next_arg {
                                     if !generator.declared_locals.contains(var_name) {
                                         output.push_str(&format!("my @{} = ();\n", var_name));
                                         generator.declared_locals.insert(var_name.clone());
@@ -387,7 +397,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         "-A" => {
                             // Declare associative array
                             if let Some(next_arg) = cmd.args.get(cmd.args.iter().position(|a| a == arg).unwrap() + 1) {
-                                if let Word::Literal(var_name) = next_arg {
+                                if let Word::Literal(var_name, _) = next_arg {
                                     if !generator.declared_locals.contains(var_name) {
                                         output.push_str(&format!("my %{} = ();\n", var_name));
                                         generator.declared_locals.insert(var_name.clone());

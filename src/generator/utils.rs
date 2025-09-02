@@ -44,7 +44,7 @@ pub fn extract_array_elements_impl(value: &str) -> Option<Vec<String>> {
 
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s) => {
+        Word::Literal(s, _) => {
             // Escape quotes and backslashes for Perl string literals
             let escaped = s.replace("\\", "\\\\")
                           .replace("\"", "\\\"")
@@ -53,7 +53,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                           .replace("\r", "\\r");
             format!("\"{}\"", escaped)
         }
-        Word::Variable(var) => {
+        Word::Variable(var, _) => {
             // Handle special shell variables
             match var.as_str() {
                 "#" => "scalar(@ARGV)".to_string(),  // $# -> scalar(@ARGV) for argument count
@@ -61,19 +61,19 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 _ => format!("${}", var)             // Regular variables
             }
         }
-        Word::Arithmetic(expr) => {
+        Word::Arithmetic(expr, _) => {
             // Handle arithmetic expressions by converting them to Perl
             generator.convert_arithmetic_to_perl(&expr.expression)
         }
-        Word::ParameterExpansion(pe) => {
+        Word::ParameterExpansion(pe, _) => {
             // Handle parameter expansion
             generator.generate_parameter_expansion(pe)
         }
-        Word::StringInterpolation(interp) => {
+        Word::StringInterpolation(interp, _) => {
             // Handle string interpolation
             generator.convert_string_interpolation_to_perl(interp)
         }
-        Word::CommandSubstitution(cmd) => {
+        Word::CommandSubstitution(cmd, _) => {
             // Handle command substitution
             match cmd.as_ref() {
                 Command::Simple(simple_cmd) => {
@@ -144,8 +144,8 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     }
                     
                     // Return the code that executes the pipeline and captures output
-                    // Command substitution should strip trailing newlines and convert internal newlines to spaces
-                    format!("do {{ {} chomp({}); {} =~ s/\n/ /g; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
+                    // Command substitution should strip trailing newlines but preserve internal newlines
+                    format!("do {{ {} chomp({}); {} }}", captured_pipeline.trim(), output_var, output_var)
                 },
                 _ => {
                     // For other command types, use system command fallback
@@ -159,7 +159,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
 
 pub fn strip_shell_quotes_and_convert_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s) => {
+        Word::Literal(s, _) => {
             // Strip shell quotes if present and convert to Perl string literal
             let stripped = if (s.starts_with("'") && s.ends_with("'")) || (s.starts_with("\"") && s.ends_with("\"")) {
                 // Remove the outer quotes
@@ -176,15 +176,15 @@ pub fn strip_shell_quotes_and_convert_to_perl_impl(generator: &mut Generator, wo
                                 .replace("\r", "\\r");
             format!("\"{}\"", escaped)
         }
-        Word::Arithmetic(expr) => {
+        Word::Arithmetic(expr, _) => {
             // Handle arithmetic expressions by converting them to Perl
             generator.convert_arithmetic_to_perl(&expr.expression)
         }
-        Word::ParameterExpansion(pe) => {
+        Word::ParameterExpansion(pe, _) => {
             // Handle parameter expansion
             generator.generate_parameter_expansion(pe)
         }
-        Word::StringInterpolation(interp) => {
+        Word::StringInterpolation(interp, _) => {
             // Handle string interpolation
             generator.convert_string_interpolation_to_perl(interp)
         }
@@ -194,7 +194,7 @@ pub fn strip_shell_quotes_and_convert_to_perl_impl(generator: &mut Generator, wo
 
 pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s) => {
+        Word::Literal(s, _) => {
             // Strip shell quotes if present and return the raw string for regex
             if (s.starts_with("'") && s.ends_with("'")) || (s.starts_with("\"") && s.ends_with("\"")) {
                 // Remove the outer quotes
@@ -203,15 +203,15 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
                 s.clone()
             }
         }
-        Word::Arithmetic(expr) => {
+        Word::Arithmetic(expr, _) => {
             // Handle arithmetic expressions by converting them to Perl
             generator.convert_arithmetic_to_perl(&expr.expression)
         }
-        Word::ParameterExpansion(pe) => {
+        Word::ParameterExpansion(pe, _) => {
             // Handle parameter expansion
             generator.generate_parameter_expansion(pe)
         }
-        Word::StringInterpolation(interp) => {
+        Word::StringInterpolation(interp, _) => {
             // For regex, we need the raw content without quotes
             // For simple string interpolations with just literals, extract the raw content
             if interp.parts.len() == 1 {

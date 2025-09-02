@@ -149,7 +149,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 let operand2 = &cmd.args[2];
                 
                 // Initialize first operand if it's a variable
-                if let Word::Variable(var_name) = operand1 {
+                if let Word::Variable(var_name, _) = operand1 {
                     if !generator.declared_locals.contains(var_name) {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("my ${} = 0;\n", var_name));
@@ -160,7 +160,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 }
                 
                 // Initialize second operand if it's a variable
-                if let Word::Variable(var_name) = operand2 {
+                if let Word::Variable(var_name, _) = operand2 {
                     if !generator.declared_locals.contains(var_name) {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("my ${} = 0;\n", var_name));
@@ -221,7 +221,7 @@ fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for
             Command::Simple(cmd) => {
                 // Check if variable is used in simple commands
                 for arg in &cmd.args {
-                    if let Word::Variable(var_name) = arg {
+                    if let Word::Variable(var_name, _) = arg {
                         if var_name == for_loop_var {
                             return true;
                         }
@@ -258,7 +258,7 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
     
     for word in &for_loop.items {
         match word {
-            Word::StringInterpolation(interp) => {
+            Word::StringInterpolation(interp, _) => {
                 // Check if this is just a single array variable like "$@" or "$*"
                 if interp.parts.len() == 1 {
                     if let StringPart::Variable(var) = &interp.parts[0] {
@@ -288,7 +288,7 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                     all_items.push(generator.word_to_perl(word));
                 }
             }
-            Word::BraceExpansion(expansion) => {
+            Word::BraceExpansion(expansion, _) => {
                 // Handle brace expansion directly
                 if expansion.items.len() == 1 {
                     match &expansion.items[0] {
@@ -371,7 +371,7 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                     }
                 }
             }
-            Word::Literal(s) => {
+            Word::Literal(s, _) => {
                 // Check if this literal contains space-separated values (likely from brace expansion)
                 if s.contains(' ') && s.chars().all(|c| c.is_ascii_digit() || c.is_ascii_whitespace()) {
                     // Split by whitespace and add each item separately

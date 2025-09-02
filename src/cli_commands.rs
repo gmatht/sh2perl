@@ -4,6 +4,7 @@ use std::io::Write;
 use debashl::shared_utils;
 use crate::utils::{extract_line_col, caret_snippet};
 use debashl::{Lexer, Parser, Generator};
+use debashl::mir::{MirCommand, Word, Bounds};
 
 pub fn run_generated(lang: &str, input: &str) {
     let source = if input.ends_with(".sh") || std::path::Path::new(input).exists() {
@@ -186,7 +187,7 @@ pub fn interactive_mode() {
     }
 }
 
-pub fn export_mir(input: &str) {
+pub fn export_mir(input: &str, optimize: bool) {
     let source = if input.ends_with(".sh") || std::path::Path::new(input).exists() {
         fs::read_to_string(input).unwrap_or_else(|_| input.to_string())
     } else { 
@@ -201,14 +202,134 @@ pub fn export_mir(input: &str) {
         }
     };
     
-    // Convert the parsed commands to MIR format
-    // For now, we'll serialize the entire command structure as JSON
-    match serde_json::to_string_pretty(&commands) {
+    // Convert the parsed commands to MIR format with optimization information
+    let mut mir_commands: Vec<MirCommand> = commands.iter()
+        .map(|cmd| MirCommand::from_ast_command(cmd))
+        .collect();
+    
+    // Apply optimizations if requested
+    if optimize {
+        mir_commands = optimize_mir_commands(mir_commands);
+    }
+    
+    match serde_json::to_string_pretty(&mir_commands) {
         Ok(mir_json) => {
             println!("{}", mir_json);
         }
         Err(e) => {
             println!("Error serializing MIR: {}", e);
+        }
+    }
+}
+
+/// Apply optimizations to MIR commands
+fn optimize_mir_commands(mut commands: Vec<MirCommand>) -> Vec<MirCommand> {
+    for command in &mut commands {
+        optimize_mir_command(command);
+    }
+    commands
+}
+
+/// Apply optimizations to a single MIR command
+fn optimize_mir_command(command: &mut MirCommand) {
+    match command {
+        MirCommand::Simple(simple_cmd) => {
+            // Optimize the command name
+            simple_cmd.name = optimize_word(&simple_cmd.name);
+            
+            // Optimize all arguments
+            for arg in &mut simple_cmd.args {
+                *arg = optimize_word(arg);
+            }
+        }
+        MirCommand::Pipeline(_pipeline) => {
+            // Pipeline contains AST Command types, not MirCommand types
+            // We can't optimize them directly here since they're not MirCommand
+            // The optimization would need to be done at the AST level
+        }
+        MirCommand::For(_for_loop) => {
+            // For loops contain AST Command types, not MirCommand types
+            // We can't optimize them directly here since they're not MirCommand
+            // The optimization would need to be done at the AST level
+        }
+        MirCommand::While(_while_loop) => {
+            // While loops contain AST Command types, not MirCommand types
+            // We can't optimize them directly here since they're not MirCommand
+            // The optimization would need to be done at the AST level
+        }
+        MirCommand::Redirect(redirect_cmd) => {
+            // RedirectCommand contains AST Command types, not MirCommand types
+            // We can't optimize them directly here since they're not MirCommand
+            // The optimization would need to be done at the AST level
+            
+            // Optimize redirect targets
+            for redirect in &mut redirect_cmd.redirects {
+                redirect.target = optimize_word(&redirect.target);
+            }
+        }
+        MirCommand::And(left, right) => {
+            optimize_mir_command(left);
+            optimize_mir_command(right);
+        }
+        MirCommand::Or(left, right) => {
+            optimize_mir_command(left);
+            optimize_mir_command(right);
+        }
+        MirCommand::If(_if_stmt) => {
+            // If statements contain AST Command types, not MirCommand types
+            // We can't optimize them directly here since they're not MirCommand
+            // The optimization would need to be done at the AST level
+        }
+        MirCommand::Case(_case_stmt) => {
+            // Case statements contain AST Command types, not MirCommand types
+            // We can't optimize them directly here since they're not MirCommand
+            // The optimization would need to be done at the AST level
+        }
+        MirCommand::Function(_func) => {
+            // Functions contain AST Command types, not MirCommand types
+            // We can't optimize them directly here since they're not MirCommand
+            // The optimization would need to be done at the AST level
+        }
+        MirCommand::Subshell(cmd) => {
+            optimize_mir_command(cmd);
+        }
+        MirCommand::Background(cmd) => {
+            optimize_mir_command(cmd);
+        }
+    }
+}
+
+/// Apply optimizations to a Word
+fn optimize_word(word: &Word) -> Word {
+    match word {
+        Word::ParameterExpansion(pe, bounds) => {
+            // Optimize parameter expansion by evaluating it if possible
+            // For now, we'll keep it as-is but could add evaluation logic here
+            Word::ParameterExpansion(pe.clone(), bounds.clone())
+        }
+        Word::StringInterpolation(interp, bounds) => {
+            // Optimize string interpolation by evaluating it if possible
+            // For now, we'll keep it as-is but could add evaluation logic here
+            Word::StringInterpolation(interp.clone(), bounds.clone())
+        }
+        Word::Arithmetic(arith, bounds) => {
+            // Optimize arithmetic expressions by evaluating them if possible
+            // For now, we'll keep it as-is but could add evaluation logic here
+            Word::Arithmetic(arith.clone(), bounds.clone())
+        }
+        Word::CommandSubstitution(cmd, bounds) => {
+            // Optimize command substitution by evaluating it if possible
+            // For now, we'll keep it as-is but could add evaluation logic here
+            Word::CommandSubstitution(cmd.clone(), bounds.clone())
+        }
+        Word::BraceExpansion(expansion, bounds) => {
+            // Optimize brace expansion by expanding it if possible
+            // For now, we'll keep it as-is but could add expansion logic here
+            Word::BraceExpansion(expansion.clone(), bounds.clone())
+        }
+        _ => {
+            // No optimization for other word types
+            word.clone()
         }
     }
 }
