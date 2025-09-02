@@ -7,6 +7,31 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
     
     // Generate: left && right
     output.push_str(&generator.indent());
+    
+    // For TestExpression, use the test expression directly as the condition
+    if let Command::TestExpression(_) = left {
+        output.push_str("if (");
+        let test_result = generator.generate_command(left);
+        output.push_str(&test_result);
+        output.push_str(") {\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&generator.generate_command(right));
+        output.push_str(&generator.indent());
+        output.push_str("$? = 0;\n");
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("} else {\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str("$? = 1;\n");
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
+        return output;
+    }
+    
+    // For other commands, use the original pattern with exit code checking
     output.push_str("if (");
     
     // For RedirectCommand, we need to check exit code
@@ -19,10 +44,6 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("} == 0");
-    } else if let Command::TestExpression(_) = left {
-        // For test expressions, generate the test condition directly
-        let test_result = generator.generate_command(left);
-        output.push_str(&test_result);
     } else if let Command::Simple(simple_cmd) = left {
         if let Word::Literal(name) = &simple_cmd.name {
             if name == "grep" {
@@ -102,22 +123,11 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         output.push_str("}\n");
     } else if let Command::And(and_left, and_right) = left {
         // Special handling for AND operations in OR context
-        // Generate: if (!(left && right)) { or_right }
-        output.push_str("my $and_success = 0;\n");
+        // Use the logical AND generation function to handle the AND operation properly
+        let and_result = generator.generate_command(left);
+        output.push_str(&and_result);
         output.push_str(&generator.indent());
-        output.push_str(&generator.generate_command(and_left));
-        output.push_str(&generator.indent());
-        output.push_str("if ($? == 0) {\n");
-        generator.indent_level += 1;
-        output.push_str(&generator.indent());
-        output.push_str(&generator.generate_command(and_right));
-        output.push_str(&generator.indent());
-        output.push_str("$and_success = 1;\n");
-        generator.indent_level -= 1;
-        output.push_str(&generator.indent());
-        output.push_str("}\n");
-        output.push_str(&generator.indent());
-        output.push_str("if ($and_success == 0) {\n");
+        output.push_str("if ($? != 0) {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
         output.push_str(&generator.generate_command(right));
