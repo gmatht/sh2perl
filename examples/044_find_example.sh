@@ -29,12 +29,12 @@ find . -empty  | sort
 #find . -group $(id -gn) -type f
 
 # Find files and execute command on them
-touch a.log a.log.sav
-find . -name "*.log" -exec rm {} \;
+touch a.logtmp a.logtmp.sav
+find . -name "*.logtmp" -exec rm {} \;
 
-ls *.log*
+ls *.logtmp*
 
-rm a.log.sav
+rm a.logtmp.sav
 
 # Find files and show detailed information
 find . -type f -ls  | sort
