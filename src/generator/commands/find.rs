@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::mir::*;
 use crate::generator::Generator;
 
 fn escape_glob_pattern(pattern: &str) -> String {
@@ -57,7 +58,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                         Word::StringInterpolation(interp) => {
                             interp.parts.iter()
                                 .map(|part| match part {
-                                    crate::ast::StringPart::Literal(s) => s,
+                                    StringPart::Literal(s) => s,
                                     _ => "*"
                                 })
                                 .collect::<Vec<_>>()

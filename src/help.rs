@@ -15,6 +15,7 @@ pub fn show_help(program_name: &str) {
     println!("TRANSLATION OPTIONS:");
     println!();
     println!("  parse --perl <input>           - Convert shell script to Perl");
+    println!("  --mir <input>                  - Export Mid-level Intermediate Representation (MIR) as JSON");
     
     println!();
     println!("  file --perl <filename>         - Convert shell script file to Perl");
@@ -59,6 +60,7 @@ pub fn show_help(program_name: &str) {
     println!("  {} lex 'echo hello world'", program_name);
     println!("  {} parse 'echo hello world'", program_name);
     println!("  {} parse --perl 'echo hello world'", program_name);
+    println!("  {} --mir 'echo hello world'", program_name);
     println!("  {} file --perl examples/simple.sh", program_name);
     println!("  {} --test-file perl examples/simple.sh", program_name);
     println!("  {} --test-eq", program_name);

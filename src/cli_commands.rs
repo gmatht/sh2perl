@@ -185,3 +185,30 @@ pub fn interactive_mode() {
         }
     }
 }
+
+pub fn export_mir(input: &str) {
+    let source = if input.ends_with(".sh") || std::path::Path::new(input).exists() {
+        fs::read_to_string(input).unwrap_or_else(|_| input.to_string())
+    } else { 
+        input.to_string() 
+    };
+    
+    let commands = match Parser::new(&source).parse() {
+        Ok(c) => c,
+        Err(e) => { 
+            println!("Parse error: {}", e); 
+            return; 
+        }
+    };
+    
+    // Convert the parsed commands to MIR format
+    // For now, we'll serialize the entire command structure as JSON
+    match serde_json::to_string_pretty(&commands) {
+        Ok(mir_json) => {
+            println!("{}", mir_json);
+        }
+        Err(e) => {
+            println!("Error serializing MIR: {}", e);
+        }
+    }
+}

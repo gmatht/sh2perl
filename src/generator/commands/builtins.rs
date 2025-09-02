@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use crate::ast::*;
+use crate::mir::*;
 use crate::generator::Generator;
 
 #[derive(Debug, Clone)]

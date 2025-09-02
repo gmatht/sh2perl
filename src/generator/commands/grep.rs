@@ -1,5 +1,6 @@
 use crate::generator::Generator;
 use crate::ast::*;
+use crate::mir::*;
 
 pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, should_print: bool) -> String {
     let mut output = String::new();

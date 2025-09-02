@@ -1,4 +1,4 @@
-use crate::ast::*;
+use crate::mir::*;
 use super::Generator;
 
 pub fn generate_parameter_expansion_impl(generator: &mut Generator, pe: &ParameterExpansion) -> String {

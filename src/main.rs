@@ -17,7 +17,7 @@ use crate::utils::generate_unified_diff;
 use crate::testing::{test_all_examples, test_all_examples_next_fail, find_uses_of_system,
                     test_file_equivalence, AstFormatOptions};
 use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, 
-                     parse_file_to_perl, interactive_mode};
+                     parse_file_to_perl, interactive_mode, export_mir};
 use crate::help::show_help;
 
 fn main() {
@@ -368,6 +368,28 @@ fn main() {
         }
         "interactive" => {
             interactive_mode();
+        }
+        "--mir" => {
+            if args.len() < 3 {
+                println!("Error: --mir command requires input");
+                return;
+            }
+            let input = &args[2];
+            // Check if input looks like a filename (contains .sh or doesn't contain spaces)
+            if input.contains(".sh") || !input.contains(' ') {
+                // Try to read as file first
+                match fs::read_to_string(input) {
+                    Ok(content) => {
+                        export_mir(&content);
+                    }
+                    Err(_) => {
+                        // If file read fails, treat as direct input
+                        export_mir(input);
+                    }
+                }
+            } else {
+                export_mir(input);
+            }
         }
         "fail" => {
             // Shorthand for --next-fail
