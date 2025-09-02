@@ -1,0 +1,434 @@
+use crate::ast::*;
+use super::Generator;
+use crate::generator::utils::get_temp_dir;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) -> String {
+    let mut output = String::new();
+    
+    match &redirect.operator {
+        RedirectOperator::Input => {
+            // Input redirection: command < file
+            output.push_str(&format!("open(STDIN, '<', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+        }
+        RedirectOperator::Output => {
+            // Output redirection: command > file
+            // Note: This function doesn't have access to the command name, so it can't handle echo specially
+            // The special handling is done in generate_simple_command
+            output.push_str(&format!("open(STDOUT, '>', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+        }
+        RedirectOperator::Append => {
+            // Append redirection: command >> file
+            output.push_str(&format!("open(STDOUT, '>>', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+        }
+        RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => {
+            // Heredoc: command << delimiter
+            if let Some(body) = &redirect.heredoc_body {
+                // Check if this is a perl command - if so, embed the code directly
+                if let Some(cmd_name) = get_command_name_from_context() {
+                    if cmd_name == "perl" {
+                        // For perl commands, directly embed the heredoc content as Perl code
+                        output.push_str(&format!("{{\n"));
+                        output.push_str(&format!("    # Embedded Perl code from heredoc\n"));
+                        output.push_str(&format!("{}\n", body));
+                        output.push_str(&format!("}}\n"));
+                        return output;
+                    }
+                }
+                
+                // For other commands, create a temporary file with the heredoc content
+                output.push_str(&format!("my $temp_content = {};\n", generator.perl_string_literal(&Word::Literal(body.clone()))));
+                let fh = generator.get_unique_file_handle();
+                output.push_str(&format!("use File::Path qw(make_path);\n"));
+                output.push_str(&format!("make_path('{}') unless -d '{}';\n", get_temp_dir(), get_temp_dir()));
+                output.push_str(&format!("open(my ${}, '>', '{}heredoc_temp') or die \"Cannot create temp file: $!\\n\";\n", fh, get_temp_dir()));
+                output.push_str(&format!("print {} $temp_content;\n", fh));
+                output.push_str(&format!("close({});\n", fh));
+                output.push_str(&format!("open(STDIN, '<', '{}heredoc_temp') or die \"Cannot open temp file: $!\\n\";\n", get_temp_dir()));
+            }
+        }
+        RedirectOperator::ProcessSubstitutionInput(cmd) => {
+            let global_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temp_file = format!("{}/process_sub_{}.tmp", get_temp_dir(), global_counter);
+            let temp_var = format!("temp_file_ps_{}", global_counter);
+            let output_var = format!("output_ps_{}", global_counter);
+            let fh_var = format!("fh_ps_{}", global_counter);
+            
+            output.push_str(&format!("my ${} = {} . '/process_sub_{}.tmp';\n", temp_var, get_temp_dir(), global_counter));
+            
+            if let Command::Pipeline(_) = cmd.as_ref() {
+                output.push_str(&format!("my ${};\n", output_var));
+                output.push_str(&format!("{{\n"));
+                output.push_str(&format!("    local *STDOUT;\n"));
+                output.push_str(&format!("    open(STDOUT, '>', \\${}) or die \"Cannot redirect STDOUT\";\n", output_var));
+                output.push_str(&format!("    {{\n"));
+                
+                // Use the Perl generator instead of bash execution
+                let perl_code = generator.generate_command(cmd);
+                for line in perl_code.lines() {
+                    if !line.trim().is_empty() {
+                        output.push_str(&format!("    {}\n", line));
+                    }
+                }
+                
+                output.push_str(&format!("    }}\n"));
+                output.push_str(&format!("}}\n"));
+            } else {
+                let cmd_str = generate_bash_command_string(cmd);
+                output.push_str(&format!("my ${} = `{}`;\n", output_var, cmd_str));
+            }
+            
+            output.push_str(&format!("use File::Path qw(make_path);\n"));
+            output.push_str(&format!("my $temp_dir_{} = dirname(${});\n", global_counter, temp_var));
+            output.push_str(&format!("make_path($temp_dir_{}) unless -d $temp_dir_{};\n", global_counter, global_counter));
+            output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
+            output.push_str(&format!("print ${} ${};\n", fh_var, output_var));
+            output.push_str(&format!("close(${});\n", fh_var));
+            
+            generator.process_sub_files.insert(format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter), temp_var.clone());
+            
+            // Store the temp_var for use by commands that need it (like grep -f)
+            generator.current_process_sub_file = Some(temp_var.clone());
+        }
+        RedirectOperator::ProcessSubstitutionOutput(_cmd) => {
+            output.push_str("# Redirect ProcessSubstitutionOutput not yet implemented\n");
+        }
+        RedirectOperator::HereString => {
+            // Here-strings are now handled in the command dispatcher
+            // This case should not be reached
+            output.push_str("# Here-string handling moved to command dispatcher\n");
+        }
+        _ => {
+            // Other redirects not yet implemented
+            output.push_str(&format!("# Redirect {:?} not yet implemented\n", redirect.operator));
+        }
+    }
+    
+    output
+}
+
+// Helper function to generate bash command strings for process substitution
+fn generate_bash_command_string(cmd: &Command) -> String {
+    match cmd {
+        Command::Simple(simple_cmd) => {
+            let args: Vec<String> = simple_cmd.args.iter()
+                .map(|arg| word_to_bash_string(arg))
+                .collect();
+            if args.is_empty() {
+                simple_cmd.name.to_string()
+            } else {
+                format!("{} {}", simple_cmd.name, args.join(" "))
+            }
+        }
+        Command::Pipeline(pipeline) => {
+            let commands: Vec<String> = pipeline.commands.iter()
+                .map(|cmd| generate_bash_command_string(cmd))
+                .collect();
+            
+            let mut result = String::new();
+            // Handle pipeline operators
+            for (i, (command, _)) in commands.iter().zip(pipeline.commands.iter()).enumerate() {
+                if i > 0 {
+                    result.push_str(" | "); // Default to pipe for now
+                }
+                result.push_str(command);
+            }
+            result
+        }
+        Command::Subshell(subshell_cmd) => {
+            format!("({})", generate_bash_command_string(&**subshell_cmd))
+        }
+        Command::Redirect(redirect_cmd) => {
+            // For redirects, we need to generate the base command and redirects
+            let base_cmd = if let Command::Simple(cmd) = &*redirect_cmd.command {
+                if cmd.name.to_string().is_empty() {
+                    // Empty command with just redirects (like process substitution)
+                    String::new()
+                } else {
+                    generate_bash_command_string(&*redirect_cmd.command)
+                }
+            } else {
+                generate_bash_command_string(&*redirect_cmd.command)
+            };
+            
+            let mut result = base_cmd;
+            for redirect in &redirect_cmd.redirects {
+                match &redirect.operator {
+                    RedirectOperator::Input => {
+                        result.push_str(&format!(" < {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::Output => {
+                        result.push_str(&format!(" > {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::Append => {
+                        result.push_str(&format!(" >> {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::ProcessSubstitutionInput(cmd) => {
+                        result.push_str(&format!(" <({})", generate_bash_command_string(cmd)));
+                    }
+                    RedirectOperator::ProcessSubstitutionOutput(cmd) => {
+                        result.push_str(&format!(" >({})", generate_bash_command_string(cmd)));
+                    }
+                    RedirectOperator::HereString => {
+                        result.push_str(&format!(" <<< {}", word_to_bash_string(&redirect.target)));
+                    }
+                    _ => {
+                        // Skip other redirect types for now
+                    }
+                }
+            }
+            result
+        }
+        _ => {
+            // For other complex commands, generate a reasonable bash representation
+            format!("echo 'Complex command not supported in bash string generation'")
+        }
+    }
+}
+
+// Helper function to convert Word to bash string representation
+fn word_to_bash_string(word: &Word) -> String {
+    match word {
+        Word::Literal(s) => s.clone(),
+        Word::BraceExpansion(expansion) => {
+            let mut result = String::new();
+            if let Some(ref prefix) = expansion.prefix {
+                result.push_str(prefix);
+            }
+            result.push('{');
+            
+            let items_str = expansion.items.iter()
+                .map(|item| match item {
+                    BraceItem::Literal(s) => s.clone(),
+                    BraceItem::Range(range) => {
+                        if let Some(ref step) = range.step {
+                            format!("{}..{}..{}", range.start, range.end, step)
+                        } else {
+                            format!("{}..{}", range.start, range.end)
+                        }
+                    }
+                    BraceItem::Sequence(items) => items.join(","),
+                })
+                .collect::<Vec<String>>()
+                .join(",");
+            result.push_str(&items_str);
+            result.push('}');
+            
+            if let Some(ref suffix) = expansion.suffix {
+                result.push_str(suffix);
+            }
+            result
+        }
+        Word::ParameterExpansion(param) => {
+            format!("${{{}}}", param)
+        }
+        Word::StringInterpolation(parts) => {
+            let mut result = String::new();
+            for part in &parts.parts {
+                match part {
+                    StringPart::Literal(s) => result.push_str(&s),
+                    StringPart::Variable(var) => result.push_str(&format!("${{{}}}", var)),
+                    _ => result.push_str("$var"), // Placeholder for other types
+                }
+            }
+            result
+        }
+        Word::CommandSubstitution(cmd) => {
+            // This would need to be handled by the caller
+            format!("$({})", "command")
+        }
+        _ => format!("{:?}", word)
+    }
+}
+
+pub fn generate_shopt_command_impl(generator: &mut Generator, cmd: &ShoptCommand) -> String {
+    let mut output = String::new();
+    
+    // Handle shopt command for shell options
+    match cmd.option.as_str() {
+        "extglob" => {
+            generator.extglob_enabled = cmd.enable;
+            output.push_str(&format!("# extglob option {}\n", if cmd.enable { "enabled" } else { "disabled" }));
+        }
+        "nocasematch" => {
+            generator.nocasematch_enabled = cmd.enable;
+            output.push_str(&format!("# nocasematch option {}\n", if cmd.enable { "enabled" } else { "disabled" }));
+        }
+        _ => {
+            output.push_str(&format!("# shopt -{} {} not implemented\n", if cmd.enable { "s" } else { "u" }, cmd.option));
+        }
+    }
+    
+    // shopt commands always succeed (return true)
+    output
+}
+
+pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCommand) -> String {
+    let mut output = String::new();
+    
+    // Handle environment variables if any
+    let has_env = !cmd.env_vars.is_empty();
+    if has_env {
+        output.push_str("{\n");
+        for (var, value) in &cmd.env_vars {
+            // Check if this is an associative array assignment like map[foo]=bar
+            if let Some((array_name, key)) = generator.extract_array_key(var) {
+                let val = generator.perl_string_literal(value);
+                // For associative array assignments, generate $array{key} = value instead of $ENV{var}
+                output.push_str(&format!("${}{{{}}} = {};\n", array_name, key, val));
+            } else if let Word::Literal(s) = value {
+                if let Some(elements) = generator.extract_array_elements(s) {
+                    // Check if this is an indexed array assignment like arr=(one two three)
+                    let elements_perl: Vec<String> = elements.iter()
+                        .map(|s| format!("\"{}\"", generator.escape_perl_string(s)))
+                        .collect();
+                    output.push_str(&format!("@{} = ({});\n", var, elements_perl.join(", ")));
+                } else {
+                    // Regular string assignment
+                    let val = generator.perl_string_literal(value);
+                    // Declare the variable if it's not already declared
+                    if !generator.declared_locals.contains(var) {
+                        output.push_str(&format!("my ${} = {};\n", var, val));
+                        generator.declared_locals.insert(var.clone());
+                    } else {
+                        // Variable already declared, just assign the value
+                        output.push_str(&format!("${} = {};\n", var, val));
+                    }
+                    output.push_str(&format!("local $ENV{{{}}} = {};;\n", var, val));
+                }
+            } else {
+                let val = generator.perl_string_literal(value);
+                // Declare the variable if it's not already declared
+                if !generator.declared_locals.contains(var) {
+                    output.push_str(&format!("my ${} = {};\n", var, val));
+                    generator.declared_locals.insert(var.clone());
+                } else {
+                    // Variable already declared, just assign the value
+                    output.push_str(&format!("${} = {};\n", var, val));
+                }
+                output.push_str(&format!("local $ENV{{{}}} = {};;\n", var, val));
+            }
+        }
+    }
+    
+    // Generate the builtin command
+    match cmd.name.as_str() {
+        "set" => {
+            // Convert shell set options to Perl equivalents
+            for arg in &cmd.args {
+                if let Word::Literal(opt) = arg {
+                    match opt.as_str() {
+                        "-e" => output.push_str("$SIG{__DIE__} = sub { exit 1 };\n"),
+                        "-u" => output.push_str("use strict;\n"),
+                        "-o" => {
+                            // Handle pipefail and other options
+                            if let Some(next_arg) = cmd.args.get(cmd.args.iter().position(|a| a == arg).unwrap() + 1) {
+                                if let Word::Literal(opt_name) = next_arg {
+                                    match opt_name.as_str() {
+                                        "pipefail" => output.push_str("# set -o pipefail not implemented in Perl\n"),
+                                        _ => output.push_str(&format!("# set -o {} not implemented\n", opt_name)),
+                                    }
+                                }
+                            }
+                        }
+                        _ => output.push_str(&format!("# set {} not implemented\n", opt)),
+                    }
+                }
+            }
+        }
+        "unset" => {
+            // Handle unset command
+            for arg in &cmd.args {
+                if let Word::Literal(var_name) = arg {
+                    if let Some((array_name, key)) = generator.extract_array_key(var_name) {
+                        // Unset array element
+                        output.push_str(&format!("delete ${}{{{}}};\n", array_name, key));
+                    } else {
+                        // Unset variable - ensure it's declared first
+                        if !generator.declared_locals.contains(var_name) {
+                            output.push_str(&format!("my ${};\n", var_name));
+                            generator.declared_locals.insert(var_name.clone());
+                        }
+                        output.push_str(&format!("undef ${};\n", var_name));
+                        output.push_str(&format!("delete $ENV{{{}}};\n", var_name));
+                    }
+                }
+            }
+        }
+        "export" => {
+            // Handle export command
+            for arg in &cmd.args {
+                if let Word::Literal(var_name) = arg {
+                    if let Some((array_name, key)) = generator.extract_array_key(var_name) {
+                        // Export array element
+                        output.push_str(&format!("$ENV{{{}}} = ${}{{{}}};\n", var_name, array_name, key));
+                    } else {
+                        // Export variable
+                        output.push_str(&format!("$ENV{{{}}} = ${};\n", var_name, var_name));
+                    }
+                }
+            }
+        }
+        "readonly" => {
+            // Handle readonly command (not directly supported in Perl)
+            for arg in &cmd.args {
+                if let Word::Literal(var_name) = arg {
+                    output.push_str(&format!("# readonly {} not implemented in Perl\n", var_name));
+                }
+            }
+        }
+        "declare" => {
+            // Handle declare command
+            for arg in &cmd.args {
+                if let Word::Literal(opt) = arg {
+                    match opt.as_str() {
+                        "-a" => {
+                            // Declare array
+                            if let Some(next_arg) = cmd.args.get(cmd.args.iter().position(|a| a == arg).unwrap() + 1) {
+                                if let Word::Literal(var_name) = next_arg {
+                                    if !generator.declared_locals.contains(var_name) {
+                                        output.push_str(&format!("my @{} = ();\n", var_name));
+                                        generator.declared_locals.insert(var_name.clone());
+                                    }
+                                }
+                            }
+                        }
+                        "-A" => {
+                            // Declare associative array
+                            if let Some(next_arg) = cmd.args.get(cmd.args.iter().position(|a| a == arg).unwrap() + 1) {
+                                if let Word::Literal(var_name) = next_arg {
+                                    if !generator.declared_locals.contains(var_name) {
+                                        output.push_str(&format!("my %{} = ();\n", var_name));
+                                        generator.declared_locals.insert(var_name.clone());
+                                    }
+                                }
+                            }
+                        }
+                        _ => output.push_str(&format!("# declare {} not implemented\n", opt)),
+                    }
+                }
+            }
+        }
+        _ => {
+            // Other builtin commands
+            output.push_str(&format!("# Builtin command '{}' not implemented\n", cmd.name));
+        }
+    }
+    
+    if has_env {
+        output.push_str("}\n");
+    }
+    
+    output
+}
+
+// Helper method for escaping Perl strings
+pub fn escape_perl_string(s: &str) -> String {
+    s.replace("\\", "\\\\")
+     .replace("\"", "\\\"")
+     .replace("\n", "\\n")
+     .replace("\t", "\\t")
+     .replace("\r", "\\r")
+}
