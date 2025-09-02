@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::mir::*;
 use std::collections::{HashSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 

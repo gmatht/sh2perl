@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::mir::*;
 use crate::generator::Generator;
 
 pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {

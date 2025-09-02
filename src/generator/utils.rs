@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::mir::*;
 use super::Generator;
 use regex::Regex;
 
@@ -144,7 +145,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     
                     // Return the code that executes the pipeline and captures output
                     // Command substitution should strip trailing newlines and convert internal newlines to spaces
-                    format!("do {{ {} chomp({}); {} =~ s/\\n/ /g; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
+                    format!("do {{ {} chomp({}); {} =~ s/\n/ /g; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
                 },
                 _ => {
                     // For other command types, use system command fallback
@@ -214,7 +215,7 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
             // For regex, we need the raw content without quotes
             // For simple string interpolations with just literals, extract the raw content
             if interp.parts.len() == 1 {
-                if let crate::ast::StringPart::Literal(s) = &interp.parts[0] {
+                if let StringPart::Literal(s) = &interp.parts[0] {
                     // Return the raw string content for regex
                     s.clone()
                 } else {

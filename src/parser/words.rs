@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::mir::*;
 use crate::lexer::{Lexer, Token};
 use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;
@@ -765,7 +766,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
 
 // Placeholder functions - these would need to be implemented based on the actual AST structures
 fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
-    use crate::ast::{StringInterpolation, StringPart};
+    use crate::mir::{StringInterpolation, StringPart};
     
     // Get the double-quoted string content (this includes the quotes)
     let string_content = lexer.get_string_text()?;
@@ -1212,7 +1213,7 @@ fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
 }
 
 fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
-    use crate::ast::{BraceExpansion, BraceItem, BraceRange};
+    use crate::mir::{BraceExpansion, BraceItem, BraceRange};
     
     // Consume the opening brace
     if !matches!(lexer.peek(), Some(Token::BraceOpen)) {

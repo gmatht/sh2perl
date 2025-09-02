@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::mir::*;
 use crate::generator::Generator;
 
 pub fn generate_xargs_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
@@ -20,7 +21,7 @@ pub fn generate_xargs_command(_generator: &mut Generator, cmd: &SimpleCommand, i
         } else if let Word::StringInterpolation(interp) = arg {
             let pattern = interp.parts.iter()
                 .map(|part| match part {
-                    crate::ast::StringPart::Literal(s) => s,
+                    StringPart::Literal(s) => s,
                     _ => ".*"
                 })
                 .collect::<Vec<_>>()

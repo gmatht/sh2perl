@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::mir::*;
 use super::Generator;
 
 pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStatement) -> String {
