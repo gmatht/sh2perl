@@ -392,9 +392,10 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
             "perl" => {
                 let mut gen = Generator::new();
                 let code = gen.generate(&commands);
-                let tmp = "examples/__tmp_test_output.pl";
-                if let Err(e) = shared_utils::SharedUtils::write_utf8_file(tmp, &code) { return Err(format!("Failed to write Perl temp file: {}", e)); }
-                (tmp.to_string(), vec!["perl", "__tmp_test_output.pl"], code)
+                let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
+                let tmp_str = tmp.to_string_lossy().to_string();
+                if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) { return Err(format!("Failed to write Perl temp file: {}", e)); }
+                (tmp_str.clone(), vec!["perl".to_string(), tmp_str], code)
             }
             _ => { return Err(format!("Unsupported language for --test-file: {}", lang)); }
         };
