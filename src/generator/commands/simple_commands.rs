@@ -374,7 +374,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     // Handle brace expansion for command arguments
                                     handle_brace_expansion_for_command(generator, expansion)
                                 }
-                                _ => generator.word_to_perl(arg)
+                                _ => generator.perl_string_literal(arg)
                             }
                         })
                         .collect();
@@ -394,7 +394,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             output.push_str(&format!("system('{}');\n", cmd_name));
         } else {
             let args: Vec<String> = cmd.args.iter()
-                .map(|arg| generator.word_to_perl(arg))
+                .map(|arg| generator.perl_string_literal(arg))
                 .collect();
             output.push_str(&generator.indent());
             output.push_str(&format!("system('{}', {});\n", cmd_name, args.join(", ")));
