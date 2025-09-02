@@ -1,22 +1,22 @@
 #!/bin/bash
 
 # Find all .txt files in current directory and subdirectories
-find . -name "*.txt" -type f
+find . -name "*.txt" -type f | sort
 
 # Find files modified in the last 7 days
-find . -mtime -7 -type f
+find . -mtime -7 -type f  | sort
 
 # Find files modified in the last 1 day
-find . -mtime -1 -type f
+find . -mtime -1 -type f  | sort
 
 # Find files modified in the last 1 hour
-find . -mmin -60 -type f
+find . -mmin -60 -type f  | sort
 
 # Find files larger than 1MB
-find . -size +1M -type f
+find . -size +1M -type f  | sort
 
 # Find empty files and directories
-find . -empty
+find . -empty  | sort
 
 # Don't use  yet, they are not portable
 # Find files with specific permissions (executable)
@@ -29,10 +29,15 @@ find . -empty
 #find . -group $(id -gn) -type f
 
 # Find files and execute command on them
+touch a.log a.log.sav
 find . -name "*.log" -exec rm {} \;
 
+ls *.log*
+
+rm a.log.sav
+
 # Find files and show detailed information
-find . -type f -ls
+find . -type f -ls  | sort
 
 # Find files excluding certain directories
-find . -type f -not -path "./.git/*" -not -path "./node_modules/*"
+find .. -type f -not -path "./.git/*" -not -path "./node_modules/*"  | sort
