@@ -96,7 +96,7 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
     // First check if all commands support line-by-line processing
     let all_support_linebyline = pipeline.commands.iter().all(|cmd| {
         if let Command::Simple(simple_cmd) = cmd {
-            if let Word::Literal(name) = &simple_cmd.name {
+            if let Word::Literal(name, _) = &simple_cmd.name {
                 if let Some(builtin) = get_builtin_commands().get(name.as_str()) {
                     builtin.supports_linebyline
                 } else {
@@ -118,12 +118,12 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
     
     // Check if the first command reads from a file (not STDIN)
     if let Some(Command::Simple(first_cmd)) = pipeline.commands.first() {
-        if let Word::Literal(name) = &first_cmd.name {
+        if let Word::Literal(name, _) = &first_cmd.name {
             match name.as_str() {
                 "grep" => {
                     // Check for grep options that make streaming inappropriate
                     for arg in &first_cmd.args {
-                        if let Word::Literal(arg_str) = arg {
+                        if let Word::Literal(arg_str, _) = arg {
                             if arg_str == "-l" || arg_str == "-L" || arg_str == "-Z" || arg_str == "-r" {
                                 // These options don't make sense in streaming context
                                 // -r (recursive) requires file system traversal
@@ -136,7 +136,7 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
                     if first_cmd.args.len() > 1 {
                         // Look for the last argument that might be a filename
                         if let Some(last_arg) = first_cmd.args.last() {
-                            if let Word::Literal(filename) = last_arg {
+                            if let Word::Literal(filename, _) = last_arg {
                                 // If it's not an option (doesn't start with -), it's likely a filename
                                 if !filename.starts_with('-') {
                                     return false;
@@ -163,7 +163,7 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
 /// This is a fallback for commands that don't have specialized modules
 pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, output_var: &str, command_index: &str, linebyline: bool) -> String {
     let command_name = match &cmd.name {
-        Word::Literal(s) => s,
+        Word::Literal(s, _) => s,
         _ => "unknown_command"
     };
     
@@ -341,6 +341,7 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             // For now, use the existing signature but we should standardize this
             crate::generator::commands::tee::generate_tee_command(generator, cmd, input_var)
         },
+
         _ => {
             // Fallback for unknown commands - use system call
             generate_system_call_fallback(command_name, cmd, input_var, output_var)
@@ -348,11 +349,12 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
     }
 }
 
+
 /// Generate a system call fallback for unknown commands
 fn generate_system_call_fallback(command_name: &str, cmd: &SimpleCommand, input_var: &str, output_var: &str) -> String {
     let args: Vec<String> = cmd.args.iter()
         .filter_map(|arg| match arg {
-            Word::Literal(s) => Some(s.clone()),
+            Word::Literal(s, _) => Some(s.clone()),
             _ => None
         })
         .collect();

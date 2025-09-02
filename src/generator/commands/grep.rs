@@ -34,7 +34,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     // First pass: identify options and find the pattern
     let mut args_iter = cmd.args.iter();
     while let Some(arg) = args_iter.next() {
-        if let Word::Literal(s) = arg {
+        if let Word::Literal(s, _) = arg {
             if s.starts_with('-') {
                 // Handle --color=always first
                 if s.starts_with("--color") {
@@ -112,26 +112,26 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 
                 // Handle numeric options
                 if s == "-m" {
-                    if let Some(Word::Literal(next_arg)) = args_iter.next() {
+                    if let Some(Word::Literal(next_arg, _)) = args_iter.next() {
                         max_count = Some(next_arg.parse().unwrap_or(0));
                     }
                 } else if s == "-f" {
-                    if let Some(Word::Literal(next_arg)) = args_iter.next() {
+                    if let Some(Word::Literal(next_arg, _)) = args_iter.next() {
                         pattern_file = Some(next_arg.clone());
                     } else if let Some(ref temp_file) = generator.current_process_sub_file {
                         // Use the process substitution file if no explicit file is provided
                         pattern_file = Some(format!("${}", temp_file));
                     }
                 } else if s == "-A" {
-                    if let Some(Word::Literal(next_arg)) = args_iter.next() {
+                    if let Some(Word::Literal(next_arg, _)) = args_iter.next() {
                         after_context = next_arg.parse().unwrap_or(0);
                     }
                 } else if s == "-B" {
-                    if let Some(Word::Literal(next_arg)) = args_iter.next() {
+                    if let Some(Word::Literal(next_arg, _)) = args_iter.next() {
                         before_context = next_arg.parse().unwrap_or(0);
                     }
                 } else if s == "-C" {
-                    if let Some(Word::Literal(next_arg)) = args_iter.next() {
+                    if let Some(Word::Literal(next_arg, _)) = args_iter.next() {
                         context_lines = next_arg.parse().unwrap_or(0);
                     }
                 }
@@ -156,7 +156,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     let mut file_args = Vec::new();
     let mut i = 0;
     while i < cmd.args.len() {
-            if let Word::Literal(s) = &cmd.args[i] {
+            if let Word::Literal(s, _) = &cmd.args[i] {
                 if !s.starts_with('-') && s != &pattern {
                     // Check if this is a pattern file (skip it from file_args)
                     if let Some(ref pf) = pattern_file {
@@ -168,7 +168,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     
                     // Check if this is a numeric value that follows a context flag
                     if i > 0 {
-                        if let Word::Literal(prev) = &cmd.args[i - 1] {
+                        if let Word::Literal(prev, _) = &cmd.args[i - 1] {
                             if prev == "-m" || prev == "-A" || prev == "-B" || prev == "-C" {
                                 i += 1; // Skip the numeric value after context flags
                                 continue;
@@ -178,7 +178,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     
                     // Check if this is part of a glob pattern (like *.txt)
                     if s == "*" && i + 1 < cmd.args.len() {
-                        if let Word::Literal(next) = &cmd.args[i + 1] {
+                        if let Word::Literal(next, _) = &cmd.args[i + 1] {
                             if next.starts_with('.') {
                                 // Combine * and .txt into *.txt
                                 file_args.push(format!("{}{}", s, next));

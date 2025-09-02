@@ -10,7 +10,7 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
     
     // Parse strings options
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             if arg_str.starts_with("-n") {
                 // Parse minimum length option
                 if let Some(length_str) = arg_str.strip_prefix("-n") {

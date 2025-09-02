@@ -12,7 +12,7 @@ pub fn generate_gzip_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     
     // Parse gzip options
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             match arg_str.as_str() {
                 "-d" | "--decompress" => {
                     decompress_mode = true;

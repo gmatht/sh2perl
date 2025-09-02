@@ -588,8 +588,8 @@ pub fn convert_test_args_to_expression_impl(_generator: &Generator, args: &[Word
     
     for arg in args {
         match arg {
-            Word::Literal(s) => expr_parts.push(s.clone()),
-            Word::Array(_, elements) => {
+            Word::Literal(s, _) => expr_parts.push(s.clone()),
+            Word::Array(_, elements, _) => {
                 // Handle array arguments
                 let array_expr = format!("@{{{}}}", elements.join(", "));
                 expr_parts.push(array_expr);

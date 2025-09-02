@@ -10,7 +10,7 @@ pub fn generate_kill_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     
     // Parse kill options
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             if arg_str.starts_with("-") {
                 if arg_str.len() > 1 {
                     // Handle numeric signals like -9, -15

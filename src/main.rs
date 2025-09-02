@@ -45,6 +45,7 @@ fn main() {
     let mut ast_options = AstFormatOptions::default();
     let mut input_file: Option<String> = None;
     let mut output_file: Option<String> = None;
+    let mut optimize_mir = false;
     let mut i = 2;
     
     // Special case: if the first argument is -i or -o, start parsing from index 1
@@ -94,6 +95,7 @@ fn main() {
                     return;
                 }
             }
+
             _ => {
                 // This might be a filename or other argument
                 break;
@@ -374,21 +376,37 @@ fn main() {
                 println!("Error: --mir command requires input");
                 return;
             }
-            let input = &args[2];
+            
+            // Parse --mir specific options
+            let mut mir_optimize = false;
+            let mut input_index = 2;
+            
+            // Check for -O flag
+            if args.len() > 3 && args[2] == "-O" {
+                mir_optimize = true;
+                input_index = 3;
+            }
+            
+            if input_index >= args.len() {
+                println!("Error: --mir command requires input");
+                return;
+            }
+            
+            let input = &args[input_index];
             // Check if input looks like a filename (contains .sh or doesn't contain spaces)
             if input.contains(".sh") || !input.contains(' ') {
                 // Try to read as file first
                 match fs::read_to_string(input) {
                     Ok(content) => {
-                        export_mir(&content);
+                        export_mir(&content, mir_optimize);
                     }
                     Err(_) => {
                         // If file read fails, treat as direct input
-                        export_mir(input);
+                        export_mir(input, mir_optimize);
                     }
                 }
             } else {
-                export_mir(input);
+                export_mir(input, mir_optimize);
             }
         }
         "fail" => {

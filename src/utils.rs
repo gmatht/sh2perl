@@ -218,10 +218,38 @@ pub fn check_ast_must_contain(shell_content: &str, ast_string: &str) -> Result<(
                     // Parse the pattern list like [Literal("-1")]
                     if let Some(patterns) = parse_ast_pattern_list(pattern_text) {
                         // Check if ALL required patterns exist in the AST string
-                        let all_patterns_found = patterns.iter().all(|pattern| ast_string.contains(pattern));
+                        let all_patterns_found = patterns.iter().all(|pattern| {
+                            // For Word patterns like Literal("-1"), we need to be more flexible
+                            // and match even if there are additional fields like Bounds
+                            if pattern.starts_with("Literal(") {
+                                // Extract the content inside Literal() and check for flexible matching
+                                if let Some(start) = pattern.find('(') {
+                                    if let Some(end) = pattern.rfind(')') {
+                                        let literal_content = &pattern[start+1..end];
+                                        // Look for Literal(content, with any additional fields
+                                        let flexible_pattern = format!("Literal({},", literal_content);
+                                        return ast_string.contains(&flexible_pattern);
+                                    }
+                                }
+                            }
+                            // For other patterns, use exact matching
+                            ast_string.contains(pattern)
+                        });
                         if !all_patterns_found {
                             let missing_patterns: Vec<_> = patterns.iter()
-                                .filter(|pattern| !ast_string.contains(pattern.as_str()))
+                                .filter(|pattern| {
+                                    // Apply the same flexible matching logic for filtering
+                                    if pattern.starts_with("Literal(") {
+                                        if let Some(start) = pattern.find('(') {
+                                            if let Some(end) = pattern.rfind(')') {
+                                                let literal_content = &pattern[start+1..end];
+                                                let flexible_pattern = format!("Literal({},", literal_content);
+                                                return !ast_string.contains(&flexible_pattern);
+                                            }
+                                        }
+                                    }
+                                    !ast_string.contains(pattern.as_str())
+                                })
                                 .collect();
                             violations.push(format!("Line {}: Missing required AST patterns {:?} in AST string", line_num + 1, missing_patterns));
                         }

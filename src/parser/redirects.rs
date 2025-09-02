@@ -55,7 +55,7 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
         return Ok(Redirect {
             fd,
             operator: RedirectOperator::ProcessSubstitutionInput(Box::new(inner_cmd)),
-            target: Word::Literal("".to_string()), // Not used for process substitution
+            target: Word::literal("".to_string()), // Not used for process substitution
             heredoc_body: None,
         });
     }
@@ -76,7 +76,7 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
         return Ok(Redirect {
             fd,
             operator: RedirectOperator::ProcessSubstitutionInput(Box::new(inner_cmd)),
-            target: Word::Literal("".to_string()), // Not used for process substitution
+            target: Word::literal("".to_string()), // Not used for process substitution
             heredoc_body: None,
         });
     }
@@ -99,13 +99,13 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
             // For here-strings, the target is the string content
             // We need to extract the string content from the target
             match &target {
-                Word::Literal(s) => Some(s.clone()),
-                Word::StringInterpolation(interp) => {
+                Word::Literal(s, _) => Some(s.clone()),
+                Word::StringInterpolation(interp, _) => {
                     // For string interpolation, concatenate all parts
                     let mut content = String::new();
                     for part in &interp.parts {
                         match part {
-                            StringPart::Literal(s) => content.push_str(s),
+                            StringPart::Literal(s) => content.push_str(&s),
                             _ => content.push_str(&format!("{:?}", part)), // Fallback for non-literal parts
                         }
                     }
@@ -122,112 +122,83 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
 
 fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, ParserError> {
     let delim = match target {
-        Word::Literal(s) => s.clone(),
+        Word::Literal(s, _) => s.clone(),
         _ => return Err(ParserError::InvalidSyntax("Heredoc delimiter must be a literal string".to_string())),
     };
     
     eprintln!("DEBUG: parse_heredoc called with delimiter: '{}'", delim);
-    let mut body = String::new();
-    let mut found_delim = false;
-    let mut at_line_start = true;
-
+    
     // Skip to the next newline token
     while let Some(token) = lexer.peek() {
         match token {
             Token::Newline => {
-                eprintln!("DEBUG: Found newline, breaking to start content collection");
                 lexer.next(); // consume the newline
                 break;
             }
             _ => {
-                eprintln!("DEBUG: Skipping token: {:?}", token);
                 lexer.next(); // consume other tokens
             }
         }
     }
 
-    // Collect lines until we find the delimiter at start of line
+    // Get the current position in the input after the newline
+    let start_pos = if let Some((start, _)) = lexer.get_span() {
+        start
+    } else {
+        return Ok(Some(String::new()));
+    };
+    
+    eprintln!("DEBUG: Starting heredoc parsing from position: {}", start_pos);
+    
+    // Read the raw input line by line until we find the delimiter
+    let mut body = String::new();
+    let mut current_pos = start_pos;
+    let input = &lexer.input;
+    
+    while current_pos < input.len() {
+        // Find the end of the current line
+        let line_end = input[current_pos..].find('\n').map(|i| current_pos + i).unwrap_or(input.len());
+        let line = &input[current_pos..line_end];
+        
+        eprintln!("DEBUG: Processing line: '{}'", line);
+        
+        // Check if this line is the delimiter (exact match, possibly with whitespace)
+        if line.trim() == delim {
+            eprintln!("DEBUG: Found delimiter line, stopping");
+            break;
+        }
+        
+        // Add the line to the body
+        body.push_str(line);
+        
+        // Add newline if there was one in the original input
+        if line_end < input.len() && input.as_bytes()[line_end] == b'\n' {
+            body.push('\n');
+            current_pos = line_end + 1;
+        } else {
+            current_pos = line_end;
+        }
+    }
+    
+    // Advance the lexer to skip over the processed content
+    // We need to consume tokens until we reach the delimiter
     while let Some(token) = lexer.peek() {
-        eprintln!("DEBUG: Processing token: {:?}, at_line_start: {}, pos: {:?}", token, at_line_start, lexer.current_position());
         match token {
-            Token::Newline => {
-                eprintln!("DEBUG: Found newline in content");
-                lexer.next(); // consume the newline
-                at_line_start = true;
-                body.push('\n');
-            }
             Token::Identifier => {
-                // This is part of the heredoc content, not a delimiter
                 let word = lexer.get_identifier_text()?;
-                eprintln!("DEBUG: Adding identifier to body: '{}', at_line_start: {}, delimiter: '{}'", word, at_line_start, delim);
-                // Check if this identifier is the delimiter (at start of line)
-                if at_line_start && word == delim {
-                    eprintln!("DEBUG: Found delimiter at start of line, stopping");
-                    found_delim = true;
-                    // Consume the delimiter token to prevent it from being parsed as a separate command
-                    lexer.next();
-                    break;
-                }
-                // Also check if this is the delimiter at the end of content (fallback)
+                lexer.next();
                 if word == delim {
-                    eprintln!("DEBUG: Found delimiter at end of content, stopping");
-                    found_delim = true;
-                    // Consume the delimiter token to prevent it from being parsed as a separate command
-                    lexer.next();
                     break;
                 }
-                // Add newline before this word if we're not at line start and this is a new word
-                if !at_line_start {
-                    body.push('\n');
-                }
-                body.push_str(&word);
-                at_line_start = false;
-                lexer.next();
-            }
-            Token::Space => {
-                // Add spaces to the body
-                let text = lexer.get_current_text().unwrap_or_default();
-                eprintln!("DEBUG: Adding space token to body: '{}'", text);
-                body.push_str(&text);
-                at_line_start = false;
-                lexer.next();
-            }
-            Token::Tab => {
-                // Add tabs to the body
-                let text = lexer.get_current_text().unwrap_or_default();
-                eprintln!("DEBUG: Adding tab token to body: '{}'", text);
-                body.push_str(&text);
-                at_line_start = false;
-                lexer.next();
             }
             _ => {
-                // For any other token, just consume it and add to body
-                let text = lexer.get_current_text().unwrap_or_default();
-                eprintln!("DEBUG: Adding other token to body: '{}'", text);
-                // Only add space before this token if we're not at line start and the previous token was an identifier
-                // This prevents adding spaces between consecutive punctuation tokens
-                if !at_line_start && body.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
-                    body.push(' ');
-                }
-                body.push_str(&text);
-                at_line_start = false;
                 lexer.next();
             }
         }
     }
-
+    
     eprintln!("DEBUG: Final heredoc body: '{}'", body);
-    if found_delim {
-        // Ensure the heredoc body ends with a newline
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-        // Skip any whitespace after the delimiter
-        lexer.skip_whitespace_and_comments();
-        Ok(Some(body))
-    } else {
-        Ok(Some(String::new()))
-    }
+    Ok(Some(body))
 }
 
 pub fn parse_process_substitution(lexer: &mut Lexer, is_input: bool) -> Result<Redirect, ParserError> {
@@ -249,7 +220,7 @@ pub fn parse_process_substitution(lexer: &mut Lexer, is_input: bool) -> Result<R
     Ok(Redirect {
         fd: None,
         operator,
-        target: Word::Literal("".to_string()), // Not used for process substitution
+        target: Word::literal("".to_string()), // Not used for process substitution
         heredoc_body: None,
     })
 }
@@ -281,8 +252,8 @@ fn parse_command_from_text(_lexer: &mut Lexer, text: &str) -> Result<Command, Pa
             return Err(ParserError::InvalidSyntax("Empty command in process substitution".to_string()));
         }
         
-        let name = Word::Literal(cmd_parts[0].to_string());
-        let args: Vec<Word> = cmd_parts[1..].iter().map(|&s| Word::Literal(s.to_string())).collect();
+        let name = Word::literal(cmd_parts[0].to_string());
+        let args: Vec<Word> = cmd_parts[1..].iter().map(|&s| Word::literal(s.to_string())).collect();
         
         let cmd = Command::Simple(SimpleCommand {
             name,
@@ -302,8 +273,8 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
         return Err(ParserError::InvalidSyntax("Empty command in process substitution".to_string()));
     }
     
-    let name = Word::Literal(cmd_parts[0].to_string());
-    let args: Vec<Word> = cmd_parts[1..].iter().map(|&s| Word::Literal(s.to_string())).collect();
+    let name = Word::literal(cmd_parts[0].to_string());
+    let args: Vec<Word> = cmd_parts[1..].iter().map(|&s| Word::literal(s.to_string())).collect();
     
     let cmd = Command::Simple(SimpleCommand {
         name,

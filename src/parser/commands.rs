@@ -227,7 +227,7 @@ impl Parser {
                     let redirects = vec![parse_redirect(&mut self.lexer)?];
                     Command::Redirect(RedirectCommand {
                         command: Box::new(Command::Simple(SimpleCommand {
-                            name: Word::Literal("".to_string()),
+                            name: Word::literal("".to_string()),
                             args: vec![],
                             redirects: vec![],
                             env_vars: HashMap::new(),
@@ -288,7 +288,7 @@ impl Parser {
                     // Newlines should be handled at the top level, not here
                     // Return an empty command to indicate we hit a newline
                     return Ok(Command::Simple(SimpleCommand {
-                        name: Word::Literal("".to_string()),
+                        name: Word::literal("".to_string()),
                         args: vec![],
                         redirects: vec![],
                         env_vars: HashMap::new(),
@@ -446,7 +446,7 @@ impl Parser {
                                     self.lexer.next(); // consume (
                                     let elements = parse_array_elements(&mut self.lexer)?;
                                     
-                                    let array_word = Word::Array(var_name.clone(), elements);
+                                    let array_word = Word::array(var_name.clone(), elements);
                                     env_vars.insert(var_name, array_word);
                                     self.lexer.skip_whitespace_and_comments();
                                 } else {
@@ -457,10 +457,10 @@ impl Parser {
                                     let value_word = parse_word(&mut self.lexer)?;
                                     
                                     let arithmetic_expr = format!("{}+{}", var_name, value_word.to_string());
-                                    let compound_word = Word::Arithmetic(ArithmeticExpression {
-                                        expression: arithmetic_expr,
-                                        tokens: vec![],
-                                    });
+                                                        let compound_word = Word::arithmetic(ArithmeticExpression {
+                        expression: arithmetic_expr,
+                        tokens: vec![],
+                    });
                                     
                                     env_vars.insert(var_name, compound_word);
                                     self.lexer.skip_whitespace_and_comments();
@@ -473,7 +473,7 @@ impl Parser {
                                     self.lexer.next(); // consume =
                                     self.lexer.next(); // consume (
                                     let elements = parse_array_elements(&mut self.lexer)?;
-                                    let array_word = Word::Array(var_name.clone(), elements);
+                                    let array_word = Word::array(var_name.clone(), elements);
                                     env_vars.insert(var_name, array_word);
                                     self.lexer.skip_whitespace_and_comments();
                                 } else {
@@ -525,7 +525,7 @@ impl Parser {
         self.lexer.skip_inline_whitespace_and_comments();
         
         // Check if this is a builtin command
-        if let Word::Literal(name_str) = &name {
+        if let Word::Literal(name_str, _) = &name {
             if is_builtin_command(&name_str) {
                 // Parse as builtin command
                 while let Some(token) = self.lexer.peek() {
@@ -566,10 +566,10 @@ impl Parser {
         }
 
         // Special handling for Bash single-bracket test: capture everything until closing ']'
-        if let Word::Literal(name_str) = &name {
+        if let Word::Literal(name_str, _) = &name {
             if name_str == "[" {
                 let expr = self.lexer.capture_single_bracket_expression()?;
-                args.push(Word::Literal(expr));
+                args.push(Word::literal(expr));
             }
         }
 
@@ -601,7 +601,7 @@ impl Parser {
                     args.push(parse_word_no_newline_skip(&mut self.lexer)?);
                     
                     // If this is a flag that takes an argument, continue parsing to get the argument
-                    if let Word::Literal(arg_str) = args.last().unwrap() {
+                    if let Word::Literal(arg_str, _) = args.last().unwrap() {
                         if arg_str == "-name" || arg_str == "-maxdepth" || arg_str == "-type" {
                             // Skip whitespace and comments
                             self.lexer.skip_whitespace_and_comments();
@@ -704,7 +704,7 @@ impl Parser {
         let value_word = if matches!(self.lexer.peek(), Some(Token::ParenOpen)) {
             // This is an array assignment like arr=(one two three)
             let elements = parse_array_elements(&mut self.lexer)?;
-            Word::Array(var_name.clone(), elements)
+            Word::array(var_name.clone(), elements)
         } else {
             parse_word(&mut self.lexer)?
         };
@@ -735,7 +735,7 @@ impl Parser {
                     }
                     
                     let env_cmd = Command::Simple(SimpleCommand {
-                        name: Word::Literal("true".to_string()),
+                        name: Word::literal("true".to_string()),
                         args: Vec::new(),
                         redirects: Vec::new(),
                         env_vars: env_vars_cmd,
@@ -752,7 +752,7 @@ impl Parser {
             env_vars.insert(var_name, value_word);
             
             Ok(Command::Simple(SimpleCommand {
-                name: Word::Literal("true".to_string()), // Use 'true' as a dummy command
+                name: Word::literal("true".to_string()), // Use 'true' as a dummy command
                 args: Vec::new(),
                 redirects: Vec::new(),
                 env_vars,
@@ -1046,7 +1046,7 @@ impl Parser {
                 // Expect an identifier after the $
                 if let Some(Token::Identifier) = self.lexer.peek() {
                     let var_name = self.lexer.get_identifier_text()?;
-                    Ok(Word::Variable(var_name))
+                    Ok(Word::variable(var_name))
                 } else {
                     Err(ParserError::InvalidSyntax("Expected identifier after $ in variable expansion".to_string()))
                 }
@@ -1093,10 +1093,10 @@ impl Parser {
                 // For now, just create a simple parameter expansion
                 // In a full implementation, this would parse operators like :-, :+, :?, etc.
                 let var_name = expression_parts.join("");
-                Ok(Word::ParameterExpansion(ParameterExpansion {
-                    variable: var_name,
-                    operator: ParameterExpansionOperator::None,
-                }))
+                                  Ok(Word::parameter_expansion(ParameterExpansion {
+                      variable: var_name,
+                      operator: ParameterExpansionOperator::None,
+                  }))
             }
             _ => {
                 Err(ParserError::InvalidSyntax("Expected $ or ${ in variable expansion".to_string()))
@@ -1165,10 +1165,10 @@ impl Parser {
         
         // Create an arithmetic expression word
         let expression = expression_parts.join("");
-        Ok(Word::Arithmetic(ArithmeticExpression {
-            expression,
-            tokens: vec![], // For now, leave tokens empty
-        }))
+                  Ok(Word::arithmetic(ArithmeticExpression {
+              expression,
+              tokens: vec![], // For now, leave tokens empty
+          }))
     }
 
 

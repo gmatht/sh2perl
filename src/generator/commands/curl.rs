@@ -18,7 +18,7 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     // Parse curl options
     let mut i = 0;
     while i < cmd.args.len() {
-        if let Word::Literal(arg_str) = &cmd.args[i] {
+        if let Word::Literal(arg_str, _) = &cmd.args[i] {
             match arg_str.as_str() {
                 "-X" | "--request" => {
                     if i + 1 < cmd.args.len() {
@@ -58,7 +58,7 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                 "--connect-timeout" => {
                     if i + 1 < cmd.args.len() {
                         if let Some(next_arg) = cmd.args.get(i + 1) {
-                            if let Word::Literal(timeout_str) = next_arg {
+                            if let Word::Literal(timeout_str, _) = next_arg {
                                 if let Ok(timeout_num) = timeout_str.parse::<i32>() {
                                     timeout = timeout_num;
                                 }

@@ -14,7 +14,7 @@ pub fn generate_comm_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     
     // Parse options
     for arg in &cmd.args {
-        if let Word::Literal(s) = arg {
+        if let Word::Literal(s, _) = arg {
             if s.starts_with('-') {
                 if s.contains('1') { suppress_col1 = true; }
                 if s.contains('2') { suppress_col2 = true; }
@@ -44,7 +44,7 @@ pub fn generate_comm_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         let mut ps_files = Vec::new();
         for redir in &cmd.redirects {
             if matches!(redir.operator, RedirectOperator::ProcessSubstitutionInput(_)) {
-                if let Word::Literal(target) = &redir.target {
+                if let Word::Literal(target, _) = &redir.target {
                     if target.starts_with("/tmp/process_sub_") {
                         ps_files.push(target.clone());
                     }

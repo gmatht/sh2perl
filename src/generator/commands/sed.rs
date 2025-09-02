@@ -13,7 +13,7 @@ pub fn generate_sed_command(_generator: &mut Generator, cmd: &SimpleCommand, inp
     
     // Handle common sed operations
     if let Some(operation) = cmd.args.first() {
-        if let Word::Literal(op) = operation {
+        if let Word::Literal(op, _) = operation {
             if op.starts_with("s/") {
                 // Basic substitution: s/pattern/replacement/
                 let parts: Vec<&str> = op.split('/').collect();

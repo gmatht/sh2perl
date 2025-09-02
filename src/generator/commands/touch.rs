@@ -11,12 +11,12 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     // Parse touch options and expand brace expansions
     for arg in &cmd.args {
         match arg {
-            Word::Literal(arg_str) => {
+            Word::Literal(arg_str, _) => {
                 if !arg_str.starts_with('-') {
                     files.push(format!("\"{}\"", arg_str));
                 }
             }
-            Word::BraceExpansion(expansion) => {
+            Word::BraceExpansion(expansion, _) => {
                 // Handle brace expansion by storing it as a special marker for later processing
                 let mut expanded_items = Vec::new();
                 if expansion.items.len() == 1 {

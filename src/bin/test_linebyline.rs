@@ -30,20 +30,20 @@ fn main() {
         source_text: Some("cat | grep 'test' | wc -l".to_string()),
         commands: vec![
             Command::Simple(SimpleCommand {
-                name: Word::Literal("cat".to_string()),
+                name: Word::literal("cat".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),
             }),
             Command::Simple(SimpleCommand {
-                name: Word::Literal("tr".to_string()),
-                args: vec![Word::Literal("a".to_string()), Word::Literal("b".to_string())],
+                name: Word::literal("tr".to_string()),
+                args: vec![Word::literal("a".to_string()), Word::literal("b".to_string())],
                 redirects: vec![],
                 env_vars: HashMap::new(),
             }),
             Command::Simple(SimpleCommand {
-                name: Word::Literal("grep".to_string()),
-                args: vec![Word::Literal("hello".to_string())],
+                name: Word::literal("grep".to_string()),
+                args: vec![Word::literal("hello".to_string())],
                 redirects: vec![],
                 env_vars: HashMap::new(),
             }),
@@ -64,20 +64,20 @@ fn main() {
         source_text: Some("ls | tr 'a-z' 'A-Z' | sort".to_string()),
         commands: vec![
             Command::Simple(SimpleCommand {
-                name: Word::Literal("cat".to_string()),
+                name: Word::literal("cat".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),
             }),
             Command::Simple(SimpleCommand {
-                name: Word::Literal("sort".to_string()),
+                name: Word::literal("sort".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),
             }),
             Command::Simple(SimpleCommand {
-                name: Word::Literal("grep".to_string()),
-                args: vec![Word::Literal("hello".to_string())],
+                name: Word::literal("grep".to_string()),
+                args: vec![Word::literal("hello".to_string())],
                 redirects: vec![],
                 env_vars: HashMap::new(),
             }),
@@ -99,13 +99,13 @@ fn main() {
         source_text: Some("head -n 10 | tail -n 5 | cut -d' ' -f1".to_string()),
         commands: vec![
             Command::Simple(SimpleCommand {
-                name: Word::Literal("cat".to_string()),
+                name: Word::literal("cat".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),
             }),
             Command::Simple(SimpleCommand {
-                name: Word::Literal("custom_script".to_string()),
+                name: Word::literal("custom_script".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),

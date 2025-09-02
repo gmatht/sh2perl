@@ -46,7 +46,7 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         output.push_str(&generator.indent());
         output.push_str("} == 0");
     } else if let Command::Simple(simple_cmd) = left {
-        if let Word::Literal(name) = &simple_cmd.name {
+        if let Word::Literal(name, _) = &simple_cmd.name {
             if name == "grep" {
                 // For grep commands in logical AND, generate the command in a block
                 // and check if it found any matches
@@ -140,7 +140,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         // For commands that generate Perl code (like grep), we need to handle them specially
         // to avoid embedding Perl code inside shell backticks
         if let Command::Simple(simple_cmd) = left {
-            if let Word::Literal(name) = &simple_cmd.name {
+            if let Word::Literal(name, _) = &simple_cmd.name {
                 if name == "grep" {
                     // For grep commands in logical OR, generate the command and check exit code
                     output.push_str(&generator.generate_command(left));
@@ -185,7 +185,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
 fn contains_diff_command(cmd: &Command) -> bool {
     match cmd {
         Command::Simple(simple_cmd) => {
-            if let Word::Literal(name) = &simple_cmd.name {
+            if let Word::Literal(name, _) = &simple_cmd.name {
                 name == "diff"
             } else {
                 false
