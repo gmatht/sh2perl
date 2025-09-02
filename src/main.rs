@@ -1,8 +1,3 @@
-mod lexer;
-mod parser;
-mod ast;
-mod shared_utils;
-mod generator;
 mod cache;
 mod execution;
 mod utils;
@@ -15,7 +10,7 @@ use std::fs;
 
 // Use the debug module for controlling DEBUG output
 use debashl::debug::set_debug_enabled;
-use debashl::{Parser, Generator};
+use debashl::{Parser, Generator, shared_utils::SharedUtils};
 
 // Import from our new modules
 use crate::utils::generate_unified_diff;
@@ -132,7 +127,7 @@ fn main() {
                     // Handle output file option
                     if let Some(output_filename) = &output_file {
                         // Write to output file with UTF-8 encoding
-                        match shared_utils::SharedUtils::write_utf8_file(output_filename, &code) {
+                        match SharedUtils::write_utf8_file(output_filename, &code) {
                             Ok(_) => println!("Generated Perl code written to: {} (UTF-8 encoded)", output_filename),
                             Err(e) => println!("Error writing to output file {}: {}", output_filename, e),
                         }
@@ -142,7 +137,7 @@ fn main() {
                         println!("{}", code);
                         println!("\n--- Running generated Perl code ---");
                         let tmp = "__tmp_run.pl";
-                        if shared_utils::SharedUtils::write_utf8_file(tmp, &code).is_ok() {
+                        if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
                             let _ = std::process::Command::new("perl").arg(tmp).status();
                             let _ = fs::remove_file(tmp);
                         }
@@ -442,7 +437,7 @@ fn main() {
                         // Handle output file option
                         if let Some(output_filename) = &output_file {
                             // Write to output file with UTF-8 encoding
-                            match shared_utils::SharedUtils::write_utf8_file(output_filename, &code) {
+                            match SharedUtils::write_utf8_file(output_filename, &code) {
                                 Ok(_) => println!("Generated Perl code written to: {} (UTF-8 encoded)", output_filename),
                                 Err(e) => println!("Error writing to output file {}: {}", output_filename, e),
                             }
@@ -452,7 +447,7 @@ fn main() {
                             println!("{}", code);
                             println!("\n--- Running generated Perl code ---");
                             let tmp = "__tmp_run.pl";
-                            if shared_utils::SharedUtils::write_utf8_file(tmp, &code).is_ok() {
+                            if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
                                 let _ = std::process::Command::new("perl").arg(tmp).status();
                                 let _ = fs::remove_file(tmp);
                             }
@@ -483,7 +478,7 @@ fn main() {
                         // Handle output file option
                         if let Some(output_filename) = &output_file {
                             // Write to output file with UTF-8 encoding
-                            match shared_utils::SharedUtils::write_utf8_file(output_filename, &code) {
+                            match SharedUtils::write_utf8_file(output_filename, &code) {
                                 Ok(_) => println!("Generated Perl code written to: {} (UTF-8 encoded)", output_filename),
                                 Err(e) => println!("Error writing to output file {}: {}", output_filename, e),
                             }
@@ -493,7 +488,7 @@ fn main() {
                             println!("{}", code);
                             println!("\n--- Running generated Perl code ---");
                             let tmp = "__tmp_run.pl";
-                            if shared_utils::SharedUtils::write_utf8_file(tmp, &code).is_ok() {
+                            if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
                                 let _ = std::process::Command::new("perl").arg(tmp).status();
                                 let _ = fs::remove_file(tmp);
                             }
@@ -517,7 +512,7 @@ fn main() {
                         
                         // Write to temporary file and execute
                         let tmp_file = "__tmp_direct_exec.pl";
-                        if shared_utils::SharedUtils::write_utf8_file(tmp_file, &perl_code).is_ok() {
+                        if SharedUtils::write_utf8_file(tmp_file, &perl_code).is_ok() {
                             println!("Generated Perl code:");
                             println!("{}", perl_code);
                             println!("\n--- Running generated Perl code ---");

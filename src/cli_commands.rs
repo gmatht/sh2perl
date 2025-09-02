@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::Command;
 use std::io::Write;
-use crate::shared_utils;
+use debashl::shared_utils;
 use crate::utils::{extract_line_col, caret_snippet};
 use debashl::{Lexer, Parser, Generator};
 

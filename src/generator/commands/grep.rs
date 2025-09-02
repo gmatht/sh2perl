@@ -28,6 +28,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     let mut include_pattern = None;
     let mut exclude_pattern = None;
     let mut pattern_file = None;
+    let mut missing_pattern = None;
     
     // First pass: identify options and find the pattern
     let mut args_iter = cmd.args.iter();
@@ -72,6 +73,22 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                         pattern
                     };
                     exclude_pattern = Some(clean_pattern);
+                    // Don't treat this as a pattern
+                    continue;
+                }
+                
+                // Handle --missing flag
+                if s.starts_with("--missing=") {
+                    let pattern = s[10..].to_string(); // Remove "--missing=" prefix
+                    // Remove quotes if present
+                    let clean_pattern = if pattern.starts_with('"') && pattern.ends_with('"') {
+                        pattern[1..pattern.len()-1].to_string()
+                    } else if pattern.starts_with("'") && pattern.ends_with("'") {
+                        pattern[1..pattern.len()-1].to_string()
+                    } else {
+                        pattern
+                    };
+                    missing_pattern = Some(clean_pattern);
                     // Don't treat this as a pattern
                     continue;
                 }
@@ -397,6 +414,49 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             if max > 0 {
                 output.push_str(&format!("@grep_filtered_{} = @grep_filtered_{}[0..{}];\n", command_index, command_index, max - 1));
             }
+        }
+        
+        // Handle --missing option: find lines matching regex that are not in chunks
+        if let Some(ref missing_regex) = missing_pattern {
+            output.push_str(&format!("my @missing_lines_{} = ();\n", command_index));
+            output.push_str(&format!("my @chunk_ranges_{} = ();\n", command_index));
+            
+            // First, identify chunks (consecutive lines with output.push_str or result.push_str calls)
+            output.push_str(&format!("my $in_chunk_{} = 0;\n", command_index));
+            output.push_str(&format!("my $chunk_start_{} = -1;\n", command_index));
+            output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
+            output.push_str(&format!("    if ($grep_lines_{}[$i] =~ /(output|result)\\.push_str\\(/) {{\n", command_index));
+            output.push_str(&format!("        if (!$in_chunk_{}) {{\n", command_index));
+            output.push_str(&format!("            $chunk_start_{} = $i;\n", command_index));
+            output.push_str(&format!("            $in_chunk_{} = 1;\n", command_index));
+            output.push_str("        }\n");
+            output.push_str("    } else {\n");
+            output.push_str(&format!("        if ($in_chunk_{}) {{\n", command_index));
+            output.push_str(&format!("            push @chunk_ranges_{}, [$chunk_start_{}, $i - 1];\n", command_index, command_index));
+            output.push_str(&format!("            $in_chunk_{} = 0;\n", command_index));
+            output.push_str("        }\n");
+            output.push_str("    }\n");
+            output.push_str("}\n");
+            output.push_str(&format!("if ($in_chunk_{}) {{\n", command_index));
+            output.push_str(&format!("    push @chunk_ranges_{}, [$chunk_start_{}, $#grep_lines_{}];\n", command_index, command_index, command_index));
+            output.push_str("}\n");
+            
+            // Now find lines that match the missing regex but are not in chunks
+            output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
+            output.push_str(&format!("    my $in_chunk_{} = 0;\n", command_index));
+            output.push_str(&format!("    for my $range (@chunk_ranges_{}) {{\n", command_index));
+            output.push_str(&format!("        if ($i >= $range->[0] && $i <= $range->[1]) {{\n"));
+            output.push_str(&format!("            $in_chunk_{} = 1;\n", command_index));
+            output.push_str("            last;\n");
+            output.push_str("        }\n");
+            output.push_str("    }\n");
+            output.push_str(&format!("    if (!$in_chunk_{} && $grep_lines_{}[$i] =~ /{}/) {{\n", command_index, command_index, missing_regex));
+            output.push_str(&format!("        push @missing_lines_{}, $grep_lines_{}[$i];\n", command_index, command_index));
+            output.push_str("    }\n");
+            output.push_str("}\n");
+            
+            // Replace the filtered results with missing lines
+            output.push_str(&format!("@grep_filtered_{} = @missing_lines_{};\n", command_index, command_index));
         }
         
         // Generate output based on options

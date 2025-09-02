@@ -280,18 +280,16 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 // For variables used in arithmetic expressions inside loops,
                                 // we need to declare them in the outer scope
                                 // Check if we're inside a loop by looking at the indent level
-                                if generator.indent_level > 0 {
-                                    // We're inside a loop, just assign to it
-                                    output.push_str(&generator.indent());
-                                    output.push_str(&format!("${} = {};\n", var, perl_expr));
-                                } else {
-                                    // We're in the outer scope, declare normally
-                                    output.push_str(&generator.indent());
-                                    output.push_str(&format!("my ${} = 0;\n", var));
-                                    output.push_str(&generator.indent());
-                                    output.push_str(&format!("${} = {};\n", var, perl_expr));
+                                // For variables used in arithmetic expressions, we need to declare them
+                                // at the top level if they haven't been declared yet
+                                if !generator.declared_locals.contains(var) {
+                                    // Mark this variable as needing top-level declaration
+                                    generator.function_level_vars.insert(var.clone());
+                                    generator.declared_locals.insert(var.clone());
                                 }
-                                generator.declared_locals.insert(var.clone());
+                                // Now assign to it
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("${} = {};\n", var, perl_expr));
                             } else {
                                 // Variable not used in expression, declare and assign
                                 output.push_str(&generator.indent());
@@ -329,6 +327,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     "rm" => {
                         // Standalone rm command
                         output.push_str(&crate::generator::commands::rm::generate_rm_command(generator, cmd));
+                    }
+                    "find" => {
+                        // Standalone find command - generate output directly without variable assignment
+                        output.push_str(&crate::generator::commands::find::generate_find_command(generator, cmd, false, ""));
                     }
                     _ => {
                         // Route other builtins to the builtins system
