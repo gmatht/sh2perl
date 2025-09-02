@@ -9,6 +9,7 @@ pub fn show_help(program_name: &str) {
     println!();
     println!("  lex <input>                    - Tokenize shell script input");
     println!("  parse <input>                  - Parse shell script to AST");
+    println!("  --ast <input>                  - Parse shell script to AST (synonym for parse)");
     println!("  file <filename>                - Parse shell script from file");
     println!("  interactive                    - Start interactive mode");
     println!();
@@ -59,6 +60,7 @@ pub fn show_help(program_name: &str) {
     println!();
     println!("  {} lex 'echo hello world'", program_name);
     println!("  {} parse 'echo hello world'", program_name);
+    println!("  {} --ast 'echo hello world'", program_name);
     println!("  {} parse --perl 'echo hello world'", program_name);
     println!("  {} --mir 'echo hello world'", program_name);
     println!("  {} file --perl examples/simple.sh", program_name);
