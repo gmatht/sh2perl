@@ -445,3 +445,22 @@ pub enum StringPart {
     Arithmetic(ArithmeticExpression),
     CommandSubstitution(Box<Command>),
 }
+
+/// MIR representation of a for loop with optimization information
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MirForLoop {
+    pub variable: String,
+    pub items: Vec<Word>,
+    pub body: Vec<Command>,
+    pub variable_used_after: bool,  // Whether the loop variable is used after the loop
+    pub variable_overwritten_before_use: bool,  // Whether the variable is overwritten before being used
+}
+
+/// MIR representation of a while loop with optimization information
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MirWhileLoop {
+    pub condition: Box<Command>,
+    pub body: Vec<Command>,
+    pub variables_modified_in_loop: Vec<String>,  // Variables that are modified in the loop body
+    pub variables_used_after_loop: Vec<String>,  // Variables that are used after the loop ends
+}
