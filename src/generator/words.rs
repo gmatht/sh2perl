@@ -5,7 +5,7 @@ use regex::Regex;
 
 pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s) => {
+        Word::Literal(s, _) => {
             // Handle literal strings
             if s.contains("..") {
                 generator.handle_range_expansion(s)
@@ -15,22 +15,22 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 s.clone()
             }
         },
-        Word::ParameterExpansion(pe) => generator.generate_parameter_expansion(pe),
-        Word::Array(name, elements) => {
+        Word::ParameterExpansion(pe, _) => generator.generate_parameter_expansion(pe),
+        Word::Array(name, elements, _) => {
             let elements_str = elements.iter()
                 .map(|e| format!("'{}'", e.replace("'", "\\'")))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("@{} = ({});", name, elements_str)
         },
-        Word::StringInterpolation(interp) => generator.convert_string_interpolation_to_perl(interp),
-        Word::Arithmetic(expr) => generator.convert_arithmetic_to_perl(&expr.expression),
-        Word::BraceExpansion(expansion) => {
+        Word::StringInterpolation(interp, _) => generator.convert_string_interpolation_to_perl(interp),
+        Word::Arithmetic(expr, _) => generator.convert_arithmetic_to_perl(&expr.expression),
+        Word::BraceExpansion(expansion, _) => {
             let expanded = generator.handle_brace_expansion(expansion);
             // Quote the result since it's used in contexts where quotes are needed
             format!("\"{}\"", expanded)
         },
-        Word::CommandSubstitution(cmd) => {
+        Word::CommandSubstitution(cmd, _) => {
             // Handle command substitution
             match cmd.as_ref() {
                 Command::Simple(simple_cmd) => {
@@ -101,8 +101,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     }
                     
                     // Return the code that executes the pipeline and captures output
-                    // Command substitution should strip trailing newlines and convert internal newlines to spaces
-                    format!("do {{ {} chomp({}); {} =~ s/\n/ /g; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
+                    // Command substitution should strip trailing newlines but preserve internal newlines
+                    format!("do {{ {} chomp({}); {} }}", captured_pipeline.trim(), output_var, output_var)
                 },
                 _ => {
                     // For other command types, use system command fallback
@@ -110,7 +110,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 }
             }
         },
-        Word::Variable(var) => {
+        Word::Variable(var, _) => {
             // Handle special shell variables
             match var.as_str() {
                 "#" => "scalar(@ARGV)".to_string(),  // $# -> scalar(@ARGV) for argument count
@@ -119,7 +119,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 _ => format!("${}", var)             // Regular variable
             }
         },
-        Word::MapAccess(map_name, key) => {
+        Word::MapAccess(map_name, key, _) => {
             // Handle array/map access like arr[1] or map[foo]
             // Check if the key is numeric (indexed array) or string (associative array)
             if key.parse::<usize>().is_ok() {
@@ -130,15 +130,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 format!("${}{{{}}}", map_name, key)
             }
         },
-        Word::MapKeys(map_name) => {
+        Word::MapKeys(map_name, _) => {
             // Handle map keys like !map[@] -> keys %map
             format!("keys %{}", map_name)
         },
-        Word::MapLength(map_name) => {
+        Word::MapLength(map_name, _) => {
             // Handle array length like #arr[@] -> scalar(@arr)
             format!("scalar(@{})", map_name)
         },
-        Word::ArraySlice(array_name, offset, length) => {
+        Word::ArraySlice(array_name, offset, length, _) => {
             // Handle array slicing like arr[@]:1:3 -> @arr[1..3]
             if let Some(length_str) = length {
                 format!("@{}[{}..{}]", array_name, offset, length_str)
@@ -152,8 +152,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
 
 pub fn word_to_perl_for_test_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s) => s.clone(),
-        Word::ParameterExpansion(pe) => generator.generate_parameter_expansion(pe),
+        Word::Literal(s, _) => s.clone(),
+        Word::ParameterExpansion(pe, _) => generator.generate_parameter_expansion(pe),
         _ => format!("{:?}", word)
     }
 }
@@ -207,7 +207,7 @@ pub fn handle_brace_expansion_impl(generator: &mut Generator, expansion: &BraceE
             .map(|item| {
                 let word = generator.brace_item_to_word(item);
                 match word {
-                    Word::Literal(s) => vec![s],
+                    Word::Literal(s, _) => vec![s],
                     _ => vec![generator.word_to_perl(&word)],
                 }
             })
@@ -249,13 +249,13 @@ fn generate_cartesian_product(items: &[Vec<String>]) -> Vec<String> {
 
 pub fn brace_item_to_word_impl(_generator: &Generator, item: &BraceItem) -> Word {
     match item {
-        BraceItem::Literal(s) => Word::Literal(s.clone()),
+        BraceItem::Literal(s) => Word::literal(s.clone()),
         BraceItem::Range(range) => {
             // Expand the range to actual values
             let expanded = expand_range(range);
-            Word::Literal(expanded)
+            Word::literal(expanded)
         },
-        BraceItem::Sequence(seq) => Word::Literal(seq.join(" ")),
+        BraceItem::Sequence(seq) => Word::literal(seq.join(" ")),
     }
 }
 

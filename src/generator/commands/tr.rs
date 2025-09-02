@@ -18,7 +18,7 @@ fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, i
     let mut args = Vec::new();
     
     for arg in &cmd.args {
-        if let Word::Literal(s) = arg {
+        if let Word::Literal(s, _) = arg {
             if s == "-d" {
                 delete_mode = true;
             } else {
@@ -57,7 +57,7 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
     let mut args = Vec::new();
     
     for arg in &cmd.args {
-        if let Word::Literal(s) = arg {
+        if let Word::Literal(s, _) = arg {
             if s == "-d" {
                 delete_mode = true;
             } else {

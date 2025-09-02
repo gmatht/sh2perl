@@ -47,7 +47,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     // Parse find arguments
     let mut i = 0;
     while i < cmd.args.len() {
-        if let Word::Literal(arg) = &cmd.args[i] {
+        if let Word::Literal(arg, _) = &cmd.args[i] {
             if arg == "." {
                 // For find . command, search from the directory where the script is located
                 // This ensures we find files relative to the script location, not current working directory
@@ -55,14 +55,16 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
             } else if arg == "-name" && i + 1 < cmd.args.len() {
                 if let Some(next_arg) = cmd.args.get(i + 1) {
                     pattern = match next_arg {
-                        Word::StringInterpolation(interp) => {
+                        Word::StringInterpolation(interp, _) => {
                             interp.parts.iter()
                                 .map(|part| match part {
                                     StringPart::Literal(s) => s,
                                     _ => "*"
                                 })
                                 .collect::<Vec<_>>()
-                                .join("")
+                                .into_iter()
+                                .map(|s| s.clone())
+                                .collect::<String>()
                         },
                         _ => generator.word_to_perl(next_arg)
                     };
@@ -71,7 +73,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                 }
             } else if arg == "-type" && i + 1 < cmd.args.len() {
                 if let Some(next_arg) = cmd.args.get(i + 1) {
-                    if let Word::Literal(type_arg) = next_arg {
+                    if let Word::Literal(type_arg, _) = next_arg {
                         file_type = type_arg;
                     }
                     i += 1; // Skip the type argument

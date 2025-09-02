@@ -11,10 +11,10 @@ pub fn generate_nice_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     
     // Parse nice options
     while i < cmd.args.len() {
-        if let Word::Literal(arg_str) = &cmd.args[i] {
+        if let Word::Literal(arg_str, _) = &cmd.args[i] {
             if arg_str == "-n" && i + 1 < cmd.args.len() {
                 if let Some(next_arg) = cmd.args.get(i + 1) {
-                    if let Word::Literal(nice_str) = next_arg {
+                    if let Word::Literal(nice_str, _) = next_arg {
                         if let Ok(nice_num) = nice_str.parse::<i32>() {
                             nice_value = nice_num;
                         }

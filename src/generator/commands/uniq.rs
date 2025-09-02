@@ -8,7 +8,7 @@ pub fn generate_uniq_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     
     // Check for flags
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             if arg_str == "-c" {
                 count = true;
             }

@@ -11,7 +11,7 @@ pub fn generate_cat_command(generator: &mut Generator, cmd: &SimpleCommand, redi
             has_heredoc = true;
             if let Some(body) = &redir.heredoc_body {
                 // Print the heredoc content directly
-                output.push_str(&format!("print {};\n", generator.perl_string_literal(&Word::Literal(body.clone()))));
+                output.push_str(&format!("print {};\n", generator.perl_string_literal(&Word::literal(body.clone()))));
             }
         }
     }

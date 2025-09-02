@@ -82,7 +82,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
     let mut single_column = false;
     
     for arg in &cmd.args {
-        if let Word::Literal(s) = arg {
+        if let Word::Literal(s, _) = arg {
             if s.starts_with('-') {
                 // Parse flags
                 for flag in s.chars().skip(1) {
@@ -135,7 +135,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let mut single_column = false; // Default to multi-column (space-separated) like shell ls
     
     for arg in &cmd.args {
-        if let Word::Literal(s) = arg {
+        if let Word::Literal(s, _) = arg {
             if s.starts_with('-') {
                 // Parse flags
                 for flag in s.chars().skip(1) {

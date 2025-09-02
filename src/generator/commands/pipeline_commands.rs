@@ -15,7 +15,7 @@ fn generate_command_using_builtins(
     match command {
         Command::Simple(cmd) => {
             let cmd_name = match &cmd.name {
-                Word::Literal(s) => s,
+                Word::Literal(s, _) => s,
                 _ => "unknown_command"
             };
             
@@ -45,7 +45,7 @@ fn generate_command_using_builtins(
                 let mut all_items = Vec::new();
                 for word in &for_loop.items {
                     match word {
-                        Word::StringInterpolation(interp) => {
+                        Word::StringInterpolation(interp, _) => {
                             if interp.parts.len() == 1 {
                                 if let StringPart::Variable(var) = &interp.parts[0] {
                                     match var.as_str() {
@@ -84,7 +84,7 @@ fn generate_command_using_builtins(
                 // Generate the body commands, but capture their output instead of printing
                 for cmd in &for_loop.body.commands {
                     if let Command::Simple(simple_cmd) = cmd {
-                        if let Word::Literal(cmd_name) = &simple_cmd.name {
+                        if let Word::Literal(cmd_name, _) = &simple_cmd.name {
                             if cmd_name == "echo" {
                                 // For echo commands, append to output variable
                                 let echo_args: Vec<String> = simple_cmd.args.iter()
@@ -129,7 +129,7 @@ fn generate_command_using_builtins(
             if let Command::And(and_left, and_right) = &**left {
                 // Handle nested AND operations in OR context
                 if let Command::Simple(simple_cmd) = &**and_left {
-                    if let Word::Literal(name) = &simple_cmd.name {
+                    if let Word::Literal(name, _) = &simple_cmd.name {
                         if name == "grep" {
                         // For grep commands in logical OR, generate proper conditional structure
                         let unique_id = generator.get_unique_id();
@@ -222,7 +222,7 @@ fn generate_command_using_builtins(
                 
                 // Check if left command is a grep command that needs input
                 if let Command::Simple(simple_cmd) = &**left {
-                    if let Word::Literal(name) = &simple_cmd.name {
+                    if let Word::Literal(name, _) = &simple_cmd.name {
                         if name == "grep" {
                             // Generate grep command with input
                             let grep_output = crate::generator::commands::grep::generate_grep_command(generator, simple_cmd, &format!("temp_input_{}", unique_id), &unique_id.to_string(), true);
@@ -372,7 +372,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
     // Check if the first command is 'cat filename' or 'echo' and handle it specially
     let mut start_index = 0;
     if let Command::Simple(first_cmd) = &pipeline.commands[0] {
-        if let Word::Literal(name) = &first_cmd.name {
+        if let Word::Literal(name, _) = &first_cmd.name {
             if name == "cat" && !first_cmd.args.is_empty() {
                 // First command is 'cat filename', so read from the file instead of STDIN
                 let filename = generator.perl_string_literal(&first_cmd.args[0]);
@@ -391,7 +391,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 // Check if we need to declare variables for wc command
                 let has_wc = pipeline.commands.iter().any(|cmd| {
                     if let Command::Simple(simple_cmd) = cmd {
-                        if let Word::Literal(name) = &simple_cmd.name {
+                        if let Word::Literal(name, _) = &simple_cmd.name {
                             name == "wc"
                         } else {
                             false
@@ -424,7 +424,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         // Check if we need to declare variables for wc command
         let has_wc = pipeline.commands.iter().any(|cmd| {
             if let Command::Simple(simple_cmd) = cmd {
-                if let Word::Literal(name) = &simple_cmd.name {
+                if let Word::Literal(name, _) = &simple_cmd.name {
                     name == "wc"
                 } else {
                     false
@@ -453,7 +453,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
             if let Command::Simple(cmd) = command {
                 let cmd_name = match &cmd.name {
-                    Word::Literal(s) => s,
+                    Word::Literal(s, _) => s,
                     _ => "unknown_command"
                 };
                 
@@ -476,7 +476,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         // Output wc results if wc was used
         let has_wc = pipeline.commands.iter().any(|cmd| {
             if let Command::Simple(simple_cmd) = cmd {
-                if let Word::Literal(name) = &simple_cmd.name {
+                if let Word::Literal(name, _) = &simple_cmd.name {
                     name == "wc"
                 } else {
                     false
@@ -498,7 +498,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
             if let Command::Simple(cmd) = command {
                 let cmd_name = match &cmd.name {
-                    Word::Literal(s) => s,
+                    Word::Literal(s, _) => s,
                     _ => "unknown_command"
                 };
                 
@@ -524,7 +524,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         // Output wc results if wc was used
         let has_wc = pipeline.commands.iter().any(|cmd| {
             if let Command::Simple(simple_cmd) = cmd {
-                if let Word::Literal(name) = &simple_cmd.name {
+                if let Word::Literal(name, _) = &simple_cmd.name {
                     name == "wc"
                 } else {
                     false
@@ -558,7 +558,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
 /// Generate line-by-line processing for a single command
 fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, line_var: &str, cmd_index: usize) -> String {
     let cmd_name = match &cmd.name {
-        Word::Literal(s) => s,
+        Word::Literal(s, _) => s,
         _ => "unknown_command"
     };
     
@@ -570,7 +570,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             // For grep, we need to check if the line matches and skip if it doesn't
             let mut output = String::new();
             if let Some(pattern_arg) = cmd.args.iter().find(|arg| {
-                if let Word::Literal(s) = arg { !s.starts_with('-') } else { true }
+                if let Word::Literal(s, _) = arg { !s.starts_with('-') } else { true }
             }) {
                 let pattern = generator.strip_shell_quotes_for_regex(pattern_arg);
                 output.push_str(&format!("next unless $line =~ /{}/;\n", pattern));
@@ -581,7 +581,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             // For sed, we'll use basic substitution for now
             let mut output = String::new();
             if let Some(sed_expr) = cmd.args.iter().find(|arg| {
-                if let Word::Literal(s) = arg { s.starts_with('s') } else { false }
+                if let Word::Literal(s, _) = arg { s.starts_with('s') } else { false }
             }) {
                 let expr = generator.word_to_perl(sed_expr);
                 output.push_str(&format!("$line =~ {expr};\n"));
@@ -592,7 +592,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             // For cut, extract specific fields
             let mut output = String::new();
             if let Some(fields_arg) = cmd.args.iter().find(|arg| {
-                if let Word::Literal(s) = arg { s.starts_with('-') && s.contains('f') } else { false }
+                if let Word::Literal(s, _) = arg { s.starts_with('-') && s.contains('f') } else { false }
             }) {
                 // Extract field specification and apply cut logic
                 output.push_str(&format!("# cut processing for {}\n", fields_arg));
@@ -606,6 +606,35 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             output.push_str("$word_count += scalar(split(/\\s+/, $line));\n");
             output.push_str("$line_count++;\n");
             output.push_str("next; # Skip normal line processing for wc\n");
+            output
+        },
+        "perl" => {
+            // For perl commands, we need to set $_ to the current line and execute the perl code
+            let mut output = String::new();
+            output.push_str("$_ = $line;\n");
+            
+            // Find the perl code argument (usually after -e or -ne)
+            let mut perl_code = String::new();
+            let mut in_code = false;
+            
+            for arg in &cmd.args {
+                if let Word::Literal(s, _) = arg {
+                    if s == "-e" || s == "-ne" {
+                        in_code = true;
+                        continue;
+                    }
+                    if in_code {
+                        perl_code = s.clone();
+                        break;
+                    }
+                }
+            }
+            
+            if !perl_code.is_empty() {
+                // Execute the perl code
+                output.push_str(&format!("{}\n", perl_code));
+            }
+            
             output
         },
         _ => {
@@ -675,7 +704,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     
                     // For builtin commands, ensure output assignment for those with separate result vars
                     if let Command::Simple(cmd) = command {
-                        if let Word::Literal(cmd_name) = &cmd.name {
+                        if let Word::Literal(cmd_name, _) = &cmd.name {
                             if matches!(cmd_name.as_str(), "grep" | "wc" | "xargs" | "tr") {
                                 let result_var = format!("{}_result_{}_{}", cmd_name, unique_id, i);
                                 output.push_str(&generator.indent());
@@ -695,7 +724,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     // Check if the first command failed (e.g., cat with non-existent file)
                     // If the output is empty, the command likely failed
                     if let Command::Simple(cmd) = command {
-                        if let Word::Literal(cmd_name) = &cmd.name {
+                        if let Word::Literal(cmd_name, _) = &cmd.name {
                             if cmd_name == "cat" {
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("if ($output_{} eq '') {{\n", unique_id));
@@ -760,7 +789,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                             
                             // For builtin commands, ensure output assignment for those with separate result vars
                             if let Command::Simple(cmd) = command {
-                                if let Word::Literal(cmd_name) = &cmd.name {
+                                if let Word::Literal(cmd_name, _) = &cmd.name {
                                     if matches!(cmd_name.as_str(), "grep" | "wc" | "xargs" | "tr") {
                                         let result_var = format!("{}_result_{}_{}", cmd_name, unique_id, i);
                                         output.push_str(&generator.indent());
@@ -813,11 +842,11 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         
         if let (Command::Simple(cmd1), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline.commands[1]) {
             let cmd1_name = match &cmd1.name {
-                Word::Literal(s) => s,
+                Word::Literal(s, _) => s,
                 _ => "unknown_command"
             };
             let cmd2_name = match &cmd2.name {
-                Word::Literal(s) => s,
+                Word::Literal(s, _) => s,
                 _ => "unknown_command"
             };
 
@@ -905,7 +934,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 for (i, command) in pipeline.commands[1..].iter().enumerate() {
                     if let Command::Simple(cmd) = command {
                         let cmd_name = match &cmd.name {
-                            Word::Literal(s) => s,
+                            Word::Literal(s, _) => s,
                             _ => "unknown_command"
                         };
                         

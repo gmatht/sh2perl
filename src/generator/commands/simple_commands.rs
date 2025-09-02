@@ -12,7 +12,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     
     // Handle array assignments first (these need to be in the main scope)
     for (var, value) in &cmd.env_vars {
-        if let Word::Array(_, elements) = value {
+        if let Word::Array(_, elements, _) = value {
             // Handle array assignment like arr=(one two three)
             let elements_perl: Vec<String> = elements.iter()
                 .map(|s| format!("\"{}\"", generator.escape_perl_string(s)))
@@ -23,7 +23,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             if !generator.declared_locals.contains(var) {
                 generator.declared_locals.insert(var.clone());
             }
-        } else if let Word::Literal(s) = value {
+        } else if let Word::Literal(s, _) = value {
             if let Some(elements) = generator.extract_array_elements(s) {
                 // Check if this is an indexed array assignment like arr=(one two three)
                 let elements_perl: Vec<String> = elements.iter()
@@ -37,15 +37,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     
     // Check if there are any non-array environment variables to process
     // But exclude standalone assignments (cmd.name == "true")
-    let is_standalone_assignment = if let Word::Literal(ref name) = cmd.name {
+    let is_standalone_assignment = if let Word::Literal(ref name, _) = cmd.name {
         name == "true" && !cmd.env_vars.is_empty() && cmd.args.is_empty()
     } else {
         false
     };
     
     let has_non_array_env = !is_standalone_assignment && cmd.env_vars.iter().any(|(var, value)| {
-        !matches!(value, Word::Array(_, _)) && 
-        !matches!(value, Word::Literal(s) if generator.extract_array_elements(s).is_some())
+        !matches!(value, Word::Array(..)) && 
+        !matches!(value, Word::Literal(s, _) if generator.extract_array_elements(s).is_some())
     });
     
     if has_non_array_env {
@@ -58,10 +58,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 let quoted_key = format!("\"{}\"", generator.escape_perl_string(&key));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("${}{{{}}} = {};\n", array_name, quoted_key, val));
-            } else if let Word::Array(_, _) = value {
+            } else if let Word::Array(..) = value {
                 // Skip array assignments here - they're handled above
                 continue;
-            } else if let Word::Literal(s) = value {
+            } else if let Word::Literal(s, _) = value {
                 if let Some(_) = generator.extract_array_elements(s) {
                     // Skip array assignments here - they're handled above
                     continue;
@@ -79,7 +79,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         output.push_str(&format!("${} = {};\n", var, val));
                     }
                     // Only set environment variable if this is not a standalone variable assignment
-                    if let Word::Literal(ref name) = cmd.name {
+                    if let Word::Literal(ref name, _) = cmd.name {
                         if name != "true" {
                             output.push_str(&generator.indent());
                             output.push_str(&format!("local $ENV{{{}}} = {};;\n", var, val));
@@ -100,7 +100,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&format!("${} = {};\n", var, val));
                 }
                 // Only set environment variable if this is not a standalone variable assignment
-                if let Word::Literal(ref name) = cmd.name {
+                if let Word::Literal(ref name, _) = cmd.name {
                     if name != "true" {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("local $ENV{{{}}} = {};;\n", var, val));
@@ -138,7 +138,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 let cmd_str = generator.generate_command_string_for_system(&**cmd);
                 output.push_str(&generator.indent());
                 output.push_str(&format!("open(my $pipe, '-|', 'bash', '-c', {});\n", 
-                    generator.perl_string_literal(&Word::Literal(cmd_str))));
+                    generator.perl_string_literal(&Word::literal(cmd_str))));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $output_ps_{} = <$pipe>;\n", global_counter));
                 output.push_str(&generator.indent());
@@ -188,7 +188,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&generator.indent());
                     output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("print ${} {};\n", fh_var, generator.perl_string_literal(&Word::Literal(content.clone()))));
+                    output.push_str(&format!("print ${} {};\n", fh_var, generator.perl_string_literal(&Word::literal(content.clone()))));
                     output.push_str(&generator.indent());
                     output.push_str(&format!("close(${});\n", fh_var));
                 }
@@ -200,26 +200,35 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     }
 
     // Generate the actual command
-    if let Word::Literal(ref name) = cmd.name {
+    if let Word::Literal(ref name, _) = cmd.name {
         if name == "echo" {
             // Use the echo command generator for non-pipeline echo commands
             if cmd.args.is_empty() {
                 output.push_str(&generator.indent());
                 output.push_str("print \"\\n\";\n");
             } else {
+                // Check for -e flag and filter it out
+                let filtered_args: Vec<&Word> = cmd.args.iter().filter(|&arg| {
+                    if let Word::Literal(s, _) = arg {
+                        s != "-e"
+                    } else {
+                        true
+                    }
+                }).collect();
+                
                 // Convert arguments to Perl format using the dedicated echo function
-                let args: Vec<String> = cmd.args.iter()
+                let args: Vec<String> = filtered_args.iter()
                     .map(|arg| {
                         // For echo commands, handle special variables differently
                         match arg {
-                            Word::Variable(var) => {
+                            Word::Variable(var, _) => {
                                 match var.as_str() {
                                     "#" => "scalar(@ARGV)".to_string(),
                                     "@" => "@ARGV".to_string(),
                                     _ => format!("${}", var)
                                 }
                             }
-                            Word::StringInterpolation(interp) => {
+                            Word::StringInterpolation(interp, _) => {
                                 // Handle quoted variables like "$#" -> scalar(@ARGV)
                                 if interp.parts.len() == 1 {
                                     if let StringPart::Variable(var) = &interp.parts[0] {
@@ -230,7 +239,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         }
                                     } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
                                         // Handle parameter expansion like "${#arr[@]}" -> scalar(@arr)
-                                        generator.generate_parameter_expansion(pe)
+                                        generator.generate_parameter_expansion(&pe)
                                     } else {
                                         generator.perl_string_literal(arg)
                                     }
@@ -238,9 +247,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     generator.perl_string_literal(arg)
                                 }
                             }
-                            Word::BraceExpansion(expansion) => {
+                            Word::BraceExpansion(expansion, _) => {
                                 // Handle brace expansion like {1..5} -> "1 2 3 4 5"
                                 handle_brace_expansion_for_echo(generator, expansion)
+                            }
+                            Word::CommandSubstitution(_, _) => {
+                                // For command substitution, don't escape newlines - preserve them as-is
+                                generator.word_to_perl(arg)
                             }
                             _ => generator.perl_string_literal(arg)
                         }
@@ -253,7 +266,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 } else {
                     // Check if we have multiple brace expansions that need cartesian product
                     let brace_expansions: Vec<&Word> = cmd.args.iter()
-                        .filter(|arg| matches!(arg, Word::BraceExpansion(_)))
+                        .filter(|arg| matches!(arg, Word::BraceExpansion(..)))
                         .collect();
                     
                     if brace_expansions.len() > 1 {
@@ -271,7 +284,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             // This is a standalone assignment (e.g., i=$((i + 1)))
             for (var, value) in &cmd.env_vars {
                 match value {
-                    Word::Arithmetic(expr) => {
+                    Word::Arithmetic(expr, _) => {
                         // Convert arithmetic expression to Perl
                         let perl_expr = generator.convert_arithmetic_to_perl(&expr.expression);
                         if !generator.declared_locals.contains(var) {
@@ -349,7 +362,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     let args: Vec<String> = cmd.args.iter()
                         .map(|arg| {
                             match arg {
-                                Word::BraceExpansion(expansion) => {
+                                Word::BraceExpansion(expansion, _) => {
                                     // Handle brace expansion for command arguments
                                     handle_brace_expansion_for_command(generator, expansion)
                                 }
@@ -367,17 +380,36 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&generator.indent());
                     output.push_str(&format!("system('{}');\n", name));
                 } else {
-                    let args: Vec<String> = cmd.args.iter()
-                        .map(|arg| {
-                            match arg {
-                                Word::BraceExpansion(expansion) => {
-                                    // Handle brace expansion for command arguments
-                                    handle_brace_expansion_for_command(generator, expansion)
+                    let args: Vec<String> = if name == "perl" {
+                        // Special handling for perl command - don't double-quote the Perl code
+                        cmd.args.iter()
+                            .map(|arg| {
+                                match arg {
+                                    Word::Literal(s, _) => {
+                                        // For perl command, pass literal strings as-is without additional quoting
+                                        format!("'{}'", s.replace("'", "\\'"))
+                                    }
+                                    Word::BraceExpansion(expansion, _) => {
+                                        // Handle brace expansion for command arguments
+                                        handle_brace_expansion_for_command(generator, expansion)
+                                    }
+                                    _ => generator.perl_string_literal(arg)
                                 }
-                                _ => generator.perl_string_literal(arg)
-                            }
-                        })
-                        .collect();
+                            })
+                            .collect()
+                    } else {
+                        cmd.args.iter()
+                            .map(|arg| {
+                                match arg {
+                                    Word::BraceExpansion(expansion, _) => {
+                                        // Handle brace expansion for command arguments
+                                        handle_brace_expansion_for_command(generator, expansion)
+                                    }
+                                    _ => generator.perl_string_literal(arg)
+                                }
+                            })
+                            .collect()
+                    };
                     let args_str = args.join(", ");
                     output.push_str(&generator.indent());
                     output.push_str(&format!("system('{}', {});\n", name, args_str));
@@ -413,7 +445,7 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
     } else {
         // Check for -e flag
         let has_e_flag = cmd.args.iter().any(|arg| {
-            if let Word::Literal(s) = arg {
+            if let Word::Literal(s, _) = arg {
                 s == "-e"
             } else {
                 false
@@ -422,7 +454,7 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         
         // Filter out the -e flag from arguments
         let filtered_args: Vec<&Word> = cmd.args.iter().filter(|&arg| {
-            if let Word::Literal(s) = arg {
+            if let Word::Literal(s, _) = arg {
                 s != "-e"
             } else {
                 true
@@ -434,14 +466,14 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
             .map(|arg| {
                 // For echo commands, handle special variables differently
                 match arg {
-                    Word::Variable(var) => {
+                    Word::Variable(var, _) => {
                         match var.as_str() {
                             "#" => "scalar(@ARGV)".to_string(),
                             "@" => "@ARGV".to_string(),
                             _ => format!("${}", var)
                         }
                     }
-                    Word::StringInterpolation(interp) => {
+                    Word::StringInterpolation(interp, _) => {
                         // Handle quoted variables like "$#" -> scalar(@ARGV)
                         if interp.parts.len() == 1 {
                             if let StringPart::Variable(var) = &interp.parts[0] {
@@ -452,7 +484,7 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                 }
                             } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
                                 // Handle parameter expansion like "${#arr[@]}" -> scalar(@arr)
-                                generator.generate_parameter_expansion(pe)
+                                generator.generate_parameter_expansion(&pe)
                             } else {
                                 generator.perl_string_literal(arg)
                             }
@@ -460,11 +492,11 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                             generator.perl_string_literal(arg)
                         }
                     }
-                    Word::BraceExpansion(expansion) => {
+                    Word::BraceExpansion(expansion, _) => {
                         // Handle brace expansion like {1..5} -> "1 2 3 4 5"
                         handle_brace_expansion_for_echo(generator, expansion)
                     }
-                    Word::Literal(literal) => {
+                    Word::Literal(literal, _) => {
                         if has_e_flag {
                             // If -e flag is present, interpret backslash escapes
                             let mut interpreted = literal.clone();
@@ -486,6 +518,10 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                         } else {
                             generator.perl_string_literal(arg)
                         }
+                    }
+                    Word::CommandSubstitution(_, _) => {
+                        // For command substitution, don't escape newlines - preserve them as-is
+                        generator.word_to_perl(arg)
                     }
                     _ => generator.perl_string_literal(arg)
                 }
@@ -645,7 +681,7 @@ fn generate_cartesian_product_for_echo(
     
     for arg in args {
         match arg {
-            Word::BraceExpansion(items) => {
+            Word::BraceExpansion(items, _) => {
                 let mut expanded = Vec::new();
                 for item in &items.items {
                     match item {

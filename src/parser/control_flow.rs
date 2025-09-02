@@ -45,7 +45,7 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
         // Handle arithmetic evaluation like: if (( a > b )); then
         let arithmetic_word = parse_arithmetic_expression(parser)?;
         Box::new(Command::Simple(SimpleCommand {
-            name: Word::Literal("test".to_string()),
+            name: Word::literal("test".to_string()),
             args: vec![arithmetic_word],
             redirects: Vec::new(),
             env_vars: HashMap::new(),
@@ -145,7 +145,7 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
                 // Handle arithmetic evaluation like: elif (( a == b )); then
                             let arithmetic_word = parse_arithmetic_expression(parser)?;
             Box::new(Command::Simple(SimpleCommand {
-                name: Word::Literal("test".to_string()),
+                name: Word::literal("test".to_string()),
                 args: vec![arithmetic_word],
                 redirects: Vec::new(),
                 env_vars: HashMap::new(),
@@ -932,10 +932,10 @@ fn parse_arithmetic_expression(parser: &mut Parser) -> Result<Word, ParserError>
     
     let expression = expression_parts.join(" ");
     
-    Ok(Word::Arithmetic(ArithmeticExpression {
-        expression,
-        tokens: vec![], // TODO: Store actual tokens if needed
-    }))
+          Ok(Word::arithmetic(ArithmeticExpression {
+          expression,
+          tokens: vec![], // TODO: Store actual tokens if needed
+      }))
 }
 
 fn parse_pipeline(parser: &mut Parser) -> Result<Command, ParserError> {
@@ -961,7 +961,7 @@ pub fn parse_simple_command(parser: &mut Parser) -> Result<Command, ParserError>
     let name = match parser.lexer.peek() {
         Some(Token::Identifier) => {
             let name_text = parser.lexer.get_identifier_text()?;
-            Word::Literal(name_text)
+            Word::literal(name_text)
         }
         _ => {
             return Err(ParserError::InvalidSyntax("Expected command name".to_string()));
@@ -1223,7 +1223,7 @@ fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
     env_vars.insert(var_name.clone(), value);
     
     Ok(Command::Simple(SimpleCommand {
-        name: Word::Literal("assignment".to_string()), // Placeholder name
+        name: Word::literal("assignment".to_string()), // Placeholder name
         args: Vec::new(),
         redirects: Vec::new(),
         env_vars,

@@ -11,7 +11,7 @@ pub fn generate_wc_command(_generator: &mut Generator, cmd: &SimpleCommand, inpu
     let mut count_bytes = false;
     
     for arg in &cmd.args {
-        if let Word::Literal(s) = arg {
+        if let Word::Literal(s, _) = arg {
             if s.starts_with('-') {
                 if s.contains('l') { count_lines = true; }
                 if s.contains('w') { count_words = true; }

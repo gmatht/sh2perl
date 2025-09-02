@@ -305,7 +305,7 @@ impl Generator {
             if let Command::Simple(cmd) = command {
                 // Check environment variables for arithmetic expressions
                 for (env_var, value) in &cmd.env_vars {
-                    if let Word::Arithmetic(arith_expr) = value {
+                    if let Word::Arithmetic(arith_expr, _) = value {
                         // Extract variable names from arithmetic expression
                         // Simple approach: look for identifiers in the expression
                         let expr = &arith_expr.expression;
@@ -347,7 +347,7 @@ impl Generator {
                 if let Command::Simple(cmd) = &*while_loop.condition {
                     // Check if variable is used in test command arguments
                     for arg in &cmd.args {
-                        if let Word::Variable(var) = arg {
+                        if let Word::Variable(var, _) = arg {
                             if var == var_name {
                                 return true;
                             }
@@ -358,7 +358,7 @@ impl Generator {
             Command::Simple(cmd) => {
                 // Check if variable is used in simple command arguments
                 for arg in &cmd.args {
-                    if let Word::Variable(var) = arg {
+                    if let Word::Variable(var, _) = arg {
                         if var == var_name {
                             return true;
                         }
@@ -371,7 +371,7 @@ impl Generator {
                         return true;
                     }
                     // Check if the variable is used in the value (e.g., arithmetic expressions)
-                    if let Word::Arithmetic(arith_expr) = value {
+                    if let Word::Arithmetic(arith_expr, _) = value {
                         if arith_expr.expression.contains(var_name) {
                             return true;
                         }

@@ -9,7 +9,7 @@ pub fn generate_head_command(_generator: &mut Generator, cmd: &SimpleCommand, in
     
     // Parse head options
     for arg in &cmd.args {
-        if let Word::Literal(arg_str) = arg {
+        if let Word::Literal(arg_str, _) = arg {
             if arg_str.starts_with("-n") {
                 if let Some(num_str) = arg_str.strip_prefix("-n") {
                     if let Ok(num) = num_str.parse::<usize>() {

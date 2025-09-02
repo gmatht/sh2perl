@@ -11,7 +11,7 @@ pub fn generate_wget_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         
         // Parse wget options
         for arg in &cmd.args {
-            if let Word::Literal(arg_str) = arg {
+            if let Word::Literal(arg_str, _) = arg {
                 if arg_str == "-O" {
                     // Output file option
                     if let Some(_next_arg) = cmd.args.iter().find(|&a| a == arg) {
