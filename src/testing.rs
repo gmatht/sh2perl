@@ -8,7 +8,7 @@ use crate::cache::CommandCache;
 use crate::execution::{run_shell_script, create_exit_status};
 use crate::utils::{check_generator_available, cleanup_tmp, generate_unified_diff, 
                    check_perl_must_not_contain, check_ast_must_not_contain, check_ast_must_contain};
-use crate::shared_utils;
+use debashl::shared_utils;
 use debashl::{Lexer, Parser, Generator, lexer::Token};
 
 #[derive(Debug)]

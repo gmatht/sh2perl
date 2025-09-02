@@ -4,6 +4,7 @@ pub mod ast;
 pub mod debug;
 pub mod shared_utils;
 pub mod generator;
+// pub mod variable_analysis; // TODO: Implement variable analysis
 pub mod wasm;
 
 // Only export the main types to avoid conflicts

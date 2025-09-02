@@ -406,7 +406,12 @@ pub fn parse_while_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     parser.lexer.consume(Token::Done)?;
     
     let body = Block { commands: body_commands };
-    Ok(Command::While(WhileLoop { condition, body }))
+    Ok(Command::While(WhileLoop { 
+        condition, 
+        body,
+        variables_modified_in_loop: Vec::new(),  // Will be set during analysis
+        variables_used_after_loop: Vec::new(),  // Will be set during analysis
+    }))
 }
 
 pub fn parse_for_loop(parser: &mut Parser) -> Result<Command, ParserError> {
@@ -527,6 +532,8 @@ pub fn parse_for_loop(parser: &mut Parser) -> Result<Command, ParserError> {
         variable,
         items,
         body: Block { commands: body_commands },
+        variable_used_after: false,  // Will be set during analysis
+        variable_overwritten_before_use: false,  // Will be set during analysis
     });
     
     // If there's a pipe after 'done', parse the pipeline

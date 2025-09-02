@@ -848,7 +848,7 @@ impl Parser {
     }
 
     fn parse_test_expression(&mut self) -> Result<Command, ParserError> {
-        use crate::ast::{TestExpression, TestModifiers};
+        use crate::ast::TestExpression;
         
                             // Check if this is being called for double brackets (already consumed) or single bracket
                     // If we're called from double bracket detection, the [[ tokens have already been consumed

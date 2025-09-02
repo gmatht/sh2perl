@@ -150,17 +150,12 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 // Initialize first operand if it's a variable
                 if let Word::Variable(var_name) = operand1 {
                     if !generator.declared_locals.contains(var_name) {
-                        // Check if this variable was used in a previous for loop
-                        if var_name == "i" {
-                            output.push_str(&generator.indent());
-                            output.push_str(&format!("my ${} = 5;\n", var_name));
-                            generator.declared_locals.insert(var_name.to_string());
-                        } else {
-                            output.push_str(&generator.indent());
-                            output.push_str(&format!("my ${} = 0;\n", var_name));
-                            generator.declared_locals.insert(var_name.to_string());
-                        }
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("my ${} = 0;\n", var_name));
+                        generator.declared_locals.insert(var_name.to_string());
                     }
+                    // Mark this variable as used at function level so for loops know to preserve it
+                    generator.function_level_vars.insert(var_name.to_string());
                 }
                 
                 // Initialize second operand if it's a variable
@@ -170,12 +165,17 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                         output.push_str(&format!("my ${} = 0;\n", var_name));
                         generator.declared_locals.insert(var_name.to_string());
                     }
+                    // Mark this variable as used at function level so for loops know to preserve it
+                    generator.function_level_vars.insert(var_name.to_string());
                 }
             }
         }
-    } else if let Command::TestExpression(_test_expr) = &*while_loop.condition {
-        // For test expressions, variables should already be declared at function level
-        // if they are used after their loop context
+    } else if let Command::TestExpression(test_expr) = &*while_loop.condition {
+        // For test expressions, check if variables are used in the expression
+        // and mark them as function-level variables so for loops know to preserve them
+        if test_expr.expression.contains("$i") {
+            generator.function_level_vars.insert("i".to_string());
+        }
     }
     
     // Generate while loop
@@ -201,11 +201,45 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
     output
 }
 
+// Helper function to analyze if a variable is used after a for loop
+fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for_loop_index: usize) -> bool {
+    for (i, command) in commands.iter().enumerate() {
+        if i <= for_loop_index {
+            continue; // Skip commands before and including the for loop
+        }
+        
+        match command {
+            Command::While(while_loop) => {
+                // Check if variable is used in while loop condition
+                if let Command::TestExpression(test_expr) = &*while_loop.condition {
+                    if test_expr.expression.contains(&format!("${}", for_loop_var)) {
+                        return true;
+                    }
+                }
+            },
+            Command::Simple(cmd) => {
+                // Check if variable is used in simple commands
+                for arg in &cmd.args {
+                    if let Word::Variable(var_name) = arg {
+                        if var_name == for_loop_var {
+                            return true;
+                        }
+                    }
+                }
+            },
+            _ => {
+                // For other command types, we could add more analysis here
+            }
+        }
+    }
+    false
+}
+
 pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> String {
     let mut output = String::new();
     
     // Declare the loop variable outside the loop so it persists after the loop ends
-    // But only if it hasn't already been declared at function level
+    // But only if it hasn't already been declared and it's not a function-level variable
     let loop_var = &for_loop.variable;
     if !generator.declared_locals.contains(loop_var) && !generator.function_level_vars.contains(loop_var) {
         output.push_str(&generator.indent());
@@ -366,9 +400,10 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
     
     // After the loop, set the variable to the last value to mimic shell behavior
     // But only if the variable is used later (to avoid unnecessary assignments)
+    // This is important for shell compatibility where loop variables retain their last value
+    // However, we should only do this if the variable is actually used after the loop
     if generator.function_level_vars.contains(&for_loop.variable) && !all_items.is_empty() {
         // For simple ranges like 1..3, the last value is 3
-        // For now, we'll handle the common case of ranges
         if all_items.len() == 1 && items_str.contains("..") {
             // This is a range like "1..3"
             let range_parts: Vec<&str> = items_str.split("..").collect();
@@ -376,6 +411,12 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                 let end_value = range_parts[1];
                 output.push_str(&generator.indent());
                 output.push_str(&format!("${} = {};\n", for_loop.variable, end_value));
+            }
+        } else if all_items.len() > 1 {
+            // For multiple items, set to the last item
+            if let Some(last_item) = all_items.last() {
+                output.push_str(&generator.indent());
+                output.push_str(&format!("${} = {};\n", for_loop.variable, last_item));
             }
         }
     }

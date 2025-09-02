@@ -93,6 +93,8 @@ pub struct CaseClause {
 pub struct WhileLoop {
     pub condition: Box<Command>,
     pub body: Block,
+    pub variables_modified_in_loop: Vec<String>,  // Variables that are modified in the loop body
+    pub variables_used_after_loop: Vec<String>,  // Variables that are used after the loop ends
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +102,8 @@ pub struct ForLoop {
     pub variable: String,
     pub items: Vec<Word>,
     pub body: Block,
+    pub variable_used_after: bool,  // Whether the loop variable is used after the loop
+    pub variable_overwritten_before_use: bool,  // Whether the variable is overwritten before being used
 }
 
 #[derive(Debug, Clone, PartialEq)]
