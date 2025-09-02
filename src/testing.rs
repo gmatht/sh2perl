@@ -152,9 +152,10 @@ pub fn test_file_equivalence(lang: &str, filename: &str) -> Result<(), String> {
                 return Err(format!("PERL_MUST_NOT_CONTAIN constraint violation in {}:\n{}", filename, violation_msg));
             }
             
-            let tmp = "examples/__tmp_test_output.pl";
-            if let Err(e) = shared_utils::SharedUtils::write_utf8_file(tmp, &code) { return Err(format!("Failed to write Perl temp file: {}", e)); }
-            (tmp.to_string(), vec!["perl", "__tmp_test_output.pl"])
+            let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
+            let tmp_str = tmp.to_string_lossy().to_string();
+            if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) { return Err(format!("Failed to write Perl temp file: {}", e)); }
+            (tmp_str.clone(), vec!["perl".to_string(), tmp_str])
         }
         _ => { return Err(format!("Unsupported language for --test-file: {}", lang)); }
     };
@@ -313,12 +314,13 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
     
     // If we have cached Perl code but need to set up temp file and run command
     if lang == "perl" && cached_perl_code.is_some() && tmp_file.is_empty() {
-        let tmp = "__tmp_test_output.pl";
-        if let Err(e) = shared_utils::SharedUtils::write_utf8_file(tmp, &translated_code) { 
+        let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
+        let tmp_str = tmp.to_string_lossy().to_string();
+        if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &translated_code) { 
             return Err(format!("Failed to write Perl temp file: {}", e)); 
         }
-        tmp_file = tmp.to_string();
-        run_cmd = vec!["perl", tmp];
+        tmp_file = tmp_str.clone();
+        run_cmd = vec!["perl".to_string(), tmp_str];
     }
     
     // If no cached output, we need to run the shell script
