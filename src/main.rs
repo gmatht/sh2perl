@@ -270,7 +270,7 @@ fn main() {
                 lex_input(input);
             }
         }
-        "parse" => {
+        "parse" | "--ast" => {
             if args.len() < 3 {
                 println!("Error: parse command requires input");
                 return;
