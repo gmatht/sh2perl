@@ -101,8 +101,9 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
     // Handle context-based logic
     if pipeline_context {
         // Pipeline context: populate array but don't print - output goes to pipeline
-        // Always enable sorting in pipeline context for consistent behavior
-        output.push_str(&generate_ls_helper(generator, dir, "ls_files", true));
+        // Don't sort by default - only sort when explicitly requested with -C or -x flags
+        let should_sort = false; // Default to no sorting to match shell behavior
+        output.push_str(&generate_ls_helper(generator, dir, "ls_files", should_sort));
         if let Some(var) = output_var {
             output.push_str(&generator.indent());
             output.push_str(&format!("${} = join(\"\\n\", @ls_files);\n", var));
@@ -156,8 +157,9 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let mut output = String::new();
     output.push_str("do {\n");
     generator.indent_level += 1;
-    // Always enable sorting for consistent behavior with regular pipelines
-    output.push_str(&generate_ls_helper(generator, dir, "ls_files_sub", true));
+    // Use sorting based on flags, not always true
+    let should_sort = !single_column; // Only sort if not using -1 flag
+    output.push_str(&generate_ls_helper(generator, dir, "ls_files_sub", should_sort));
     output.push_str(&generator.indent());
     if single_column {
         // -1 flag: join with newlines to preserve one file per line

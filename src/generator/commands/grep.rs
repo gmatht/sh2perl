@@ -141,7 +141,24 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             }
         } else if pattern.is_empty() {
             // First non-literal argument is the pattern
-            pattern = generator.word_to_perl(arg);
+            // For StringInterpolation, extract the raw string content for regex patterns
+            if let Word::StringInterpolation(interp, _) = arg {
+                if interp.parts.len() == 1 {
+                    if let StringPart::Literal(s) = &interp.parts[0] {
+                        // Use the raw string content for regex patterns
+                        pattern = s.clone();
+                    } else {
+                        // Fall back to normal string interpolation handling
+                        pattern = generator.word_to_perl(arg);
+                    }
+                } else {
+                    // Fall back to normal string interpolation handling
+                    pattern = generator.word_to_perl(arg);
+                }
+            } else {
+                // For other word types, use normal processing
+                pattern = generator.word_to_perl(arg);
+            }
         }
     }
     
@@ -399,6 +416,9 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             regex_pattern = regex_pattern.replace("\\}", "}");
             // Convert \| to | (shell extended regex to Perl)
             regex_pattern = regex_pattern.replace("\\|", "|");
+            // Convert \. to . (shell extended regex to Perl) - but keep \. for literal dot
+            // Actually, \. in shell regex means literal dot, so we should keep it as \. in Perl
+            // No conversion needed for \.
             
             // Apply grep filtering
             if invert_match {
