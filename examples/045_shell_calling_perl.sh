@@ -18,7 +18,9 @@ perl -e 'foreach $arg (@ARGV) { print "Argument: $arg\n" }' "first" "second" "th
 # Example 3: Perl script processing shell variables
 echo -e "\n=== Example 3: Perl processing shell variables ==="
 SHELL_VAR="Hello World"
-perl -e 'print \"Shell variable: $ENV{SHELL_VAR}\n\"'
+perl -e 'print "Shell variable: $ENV{SHELL_VAR}\n"'
+export SHELL_VAR 
+perl -e 'print "Shell variable: $ENV{SHELL_VAR}\n"'
 
 # Example 4: Perl script reading from shell pipeline
 echo -e "\n=== Example 4: Perl reading from pipeline ==="
