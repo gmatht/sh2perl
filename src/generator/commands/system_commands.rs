@@ -3,11 +3,15 @@ use crate::mir::*;
 use crate::generator::Generator;
 
 // Helper function to convert Word to bash string representation for system commands
-fn word_to_bash_string_for_system(word: &Word) -> String {
+pub fn word_to_bash_string_for_system(word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
-            // If the literal contains spaces or special characters, quote it
-            if s.contains(' ') || s.contains('"') || s.contains('\'') || s.contains(';') || s.contains('|') || s.contains('&') || s.contains('<') || s.contains('>') {
+            // If the literal is already properly quoted (starts and ends with same quote), use it as-is
+            if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
+                s.clone()
+            }
+            // Always quote literals that contain spaces, quotes, or special characters to ensure proper shell parsing
+            else if s.contains(' ') || s.contains('"') || s.contains('\'') || s.contains(';') || s.contains('|') || s.contains('&') || s.contains('<') || s.contains('>') || s.contains('\\') || s.contains('$') {
                 format!("'{}'", s.replace("'", "'\"'\"'"))
             } else {
                 s.clone()

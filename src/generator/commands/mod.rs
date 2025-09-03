@@ -50,6 +50,7 @@ pub mod head;
 pub mod tail;
 pub mod paste;
 pub mod diff;
+pub mod perl;
 
 // Re-export main functions
 pub use command_dispatcher::*;
@@ -96,3 +97,4 @@ pub use head::*;
 pub use tail::*;
 pub use paste::*;
 pub use diff::*;
+pub use perl::*;

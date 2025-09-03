@@ -262,7 +262,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 
                 if args.len() == 1 {
                     output.push_str(&generator.indent());
+                    // Check if the argument is a command substitution
+                    if matches!(cmd.args[0], Word::CommandSubstitution(_, _)) {
+                        // For command substitution, don't add extra newline as it already contains proper formatting
+                        output.push_str(&format!("print {};\n", args[0]));
+                    } else {
                     output.push_str(&format!("print {}. \"\\n\";\n", args[0]));
+                    }
                 } else {
                     // Check if we have multiple brace expansions that need cartesian product
                     let brace_expansions: Vec<&Word> = cmd.args.iter()
@@ -346,6 +352,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // Standalone find command - generate output directly without variable assignment
                         output.push_str(&crate::generator::commands::find::generate_find_command(generator, cmd, false, ""));
                     }
+                    "perl" => {
+                        // Use the dedicated perl command handler
+                        output.push_str(&crate::generator::commands::perl::generate_perl_command(generator, cmd));
+                    }
+
                     _ => {
                         // Route other builtins to the builtins system
                         // Use unique index for standalone commands to prevent variable masking
@@ -381,22 +392,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&format!("system('{}');\n", name));
                 } else {
                     let args: Vec<String> = if name == "perl" {
-                        // Special handling for perl command - don't double-quote the Perl code
-                        cmd.args.iter()
-                            .map(|arg| {
-                                match arg {
-                                    Word::Literal(s, _) => {
-                                        // For perl command, pass literal strings as-is without additional quoting
-                                        format!("'{}'", s.replace("'", "\\'"))
-                                    }
-                                    Word::BraceExpansion(expansion, _) => {
-                                        // Handle brace expansion for command arguments
-                                        handle_brace_expansion_for_command(generator, expansion)
-                                    }
-                                    _ => generator.perl_string_literal(arg)
-                                }
-                            })
-                            .collect()
+                        // Special handling for perl command - embed Perl code directly instead of system call
+                        // This will be handled specially below, so we don't need to process args here
+                        Vec::new()
                     } else {
                         cmd.args.iter()
                             .map(|arg| {
@@ -410,9 +408,126 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             })
                             .collect()
                     };
+                    
+                    if name == "perl" {
+                        // Handle Perl commands by embedding the Perl code directly
+                        if cmd.args.len() >= 2 {
+                            // Check for -e flag (execute code)
+                            if let Word::Literal(flag, _) = &cmd.args[0] {
+                                if flag == "-e" {
+                                    // Extract the Perl code from the second argument
+                                    let perl_code = if let Word::Literal(perl_code, _) = &cmd.args[1] {
+                                        Some(perl_code.clone())
+                                    } else if let Word::StringInterpolation(interp, _) = &cmd.args[1] {
+                                        // Convert string interpolation to Perl code
+                                        let result = generator.convert_string_interpolation_to_perl(interp);
+                
+                                        Some(result)
+                    } else {
+                                        None
+                                    };
+                                    
+                                    if let Some(perl_code) = perl_code {
+                                        // Check if this is from StringInterpolation (already clean Perl code)
+                                        let is_string_interpolation = matches!(&cmd.args[1], Word::StringInterpolation(_, _));
+                                        
+                                        if is_string_interpolation {
+                                            // StringInterpolation already returns clean Perl code, don't clean it again
+                                            output.push_str(&generator.indent());
+                                            // Split the code by newlines and add proper indentation
+                                            for line in perl_code.lines() {
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!("{}\n", line));
+                                            }
+                                        } else {
+                                            // Clean up the Perl code - remove outer quotes if present
+                                            let mut clean_code = perl_code.clone();
+                                            if (clean_code.starts_with('"') && clean_code.ends_with('"')) ||
+                                               (clean_code.starts_with('\'') && clean_code.ends_with('\'')) {
+                                                clean_code = clean_code[1..clean_code.len()-1].to_string();
+                                            }
+                                            
+                                            // Handle backslash escapes
+                                            clean_code = clean_code
+                                                .replace("\\n", "\n")
+                                                .replace("\\t", "\t")
+                                                .replace("\\r", "\r")
+                                                .replace("\\\\", "\\");
+                                            
+                                            // Embed the Perl code directly - ensure it's properly formatted
+                                            output.push_str(&generator.indent());
+                                            // Split the code by newlines and add proper indentation
+                                            for line in clean_code.lines() {
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!("{}\n", line));
+                                            }
+                                        }
+                                        return output;
+                                    }
+                                } else if flag == "-ne" {
+                                    // Handle -ne flag (execute code for each line of input)
+                                    let perl_code = if let Word::Literal(perl_code, _) = &cmd.args[1] {
+                                        Some(perl_code.clone())
+                                    } else if let Word::StringInterpolation(interp, _) = &cmd.args[1] {
+                                        // Convert string interpolation to Perl code
+                                        Some(generator.convert_string_interpolation_to_perl(interp))
+                                    } else {
+                                        None
+                                    };
+                                    
+                                    if let Some(perl_code) = perl_code {
+                                        // Check if this is from StringInterpolation (already clean Perl code)
+                                        let is_string_interpolation = matches!(&cmd.args[1], Word::StringInterpolation(_, _));
+                                        
+                                        if is_string_interpolation {
+                                            // StringInterpolation already returns clean Perl code, don't clean it again
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!("# Perl -ne: {}\n", perl_code));
+                                            // Split the code by newlines and add proper indentation
+                                            for line in perl_code.lines() {
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!("{}\n", line));
+                                            }
+                                        } else {
+                                            // Clean up the Perl code
+                                            let mut clean_code = perl_code.clone();
+                                            if (clean_code.starts_with('"') && clean_code.ends_with('"')) ||
+                                               (clean_code.starts_with('\'') && clean_code.ends_with('\'')) {
+                                                clean_code = clean_code[1..clean_code.len()-1].to_string();
+                                            }
+                                            
+                                            // Handle backslash escapes
+                                            clean_code = clean_code
+                                                .replace("\\n", "\n")
+                                                .replace("\\t", "\t")
+                                                .replace("\\r", "\r")
+                                                .replace("\\\\", "\\");
+                                            
+                                            // For -ne, we need to process each line
+                                            // This will be handled in pipeline context
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!("# Perl -ne: {}\n", clean_code));
+                                            // Split the code by newlines and add proper indentation
+                                            for line in clean_code.lines() {
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!("{}\n", line));
+                                            }
+                                        }
+                                        return output;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Fallback to system call for other Perl usage
+                        let args_str = args.join(", ");
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("system('{}', {});\n", name, args_str));
+                    } else {
                     let args_str = args.join(", ");
                     output.push_str(&generator.indent());
                     output.push_str(&format!("system('{}', {});\n", name, args_str));
+                    }
                 }
             }
         }

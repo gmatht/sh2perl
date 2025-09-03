@@ -101,8 +101,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     }
                     
                     // Return the code that executes the pipeline and captures output
-                    // Command substitution should strip trailing newlines but preserve internal newlines
-                    format!("do {{ {} chomp({}); {} }}", captured_pipeline.trim(), output_var, output_var)
+                    // Command substitution should convert newlines to spaces (bash behavior)
+                    format!("do {{ {} chomp({}); {} =~ s/\\n/ /g; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
                 },
                 _ => {
                     // For other command types, use system command fallback
@@ -328,8 +328,16 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &Generator, interp: 
     for part in &interp.parts {
         match part {
             StringPart::Literal(s) => {
+                // Handle backslash escapes in literal text
+                let unescaped = s
+                    .replace("\\\"", "\"")
+                    .replace("\\'", "'")
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace("\\r", "\r")
+                    .replace("\\\\", "\\");
                 // Add the literal text directly to the interpolated string
-                combined_string.push_str(s);
+                combined_string.push_str(&unescaped);
             },
             StringPart::Variable(var) => {
                 // Handle special shell variables
@@ -345,6 +353,7 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &Generator, interp: 
                             combined_string.push_str(&format!("$_[{}]", index - 1)); // Perl arrays are 0-indexed
                         } else {
                             // Regular variable - add directly for interpolation
+                            // In bash, $ENV{SHELL_VAR} is treated as variable $ENV followed by literal {SHELL_VAR}
                             combined_string.push_str(&format!("${}", var));
                         }
                     }

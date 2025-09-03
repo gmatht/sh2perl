@@ -41,6 +41,7 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     commands.insert("diff", BuiltinCommand::new("diff", "Compare files", false));
     commands.insert("tr", BuiltinCommand::new("tr", "Translate or delete characters", true));
     commands.insert("xargs", BuiltinCommand::new("xargs", "Execute command with arguments", false));
+    commands.insert("perl", BuiltinCommand::new("perl", "Perl interpreter", true));
     
     // File manipulation
     commands.insert("cp", BuiltinCommand::new("cp", "Copy files", false));
@@ -50,7 +51,7 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     commands.insert("touch", BuiltinCommand::new("touch", "Create empty files", false));
     
     // Text processing
-    commands.insert("echo", BuiltinCommand::new("echo", "Display text", false));
+    commands.insert("echo", BuiltinCommand::new("echo", "Display text", true));
     commands.insert("printf", BuiltinCommand::new("printf", "Format and print data", true));
     commands.insert("basename", BuiltinCommand::new("basename", "Extract filename", true));
     commands.insert("dirname", BuiltinCommand::new("dirname", "Extract directory name", true));
@@ -120,6 +121,11 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
     if let Some(Command::Simple(first_cmd)) = pipeline.commands.first() {
         if let Word::Literal(name, _) = &first_cmd.name {
             match name.as_str() {
+                "echo" => {
+                    // echo produces output, it doesn't read from STDIN
+                    // So it should use buffered pipeline, not line-by-line
+                    return false;
+                },
                 "grep" => {
                     // Check for grep options that make streaming inappropriate
                     for arg in &first_cmd.args {
