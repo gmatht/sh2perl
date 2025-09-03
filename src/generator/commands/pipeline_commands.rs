@@ -491,7 +491,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
             output.push_str("print \"$line_count\\n\";\n");
         }
     } else if start_index == 1 {
-        // For cat commands, we need to add the command processing inside the while loop
+        // For echo or cat commands, we need to add the command processing
         // No variable declarations needed for streaming pipeline - we process each line directly
         
         // Process each line through the remaining pipeline commands
@@ -504,7 +504,8 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 
                 // Generate line-by-line version of each command
                 output.push_str(&generator.indent());
-                output.push_str(&generate_linebyline_command(generator, cmd, "line", start_index + i));
+                let cmd_index = start_index + i;
+                output.push_str(&generate_linebyline_command(generator, cmd, "line", cmd_index));
             }
         }
         
@@ -609,33 +610,8 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             output
         },
         "perl" => {
-            // For perl commands, we need to set $_ to the current line and execute the perl code
-            let mut output = String::new();
-            output.push_str("$_ = $line;\n");
-            
-            // Find the perl code argument (usually after -e or -ne)
-            let mut perl_code = String::new();
-            let mut in_code = false;
-            
-            for arg in &cmd.args {
-                if let Word::Literal(s, _) = arg {
-                    if s == "-e" || s == "-ne" {
-                        in_code = true;
-                        continue;
-                    }
-                    if in_code {
-                        perl_code = s.clone();
-                        break;
-                    }
-                }
-            }
-            
-            if !perl_code.is_empty() {
-                // Execute the perl code
-                output.push_str(&format!("{}\n", perl_code));
-            }
-            
-            output
+            // Use the dedicated Perl pipeline command generator
+            crate::generator::commands::perl::generate_perl_pipeline_command(generator, cmd, line_var)
         },
         _ => {
             // Fallback for unsupported commands
