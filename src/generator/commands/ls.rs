@@ -101,9 +101,9 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
     // Handle context-based logic
     if pipeline_context {
         // Pipeline context: populate array but don't print - output goes to pipeline
-        // Don't sort by default - only sort when explicitly requested with -C or -x flags
-        let should_sort = false; // Default to no sorting to match shell behavior
-        output.push_str(&generate_ls_helper(generator, dir, "ls_files", should_sort));
+            // Sort by default to match GNU ls behavior
+    let should_sort = true; // Default to sorting to match shell behavior
+    output.push_str(&generate_ls_helper(generator, dir, "ls_files", should_sort));
         if let Some(var) = output_var {
             output.push_str(&generator.indent());
             output.push_str(&format!("${} = join(\"\\n\", @ls_files);\n", var));
@@ -157,8 +157,8 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let mut output = String::new();
     output.push_str("do {\n");
     generator.indent_level += 1;
-    // Use sorting based on flags, not always true
-    let should_sort = !single_column; // Only sort if not using -1 flag
+    // Sort by default to match GNU ls behavior
+    let should_sort = true; // Default to sorting to match shell behavior
     output.push_str(&generate_ls_helper(generator, dir, "ls_files_sub", should_sort));
     output.push_str(&generator.indent());
     if single_column {
