@@ -161,13 +161,9 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let should_sort = true; // Default to sorting to match shell behavior
     output.push_str(&generate_ls_helper(generator, dir, "ls_files_sub", should_sort));
     output.push_str(&generator.indent());
-    if single_column {
-        // -1 flag: join with newlines to preserve one file per line
-        output.push_str("join(\"\\n\", @ls_files_sub);\n");
-    } else {
-        // Default behavior and -C or -x flags: join with spaces for multi-column output
-        output.push_str("join(\" \", @ls_files_sub);\n");
-    }
+    // In command substitution context, always join with newlines to match shell behavior
+    // The shell's ls command outputs one file per line by default in command substitution
+    output.push_str("join(\"\\n\", @ls_files_sub);\n");
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("}");
