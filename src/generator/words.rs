@@ -435,7 +435,14 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &Generator, interp: 
     }
     
     // Return as a single interpolated string
-    format!("\"{}\"", combined_string)
+    // Escape newlines, tabs, and other special characters for proper Perl formatting
+    let escaped_string = combined_string
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+        .replace("\r", "\\r");
+    format!("\"{}\"", escaped_string)
 }
 
 pub fn convert_arithmetic_to_perl_impl(_generator: &Generator, expr: &str) -> String {

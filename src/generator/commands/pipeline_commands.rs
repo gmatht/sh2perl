@@ -86,13 +86,9 @@ fn generate_command_using_builtins(
                     if let Command::Simple(simple_cmd) = cmd {
                         if let Word::Literal(cmd_name, _) = &simple_cmd.name {
                             if cmd_name == "echo" {
-                                // For echo commands, append to output variable
-                                let echo_args: Vec<String> = simple_cmd.args.iter()
-                                    .map(|arg| generator.perl_string_literal(arg))
-                                    .collect();
-                                let echo_output = echo_args.join(" . ");
-                                output.push_str(&generator.indent());
-                                output.push_str(&format!("${} .= {} . \"\\n\";\n", output_var, echo_output));
+                                // For echo commands, use the dedicated echo command generator
+                                let echo_output = crate::generator::commands::simple_commands::generate_echo_command(generator, simple_cmd, "", output_var);
+                                output.push_str(&echo_output);
                             } else {
                                 // For other commands, execute and capture output
                                 output.push_str(&generator.indent());
@@ -667,13 +663,49 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     // Handle the first command - use generate_command_using_builtins for all command types
                     let command_output = generate_command_using_builtins(generator, command, "", &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
                     
-                    // Split the output into lines and apply indentation
-                    for line in command_output.lines() {
-                        if !line.trim().is_empty() {
-                            output.push_str(&generator.indent());
-                            output.push_str(line);
-                            if !line.ends_with('\n') {
-                                output.push_str("\n");
+                    // For echo commands, don't split into lines as they generate string assignments
+                    if let Command::Simple(cmd) = command {
+                        if let Word::Literal(cmd_name, _) = &cmd.name {
+                            if cmd_name == "echo" {
+                                // For echo commands, just add the output directly without splitting
+                                output.push_str(&generator.indent());
+                                output.push_str(&command_output);
+                                if !command_output.ends_with('\n') {
+                                    output.push_str("\n");
+                                }
+                            } else {
+                                // For other commands, split the output into lines and apply indentation
+                                for line in command_output.lines() {
+                                    if !line.trim().is_empty() {
+                                        output.push_str(&generator.indent());
+                                        output.push_str(line);
+                                        if !line.ends_with('\n') {
+                                            output.push_str("\n");
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // For other command types, split the output into lines and apply indentation
+                            for line in command_output.lines() {
+                                if !line.trim().is_empty() {
+                                    output.push_str(&generator.indent());
+                                    output.push_str(line);
+                                    if !line.ends_with('\n') {
+                                        output.push_str("\n");
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // For other command types, split the output into lines and apply indentation
+                        for line in command_output.lines() {
+                            if !line.trim().is_empty() {
+                                output.push_str(&generator.indent());
+                                output.push_str(line);
+                                if !line.ends_with('\n') {
+                                    output.push_str("\n");
+                                }
                             }
                         }
                     }
