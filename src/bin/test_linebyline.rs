@@ -28,24 +28,32 @@ fn main() {
     // Example 1: All commands support line-by-line
     let pipeline1 = Pipeline {
         source_text: Some("cat | grep 'test' | wc -l".to_string()),
+        stdout_used: true,
+        stderr_used: true,
         commands: vec![
             Command::Simple(SimpleCommand {
                 name: Word::literal("cat".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),
+                stdout_used: true,
+                stderr_used: true,
             }),
             Command::Simple(SimpleCommand {
                 name: Word::literal("tr".to_string()),
                 args: vec![Word::literal("a".to_string()), Word::literal("b".to_string())],
                 redirects: vec![],
                 env_vars: HashMap::new(),
+                stdout_used: true,
+                stderr_used: true,
             }),
             Command::Simple(SimpleCommand {
                 name: Word::literal("grep".to_string()),
                 args: vec![Word::literal("hello".to_string())],
                 redirects: vec![],
                 env_vars: HashMap::new(),
+                stdout_used: true,
+                stderr_used: true,
             }),
         ],
     };
@@ -62,24 +70,32 @@ fn main() {
     // Example 2: Some commands don't support line-by-line
     let pipeline2 = Pipeline {
         source_text: Some("ls | tr 'a-z' 'A-Z' | sort".to_string()),
+        stdout_used: true,
+        stderr_used: true,
         commands: vec![
             Command::Simple(SimpleCommand {
                 name: Word::literal("cat".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),
+                stdout_used: true,
+                stderr_used: true,
             }),
             Command::Simple(SimpleCommand {
                 name: Word::literal("sort".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),
+                stdout_used: true,
+                stderr_used: true,
             }),
             Command::Simple(SimpleCommand {
                 name: Word::literal("grep".to_string()),
                 args: vec![Word::literal("hello".to_string())],
                 redirects: vec![],
                 env_vars: HashMap::new(),
+                stdout_used: true,
+                stderr_used: true,
             }),
         ],
     };
@@ -97,18 +113,24 @@ fn main() {
     // Example 3: Non-builtin command
     let pipeline3 = Pipeline {
         source_text: Some("head -n 10 | tail -n 5 | cut -d' ' -f1".to_string()),
+        stdout_used: true,
+        stderr_used: true,
         commands: vec![
             Command::Simple(SimpleCommand {
                 name: Word::literal("cat".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),
+                stdout_used: true,
+                stderr_used: true,
             }),
             Command::Simple(SimpleCommand {
                 name: Word::literal("custom_script".to_string()),
                 args: vec![],
                 redirects: vec![],
                 env_vars: HashMap::new(),
+                stdout_used: true,
+                stderr_used: true,
             }),
         ],
     };

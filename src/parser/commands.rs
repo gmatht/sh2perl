@@ -231,6 +231,8 @@ impl Parser {
                             args: vec![],
                             redirects: vec![],
                             env_vars: HashMap::new(),
+                            stdout_used: true,
+                            stderr_used: true,
                         })),
                         redirects,
                     })
@@ -292,6 +294,8 @@ impl Parser {
                         args: vec![],
                         redirects: vec![],
                         env_vars: HashMap::new(),
+                        stdout_used: true,
+                        stderr_used: true,
                     }));
                 }
                 _ => self.parse_pipeline()?,
@@ -412,7 +416,7 @@ impl Parser {
                 None
             };
             
-            let result = Command::Pipeline(Pipeline { commands, source_text });
+            let result = Command::Pipeline(Pipeline { commands, source_text, stdout_used: true, stderr_used: true });
             eprintln!("DEBUG: parse_pipeline_from_command returning pipeline: {:?}", result);
             Ok(result)
         }
@@ -561,6 +565,8 @@ impl Parser {
                     args,
                     redirects,
                     env_vars,
+                    stdout_used: true,
+                    stderr_used: true,
                 }));
             }
         }
@@ -676,6 +682,8 @@ impl Parser {
             args,
             redirects,
             env_vars,
+            stdout_used: true,
+            stderr_used: true,
         }))
     }
 
@@ -739,6 +747,8 @@ impl Parser {
                         args: Vec::new(),
                         redirects: Vec::new(),
                         env_vars: env_vars_cmd,
+                        stdout_used: true,
+                        stderr_used: true,
                     });
                     
                     Ok(Command::Block(Block {
@@ -756,6 +766,8 @@ impl Parser {
                 args: Vec::new(),
                 redirects: Vec::new(),
                 env_vars,
+                stdout_used: true,
+                stderr_used: true,
             }))
         }
     }
@@ -1096,6 +1108,7 @@ impl Parser {
                                   Ok(Word::parameter_expansion(ParameterExpansion {
                       variable: var_name,
                       operator: ParameterExpansionOperator::None,
+                      is_mutable: true,
                   }))
             }
             _ => {

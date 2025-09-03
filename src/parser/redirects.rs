@@ -242,7 +242,7 @@ fn parse_command_from_text(_lexer: &mut Lexer, text: &str) -> Result<Command, Pa
         if commands.len() == 1 {
             Ok(commands.remove(0))
         } else {
-            let pipeline = Command::Pipeline(Pipeline { commands, source_text: None });
+            let pipeline = Command::Pipeline(Pipeline { commands, source_text: None, stdout_used: true, stderr_used: true });
             Ok(pipeline)
         }
     } else {
@@ -260,6 +260,8 @@ fn parse_command_from_text(_lexer: &mut Lexer, text: &str) -> Result<Command, Pa
             args,
             redirects: vec![],
             env_vars: HashMap::new(),
+            stdout_used: true,
+            stderr_used: true,
         });
         
         Ok(cmd)
@@ -281,6 +283,8 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
         args,
         redirects: vec![],
         env_vars: HashMap::new(),
+        stdout_used: true,
+        stderr_used: true,
     });
     
     Ok(cmd)

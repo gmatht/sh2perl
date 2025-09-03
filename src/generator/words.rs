@@ -110,7 +110,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 }
             }
         },
-        Word::Variable(var, _) => {
+        Word::Variable(var, _, _) => {
             // Handle special shell variables
             match var.as_str() {
                 "#" => "scalar(@ARGV)".to_string(),  // $# -> scalar(@ARGV) for argument count

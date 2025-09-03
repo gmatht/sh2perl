@@ -47,6 +47,8 @@ pub struct SimpleCommand {
     pub args: Vec<Word>,
     pub redirects: Vec<Redirect>,
     pub env_vars: HashMap<String, Word>,
+    pub stdout_used: bool,  // true if stdout is not redirected to /dev/null
+    pub stderr_used: bool,  // true if stderr is not redirected to /dev/null
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -55,6 +57,8 @@ pub struct BuiltinCommand {
     pub args: Vec<Word>,
     pub redirects: Vec<Redirect>,
     pub env_vars: HashMap<String, Word>,
+    pub stdout_used: bool,  // true if stdout is not redirected to /dev/null
+    pub stderr_used: bool,  // true if stderr is not redirected to /dev/null
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -67,6 +71,8 @@ pub struct ShoptCommand {
 pub struct Pipeline {
     pub commands: Vec<Command>,
     pub source_text: Option<String>, // Original bash command text for comments
+    pub stdout_used: bool,  // true if stdout is not redirected to /dev/null
+    pub stderr_used: bool,  // true if stderr is not redirected to /dev/null
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

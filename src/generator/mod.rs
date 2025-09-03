@@ -347,7 +347,7 @@ impl Generator {
                 if let Command::Simple(cmd) = &*while_loop.condition {
                     // Check if variable is used in test command arguments
                     for arg in &cmd.args {
-                        if let Word::Variable(var, _) = arg {
+                        if let Word::Variable(var, _, _) = arg {
                             if var == var_name {
                                 return true;
                             }
@@ -358,7 +358,7 @@ impl Generator {
             Command::Simple(cmd) => {
                 // Check if variable is used in simple command arguments
                 for arg in &cmd.args {
-                    if let Word::Variable(var, _) = arg {
+                    if let Word::Variable(var, _, _) = arg {
                         if var == var_name {
                             return true;
                         }

@@ -149,7 +149,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 let operand2 = &cmd.args[2];
                 
                 // Initialize first operand if it's a variable
-                if let Word::Variable(var_name, _) = operand1 {
+                if let Word::Variable(var_name, _, _) = operand1 {
                     if !generator.declared_locals.contains(var_name) {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("my ${} = 0;\n", var_name));
@@ -160,7 +160,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 }
                 
                 // Initialize second operand if it's a variable
-                if let Word::Variable(var_name, _) = operand2 {
+                if let Word::Variable(var_name, _, _) = operand2 {
                     if !generator.declared_locals.contains(var_name) {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("my ${} = 0;\n", var_name));
@@ -221,7 +221,7 @@ fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for
             Command::Simple(cmd) => {
                 // Check if variable is used in simple commands
                 for arg in &cmd.args {
-                    if let Word::Variable(var_name, _) = arg {
+                    if let Word::Variable(var_name, _, _) = arg {
                         if var_name == for_loop_var {
                             return true;
                         }
