@@ -39,6 +39,21 @@ fn escape_glob_pattern(pattern: &str) -> String {
 pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, generate_output: bool, input_var: &str) -> String {
     let mut output = String::new();
     
+    // Check for unsupported find options that require system fallback
+    let unsupported_options = ["-mtime", "-mmin", "-size", "-empty", "-exec", "-ls", "-not", "-path", "-user", "-group", "-perm"];
+    let has_unsupported = cmd.args.iter().any(|arg| {
+        if let Word::Literal(opt, _) = arg {
+            unsupported_options.contains(&opt.as_str())
+        } else {
+            false
+        }
+    });
+    
+    // If we have unsupported options, fall back to system find command
+    if has_unsupported {
+        return generate_system_find_fallback(generator, cmd, generate_output, input_var);
+    }
+    
     let mut path = ".";
     let mut pattern = "*".to_string(); // Default to all files
     let mut file_type = "f"; // Default to files only
@@ -66,6 +81,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                                 .map(|s| s.clone())
                                 .collect::<String>()
                         },
+                        Word::Literal(s, _) => s.clone(),
                         _ => generator.word_to_perl(next_arg)
                     };
                     has_name_filter = true;
@@ -170,6 +186,55 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         output.push_str("}\n");
     }
     output.push_str("\n");
+    
+    output
+}
+
+fn generate_system_find_fallback(generator: &mut Generator, cmd: &SimpleCommand, generate_output: bool, input_var: &str) -> String {
+    let mut output = String::new();
+    
+    // Build the find command arguments
+    let mut find_args = vec!["find".to_string()];
+    for arg in &cmd.args {
+        match arg {
+            Word::Literal(s, _) => find_args.push(s.clone()),
+            Word::StringInterpolation(interp, _) => {
+                let arg_str = interp.parts.iter()
+                    .map(|part| match part {
+                        StringPart::Literal(s) => s.clone(),
+                        StringPart::Variable(var) => format!("$ENV{{{}}}", var),
+                        StringPart::MapAccess(map, key) => format!("$ENV{{{}}}[{}]", map, key),
+                        StringPart::ParameterExpansion(param) => format!("$ENV{{{}}}", param),
+                        StringPart::MapKeys(_) => "*".to_string(), // Fallback for unsupported
+                        StringPart::MapLength(_) => "*".to_string(), // Fallback for unsupported
+                        StringPart::ArraySlice(_, _, _) => "*".to_string(), // Fallback for unsupported
+                        StringPart::Arithmetic(_) => "*".to_string(), // Fallback for unsupported
+                        StringPart::CommandSubstitution(_) => "*".to_string(), // Fallback for unsupported
+                    })
+                    .collect::<String>();
+                find_args.push(arg_str);
+            },
+            _ => {
+                // For other word types, convert to Perl
+                find_args.push(generator.word_to_perl(arg));
+            }
+        }
+    }
+    
+    // Join arguments with spaces and escape properly
+    let find_cmd = find_args.join(" ");
+    
+    if generate_output {
+        // For pipeline context, capture output to variable
+        output.push_str(&generator.indent());
+        output.push_str(&format!("${} = `{}`;\n", input_var, find_cmd));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("chomp(${});\n", input_var));
+    } else {
+        // For standalone commands, execute directly
+        output.push_str(&generator.indent());
+        output.push_str(&format!("system(\"{}\");\n", find_cmd));
+    }
     
     output
 }
