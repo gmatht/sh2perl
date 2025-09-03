@@ -216,8 +216,25 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
             // For simple string interpolations with just literals, extract the raw content
             if interp.parts.len() == 1 {
                 if let StringPart::Literal(s) = &interp.parts[0] {
-                    // Return the raw string content for regex
-                    s.clone()
+                    // Convert shell regex patterns to Perl regex patterns
+                    let mut regex_pattern = s.clone();
+                    
+                    // Convert shell extended regex patterns to Perl patterns
+                    // Convert \+ to + (shell extended regex to Perl)
+                    regex_pattern = regex_pattern.replace("\\+", "+");
+                    // Convert \? to ? (shell extended regex to Perl)
+                    regex_pattern = regex_pattern.replace("\\?", "?");
+                    // Convert \( and \) to ( and ) (shell extended regex to Perl)
+                    regex_pattern = regex_pattern.replace("\\(", "(");
+                    regex_pattern = regex_pattern.replace("\\)", ")");
+                    // Convert \{ and \} to { and } (shell extended regex to Perl)
+                    regex_pattern = regex_pattern.replace("\\{", "{");
+                    regex_pattern = regex_pattern.replace("\\}", "}");
+                    // Convert \| to | (shell extended regex to Perl)
+                    regex_pattern = regex_pattern.replace("\\|", "|");
+                    
+                    // Return the converted regex pattern
+                    regex_pattern
                 } else {
                     // Fall back to normal string interpolation handling
                     generator.convert_string_interpolation_to_perl(interp)
