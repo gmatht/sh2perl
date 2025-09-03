@@ -311,6 +311,16 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             // For now, use the existing signature but we should standardize this
             crate::generator::commands::zcat::generate_zcat_command(generator, cmd)
         },
+        "perl" => {
+            // Use the specialized Perl command generator
+            if input_var.is_empty() {
+                // First command in pipeline - use simple command generator
+                crate::generator::commands::perl::generate_perl_command(generator, cmd)
+            } else {
+                // Subsequent command in pipeline - use pipeline command generator
+                crate::generator::commands::perl::generate_perl_pipeline_command(generator, cmd, input_var)
+            }
+        },
         "wget" => {
             // For now, use the existing signature but we should standardize this
             crate::generator::commands::wget::generate_wget_command(generator, cmd)

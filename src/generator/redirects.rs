@@ -295,7 +295,8 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         // Variable already declared, just assign the value
                         output.push_str(&format!("${} = {};\n", var, val));
                     }
-                    output.push_str(&format!("local $ENV{{{}}} = {};;\n", var, val));
+                    // Don't set environment variable immediately - only set it when export command is encountered
+                    // This matches bash behavior where variables are only exported to environment after export command
                 }
             } else {
                 let val = generator.perl_string_literal(value);
