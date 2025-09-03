@@ -24,7 +24,7 @@ perl -e 'print "Shell variable: $ENV{SHELL_VAR}\n"'
 
 # Example 4: Perl script reading from shell pipeline
 echo -e "\n=== Example 4: Perl reading from pipeline ==="
-echo "apple\nbanana\ncherry" | perl -ne 'chomp; print "Fruit: $_\n"'
+echo -e "apple\nbanana\ncherry" | perl -ne 'chomp; print "Fruit: $_\n"'
 
 # Example 5: Complex Perl script with here document
 echo -e "\n=== Example 5: Perl script with here document ==="
