@@ -1,5 +1,12 @@
 #!/bin/bash
 
+echo Warmup 1
+echo "apple" | perl -ne 'print "Fruit: $_\n"'
+
+echo Warmup 2
+perl -e "print \"Shell variable: $ENV{SHELL_VAR}\n\""
+
+
 # Example 1: Simple Perl one-liner to print text
 echo "=== Example 1: Simple Perl one-liner ==="
 perl -e 'print "Hello from Perl!\n"'
