@@ -44,6 +44,7 @@ impl Bounds {
 pub struct ParameterExpansion {
     pub variable: String,
     pub operator: ParameterExpansionOperator,
+    pub is_mutable: bool,
 }
 
 impl std::fmt::Display for ParameterExpansion {
@@ -110,7 +111,7 @@ pub enum ParameterExpansionOperator {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Word {
     Literal(String, Bounds),
-    Variable(String, Bounds),
+    Variable(String, Bounds, bool), // variable_name, bounds, is_mutable
     ParameterExpansion(ParameterExpansion, Bounds),
     Array(String, Vec<String>, Bounds), // array_name, elements, bounds
     MapAccess(String, String, Bounds), // map_name, key, bounds
@@ -127,7 +128,7 @@ impl std::fmt::Display for Word {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Word::Literal(s, _) => write!(f, "{}", s),
-            Word::Variable(var, _) => write!(f, "${}", var),
+            Word::Variable(var, _, _) => write!(f, "${}", var),
             Word::ParameterExpansion(pe, _) => {
                 match &pe.operator {
                     ParameterExpansionOperator::None => write!(f, "${{{}}}", pe.variable),
@@ -256,7 +257,7 @@ impl Word {
     
     /// Create a variable word with unknown bounds
     pub fn variable(name: String) -> Self {
-        Word::Variable(name, Bounds::unknown())
+        Word::Variable(name, Bounds::unknown(), false)
     }
     
     /// Create a parameter expansion word with unknown bounds
@@ -379,7 +380,7 @@ impl Word {
     pub fn bounds(&self) -> &Bounds {
         match self {
             Word::Literal(_, bounds) => bounds,
-            Word::Variable(_, bounds) => bounds,
+            Word::Variable(_, bounds, _) => bounds,
             Word::ParameterExpansion(_, bounds) => bounds,
             Word::Array(_, _, bounds) => bounds,
             Word::MapAccess(_, _, bounds) => bounds,
@@ -397,7 +398,7 @@ impl Word {
     pub fn to_string(&self) -> String {
         match self {
             Word::Literal(s, _) => s.to_string(),
-            Word::Variable(var, _) => format!("${}", var),
+            Word::Variable(var, _, _) => format!("${}", var),
             Word::ParameterExpansion(pe, _) => {
                 match &pe.operator {
                     ParameterExpansionOperator::None => format!("${{{}}}", pe.variable),
@@ -548,7 +549,7 @@ impl PartialEq<str> for Word {
     fn eq(&self, other: &str) -> bool {
         match self {
             Word::Literal(s, _) => s == other,
-            Word::Variable(var, _) => var == other,
+            Word::Variable(var, _, _) => var == other,
             Word::ParameterExpansion(pe, _) => pe.variable == other,
             Word::MapKeys(map_name, _) => map_name == other,
             Word::MapLength(map_name, _) => map_name == other,
@@ -804,7 +805,7 @@ impl MirCommand {
     fn from_ast_word(word: &crate::ast::Word) -> Word {
         match word {
             crate::ast::Word::Literal(s, _) => Word::literal(s.clone()),
-            crate::ast::Word::Variable(var, _) => Word::variable(var.clone()),
+            crate::ast::Word::Variable(var, _, _) => Word::variable(var.clone()),
             crate::ast::Word::ParameterExpansion(pe, _) => Word::parameter_expansion(pe.clone()),
             crate::ast::Word::Array(name, elements, _) => Word::array(name.clone(), elements.clone()),
             crate::ast::Word::MapAccess(map_name, key, _) => Word::map_access(map_name.clone(), key.clone()),
@@ -843,6 +844,8 @@ impl MirCommand {
                     args: expanded_args,
                     redirects: simple_cmd.redirects.clone(),
                     env_vars: simple_cmd.env_vars.clone(),
+                    stdout_used: simple_cmd.stdout_used,
+                    stderr_used: simple_cmd.stderr_used,
                 };
                 
                 MirCommand::Simple(expanded_simple_cmd)
@@ -919,6 +922,8 @@ impl MirCommand {
                     args: vec![],
                     redirects: vec![],
                     env_vars: std::collections::HashMap::new(),
+                    stdout_used: true,
+                    stderr_used: true,
                 })
             }
         }

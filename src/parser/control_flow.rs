@@ -49,6 +49,8 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
             args: vec![arithmetic_word],
             redirects: Vec::new(),
             env_vars: HashMap::new(),
+            stdout_used: true,
+            stderr_used: true,
         }))
     } else {
         // Parse as a pipeline to handle && and || operators
@@ -149,6 +151,8 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
                 args: vec![arithmetic_word],
                 redirects: Vec::new(),
                 env_vars: HashMap::new(),
+                stdout_used: true,
+                stderr_used: true,
             }))
         } else {
             // Parse as a pipeline to handle && and || operators
@@ -993,6 +997,8 @@ pub fn parse_simple_command(parser: &mut Parser) -> Result<Command, ParserError>
         args,
         redirects,
         env_vars,
+        stdout_used: true,
+        stderr_used: true,
     }))
 }
 
@@ -1227,6 +1233,8 @@ fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
         args: Vec::new(),
         redirects: Vec::new(),
         env_vars,
+        stdout_used: true,
+        stderr_used: true,
     }))
 }
 

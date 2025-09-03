@@ -221,7 +221,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     .map(|arg| {
                         // For echo commands, handle special variables differently
                         match arg {
-                            Word::Variable(var, _) => {
+                            Word::Variable(var, _, _) => {
                                 match var.as_str() {
                                     "#" => "scalar(@ARGV)".to_string(),
                                     "@" => "@ARGV".to_string(),
@@ -466,7 +466,7 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
             .map(|arg| {
                 // For echo commands, handle special variables differently
                 match arg {
-                    Word::Variable(var, _) => {
+                    Word::Variable(var, _, _) => {
                         match var.as_str() {
                             "#" => "scalar(@ARGV)".to_string(),
                             "@" => "@ARGV".to_string(),
