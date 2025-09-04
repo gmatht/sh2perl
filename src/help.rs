@@ -36,6 +36,11 @@ pub fn show_help(program_name: &str) {
     println!("  <filename>.sh                  - Run shell script directly (auto-detected)");
     println!("  <shell_command>                - Run shell command directly (auto-detected)");
     println!();
+    println!("DEBUG OPTIONS:");
+    println!();
+    println!("  --debug                        - Enable debug output (default)");
+    println!("  --no-debug                     - Disable debug output");
+    println!();
     println!("TESTING OPTIONS:");
     println!();
     println!("  --test-file <lang> <filename>  - Compare outputs of .sh vs translated code");
@@ -69,10 +74,12 @@ pub fn show_help(program_name: &str) {
     println!("  {} --test-file perl examples/simple.sh", program_name);
     println!("  {} --test-eq", program_name);
             println!("  {} --next-fail", program_name);
-        println!("  {} --next-fail 5", program_name);
-        println!("  {} --next-fail perl", program_name);
-        println!("  {} --next-fail 10 perl --ast-pretty", program_name);
+            println!("  {} --next-fail 5", program_name);
+    println!("  {} --next-fail perl", program_name);
+    println!("  {} --next-fail 10 perl --ast-pretty", program_name);
     println!("  {} --clear-cache", program_name);
+    println!("  {} --debug parse 'echo hello'", program_name);
+    println!("  {} --no-debug parse 'echo hello'", program_name);
     println!();
     println!("DIRECT EXECUTION EXAMPLES:");
     println!("  {} examples/simple.sh           - Run shell script directly", program_name);

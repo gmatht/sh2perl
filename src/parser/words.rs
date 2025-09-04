@@ -1271,18 +1271,18 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
             }
             Some(Token::Number) | Some(Token::PaddedNumber) => {
                 let start = lexer.get_number_text()?;
-                eprintln!("DEBUG: Found start number: {}", start);
-                eprintln!("DEBUG: After getting start number, current token: {:?}", lexer.peek());
+                debug_eprintln!("DEBUG: Found start number: {}", start);
+                debug_eprintln!("DEBUG: After getting start number, current token: {:?}", lexer.peek());
                 
                 // Check if this is a range (look for ..)
                 if matches!(lexer.peek(), Some(Token::Range)) {
-                    eprintln!("DEBUG: Found '..' after start number");
+                    debug_eprintln!("DEBUG: Found '..' after start number");
                     lexer.next(); // consume '..'
                     
                     if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                         let end = lexer.get_number_text()?;
-                        eprintln!("DEBUG: Found end number: {}", end);
-                        eprintln!("DEBUG: After getting end number, current token: {:?}", lexer.peek());
+                        debug_eprintln!("DEBUG: Found end number: {}", end);
+                        debug_eprintln!("DEBUG: After getting end number, current token: {:?}", lexer.peek());
                         
                         // Check if there's a step value (another ..)
                         if matches!(lexer.peek(), Some(Token::Range)) {

@@ -17,3 +17,4 @@ print "\n";
 
 print join(" ", map { $_ * 2 - 1 } 1..5) . "\n";  # 1..10..2 equivalent
 print join(" ", map { chr(ord('a') + $_ * 3) } 0..8) . "\n";  # a..z..3 equivalent
+

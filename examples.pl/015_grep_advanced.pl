@@ -85,3 +85,4 @@ if ($has_pattern) {
 
 # Cleanup
 unlink("temp_file.txt");
+

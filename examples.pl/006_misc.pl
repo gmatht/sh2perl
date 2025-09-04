@@ -11,3 +11,4 @@ print "== Simple pipeline ==\n";
 # echo "alpha beta" | grep beta
 my $text = "alpha beta";
 print "$text\n" if $text =~ /beta/;
+

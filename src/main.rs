@@ -36,8 +36,12 @@ fn main() {
         return;
     }
     
-    // Check if this is --next-fail and disable DEBUG output early
-    if command == "--next-fail" {
+    // Check for debug control flags early
+    if command == "--debug" {
+        set_debug_enabled(true);
+    } else if command == "--no-debug" {
+        set_debug_enabled(false);
+    } else if command == "--next-fail" {
         set_debug_enabled(false);
     }
     
@@ -55,6 +59,12 @@ fn main() {
     
     while i < args.len() {
         match args[i].as_str() {
+            "--debug" => {
+                set_debug_enabled(true);
+            }
+            "--no-debug" => {
+                set_debug_enabled(false);
+            }
             "--ast-pretty" => {
                 ast_options.compact = false;
                 ast_options.indent = true;

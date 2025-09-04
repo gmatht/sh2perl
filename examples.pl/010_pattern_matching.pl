@@ -32,3 +32,4 @@ my $word = "Foo";
 if ($word =~ /^foo$/i) {
     print "ci-match\n";
 }
+

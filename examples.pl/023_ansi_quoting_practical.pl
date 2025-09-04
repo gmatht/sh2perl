@@ -10,3 +10,4 @@ print "== Practical examples ==\n";
 printf "%-10s %-10s %s\n", "Name", "Age", "City";
 printf "%-10s %-10s %s\n", "John", "25", "NYC";
 printf "%-10s %-10s %s\n", "Jane", "30", "LA";
+
