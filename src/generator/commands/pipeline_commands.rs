@@ -400,7 +400,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                     "\"y\"".to_string()
                 };
                 
-                // Generate a loop that processes the line through all commands
+                // Generate a while loop that processes the line through all commands
                 output.push_str(&generator.indent());
                 output.push_str("my $i = 0;\n");
                 output.push_str(&generator.indent());
@@ -408,7 +408,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str("my $head_max_0 = 10;\n");
                 output.push_str(&generator.indent());
-                output.push_str("for (my $loop_count = 0; $loop_count < 100; $loop_count++) {\n");
+                output.push_str("while (1) {\n");
                 generator.indent_level += 1;
                 
                 // Generate the yes command inside the loop
@@ -1036,7 +1036,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             output.push_str(&format!("if ($head_count_{} < $head_max_{}) {{\n", cmd_index, cmd_index));
             output.push_str(&format!("    $head_count_{}++;\n", cmd_index));
             output.push_str("} else {\n");
-            output.push_str("    next;\n");
+            output.push_str("    last;\n");
             output.push_str("}\n");
             // Note: The line is already available in $line from the previous command
             output
