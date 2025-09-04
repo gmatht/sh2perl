@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use crate::ast::*;
-use crate::mir::*;
 use crate::generator::Generator;
 
 #[derive(Debug, Clone)]
@@ -206,8 +205,8 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         // Echo is handled in simple_commands.rs, so use generic fallback
         // "echo" => { ... },
         "echo" => {
-            // Use the echo command generator from simple_commands.rs
-            crate::generator::commands::simple_commands::generate_echo_command(generator, cmd, input_var, output_var)
+            // Use the echo command generator from echo.rs
+            crate::generator::commands::echo::generate_echo_command(generator, cmd, input_var, output_var)
         },
         "printf" => {
             // For now, use the existing signature but we should standardize this

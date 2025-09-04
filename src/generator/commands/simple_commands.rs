@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use crate::generator::Generator;
 use crate::generator::utils::get_temp_dir;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -239,7 +238,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             }
                             Word::BraceExpansion(expansion, _) => {
                                 // Handle brace expansion like {1..5} -> "1 2 3 4 5"
-                                handle_brace_expansion_for_echo(generator, expansion)
+                                crate::generator::commands::echo::handle_brace_expansion_for_echo(generator, expansion)
                             }
                             Word::CommandSubstitution(_, _) => {
                                 // For command substitution, don't escape newlines - preserve them as-is
@@ -624,7 +623,7 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                 let mut result = String::new();
                                 for part in &interp.parts {
                                     match part {
-                                        crate::mir::StringPart::Literal(literal) => {
+                                        crate::ast::StringPart::Literal(literal) => {
                                             // Interpret backslash escapes
                                             let mut interpreted = literal.clone();
                                             // Remove outer quotes if present

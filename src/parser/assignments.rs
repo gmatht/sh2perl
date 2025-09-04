@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use crate::lexer::{Lexer, Token};
 use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;

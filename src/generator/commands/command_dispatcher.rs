@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use crate::generator::Generator;
 use super::grep::generate_grep_command;
 use crate::generator::utils::get_temp_dir;
