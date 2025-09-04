@@ -8,9 +8,22 @@ pub fn generate_head_command(_generator: &mut Generator, cmd: &SimpleCommand, in
     let mut num_lines = 10; // Default to first 10 lines
     
     // Parse head options
-    for arg in &cmd.args {
-        if let Word::Literal(arg_str, _) = arg {
-            if arg_str.starts_with("-n") {
+    let mut i = 0;
+    while i < cmd.args.len() {
+        if let Word::Literal(arg_str, _) = &cmd.args[i] {
+            if arg_str == "-n" {
+                // Handle -n followed by number as separate argument
+                if i + 1 < cmd.args.len() {
+                    if let Word::Literal(num_str, _) = &cmd.args[i + 1] {
+                        if let Ok(num) = num_str.parse::<usize>() {
+                            num_lines = num;
+                            i += 2; // Skip both -n and the number
+                            continue;
+                        }
+                    }
+                }
+            } else if arg_str.starts_with("-n") {
+                // Handle -n100 style (number attached to -n)
                 if let Some(num_str) = arg_str.strip_prefix("-n") {
                     if let Ok(num) = num_str.parse::<usize>() {
                         num_lines = num;
@@ -23,15 +36,26 @@ pub fn generate_head_command(_generator: &mut Generator, cmd: &SimpleCommand, in
                 }
             }
         }
+        i += 1;
     }
     
-    output.push_str(&format!("my @lines = split(/\\n/, ${});\n", input_var));
+    // Use line-by-line processing instead of arrays
     output.push_str(&format!("my $num_lines = {};\n", num_lines));
-    output.push_str("if ($num_lines > scalar(@lines)) {\n");
-    output.push_str("$num_lines = scalar(@lines);\n");
-    output.push_str("}\n");
-    output.push_str("my @result = @lines[0..$num_lines-1];\n");
-    output.push_str(&format!("${} = join(\"\\n\", @result);\n", input_var));
+    output.push_str(&format!("my $line_count = 0;\n"));
+    output.push_str(&format!("my $result = '';\n"));
+    output.push_str(&format!("my $input = ${};\n", input_var));
+    output.push_str(&format!("my $pos = 0;\n"));
+    output.push_str(&format!("while ($pos < length($input) && $line_count < $num_lines) {{\n"));
+    output.push_str(&format!("    my $line_end = index($input, \"\\n\", $pos);\n"));
+    output.push_str(&format!("    if ($line_end == -1) {{\n"));
+    output.push_str(&format!("        $line_end = length($input);\n"));
+    output.push_str(&format!("    }}\n"));
+    output.push_str(&format!("    my $line = substr($input, $pos, $line_end - $pos);\n"));
+    output.push_str(&format!("    $result .= $line . \"\\n\";\n"));
+    output.push_str(&format!("    $pos = $line_end + 1;\n"));
+    output.push_str(&format!("    $line_count++;\n"));
+    output.push_str(&format!("}}\n"));
+    output.push_str(&format!("${} = $result;\n", input_var));
     output.push_str("\n");
     
     output

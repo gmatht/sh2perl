@@ -150,10 +150,16 @@ pub fn check_perl_must_not_contain(shell_content: &str, perl_code: &str) -> Resu
     let mut violations = Vec::new();
     
     for (line_num, line) in lines.iter().enumerate() {
-        if line.contains("#PERL_MUST_NOT_CONTAIN:") {
+        if line.contains("#PERL_MUST_NOT_CONTAIN") {
             // Extract the forbidden pattern after the comment
-            if let Some(pattern_start) = line.find("#PERL_MUST_NOT_CONTAIN:") {
-                let pattern = line[pattern_start + "#PERL_MUST_NOT_CONTAIN:".len()..].trim();
+            if let Some(pattern_start) = line.find("#PERL_MUST_NOT_CONTAIN") {
+                let pattern = line[pattern_start + "#PERL_MUST_NOT_CONTAIN".len()..].trim();
+                // Remove leading colon if present
+                let pattern = if pattern.starts_with(':') {
+                    pattern[1..].trim()
+                } else {
+                    pattern
+                };
                 if !pattern.is_empty() {
                     // Check if the forbidden pattern exists in the generated Perl code
                     if perl_code.contains(pattern) {

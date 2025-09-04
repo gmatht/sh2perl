@@ -63,11 +63,6 @@ impl Generator {
             output.push_str("\n");
         }
         
-        // DEBUG: Print function-level vars
-        if !self.function_level_vars.is_empty() {
-            eprintln!("DEBUG: Function-level vars: {:?}", self.function_level_vars);
-        }
-        
         for command in ast {
             // Reset indentation level for each top-level command to prevent staircase effect
             self.indent_level = 0;
@@ -87,7 +82,6 @@ impl Generator {
     }
 
     pub fn generate_command(&mut self, command: &Command) -> String {
-        eprintln!("DEBUG: generate_command called with: {:?}", command);
         commands::generate_command_impl(self, command, false)
     }
 
@@ -155,35 +149,12 @@ impl Generator {
     pub fn generate_assignment(&mut self, assignment: &Assignment) -> String {
         let mut output = String::new();
         
-        // Check if this is an arithmetic assignment that uses the variable itself
-        let needs_initialization = if let Word::Arithmetic(expr, _) = &assignment.value {
-            let result = expr.expression.contains(&assignment.variable);
-            eprintln!("DEBUG: Variable '{}' in expression '{}': needs_initialization = {}", 
-                     assignment.variable, expr.expression, result);
-            result
-        } else {
-            false
-        };
-        
-        // Only declare the variable if not already declared
-        if !self.declared_locals.contains(&assignment.variable) {
-            if needs_initialization {
-                // For arithmetic expressions that use the variable, mark it as function level
-                // so it gets declared at the top level
-                eprintln!("DEBUG: Marking variable '{}' as function-level", assignment.variable);
-                self.function_level_vars.insert(assignment.variable.clone());
-                self.declared_locals.insert(assignment.variable.clone());
-            } else if self.indent_level <= 1 {
-                // Regular variable declaration at function level
-                output.push_str(&self.indent());
-                output.push_str(&format!("my ${};\n", assignment.variable));
-                self.declared_locals.insert(assignment.variable.clone());
-            } else {
-                // Variable used inside nested scope - declare it locally
-                output.push_str(&self.indent());
-                output.push_str(&format!("my ${};\n", assignment.variable));
-                self.declared_locals.insert(assignment.variable.clone());
-            }
+        // Only declare the variable if not already declared AND we're at function level
+        // This prevents redeclaring variables inside loops that shadow outer scope variables
+        if !self.declared_locals.contains(&assignment.variable) && self.indent_level <= 1 {
+            output.push_str(&self.indent());
+            output.push_str(&format!("my ${};\n", assignment.variable));
+            self.declared_locals.insert(assignment.variable.clone());
         }
         
         // Generate the assignment based on the operator
@@ -373,9 +344,6 @@ impl Generator {
                 // Also check for variables used in arithmetic expressions within the loop body
                 self.analyze_variables_in_block(&for_loop.body);
             }
-            
-            // Recursively analyze all commands to find assignment commands with arithmetic expressions
-            self.analyze_command_for_function_level_vars(command);
         }
     }
     
@@ -412,55 +380,6 @@ impl Generator {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    /// Recursively analyze a command to find variables that need function-level declaration
-    fn analyze_command_for_function_level_vars(&mut self, command: &Command) {
-        match command {
-            Command::Assignment(assignment) => {
-                // Check if this is an arithmetic assignment that uses the variable itself
-                if let Word::Arithmetic(expr, _) = &assignment.value {
-                    if expr.expression.contains(&assignment.variable) {
-                        eprintln!("DEBUG: Pre-analysis found function-level variable: {}", assignment.variable);
-                        self.function_level_vars.insert(assignment.variable.clone());
-                    }
-                }
-            }
-            Command::While(while_loop) => {
-                // Recursively analyze the while loop body
-                for body_cmd in &while_loop.body.commands {
-                    self.analyze_command_for_function_level_vars(body_cmd);
-                }
-            }
-            Command::For(for_loop) => {
-                // Recursively analyze the for loop body
-                for body_cmd in &for_loop.body.commands {
-                    self.analyze_command_for_function_level_vars(body_cmd);
-                }
-            }
-            Command::If(if_stmt) => {
-                // Recursively analyze if statement branches
-                self.analyze_command_for_function_level_vars(&if_stmt.then_branch);
-                if let Some(else_branch) = &if_stmt.else_branch {
-                    self.analyze_command_for_function_level_vars(else_branch);
-                }
-            }
-            Command::Pipeline(pipeline) => {
-                // Recursively analyze pipeline commands
-                for pipeline_cmd in &pipeline.commands {
-                    self.analyze_command_for_function_level_vars(pipeline_cmd);
-                }
-            }
-            Command::Block(block) => {
-                // Recursively analyze block commands
-                for block_cmd in &block.commands {
-                    self.analyze_command_for_function_level_vars(block_cmd);
-                }
-            }
-            _ => {
-                // For other command types, no special analysis needed
             }
         }
     }

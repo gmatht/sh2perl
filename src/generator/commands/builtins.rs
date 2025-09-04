@@ -42,6 +42,7 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     commands.insert("xargs", BuiltinCommand::new("xargs", "Execute command with arguments", false));
     commands.insert("perl", BuiltinCommand::new("perl", "Perl interpreter", true));
     commands.insert("cd", BuiltinCommand::new("cd", "Change directory", false));
+    commands.insert("read", BuiltinCommand::new("read", "Read input into variables", true));
     
     // File manipulation
     commands.insert("cp", BuiltinCommand::new("cp", "Copy files", false));
@@ -109,8 +110,13 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
             } else {
                 false
             }
+        } else if matches!(cmd, Command::While(_)) {
+            true // While loops can do line-by-line processing
+        } else if let Command::Pipeline(nested_pipeline) = cmd {
+            // For nested pipelines, recursively check if they support line-by-line processing
+            pipeline_supports_linebyline(nested_pipeline)
         } else {
-            false // Only simple commands can do line-by-line
+            false // Other command types can't do line-by-line
         }
     });
     
@@ -121,10 +127,13 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
     // Additional checks for specific cases where streaming doesn't make sense
     
     // Check if the first command is an output-generating command like 'yes'
+    // But allow line-by-line processing if all subsequent commands support it
     if let Some(Command::Simple(first_cmd)) = pipeline.commands.first() {
         if let Word::Literal(name, _) = &first_cmd.name {
             if name == "yes" {
-                return false; // Use buffered pipeline for output-generating commands
+                // For 'yes' command, check if we can use line-by-line processing
+                // by limiting the output and processing line by line
+                return true; // Allow line-by-line processing for 'yes' command
             }
         }
     }
@@ -380,6 +389,16 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         "tee" => {
             // For now, use the existing signature but we should standardize this
             crate::generator::commands::tee::generate_tee_command(generator, cmd, input_var)
+        },
+        "read" => {
+            // Handle read command - read from input_var if available, otherwise from STDIN
+            if input_var.is_empty() {
+                // No input variable, read from STDIN
+                format!("my $L = <STDIN>;\nchomp $L;\n")
+            } else {
+                // Read from input variable (pipeline context)
+                format!("my $L = ${};\n", input_var)
+            }
         },
 
         _ => {
