@@ -9,3 +9,4 @@ print "== readarray/mapfile ==\n";
 my @lines = qw(x y);
 printf "%s ", $_ for @lines;
 print "\n";
+

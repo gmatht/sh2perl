@@ -160,3 +160,4 @@ print "  File info: $file_info\n";
 print "\n";
 
 print "=== Advanced Bash Idioms Examples Complete ===\n";
+

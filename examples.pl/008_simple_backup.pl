@@ -24,3 +24,4 @@ print $ls_output;
 # Let's not consider ls -la at the moment as permissions are OS dependent
 # ls -la
 # grep "pattern" file.txt
+

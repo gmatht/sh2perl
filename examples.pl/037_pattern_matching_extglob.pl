@@ -16,3 +16,4 @@ if ($f2 =~ /\.js$/ && $f2 !~ /\.min\.js$/) {
 } else {
     print "f2-filtered\n";
 }
+

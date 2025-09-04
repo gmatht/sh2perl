@@ -17,3 +17,4 @@ print "$map{answer}\n";   # 42
 for my $k (sort keys %map) {
     print "$k => $map{$k}\n";
 }
+

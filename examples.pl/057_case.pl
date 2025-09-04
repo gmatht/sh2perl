@@ -93,3 +93,4 @@ if ($command eq "ls") {
 } else {
     print "Available commands: ls, date, pwd, whoami\n";
 }
+

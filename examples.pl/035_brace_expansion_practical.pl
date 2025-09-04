@@ -25,3 +25,4 @@ for my $i (1..5) {
     my $filename = sprintf("file_%03d.txt", $i);
     unlink($filename) if -f $filename;
 }
+

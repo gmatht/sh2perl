@@ -70,3 +70,4 @@ while (1) {
 }
 
 print "GCD calculation complete!\n";
+

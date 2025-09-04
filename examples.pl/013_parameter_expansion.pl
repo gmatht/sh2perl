@@ -41,3 +41,4 @@ print "$maybe\n";  # default (and sets maybe)
 if (!defined($maybe)) {
     die "error\n";
 }
+

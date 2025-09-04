@@ -59,3 +59,4 @@ print "First 10: " . join(" ", @primes[0..9]) . "\n";
 print "Last 10: " . join(" ", @primes[-10..-1]) . "\n";
 
 print "Prime number generation complete!\n";
+
