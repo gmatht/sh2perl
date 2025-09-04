@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use super::Generator;
 use crate::generator::utils::get_temp_dir;
 use std::sync::atomic::{AtomicUsize, Ordering};

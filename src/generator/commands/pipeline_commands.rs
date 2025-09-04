@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use crate::generator::Generator;
 use crate::generator::commands::builtins::{is_builtin, generate_generic_builtin, pipeline_supports_linebyline};
 

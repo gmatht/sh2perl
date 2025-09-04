@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use crate::generator::Generator;
 
 /// Generate logical AND operation (left && right)

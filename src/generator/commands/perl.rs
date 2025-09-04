@@ -1,6 +1,6 @@
 use crate::generator::Generator;
 use crate::ast::SimpleCommand;
-use crate::mir::Word;
+use crate::ast::Word;
 use crate::generator::commands::system_commands::word_to_bash_string_for_system;
 
 /// Handle Perl commands by embedding the Perl code directly

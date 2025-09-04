@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use crate::generator::Generator;
 
 fn escape_glob_pattern(pattern: &str) -> String {
