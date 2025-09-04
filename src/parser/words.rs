@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use crate::lexer::{Lexer, Token};
 use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;
@@ -27,13 +26,13 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         }
         // Skip inline whitespace after consuming the word
         lexer.skip_inline_whitespace_and_comments();
-        return Ok(Word::Literal(combined, Bounds::unknown()));
+        return Ok(Word::Literal(combined, None));
     }
 
     let result = match lexer.peek() {
-        Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?, Bounds::unknown())),
-        Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, Bounds::unknown())),
-        Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown())),
+        Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?, None)),
+        Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
+        Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::DoubleQuotedString) => {
             // Always parse as string interpolation for double-quoted strings
             // This handles both strings and strings with variables
@@ -47,7 +46,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             } else {
                 quoted_text
             };
-            Ok(Word::Literal(content, Bounds::unknown()))
+            Ok(Word::Literal(content, None))
         },
         Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
@@ -56,155 +55,155 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         Some(Token::Source) => {
             // Treat standalone 'source' as a normal word (e.g., `source file.sh`)
             lexer.next();
-            Ok(Word::Literal("source".to_string(), Bounds::string_length(6, 6)))
+            Ok(Word::Literal("source".to_string(), None))
         }
         Some(Token::Set) => {
             // Treat standalone 'set' as a normal word (e.g., `set -euo pipefail`)
             lexer.next();
-            Ok(Word::Literal("set".to_string(), Bounds::string_length(3, 3)))
+            Ok(Word::Literal("set".to_string(), None))
         }
         Some(Token::Declare) => {
             // Treat standalone 'declare' as a normal word (e.g., `declare -a arr`)
             lexer.next();
-            Ok(Word::Literal("declare".to_string(), Bounds::string_length(7, 7)))
+            Ok(Word::Literal("declare".to_string(), None))
         }
         Some(Token::Unset) => {
             // Treat standalone 'unset' as a normal word (e.g., `unset var`)
             lexer.next();
-            Ok(Word::Literal("unset".to_string(), Bounds::string_length(5, 5)))
+            Ok(Word::Literal("unset".to_string(), None))
         }
         Some(Token::Export) => {
             // Treat standalone 'export' as a normal word (e.g., `export PATH`)
             lexer.next();
-            Ok(Word::Literal("export".to_string(), Bounds::string_length(6, 6)))
+            Ok(Word::Literal("export".to_string(), None))
         }
         Some(Token::Readonly) => {
             // Treat standalone 'readonly' as a normal word (e.g., `readonly VAR`)
             lexer.next();
-            Ok(Word::Literal("readonly".to_string(), Bounds::string_length(8, 8)))
+            Ok(Word::Literal("readonly".to_string(), None))
         }
         Some(Token::Typeset) => {
             // Treat standalone 'typeset' as a normal word (e.g., `typeset -i var`)
             lexer.next();
-            Ok(Word::Literal("typeset".to_string(), Bounds::string_length(7, 7)))
+            Ok(Word::Literal("typeset".to_string(), None))
         }
         Some(Token::Local) => {
             // Treat standalone 'local' as a normal word (e.g., `local var`)
             lexer.next();
-            Ok(Word::Literal("local".to_string(), Bounds::string_length(5, 5)))
+            Ok(Word::Literal("local".to_string(), None))
         }
         Some(Token::Shift) => {
             // Treat standalone 'shift' as a normal word (e.g., `shift 2`)
             lexer.next();
-            Ok(Word::Literal("shift".to_string(), Bounds::string_length(5, 5)))
+            Ok(Word::Literal("shift".to_string(), None))
         }
         Some(Token::Eval) => {
             // Treat standalone 'eval' as a normal word (e.g., `eval $cmd`)
             lexer.next();
-            Ok(Word::Literal("eval".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("eval".to_string(), None))
         }
         Some(Token::Exec) => {
             // Treat standalone 'exec' as a normal word (e.g., `exec cmd`)
             lexer.next();
-            Ok(Word::Literal("exec".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("exec".to_string(), None))
         }
         Some(Token::Trap) => {
             // Treat standalone 'trap' as a normal word (e.g., `trap 'echo' INT`)
             lexer.next();
-            Ok(Word::Literal("trap".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("trap".to_string(), None))
         }
         Some(Token::Wait) => {
             // Treat standalone 'wait' as a normal word (e.g., `wait $pid`)
             lexer.next();
-            Ok(Word::Literal("wait".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("wait".to_string(), None))
         }
         Some(Token::Exit) => {
             // Treat standalone 'exit' as a normal word (e.g., `exit 0`)
             lexer.next();
-            Ok(Word::Literal("exit".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("exit".to_string(), None))
         }
         Some(Token::Range) => {
             // Treat standalone '..' as a literal (e.g., `cd ..`)
             lexer.next();
-            Ok(Word::Literal("..".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("..".to_string(), None))
         }
         Some(Token::Star) => {
             // Treat standalone '*' as a literal (e.g., `ls *`)
             lexer.next();
-            Ok(Word::Literal("*".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal("*".to_string(), None))
         }
         Some(Token::Dot) => {
             // Treat standalone '.' as a literal (e.g., `ls .`)
             lexer.next();
-            Ok(Word::Literal(".".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal(".".to_string(), None))
         }
         Some(Token::CasePattern) => {
             // Treat case statement patterns like *.txt as literals.
             // get_raw_token_text() consumes the current token, so do not call next() here.
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::Slash) => {
             // Treat standalone '/' as a literal (e.g., `cd /`)
             lexer.next();
-            Ok(Word::Literal("/".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal("/".to_string(), None))
         }
         // Test operators
         Some(Token::File) => {
             lexer.next();
-            Ok(Word::Literal("-f".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-f".to_string(), None))
         }
         Some(Token::Directory) => {
             lexer.next();
-            Ok(Word::Literal("-d".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-d".to_string(), None))
         }
         Some(Token::Exists) => {
             lexer.next();
-            Ok(Word::Literal("-e".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-e".to_string(), None))
         }
         Some(Token::Readable) => {
             lexer.next();
-            Ok(Word::Literal("-r".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-r".to_string(), None))
         }
         Some(Token::Writable) => {
             lexer.next();
-            Ok(Word::Literal("-w".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-w".to_string(), None))
         }
         Some(Token::Executable) => {
             lexer.next();
-            Ok(Word::Literal("-x".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-x".to_string(), None))
         }
         Some(Token::Size) => {
             lexer.next();
-            Ok(Word::Literal("-s".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-s".to_string(), None))
         }
         Some(Token::Symlink) => {
             lexer.next();
-            Ok(Word::Literal("-L".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-L".to_string(), None))
         }
         Some(Token::TestBracketClose) => {
             lexer.next();
-            Ok(Word::Literal("]".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal("]".to_string(), None))
         }
         Some(Token::Tilde) => {
             // Treat standalone '~' as a literal (e.g., `cd ~`)
             lexer.next();
-            Ok(Word::Literal("~".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal("~".to_string(), None))
         }
         Some(Token::LongOption) => {
             // Treat long options like --color=always as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::RegexPattern) => {
             // Treat regex patterns as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::RegexMatch) => {
             // Treat regex match operator as literal
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::NameFlag) | Some(Token::MaxDepthFlag) | Some(Token::TypeFlag) => {
             // Treat command-line flags as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::Minus) => {
             // Handle minus tokens like -l, -c, etc.
@@ -221,12 +220,12 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 combined.push_str(&number);
             }
             
-            Ok(Word::Literal(combined, Bounds::unknown()))
+            Ok(Word::Literal(combined, None))
         }
         Some(Token::Character) | Some(Token::NonZero) | Some(Token::SymlinkH) | Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block) | Some(Token::SetGid) | Some(Token::Sticky) | Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned) | Some(Token::Modified) | Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le) | Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) => {
             // Handle test operator tokens like -e, -f, -d, etc.
             // These are already complete flags, just get their text
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::Dollar) => Ok(parse_variable_expansion(lexer)?),
         Some(Token::DollarBrace) | Some(Token::DollarParen) | Some(Token::DollarHashSimple) | Some(Token::DollarAtSimple) | Some(Token::DollarStarSimple)
@@ -237,12 +236,12 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         Some(Token::True) => {
             // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
             lexer.next();
-            Ok(Word::Literal("true".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("true".to_string(), None))
         }
         Some(Token::False) => {
             // Treat standalone 'false' as a normal word (e.g., `false` or `command && false`)
             lexer.next();
-            Ok(Word::Literal("false".to_string(), Bounds::string_length(5, 5)))
+            Ok(Word::Literal("false".to_string(), None))
         }
         _ => {
             let (line, col) = lexer.offset_to_line_col(0);
@@ -281,13 +280,13 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         }
         // Skip inline whitespace after consuming the word, but NOT newlines
         lexer.skip_inline_whitespace_and_comments();
-        return Ok(Word::Literal(combined, Bounds::unknown()));
+        return Ok(Word::Literal(combined, None));
     }
 
     let result = match lexer.peek() {
-        Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?, Bounds::unknown())),
-        Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, Bounds::unknown())),
-        Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown())),
+        Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?, None)),
+        Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
+        Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::DoubleQuotedString) => {
             // Always parse as string interpolation for double-quoted strings
             // This handles both simple strings and strings with variables
@@ -301,7 +300,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             } else {
                 quoted_text
             };
-            Ok(Word::Literal(content, Bounds::unknown()))
+            Ok(Word::Literal(content, None))
         },
         Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
@@ -310,155 +309,155 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         Some(Token::Source) => {
             // Treat standalone 'source' as a normal word (e.g., `source file.sh`)
             lexer.next();
-            Ok(Word::Literal("source".to_string(), Bounds::string_length(6, 6)))
+            Ok(Word::Literal("source".to_string(), None))
         }
         Some(Token::Set) => {
             // Treat standalone 'set' as a normal word (e.g., `set -euo pipefail`)
             lexer.next();
-            Ok(Word::Literal("set".to_string(), Bounds::string_length(3, 3)))
+            Ok(Word::Literal("set".to_string(), None))
         }
         Some(Token::Declare) => {
             // Treat standalone 'declare' as a normal word (e.g., `declare -a arr`)
             lexer.next();
-            Ok(Word::Literal("declare".to_string(), Bounds::string_length(7, 7)))
+            Ok(Word::Literal("declare".to_string(), None))
         }
         Some(Token::Unset) => {
             // Treat standalone 'unset' as a normal word (e.g., `unset var`)
             lexer.next();
-            Ok(Word::Literal("unset".to_string(), Bounds::string_length(5, 5)))
+            Ok(Word::Literal("unset".to_string(), None))
         }
         Some(Token::Export) => {
             // Treat standalone 'export' as a normal word (e.g., `export PATH`)
             lexer.next();
-            Ok(Word::Literal("export".to_string(), Bounds::string_length(6, 6)))
+            Ok(Word::Literal("export".to_string(), None))
         }
         Some(Token::Readonly) => {
             // Treat standalone 'readonly' as a normal word (e.g., `readonly VAR`)
             lexer.next();
-            Ok(Word::Literal("readonly".to_string(), Bounds::string_length(8, 8)))
+            Ok(Word::Literal("readonly".to_string(), None))
         }
         Some(Token::Typeset) => {
             // Treat standalone 'typeset' as a normal word (e.g., `typeset -i var`)
             lexer.next();
-            Ok(Word::Literal("typeset".to_string(), Bounds::string_length(7, 7)))
+            Ok(Word::Literal("typeset".to_string(), None))
         }
         Some(Token::Local) => {
             // Treat standalone 'local' as a normal word (e.g., `local var`)
             lexer.next();
-            Ok(Word::Literal("local".to_string(), Bounds::string_length(5, 5)))
+            Ok(Word::Literal("local".to_string(), None))
         }
         Some(Token::Shift) => {
             // Treat standalone 'shift' as a normal word (e.g., `shift 2`)
             lexer.next();
-            Ok(Word::Literal("shift".to_string(), Bounds::string_length(5, 5)))
+            Ok(Word::Literal("shift".to_string(), None))
         }
         Some(Token::Eval) => {
             // Treat standalone 'eval' as a normal word (e.g., `eval $cmd`)
             lexer.next();
-            Ok(Word::Literal("eval".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("eval".to_string(), None))
         }
         Some(Token::Exec) => {
             // Treat standalone 'exec' as a normal word (e.g., `exec cmd`)
             lexer.next();
-            Ok(Word::Literal("exec".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("exec".to_string(), None))
         }
         Some(Token::Trap) => {
             // Treat standalone 'trap' as a normal word (e.g., `trap 'echo' INT`)
             lexer.next();
-            Ok(Word::Literal("trap".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("trap".to_string(), None))
         }
         Some(Token::Wait) => {
             // Treat standalone 'wait' as a normal word (e.g., `wait $pid`)
             lexer.next();
-            Ok(Word::Literal("wait".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("wait".to_string(), None))
         }
         Some(Token::Exit) => {
             // Treat standalone 'exit' as a normal word (e.g., `exit 0`)
             lexer.next();
-            Ok(Word::Literal("exit".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("exit".to_string(), None))
         }
         Some(Token::Range) => {
             // Treat standalone '..' as a literal (e.g., `cd ..`)
             lexer.next();
-            Ok(Word::Literal("..".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("..".to_string(), None))
         }
         Some(Token::Star) => {
             // Treat standalone '*' as a literal (e.g., `ls *`)
             lexer.next();
-            Ok(Word::Literal("*".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal("*".to_string(), None))
         }
         Some(Token::Dot) => {
             // Treat standalone '.' as a literal (e.g., `ls .`)
             lexer.next();
-            Ok(Word::Literal(".".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal(".".to_string(), None))
         }
         Some(Token::CasePattern) => {
             // Treat case statement patterns like *.txt as literals.
             // get_raw_token_text() consumes the current token, so do not call next() here.
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::Slash) => {
             // Treat standalone '/' as a literal (e.g., `cd /`)
             lexer.next();
-            Ok(Word::Literal("/".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal("/".to_string(), None))
         }
         // Test operators
         Some(Token::File) => {
             lexer.next();
-            Ok(Word::Literal("-f".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-f".to_string(), None))
         }
         Some(Token::Directory) => {
             lexer.next();
-            Ok(Word::Literal("-d".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-d".to_string(), None))
         }
         Some(Token::Exists) => {
             lexer.next();
-            Ok(Word::Literal("-e".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-e".to_string(), None))
         }
         Some(Token::Readable) => {
             lexer.next();
-            Ok(Word::Literal("-r".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-r".to_string(), None))
         }
         Some(Token::Writable) => {
             lexer.next();
-            Ok(Word::Literal("-w".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-w".to_string(), None))
         }
         Some(Token::Executable) => {
             lexer.next();
-            Ok(Word::Literal("-x".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-x".to_string(), None))
         }
         Some(Token::Size) => {
             lexer.next();
-            Ok(Word::Literal("-s".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-s".to_string(), None))
         }
         Some(Token::Symlink) => {
             lexer.next();
-            Ok(Word::Literal("-L".to_string(), Bounds::string_length(2, 2)))
+            Ok(Word::Literal("-L".to_string(), None))
         }
         Some(Token::TestBracketClose) => {
             lexer.next();
-            Ok(Word::Literal("]".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal("]".to_string(), None))
         }
         Some(Token::Tilde) => {
             // Treat standalone '~' as a literal (e.g., `cd ~`)
             lexer.next();
-            Ok(Word::Literal("~".to_string(), Bounds::string_length(1, 1)))
+            Ok(Word::Literal("~".to_string(), None))
         }
         Some(Token::LongOption) => {
             // Treat long options like --color=always as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::RegexPattern) => {
             // Treat regex patterns as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::RegexMatch) => {
             // Treat regex match operator as literal
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::NameFlag) | Some(Token::MaxDepthFlag) | Some(Token::TypeFlag) => {
             // Treat command-line flags as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::Minus) => {
             // Handle minus tokens like -l, -c, etc.
@@ -475,12 +474,12 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 combined.push_str(&number);
             }
             
-            Ok(Word::Literal(combined, Bounds::unknown()))
+            Ok(Word::Literal(combined, None))
         }
         Some(Token::Character) | Some(Token::NonZero) | Some(Token::SymlinkH) | Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block) | Some(Token::SetGid) | Some(Token::Sticky) | Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned) | Some(Token::Modified) | Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le) | Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) => {
             // Handle test operator tokens like -e, -f, -d, etc.
             // These are already complete flags, just get their text
-            Ok(Word::Literal(lexer.get_raw_token_text()?, Bounds::unknown()))
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
         }
         Some(Token::Dollar) => Ok(parse_variable_expansion(lexer)?),
         Some(Token::DollarBrace) | Some(Token::DollarParen) | Some(Token::DollarHashSimple) | Some(Token::DollarAtSimple) | Some(Token::DollarStarSimple)
@@ -491,12 +490,12 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         Some(Token::True) => {
             // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
             lexer.next();
-            Ok(Word::Literal("true".to_string(), Bounds::string_length(4, 4)))
+            Ok(Word::Literal("true".to_string(), None))
         }
         Some(Token::False) => {
             // Treat standalone 'false' as a normal word (e.g., `false` or `command && false`)
             lexer.next();
-            Ok(Word::Literal("false".to_string(), Bounds::string_length(5, 5)))
+            Ok(Word::Literal("false".to_string(), None))
         }
         _ => {
             let (line, col) = lexer.offset_to_line_col(0);
@@ -574,25 +573,25 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     }
                     
                     // Return the map access
-                    return Ok(Word::MapAccess(var_name, index_content, Bounds::unknown()));
+                    return Ok(Word::MapAccess(var_name, index_content, None));
                 }
                 
-                Ok(Word::Variable(var_name, Bounds::unknown(), false))
+                Ok(Word::Variable(var_name, false, None))
             } else {
                 Err(ParserError::InvalidSyntax("Expected identifier after $".to_string()))
             }
         }
         Some(Token::DollarHashSimple) => { 
             lexer.next(); 
-            Ok(Word::Variable("#".to_string(), Bounds::unknown(), false))
+            Ok(Word::Variable("#".to_string(), false, None))
         }
         Some(Token::DollarAtSimple) => { 
             lexer.next(); 
-            Ok(Word::Variable("@".to_string(), Bounds::unknown(), false))
+            Ok(Word::Variable("@".to_string(), false, None))
         }
         Some(Token::DollarStarSimple) => { 
             lexer.next(); 
-            Ok(Word::Variable("*".to_string(), Bounds::unknown(), false))
+            Ok(Word::Variable("*".to_string(), false, None))
         }
         Some(Token::DollarBrace) => {
             // Parse ${...} expansions
@@ -607,7 +606,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 if let Some(bracket_start) = braced_content.find('[') {
                     if let Some(_bracket_end) = braced_content.rfind(']') {
                         let array_name = &braced_content[1..bracket_start]; // Remove # prefix
-                        return Ok(Word::MapLength(array_name.to_string(), Bounds::unknown()));
+                        return Ok(Word::MapLength(array_name.to_string(), None));
                     }
                 }
             } else if braced_content.starts_with('!') && braced_content.contains('[') && braced_content.contains(']') {
@@ -615,7 +614,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 if let Some(bracket_start) = braced_content.find('[') {
                     if let Some(_bracket_end) = braced_content.rfind(']') {
                         let map_name = &braced_content[1..bracket_start]; // Remove ! prefix
-                        return Ok(Word::MapKeys(map_name.to_string(), Bounds::unknown()));
+                        return Ok(Word::MapKeys(map_name.to_string(), None));
                     }
                 }
             } else if braced_content.contains('[') && braced_content.contains(']') {
@@ -633,10 +632,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                                 // This is array slicing like ${arr[@]:start:length}
                                 return parse_array_slicing(lexer, map_name.to_string());
                             }
-                            return Ok(Word::MapAccess(map_name.to_string(), "@".to_string(), Bounds::unknown()));
+                            return Ok(Word::MapAccess(map_name.to_string(), "@".to_string(), None));
                         }
                         
-                        return Ok(Word::MapAccess(map_name.to_string(), key.to_string(), Bounds::unknown()));
+                        return Ok(Word::MapAccess(map_name.to_string(), key.to_string(), None));
                     }
                 }
             }
@@ -656,14 +655,14 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                             variable: var_name.to_string(),
                             operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
                             is_mutable: true,
-                        }, Bounds::unknown()));
+                        }, None));
                     } else {
                         // This is ${var:offset} syntax
                         return Ok(Word::ParameterExpansion(ParameterExpansion {
                             variable: var_name.to_string(),
                             operator: ParameterExpansionOperator::ArraySlice(slice_part.to_string(), None),
                             is_mutable: true,
-                        }, Bounds::unknown()));
+                        }, None));
                     }
                 }
             }
@@ -676,35 +675,35 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     variable: base_var.to_string(),
                     operator: ParameterExpansionOperator::UppercaseAll,
                     is_mutable: true,
-                }, Bounds::unknown()))
+                }, None))
             } else if braced_content.ends_with(",,") {
                 let base_var = braced_content.trim_end_matches(",,");
                 Ok(Word::ParameterExpansion(ParameterExpansion {
                     variable: base_var.to_string(),
                     operator: ParameterExpansionOperator::LowercaseAll,
                     is_mutable: true,
-                }, Bounds::unknown()))
+                }, None))
             } else if braced_content.ends_with("^") && !braced_content.ends_with("^^") {
                 let base_var = braced_content.trim_end_matches("^");
                 Ok(Word::ParameterExpansion(ParameterExpansion {
                     variable: base_var.to_string(),
                     operator: ParameterExpansionOperator::UppercaseFirst,
                     is_mutable: true,
-                }, Bounds::unknown()))
+                }, None))
             } else if braced_content.ends_with("##*/") {
                 let base_var = braced_content.trim_end_matches("##*/");
                 Ok(Word::ParameterExpansion(ParameterExpansion {
                     variable: base_var.to_string(),
                     operator: ParameterExpansionOperator::Basename,
                     is_mutable: true,
-                }, Bounds::unknown()))
+                }, None))
             } else if braced_content.ends_with("%/*") {
                 let base_var = braced_content.trim_end_matches("%/*");
                 Ok(Word::ParameterExpansion(ParameterExpansion {
                     variable: base_var.to_string(),
                     operator: ParameterExpansionOperator::Dirname,
                     is_mutable: true,
-                }, Bounds::unknown()))
+                }, None))
             } else if braced_content.contains("##") && !braced_content.ends_with("##*/") {
                 let parts: Vec<&str> = braced_content.split("##").collect();
                 if parts.len() == 2 {
@@ -712,9 +711,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         variable: parts[0].to_string(),
                         operator: ParameterExpansionOperator::RemoveLongestPrefix(parts[1].to_string()),
                         is_mutable: true,
-                    }, Bounds::unknown()))
+                    }, None))
                 } else {
-                    Ok(Word::Variable(braced_content, Bounds::unknown(), true))
+                    Ok(Word::Variable(braced_content, true, None))
                 }
             } else if braced_content.contains("%%") && !braced_content.ends_with("%/*") {
                 let parts: Vec<&str> = braced_content.split("%%").collect();
@@ -723,9 +722,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         variable: parts[0].to_string(),
                         operator: ParameterExpansionOperator::RemoveLongestSuffix(parts[1].to_string()),
                         is_mutable: true,
-                    }, Bounds::unknown()))
+                    }, None))
                 } else {
-                    Ok(Word::Variable(braced_content, Bounds::unknown(), true))
+                    Ok(Word::Variable(braced_content, true, None))
                 }
             } else if braced_content.contains("//") {
                 let parts: Vec<&str> = braced_content.split("//").collect();
@@ -734,9 +733,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         variable: parts[0].to_string(),
                         operator: ParameterExpansionOperator::SubstituteAll(parts[1].to_string(), parts[2].to_string()),
                         is_mutable: true,
-                    }, Bounds::unknown()))
+                    }, None))
                 } else {
-                    Ok(Word::Variable(braced_content, Bounds::unknown(), true))
+                    Ok(Word::Variable(braced_content, true, None))
                 }
             } else if braced_content.contains("/") && !braced_content.contains("//") {
                 let parts: Vec<&str> = braced_content.split("/").collect();
@@ -745,13 +744,13 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         variable: parts[0].to_string(),
                         operator: ParameterExpansionOperator::SubstituteAll(parts[1].to_string(), parts[2].to_string()),
                         is_mutable: true,
-                    }, Bounds::unknown()))
+                    }, None))
                 } else {
-                    Ok(Word::Variable(braced_content, Bounds::unknown(), true))
+                    Ok(Word::Variable(braced_content, true, None))
                 }
             } else {
                 // If it's not a special case, return as a variable
-                Ok(Word::Variable(braced_content, Bounds::unknown(), true))
+                Ok(Word::Variable(braced_content, true, None))
             }
         }
         Some(Token::DollarParen) => {
@@ -761,14 +760,14 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
             // For now, create a simple command as a placeholder
             // TODO: Parse the command_text into an actual Command
             let placeholder_cmd = Command::Simple(SimpleCommand {
-                name: Word::Literal("echo".to_string(), Bounds::unknown()),
-                args: vec![Word::Literal(command_text, Bounds::unknown())],
+                name: Word::Literal("echo".to_string(), None),
+                args: vec![Word::Literal(command_text, None)],
                 redirects: Vec::new(),
                 env_vars: HashMap::new(),
                 stdout_used: true,
                 stderr_used: true,
             });
-            Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), Bounds::unknown()))
+            Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
         }
         _ => {
             let (line, col) = lexer.offset_to_line_col(0);
@@ -779,7 +778,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
 
 // Placeholder functions - these would need to be implemented based on the actual AST structures
 fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
-    use crate::mir::{StringInterpolation, StringPart};
+    use crate::ast::{StringInterpolation, StringPart};
     
     // Get the double-quoted string content (this includes the quotes)
     let string_content = lexer.get_string_text()?;
@@ -890,7 +889,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
         parts.push(StringPart::Literal(content.to_string()));
     }
     
-    Ok(Word::StringInterpolation(StringInterpolation { parts }, Bounds::unknown()))
+    Ok(Word::StringInterpolation(StringInterpolation { parts }, None))
 }
 
 fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion, ParserError> {
@@ -1249,11 +1248,11 @@ fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Consume the token
     lexer.next();
     
-    Ok(Word::Literal(result, Bounds::unknown()))
+    Ok(Word::Literal(result, None))
 }
 
 fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
-    use crate::mir::{BraceExpansion, BraceItem, BraceRange};
+    use crate::ast::{BraceExpansion, BraceItem, BraceRange};
     
     // Consume the opening brace
     if !matches!(lexer.peek(), Some(Token::BraceOpen)) {
@@ -1384,7 +1383,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
         prefix: None,
         items,
         suffix: None,
-    }, Bounds::unknown()))
+    }, None))
 }
 
 fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
@@ -1475,7 +1474,7 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
     Ok(Word::Arithmetic(ArithmeticExpression {
         expression,
         tokens: Vec::new(), // We don't need to store individual tokens for now
-    }, Bounds::unknown()))
+    }, None))
 }
 
 fn parse_braced_variable_name(lexer: &mut Lexer) -> Result<String, ParserError> {
@@ -1546,10 +1545,10 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
         }
         
         if commands.len() == 1 {
-            Ok(Word::CommandSubstitution(Box::new(commands.remove(0)), Bounds::unknown()))
+            Ok(Word::CommandSubstitution(Box::new(commands.remove(0)), None))
         } else {
             let pipeline = Command::Pipeline(Pipeline { commands, source_text: None, stdout_used: true, stderr_used: true });
-            Ok(Word::CommandSubstitution(Box::new(pipeline), Bounds::unknown()))
+            Ok(Word::CommandSubstitution(Box::new(pipeline), None))
         }
     } else {
         // Parse as a simple command (original logic)
@@ -1558,8 +1557,8 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
             return Err(ParserError::InvalidSyntax("Empty command in backticks".to_string()));
         }
         
-        let name = Word::Literal(parts[0].to_string(), Bounds::unknown());
-        let args: Vec<Word> = parts[1..].iter().map(|&s| Word::Literal(s.to_string(), Bounds::unknown())).collect();
+        let name = Word::Literal(parts[0].to_string(), None);
+        let args: Vec<Word> = parts[1..].iter().map(|&s| Word::Literal(s.to_string(), None)).collect();
         
         let cmd = Command::Simple(SimpleCommand {
             name,
@@ -1570,7 +1569,7 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
             stderr_used: true,
         });
         
-        Ok(Word::CommandSubstitution(Box::new(cmd), Bounds::unknown()))
+        Ok(Word::CommandSubstitution(Box::new(cmd), None))
     }
 }
 
@@ -1581,8 +1580,8 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
         return Err(ParserError::InvalidSyntax("Empty command in process substitution".to_string()));
     }
     
-    let name = Word::Literal(cmd_parts[0].to_string(), Bounds::unknown());
-    let args: Vec<Word> = cmd_parts[1..].iter().map(|&s| Word::Literal(s.to_string(), Bounds::unknown())).collect();
+    let name = Word::Literal(cmd_parts[0].to_string(), None);
+    let args: Vec<Word> = cmd_parts[1..].iter().map(|&s| Word::Literal(s.to_string(), None)).collect();
     
     let cmd = Command::Simple(SimpleCommand {
         name,

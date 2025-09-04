@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use crate::generator::Generator;
 
 // Helper function to convert Word to bash string representation for system commands

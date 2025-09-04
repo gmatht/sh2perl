@@ -1,5 +1,4 @@
 use crate::ast::*;
-use crate::mir::*;
 use super::Generator;
 use regex::Regex;
 

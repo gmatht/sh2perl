@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-// Forward declaration to avoid circular dependency
-pub use crate::mir::Word;
+// Import word types from the separate ast_words module
+pub use crate::ast_words::*;
 
 /// Represents a span of source code with start/end positions and original text
 #[derive(Debug, Clone, PartialEq)]
