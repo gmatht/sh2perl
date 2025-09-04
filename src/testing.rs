@@ -758,7 +758,60 @@ pub fn test_all_examples() {
     println!("{}", "=".repeat(80));
 }
 
-pub fn test_all_examples_next_fail(generators: &[String], test_number: Option<usize>) {
+fn find_example_by_prefix(examples: &[String], prefix: &str) -> Option<usize> {
+    // First try exact match
+    for (i, example) in examples.iter().enumerate() {
+        let name = example.replace("examples/", "").replace("examples\\", "");
+        if name.starts_with(prefix) {
+            return Some(i);
+        }
+    }
+    
+    // If no exact match, try to find shortest unique prefix
+    let mut candidates = Vec::new();
+    for (i, example) in examples.iter().enumerate() {
+        let name = example.replace("examples/", "").replace("examples\\", "");
+        if name.starts_with(prefix) {
+            candidates.push((i, name));
+        }
+    }
+    
+    if candidates.len() == 1 {
+        return Some(candidates[0].0);
+    } else if candidates.len() > 1 {
+        // Find the shortest unique prefix
+        let mut shortest_prefix_len = prefix.len();
+        let mut best_match = None;
+        
+        for (i, name) in &candidates {
+            // Try to find the shortest unique prefix for this name
+            for len in (prefix.len() + 1)..=name.len() {
+                let candidate_prefix = &name[..len];
+                let mut matches = 0;
+                
+                for (_, other_name) in &candidates {
+                    if other_name.starts_with(candidate_prefix) {
+                        matches += 1;
+                    }
+                }
+                
+                if matches == 1 {
+                    if best_match.is_none() || len < shortest_prefix_len {
+                        best_match = Some(*i);
+                        shortest_prefix_len = len;
+                    }
+                    break;
+                }
+            }
+        }
+        
+        return best_match;
+    }
+    
+    None
+}
+
+pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>) {
     // Filter to only available generators
     let generators: Vec<_> = generators.iter()
         .filter(|g| {
@@ -799,19 +852,30 @@ pub fn test_all_examples_next_fail(generators: &[String], test_number: Option<us
     let mut current_test = 0;
     let total_tests = examples.len() * generators.len();
     
-    // If a specific test number is requested, calculate which test to run
-    let target_test = if let Some(num) = test_number {
-        if num < 1 || num > total_tests {
-            println!("Error: Test number {} is out of range. Valid range is 1-{}", num, total_tests);
-            std::process::exit(1);
+    // If a specific test prefix is requested, find the matching example
+    let target_example_index = if let Some(prefix) = test_prefix {
+        match find_example_by_prefix(&examples, &prefix) {
+            Some(index) => {
+                println!("\nFound example matching prefix '{}': {}", prefix, 
+                         examples[index].replace("examples/", "").replace("examples\\", ""));
+                Some(index)
+            }
+            None => {
+                println!("Error: No example found matching prefix '{}'", prefix);
+                println!("Available examples:");
+                for example in &examples {
+                    let name = example.replace("examples/", "").replace("examples\\", "");
+                    println!("  {}", name);
+                }
+                std::process::exit(1);
+            }
         }
-        Some(num)
     } else {
         None
     };
     
-    if let Some(target) = target_test {
-        println!("\nRunning only test {} out of {} total tests", target, total_tests);
+    if let Some(_) = target_example_index {
+        println!("\nRunning only the specified example");
     } else {
         if generators.len() == 1 {
             println!("\nRunning {} tests across {} examples with {} generator", 
@@ -824,12 +888,12 @@ pub fn test_all_examples_next_fail(generators: &[String], test_number: Option<us
     println!("{}", "=".repeat(50));
     
     for generator in &generators {
-    for example in &examples {
+        for (example_index, example) in examples.iter().enumerate() {
             current_test += 1;
             
-            // Skip tests until we reach the target test number
-            if let Some(target) = target_test {
-                if current_test != target {
+            // Skip tests until we reach the target example
+            if let Some(target_index) = target_example_index {
+                if example_index != target_index {
                     continue;
                 }
             }
@@ -847,7 +911,7 @@ pub fn test_all_examples_next_fail(generators: &[String], test_number: Option<us
                         print!("✓");
                         
                         // If we're running only one specific test and it passed, show results and exit
-                        if let Some(_) = target_test {
+                        if let Some(_) = target_example_index {
                             println!("\n\n");
                             println!("{}", "=".repeat(80));
                             println!("                                    TEST PASSED");
@@ -1029,7 +1093,7 @@ pub fn test_all_examples_next_fail(generators: &[String], test_number: Option<us
     }
     
     // All tests passed (only reached when running all tests, not a specific test)
-    if target_test.is_none() {
+    if target_example_index.is_none() {
         println!("\n\n");
         println!("ALL TESTS PASSED! 🎉");
         println!("Total tests: {}", total_tests);
