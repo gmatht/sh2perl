@@ -50,8 +50,8 @@ ls *.logtmp*
 rm a.logtmp.sav
 
 # Find files and show detailed information
-echo 'find . -type f -ls  | sort'
-find . -type f -ls  | sort
+#echo 'find . -type f -ls  | sort'
+#find . -type f -ls  | sort
 
 # Find files excluding certain directories
 echo 'find .. -type f -not -path "./.git/*" -not -path "./node_modules/*"  | sort'
