@@ -69,6 +69,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
         Command::Break(level) => generator.generate_break_statement(level),
         Command::Continue(level) => generator.generate_continue_statement(level),
         Command::Return(value) => generator.generate_return_statement(value),
+        Command::Assignment(assignment) => generator.generate_assignment(assignment),
         Command::BlankLine => "\n".to_string(),
         Command::Redirect(redirect_cmd) => {
 //             eprintln!("DEBUG: Processing Redirect command with {} redirects", redirect_cmd.redirects.len());

@@ -811,6 +811,30 @@ fn find_example_by_prefix(examples: &[String], prefix: &str) -> Option<usize> {
     None
 }
 
+/// Find the shortest unique prefix for a given example name
+fn find_shortest_unique_prefix(examples: &[String], target_name: &str) -> String {
+    // Try progressively longer prefixes until we find one that's unique
+    for len in 1..=target_name.len() {
+        let prefix = &target_name[..len];
+        let mut matches = 0;
+        
+        for example in examples {
+            let name = example.replace("examples/", "").replace("examples\\", "");
+            if name.starts_with(prefix) {
+                matches += 1;
+            }
+        }
+        
+        // If only one match, this prefix is unique
+        if matches == 1 {
+            return prefix.to_string();
+        }
+    }
+    
+    // Fallback to the full name if no unique prefix found
+    target_name.to_string()
+}
+
 pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>) {
     // Filter to only available generators
     let generators: Vec<_> = generators.iter()
@@ -853,12 +877,13 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
     let total_tests = examples.len() * generators.len();
     
     // If a specific test prefix is requested, find the matching example
-    let target_example_index = if let Some(prefix) = test_prefix {
+    let (target_example_index, original_prefix) = if let Some(prefix) = test_prefix {
+        println!("\nDEBUG: Looking for prefix '{}'", prefix);
         match find_example_by_prefix(&examples, &prefix) {
             Some(index) => {
                 println!("\nFound example matching prefix '{}': {}", prefix, 
                          examples[index].replace("examples/", "").replace("examples\\", ""));
-                Some(index)
+                (Some(index), Some(prefix))
             }
             None => {
                 println!("Error: No example found matching prefix '{}'", prefix);
@@ -871,7 +896,7 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
             }
         }
     } else {
-        None
+        (None, None)
     };
     
     if let Some(_) = target_example_index {
@@ -1023,7 +1048,14 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                         }
                         
                         // Show how to run the test again
-                        println!("\nTo run test again: ./fail {}", current_test);
+                        if let Some(ref prefix) = original_prefix {
+                            println!("\nTo run test again: ./fail {}", prefix);
+                        } else {
+                            // Find the prefix for this test
+                            let example_name = example.replace("examples/", "").replace("examples\\", "");
+                            let prefix = find_shortest_unique_prefix(&examples, &example_name);
+                            println!("\nTo run test again: ./fail {}", prefix);
+                        }
                         
                         std::process::exit(1);
                     }
@@ -1082,7 +1114,14 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                     }
                     
                     // Show how to run the test again
-                    println!("To run test again: ./fail {}", current_test);
+                    if let Some(ref prefix) = original_prefix {
+                        println!("To run test again: ./fail {}", prefix);
+                    } else {
+                        // Find the prefix for this test
+                        let example_name = example.replace("examples/", "").replace("examples\\", "");
+                        let prefix = find_shortest_unique_prefix(&examples, &example_name);
+                        println!("To run test again: ./fail {}", prefix);
+                    }
                     
                     std::process::exit(1);
                 }

@@ -41,6 +41,7 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     commands.insert("tr", BuiltinCommand::new("tr", "Translate or delete characters", true));
     commands.insert("xargs", BuiltinCommand::new("xargs", "Execute command with arguments", false));
     commands.insert("perl", BuiltinCommand::new("perl", "Perl interpreter", true));
+    commands.insert("cd", BuiltinCommand::new("cd", "Change directory", false));
     
     // File manipulation
     commands.insert("cp", BuiltinCommand::new("cp", "Copy files", false));
@@ -83,6 +84,9 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     // I/O redirection
     commands.insert("tee", BuiltinCommand::new("tee", "Read from stdin, write to stdout and files", true));
     
+    // Output generation
+    commands.insert("yes", BuiltinCommand::new("yes", "Output a string repeatedly", true));
+    
     //TODO: pkill and killall
     commands
 }
@@ -115,6 +119,15 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
     }
     
     // Additional checks for specific cases where streaming doesn't make sense
+    
+    // Check if the first command is an output-generating command like 'yes'
+    if let Some(Command::Simple(first_cmd)) = pipeline.commands.first() {
+        if let Word::Literal(name, _) = &first_cmd.name {
+            if name == "yes" {
+                return false; // Use buffered pipeline for output-generating commands
+            }
+        }
+    }
     
     // Check if the first command reads from a file (not STDIN)
     if let Some(Command::Simple(first_cmd)) = pipeline.commands.first() {
@@ -299,8 +312,8 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             crate::generator::commands::which::generate_which_command(generator, cmd)
         },
         "yes" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::yes::generate_yes_command(generator, cmd)
+            // Handle yes command in pipeline context
+            crate::generator::commands::yes::generate_yes_command_with_context(generator, cmd, input_var, output_var, command_index)
         },
         "gzip" => {
             // For now, use the existing signature but we should standardize this

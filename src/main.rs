@@ -176,7 +176,7 @@ fn main() {
         "--next-fail" => {
             // Disable DEBUG output for --next-fail mode
             set_debug_enabled(false);
-            
+
             // Parse optional test prefix, generator list, and AST options after --next-fail
             let mut test_prefix: Option<String> = None;
             let mut generators = Vec::new();
@@ -185,8 +185,8 @@ fn main() {
             // Check if first argument is a test prefix (not a number)
             if i < args.len() {
                 let arg = &args[i];
-                // If it's not a pure number, treat it as a prefix
-                if arg.parse::<usize>().is_err() || arg.len() > 3 {
+                // If it's not a pure number or has leading zeros, treat it as a prefix
+                if arg.parse::<usize>().is_err() || arg.len() > 3 || arg.starts_with('0') {
                     test_prefix = Some(arg.clone());
                     i += 1;
                 }
@@ -425,7 +425,7 @@ fn main() {
             // Shorthand for --next-fail
             // Disable DEBUG output for fail mode
             set_debug_enabled(false);
-            
+
             // Parse optional test prefix, generator list, and AST options after fail
             let mut test_prefix: Option<String> = None;
             let mut generators = Vec::new();
@@ -434,8 +434,8 @@ fn main() {
             // Check if first argument is a test prefix (not a number)
             if i < args.len() {
                 let arg = &args[i];
-                // If it's not a pure number, treat it as a prefix
-                if arg.parse::<usize>().is_err() || arg.len() > 3 {
+                // If it's not a pure number or has leading zeros, treat it as a prefix
+                if arg.parse::<usize>().is_err() || arg.len() > 3 || arg.starts_with('0') {
                     test_prefix = Some(arg.clone());
                     i += 1;
                 }

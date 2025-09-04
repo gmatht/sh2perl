@@ -146,6 +146,54 @@ impl Generator {
         control_flow::generate_return_statement_impl(self, value)
     }
 
+    pub fn generate_assignment(&mut self, assignment: &Assignment) -> String {
+        let mut output = String::new();
+        
+        // Declare the variable if not already declared
+        if !self.declared_locals.contains(&assignment.variable) {
+            output.push_str(&self.indent());
+            output.push_str(&format!("my ${};\n", assignment.variable));
+            self.declared_locals.insert(assignment.variable.clone());
+        }
+        
+        // Generate the assignment based on the operator
+        output.push_str(&self.indent());
+        match assignment.operator {
+            AssignmentOperator::Assign => {
+                output.push_str(&format!("${} = {};\n", 
+                    assignment.variable, 
+                    words::word_to_perl_impl(self, &assignment.value)));
+            }
+            AssignmentOperator::PlusAssign => {
+                output.push_str(&format!("${} += {};\n", 
+                    assignment.variable, 
+                    words::word_to_perl_impl(self, &assignment.value)));
+            }
+            AssignmentOperator::MinusAssign => {
+                output.push_str(&format!("${} -= {};\n", 
+                    assignment.variable, 
+                    words::word_to_perl_impl(self, &assignment.value)));
+            }
+            AssignmentOperator::StarAssign => {
+                output.push_str(&format!("${} *= {};\n", 
+                    assignment.variable, 
+                    words::word_to_perl_impl(self, &assignment.value)));
+            }
+            AssignmentOperator::SlashAssign => {
+                output.push_str(&format!("${} /= {};\n", 
+                    assignment.variable, 
+                    words::word_to_perl_impl(self, &assignment.value)));
+            }
+            AssignmentOperator::PercentAssign => {
+                output.push_str(&format!("${} %= {};\n", 
+                    assignment.variable, 
+                    words::word_to_perl_impl(self, &assignment.value)));
+            }
+        }
+        
+        output
+    }
+
     pub fn generate_test_expression(&mut self, test_expr: &TestExpression) -> String {
         test_expressions::generate_test_expression_impl(self, test_expr)
     }

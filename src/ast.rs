@@ -35,6 +35,7 @@ pub enum Command {
     Background(Box<Command>),
     Block(Block),
     Redirect(RedirectCommand),
+    Assignment(Assignment),               // Variable assignment like i=value
     Break(Option<String>),      // Optional loop level
     Continue(Option<String>),   // Optional loop level
     Return(Option<Word>),       // Optional return value
@@ -123,6 +124,23 @@ pub struct Block {
 pub struct RedirectCommand {
     pub command: Box<Command>,
     pub redirects: Vec<Redirect>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Assignment {
+    pub variable: String,
+    pub value: Word,
+    pub operator: AssignmentOperator,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub enum AssignmentOperator {
+    Assign,      // =
+    PlusAssign,  // +=
+    MinusAssign, // -=
+    StarAssign,  // *=
+    SlashAssign, // /=
+    PercentAssign, // %=
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

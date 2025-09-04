@@ -345,6 +345,19 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // Use the dedicated perl command handler
                         output.push_str(&crate::generator::commands::perl::generate_perl_command(generator, cmd));
                     }
+                    "cd" => {
+                        // Handle cd command using chdir() instead of system call
+                        if cmd.args.is_empty() {
+                            // cd with no arguments goes to home directory
+                            output.push_str(&generator.indent());
+                            output.push_str("chdir($ENV{HOME} || $ENV{USERPROFILE} || '.');\n");
+                        } else {
+                            // cd with directory argument
+                            let dir = generator.perl_string_literal(&cmd.args[0]);
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("chdir({});\n", dir));
+                        }
+                    }
 
                     _ => {
                         // Route other builtins to the builtins system

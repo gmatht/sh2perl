@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
+use regex::Regex;
 
 /// Generate Perl code for echo command
 pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, output_var: &str) -> String {
@@ -145,9 +146,9 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                             generator.perl_string_literal(arg)
                         }
                     }
-                    Word::CommandSubstitution(_, _) => {
-                        // For command substitution, don't escape newlines - preserve them as-is
-                        generator.word_to_perl(arg)
+                    Word::CommandSubstitution(cmd, _) => {
+                        // For command substitution in echo, preserve newlines instead of converting to spaces
+                        handle_command_substitution_for_echo(generator, cmd)
                     }
                     _ => generator.perl_string_literal(arg)
                 }
@@ -231,4 +232,84 @@ pub fn handle_brace_expansion_for_echo(_generator: &mut Generator, expansion: &B
     // Join all items with spaces and return as a quoted string
     let items_str = items.join(" ");
     format!("\"{}\"", items_str.replace("\"", "\\\""))
+}
+
+/// Handle command substitution specifically for echo commands, preserving newlines
+fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command) -> String {
+    match cmd {
+        Command::Simple(simple_cmd) => {
+            let cmd_name = generator.word_to_perl(&simple_cmd.name);
+            let args: Vec<String> = simple_cmd.args.iter()
+                .map(|arg| generator.word_to_perl(arg))
+                .collect();
+            
+            // For simple commands, fall back to system command for now
+            if args.is_empty() {
+                format!("`{}`", cmd_name)
+            } else {
+                format!("`{} {}`", cmd_name, args.join(" "))
+            }
+        },
+        Command::Pipeline(pipeline) => {
+            // For command substitution pipelines in echo, preserve newlines instead of converting to spaces
+            let pipeline_code = generator.generate_command(&Command::Pipeline(pipeline.clone()));
+            
+            // Find the actual output variable name that was generated
+            let re = Regex::new(r"\$output_(\d+)").unwrap();
+            let output_var = if let Some(cap) = re.captures(&pipeline_code) {
+                format!("$output_{}", cap.get(1).unwrap().as_str())
+            } else {
+                "$output_0".to_string()
+            };
+            
+            // Find the pipeline success variable
+            let success_var = if pipeline_code.contains("$pipeline_success_") {
+                let re = Regex::new(r"\$pipeline_success_(\d+)").unwrap();
+                if let Some(cap) = re.captures(&pipeline_code) {
+                    format!("$pipeline_success_{}", cap.get(1).unwrap().as_str())
+                } else {
+                    "$pipeline_success_0".to_string()
+                }
+            } else {
+                "$pipeline_success_0".to_string()
+            };
+            
+            // Remove the print statements and exit code assignment using the actual variable names
+            let mut captured_pipeline = pipeline_code
+                .replace(&format!("print {};", output_var), "")
+                .replace("print \"\\n\";", "")
+                .replace(&format!("print \"\\n\" unless {} =~ /\\n$/;", output_var), "")
+                .replace(&format!("$main_exit_code = 1 unless {};", success_var), "");
+            
+            // Remove conditional print blocks that are common in pipelines
+            // Use a simpler approach with string replacement for the specific pattern
+            let output_var_num = output_var.trim_start_matches("$output_");
+            let print_block_to_remove = format!(
+                "if ({} ne '' && !defined($output_printed_{})) {{\n\n        print {};\n        print \"\\n\" unless {} =~ /\\n$/;\n    }}", 
+                output_var, output_var_num, output_var, output_var
+            );
+            captured_pipeline = captured_pipeline.replace(&print_block_to_remove, "");
+            
+            // Also try without the extra newlines in case formatting is different
+            let print_block_compact = format!(
+                "if ({} ne '' && !defined($output_printed_{})) {{ print {}; print \"\\n\" unless {} =~ /\\n$/; }}", 
+                output_var, output_var_num, output_var, output_var
+            );
+            captured_pipeline = captured_pipeline.replace(&print_block_compact, "");
+            
+            // Remove the outer braces if they exist, as we'll wrap in our own do block
+            captured_pipeline = captured_pipeline.trim().to_string();
+            if captured_pipeline.starts_with('{') && captured_pipeline.ends_with('}') {
+                captured_pipeline = captured_pipeline[1..captured_pipeline.len()-1].to_string();
+            }
+            
+            // Return the code that executes the pipeline and captures output
+            // For echo commands, preserve newlines instead of converting to spaces
+            format!("do {{ {} {} }}", captured_pipeline.trim(), output_var)
+        },
+        _ => {
+            // For other command types, use system command fallback
+            format!("`{}`", generator.generate_command_string_for_system(cmd))
+        }
+    }
 }
