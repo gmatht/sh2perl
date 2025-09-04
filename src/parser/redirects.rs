@@ -41,14 +41,14 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
 
     // Check for process substitution syntax: <(...)
     if matches!(operator, RedirectOperator::Input) && matches!(lexer.peek(), Some(Token::ParenOpen)) {
-        eprintln!("DEBUG: Found process substitution: <(...)");
+//         eprintln!("DEBUG: Found process substitution: <(...)");
         // This is a process substitution: <(...)
         let inner_text = lexer.capture_parenthetical_text()?;
-        eprintln!("DEBUG: Inner text: '{}'", inner_text);
+//         eprintln!("DEBUG: Inner text: '{}'", inner_text);
         
         // Parse the inner command text to extract command name and arguments
         let inner_cmd = parse_command_from_text(lexer, &inner_text)?;
-        eprintln!("DEBUG: Parsed inner command: {:?}", inner_cmd);
+//         eprintln!("DEBUG: Parsed inner command: {:?}", inner_cmd);
         
         // Return a process substitution redirect
         return Ok(Redirect {
@@ -61,15 +61,15 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     
     // Check for process substitution with extra '<': < <(...)
     if matches!(operator, RedirectOperator::Input) && matches!(lexer.peek(), Some(Token::RedirectIn)) && matches!(lexer.peek_n(1), Some(Token::ParenOpen)) {
-        eprintln!("DEBUG: Found process substitution with extra <: < <(...)");
+//         eprintln!("DEBUG: Found process substitution with extra <: < <(...)");
         // This is a process substitution: < <(...)
         lexer.next(); // consume the extra '<'
         let inner_text = lexer.capture_parenthetical_text()?;
-        eprintln!("DEBUG: Inner text: '{}'", inner_text);
+//         eprintln!("DEBUG: Inner text: '{}'", inner_text);
         
         // Parse the inner command text to extract command name and arguments
         let inner_cmd = parse_command_from_text(lexer, &inner_text)?;
-        eprintln!("DEBUG: Parsed inner command: {:?}", inner_cmd);
+//         eprintln!("DEBUG: Parsed inner command: {:?}", inner_cmd);
         
         // Return a process substitution redirect
         return Ok(Redirect {
@@ -125,7 +125,7 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         _ => return Err(ParserError::InvalidSyntax("Heredoc delimiter must be a literal string".to_string())),
     };
     
-    eprintln!("DEBUG: parse_heredoc called with delimiter: '{}'", delim);
+//     eprintln!("DEBUG: parse_heredoc called with delimiter: '{}'", delim);
     
     // Skip to the next newline token
     while let Some(token) = lexer.peek() {
@@ -147,7 +147,7 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         return Ok(Some(String::new()));
     };
     
-    eprintln!("DEBUG: Starting heredoc parsing from position: {}", start_pos);
+//     eprintln!("DEBUG: Starting heredoc parsing from position: {}", start_pos);
     
     // Read the raw input line by line until we find the delimiter
     let mut body = String::new();
@@ -159,11 +159,11 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         let line_end = input[current_pos..].find('\n').map(|i| current_pos + i).unwrap_or(input.len());
         let line = &input[current_pos..line_end];
         
-        eprintln!("DEBUG: Processing line: '{}'", line);
+//         eprintln!("DEBUG: Processing line: '{}'", line);
         
         // Check if this line is the delimiter (exact match, possibly with whitespace)
         if line.trim() == delim {
-            eprintln!("DEBUG: Found delimiter line, stopping");
+//             eprintln!("DEBUG: Found delimiter line, stopping");
             break;
         }
         
@@ -196,7 +196,7 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         }
     }
     
-    eprintln!("DEBUG: Final heredoc body: '{}'", body);
+//     eprintln!("DEBUG: Final heredoc body: '{}'", body);
     Ok(Some(body))
 }
 

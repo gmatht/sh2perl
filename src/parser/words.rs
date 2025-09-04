@@ -1271,29 +1271,29 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
             }
             Some(Token::Number) | Some(Token::PaddedNumber) => {
                 let start = lexer.get_number_text()?;
-                debug_eprintln!("DEBUG: Found start number: {}", start);
-                debug_eprintln!("DEBUG: After getting start number, current token: {:?}", lexer.peek());
+//                 debug_eprintln!("DEBUG: Found start number: {}", start);
+//                 debug_eprintln!("DEBUG: After getting start number, current token: {:?}", lexer.peek());
                 
                 // Check if this is a range (look for ..)
                 if matches!(lexer.peek(), Some(Token::Range)) {
-                    debug_eprintln!("DEBUG: Found '..' after start number");
+//                     debug_eprintln!("DEBUG: Found '..' after start number");
                     lexer.next(); // consume '..'
                     
                     if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                         let end = lexer.get_number_text()?;
-                        debug_eprintln!("DEBUG: Found end number: {}", end);
-                        debug_eprintln!("DEBUG: After getting end number, current token: {:?}", lexer.peek());
+//                         debug_eprintln!("DEBUG: Found end number: {}", end);
+//                         debug_eprintln!("DEBUG: After getting end number, current token: {:?}", lexer.peek());
                         
                         // Check if there's a step value (another ..)
                         if matches!(lexer.peek(), Some(Token::Range)) {
-                            eprintln!("DEBUG: Found second '..' in number range, looking for step value");
+//                             eprintln!("DEBUG: Found second '..' in number range, looking for step value");
                             lexer.next(); // consume second '..'
-                            eprintln!("DEBUG: After consuming second '..', current token: {:?}", lexer.peek());
+//                             eprintln!("DEBUG: After consuming second '..', current token: {:?}", lexer.peek());
                             
                             if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                                 let step = lexer.get_number_text()?;
-                                eprintln!("DEBUG: Found step value: {}", step);
-                                eprintln!("DEBUG: Added step range, continuing to next iteration");
+//                                 eprintln!("DEBUG: Found step value: {}", step);
+//                                 eprintln!("DEBUG: Added step range, continuing to next iteration");
                                 items.push(BraceItem::Range(BraceRange {
                                     start,
                                     end,
@@ -1302,26 +1302,26 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                 }));
                                 continue; // Continue to next iteration to look for closing brace or more items
                             } else {
-                                eprintln!("DEBUG: Expected number after second '..', but got: {:?}", lexer.peek());
+//                                 eprintln!("DEBUG: Expected number after second '..', but got: {:?}", lexer.peek());
                                 return Err(ParserError::InvalidSyntax("Expected number after second '..' in brace range".to_string()));
                             }
                         } else {
-                            eprintln!("DEBUG: No step value, creating range from {} to {}", start, end);
+//                             eprintln!("DEBUG: No step value, creating range from {} to {}", start, end);
                             items.push(BraceItem::Range(BraceRange {
                                 start,
                                 end,
                                 step: None,
                                 format: None,
                             }));
-                            eprintln!("DEBUG: Added simple range, continuing to next iteration");
+//                             eprintln!("DEBUG: Added simple range, continuing to next iteration");
                             continue; // Continue to next iteration to look for closing brace or more items
                         }
                     } else {
-                        eprintln!("DEBUG: Expected number after '..', but got: {:?}", lexer.peek());
+//                         eprintln!("DEBUG: Expected number after '..', but got: {:?}", lexer.peek());
                         return Err(ParserError::InvalidSyntax("Expected number after '..' in brace range".to_string()));
                     }
                 } else {
-                    eprintln!("DEBUG: No range, treating as literal number: {}", start);
+//                     eprintln!("DEBUG: No range, treating as literal number: {}", start);
                     // Just a literal number
                     items.push(BraceItem::Literal(start));
                 }
