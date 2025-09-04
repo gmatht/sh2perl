@@ -189,19 +189,24 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         "grep" => {
             // Print only for standalone grep (no pipeline input/output)
             let should_print = input_var.is_empty() && output_var.is_empty();
-            crate::generator::commands::grep::generate_grep_command(generator, cmd, input_var, command_index, should_print)
+            let mut grep_output = crate::generator::commands::grep::generate_grep_command(generator, cmd, input_var, command_index, should_print);
+            // Assign the grep result to output_var if not already done
+            if !output_var.is_empty() && !grep_output.contains(&format!("${} =", output_var)) {
+                grep_output.push_str(&format!("${} = $grep_result_{};\n", output_var, command_index));
+            }
+            grep_output
         },
         "wc" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::wc::generate_wc_command(generator, cmd, input_var, command_index)
+            // Use the new signature that supports output_var
+            crate::generator::commands::wc::generate_wc_command_with_output(generator, cmd, input_var, command_index, output_var)
         },
         "sort" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::sort::generate_sort_command(generator, cmd, input_var, command_index)
+            // Use the new signature that supports output_var
+            crate::generator::commands::sort::generate_sort_command_with_output(generator, cmd, input_var, command_index, output_var)
         },
         "uniq" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::uniq::generate_uniq_command(generator, cmd, input_var, command_index)
+            // Use the new signature that supports output_var
+            crate::generator::commands::uniq::generate_uniq_command_with_output(generator, cmd, input_var, command_index, output_var)
         },
         "tr" => {
             // Pass the full command_index string and linebyline parameter
@@ -237,7 +242,9 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         },
         "sed" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::sed::generate_sed_command(generator, cmd, input_var, 0)
+            // Parse command_index to get the numeric part for sed
+            let index_num = command_index.split('_').next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+            crate::generator::commands::sed::generate_sed_command(generator, cmd, input_var, index_num)
         },
         "awk" => {
             // For now, use the existing signature but we should standardize this
@@ -245,7 +252,12 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         },
         "head" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::head::generate_head_command(generator, cmd, input_var, 0)
+            // Parse command_index to get the numeric part for head
+            let index_num = command_index.split('_').next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+            let mut head_output = crate::generator::commands::head::generate_head_command(generator, cmd, input_var, index_num);
+            // Fix the output variable assignment to use output_var instead of input_var
+            head_output = head_output.replace(&format!("${} = join(", input_var), &format!("${} = join(", output_var));
+            head_output
         },
         "tail" => {
             // For now, use the existing signature but we should standardize this

@@ -2,6 +2,10 @@ use crate::ast::*;
 use crate::generator::Generator;
 
 pub fn generate_sort_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+    generate_sort_command_with_output(generator, cmd, input_var, command_index, input_var)
+}
+
+pub fn generate_sort_command_with_output(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
     let mut output = String::new();
     
     let mut numeric = false;
@@ -40,9 +44,9 @@ pub fn generate_sort_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     if reverse {
         output.push_str(&format!("@sort_sorted_{} = reverse(@sort_sorted_{});\n", command_index, command_index));
     }
-    output.push_str(&format!("${} = join(\"\\n\", @sort_sorted_{});\n", input_var, command_index));
+    output.push_str(&format!("${} = join(\"\\n\", @sort_sorted_{});\n", output_var, command_index));
     // Ensure output ends with newline to match shell behavior
-    output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", input_var, input_var));
+    output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", output_var, output_var));
     
     output
 }

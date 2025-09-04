@@ -1,7 +1,8 @@
 @echo off
-echo To run this test: ./fail FAILING_TEST_NUMBER
-echo To run a specific test: ./fail TEST_NUMBER
-git stash push examples .\f.bat .\fail.bat .\src\main.rs src\testing.rs
+echo To run this test: ./fail FAILING_TEST_PREFIX
+echo To run a specific test: ./fail TEST_PREFIX
+echo Examples: ./fail 062_02, ./fail 044, ./fail find
+REM git stash push examples .\fail.bat .\src\main.rs src\testing.rs
 cargo run --bin debashc -- fail %*
 
 REM Simulate keypresses for Cursor

@@ -2,6 +2,10 @@ use crate::ast::*;
 use crate::generator::Generator;
 
 pub fn generate_wc_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+    generate_wc_command_with_output(_generator, cmd, input_var, command_index, &format!("wc_result_{}", command_index))
+}
+
+pub fn generate_wc_command_with_output(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
     let mut output = String::new();
     
     // Parse wc options
@@ -53,20 +57,20 @@ pub fn generate_wc_command(_generator: &mut Generator, cmd: &SimpleCommand, inpu
     }
     
     // Format output into a result variable expected by the pipeline
-    output.push_str(&format!("my $wc_result_{} = '';\n", command_index));
+    output.push_str(&format!("${} = '';\n", output_var));
     if count_lines {
-        output.push_str(&format!("$wc_result_{} .= \"$wc_line_count_{} \";\n", command_index, command_index));
+        output.push_str(&format!("${} .= \"$wc_line_count_{} \";\n", output_var, command_index));
     }
     if count_words {
-        output.push_str(&format!("$wc_result_{} .= \"$wc_word_count_{} \";\n", command_index, command_index));
+        output.push_str(&format!("${} .= \"$wc_word_count_{} \";\n", output_var, command_index));
     }
     if count_chars {
-        output.push_str(&format!("$wc_result_{} .= \"$wc_char_count_{} \";\n", command_index, command_index));
+        output.push_str(&format!("${} .= \"$wc_char_count_{} \";\n", output_var, command_index));
     }
     if count_bytes {
-        output.push_str(&format!("$wc_result_{} .= \"$wc_byte_count_{} \";\n", command_index, command_index));
+        output.push_str(&format!("${} .= \"$wc_byte_count_{} \";\n", output_var, command_index));
     }
-    output.push_str(&format!("$wc_result_{} =~ s/\\s+$//;\n", command_index)); // Remove trailing space
+    output.push_str(&format!("${} =~ s/\\s+$//;\n", output_var)); // Remove trailing space
     // Don't add newline for pipeline commands - shell wc doesn't add trailing newline in pipelines
     
     output

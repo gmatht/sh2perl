@@ -39,16 +39,18 @@ fn generate_command_using_builtins(
             let mut while_output = String::new();
             
             // Generate a while loop that processes the input line by line
-            while_output.push_str(&format!("my @lines = split(/\\n/, ${});\n", input_var));
+            while_output.push_str(&format!("my @while_lines_{} = split(/\\n/, ${});\n", command_index, input_var));
             while_output.push_str(&format!("my $result_{} = '';\n", command_index));
-            while_output.push_str("for my $line (@lines) {\n");
+            while_output.push_str(&format!("for my $line (@while_lines_{}) {{\n", command_index));
             while_output.push_str("    chomp $line;\n");
             while_output.push_str("    my $L = $line;\n");
             
             // Generate the while loop body commands
             for body_cmd in &while_loop.body.commands {
+                eprintln!("DEBUG: Processing while loop body command: {:?}", body_cmd);
                 while_output.push_str("    ");
                 while_output.push_str(&generator.generate_command(body_cmd));
+                while_output.push_str("\n");
             }
             
             while_output.push_str("}\n");
@@ -324,6 +326,45 @@ fn generate_command_using_builtins(
                 // Subsequent command - pass the pipeline input to the redirect command
                 // The redirect command should receive the pipeline input and generate its output
                 generator.generate_command(command)
+            }
+        },
+        Command::Pipeline(inner_pipeline) => {
+            // Handle nested pipelines in pipeline context
+            if input_var.is_empty() {
+                // First command in pipeline - generate the inner pipeline normally
+                generator.generate_command(command)
+            } else {
+                // Subsequent command - pass the pipeline input to the inner pipeline
+                // We need to process the inner pipeline with the input from the outer pipeline
+                let mut inner_output = String::new();
+                inner_output.push_str(&format!("my $inner_input_{} = ${};\n", command_index, input_var));
+                
+                // Generate the inner pipeline with the input
+                // For nested pipelines, we need to process each command in the inner pipeline
+                for (i, inner_cmd) in inner_pipeline.commands.iter().enumerate() {
+                    // Declare the output variable for this command
+                    inner_output.push_str(&format!("my $inner_output_{}_{};\n", command_index, i));
+                    
+                    if i == 0 {
+                        // First command in inner pipeline - use the input
+                        let cmd_output = generate_command_using_builtins(generator, inner_cmd, &format!("inner_input_{}", command_index), &format!("inner_output_{}_{}", command_index, i), &format!("{}_{}", command_index, i), false);
+                        inner_output.push_str(&cmd_output);
+                    } else {
+                        // Subsequent commands in inner pipeline - use previous output
+                        let cmd_output = generate_command_using_builtins(generator, inner_cmd, &format!("inner_output_{}_{}", command_index, i-1), &format!("inner_output_{}_{}", command_index, i), &format!("{}_{}", command_index, i), false);
+                        inner_output.push_str(&cmd_output);
+                    }
+                }
+                
+                // Set the output variable to the final result
+                if !inner_pipeline.commands.is_empty() {
+                    let final_index = inner_pipeline.commands.len() - 1;
+                    inner_output.push_str(&format!("${} = $inner_output_{}_{};\n", output_var, command_index, final_index));
+                } else {
+                    inner_output.push_str(&format!("${} = $inner_input_{};\n", output_var, command_index));
+                }
+                
+                inner_output
             }
         },
         _ => {
