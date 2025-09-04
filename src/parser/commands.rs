@@ -362,7 +362,7 @@ impl Parser {
                     self.lexer.next();
                     pipe_operators.push(());
                     self.lexer.skip_whitespace_and_comments();
-                    let command = self.parse_simple_command()?;
+                    let command = self.parse_command()?;
                     // Parse redirects for this command
                     let command_with_redirects = self.parse_command_redirects(command)?;
                     commands.push(command_with_redirects);
@@ -370,7 +370,7 @@ impl Parser {
                 Token::And => {
                     self.lexer.next();
                     self.lexer.skip_whitespace_and_comments();
-                    let right_command = self.parse_simple_command()?;
+                    let right_command = self.parse_command()?;
                     let right_command_with_redirects = self.parse_command_redirects(right_command)?;
                     
                     // Create Command::And(left, right)
@@ -381,7 +381,7 @@ impl Parser {
                 Token::Or => {
                     self.lexer.next();
                     self.lexer.skip_whitespace_and_comments();
-                    let right_command = self.parse_simple_command()?;
+                    let right_command = self.parse_command()?;
                     let right_command_with_redirects = self.parse_command_redirects(right_command)?;
                     
                     // Create Command::Or(left, right)
@@ -757,16 +757,18 @@ impl Parser {
             }
         } else {
             // No command following, this is a standalone assignment
-            let mut env_vars = HashMap::new();
-            env_vars.insert(var_name, value_word);
-            
-            Ok(Command::Simple(SimpleCommand {
-                name: Word::literal("true".to_string()), // Use 'true' as a dummy command
-                args: Vec::new(),
-                redirects: Vec::new(),
-                env_vars,
-                stdout_used: true,
-                stderr_used: true,
+            Ok(Command::Assignment(Assignment {
+                variable: var_name,
+                value: value_word,
+                operator: match assignment_op {
+                    Token::Assign => AssignmentOperator::Assign,
+                    Token::PlusAssign => AssignmentOperator::PlusAssign,
+                    Token::MinusAssign => AssignmentOperator::MinusAssign,
+                    Token::StarAssign => AssignmentOperator::StarAssign,
+                    Token::SlashAssign => AssignmentOperator::SlashAssign,
+                    Token::PercentAssign => AssignmentOperator::PercentAssign,
+                    _ => AssignmentOperator::Assign, // Default fallback
+                },
             }))
         }
     }

@@ -38,153 +38,390 @@ fn escape_glob_pattern(pattern: &str) -> String {
 pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, generate_output: bool, input_var: &str) -> String {
     let mut output = String::new();
     
-    // Check for unsupported find options that require system fallback
-    let unsupported_options = ["-mtime", "-mmin", "-size", "-empty", "-exec", "-ls", "-not", "-path", "-user", "-group", "-perm"];
-    let has_unsupported = cmd.args.iter().any(|arg| {
-        if let Word::Literal(opt, _) = arg {
-            unsupported_options.contains(&opt.as_str())
+    // Check if -ls is present - if so, use system fallback for better compatibility
+    let has_ls = cmd.args.iter().any(|arg| {
+        if let Word::Literal(s, _) = arg {
+            s == "-ls"
         } else {
             false
         }
     });
     
-    // If we have unsupported options, fall back to system find command
-    if has_unsupported {
+    if has_ls {
         return generate_system_find_fallback(generator, cmd, generate_output, input_var);
     }
     
-    let mut path = ".";
-    let mut pattern = "*".to_string(); // Default to all files
-    let mut file_type = "f"; // Default to files only
-    let mut has_name_filter = false;
+    // Generate a unique subroutine name
+    let subroutine_id = generator.get_unique_id();
+    let subroutine_name = format!("find_files_{}", subroutine_id);
     
-    // Parse find arguments
+    // Parse find arguments to understand what we're looking for
+    let mut start_path = ".".to_string();
+    let mut name_pattern = None;
+    let mut file_type = None;
+    let mut mtime_days = None;
+    let mut mmin_minutes = None;
+    let mut size_spec = None;
+    let mut empty_only = false;
+    let mut exec_command = None;
+    let mut ls_format = false;
+    let mut not_paths = Vec::new();
+    
     let mut i = 0;
     while i < cmd.args.len() {
-        if let Word::Literal(arg, _) = &cmd.args[i] {
-            if arg == "." {
-                // For find . command, search from the directory where the script is located
-                // This ensures we find files relative to the script location, not current working directory
-                path = ".";
-            } else if arg == "-name" && i + 1 < cmd.args.len() {
-                if let Some(next_arg) = cmd.args.get(i + 1) {
-                    pattern = match next_arg {
-                        Word::StringInterpolation(interp, _) => {
-                            interp.parts.iter()
+        match &cmd.args[i] {
+            Word::Literal(s, _) => {
+                match s.as_str() {
+                    "-name" => {
+                        if i + 1 < cmd.args.len() {
+                            if let Word::StringInterpolation(interp, _) = &cmd.args[i + 1] {
+                                let pattern = interp.parts.iter()
+                                    .map(|part| match part {
+                                        StringPart::Literal(s) => s.clone(),
+                                        _ => "*".to_string(),
+                                    })
+                                    .collect::<String>();
+                                name_pattern = Some(pattern);
+                            }
+                            i += 1;
+                        }
+                    },
+                    "-type" => {
+                        if i + 1 < cmd.args.len() {
+                            if let Word::Literal(type_str, _) = &cmd.args[i + 1] {
+                                file_type = Some(type_str.clone());
+                            }
+                            i += 1;
+                        }
+                    },
+                    "-mtime" => {
+                        if i + 1 < cmd.args.len() {
+                            if let Word::Literal(time_str, _) = &cmd.args[i + 1] {
+                                mtime_days = Some(time_str.clone());
+                            }
+                            i += 1;
+                        }
+                    },
+                    "-mmin" => {
+                        if i + 1 < cmd.args.len() {
+                            if let Word::Literal(min_str, _) = &cmd.args[i + 1] {
+                                mmin_minutes = Some(min_str.clone());
+                            }
+                            i += 1;
+                        }
+                    },
+                    "-size" => {
+                        if i + 1 < cmd.args.len() {
+                            if let Word::Literal(size_str, _) = &cmd.args[i + 1] {
+                                size_spec = Some(size_str.clone());
+                            }
+                            i += 1;
+                        }
+                    },
+                    "-empty" => {
+                        empty_only = true;
+                    },
+                    "-exec" => {
+                        // Collect exec command arguments until semicolon
+                        let mut exec_args = Vec::new();
+                        i += 1;
+                        while i < cmd.args.len() {
+                            if let Word::Literal(exec_arg, _) = &cmd.args[i] {
+                                if exec_arg == ";" {
+                                    break;
+                                }
+                                exec_args.push(exec_arg.clone());
+                            } else if let Word::BraceExpansion(be, _) = &cmd.args[i] {
+                                // Handle {} placeholder
+                                if be.items.len() == 1 {
+                                    if let BraceItem::Literal(s) = &be.items[0] {
+                                        if s == "{}" {
+                                            exec_args.push("{}".to_string());
+                                        }
+                                    }
+                                }
+                            } else {
+                                exec_args.push(generator.word_to_perl(&cmd.args[i]));
+                            }
+                            i += 1;
+                        }
+                        if !exec_args.is_empty() {
+                            exec_command = Some(exec_args);
+                        }
+                    },
+                    "-ls" => {
+                        ls_format = true;
+                    },
+                    "-not" => {
+                        if i + 1 < cmd.args.len() && i + 2 < cmd.args.len() {
+                            if let Word::Literal(not_arg, _) = &cmd.args[i + 1] {
+                                if not_arg == "-path" {
+                                    if let Word::StringInterpolation(interp, _) = &cmd.args[i + 2] {
+                                        let path_pattern = interp.parts.iter()
                                 .map(|part| match part {
-                                    StringPart::Literal(s) => s,
-                                    _ => "*"
-                                })
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .map(|s| s.clone())
-                                .collect::<String>()
-                        },
-                        Word::Literal(s, _) => s.clone(),
-                        _ => generator.word_to_perl(next_arg)
-                    };
-                    has_name_filter = true;
-                    i += 1; // Skip the pattern argument
-                }
-            } else if arg == "-type" && i + 1 < cmd.args.len() {
-                if let Some(next_arg) = cmd.args.get(i + 1) {
-                    if let Word::Literal(type_arg, _) = next_arg {
-                        file_type = type_arg;
+                                                StringPart::Literal(s) => s.clone(),
+                                                _ => "*".to_string(),
+                                            })
+                                            .collect::<String>();
+                                        not_paths.push(path_pattern);
+                                    }
+                                    i += 2;
+                                }
+                            }
+                        }
+                    },
+                    _ => {
+                        // This might be the starting path
+                        if i == 0 {
+                            start_path = s.clone();
+                        }
                     }
-                    i += 1; // Skip the type argument
                 }
-            }
+            },
+            Word::StringInterpolation(interp, _) => {
+                // This might be the starting path
+                if i == 0 {
+                    let path = interp.parts.iter()
+                        .map(|part| match part {
+                            StringPart::Literal(s) => s.clone(),
+                            StringPart::Variable(var) => format!("$ENV{{{}}}", var),
+                            _ => ".".to_string(),
+                        })
+                        .collect::<String>();
+                    start_path = path;
+                }
+            },
+            _ => {}
         }
         i += 1;
     }
     
-    // Use unique variable names to prevent cross-contamination between pipelines
-    let unique_id = generator.get_unique_id();
-    let find_var = format!("find_files_{}", unique_id);
-    let find_func = format!("find_files_{}", unique_id);
+    // Generate native Perl code for find functionality
+    let base_indent = generator.indent();
+    let indent1 = format!("{}    ", base_indent);
+    let indent2 = format!("{}        ", base_indent);
+    let indent3 = format!("{}            ", base_indent);
+    let indent4 = format!("{}                ", base_indent);
+    let indent5 = format!("{}                    ", base_indent);
     
-    output.push_str(&generator.indent());
-    output.push_str(&format!("my @{};\n", find_var));
-    output.push_str(&generator.indent());
-    output.push_str(&format!("sub {} {{\n", find_func));
-    generator.indent_level += 1;
-    output.push_str(&generator.indent());
-    output.push_str("my ($dir, $pattern) = @_;\n");
-    output.push_str(&generator.indent());
+    output.push_str(&base_indent);
+    output.push_str("{\n");
+    
+    // Generate recursive directory traversal
+    output.push_str(&indent1);
+    output.push_str(&format!("sub {} {{\n", subroutine_name));
+    
+    output.push_str(&indent2);
+    output.push_str("my ($dir, $results) = @_;\n");
+    
+    output.push_str(&indent2);
     output.push_str("if (opendir(my $dh, $dir)) {\n");
-    generator.indent_level += 1;
-    output.push_str(&generator.indent());
+    
+    output.push_str(&indent3);
     output.push_str("while (my $file = readdir($dh)) {\n");
-    generator.indent_level += 1;
-    output.push_str(&generator.indent());
+    
+    output.push_str(&indent4);
     output.push_str("next if $file eq '.' || $file eq '..';\n");
-    output.push_str(&generator.indent());
-    output.push_str("my $full_path = $dir eq '.' ? \"./$file\" : \"$dir/$file\";\n");
-    output.push_str(&generator.indent());
-    output.push_str("if (-d $full_path) {\n");
-    generator.indent_level += 1;
-    output.push_str(&generator.indent());
-    output.push_str(&format!("{}($full_path, $pattern);\n", find_func));
-    generator.indent_level -= 1;
-    output.push_str(&generator.indent());
     
-    // Check file type and pattern
-    if file_type == "f" {
-        output.push_str("} elsif (-f $full_path");
-    } else if file_type == "d" {
-        output.push_str("} elsif (-d $full_path");
-    } else {
-        output.push_str("} elsif (1"); // Accept all types
+    output.push_str(&indent4);
+    output.push_str("my $full_path = \"$dir/$file\";\n");
+    
+    // Add file type check
+    if let Some(ftype) = &file_type {
+        match ftype.as_str() {
+            "f" => {
+                output.push_str(&indent4);
+                output.push_str("next unless -f $full_path;\n");
+            },
+            "d" => {
+                output.push_str(&indent4);
+                output.push_str("next unless -d $full_path;\n");
+            },
+            _ => {}
+        }
     }
     
-    if has_name_filter {
-        output.push_str(&format!(" && $file =~ /^{}$/", escape_glob_pattern(&pattern)));
-    }
-    output.push_str(") {\n");
-    
-    generator.indent_level += 1;
-    output.push_str(&generator.indent());
-    output.push_str(&format!("push @{}, $full_path;\n", find_var));
-    generator.indent_level -= 1;
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
-    generator.indent_level -= 1;
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
-    output.push_str(&generator.indent());
-    output.push_str("closedir($dh);\n");
-    generator.indent_level -= 1;
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
-    generator.indent_level -= 1;
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
-    output.push_str(&generator.indent());
-    // For find . command, search from current directory
-    if path == "." {
-        output.push_str(&format!("{}('.', '{}');\n", find_func, pattern));
-    } else {
-        output.push_str(&format!("{}('{}', '{}');\n", find_func, path, pattern));
+    // Add name pattern check
+    if let Some(pattern) = &name_pattern {
+        output.push_str(&indent4);
+        output.push_str(&format!("next unless $file =~ /{}/;\n", escape_glob_pattern(pattern)));
     }
     
-    if generate_output {
-        output.push_str(&generator.indent());
-        output.push_str(&format!("${} = join(\"\\n\", @{});\n", input_var, find_var));
-        // Ensure output ends with newline to match shell behavior
-        output.push_str(&generator.indent());
-        output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", input_var, input_var));
-    } else {
-        // For standalone find commands, print results directly
-        output.push_str(&generator.indent());
-        output.push_str(&format!("for my $file (@{}) {{\n", find_var));
-        generator.indent_level += 1;
-        output.push_str(&generator.indent());
-        output.push_str("print \"$file\\n\";\n");
-        generator.indent_level -= 1;
-        output.push_str(&generator.indent());
+    // Add empty check
+    if empty_only {
+        output.push_str(&indent4);
+        output.push_str("if (-f $full_path) {\n");
+        output.push_str(&indent5);
+        output.push_str("next unless -z $full_path;\n");
+        output.push_str(&indent4);
+        output.push_str("} elsif (-d $full_path) {\n");
+        output.push_str(&indent5);
+        output.push_str("opendir(my $empty_dh, $full_path) or next;\n");
+        output.push_str(&indent5);
+        output.push_str("my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($empty_dh);\n");
+        output.push_str(&indent5);
+        output.push_str("closedir($empty_dh);\n");
+        output.push_str(&indent5);
+        output.push_str("next unless @entries == 0;\n");
+        output.push_str(&indent4);
+        output.push_str("} else {\n");
+        output.push_str(&indent5);
+        output.push_str("next;\n");
+        output.push_str(&indent4);
         output.push_str("}\n");
     }
-    output.push_str("\n");
+    
+    // Add mtime check
+    if let Some(mtime) = &mtime_days {
+        output.push_str(&indent4);
+        if mtime.starts_with('-') {
+            // Negative mtime means "less than N days old"
+            let days = &mtime[1..];
+            output.push_str(&format!("next unless (0 + -M $full_path) < {};\n", days));
+        } else if mtime.starts_with('+') {
+            // Positive mtime means "more than N days old"
+            let days = &mtime[1..];
+            output.push_str(&format!("next unless (0 + -M $full_path) > {};\n", days));
+        } else {
+            // Exact mtime means "exactly N days old"
+            output.push_str(&format!("next unless (0 + -M $full_path) == {};\n", mtime));
+        }
+    }
+    
+    // Add mmin check
+    if let Some(mmin) = &mmin_minutes {
+        output.push_str(&indent4);
+        if mmin.starts_with('-') {
+            // Negative mmin means "less than N minutes old"
+            let minutes = &mmin[1..];
+            output.push_str(&format!("next unless (0 + -M $full_path) * 24 * 60 < {};\n", minutes));
+        } else if mmin.starts_with('+') {
+            // Positive mmin means "more than N minutes old"
+            let minutes = &mmin[1..];
+            output.push_str(&format!("next unless (0 + -M $full_path) * 24 * 60 > {};\n", minutes));
+    } else {
+            // Exact mmin means "exactly N minutes old"
+            output.push_str(&format!("next unless (0 + -M $full_path) * 24 * 60 == {};\n", mmin));
+        }
+    }
+    
+    // Add size check
+    if let Some(size) = &size_spec {
+        if size.starts_with('+') {
+            let size_val = &size[1..];
+            output.push_str(&indent4);
+            output.push_str(&format!("next unless -s $full_path > {};\n", size_val));
+        } else if size.starts_with('-') {
+            let size_val = &size[1..];
+            output.push_str(&indent4);
+            output.push_str(&format!("next unless -s $full_path < {};\n", size_val));
+        }
+    }
+    
+    // Add not path checks
+    for not_path in &not_paths {
+        output.push_str(&indent4);
+        output.push_str(&format!("next if $full_path =~ /{}/;\n", escape_glob_pattern(not_path)));
+    }
+    
+    // Handle exec command
+    if let Some(exec_cmd) = &exec_command {
+        output.push_str(&indent4);
+        output.push_str("my $exec_cmd = \"");
+        for (j, arg) in exec_cmd.iter().enumerate() {
+            if j > 0 {
+                output.push_str(" ");
+            }
+            if arg == "{}" {
+                output.push_str("\" . $full_path . \"");
+            } else {
+                output.push_str(arg);
+            }
+        }
+        output.push_str("\";\n");
+        output.push_str(&indent4);
+        output.push_str("system($exec_cmd);\n");
+    } else {
+        // Add to results
+        if ls_format {
+            output.push_str(&indent4);
+            output.push_str("my @stat = stat($full_path);\n");
+            output.push_str(&indent4);
+            output.push_str("my $inode = $stat[1];\n");
+            output.push_str(&indent4);
+            output.push_str("my $blocks = int(($stat[7] + 511) / 512);\n");
+            output.push_str(&indent4);
+            output.push_str("my $perms = '';\n");
+            output.push_str(&indent4);
+            output.push_str("$perms .= ($stat[2] & 0400) ? 'r' : '-';\n");
+            output.push_str(&indent4);
+            output.push_str("$perms .= ($stat[2] & 0200) ? 'w' : '-';\n");
+            output.push_str(&indent4);
+            output.push_str("$perms .= ($stat[2] & 0100) ? 'x' : '-';\n");
+            output.push_str(&indent4);
+            output.push_str("$perms .= ($stat[2] & 0040) ? 'r' : '-';\n");
+            output.push_str(&indent4);
+            output.push_str("$perms .= ($stat[2] & 0020) ? 'w' : '-';\n");
+            output.push_str(&indent4);
+            output.push_str("$perms .= ($stat[2] & 0010) ? 'x' : '-';\n");
+            output.push_str(&indent4);
+            output.push_str("$perms .= ($stat[2] & 0004) ? 'r' : '-';\n");
+            output.push_str(&indent4);
+            output.push_str("$perms .= ($stat[2] & 0002) ? 'w' : '-';\n");
+            output.push_str(&indent4);
+            output.push_str("$perms .= ($stat[2] & 0001) ? 'x' : '-';\n");
+            output.push_str(&indent4);
+            output.push_str("my $owner = getpwuid($stat[4]) || $stat[4];\n");
+            output.push_str(&indent4);
+            output.push_str("my $group = getgrgid($stat[5]) || $stat[5];\n");
+            output.push_str(&indent4);
+            output.push_str("my $mtime = scalar localtime($stat[9]);\n");
+            output.push_str(&indent4);
+            output.push_str("push @$results, sprintf(\"%d %d -%s %d %s %s %d %s %s\", $inode, $blocks, $perms, $stat[3], $owner, $group, $stat[7], $mtime, $full_path);\n");
+        } else {
+            output.push_str(&indent4);
+            output.push_str("push @$results, $full_path;\n");
+        }
+    }
+    
+    // Recursive call for directories
+    output.push_str(&indent4);
+    output.push_str("if (-d $full_path) {\n");
+    output.push_str(&format!("{}    ", indent4));
+    output.push_str(&format!("{}($full_path, $results);\n", subroutine_name));
+    output.push_str(&indent4);
+    output.push_str("}\n");
+    
+    output.push_str(&indent3);
+    output.push_str("}\n");
+    
+    output.push_str(&indent2);
+    output.push_str("closedir($dh);\n");
+    
+    output.push_str(&indent2);
+    output.push_str("}\n");
+    
+    output.push_str(&indent1);
+    output.push_str("}\n");
+    
+    // Call the function
+    output.push_str(&indent1);
+    output.push_str("my @find_results;\n");
+    output.push_str(&indent1);
+    output.push_str(&format!("{}(\"{}\", \\@find_results);\n", subroutine_name, start_path));
+    
+    if generate_output {
+        output.push_str(&indent1);
+        output.push_str(&format!("${} = join(\"\\n\", @find_results);\n", input_var));
+        output.push_str(&indent1);
+        output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", input_var, input_var));
+    } else {
+        output.push_str(&indent1);
+        output.push_str("print join(\"\\n\", @find_results) . \"\\n\";\n");
+    }
+    
+    output.push_str(&base_indent);
+    output.push_str("}\n");
     
     output
 }

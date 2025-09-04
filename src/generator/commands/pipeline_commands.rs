@@ -32,6 +32,30 @@ fn generate_command_using_builtins(
                 generate_generic_builtin(generator, cmd, input_var, output_var, command_index, linebyline)
             }
         },
+        Command::While(while_loop) => {
+            // Handle while loops in buffered pipeline context
+            // For buffered pipelines, we need to process the while loop differently
+            // The while loop should read from the input and process it
+            let mut while_output = String::new();
+            
+            // Generate a while loop that processes the input line by line
+            while_output.push_str(&format!("my @lines = split(/\\n/, ${});\n", input_var));
+            while_output.push_str(&format!("my $result_{} = '';\n", command_index));
+            while_output.push_str("for my $line (@lines) {\n");
+            while_output.push_str("    chomp $line;\n");
+            while_output.push_str("    my $L = $line;\n");
+            
+            // Generate the while loop body commands
+            for body_cmd in &while_loop.body.commands {
+                while_output.push_str("    ");
+                while_output.push_str(&generator.generate_command(body_cmd));
+            }
+            
+            while_output.push_str("}\n");
+            while_output.push_str(&format!("${} = $result_{};\n", output_var, command_index));
+            
+            while_output
+        },
         Command::For(for_loop) => {
             // Handle for loops in pipeline context
             if input_var.is_empty() {
@@ -364,7 +388,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         output.push_str(&format!("# Original bash: {}\n", first_line));
     }
     
-    // Check if the first command is 'cat filename' or 'echo' and handle it specially
+    // Check if the first command is 'cat filename' or an output-generating command and handle it specially
     let mut start_index = 0;
     if let Command::Simple(first_cmd) = &pipeline.commands[0] {
         if let Word::Literal(name, _) = &first_cmd.name {
@@ -413,6 +437,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         }
     }
     
+    
     if start_index == 0 {
         // No special handling, read from STDIN
         
@@ -446,15 +471,36 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         
         // Process each line through the remaining pipeline commands
         for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
-            if let Command::Simple(cmd) = command {
-                let cmd_name = match &cmd.name {
-                    Word::Literal(s, _) => s,
-                    _ => "unknown_command"
-                };
-                
-                // Generate line-by-line version of each command
-                output.push_str(&generator.indent());
-                output.push_str(&generate_linebyline_command(generator, cmd, "line", start_index + i));
+            match command {
+                Command::Simple(cmd) => {
+                    let cmd_name = match &cmd.name {
+                        Word::Literal(s, _) => s,
+                        _ => "unknown_command"
+                    };
+                    
+                    // Generate line-by-line version of each command
+                    output.push_str(&generator.indent());
+                    output.push_str(&generate_linebyline_command(generator, cmd, "line", start_index + i));
+                }
+                Command::While(while_loop) => {
+                    // Handle while loops in pipeline context
+                    // The while loop should read from the current line and process it
+                    output.push_str(&generator.indent());
+                    output.push_str("my $L = $line;\n");
+                    
+                    // Generate the while loop body with the line as input
+                    generator.indent_level += 1;
+                    for body_cmd in &while_loop.body.commands {
+                        output.push_str(&generator.indent());
+                        output.push_str(&generator.generate_command(body_cmd));
+                    }
+                    generator.indent_level -= 1;
+                }
+                _ => {
+                    // For other command types, generate them normally
+                    output.push_str(&generator.indent());
+                    output.push_str(&generator.generate_command(command));
+                }
             }
         }
         
@@ -491,16 +537,37 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         
         // Process each line through the remaining pipeline commands
         for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
-            if let Command::Simple(cmd) = command {
-                let cmd_name = match &cmd.name {
-                    Word::Literal(s, _) => s,
-                    _ => "unknown_command"
-                };
-                
-                // Generate line-by-line version of each command
-                output.push_str(&generator.indent());
-                let cmd_index = start_index + i;
-                output.push_str(&generate_linebyline_command(generator, cmd, "line", cmd_index));
+            match command {
+                Command::Simple(cmd) => {
+                    let cmd_name = match &cmd.name {
+                        Word::Literal(s, _) => s,
+                        _ => "unknown_command"
+                    };
+                    
+                    // Generate line-by-line version of each command
+                    output.push_str(&generator.indent());
+                    let cmd_index = start_index + i;
+                    output.push_str(&generate_linebyline_command(generator, cmd, "line", cmd_index));
+                }
+                Command::While(while_loop) => {
+                    // Handle while loops in pipeline context
+                    // The while loop should read from the current line and process it
+                    output.push_str(&generator.indent());
+                    output.push_str("my $L = $line;\n");
+                    
+                    // Generate the while loop body with the line as input
+                    generator.indent_level += 1;
+                    for body_cmd in &while_loop.body.commands {
+                        output.push_str(&generator.indent());
+                        output.push_str(&generator.generate_command(body_cmd));
+                    }
+                    generator.indent_level -= 1;
+                }
+                _ => {
+                    // For other command types, generate them normally
+                    output.push_str(&generator.indent());
+                    output.push_str(&generator.generate_command(command));
+                }
             }
         }
         
