@@ -543,7 +543,117 @@ fn main() {
                             println!("\n--- Running generated Perl code ---");
                             let tmp = "__tmp_run.pl";
                             if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
-                                let _ = std::process::Command::new("perl").arg(tmp).status();
+                                // Time the Perl execution
+                                let perl_start = std::time::Instant::now();
+                                let perl_output = std::process::Command::new("perl").arg(tmp).output();
+                                let perl_duration = perl_start.elapsed();
+                                
+                                // Time the bash execution
+                                let bash_start = std::time::Instant::now();
+                                let bash_output = std::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(&content)
+                                    .output();
+                                let bash_duration = bash_start.elapsed();
+                                
+                                match (perl_output, bash_output) {
+                                    (Ok(perl_out), Ok(bash_out)) => {
+                                        let perl_stdout = String::from_utf8_lossy(&perl_out.stdout).to_string();
+                                        let perl_stderr = String::from_utf8_lossy(&perl_out.stderr).to_string();
+                                        let bash_stdout = String::from_utf8_lossy(&bash_out.stdout).to_string();
+                                        let bash_stderr = String::from_utf8_lossy(&bash_out.stderr).to_string();
+                                        
+                                        // Display Perl output
+                                        if !perl_stdout.is_empty() {
+                                            print!("{}", perl_stdout);
+                                        }
+                                        if !perl_stderr.is_empty() {
+                                            eprint!("{}", perl_stderr);
+                                        }
+                                        println!("Exit code: {}", perl_out.status);
+                                        
+                                        // Display timing information
+                                        println!("\n{}", "=".repeat(50));
+                                        println!("TIMING COMPARISON");
+                                        println!("{}", "=".repeat(50));
+                                        println!("Perl execution time:  {:.4} seconds", perl_duration.as_secs_f64());
+                                        println!("Bash execution time:  {:.4} seconds", bash_duration.as_secs_f64());
+                                        
+                                        let speedup = if perl_duration.as_secs_f64() > 0.0 {
+                                            bash_duration.as_secs_f64() / perl_duration.as_secs_f64()
+                                        } else {
+                                            0.0
+                                        };
+                                        
+                                        if speedup > 1.0 {
+                                            println!("Perl is {:.2}x faster than Bash", speedup);
+                                        } else if speedup > 0.0 {
+                                            println!("Bash is {:.2}x faster than Perl", 1.0 / speedup);
+                                        } else {
+                                            println!("Cannot calculate speedup (Perl execution time was 0)");
+                                        }
+                                        
+                                        // Display diff output
+                                        println!("\n{}", "=".repeat(50));
+                                        println!("OUTPUT COMPARISON");
+                                        println!("{}", "=".repeat(50));
+                                        
+                                        let stdout_match = perl_stdout.trim() == bash_stdout.trim();
+                                        let stderr_match = perl_stderr.trim() == bash_stderr.trim();
+                                        let exit_match = perl_out.status.code() == bash_out.status.code();
+                                        
+                                        if stdout_match && stderr_match && exit_match {
+                                            println!("✓ PERFECT MATCH: Perl and Bash outputs are identical!");
+                                        } else {
+                                            println!("✗ DIFFERENCES FOUND:");
+                                            
+                                            if !stdout_match {
+                                                println!("\nSTDOUT DIFFERENCES:");
+                                                println!("{}", generate_unified_diff(&bash_stdout, &perl_stdout, "bash_stdout", "perl_stdout"));
+                                            }
+                                            
+                                            if !stderr_match {
+                                                println!("\nSTDERR DIFFERENCES:");
+                                                println!("{}", generate_unified_diff(&bash_stderr, &perl_stderr, "bash_stderr", "perl_stderr"));
+                                            }
+                                            
+                                            if !exit_match {
+                                                println!("\nEXIT CODE DIFFERENCES:");
+                                                println!("Bash exit code: {:?}", bash_out.status.code());
+                                                println!("Perl exit code: {:?}", perl_out.status.code());
+                                            }
+                                        }
+                                    }
+                                    (Ok(perl_out), Err(bash_err)) => {
+                                        // Perl succeeded but bash failed
+                                        if !perl_out.stdout.is_empty() {
+                                            print!("{}", String::from_utf8_lossy(&perl_out.stdout));
+                                        }
+                                        if !perl_out.stderr.is_empty() {
+                                            eprint!("{}", String::from_utf8_lossy(&perl_out.stderr));
+                                        }
+                                        println!("Exit code: {}", perl_out.status);
+                                        println!("\nBash execution failed: {}", bash_err);
+                                    }
+                                    (Err(perl_err), Ok(bash_out)) => {
+                                        // Bash succeeded but Perl failed
+                                        println!("Perl execution failed: {}", perl_err);
+                                        if !bash_out.stdout.is_empty() {
+                                            print!("Bash output: {}", String::from_utf8_lossy(&bash_out.stdout));
+                                        }
+                                        if !bash_out.stderr.is_empty() {
+                                            eprint!("Bash stderr: {}", String::from_utf8_lossy(&bash_out.stderr));
+                                        }
+                                        println!("Bash exit code: {}", bash_out.status);
+                                    }
+                                    (Err(perl_err), Err(bash_err)) => {
+                                        // Both failed
+                                        println!("Perl execution failed: {}", perl_err);
+                                        println!("Bash execution failed: {}", bash_err);
+                                    }
+                                }
+                                
+                                // Clean up temporary file
                                 let _ = fs::remove_file(tmp);
                             }
                         }

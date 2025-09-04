@@ -28,6 +28,7 @@ fn escape_glob_pattern(pattern: &str) -> String {
             '|' => result.push_str("\\|"),
             '{' => result.push_str("\\{"),
             '}' => result.push_str("\\}"),
+            '/' => result.push_str("\\/"),
             _ => result.push(*c)
         }
     }
@@ -67,14 +68,54 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     let mut ls_format = false;
     let mut not_paths = Vec::new();
     
+    // First, reconstruct split arguments (e.g., "-s" + "ize" = "-size")
+    let mut reconstructed_args = Vec::new();
     let mut i = 0;
     while i < cmd.args.len() {
-        match &cmd.args[i] {
+        if let Word::Literal(s, _) = &cmd.args[i] {
+            // Check if this is a split argument that needs reconstruction
+            if (s == "-s" || s == "-e" || s == "-p" || s == "-n") && i + 1 < cmd.args.len() {
+                if let Word::Literal(next_s, _) = &cmd.args[i + 1] {
+                    // Reconstruct common find arguments
+                    match (s.as_str(), next_s.as_str()) {
+                        ("-s", "ize") => {
+                            reconstructed_args.push(Word::Literal("-size".to_string(), None));
+                            i += 2;
+                            continue;
+                        },
+                        ("-e", "mpty") => {
+                            reconstructed_args.push(Word::Literal("-empty".to_string(), None));
+                            i += 2;
+                            continue;
+                        },
+                        ("-p", "ath") => {
+                            reconstructed_args.push(Word::Literal("-path".to_string(), None));
+                            i += 2;
+                            continue;
+                        },
+                        ("-n", "ot") => {
+                            reconstructed_args.push(Word::Literal("-not".to_string(), None));
+                            i += 2;
+                            continue;
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+        reconstructed_args.push(cmd.args[i].clone());
+        i += 1;
+    }
+    
+    // Now parse the reconstructed arguments
+    let mut i = 0;
+    while i < reconstructed_args.len() {
+        match &reconstructed_args[i] {
             Word::Literal(s, _) => {
                 match s.as_str() {
                     "-name" => {
-                        if i + 1 < cmd.args.len() {
-                            if let Word::StringInterpolation(interp, _) = &cmd.args[i + 1] {
+                        if i + 1 < reconstructed_args.len() {
+                            if let Word::StringInterpolation(interp, _) = &reconstructed_args[i + 1] {
                                 let pattern = interp.parts.iter()
                                     .map(|part| match part {
                                         StringPart::Literal(s) => s.clone(),
@@ -87,32 +128,32 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                         }
                     },
                     "-type" => {
-                        if i + 1 < cmd.args.len() {
-                            if let Word::Literal(type_str, _) = &cmd.args[i + 1] {
+                        if i + 1 < reconstructed_args.len() {
+                            if let Word::Literal(type_str, _) = &reconstructed_args[i + 1] {
                                 file_type = Some(type_str.clone());
                             }
                             i += 1;
                         }
                     },
                     "-mtime" => {
-                        if i + 1 < cmd.args.len() {
-                            if let Word::Literal(time_str, _) = &cmd.args[i + 1] {
+                        if i + 1 < reconstructed_args.len() {
+                            if let Word::Literal(time_str, _) = &reconstructed_args[i + 1] {
                                 mtime_days = Some(time_str.clone());
                             }
                             i += 1;
                         }
                     },
                     "-mmin" => {
-                        if i + 1 < cmd.args.len() {
-                            if let Word::Literal(min_str, _) = &cmd.args[i + 1] {
+                        if i + 1 < reconstructed_args.len() {
+                            if let Word::Literal(min_str, _) = &reconstructed_args[i + 1] {
                                 mmin_minutes = Some(min_str.clone());
                             }
                             i += 1;
                         }
                     },
                     "-size" => {
-                        if i + 1 < cmd.args.len() {
-                            if let Word::Literal(size_str, _) = &cmd.args[i + 1] {
+                        if i + 1 < reconstructed_args.len() {
+                            if let Word::Literal(size_str, _) = &reconstructed_args[i + 1] {
                                 size_spec = Some(size_str.clone());
                             }
                             i += 1;
@@ -125,23 +166,32 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                         // Collect exec command arguments until semicolon
                         let mut exec_args = Vec::new();
                         i += 1;
-                        while i < cmd.args.len() {
-                            if let Word::Literal(exec_arg, _) = &cmd.args[i] {
-                                if exec_arg == ";" {
+                        while i < reconstructed_args.len() {
+                            if let Word::Literal(exec_arg, _) = &reconstructed_args[i] {
+                                // Check for various semicolon terminators
+                                if exec_arg == ";" || exec_arg == "\\;" {
                                     break;
                                 }
-                                exec_args.push(exec_arg.clone());
-                            } else if let Word::BraceExpansion(be, _) = &cmd.args[i] {
-                                // Handle {} placeholder
-                                if be.items.len() == 1 {
-                                    if let BraceItem::Literal(s) = &be.items[0] {
-                                        if s == "{}" {
-                                            exec_args.push("{}".to_string());
+                                // Also check for backslash followed by semicolon as separate tokens
+                                if exec_arg == "\\" && i + 1 < reconstructed_args.len() {
+                                    if let Word::Literal(next_arg, _) = &reconstructed_args[i + 1] {
+                                        if next_arg == ";" {
+                                            i += 1; // Skip the semicolon
+                                            break;
                                         }
                                     }
                                 }
+                                // Check for end of arguments (no semicolon found)
+                                if exec_arg == "\\" && i + 1 >= reconstructed_args.len() {
+                                    // Assume this is the end of exec command (missing semicolon)
+                                    break;
+                                }
+                                exec_args.push(exec_arg.clone());
+                            } else if let Word::BraceExpansion(be, _) = &reconstructed_args[i] {
+                                // Handle {} placeholder - even if empty
+                                exec_args.push("{}".to_string());
                             } else {
-                                exec_args.push(generator.word_to_perl(&cmd.args[i]));
+                                exec_args.push(generator.word_to_perl(&reconstructed_args[i]));
                             }
                             i += 1;
                         }
@@ -153,10 +203,10 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                         ls_format = true;
                     },
                     "-not" => {
-                        if i + 1 < cmd.args.len() && i + 2 < cmd.args.len() {
-                            if let Word::Literal(not_arg, _) = &cmd.args[i + 1] {
+                        if i + 1 < reconstructed_args.len() && i + 2 < reconstructed_args.len() {
+                            if let Word::Literal(not_arg, _) = &reconstructed_args[i + 1] {
                                 if not_arg == "-path" {
-                                    if let Word::StringInterpolation(interp, _) = &cmd.args[i + 2] {
+                                    if let Word::StringInterpolation(interp, _) = &reconstructed_args[i + 2] {
                                         let path_pattern = interp.parts.iter()
                                 .map(|part| match part {
                                                 StringPart::Literal(s) => s.clone(),
@@ -225,6 +275,14 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     
     output.push_str(&indent4);
     output.push_str("my $full_path = \"$dir/$file\";\n");
+    
+    // Recursive call for directories (do this first, before filtering)
+    output.push_str(&indent4);
+    output.push_str("if (-d $full_path) {\n");
+    output.push_str(&format!("{}    ", indent4));
+    output.push_str(&format!("{}($full_path, $results);\n", subroutine_name));
+    output.push_str(&indent4);
+    output.push_str("}\n");
     
     // Add file type check
     if let Some(ftype) = &file_type {
@@ -309,12 +367,14 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     if let Some(size) = &size_spec {
         if size.starts_with('+') {
             let size_val = &size[1..];
+            let size_bytes = parse_size_to_bytes(size_val);
             output.push_str(&indent4);
-            output.push_str(&format!("next unless -s $full_path > {};\n", size_val));
+            output.push_str(&format!("next unless (stat($full_path))[7] > {};\n", size_bytes));
         } else if size.starts_with('-') {
             let size_val = &size[1..];
+            let size_bytes = parse_size_to_bytes(size_val);
             output.push_str(&indent4);
-            output.push_str(&format!("next unless -s $full_path < {};\n", size_val));
+            output.push_str(&format!("next unless (stat($full_path))[7] < {};\n", size_bytes));
         }
     }
     
@@ -383,14 +443,6 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
             output.push_str("push @$results, $full_path;\n");
         }
     }
-    
-    // Recursive call for directories
-    output.push_str(&indent4);
-    output.push_str("if (-d $full_path) {\n");
-    output.push_str(&format!("{}    ", indent4));
-    output.push_str(&format!("{}($full_path, $results);\n", subroutine_name));
-    output.push_str(&indent4);
-    output.push_str("}\n");
     
     output.push_str(&indent3);
     output.push_str("}\n");
@@ -474,3 +526,28 @@ fn generate_system_find_fallback(generator: &mut Generator, cmd: &SimpleCommand,
     
     output
 }
+
+fn parse_size_to_bytes(size_str: &str) -> u64 {
+    if size_str.is_empty() {
+        return 0;
+    }
+    
+    let (number_part, unit) = if size_str.ends_with('c') {
+        (&size_str[..size_str.len()-1], 1) // bytes
+    } else if size_str.ends_with('w') {
+        (&size_str[..size_str.len()-1], 2) // 2-byte words
+    } else if size_str.ends_with('b') {
+        (&size_str[..size_str.len()-1], 512) // 512-byte blocks
+    } else if size_str.ends_with('k') || size_str.ends_with('K') {
+        (&size_str[..size_str.len()-1], 1024) // kilobytes
+    } else if size_str.ends_with('M') {
+        (&size_str[..size_str.len()-1], 1024 * 1024) // megabytes
+    } else if size_str.ends_with('G') {
+        (&size_str[..size_str.len()-1], 1024 * 1024 * 1024) // gigabytes
+    } else {
+        (size_str, 1) // default to bytes
+    };
+    
+    number_part.parse::<u64>().unwrap_or(0) * unit
+}
+

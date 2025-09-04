@@ -2,6 +2,10 @@ use crate::ast::*;
 use crate::generator::Generator;
 
 pub fn generate_xargs_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+    generate_xargs_command_with_output(_generator, cmd, input_var, command_index, &format!("xargs_result_{}", command_index))
+}
+
+pub fn generate_xargs_command_with_output(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
     let mut output = String::new();
     
     let mut command = "echo";
@@ -50,9 +54,9 @@ pub fn generate_xargs_command(_generator: &mut Generator, cmd: &SimpleCommand, i
         output.push_str("}\n");
         output.push_str("}\n");
         // Write into a result variable expected by the pipeline
-        output.push_str(&format!("my $xargs_result_{} = join(\"\\n\", @xargs_matching_files_{});\n", command_index, command_index));
+        output.push_str(&format!("${} = join(\"\\n\", @xargs_matching_files_{});\n", output_var, command_index));
         // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("$xargs_result_{} .= \"\\n\" unless $xargs_result_{} =~ /\\n$/;\n", command_index, command_index));
+        output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", output_var, output_var));
     } else {
         // Fallback to system command for other cases
         output.push_str(&format!("${} = `echo \"${}\" | {}`;\n", input_var, input_var, command));

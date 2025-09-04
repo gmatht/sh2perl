@@ -25,6 +25,8 @@ pub struct TestResult {
     pub ast: String,
     pub _lexer_output: String, // Unused field, prefixed with underscore
     pub failure_reason: String, // Reason for test failure
+    pub shell_duration: std::time::Duration, // Shell execution time
+    pub translated_duration: std::time::Duration, // Translated program execution time
 }
 
 #[derive(Debug, Clone)]
@@ -324,9 +326,12 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
     }
     
     // If no cached output, we need to run the shell script
+    let mut shell_duration = std::time::Duration::from_secs(0);
     if shell_output.is_none() {
         // Run the shell script and cache the output
+        let start = std::time::Instant::now();
         let output = run_shell_script(filename)?;
+        shell_duration = start.elapsed();
         
         // Cache the output
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -434,8 +439,8 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
     // Get the shell output (either cached or fresh)
     let shell_output = shell_output.unwrap();
 
-    // Run translated program
-    let translated_output = {
+    // Run translated program with timing
+    let (translated_output, translated_duration) = {
         if lang == "rust" {
             // Run compiled binary directly (first arg of run_cmd)
             let bin = "__tmp_test_bin";
@@ -455,7 +460,8 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
                     Err(_) => break child.wait_with_output().unwrap(),
                 }
             };
-            out
+            let duration = start.elapsed();
+            (out, duration)
         } else {
             let mut cmd = Command::new(&run_cmd[0]);
             
@@ -489,7 +495,8 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
                     Err(_) => break child.wait_with_output().unwrap(),
                 }
             };
-            out
+            let duration = start.elapsed();
+            (out, duration)
         }
     };
 
@@ -562,6 +569,8 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
         ast,
         _lexer_output: String::new(), // No lexer output for detailed test
         failure_reason,
+        shell_duration,
+        translated_duration,
     })
 }
 
@@ -986,6 +995,27 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                         println!("\nExit Code Comparison (IGNORED):");
                         println!("Shell script exit code: {}", result.shell_exit);
                         println!("Translated code exit code: {}", result.translated_exit);
+                        
+                        // Show timing information
+                        println!("\n{}", "=".repeat(80));
+                        println!("TIMING COMPARISON");
+                        println!("{}", "=".repeat(80));
+                        println!("Shell execution time:  {:.4} seconds", result.shell_duration.as_secs_f64());
+                        println!("Perl execution time:   {:.4} seconds", result.translated_duration.as_secs_f64());
+                        
+                        let speedup = if result.translated_duration.as_secs_f64() > 0.0 {
+                            result.shell_duration.as_secs_f64() / result.translated_duration.as_secs_f64()
+                        } else {
+                            0.0
+                        };
+                        
+                        if speedup > 1.0 {
+                            println!("Perl is {:.2}x faster than Shell", speedup);
+                        } else if speedup > 0.0 {
+                            println!("Shell is {:.2}x faster than Perl", 1.0 / speedup);
+                        } else {
+                            println!("Cannot calculate speedup (Perl execution time was 0)");
+                        }
                         
                         // Show original code
                         println!("\n{}", "=".repeat(80));

@@ -1,9 +1,10 @@
 #!/bin/bash
 
-echo "To run this test: ./fail FAILING_TEST_NUMBER"
-echo "To run a specific test: ./fail TEST_NUMBER"
+echo "To run this test: ./fail FAILING_TEST_PREFIX"
+echo "To run a specific test: ./fail TEST_PREFIX"
+echo "Examples: ./fail 062_02, ./fail 044, ./fail find"
 
-git stash push examples ./f.bat ./fail.bat ./fail ./src/main.rs src/testing.rs src/execution.rs
+#git stash push examples ./fail.bat ./fail ./src/main.rs src/testing.rs src/execution.rs
 cargo run --bin debashc -- fail "$@"
 
 # Note: The Windows-specific powershell command for simulating keypresses

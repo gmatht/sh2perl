@@ -2,14 +2,22 @@ use crate::ast::*;
 use crate::generator::Generator;
 
 pub fn generate_tr_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, linebyline: bool) -> String {
+    generate_tr_command_with_output(generator, cmd, input_var, command_index, linebyline, &format!("tr_result_{}", command_index))
+}
+
+pub fn generate_tr_command_with_output(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, linebyline: bool, output_var: &str) -> String {
     if linebyline {
-        generate_tr_linebyline_impl(generator, cmd, input_var, command_index)
+        generate_tr_linebyline_impl_with_output(generator, cmd, input_var, command_index, output_var)
     } else {
-        generate_tr_buffered_impl(generator, cmd, input_var, command_index)
+        generate_tr_buffered_impl_with_output(generator, cmd, input_var, command_index, output_var)
     }
 }
 
-fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str) -> String {
+    generate_tr_linebyline_impl_with_output(generator, cmd, input_var, _command_index, input_var)
+}
+
+fn generate_tr_linebyline_impl_with_output(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str, output_var: &str) -> String {
     let mut output = String::new();
     
     // tr command syntax: tr [OPTION]... SET1 [SET2]
@@ -34,14 +42,20 @@ fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, i
         let set1 = generator.strip_shell_quotes_for_regex(&args[0]);
         
         // For line-by-line, process the line directly
-        output.push_str(&format!("${} =~ tr/{}/ /d;\n", input_var, set1));
+        if input_var != output_var {
+            output.push_str(&format!("${} = ${};\n", output_var, input_var));
+        }
+        output.push_str(&format!("${} =~ tr/{}/ /d;\n", output_var, set1));
     } else if args.len() >= 2 {
         // tr SET1 SET2: translate characters
         let set1 = generator.strip_shell_quotes_for_regex(&args[0]);
         let set2 = generator.strip_shell_quotes_for_regex(&args[1]);
         
         // For line-by-line, process the line directly
-        output.push_str(&format!("${} =~ tr/{}/{}/;\n", input_var, set1, set2));
+        if input_var != output_var {
+            output.push_str(&format!("${} = ${};\n", output_var, input_var));
+        }
+        output.push_str(&format!("${} =~ tr/{}/{}/;\n", output_var, set1, set2));
     }
     // No valid arguments - line passes through unchanged
     
@@ -49,6 +63,10 @@ fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, i
 }
 
 fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+    generate_tr_buffered_impl_with_output(generator, cmd, input_var, command_index, &format!("tr_result_{}", command_index))
+}
+
+fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
     let mut output = String::new();
     
     // tr command syntax: tr [OPTION]... SET1 [SET2]
@@ -76,14 +94,14 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
         output.push_str(&format!("my $input = ${};\n", input_var));
         
         // Delete characters in SET1 from input
-        output.push_str(&format!("my $tr_result_{} = '';\n", command_index));
+        output.push_str(&format!("${} = '';\n", output_var));
         output.push_str("for my $char (split //, $input) {\n");
         output.push_str("    if (index($set1, $char) == -1) {\n");
-        output.push_str(&format!("        $tr_result_{} .= $char;\n", command_index));
+        output.push_str(&format!("        ${} .= $char;\n", output_var));
         output.push_str("    }\n");
         output.push_str("}\n");
         // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("$tr_result_{} .= \"\\n\" unless $tr_result_{} =~ /\\n$/ || $tr_result_{} eq '';\n", command_index, command_index, command_index));
+        output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/ || ${} eq '';\n", output_var, output_var, output_var));
     } else if args.len() >= 2 {
         // tr SET1 SET2: translate characters
         let set1 = generator.strip_shell_quotes_and_convert_to_perl(&args[0]);
@@ -94,21 +112,22 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
         output.push_str(&format!("my $input = ${};\n", input_var));
         
         // Character-by-character translation
-        output.push_str(&format!("my $tr_result_{} = '';\n", command_index));
+        output.push_str(&format!("${} = '';\n", output_var));
         output.push_str("for my $char (split //, $input) {\n");
         output.push_str("    my $pos = index($set1, $char);\n");
         output.push_str("    if ($pos >= 0 && $pos < length($set2)) {\n");
-        output.push_str(&format!("        $tr_result_{} .= substr($set2, $pos, 1);\n", command_index));
+        output.push_str(&format!("        ${} .= substr($set2, $pos, 1);\n", output_var));
         output.push_str("    } else {\n");
-        output.push_str(&format!("        $tr_result_{} .= $char;\n", command_index));
+        output.push_str(&format!("        ${} .= $char;\n", output_var));
         output.push_str("    }\n");
         output.push_str("}\n");
         // Ensure output ends with newline to match shell behavior (but not for empty input)
-        output.push_str(&format!("$tr_result_{} .= \"\\n\" unless $tr_result_{} =~ /\\n$/ || $tr_result_{} eq '';\n", command_index, command_index, command_index));
+        output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/ || ${} eq '';\n", output_var, output_var, output_var));
     } else {
         // No valid arguments, just pass through input
-        output.push_str(&format!("${} = ${};\n", input_var, input_var));
+        output.push_str(&format!("${} = ${};\n", output_var, input_var));
     }
     
     output
 }
+
