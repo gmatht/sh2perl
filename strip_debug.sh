@@ -37,7 +37,7 @@ for file in "${rust_files[@]}"; do
             if [[ "$line" =~ eprintln!.*DEBUG: ]] && [[ ! "$line" =~ ^[[:space:]]*// ]]; then
                 # Comment out the line by adding // at the beginning
                 echo "// $line" >> "$temp_file"
-                ((line_count++))
+                line_count=$((line_count + 1))
                 echo -e "  ${GREEN}Commented: $line${NC}"
             else
                 # Keep the line as is
@@ -49,7 +49,7 @@ for file in "${rust_files[@]}"; do
         if [[ $line_count -gt 0 ]]; then
             if mv "$temp_file" "$file" 2>/dev/null; then
                 echo -e "  ${GREEN}Modified $file: $line_count DEBUG lines commented${NC}"
-                ((total_lines += line_count))
+                total_lines=$((total_lines + line_count))
             else
                 echo -e "  ${RED}Error: Failed to update $file${NC}"
                 rm -f "$temp_file"
@@ -59,7 +59,7 @@ for file in "${rust_files[@]}"; do
             echo -e "  ${BLUE}No changes needed in $file${NC}"
         fi
         
-        ((total_files++))
+        total_files=$((total_files + 1))
     fi
 done
 

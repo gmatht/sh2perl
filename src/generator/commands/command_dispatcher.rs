@@ -26,12 +26,12 @@ pub fn generate_command_impl(generator: &mut Generator, command: &Command, in_st
 }
 
 pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Command, in_stdout_context: bool, input_data: Option<&str>) -> String {
-    eprintln!("DEBUG: generate_command_impl called with command: {:?}, in_stdout_context: {}", command, in_stdout_context);
+//     eprintln!("DEBUG: generate_command_impl called with command: {:?}, in_stdout_context: {}", command, in_stdout_context);
     match command {
         Command::Simple(cmd) => {
-            eprintln!("DEBUG: Dispatching Simple command: {:?}", cmd);
+//             eprintln!("DEBUG: Dispatching Simple command: {:?}", cmd);
             let result = generator.generate_simple_command(cmd);
-            eprintln!("DEBUG: Simple command result: {}", result);
+//             eprintln!("DEBUG: Simple command result: {}", result);
             result
         },
         Command::ShoptCommand(cmd) => generator.generate_shopt_command(cmd),
@@ -39,7 +39,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
             generator.generate_test_expression(test_expr)
         },
         Command::Pipeline(pipeline) => {
-            eprintln!("DEBUG: Found Pipeline, commands: {:?}", pipeline.commands);
+//             eprintln!("DEBUG: Found Pipeline, commands: {:?}", pipeline.commands);
             // This is now a pure pipe pipeline since logical operators are handled separately
             if pipeline.commands.len() == 1 {
                 // Single command in pipeline, just generate it
@@ -71,19 +71,19 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
         Command::Return(value) => generator.generate_return_statement(value),
         Command::BlankLine => "\n".to_string(),
         Command::Redirect(redirect_cmd) => {
-            eprintln!("DEBUG: Processing Redirect command with {} redirects", redirect_cmd.redirects.len());
+//             eprintln!("DEBUG: Processing Redirect command with {} redirects", redirect_cmd.redirects.len());
             
                     // Check if the base command is a Pipeline with logical operators
         let (all_redirects, base_command) = collect_all_redirects(command);
-        eprintln!("DEBUG: Collected {} total redirects from nested structure", all_redirects.len());
+//         eprintln!("DEBUG: Collected {} total redirects from nested structure", all_redirects.len());
         
         // If the base command is a Pipeline with logical operators, handle it specially
-        eprintln!("DEBUG: Base command type: {:?}", std::mem::discriminant(&base_command));
+//         eprintln!("DEBUG: Base command type: {:?}", std::mem::discriminant(&base_command));
         if let Command::Pipeline(pipeline) = &base_command {
-            eprintln!("DEBUG: Found Pipeline, commands: {:?}", pipeline.commands);
+//             eprintln!("DEBUG: Found Pipeline, commands: {:?}", pipeline.commands);
             // This is now a pure pipe pipeline since logical operators are handled separately
             if pipeline.commands.len() == 1 {
-                eprintln!("DEBUG: Found Pipeline with logical operators inside Redirect, delegating to pipeline generator");
+//                 eprintln!("DEBUG: Found Pipeline with logical operators inside Redirect, delegating to pipeline generator");
                 return generator.generate_pipeline(pipeline);
             }
         }
@@ -91,12 +91,12 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
         // Check if the command structure contains a Pipeline with logical operators
         // This handles the case where the parser didn't correctly identify the || operator
         if let Command::Redirect(redirect_cmd) = command {
-            eprintln!("DEBUG: Checking RedirectCommand for nested Pipeline with logical operators");
+//             eprintln!("DEBUG: Checking RedirectCommand for nested Pipeline with logical operators");
             if let Command::Pipeline(pipeline) = &*redirect_cmd.command {
-                eprintln!("DEBUG: Found Pipeline in nested Redirect, commands: {:?}", pipeline.commands);
+//                 eprintln!("DEBUG: Found Pipeline in nested Redirect, commands: {:?}", pipeline.commands);
                 // This is now a pure pipe pipeline since logical operators are handled separately
                 if pipeline.commands.len() > 1 {
-                    eprintln!("DEBUG: Delegating to pipeline generator for logical operators");
+//                     eprintln!("DEBUG: Delegating to pipeline generator for logical operators");
                     return generator.generate_pipeline(pipeline);
                 }
             }
@@ -128,7 +128,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
             for redirect in &all_redirects {
                 match &redirect.operator {
                     RedirectOperator::HereString => {
-                        eprintln!("DEBUG: Found HereString redirect, heredoc_body: {:?}", redirect.heredoc_body);
+//                         eprintln!("DEBUG: Found HereString redirect, heredoc_body: {:?}", redirect.heredoc_body);
                         has_here_string = true;
                         if let Some(content) = &redirect.heredoc_body {
                             // The content is already a string, just use it directly
@@ -225,7 +225,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     
                     // Special handling for comm command with process substitution
                     if cmd_name == "comm" && !process_sub_files.is_empty() {
-                        eprintln!("DEBUG: Handling comm command with {} process substitution files", process_sub_files.len());
+//                         eprintln!("DEBUG: Handling comm command with {} process substitution files", process_sub_files.len());
                         if process_sub_files.len() >= 2 {
                             let file1 = &process_sub_files[0];
                             let file2 = &process_sub_files[1];
@@ -351,7 +351,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     
                     // Special handling for mapfile command with process substitution
                     if cmd_name == "mapfile" && !process_sub_files.is_empty() {
-                        eprintln!("DEBUG: Handling mapfile command with {} process substitution files", process_sub_files.len());
+//                         eprintln!("DEBUG: Handling mapfile command with {} process substitution files", process_sub_files.len());
                         if process_sub_files.len() >= 1 {
                             let input_file = &process_sub_files[0];
                             
@@ -394,7 +394,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     
                     // For grep with here-string, pass the here-string content
                     if cmd_name == "grep" && has_here_string {
-                        eprintln!("DEBUG: Generating grep with here-string, content: {}", here_string_content);
+//                         eprintln!("DEBUG: Generating grep with here-string, content: {}", here_string_content);
                         let mut grep_cmd = cmd.clone();
                         // Create a temporary variable for the here-string content
                         let temp_var = format!("here_string_content_{}", generator.get_unique_file_handle());
@@ -407,7 +407,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                         let modified_output = specific_output;
                         result.push_str(&modified_output);
                         
-                        eprintln!("DEBUG: Final grep result: {}", result);
+//                         eprintln!("DEBUG: Final grep result: {}", result);
                         return result;
                     }
                     
@@ -423,7 +423,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                         });
                         
                         if has_f_flag && process_sub_files.len() >= 1 {
-                            eprintln!("DEBUG: Handling grep -f command with {} process substitution files", process_sub_files.len());
+//                             eprintln!("DEBUG: Handling grep -f command with {} process substitution files", process_sub_files.len());
                             let pattern_file = &process_sub_files[0];
                             
                             // Create a modified grep command that uses the temporary file as the pattern file
@@ -435,25 +435,25 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                                     if s == "-f" {
                                         // Insert the file argument after the -f flag
                                         modified_grep_cmd.args.insert(i + 1, Word::literal(format!("${}", pattern_file.0)));
-                                        eprintln!("DEBUG: Inserted file argument: ${} at position {}", pattern_file.0, i + 1);
+//                                         eprintln!("DEBUG: Inserted file argument: ${} at position {}", pattern_file.0, i + 1);
                                         break;
                                     }
                                 }
                             }
                             
                             let input_var = input_data.unwrap_or("input_data");
-                            eprintln!("DEBUG: Calling generate_grep_command with input_var: {}", input_var);
+//                             eprintln!("DEBUG: Calling generate_grep_command with input_var: {}", input_var);
                             let specific_output = generate_grep_command(generator, &modified_grep_cmd, input_var, "0", true);
                             result.push_str(&specific_output);
                             
-                            eprintln!("DEBUG: Final grep -f result: {}", result);
+//                             eprintln!("DEBUG: Final grep -f result: {}", result);
                             return result;
                         }
                     }
                     
                     // Special handling for diff command with process substitution
                     if cmd_name == "diff" && !process_sub_files.is_empty() {
-                        eprintln!("DEBUG: Handling diff command with {} process substitution files", process_sub_files.len());
+//                         eprintln!("DEBUG: Handling diff command with {} process substitution files", process_sub_files.len());
                         if process_sub_files.len() >= 2 {
                             let file1 = &process_sub_files[0];
                             let file2 = &process_sub_files[1];
@@ -474,7 +474,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     
                     // Special handling for paste command with process substitution
                     if cmd_name == "paste" && !process_sub_files.is_empty() {
-                        eprintln!("DEBUG: Handling paste command with {} process substitution files", process_sub_files.len());
+//                         eprintln!("DEBUG: Handling paste command with {} process substitution files", process_sub_files.len());
                         if process_sub_files.len() >= 2 {
                             let file1 = &process_sub_files[0];
                             let file2 = &process_sub_files[1];
@@ -491,7 +491,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
             
             // For other commands, generate normally but don't call recursively
             // Instead, generate the base command directly
-            eprintln!("DEBUG: Generating base command for redirect, has_here_string: {}, command: {:?}", has_here_string, &base_command);
+//             eprintln!("DEBUG: Generating base command for redirect, has_here_string: {}, command: {:?}", has_here_string, &base_command);
             
             // Check if we have output redirects that need to be wrapped in a local STDOUT block
             let has_output_redirect = all_redirects.iter().any(|r| {
@@ -549,7 +549,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     
                     // Special handling for grep -f with process substitution
                     if let Word::Literal(cmd_name, _) = &cmd.name {
-                        eprintln!("DEBUG: Processing simple command: {}", cmd_name);
+//                         eprintln!("DEBUG: Processing simple command: {}", cmd_name);
                         if cmd_name == "grep" {
                             // Check if this is a grep -f command
                             let has_f_flag = cmd.args.iter().any(|arg| {
@@ -560,10 +560,10 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                                 }
                             });
                             
-                            eprintln!("DEBUG: has_f_flag: {}, process_sub_files.len(): {}", has_f_flag, process_sub_files.len());
+//                             eprintln!("DEBUG: has_f_flag: {}, process_sub_files.len(): {}", has_f_flag, process_sub_files.len());
                             
                             if has_f_flag && !process_sub_files.is_empty() {
-                                eprintln!("DEBUG: Handling grep -f redirect command with {} process substitution files", process_sub_files.len());
+//                                 eprintln!("DEBUG: Handling grep -f redirect command with {} process substitution files", process_sub_files.len());
                                 let pattern_file = &process_sub_files[0];
                                 
                                 // Create a modified grep command that uses the temporary file as the pattern file
@@ -575,19 +575,19 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                                         if s == "-f" {
                                             // Insert the file argument after the -f flag
                                             modified_grep_cmd.args.insert(i + 1, Word::literal(format!("${}", pattern_file.0)));
-                                            eprintln!("DEBUG: Inserted file argument: ${}", pattern_file.0);
-                                            eprintln!("DEBUG: Modified grep command args: {:?}", modified_grep_cmd.args);
+//                                             eprintln!("DEBUG: Inserted file argument: ${}", pattern_file.0);
+//                                             eprintln!("DEBUG: Modified grep command args: {:?}", modified_grep_cmd.args);
                                             break;
                                         }
                                     }
                                 }
                                 
                                 let input_var = input_data.unwrap_or("input_data");
-                                eprintln!("DEBUG: Calling generate_grep_command with input_var: {}", input_var);
+//                                 eprintln!("DEBUG: Calling generate_grep_command with input_var: {}", input_var);
                                 let specific_output = generate_grep_command(generator, &modified_grep_cmd, input_var, "0", true);
                                 result.push_str(&specific_output);
                                 
-                                eprintln!("DEBUG: Final grep -f redirect result: {}", result);
+//                                 eprintln!("DEBUG: Final grep -f redirect result: {}", result);
                                 return result;
                             } else if has_f_flag {
                                 // Try to find the temporary file variable from the generated redirects
@@ -595,12 +595,12 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                                 let lines: Vec<&str> = result.lines().collect();
                                 for line in &lines {
                                     if line.contains("temp_file_ps_") && line.contains("=") {
-                                        eprintln!("DEBUG: Examining line for temp file: {}", line);
+//                                         eprintln!("DEBUG: Examining line for temp file: {}", line);
                                         if let Some(start) = line.find("$temp_file_ps_") {
                                             let var_part = &line[start..];
                                             if let Some(end) = var_part.find([' ', ';', '\'', '=']) {
                                                 let temp_var = &var_part[..end];
-                                                eprintln!("DEBUG: Found process substitution temp file variable: {}", temp_var);
+//                                                 eprintln!("DEBUG: Found process substitution temp file variable: {}", temp_var);
                                                 
                                                 // Create a modified grep command that uses the temporary file
                                                 let mut modified_grep_cmd = cmd.clone();
@@ -609,13 +609,13 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                                                 let specific_output = generate_grep_command(generator, &modified_grep_cmd, "input_data", "0", true);
                                                 result.push_str(&specific_output);
                                                 
-                                                eprintln!("DEBUG: Final grep -f redirect result with found temp file: {}", result);
+//                                                 eprintln!("DEBUG: Final grep -f redirect result with found temp file: {}", result);
                                                 return result;
                                             }
                                         }
                                     }
                                 }
-                                eprintln!("DEBUG: No temp_file_ps_ variable found in result: {}", result);
+//                                 eprintln!("DEBUG: No temp_file_ps_ variable found in result: {}", result);
                                 
                                 // If we can't find the temp file, fall back to generating an error
                                 result.push_str("warn \"grep: no pattern specified\";\n");
@@ -645,7 +645,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                 result.push_str(&generator.indent());
                 result.push_str("}\n");
             }
-            eprintln!("DEBUG: Final redirect result: {}", result);
+//             eprintln!("DEBUG: Final redirect result: {}", result);
             result
         }
     }

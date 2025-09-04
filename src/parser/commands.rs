@@ -245,7 +245,7 @@ impl Parser {
                 Some(Token::TestBracket) => {
                     // Check for double-bracket test [[ ... ]] before parsing as single bracket
                     if matches!(self.lexer.peek_n(1), Some(Token::TestBracket)) {
-                        eprintln!("DEBUG: Found double brackets in parse_command, parsing as test expression");
+//                         eprintln!("DEBUG: Found double brackets in parse_command, parsing as test expression");
                         // Consume the first two [[ tokens
                         self.lexer.next();
                         self.lexer.next();
@@ -253,26 +253,26 @@ impl Parser {
                         // After parsing the test expression, check if there's a pipeline operator
                         self.lexer.skip_whitespace_and_comments();
                         let next_token = self.lexer.peek();
-                        eprintln!("DEBUG: After test expression, next token: {:?}", next_token);
+//                         eprintln!("DEBUG: After test expression, next token: {:?}", next_token);
                         if let Some(token) = next_token {
                             match token {
                                 Token::And | Token::Or | Token::Pipe => {
-                                    eprintln!("DEBUG: Found pipeline operator {:?}, parsing as pipeline", token);
+//                                     eprintln!("DEBUG: Found pipeline operator {:?}, parsing as pipeline", token);
                                     // This is part of a pipeline, parse it as such
                                     // For test expressions, we don't need to capture source text
                                     let dummy_start = 0;
                                     let result = self.parse_pipeline_from_command(test_command, dummy_start)?;
-                                    eprintln!("DEBUG: Pipeline parsing result: {:?}", result);
+//                                     eprintln!("DEBUG: Pipeline parsing result: {:?}", result);
                                     result
                                 }
                                 _ => {
-                                    eprintln!("DEBUG: No pipeline operator, returning test expression");
+//                                     eprintln!("DEBUG: No pipeline operator, returning test expression");
                                     // Just a test expression, return it
                                     test_command
                                 }
                             }
                         } else {
-                            eprintln!("DEBUG: No more tokens, returning test expression");
+//                             eprintln!("DEBUG: No more tokens, returning test expression");
                             test_command
                         }
                     } else {
@@ -401,7 +401,7 @@ impl Parser {
         
         if commands.len() == 1 {
             let result = commands.remove(0);
-            eprintln!("DEBUG: parse_pipeline_from_command returning single command: {:?}", result);
+//             eprintln!("DEBUG: parse_pipeline_from_command returning single command: {:?}", result);
             Ok(result)
         } else {
             // Capture the source text from start to current position
@@ -416,7 +416,7 @@ impl Parser {
             };
             
             let result = Command::Pipeline(Pipeline { commands, source_text, stdout_used: true, stderr_used: true });
-            eprintln!("DEBUG: parse_pipeline_from_command returning pipeline: {:?}", result);
+//             eprintln!("DEBUG: parse_pipeline_from_command returning pipeline: {:?}", result);
             Ok(result)
         }
     }
@@ -866,7 +866,7 @@ impl Parser {
                     // If we're called from double bracket detection, the [[ tokens have already been consumed
                     // If we're called for single bracket, we should see a [ token
                     let is_double_bracket = !matches!(self.lexer.peek(), Some(Token::TestBracket));
-                    eprintln!("DEBUG: parse_test_expression called, is_double_bracket: {}, current token: {:?}", is_double_bracket, self.lexer.peek());
+//                     eprintln!("DEBUG: parse_test_expression called, is_double_bracket: {}, current token: {:?}", is_double_bracket, self.lexer.peek());
                     
                     // If this is a double bracket test, we don't need to consume the opening brackets
                     // If this is a single bracket test, we need to consume the opening [
@@ -879,11 +879,11 @@ impl Parser {
         // Capture the content between brackets
         let mut expression_parts = Vec::new();
         
-        eprintln!("DEBUG: Starting to capture expression content, current token: {:?}", self.lexer.peek());
+//         eprintln!("DEBUG: Starting to capture expression content, current token: {:?}", self.lexer.peek());
         
         loop {
             let current_token = self.lexer.peek();
-            eprintln!("DEBUG: Processing token in loop: {:?}", current_token);
+//             eprintln!("DEBUG: Processing token in loop: {:?}", current_token);
             match current_token {
                 Some(Token::TestBracketClose) => {
                     if is_double_bracket {
@@ -980,18 +980,18 @@ impl Parser {
                 }
                 Some(Token::Dollar) => {
                     // Handle variable reference: $variable or regex anchor: $
-                    eprintln!("DEBUG: Found $ token, checking if followed by identifier");
+//                     eprintln!("DEBUG: Found $ token, checking if followed by identifier");
                     if let Some(Token::Identifier) = self.lexer.peek_n(1) {
                         // This is a variable reference: $variable
-                        eprintln!("DEBUG: Found identifier after $, treating as variable reference");
+//                         eprintln!("DEBUG: Found identifier after $, treating as variable reference");
                         self.lexer.next(); // consume the $
                         let identifier = self.lexer.get_identifier_text()?;
-                        eprintln!("DEBUG: Found identifier after $: {}", identifier);
+//                         eprintln!("DEBUG: Found identifier after $: {}", identifier);
                         expression_parts.push(format!("${}", identifier));
                         self.lexer.next();
                     } else {
                         // This is a regex anchor: $
-                        eprintln!("DEBUG: No identifier after $, treating as regex anchor");
+//                         eprintln!("DEBUG: No identifier after $, treating as regex anchor");
                         expression_parts.push("$".to_string());
                         self.lexer.next();
                     }
