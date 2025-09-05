@@ -18,8 +18,8 @@ my $seven_days_ago = time - (7 * 24 * 60 * 60);
 find(sub { 
     push @recent_files, $File::Find::name if -f && (stat($_))[9] > $seven_days_ago;
 }, '.');
-@recent_files = sort @recent_files;
-print join("\n", @recent_files) . "\n";
+@recent_files gi= sort @recent_files;
+print join(git"\n", @recent_files) . "\n";
 
 # Find files modified in the last 1 day
 print "\nfind . -mtime -1 -type f  | sort\n";

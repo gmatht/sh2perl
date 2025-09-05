@@ -46,6 +46,92 @@ impl Default for AstFormatOptions {
     }
 }
 
+/// Check if Perl::Critic is available in the system
+pub fn check_perl_critic_available() -> bool {
+    match Command::new("perlcritic")
+        .arg("--version")
+        .output()
+    {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Run Perl::Critic on generated Perl code with Brutal level (if enabled)
+pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
+    if !check_perl_critic_available() {
+        return Err("Perl::Critic not found in PATH. Please install it with: cpan Perl::Critic".to_string());
+    }
+
+    // Create a temporary file for the Perl code
+    let temp_file = std::env::temp_dir().join("__tmp_perl_critic_test.pl");
+    let temp_file_str = temp_file.to_string_lossy().to_string();
+    
+    // Write Perl code to temporary file
+    if let Err(e) = std::fs::write(&temp_file, perl_code) {
+        return Err(format!("Failed to write temporary Perl file: {}", e));
+    }
+
+    // Check if we have a custom configuration file
+    let config_file = "docs/perlcritic.conf";
+    let mut cmd = Command::new("perlcritic");
+    
+    if std::path::Path::new(config_file).exists() {
+        cmd.arg("--profile").arg(config_file);
+    } else {
+        cmd.arg("--brutal");
+    }
+    
+    cmd.arg("--verbose").arg("10");  // Verbose level 10 for detailed output
+    cmd.arg(&temp_file_str);
+
+    // Run Perl::Critic
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(e) => {
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_file);
+            return Err(format!("Failed to run Perl::Critic: {}", e));
+        }
+    };
+
+    // Clean up temp file
+    let _ = std::fs::remove_file(&temp_file);
+
+    // Check if Perl::Critic found any issues
+    if output.status.success() {
+        Ok("Perl::Critic: No violations found".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        
+        if stderr.is_empty() && stdout.is_empty() {
+            Ok("Perl::Critic: No violations found".to_string())
+        } else {
+            let mut result = String::new();
+            if !stderr.is_empty() {
+                result.push_str(&stderr);
+            }
+            if !stdout.is_empty() {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(&stdout);
+            }
+            Err(result)
+        }
+    }
+}
+
+/// Run Perl::Critic on generated Perl code if enabled
+pub fn run_perl_critic_if_enabled(perl_code: &str, enabled: bool) -> Result<String, String> {
+    if enabled {
+        run_perl_critic_brutal(perl_code)
+    } else {
+        Ok("Perl::Critic disabled".to_string())
+    }
+}
+
 impl AstFormatOptions {
     pub fn format_ast_with_options(&self, commands: &[debashl::Command]) -> String {
         if self.compact {
@@ -132,6 +218,10 @@ pub fn find_uses_of_system() {
 }
 
 pub fn test_file_equivalence(lang: &str, filename: &str) -> Result<(), String> {
+    test_file_equivalence_with_critic(lang, filename, false)
+}
+
+pub fn test_file_equivalence_with_critic(lang: &str, filename: &str, enable_perl_critic: bool) -> Result<(), String> {
     // Read shell script content
     let shell_content = match fs::read_to_string(filename) {
         Ok(c) => c,
@@ -152,6 +242,16 @@ pub fn test_file_equivalence(lang: &str, filename: &str) -> Result<(), String> {
             // Check PERL_MUST_NOT_CONTAIN constraints for Perl code
             if let Err(violation_msg) = check_perl_must_not_contain(&shell_content, &code) {
                 return Err(format!("PERL_MUST_NOT_CONTAIN constraint violation in {}:\n{}", filename, violation_msg));
+            }
+            
+            // Run Perl::Critic on generated code if enabled
+            match run_perl_critic_if_enabled(&code, enable_perl_critic) {
+                Ok(_) => {
+                    // Perl::Critic passed or disabled
+                }
+                Err(critic_output) => {
+                    return Err(format!("Perl::Critic violations in {}:\n{}", filename, critic_output));
+                }
             }
             
             let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
@@ -287,6 +387,10 @@ pub fn test_file_equivalence(lang: &str, filename: &str) -> Result<(), String> {
 }
 
 pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>) -> Result<TestResult, String> {
+    test_file_equivalence_detailed_with_critic(lang, filename, ast_options, false)
+}
+
+pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>, enable_perl_critic: bool) -> Result<TestResult, String> {
     // Load caches
     let mut cache = CommandCache::load();
     let mut shell_output = None;
@@ -397,6 +501,17 @@ pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: O
             "perl" => {
                 let mut gen = Generator::new();
                 let code = gen.generate(&commands);
+                
+                // Run Perl::Critic on generated code if enabled
+                match run_perl_critic_if_enabled(&code, enable_perl_critic) {
+                    Ok(_) => {
+                        // Perl::Critic passed or disabled
+                    }
+                    Err(critic_output) => {
+                        return Err(format!("Perl::Critic violations in {}:\n{}", filename, critic_output));
+                    }
+                }
+                
                 let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
                 let tmp_str = tmp.to_string_lossy().to_string();
                 if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) { return Err(format!("Failed to write Perl temp file: {}", e)); }
@@ -844,7 +959,7 @@ fn find_shortest_unique_prefix(examples: &[String], target_name: &str) -> String
     target_name.to_string()
 }
 
-pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>) {
+pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
     // Filter to only available generators
     let generators: Vec<_> = generators.iter()
         .filter(|g| {
@@ -938,7 +1053,7 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
             io::stdout().flush().unwrap();
             
             // Run the actual test
-            match test_file_equivalence_detailed(generator, example, Some(AstFormatOptions::default())) {
+            match test_file_equivalence_detailed_with_critic(generator, example, Some(AstFormatOptions::default()), enable_perl_critic) {
                 Ok(result) => {
                     if result.success {
                         passed_tests += 1;
