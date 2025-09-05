@@ -46,14 +46,24 @@ impl Generator {
         // Pre-analysis pass: identify variables that are used after for loops
         self.analyze_variable_usage(ast);
         
+        // Analyze what imports and variables are needed
+        let needs_basename = self.needs_basename_import(ast);
+        let needs_exit_code = self.needs_exit_code_tracking(ast);
+        
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
         output.push_str("use strict;\n");
         output.push_str("use warnings;\n");
-        output.push_str("use File::Basename;\n\n");
+        
+        if needs_basename {
+            output.push_str("use File::Basename;\n");
+        }
+        output.push_str("\n");
         
         // Add main exit code variable for pipeline tracking
-        output.push_str("my $main_exit_code = 0;\n\n");
+        if needs_exit_code {
+            output.push_str("my $main_exit_code = 0;\n\n");
+        }
         
         // Add declarations for variables that are used in arithmetic expressions
         for var in &self.function_level_vars {
@@ -76,7 +86,9 @@ impl Generator {
         }
         
         // Add final exit statement
-        output.push_str("\nexit($main_exit_code);\n");
+        if needs_exit_code {
+            output.push_str("\nexit($main_exit_code);\n");
+        }
         
         output
     }
@@ -432,6 +444,165 @@ impl Generator {
             }
         }
         false
+    }
+    
+    /// Check if the AST needs File::Basename import
+    fn needs_basename_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_basename(command) {
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Check if a specific command needs File::Basename
+    fn command_needs_basename(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                // Check if it's a basename command
+                if let Word::Literal(name, _) = &cmd.name {
+                    if name == "basename" {
+                        return true;
+                    }
+                }
+                // Check for basename parameter expansion in arguments
+                for arg in &cmd.args {
+                    if self.word_needs_basename(arg) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::Pipeline(pipeline) => {
+                for cmd in &pipeline.commands {
+                    if self.command_needs_basename(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::And(left, right) | Command::Or(left, right) => {
+                self.command_needs_basename(left) || self.command_needs_basename(right)
+            },
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_basename(&redirect_cmd.command)
+            },
+            Command::For(for_loop) => {
+                for cmd in &for_loop.body.commands {
+                    if self.command_needs_basename(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::While(while_loop) => {
+                for cmd in &while_loop.body.commands {
+                    if self.command_needs_basename(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::If(if_stmt) => {
+                if self.command_needs_basename(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_basename(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+    
+    /// Check if a word needs basename functionality
+    fn word_needs_basename(&self, word: &Word) -> bool {
+        match word {
+            Word::ParameterExpansion(pe, _) => {
+                matches!(pe.operator, ParameterExpansionOperator::Basename)
+            },
+            Word::Array(_, _elements, _) => {
+                // Array elements are strings, not words, so no basename needed
+                false
+            },
+            Word::StringInterpolation(interp, _) => {
+                for part in &interp.parts {
+                    match part {
+                        StringPart::Literal(_) => {},
+                        StringPart::Variable(_) => {}, // Variables are strings, not words
+                        StringPart::CommandSubstitution(_) => {}, // Command substitutions don't need basename
+                        StringPart::ParameterExpansion(_) => {}, // Parameter expansions don't need basename
+                        StringPart::MapAccess(_, _) => {}, // Map access doesn't need basename
+                        StringPart::MapKeys(_) => {}, // Map keys don't need basename
+                        StringPart::MapLength(_) => {}, // Map length doesn't need basename
+                        StringPart::ArraySlice(_, _, _) => {}, // Array slice doesn't need basename
+                        StringPart::Arithmetic(_) => {}, // Arithmetic expressions don't need basename
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+    
+    /// Check if the AST needs exit code tracking
+    fn needs_exit_code_tracking(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_exit_code_tracking(command) {
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Check if a specific command needs exit code tracking
+    fn command_needs_exit_code_tracking(&self, command: &Command) -> bool {
+        match command {
+            Command::Pipeline(pipeline) => {
+                // Only complex pipelines need exit code tracking
+                // Simple pipelines like "cmd1 | cmd2" don't need it
+                pipeline.commands.len() > 2
+            },
+            Command::And(left, right) | Command::Or(left, right) => {
+                // Logical operators need exit code tracking
+                true
+            },
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_exit_code_tracking(&redirect_cmd.command)
+            },
+            Command::For(for_loop) => {
+                for cmd in &for_loop.body.commands {
+                    if self.command_needs_exit_code_tracking(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::While(while_loop) => {
+                for cmd in &while_loop.body.commands {
+                    if self.command_needs_exit_code_tracking(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::If(if_stmt) => {
+                if self.command_needs_exit_code_tracking(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_exit_code_tracking(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false
+        }
     }
 }
 
