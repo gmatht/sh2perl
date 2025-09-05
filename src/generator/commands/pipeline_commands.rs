@@ -479,6 +479,16 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                                     }
                                                     
                                                     // Process the while loop body commands directly
+                                                    let read_var_name = if let Some(var_arg) = read_cmd.args.first() {
+                                                        if let Word::Literal(var_name, _) = var_arg {
+                                                            var_name
+                                                        } else {
+                                                            "line"
+                                                        }
+                                                    } else {
+                                                        "line"
+                                                    };
+                                                    
                                                     for body_cmd in &while_loop.body.commands {
                                                         match body_cmd {
                                                             Command::Assignment(assignment) => {
@@ -497,13 +507,13 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                                             Command::Simple(cmd) => {
                                                                 // Generate line-by-line version of each command
                                                                 output.push_str(&generator.indent());
-                                                                output.push_str(&generate_linebyline_command(generator, cmd, "line", 0));
+                                                                output.push_str(&generate_linebyline_command(generator, cmd, read_var_name, 0));
                                                             }
                                                             
                                                             Command::Pipeline(pipeline) => {
                                                                 // Handle nested pipelines in while loop body with line-by-line processing
                                                                 output.push_str(&generator.indent());
-                                                                let pipeline_result = generate_linebyline_command_for_pipeline(generator, pipeline, "line");
+                                                                let pipeline_result = generate_linebyline_command_for_pipeline(generator, pipeline, read_var_name);
                                                                 output.push_str(&pipeline_result);
                                                                 // If this is an echo | sed pipeline, make sure to print the result
                                                                 if pipeline.commands.len() >= 2 {
@@ -511,7 +521,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                                                         if let (Word::Literal(first_name, _), Word::Literal(second_name, _)) = (&first_cmd.name, &second_cmd.name) {
                                                                             if first_name == "echo" && second_name == "sed" {
                                                                                 output.push_str(&generator.indent());
-                                                                                output.push_str("print $line . \"\\n\";\n");
+                                                                                output.push_str(&format!("print ${} . \"\\n\";\n", read_var_name));
                                                                             }
                                                                         }
                                                                     }
@@ -565,6 +575,16 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                         }
                                         
                                         // Process the while loop body commands directly
+                                        let read_var_name = if let Some(var_arg) = read_cmd.args.first() {
+                                            if let Word::Literal(var_name, _) = var_arg {
+                                                var_name
+                                            } else {
+                                                "line"
+                                            }
+                                        } else {
+                                            "line"
+                                        };
+                                        
                                         for body_cmd in &while_loop.body.commands {
                                             match body_cmd {
                                                 Command::Assignment(assignment) => {
@@ -583,13 +603,13 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                                 Command::Simple(cmd) => {
                                                     // Generate line-by-line version of each command
                                                     output.push_str(&generator.indent());
-                                                    output.push_str(&generate_linebyline_command(generator, cmd, "line", start_index + i));
+                                                    output.push_str(&generate_linebyline_command(generator, cmd, read_var_name, start_index + i));
                                                 }
                                                 
                                                 Command::Pipeline(pipeline) => {
                                                     // Handle nested pipelines in while loop body with line-by-line processing
                                                     output.push_str(&generator.indent());
-                                                    output.push_str(&generate_linebyline_command_for_pipeline(generator, pipeline, "line"));
+                                                    output.push_str(&generate_linebyline_command_for_pipeline(generator, pipeline, read_var_name));
                                                 }
                                                 
                                                 _ => {
@@ -1085,9 +1105,9 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
                         // Handle variable replacement properly
                         let replacement_str = format!("${}", replacement);
                         if flags.is_empty() || flags == "/" {
-                            output.push_str(&format!("$line =~ s/{}/{}/;\n", pattern_str, replacement_str));
+                            output.push_str(&format!("${} =~ s/{}/{}/;\n", line_var, pattern_str, replacement_str));
                         } else {
-                            output.push_str(&format!("$line =~ s/{}/{}/{};\n", pattern_str, replacement_str, flags));
+                            output.push_str(&format!("${} =~ s/{}/{}/{};\n", line_var, pattern_str, replacement_str, flags));
                         }
                     }
                 }
@@ -1095,7 +1115,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
                 if let Word::Literal(s, _) = arg { s.starts_with('s') } else { false }
             }) {
                 let expr = generator.word_to_perl(sed_expr);
-                output.push_str(&format!("$line =~ {expr};\n"));
+                output.push_str(&format!("${} =~ {expr};\n", line_var));
             }
             output
         },
@@ -1104,7 +1124,13 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             let mut output = String::new();
             if let Some(arg) = cmd.args.first() {
                 let value = generator.word_to_perl(arg);
-                output.push_str(&format!("$line = {};\n", value));
+                // Check if the value is the same as the input variable to avoid redundant assignment
+                let line_var_with_dollar = format!("${}", line_var);
+                if value != line_var_with_dollar {
+                    // Echo command sets the input variable to the value
+                    output.push_str(&format!("${} = {};\n", line_var, value));
+                }
+                // If value == input_var_with_dollar, skip the assignment as it's redundant
             }
             output
         },
