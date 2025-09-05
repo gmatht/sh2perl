@@ -450,8 +450,13 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                             };
                             
                             // Generate line-by-line version of each command
+                            let command_output = generate_linebyline_command(generator, cmd, "line", start_index + i);
+                            // Add indentation to all lines in the command output
+                            for line in command_output.lines() {
                             output.push_str(&generator.indent());
-                            output.push_str(&generate_linebyline_command(generator, cmd, "line", start_index + i));
+                                output.push_str(line);
+                                output.push_str("\n");
+                            }
                         }
                         Command::Pipeline(nested_pipeline) => {
                             // Handle nested pipelines - process each command in the nested pipeline
@@ -459,8 +464,13 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                 match nested_command {
                                     Command::Simple(cmd) => {
                                         // Generate line-by-line version of each command
-                                        output.push_str(&generator.indent());
-                                        output.push_str(&generate_linebyline_command(generator, cmd, "line", j));
+                                        let command_output = generate_linebyline_command(generator, cmd, "line", j);
+                                        // Add indentation to all lines in the command output
+                                        for line in command_output.lines() {
+                                            output.push_str(&generator.indent());
+                                            output.push_str(line);
+                                            output.push_str("\n");
+                                        }
                                     }
                                     Command::While(while_loop) => {
                                         // Check if this is a while read loop - if so, process directly without while loop structure
@@ -619,36 +629,36 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                         }
                                     } else {
                                         // Not a read command, handle normally with while loop structure
-                                        output.push_str(&generator.indent());
-                                        output.push_str("my $L = $line;\n");
+                            output.push_str(&generator.indent());
+                            output.push_str("my $L = $line;\n");
+                            
+                            // Generate the while loop body with line-by-line processing
+                            generator.indent_level += 1;
+                            for body_cmd in &while_loop.body.commands {
+                                match body_cmd {
+                                    Command::Simple(cmd) => {
+                                        let cmd_name = match &cmd.name {
+                                            Word::Literal(s, _) => s,
+                                            _ => "unknown_command"
+                                        };
                                         
-                                        // Generate the while loop body with line-by-line processing
-                                        generator.indent_level += 1;
-                                        for body_cmd in &while_loop.body.commands {
-                                            match body_cmd {
-                                                Command::Simple(cmd) => {
-                                                    let cmd_name = match &cmd.name {
-                                                        Word::Literal(s, _) => s,
-                                                        _ => "unknown_command"
-                                                    };
-                                                    
-                                                    // Generate line-by-line version of each command
-                                                    output.push_str(&generator.indent());
-                                                    output.push_str(&generate_linebyline_command(generator, cmd, "L", 0));
-                                                }
-                                                Command::Pipeline(pipeline) => {
-                                                    // Handle nested pipelines in while loop body with line-by-line processing
-                                                    output.push_str(&generator.indent());
-                                                    output.push_str(&generate_linebyline_command_for_pipeline(generator, pipeline, "L"));
-                                                }
-                                                _ => {
-                                                    // For other command types, generate them normally
-                                                    output.push_str(&generator.indent());
-                                                    output.push_str(&generator.generate_command(body_cmd));
-                                                }
-                                            }
-                                        }
-                                        generator.indent_level -= 1;
+                                        // Generate line-by-line version of each command
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&generate_linebyline_command(generator, cmd, "L", 0));
+                                    }
+                                    Command::Pipeline(pipeline) => {
+                                        // Handle nested pipelines in while loop body with line-by-line processing
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&generate_linebyline_command_for_pipeline(generator, pipeline, "L"));
+                                    }
+                                    _ => {
+                                        // For other command types, generate them normally
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&generator.generate_command(body_cmd));
+                                    }
+                                }
+                            }
+                            generator.indent_level -= 1;
                                     }
                                 } else {
                                     // Not a simple command, handle normally with while loop structure
@@ -1077,6 +1087,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             }
             
             // Generate line-by-line head command (variables already declared in yes command)
+            // Note: The caller will add base indentation, so we generate unindented output
             output.push_str(&format!("if ($head_count_{} < {}) {{\n", cmd_index, num_lines));
             output.push_str(&format!("    $head_count_{}++;\n", cmd_index));
             output.push_str("} else {\n");
