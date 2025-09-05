@@ -29,7 +29,7 @@ fn main() {
         return;
     }
     
-    let command = &args[1];
+    let mut command = &args[1];
     
     if command == "--help" || command == "-h" {
         show_help(&args[0]);
@@ -50,6 +50,7 @@ fn main() {
     let mut input_file: Option<String> = None;
     let mut output_file: Option<String> = None;
     let mut optimize_mir = false;
+    let mut enable_perl_critic = false;
     let mut i = 2;
     
     // Special case: if the first argument is -i or -o, start parsing from index 1
@@ -86,6 +87,9 @@ fn main() {
             }
             "--ast-no-newlines" => {
                 ast_options.newlines = false;
+            }
+            "--perl-critic" => {
+                enable_perl_critic = true;
             }
             "-i" => {
                 if i + 1 < args.len() {
@@ -200,6 +204,12 @@ fn main() {
                         // Stop parsing generators, let the AST options parsing continue
                         break;
                     }
+                    "--perl-critic" => {
+                        // Handle --perl-critic flag
+                        enable_perl_critic = true;
+                        i += 1;
+                        continue;
+                    }
                     generator => {
                         // Only perl generator is supported
                         if generator == "perl" {
@@ -217,7 +227,7 @@ fn main() {
                 generators = vec!["perl".to_string()];
             }
             
-            test_all_examples_next_fail(&generators, test_prefix);
+            test_all_examples_next_fail(&generators, test_prefix, enable_perl_critic);
         }
         "--clear-cache" => {
             // Clear the unified command cache
@@ -449,6 +459,12 @@ fn main() {
                         // Stop parsing generators, let the AST options parsing continue
                         break;
                     }
+                    "--perl-critic" => {
+                        // Handle --perl-critic flag
+                        enable_perl_critic = true;
+                        i += 1;
+                        continue;
+                    }
                     generator => {
                         // Only perl generator is supported
                         if generator == "perl" {
@@ -466,7 +482,7 @@ fn main() {
                 generators = vec!["perl".to_string()];
             }
             
-            test_all_examples_next_fail(&generators, test_prefix);
+            test_all_examples_next_fail(&generators, test_prefix, enable_perl_critic);
         }
         _ => {
             // Handle input file option
