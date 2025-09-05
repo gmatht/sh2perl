@@ -441,17 +441,7 @@ fn main() {
             let mut generators = Vec::new();
             let mut i = 2;
             
-            // Check if first argument is a test prefix (not a number)
-            if i < args.len() {
-                let arg = &args[i];
-                // If it's not a pure number or has leading zeros, treat it as a prefix
-                if arg.parse::<usize>().is_err() || arg.len() > 3 || arg.starts_with('0') {
-                    test_prefix = Some(arg.clone());
-                    i += 1;
-                }
-            }
-            
-            // Collect generators until we hit an AST option or run out of args
+            // First pass: collect flags and generators
             while i < args.len() {
                 match args[i].as_str() {
                     "--ast-pretty" | "--ast-compact" | "--ast-indent" | "--ast-no-indent" | 
@@ -470,7 +460,8 @@ fn main() {
                         if generator == "perl" {
                             generators.push(generator.to_string());
                         } else {
-                            println!("Warning: Only 'perl' generator is supported, skipping '{}'", generator);
+                            // If it's not a generator, treat it as a test prefix
+                            test_prefix = Some(generator.to_string());
                         }
                     }
                 }

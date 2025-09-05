@@ -140,20 +140,65 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
         }
     };
 
-    // Clean up temp file
-    let _ = std::fs::remove_file(&temp_file);
-
     // Check if Perl::Critic found any issues
     if output.status.success() {
+        // Clean up temp file
+        let _ = std::fs::remove_file(&temp_file);
         Ok("Perl::Critic: No violations found".to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         
         if stderr.is_empty() && stdout.is_empty() {
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_file);
             Ok("Perl::Critic: No violations found".to_string())
         } else {
             let mut result = String::new();
+            
+            // Add the generated Perl code
+            result.push_str("Generated Perl code:\n");
+            result.push_str("```perl\n");
+            result.push_str(perl_code);
+            result.push_str("\n```\n\n");
+            
+            // Check for PerlTidy differences by running the wrapper
+            if let Ok(tidy_output) = std::process::Command::new(strawberry_perl)
+                .arg("test_wrapper_minimal.pl")
+                .arg(&temp_file_str)
+                .output() 
+            {
+                if tidy_output.status.success() {
+                    let tidy_stdout = String::from_utf8_lossy(&tidy_output.stdout);
+                    // Check if there are differences by looking for "Original:" and "Tidied:" sections
+                    if tidy_stdout.contains("Original:") && tidy_stdout.contains("Tidied:") {
+                        // Extract just the differences part
+                        let lines: Vec<&str> = tidy_stdout.lines().collect();
+                        let mut in_diff_section = false;
+                        let mut diff_lines = Vec::new();
+                        
+                        for line in lines {
+                            if line == "Original:" {
+                                in_diff_section = true;
+                                diff_lines.push("Code formatting differences detected:");
+                                diff_lines.push("Original:");
+                            } else if line == "Tidied:" {
+                                diff_lines.push("Tidied:");
+                            } else if in_diff_section {
+                                diff_lines.push(line);
+                            }
+                        }
+                        
+                        if !diff_lines.is_empty() {
+                            result.push_str("PerlTidy formatting differences:\n");
+                            result.push_str("```\n");
+                            result.push_str(&diff_lines.join("\n"));
+                            result.push_str("\n```\n\n");
+                        }
+                    }
+                }
+            }
+            
             if !stderr.is_empty() {
                 result.push_str(&stderr);
             }
@@ -163,6 +208,9 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
                 }
                 result.push_str(&stdout);
             }
+            
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_file);
             Err(result)
         }
     }
