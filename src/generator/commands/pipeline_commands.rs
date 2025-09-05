@@ -400,13 +400,39 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                     "\"y\"".to_string()
                 };
                 
+                // Parse head command parameters dynamically
+                let mut head_max = 10; // Default value
+                if pipeline.commands.len() > 1 {
+                    if let Command::Pipeline(nested_pipeline) = &pipeline.commands[1] {
+                        if let Command::Simple(head_cmd) = &nested_pipeline.commands[0] {
+                            if let Word::Literal(cmd_name, _) = &head_cmd.name {
+                                if cmd_name == "head" {
+                                    // Parse head -nX arguments
+                                    for (i, arg) in head_cmd.args.iter().enumerate() {
+                                        if let Word::Literal(arg_str, _) = arg {
+                                            if arg_str == "-n" && i + 1 < head_cmd.args.len() {
+                                                if let Word::Literal(num_str, _) = &head_cmd.args[i + 1] {
+                                                    if let Ok(num) = num_str.parse::<usize>() {
+                                                        head_max = num;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Generate a while loop that processes the line through all commands
                 output.push_str(&generator.indent());
                 output.push_str("my $i = 0;\n");
                 output.push_str(&generator.indent());
                 output.push_str("my $head_count_0 = 0;\n");
                 output.push_str(&generator.indent());
-                output.push_str("my $head_max_0 = 10;\n");
+                output.push_str(&format!("my $head_max_0 = {};\n", head_max));
                 output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
                 generator.indent_level += 1;
@@ -1032,7 +1058,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
                 i += 1;
             }
             
-            // Generate line-by-line head command (don't redeclare variables if they already exist)
+            // Generate line-by-line head command (variables already declared in yes command)
             output.push_str(&format!("if ($head_count_{} < $head_max_{}) {{\n", cmd_index, cmd_index));
             output.push_str(&format!("    $head_count_{}++;\n", cmd_index));
             output.push_str("} else {\n");
