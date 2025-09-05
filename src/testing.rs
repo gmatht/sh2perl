@@ -48,13 +48,57 @@ impl Default for AstFormatOptions {
 
 /// Check if Perl::Critic is available in the system
 pub fn check_perl_critic_available() -> bool {
-    match Command::new("perlcritic")
-        .arg("--version")
+    // Try using Strawberry Perl -MPerl::Critic directly (most reliable approach)
+    let strawberry_perl = "C:\\Strawberry\\perl\\bin\\perl.exe";
+    if let Ok(output) = std::process::Command::new(strawberry_perl)
+        .args(&["-MPerl::Critic", "-e", "print Perl::Critic->VERSION"])
         .output()
     {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
+        if output.status.success() {
+            return true;
+        }
     }
+    
+    // Fallback to system perl
+    if let Ok(output) = std::process::Command::new("perl")
+        .args(&["-MPerl::Critic", "-e", "print Perl::Critic->VERSION"])
+        .output()
+    {
+        if output.status.success() {
+            return true;
+        }
+    }
+    
+    // Fallback to batch file paths
+    let possible_paths = [
+        "C:\\Strawberry\\cpan\\build\\Perl-Critic-1.156-0\\blib\\script\\perlcritic.bat",
+        "C:\\Strawberry\\perl\\site\\bin\\perlcritic.bat",
+        "C:\\Strawberry\\perl\\bin\\perlcritic.bat",
+        "perlcritic", // fallback to PATH
+    ];
+    
+    for path in &possible_paths {
+        if *path == "perlcritic" {
+            // Check if it's in PATH
+            if Command::new("perlcritic").arg("--version").output().is_ok() {
+                return true;
+            }
+        } else {
+            // Check if the specific path exists and works
+            if std::path::Path::new(path).exists() {
+                // Use the full path directly
+                if let Ok(output) = std::process::Command::new(path)
+                    .arg("--version")
+                    .output()
+                {
+                    if output.status.success() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Run Perl::Critic on generated Perl code with Brutal level (if enabled)
@@ -74,16 +118,17 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
 
     // Check if we have a custom configuration file
     let config_file = "docs/perlcritic.conf";
-    let mut cmd = Command::new("perlcritic");
+    let strawberry_perl = "C:\\Strawberry\\perl\\bin\\perl.exe";
+    let wrapper_script = "perlcritic_wrapper.pl";
+    let mut cmd = Command::new(strawberry_perl);
+    cmd.arg(wrapper_script);
     
     if std::path::Path::new(config_file).exists() {
         cmd.arg("--profile").arg(config_file);
-    } else {
-        cmd.arg("--brutal");
     }
     
-    cmd.arg("--verbose").arg("10");  // Verbose level 10 for detailed output
-    cmd.arg(&temp_file_str);
+    // Add the Perl file as the last argument
+    cmd.arg(&temp_file);
 
     // Run Perl::Critic
     let output = match cmd.output() {
@@ -1245,10 +1290,30 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                     println!("Writing test count {} to first_n_tests_passed.txt (parsing error)", passed_tests);
                     println!("Current working directory: {:?}", std::env::current_dir().unwrap_or_default());
                     
-                    // Check if this is a lexer error vs parser error
-                    let is_lexer_error = e.contains("Failed to lex");
-                    let error_code = if is_lexer_error { -2 } else { -1 };
-                    let error_type = if is_lexer_error { "lexer" } else { "parser" };
+                    // Check the type of error and assign appropriate error code
+                    let error_code = if e.contains("Perl::Critic violations") {
+                        -1  // Perl::Critic failed
+                    } else if e.contains("Failed to generate") || e.contains("generation") {
+                        -2  // Failed to generate Perl
+                    } else if e.contains("MIR") || e.contains("mir") {
+                        -3  // Failure while generating MIR
+                    } else if e.contains("Failed to lex") || e.contains("Lexer error") {
+                        -5  // Failed to Lex
+                    } else {
+                        -4  // Failed to Parse (default for parsing errors)
+                    };
+                    
+                    let error_type = if e.contains("Perl::Critic violations") {
+                        "Perl::Critic"
+                    } else if e.contains("Failed to generate") || e.contains("generation") {
+                        "Perl generation"
+                    } else if e.contains("MIR") || e.contains("mir") {
+                        "MIR generation"
+                    } else if e.contains("Failed to lex") || e.contains("Lexer error") {
+                        "lexer"
+                    } else {
+                        "parser"
+                    };
                     
                     let file_content = format!("{}\n{}", passed_tests, error_code);
                     
@@ -1287,13 +1352,13 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
         println!("Writing total test count {} to first_n_tests_passed.txt", passed_tests);
         println!("Current working directory: {:?}", std::env::current_dir().unwrap_or_default());
         
-        // When all tests pass, we can't determine matching lines, so write -2 (no failure to analyze)
-        let file_content = format!("{}\n-2", passed_tests);
+        // When all tests pass, we can't determine matching lines, so write -6 (no failure to analyze)
+        let file_content = format!("{}\n-6", passed_tests);
         
         if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
             println!("Warning: Failed to write test count to first_n_tests_passed.txt: {}", e);
         } else {
-            println!("Successfully wrote total test count {} and matching stdout lines -2 to first_n_tests_passed.txt", passed_tests);
+            println!("Successfully wrote total test count {} and matching stdout lines -6 to first_n_tests_passed.txt", passed_tests);
         }
     }
 }
