@@ -432,8 +432,6 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str("my $head_count_0 = 0;\n");
                 output.push_str(&generator.indent());
-                output.push_str(&format!("my $head_max_0 = {};\n", head_max));
-                output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
                 generator.indent_level += 1;
                 
@@ -1079,7 +1077,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             }
             
             // Generate line-by-line head command (variables already declared in yes command)
-            output.push_str(&format!("if ($head_count_{} < $head_max_{}) {{\n", cmd_index, cmd_index));
+            output.push_str(&format!("if ($head_count_{} < {}) {{\n", cmd_index, num_lines));
             output.push_str(&format!("    $head_count_{}++;\n", cmd_index));
             output.push_str("} else {\n");
             output.push_str("    last;\n");
