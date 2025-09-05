@@ -51,6 +51,7 @@ pub fn show_help(program_name: &str) {
         println!("                                   - If NUM is provided, run only the NUMth test");
         println!("  fail [NUM] [gen1 gen2 ...]      - Shorthand for --next-fail");
                         println!("  --clear-cache                    - Clear the command cache");
+    println!("  --perl-critic                    - Enable Perl::Critic code quality checks (Brutal level)");
     println!();
     println!("AST FORMATTING OPTIONS (for --next-fail):");
     println!();
