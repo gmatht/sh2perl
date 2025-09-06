@@ -334,7 +334,7 @@ fn generate_command_using_builtins(
                     output_var, 
                     generator.generate_command_string_for_system(command))
             } else {
-                // Subsequent command
+                // Subsequent command - use a different approach that works
                 format!("${} = `echo \"${}\" | {}`;\n", 
                     output_var, input_var, 
                     generator.generate_command_string_for_system(command))
