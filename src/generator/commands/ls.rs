@@ -28,10 +28,10 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
         if sort_files {
             // For sorting, we still need to collect files first
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (opendir(my $dh, '{}')) {{\n", search_dir));
+            output.push_str(&format!("if (opendir my $dh, '{}') {{\n", search_dir));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
-            output.push_str("while (my $file = readdir($dh)) {\n");
+            output.push_str("while (my $file = readdir $dh) {\n");
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str("next if $file eq '.' || $file eq '..';\n");
@@ -41,7 +41,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             output.push_str(&generator.indent());
             output.push_str("}\n");
             output.push_str(&generator.indent());
-            output.push_str("closedir($dh);\n");
+            output.push_str("closedir $dh;\n");
             output.push_str(&generator.indent());
             output.push_str(&format!("@{} = sort {{ $a cmp $b }} @{};\n", array_name, array_name));
             generator.indent_level -= 1;
@@ -51,10 +51,10 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             // For non-sorting, collect to array instead of printing directly
             // This is needed for pipeline context where we need the array
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (opendir(my $dh, '{}')) {{\n", search_dir));
+            output.push_str(&format!("if (opendir my $dh, '{}') {{\n", search_dir));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
-            output.push_str("while (my $file = readdir($dh)) {\n");
+            output.push_str("while (my $file = readdir $dh) {\n");
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str("next if $file eq '.' || $file eq '..';\n");
@@ -64,7 +64,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             output.push_str(&generator.indent());
             output.push_str("}\n");
             output.push_str(&generator.indent());
-            output.push_str("closedir($dh);\n");
+            output.push_str("closedir $dh;\n");
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");

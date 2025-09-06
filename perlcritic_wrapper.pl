@@ -54,7 +54,10 @@ if (@filtered_violations) {
         print $violation->description() . "\n";
         print "  Policy: " . $violation->policy() . "\n";
         print "  Severity: " . $violation->severity() . "\n";
-        print "  Location: " . $violation->location() . "\n";
+        # Skip location information since it's not working properly
+        # my $location = $violation->location();
+        # print "  Location: " . $location . "\n";
+        print "  Location: " . join(", ", @{$violation->location()}) . "\n";
         print "  Explanation: " . $violation->explanation() . "\n";
         
         # Add specific guidance for common violations

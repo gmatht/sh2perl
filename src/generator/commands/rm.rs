@@ -61,7 +61,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     generator.indent_level += 1;
                     if force {
                         output.push_str(&generator.indent());
-                        output.push_str("warn \"rm: warning: could not remove \", $file_to_remove, \": $err->[0]\\n\";\n");
+                        output.push_str("carp \"rm: carping: could not remove \", $file_to_remove, \": $err->[0]\\n\";\n");
                     } else {
                         output.push_str(&generator.indent());
                         output.push_str("die \"rm: cannot remove \", $file_to_remove, \": $err->[0]\\n\";\n");
@@ -84,7 +84,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     generator.indent_level += 1;
                     if force {
                         output.push_str(&generator.indent());
-                        output.push_str("warn \"rm: warning: could not remove \", $file_to_remove, \": $!\\n\";\n");
+                        output.push_str("carp \"rm: carping: could not remove \", $file_to_remove, \": $!\\n\";\n");
                     } else {
                         output.push_str(&generator.indent());
                         output.push_str("die \"rm: cannot remove \", $file_to_remove, \": $!\\n\";\n");
@@ -101,7 +101,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     generator.indent_level += 1;
                     if force {
                         output.push_str(&generator.indent());
-                        output.push_str("warn \"rm: warning: \", $file_to_remove, \" is a directory (use -r to remove recursively)\\n\";\n");
+                        output.push_str("carp \"rm: carping: \", $file_to_remove, \" is a directory (use -r to remove recursively)\\n\";\n");
                     } else {
                         output.push_str(&generator.indent());
                         output.push_str("die \"rm: \", $file_to_remove, \" is a directory (use -r to remove recursively)\\n\";\n");
@@ -118,7 +118,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     generator.indent_level += 1;
                     if force {
                         output.push_str(&generator.indent());
-                        output.push_str("warn \"rm: warning: could not remove \", $file_to_remove, \": $!\\n\";\n");
+                        output.push_str("carp \"rm: carping: could not remove \", $file_to_remove, \": $!\\n\";\n");
                     } else {
                         output.push_str(&generator.indent());
                         output.push_str("die \"rm: cannot remove \", $file_to_remove, \": $!\\n\";\n");
@@ -137,7 +137,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 generator.indent_level += 1;
                 if force {
                     output.push_str(&generator.indent());
-                    output.push_str("warn \"rm: warning: \", $file_to_remove, \": No such file or directory\\n\";\n");
+                    output.push_str("carp \"rm: carping: \", $file_to_remove, \": No such file or directory\\n\";\n");
                 } else {
                     output.push_str(&generator.indent());
                     output.push_str("die \"rm: \", $file_to_remove, \": No such file or directory\\n\";\n");
@@ -159,7 +159,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str(&format!("remove_tree({}, {{error => \\$err}});\n", file));
                     output.push_str("if (@$err) {\n");
                     if force {
-                        output.push_str(&format!("warn \"rm: warning: could not remove \", {}, \": $err->[0]\\n\";\n", file));
+                        output.push_str(&format!("carp \"rm: carping: could not remove \", {}, \": $err->[0]\\n\";\n", file));
                     } else {
                         output.push_str(&format!("die \"rm: cannot remove \", {}, \": $err->[0]\\n\";\n", file));
                     }
@@ -174,7 +174,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("$main_exit_code = 0;\n");
                     output.push_str("} else {\n");
                     if force {
-                        output.push_str(&format!("warn \"rm: warning: could not remove \", {}, \": $!\\n\";\n", file));
+                        output.push_str(&format!("carp \"rm: carping: could not remove \", {}, \": $!\\n\";\n", file));
                     } else {
                         output.push_str(&format!("die \"rm: cannot remove \", {}, \": $!\\n\";\n", file));
                     }
@@ -184,7 +184,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     // Non-recursive removal
                     output.push_str(&format!("if (-d {}) {{\n", file));
                     if force {
-                        output.push_str(&format!("warn \"rm: warning: \", {}, \" is a directory (use -r to remove recursively)\\n\";\n", file));
+                        output.push_str(&format!("carp \"rm: carping: \", {}, \" is a directory (use -r to remove recursively)\\n\";\n", file));
                     } else {
                         output.push_str(&format!("die \"rm: \", {}, \" is a directory (use -r to remove recursively)\\n\";\n", file));
                     }
@@ -194,7 +194,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("$main_exit_code = 0;\n");
                     output.push_str("} else {\n");
                     if force {
-                        output.push_str(&format!("warn \"rm: warning: could not remove \", {}, \": $!\\n\";\n", file));
+                        output.push_str(&format!("carp \"rm: carping: could not remove \", {}, \": $!\\n\";\n", file));
                     } else {
                         output.push_str(&format!("die \"rm: cannot remove \", {}, \": $!\\n\";\n", file));
                     }
@@ -204,7 +204,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 
                 output.push_str("} else {\n");
                 if force {
-                    output.push_str(&format!("warn \"rm: warning: \", {}, \": No such file or directory\\n\";\n", file));
+                    output.push_str(&format!("carp \"rm: carping: \", {}, \": No such file or directory\\n\";\n", file));
                 } else {
                     output.push_str(&format!("die \"rm: \", {}, \": No such file or directory\\n\";\n", file));
                 }

@@ -163,7 +163,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     
     if pattern.is_empty() && pattern_file.is_none() {
         // No pattern provided, return error
-        output.push_str("warn \"grep: no pattern specified\";\n");
+        output.push_str("carp \"grep: no pattern specified\";\n");
         output.push_str("exit(1);\n");
         return output;
     }
@@ -230,8 +230,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("sub find_files_recursive_{} {{\n", command_index));
                 output.push_str(&format!("    my ($dir, $pattern) = @_;\n"));
                 output.push_str(&format!("    my @files;\n"));
-                output.push_str(&format!("    if (opendir(my $dh, $dir)) {{\n"));
-                output.push_str(&format!("        while (my $file = readdir($dh)) {{\n"));
+                output.push_str(&format!("    if (opendir my $dh, $dir) {{\n"));
+                output.push_str(&format!("        while (my $file = readdir $dh) {{\n"));
                 output.push_str(&format!("            next if $file eq '.' || $file eq '..';\n"));
                 output.push_str(&format!("            my $path = \"$dir/$file\";\n"));
                 output.push_str(&format!("            if (-d $path) {{\n"));
@@ -281,7 +281,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("                }}\n"));
                 output.push_str(&format!("            }}\n"));
                 output.push_str(&format!("        }}\n"));
-                output.push_str(&format!("        closedir($dh);\n"));
+                output.push_str(&format!("        closedir $dh;\n"));
                 output.push_str(&format!("    }}\n"));
                 output.push_str(&format!("    return @files;\n"));
                 output.push_str(&format!("}}\n"));
@@ -292,11 +292,11 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     output.push_str(&format!("    if (-f $file) {{\n"));
                     output.push_str(&format!("        open(my $fh, '<', $file) or die \"Cannot open $file: $!\";\n"));
                     output.push_str(&format!("        while (my $line = <$fh>) {{\n"));
-                    output.push_str(&format!("            chomp($line);\n"));
+                    output.push_str(&format!("            chomp $line;\n"));
                     output.push_str(&format!("            push @grep_lines_{}, $line;\n", command_index));
                     output.push_str(&format!("            push @grep_filenames_{}, $file;\n", command_index));
                     output.push_str(&format!("        }}\n"));
-                    output.push_str(&format!("        close($fh);\n"));
+                    output.push_str(&format!("        close($fh) or croak \"Close failed: $!\";\n"));
                     output.push_str(&format!("    }}\n"));
                     output.push_str(&format!("}}\n"));
                 }
@@ -314,7 +314,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                         output.push_str(&format!("            push @grep_lines_{}, $line;\n", command_index));
                         output.push_str(&format!("            push @grep_filenames_{}, $glob_file;\n", command_index));
                         output.push_str("        }\n");
-                        output.push_str("        close($fh);\n");
+                        output.push_str("        close($fh) or croak \"Close failed: $!\";\n");
                         output.push_str("    }\n");
                         output.push_str("}\n");
                     } else {
@@ -325,7 +325,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                         output.push_str(&format!("        push @grep_lines_{}, $line;\n", command_index));
                         output.push_str(&format!("        push @grep_filenames_{}, '{}';\n", command_index, file));
                         output.push_str("    }\n");
-                        output.push_str("    close($fh);\n");
+                        output.push_str("    close($fh) or croak \"Close failed: $!\";\n");
                         output.push_str("}\n");
                     }
                 }
