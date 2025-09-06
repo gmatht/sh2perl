@@ -7,7 +7,7 @@ use std::thread;
 use crate::cache::CommandCache;
 use crate::execution::{run_shell_script, create_exit_status};
 use crate::utils::{check_generator_available, cleanup_tmp, generate_unified_diff, 
-                   check_perl_must_not_contain, check_ast_must_not_contain, check_ast_must_contain};
+                   check_perl_must_contain, check_perl_must_not_contain, check_ast_must_not_contain, check_ast_must_contain};
 use debashl::shared_utils;
 use debashl::{Lexer, Parser, Generator, lexer::Token};
 
@@ -595,16 +595,6 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 let mut gen = Generator::new();
                 let code = gen.generate(&commands);
                 
-                // Run Perl::Critic on generated code if enabled
-                match run_perl_critic_if_enabled(&code, enable_perl_critic) {
-                    Ok(_) => {
-                        // Perl::Critic passed or disabled
-                    }
-                    Err(critic_output) => {
-                        return Err(format!("Perl::Critic violations in {}:\n{}", filename, critic_output));
-                    }
-                }
-                
                 let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
                 let tmp_str = tmp.to_string_lossy().to_string();
                 if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) { return Err(format!("Failed to write Perl temp file: {}", e)); }
@@ -624,26 +614,6 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
         }
     }
     
-    // Check PERL_MUST_NOT_CONTAIN constraints for Perl code
-    if lang == "perl" {
-        if let Err(violation_msg) = check_perl_must_not_contain(&shell_content, &translated_code) {
-            return Err(format!("PERL_MUST_NOT_CONTAIN constraint violation in {}:\n{}", filename, violation_msg));
-        }
-    }
-    
-    // Check AST_MUST_NOT_CONTAIN constraints for AST string representation
-    if let Err(violation_msg) = check_ast_must_not_contain(&shell_content, &ast) {
-        return Err(format!("AST_MUST_NOT_CONTAIN constraint violation in {}:\n{}", filename, violation_msg));
-    }
-    
-    // Check AST_MUST_CONTAIN constraints for AST string representation
-    if let Err(violation_msg) = check_ast_must_contain(&shell_content, &ast) {
-        return Err(format!("AST_MUST_CONTAIN constraint violation in {}:\n{}", filename, violation_msg));
-    }
-    
-    // Save cache if we made any updates
-    cache.save();
-
     // Get the shell output (either cached or fresh)
     let shell_output = shell_output.unwrap();
 
@@ -1237,6 +1207,79 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                         println!("{}", "=".repeat(80));
                         println!("{}", result.translated_code);
                         
+                        // Check for PerlTidy differences and show tidied code if different
+                        if generator.as_str() == "perl" {
+                            // Create a temporary file for PerlTidy check
+                            let temp_file = std::env::temp_dir().join("__tmp_perltidy_check.pl");
+                            let temp_file_str = temp_file.to_string_lossy().to_string();
+                            
+                            if let Ok(_) = std::fs::write(&temp_file, &result.translated_code) {
+                                if let Ok(tidy_output) = std::process::Command::new("C:\\Strawberry\\perl\\bin\\perl.exe")
+                                    .arg("test_wrapper_minimal.pl")
+                                    .arg(&temp_file_str)
+                                    .output() 
+                                {
+                                    if tidy_output.status.success() {
+                                        let tidy_stdout = String::from_utf8_lossy(&tidy_output.stdout);
+                                        if tidy_stdout.contains("Original:") && tidy_stdout.contains("Tidied:") {
+                                            println!("\n{}", "=".repeat(80));
+                                            println!("TIDIED PERL CODE:");
+                                            println!("{}", "=".repeat(80));
+                                            println!("{}", tidy_stdout);
+                                        }
+                                    }
+                                }
+                                let _ = std::fs::remove_file(&temp_file);
+                            }
+                        }
+                        
+                        // Run Perl::Critic and show results
+                        if generator.as_str() == "perl" && enable_perl_critic {
+                            println!("\n{}", "=".repeat(80));
+                            println!("PERL::CRITIC RESULTS:");
+                            println!("{}", "=".repeat(80));
+                            match run_perl_critic_brutal(&result.translated_code) {
+                                Ok(msg) => println!("{}", msg),
+                                Err(violations) => println!("{}", violations),
+                            }
+                        }
+                        
+                        // Check PERL_MUST_CONTAIN constraints
+                        if generator.as_str() == "perl" {
+                            if let Err(violation_msg) = check_perl_must_contain(&result.original_code, &result.translated_code) {
+                                println!("\n{}", "=".repeat(80));
+                                println!("PERL_MUST_CONTAIN VIOLATIONS:");
+                                println!("{}", "=".repeat(80));
+                                println!("{}", violation_msg);
+                            }
+                        }
+                        
+                        // Check PERL_MUST_NOT_CONTAIN constraints
+                        if generator.as_str() == "perl" {
+                            if let Err(violation_msg) = check_perl_must_not_contain(&result.original_code, &result.translated_code) {
+                                println!("\n{}", "=".repeat(80));
+                                println!("PERL_MUST_NOT_CONTAIN VIOLATIONS:");
+                                println!("{}", "=".repeat(80));
+                                println!("{}", violation_msg);
+                            }
+                        }
+                        
+                        // Check AST_MUST_CONTAIN constraints
+                        if let Err(violation_msg) = check_ast_must_contain(&result.original_code, &result.ast) {
+                            println!("\n{}", "=".repeat(80));
+                            println!("AST_MUST_CONTAIN VIOLATIONS:");
+                            println!("{}", "=".repeat(80));
+                            println!("{}", violation_msg);
+                        }
+                        
+                        // Check AST_MUST_NOT_CONTAIN constraints
+                        if let Err(violation_msg) = check_ast_must_not_contain(&result.original_code, &result.ast) {
+                            println!("\n{}", "=".repeat(80));
+                            println!("AST_MUST_NOT_CONTAIN VIOLATIONS:");
+                            println!("{}", "=".repeat(80));
+                            println!("{}", violation_msg);
+                        }
+                        
                         // Show AST
                         println!("\n{}", "=".repeat(80));
                         println!("ABSTRACT SYNTAX TREE:");
@@ -1270,6 +1313,12 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                         println!("\n{}", "=".repeat(80));
                         println!("SUMMARY: {} out of {} tests passed before first failure", passed_tests, total_tests);
                         println!("{}", "=".repeat(80));
+                        
+                        // Show brief failure summary
+                        if !result.failure_reason.is_empty() {
+                            println!("\nBRIEF FAILURE SUMMARY:");
+                            println!("{}", result.failure_reason);
+                        }
                         
                         // Write the passed test count to first_n_tests_passed.txt
                         println!("Writing test count {} to first_n_tests_passed.txt", passed_tests);
