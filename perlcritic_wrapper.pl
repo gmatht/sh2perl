@@ -54,10 +54,43 @@ if (@filtered_violations) {
         print $violation->description() . "\n";
         print "  Policy: " . $violation->policy() . "\n";
         print "  Severity: " . $violation->severity() . "\n";
-        # Skip location information since it's not working properly
-        # my $location = $violation->location();
-        # print "  Location: " . $location . "\n";
-        print "  Location: " . join(", ", @{$violation->location()}) . "\n";
+        # Get location information and show the actual line with violation marker
+        my $location = $violation->location();
+        my @location_parts = @{$location};
+        if (@location_parts >= 2) {
+            my $line_num = $location_parts[0];
+            my $column = $location_parts[1];
+            print "  Location: Line $line_num, Column $column\n";
+            
+            # Read the file and show the line with violation marker
+            # Find the actual Perl file by looking for .pl files in ARGV
+            my $perl_file = '__tmp_test_output.pl';
+            foreach my $arg (@ARGV) {
+                if ($arg =~ /\.pl$/) {
+                    $perl_file = $arg;
+                    last;
+                }
+            }
+            if (open(my $fh, '<', $perl_file)) {
+                my $current_line = 0;
+                while (my $line = <$fh>) {
+                    $current_line++;
+                    if ($current_line == $line_num) {
+                        chomp $line;
+                        # Insert [VIOLATION!] at the column position
+                        my $before = substr($line, 0, $column - 1);
+                        my $after = substr($line, $column - 1);
+                        print "  Code: " . $before . "[VIOLATION!]" . $after . "\n";
+                        last;
+                    }
+                }
+                close($fh);
+            } else {
+                print "  Debug: Could not open file: $perl_file - $!\n";
+            }
+        } else {
+            print "  Location: " . join(", ", @location_parts) . "\n";
+        }
         print "  Explanation: " . $violation->explanation() . "\n";
         
         # Add specific guidance for common violations
