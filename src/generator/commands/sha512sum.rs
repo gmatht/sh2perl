@@ -27,7 +27,7 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
         output.push_str("my @results;\n");
         output.push_str("foreach my $line (@lines) {\n");
         output.push_str("chomp($line);\n");
-        output.push_str("if ($line =~ /^([a-f0-9]{128})\\s+(.+)$/) {\n");
+        output.push_str(&format!("if ($line =~ {}) {{\n", generator.format_regex_pattern(r"^([a-f0-9]{128})\\s+(.+)$")));
         output.push_str("my ($expected_hash, $filename) = ($1, $2);\n");
         output.push_str("if (-f $filename) {\n");
         output.push_str("my $actual_hash = `sha512sum \"$filename\" | cut -d' ' -f1`;\n");

@@ -42,7 +42,7 @@ pub fn generate_kill_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         output.push_str(");\n");
         
         output.push_str("foreach my $pid (@pids) {\n");
-        output.push_str("if ($pid =~ /^\\d+$/) {\n"); // Check if it's numeric
+        output.push_str(&format!("if ($pid =~ {}) {{\n", generator.format_regex_pattern(r"^\\d+$"))); // Check if it's numeric
         output.push_str("my $result = kill $signal, $pid;\n");
         output.push_str("if ($result) {\n");
         output.push_str("print \"Sent signal $signal to process $pid\\n\";\n");

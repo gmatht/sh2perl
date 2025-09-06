@@ -109,7 +109,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             output.push_str(&format!("${} = join(\"\\n\", @ls_files);\n", var));
             // Ensure output ends with newline to match shell behavior
             output.push_str(&generator.indent());
-            output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", var, var));
+            output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", var))));
         }
         // No print statement in pipeline context
     } else {

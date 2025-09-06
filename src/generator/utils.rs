@@ -44,13 +44,28 @@ pub fn extract_array_elements_impl(value: &str) -> Option<Vec<String>> {
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
-            // Escape quotes and backslashes for Perl string literals
-            let escaped = s.replace("\\", "\\\\")
-                          .replace("\"", "\\\"")
-                          .replace("\n", "\\n")
-                          .replace("\t", "\\t")
-                          .replace("\r", "\\r");
-            format!("\"{}\"", escaped)
+            // Handle empty strings with q{}
+            if s.is_empty() {
+                return "q{}".to_string();
+            }
+            
+            // Check if string needs interpolation (contains variables or special chars)
+            let needs_interpolation = s.contains('$') || s.contains('@') || s.contains('\\');
+            
+            if needs_interpolation {
+                // Escape quotes and backslashes for Perl string literals
+                let escaped = s.replace("\\", "\\\\")
+                              .replace("\"", "\\\"")
+                              .replace("\n", "\\n")
+                              .replace("\t", "\\t")
+                              .replace("\r", "\\r");
+                format!("\"{}\"", escaped)
+            } else {
+                // Use single quotes for strings that don't need interpolation
+                let escaped = s.replace("\\", "\\\\")
+                              .replace("'", "\\'");
+                format!("'{}'", escaped)
+            }
         }
         Word::Variable(var, _, _) => {
             // Handle special shell variables
@@ -117,22 +132,22 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     let mut captured_pipeline = pipeline_code
                         .replace(&format!("print {};", output_var), "")
                         .replace("print \"\\n\";", "")
-                        .replace(&format!("print \"\\n\" unless {} =~ /\\n$/;", output_var), "")
+                        .replace(&format!("print \"\\n\" unless {} =~ {};", output_var, generator.newline_end_regex()), "")
                         .replace(&format!("$main_exit_code = 1 unless {};", success_var), "");
                     
                     // Remove conditional print blocks that are common in pipelines
                     // Use a simpler approach with string replacement for the specific pattern
                     let output_var_num = output_var.trim_start_matches("$output_");
                     let print_block_to_remove = format!(
-                        "if ({} ne '' && !defined($output_printed_{})) {{\n\n        print {};\n        print \"\\n\" unless {} =~ /\\n$/;\n    }}", 
-                        output_var, output_var_num, output_var, output_var
+                        "if ({} ne q{} && !defined($output_printed_{})) {{\n\n        print {};\n        print \"\\n\" unless {} =~ {};\n    }}", 
+                        output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
                     );
                     captured_pipeline = captured_pipeline.replace(&print_block_to_remove, "");
                     
                     // Also try without the extra newlines in case formatting is different
                     let print_block_compact = format!(
-                        "if ({} ne '' && !defined($output_printed_{})) {{ print {}; print \"\\n\" unless {} =~ /\\n$/; }}", 
-                        output_var, output_var_num, output_var, output_var
+                        "if ({} ne q{} && !defined($output_printed_{})) {{ print {}; print \"\\n\" unless {} =~ {}; }}", 
+                        output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
                     );
                     captured_pipeline = captured_pipeline.replace(&print_block_compact, "");
                     
@@ -167,13 +182,28 @@ pub fn strip_shell_quotes_and_convert_to_perl_impl(generator: &mut Generator, wo
                 s
             };
             
-            // Escape quotes and backslashes for Perl string literals
-            let escaped = stripped.replace("\\", "\\\\")
-                                .replace("\"", "\\\"")
-                                .replace("\n", "\\n")
-                                .replace("\t", "\\t")
-                                .replace("\r", "\\r");
-            format!("\"{}\"", escaped)
+            // Handle empty strings with q{}
+            if stripped.is_empty() {
+                return "q{}".to_string();
+            }
+            
+            // Check if string needs interpolation (contains variables or special chars)
+            let needs_interpolation = stripped.contains('$') || stripped.contains('@') || stripped.contains('\\');
+            
+            if needs_interpolation {
+                // Escape quotes and backslashes for Perl string literals
+                let escaped = stripped.replace("\\", "\\\\")
+                                    .replace("\"", "\\\"")
+                                    .replace("\n", "\\n")
+                                    .replace("\t", "\\t")
+                                    .replace("\r", "\\r");
+                format!("\"{}\"", escaped)
+            } else {
+                // Use single quotes for strings that don't need interpolation
+                let escaped = stripped.replace("\\", "\\\\")
+                                    .replace("'", "\\'");
+                format!("'{}'", escaped)
+            }
         }
         Word::Arithmetic(expr, _) => {
             // Handle arithmetic expressions by converting them to Perl
@@ -250,4 +280,20 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
 pub fn get_unique_file_handle_impl(generator: &mut Generator) -> String {
     generator.file_handle_counter += 1;
     format!("fh_{}", generator.file_handle_counter)
+}
+
+/// Generate a properly formatted regex pattern with appropriate flags
+pub fn format_regex_pattern(pattern: &str) -> String {
+    // Add common flags: /s for dot matching newlines, /x for extended formatting, /m for multiline
+    format!("/{}/msx", pattern)
+}
+
+/// Generate a regex pattern for checking if string ends with newline
+pub fn newline_end_regex() -> String {
+    format_regex_pattern(r"\\n$")
+}
+
+/// Convert postfix unless statement to block form
+pub fn convert_postfix_unless_to_block(condition: &str, statement: &str) -> String {
+    format!("unless ({} ) {{\n    {};\n}}", condition, statement)
 }

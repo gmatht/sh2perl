@@ -53,7 +53,7 @@ pub fn generate_gzip_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             if decompress_mode {
                 // Decompress file
                 output.push_str(&format!("if (-f {}) {{\n", file));
-                output.push_str(&format!("if ({}.gz =~ /\\.gz$/) {{\n", file));
+                output.push_str(&format!("if ({}.gz =~ {}) {{\n", file, generator.format_regex_pattern(r"\\.gz$")));
                 output.push_str(&format!("my $decompressed = `gunzip -c {}.gz`;\n", file));
                 output.push_str("if (defined $decompressed) {\n");
                 output.push_str(&format!("push @results, \"Decompressed: {}\";\n", file));

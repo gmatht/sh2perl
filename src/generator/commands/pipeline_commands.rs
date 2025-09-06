@@ -1045,7 +1045,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
                 if let Word::Literal(s, _) = arg { !s.starts_with('-') } else { true }
             }) {
                 let pattern = generator.strip_shell_quotes_for_regex(pattern_arg);
-                output.push_str(&format!("next unless $line =~ /{}/;\n", pattern));
+                output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("$line =~ {}", generator.format_regex_pattern(&pattern)), "next")));
             }
             output
         },
@@ -1114,9 +1114,9 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
                         // Handle variable replacement properly
                         let replacement_str = format!("${}", replacement);
                         if flags.is_empty() || flags == "/" {
-                            output.push_str(&format!("${} =~ s/{}/{}/;\n", line_var, pattern_str, replacement_str));
+                            output.push_str(&format!("${} =~ s{}{};\n", line_var, generator.format_regex_pattern(&format!("{}/{}", pattern_str, replacement_str)), ""));
                         } else {
-                            output.push_str(&format!("${} =~ s/{}/{}/{};\n", line_var, pattern_str, replacement_str, flags));
+                            output.push_str(&format!("${} =~ s{}{};\n", line_var, generator.format_regex_pattern(&format!("{}/{}/{}", pattern_str, replacement_str, flags)), ""));
                         }
                     }
                 }
@@ -1158,7 +1158,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             // For wc, count characters/words in the line
             let mut output = String::new();
             output.push_str("$char_count += length($line);\n");
-            output.push_str("$word_count += scalar(split(/\\s+/, $line));\n");
+            output.push_str(&format!("$word_count += scalar(split({}, $line));\n", generator.format_regex_pattern(r"\\s+")));
             output.push_str("$line_count++;\n");
             output.push_str("next; # Skip normal line processing for wc\n");
             output
@@ -1386,7 +1386,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
             output.push_str(&format!("print $output_{};\n", unique_id));
             // Ensure output ends with newline to match shell behavior
             output.push_str(&generator.indent());
-            output.push_str(&format!("print \"\\n\" unless $output_{} =~ /\\n$/;\n", unique_id));
+            output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("$output_{} =~ {}", unique_id, generator.newline_end_regex()), "print \"\\n\"")));
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");

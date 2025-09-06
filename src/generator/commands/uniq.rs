@@ -5,7 +5,7 @@ pub fn generate_uniq_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     generate_uniq_command_with_output(generator, cmd, input_var, command_index, input_var)
 }
 
-pub fn generate_uniq_command_with_output(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
+pub fn generate_uniq_command_with_output(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
     let mut output = String::new();
     
     let mut count = false;
@@ -32,7 +32,7 @@ pub fn generate_uniq_command_with_output(_generator: &mut Generator, cmd: &Simpl
         output.push_str("}\n");
         output.push_str(&format!("${} = join(\"\\n\", @uniq_result_{});\n", output_var, command_index));
         // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", output_var, output_var));
+        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", output_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", output_var))));
     } else {
         output.push_str(&format!("my %uniq_seen_{};\n", command_index));
         output.push_str(&format!("my @uniq_result_{};\n", command_index));
@@ -41,7 +41,7 @@ pub fn generate_uniq_command_with_output(_generator: &mut Generator, cmd: &Simpl
         output.push_str("}\n");
         output.push_str(&format!("${} = join(\"\\n\", @uniq_result_{});\n", output_var, command_index));
         // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", output_var, output_var));
+        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", output_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", output_var))));
     }
     
     output
