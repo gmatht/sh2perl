@@ -321,7 +321,14 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
             let left = parts[0].trim();
             let right = parts[1].trim();
             let left_perl = convert_shell_var_to_perl(left);
-            let right_perl = convert_shell_var_to_perl(right);
+            let mut right_perl = convert_shell_var_to_perl(right);
+            
+            // Replace magic numbers with constants
+            for (const_name, value) in &generator.constants {
+                let value_str = value.to_string();
+                right_perl = right_perl.replace(&value_str, const_name);
+            }
+            
             format!("({} < {})", left_perl, right_perl)
         } else {
             "0".to_string()
@@ -389,10 +396,18 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
     } else {
         // Default case: treat as a simple boolean expression
         // This handles cases like [[ $var ]] which should check if $var is non-empty
-        if expr.trim().starts_with('$') {
-            format!("({} ne '')", expr.trim())
+        
+        // Replace magic numbers with constants first
+        let mut result = expr.to_string();
+        for (const_name, value) in &generator.constants {
+            let value_str = value.to_string();
+            result = result.replace(&value_str, const_name);
+        }
+        
+        if result.trim().starts_with('$') {
+            format!("({} ne '')", result.trim())
         } else {
-            format!("({})", expr)
+            format!("({})", result)
         }
     }
 }

@@ -158,11 +158,11 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         if args.is_empty() {
             output.push_str(&format!("${} .= \"\\n\";\n", output_var));
         } else if args.len() == 1 {
-            output.push_str(&format!("${} .= {}. \"\\n\";\n", output_var, args[0]));
+            output.push_str(&format!("${} .= {} . \"\\n\";\n", output_var, args[0]));
         } else {
             // For multiple arguments, join them with spaces
             let args_str = args.join(" . \" \" . ");
-            output.push_str(&format!("${} .= {}. \"\\n\";\n", output_var, args_str));
+            output.push_str(&format!("${} .= {} . \"\\n\";\n", output_var, args_str));
         }
     }
     

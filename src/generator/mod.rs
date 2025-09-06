@@ -23,6 +23,7 @@ pub struct Generator {
     pub process_sub_files: HashMap<String, String>,
     pub current_process_sub_file: Option<String>,
     pub function_level_vars: HashSet<String>,
+    pub constants: HashMap<String, i64>,
 }
 
 impl Generator {
@@ -37,6 +38,7 @@ impl Generator {
             process_sub_files: HashMap::new(),
             current_process_sub_file: None,
             function_level_vars: HashSet::new(),
+            constants: HashMap::new(),
         }
     }
 
@@ -45,6 +47,9 @@ impl Generator {
         
         // Pre-analysis pass: identify variables that are used after for loops
         self.analyze_variable_usage(ast);
+        
+        // Pre-analysis pass: identify constants needed for magic numbers
+        self.analyze_constants_needed(ast);
         
         // Analyze what imports and variables are needed
         let needs_basename = self.needs_basename_import(ast);
@@ -61,15 +66,22 @@ impl Generator {
         output.push_str("\n");
         
         // Add main exit code variable for pipeline tracking
-        if needs_exit_code {
-            output.push_str("my $main_exit_code = 0;\n\n");
-        }
+        // Always declare it since it's used in pipeline generation
+        output.push_str("my $main_exit_code = 0;\n\n");
         
         // Add declarations for variables that are used in arithmetic expressions
         for var in &self.function_level_vars {
             output.push_str(&format!("my ${} = 0;\n", var));
         }
         if !self.function_level_vars.is_empty() {
+            output.push_str("\n");
+        }
+        
+        // Add constant declarations
+        for (name, value) in &self.constants {
+            output.push_str(&format!("use constant {} => {};\n", name, value));
+        }
+        if !self.constants.is_empty() {
             output.push_str("\n");
         }
         
@@ -161,9 +173,10 @@ impl Generator {
     pub fn generate_assignment(&mut self, assignment: &Assignment) -> String {
         let mut output = String::new();
         
-        // Only declare the variable if not already declared AND we're at function level
+        
+        // Only declare the variable if not already declared
         // This prevents redeclaring variables inside loops that shadow outer scope variables
-        if !self.declared_locals.contains(&assignment.variable) && self.indent_level <= 1 {
+        if !self.declared_locals.contains(&assignment.variable) && !self.function_level_vars.contains(&assignment.variable) {
             output.push_str(&self.indent());
             output.push_str(&format!("my ${};\n", assignment.variable));
             self.declared_locals.insert(assignment.variable.clone());
@@ -268,6 +281,10 @@ impl Generator {
         format!("{}", id)
     }
 
+    pub fn add_constant(&mut self, name: &str, value: i64) {
+        self.constants.insert(name.to_string(), value);
+    }
+
     // Additional helper methods that are needed
     pub fn handle_range_expansion(&self, s: &str) -> String {
         words::handle_range_expansion_impl(self, s)
@@ -356,6 +373,122 @@ impl Generator {
                 // Also check for variables used in arithmetic expressions within the loop body
                 self.analyze_variables_in_block(&for_loop.body);
             }
+        }
+    }
+    
+    /// Pre-analysis pass to identify constants needed for magic numbers
+    fn analyze_constants_needed(&mut self, ast: &[Command]) {
+        for command in ast {
+            self.analyze_constants_in_command(command);
+        }
+    }
+    
+    /// Analyze constants needed in a command
+    fn analyze_constants_in_command(&mut self, command: &Command) {
+        match command {
+            Command::For(for_loop) => {
+                for word in &for_loop.items {
+                    if let Word::BraceExpansion(expansion, _) = word {
+                        if expansion.items.len() == 1 {
+                            if let BraceItem::Range(range) = &expansion.items[0] {
+                                if let (Ok(_start_num), Ok(end_num)) = (range.start.parse::<i64>(), range.end.parse::<i64>()) {
+                                    if end_num > 2 {
+                                        let const_name = format!("MAX_LOOP_{}", end_num);
+                                        self.add_constant(&const_name, end_num);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also analyze constants in the loop body
+                self.analyze_constants_in_block(&for_loop.body);
+            }
+            Command::If(if_stmt) => {
+                // Analyze test expressions for magic numbers
+                self.analyze_constants_in_command(&if_stmt.condition);
+                self.analyze_constants_in_command(&if_stmt.then_branch);
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    self.analyze_constants_in_command(else_branch);
+                }
+            }
+            Command::While(while_loop) => {
+                // Analyze test expressions for magic numbers
+                self.analyze_constants_in_command(&while_loop.condition);
+                self.analyze_constants_in_block(&while_loop.body);
+            }
+            Command::Case(case_stmt) => {
+                for case in &case_stmt.cases {
+                    for command in &case.body {
+                        self.analyze_constants_in_command(command);
+                    }
+                }
+            }
+            Command::Function(func) => {
+                self.analyze_constants_in_block(&func.body);
+            }
+            Command::Block(block) => {
+                self.analyze_constants_in_block(block);
+            }
+            Command::Simple(cmd) => {
+                // Analyze simple commands for magic numbers in arguments
+                for arg in &cmd.args {
+                    self.analyze_constants_in_word(arg);
+                }
+            }
+            Command::TestExpression(test_expr) => {
+                // Analyze test expressions for magic numbers
+                self.analyze_constants_in_test_expression(test_expr);
+            }
+            _ => {} // Other commands don't need constant analysis
+        }
+    }
+    
+    /// Analyze constants in test expressions
+    fn analyze_constants_in_test_expression(&mut self, test_expr: &TestExpression) {
+        // Extract numbers from test expressions like "($i < 10)"
+        let expr = &test_expr.expression;
+        self.extract_magic_numbers_from_string(expr);
+    }
+    
+    /// Analyze constants in words
+    fn analyze_constants_in_word(&mut self, word: &Word) {
+        match word {
+            Word::Literal(s, _) => {
+                self.extract_magic_numbers_from_string(s);
+            }
+            Word::StringInterpolation(interp, _) => {
+                for part in &interp.parts {
+                    match part {
+                        StringPart::Literal(s) => {
+                            self.extract_magic_numbers_from_string(s);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    /// Extract magic numbers from a string and add them as constants
+    fn extract_magic_numbers_from_string(&mut self, s: &str) {
+        // Simple regex-like extraction of numbers > 2
+        let words: Vec<&str> = s.split_whitespace().collect();
+        for word in words {
+            if let Ok(num) = word.parse::<i64>() {
+                if num > 2 {
+                    let const_name = format!("MAGIC_{}", num);
+                    self.add_constant(&const_name, num);
+                }
+            }
+        }
+    }
+    
+    /// Analyze constants needed in a block
+    fn analyze_constants_in_block(&mut self, block: &Block) {
+        for command in &block.commands {
+            self.analyze_constants_in_command(command);
         }
     }
     

@@ -256,7 +256,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // For command substitution, don't add extra newline as it already contains proper formatting
                         output.push_str(&format!("print {};\n", args[0]));
                     } else {
-                    output.push_str(&format!("print {}. \"\\n\";\n", args[0]));
+                    output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
                     }
                 } else {
                     // Check if we have multiple brace expansions that need cartesian product
@@ -271,7 +271,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // For multiple arguments, join them with spaces
                         let args_str = args.join(" . \" \" . ");
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("print {}. \"\\n\";\n", args_str));
+                        output.push_str(&format!("print {} . \"\\n\";\n", args_str));
                     }
                 }
             }
@@ -306,6 +306,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 generator.declared_locals.insert(var.clone());
                             }
                         } else {
+                            // Variable already declared, just assign to it
                             output.push_str(&generator.indent());
                             output.push_str(&format!("${} = {};\n", var, perl_expr));
                         }
