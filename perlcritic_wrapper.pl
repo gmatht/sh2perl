@@ -61,8 +61,8 @@ if (@filtered_violations) {
         my $policy = $violation->policy();
         if ($policy eq 'Perl::Critic::Policy::ValuesAndExpressions::ProhibitConstantPragma') {
             print "  How to fix: Replace 'use constant NAME => VALUE;' with 'my \$NAME = VALUE;' or define constants differently\n";
-        } elsif ($policy eq 'Perl::Critic::Policy::ValuesAndExpressions::ProhibitInterpolationOfLiterals') {
-            print "  How to fix: Replace string concatenation like '\"text\" . \"\\n\"' with '\"text\\n\"' or use single quotes where appropriate\n";
+    } elsif ($policy eq 'Perl::Critic::Policy::ValuesAndExpressions::ProhibitInterpolationOfLiterals') {
+        print "  How to fix: Perl::Critic sees double quotes and thinks interpolation might be happening. Use single quotes for literal strings that don't contain variables (e.g., 'Hello, World!\\n' instead of \"Hello, World!\\n\"). The \\n is just a literal escape sequence, not variable interpolation.\n";
         } elsif ($policy eq 'Perl::Critic::Policy::CodeLayout::ProhibitParensWithBuiltins') {
             print "  How to fix: Remove unnecessary parentheses around built-in functions like 'print()' -> 'print'\n";
         } elsif ($policy eq 'Perl::Critic::Policy::ValuesAndExpressions::ProhibitNoisyQuotes') {

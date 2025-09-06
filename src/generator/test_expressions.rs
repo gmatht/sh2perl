@@ -173,7 +173,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
     } else if expr.contains(" -f ") || expr.starts_with("-f ") {
         // File exists and is regular file: [[ -f $var ]]
         let var = expr.replace("-f ", "").trim().to_string();
-        format!("-f {}", var)
+        format!(" -f {} ", var)
     } else if expr.contains(" -d ") || expr.starts_with("-d ") {
         // File exists and is directory: [[ -d $var ]]
         let var = expr.replace("-d ", "").trim().to_string();

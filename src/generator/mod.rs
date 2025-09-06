@@ -79,7 +79,7 @@ impl Generator {
         
         // Add constant declarations
         for (name, value) in &self.constants {
-            output.push_str(&format!("use constant {} => {};\n", name, value));
+            output.push_str(&format!("my ${} = {};\n", name, value));
         }
         if !self.constants.is_empty() {
             output.push_str("\n");
@@ -100,6 +100,11 @@ impl Generator {
         // Add final exit statement
         if needs_exit_code {
             output.push_str("\nexit($main_exit_code);\n");
+        }
+        
+        // Ensure the output ends with a newline
+        if !output.ends_with('\n') {
+            output.push('\n');
         }
         
         output
