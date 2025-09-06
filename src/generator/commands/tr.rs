@@ -101,7 +101,14 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str("    }\n");
         output.push_str("}\n");
         // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {} || ${} eq q{}", output_var, generator.newline_end_regex(), output_var, ""), &format!("${} .= \"\\n\"", output_var))));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if (!(${} =~ {} || ${} eq q{})) {{\n", output_var, generator.newline_end_regex(), output_var, ""));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("${} .= \"\\n\";\n", output_var));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     } else if args.len() >= 2 {
         // tr SET1 SET2: translate characters
         let set1 = generator.strip_shell_quotes_and_convert_to_perl(&args[0]);
@@ -122,7 +129,14 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str("    }\n");
         output.push_str("}\n");
         // Ensure output ends with newline to match shell behavior (but not for empty input)
-        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {} || ${} eq q{}", output_var, generator.newline_end_regex(), output_var, ""), &format!("${} .= \"\\n\"", output_var))));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if (!(${} =~ {} || ${} eq q{})) {{\n", output_var, generator.newline_end_regex(), output_var, ""));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("${} .= \"\\n\";\n", output_var));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     } else {
         // No valid arguments, just pass through input
         output.push_str(&format!("${} = ${};\n", output_var, input_var));

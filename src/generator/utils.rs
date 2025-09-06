@@ -314,3 +314,13 @@ pub fn newline_end_regex() -> String {
 pub fn convert_postfix_unless_to_block(condition: &str, statement: &str) -> String {
     format!("if (!({}) ) {{\n    {};\n}}", condition, statement)
 }
+
+/// Convert postfix unless statement to block form with proper indentation
+pub fn convert_postfix_unless_to_block_with_indent(condition: &str, statement: &str, indent: &str) -> String {
+    format!("{}if (!({}) ) {{\n{}    {};\n{}}}", indent, condition, indent, statement, indent)
+}
+
+/// Convert postfix unless statement to block form without adding indentation (for use within already indented blocks)
+pub fn convert_postfix_unless_to_block_no_indent(condition: &str, statement: &str) -> String {
+    format!("if (!({}) ) {{\n    {};\n}}", condition, statement)
+}

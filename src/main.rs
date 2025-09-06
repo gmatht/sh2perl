@@ -17,7 +17,7 @@ use crate::utils::generate_unified_diff;
 use crate::testing::{test_all_examples, test_all_examples_next_fail, find_uses_of_system,
                     test_file_equivalence, AstFormatOptions};
 use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, 
-                     parse_file_to_perl, interactive_mode, export_mir};
+                     parse_file_to_perl, parse_snippet_to_perl, interactive_mode, export_mir};
 use crate::help::show_help;
 
 fn main() {
@@ -306,6 +306,13 @@ fn main() {
                 }
                 let input = &args[3];
                 parse_to_perl(input);
+            } else if args.len() >= 3 && args[2] == "--snippet" {
+                if args.len() < 4 {
+                    println!("Error: parse --snippet command requires input");
+                    return;
+                }
+                let input = &args[3];
+                parse_snippet_to_perl(input);
             } else if args.len() >= 3 && args[2] == "--run" {
                 // parse --run <lang> <input>
                 if args.len() < 5 {

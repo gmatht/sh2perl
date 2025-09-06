@@ -45,7 +45,14 @@ pub fn generate_cat_command(generator: &mut Generator, cmd: &SimpleCommand, redi
         output.push_str("}\n");
         output.push_str("close $fh or croak \"Close failed: $OS_ERROR\";\n");
         output.push_str(&format!("# Ensure content ends with newline to prevent line concatenation\n"));
-        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", input_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", input_var))));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if (!(${} =~ {})) {{\n", input_var, generator.newline_end_regex()));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("${} .= \"\\n\";\n", input_var));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
         output.push_str("} else {\n");
         output.push_str(&format!("carp \"cat: {}: No such file or directory\";\n", adjusted_filename));
         // Instead of calling exit(1), set the output to empty and let the pipeline handle the failure

@@ -32,7 +32,14 @@ pub fn generate_uniq_command_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str("}\n");
         output.push_str(&format!("${} = join \"\\n\", @uniq_result_{};\n", output_var, command_index));
         // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", output_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", output_var))));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if (!(${} =~ {})) {{\n", output_var, generator.newline_end_regex()));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("${} .= \"\\n\";\n", output_var));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     } else {
         output.push_str(&format!("my %uniq_seen_{};\n", command_index));
         output.push_str(&format!("my @uniq_result_{};\n", command_index));
@@ -41,7 +48,14 @@ pub fn generate_uniq_command_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str("}\n");
         output.push_str(&format!("${} = join \"\\n\", @uniq_result_{};\n", output_var, command_index));
         // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", output_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", output_var))));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if (!(${} =~ {})) {{\n", output_var, generator.newline_end_regex()));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("${} .= \"\\n\";\n", output_var));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     }
     
     output

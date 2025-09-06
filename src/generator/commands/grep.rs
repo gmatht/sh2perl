@@ -694,7 +694,14 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("$grep_result_{} =~ s/\\n/\\0/g;\n", command_index));
             } else {
                 // Ensure output ends with newline to match shell behavior, but only if there are matches
-                output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("$grep_result_{} =~ {} || $grep_result_{} eq q{{}}", command_index, generator.newline_end_regex(), command_index), &format!("$grep_result_{} .= \"\\n\"", command_index))));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (!($grep_result_{} =~ {} || $grep_result_{} eq q{{}})) {{\n", command_index, generator.newline_end_regex(), command_index));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$grep_result_{} .= \"\\n\";\n", command_index));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
             }
             
             if should_print && !quiet_mode {

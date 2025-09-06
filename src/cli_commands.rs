@@ -102,6 +102,67 @@ pub fn parse_to_perl(input: &str) {
     println!("{}", "=".repeat(50));
 }
 
+pub fn parse_snippet_to_perl(input: &str) {
+    let mut generator = Generator::new();
+    
+    println!("Converting snippet to Perl:");
+    println!("{}", "=".repeat(50));
+    
+    // For snippets, we need to be more lenient with parsing
+    // Try to parse as-is first
+    let commands = match Parser::new(input).parse() {
+        Ok(c) => c,
+        Err(e) => { 
+            // If parsing fails, try to wrap in a simple command structure
+            let wrapped_input = format!("{}", input);
+            match Parser::new(&wrapped_input).parse() {
+                Ok(c) => c,
+                Err(e2) => {
+                    println!("Parse error: {}", e);
+                    println!("Tried wrapped version, error: {}", e2);
+                    return;
+                }
+            }
+        }
+    };
+    
+    let perl_code = generator.generate(&commands);
+    
+    // Extract just the core logic from the generated code
+    let clean_code = extract_core_perl_logic(&perl_code);
+    println!("{}", clean_code);
+    
+    println!("{}", "=".repeat(50));
+}
+
+fn extract_core_perl_logic(perl_code: &str) -> String {
+    // Look for the main logic after variable declarations
+    if let Some(captures) = regex::Regex::new(r"my \$main_exit_code = 0;\s*\n(.*?)(?:\n\s*$|$)")
+        .unwrap()
+        .captures(perl_code) {
+        let code = captures.get(1).unwrap().as_str();
+        // Clean up the code - remove trailing semicolons and extra whitespace
+        let cleaned = code.trim_end();
+        if cleaned.ends_with(';') {
+            cleaned[..cleaned.len()-1].to_string()
+        } else {
+            cleaned.to_string()
+        }
+    } else {
+        // If we can't find the pattern, try to extract just the core logic
+        // Look for print statements or other core logic
+        if let Some(captures) = regex::Regex::new(r"(print.*?;?)\s*$")
+            .unwrap()
+            .captures(perl_code) {
+            let code = captures.get(1).unwrap().as_str();
+            code.trim_end().to_string()
+        } else {
+            // Return the original code if we can't extract anything
+            perl_code.to_string()
+        }
+    }
+}
+
 pub fn parse_file_to_perl(filename: &str) {
     match fs::read_to_string(filename) {
         Ok(content) => {
