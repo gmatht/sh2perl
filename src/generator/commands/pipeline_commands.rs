@@ -1045,7 +1045,14 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
                 if let Word::Literal(s, _) = arg { !s.starts_with('-') } else { true }
             }) {
                 let pattern = generator.strip_shell_quotes_for_regex(pattern_arg);
-                output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("$line =~ {}", generator.format_regex_pattern(&pattern)), "next")));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (!($line =~ {})) {{\n", generator.format_regex_pattern(&pattern)));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("next;\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
             }
             output
         },
@@ -1386,7 +1393,13 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
             output.push_str(&format!("print $output_{};\n", unique_id));
             // Ensure output ends with newline to match shell behavior
             output.push_str(&generator.indent());
-            output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("$output_{} =~ {}", unique_id, generator.newline_end_regex()), "print \"\\n\"")));
+            output.push_str(&format!("if (!($output_{} =~ {})) {{\n", unique_id, generator.newline_end_regex()));
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str("print \"\\n\";\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");

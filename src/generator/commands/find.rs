@@ -302,7 +302,11 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     // Add name pattern check
     if let Some(pattern) = &name_pattern {
         output.push_str(&indent4);
-        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("$file =~ {}", generator.format_regex_pattern(&escape_glob_pattern(pattern))), "next")));
+        output.push_str(&format!("if (!($file =~ {})) {{\n", generator.format_regex_pattern(&escape_glob_pattern(pattern))));
+        output.push_str(&indent4);
+        output.push_str("    next;\n");
+        output.push_str(&indent4);
+        output.push_str("}\n");
     }
     
     // Add empty check
@@ -469,7 +473,11 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         output.push_str(&indent1);
         output.push_str(&format!("${} = join \"\\n\", @find_results;\n", input_var));
         output.push_str(&indent1);
-        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", input_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", input_var))));
+        output.push_str(&format!("if (!(${} =~ {})) {{\n", input_var, generator.newline_end_regex()));
+        output.push_str(&indent1);
+        output.push_str(&format!("    ${} .= \"\\n\";\n", input_var));
+        output.push_str(&indent1);
+        output.push_str("}\n");
     } else {
         output.push_str(&indent1);
         output.push_str("print join \"\\n\", @find_results . \"\\n\";\n");

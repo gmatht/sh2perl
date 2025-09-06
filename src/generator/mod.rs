@@ -764,7 +764,7 @@ impl Generator {
     
     /// Convert postfix unless statement to block form
     pub fn convert_postfix_unless_to_block(&self, condition: &str, statement: &str) -> String {
-        utils::convert_postfix_unless_to_block(condition, statement)
+        utils::convert_postfix_unless_to_block_no_indent(condition, statement)
     }
 }
 

@@ -56,7 +56,14 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         // Write into a result variable expected by the pipeline
         output.push_str(&format!("${} = join \"\\n\", @xargs_matching_files_{};\n", output_var, command_index));
         // Ensure output ends with newline to match shell behavior
-        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", output_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", output_var))));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if (!(${} =~ {})) {{\n", output_var, generator.newline_end_regex()));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("${} .= \"\\n\";\n", output_var));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     } else {
         // Fallback to system command for other cases
         output.push_str(&format!("${} = `echo \"${}\" | {}`;\n", input_var, input_var, command));
