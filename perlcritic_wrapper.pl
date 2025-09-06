@@ -56,6 +56,41 @@ if (@filtered_violations) {
         print "  Severity: " . $violation->severity() . "\n";
         print "  Location: " . $violation->location() . "\n";
         print "  Explanation: " . $violation->explanation() . "\n";
+        
+        # Add specific guidance for common violations
+        my $policy = $violation->policy();
+        if ($policy eq 'Perl::Critic::Policy::ValuesAndExpressions::ProhibitConstantPragma') {
+            print "  How to fix: Replace 'use constant NAME => VALUE;' with 'my \$NAME = VALUE;' or define constants differently\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::ValuesAndExpressions::ProhibitInterpolationOfLiterals') {
+            print "  How to fix: Replace string concatenation like '\"text\" . \"\\n\"' with '\"text\\n\"' or use single quotes where appropriate\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::CodeLayout::ProhibitParensWithBuiltins') {
+            print "  How to fix: Remove unnecessary parentheses around built-in functions like 'print()' -> 'print'\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::ValuesAndExpressions::ProhibitNoisyQuotes') {
+            print "  How to fix: Use single quotes for strings that don't need interpolation, like 'text' instead of \"text\"\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::ControlStructures::ProhibitPostfixControls') {
+            print "  How to fix: Use block form instead of postfix, like 'unless (condition) { ... }' instead of 'statement unless condition'\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::RegularExpressions::RequireDotMatchAnything') {
+            print "  How to fix: Add /s flag to regex to make . match newlines: s/pattern/replacement/s\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::RegularExpressions::RequireExtendedFormatting') {
+            print "  How to fix: Add /x flag to regex for better readability: s/pattern/replacement/x\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::RegularExpressions::RequireLineBoundaryMatching') {
+            print "  How to fix: Add /m flag to regex for multiline matching: s/pattern/replacement/m\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::InputOutput::ProhibitBacktickOperators') {
+            print "  How to fix: Use IPC::Open3 or system() instead of backticks for better security and error handling\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::ValuesAndExpressions::ProhibitEmptyQuotes') {
+            print "  How to fix: Use q{} or qw{} instead of empty quotes, or remove unnecessary empty strings\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::InputOutput::RequireCheckedClose') {
+            print "  How to fix: Check the return value of close(): 'close(\$fh) or die \"Close failed: \$!\";'\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::ErrorHandling::RequireCarping') {
+            print "  How to fix: Use 'carp' or 'croak' from Carp module instead of 'warn' or 'die'\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::Subroutines::RequireFinalReturn') {
+            print "  How to fix: Add explicit 'return;' at the end of subroutines\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::RegularExpressions::ProhibitEscapedMetacharacters') {
+            print "  How to fix: Use character classes instead of escaping, like [.] instead of \\.\n";
+        } elsif ($policy eq 'Perl::Critic::Policy::References::ProhibitDoubleSigils') {
+            print "  How to fix: Use proper dereferencing syntax, like \\\$\\\$ref instead of \\\$\\\$\\\$ref\n";
+        }
+        
         print "\n";
     }
 }

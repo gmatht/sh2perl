@@ -617,6 +617,103 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
     // Get the shell output (either cached or fresh)
     let shell_output = shell_output.unwrap();
 
+    // For Perl, run static analysis tests first before executing the code
+    if lang == "perl" && enable_perl_critic {
+        // Run Perl::Critic
+        match run_perl_critic_brutal(&translated_code) {
+            Ok(_) => {
+                // Perl::Critic passed, continue
+            }
+            Err(violations) => {
+                // Perl::Critic failed, return early without executing
+                cleanup_tmp(lang, &tmp_file);
+                return Ok(TestResult {
+                    success: false,
+                    shell_stdout: String::from_utf8_lossy(&shell_output.stdout).to_string().replace("\r\n", "\n").trim().to_string(),
+                    shell_stderr: String::from_utf8_lossy(&shell_output.stderr).to_string().replace("\r\n", "\n").trim().to_string(),
+                    translated_stdout: String::new(),
+                    translated_stderr: String::new(),
+                    shell_exit: shell_output.status.code().unwrap_or(-1),
+                    translated_exit: -1,
+                    original_code: shell_content,
+                    translated_code,
+                    ast,
+                    _lexer_output: String::new(),
+                    failure_reason: format!("Perl::Critic violations found:\n{}", violations),
+                    shell_duration: std::time::Duration::from_secs(0),
+                    translated_duration: std::time::Duration::from_secs(0),
+                });
+            }
+        }
+        
+        // Check #PERL_MUST_CONTAIN constraints
+        if let Err(violation_msg) = check_perl_must_contain(&shell_content, &translated_code) {
+            cleanup_tmp(lang, &tmp_file);
+            return Ok(TestResult {
+                success: false,
+                shell_stdout: String::from_utf8_lossy(&shell_output.stdout).to_string().replace("\r\n", "\n").trim().to_string(),
+                shell_stderr: String::from_utf8_lossy(&shell_output.stderr).to_string().replace("\r\n", "\n").trim().to_string(),
+                translated_stdout: String::new(),
+                translated_stderr: String::new(),
+                shell_exit: shell_output.status.code().unwrap_or(-1),
+                translated_exit: -1,
+                original_code: shell_content,
+                translated_code,
+                ast,
+                _lexer_output: String::new(),
+                failure_reason: format!("PERL_MUST_CONTAIN violations:\n{}", violation_msg),
+                shell_duration: std::time::Duration::from_secs(0),
+                translated_duration: std::time::Duration::from_secs(0),
+            });
+        }
+        
+        // Check PerlTidy formatting
+        let temp_file_tidy = std::env::temp_dir().join("__tmp_perltidy_check.pl");
+        let temp_file_tidy_str = temp_file_tidy.to_string_lossy().to_string();
+        
+        if let Ok(_) = std::fs::write(&temp_file_tidy, &translated_code) {
+            if let Ok(tidy_output) = std::process::Command::new("C:\\Strawberry\\perl\\bin\\perl.exe")
+                .arg("test_wrapper_minimal.pl")
+                .arg(&temp_file_tidy_str)
+                .output() {
+                
+                let tidy_stdout = String::from_utf8_lossy(&tidy_output.stdout);
+                let tidy_stderr = String::from_utf8_lossy(&tidy_output.stderr);
+                
+                // Check if there are formatting differences
+                if tidy_stdout.contains("Original:") && tidy_stdout.contains("Tidied:") {
+                    // Extract the tidied version
+                    if let Some(tidied_start) = tidy_stdout.find("Tidied:") {
+                        let tidied_content = &tidy_stdout[tidied_start + 7..].trim();
+                        if !tidied_content.is_empty() && tidied_content != &translated_code {
+                            cleanup_tmp(lang, &tmp_file);
+                            let _ = std::fs::remove_file(&temp_file_tidy);
+                            return Ok(TestResult {
+                                success: false,
+                                shell_stdout: String::from_utf8_lossy(&shell_output.stdout).to_string().replace("\r\n", "\n").trim().to_string(),
+                                shell_stderr: String::from_utf8_lossy(&shell_output.stderr).to_string().replace("\r\n", "\n").trim().to_string(),
+                                translated_stdout: String::new(),
+                                translated_stderr: String::new(),
+                                shell_exit: shell_output.status.code().unwrap_or(-1),
+                                translated_exit: -1,
+                                original_code: shell_content,
+                                translated_code,
+                                ast,
+                                _lexer_output: String::new(),
+                                failure_reason: "Code is not tidy - PerlTidy formatting differences detected".to_string(),
+                                shell_duration: std::time::Duration::from_secs(0),
+                                translated_duration: std::time::Duration::from_secs(0),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Clean up PerlTidy temp file
+        let _ = std::fs::remove_file(&temp_file_tidy);
+    }
+
     // Run translated program with timing
     let (translated_output, translated_duration) = {
         if lang == "rust" {
