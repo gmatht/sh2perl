@@ -144,6 +144,39 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
     diff
 }
 
+/// Check if the generated Perl code contains required patterns specified in PERL_MUST_CONTAIN comments
+pub fn check_perl_must_contain(shell_content: &str, perl_code: &str) -> Result<(), String> {
+    let lines: Vec<&str> = shell_content.lines().collect();
+    let mut violations = Vec::new();
+    
+    for (line_num, line) in lines.iter().enumerate() {
+        if line.contains("#PERL_MUST_CONTAIN") {
+            // Extract the required pattern after the comment
+            if let Some(pattern_start) = line.find("#PERL_MUST_CONTAIN") {
+                let pattern = line[pattern_start + "#PERL_MUST_CONTAIN".len()..].trim();
+                // Remove leading colon if present
+                let pattern = if pattern.starts_with(':') {
+                    pattern[1..].trim()
+                } else {
+                    pattern
+                };
+                if !pattern.is_empty() {
+                    // Check if the required pattern exists in the generated Perl code
+                    if !perl_code.contains(pattern) {
+                        violations.push(format!("Line {}: Missing required pattern '{}' in generated Perl code", line_num + 1, pattern));
+                    }
+                }
+            }
+        }
+    }
+    
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("PERL_MUST_CONTAIN violations:\n{}", violations.join("\n")))
+    }
+}
+
 /// Check if the generated Perl code contains forbidden patterns specified in PERL_MUST_NOT_CONTAIN comments
 pub fn check_perl_must_not_contain(shell_content: &str, perl_code: &str) -> Result<(), String> {
     let lines: Vec<&str> = shell_content.lines().collect();
