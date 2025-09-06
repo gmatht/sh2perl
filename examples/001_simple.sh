@@ -21,5 +21,5 @@ done
 
 # "Hello, World!\n" is simpler
 #PERL_MUST_NOT_CONTAIN: "Hello, World!", "\n"
-#PERL_MUST_CONTAIN: Hello, World!\n
+#PERL_MUST_CONTAIN: "Hello, World!\n"
 

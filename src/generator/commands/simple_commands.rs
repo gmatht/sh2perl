@@ -256,7 +256,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // For command substitution, don't add extra newline as it already contains proper formatting
                         output.push_str(&format!("print {};\n", args[0]));
                     } else if args[0].starts_with('"') && args[0].ends_with('"') && !args[0].contains("\\n") {
-                        // Extract the string content and add newline directly
+                        // Extract the string content and add newline directly using double quotes for escape sequences
                         let content = &args[0][1..args[0].len()-1]; // Remove quotes
                         output.push_str(&format!("print \"{}\\n\";\n", content));
                     } else if args[0].starts_with('$') && !args[0].contains("\\n") {

@@ -78,8 +78,15 @@ impl Generator {
         }
         
         // Add constant declarations
-        for (name, value) in &self.constants {
-            output.push_str(&format!("my ${} = {};\n", name, value));
+        if !self.constants.is_empty() {
+            // Calculate the maximum length for alignment
+            let max_name_len = self.constants.keys().map(|name| name.len()).max().unwrap_or(0);
+            
+            for (name, value) in &self.constants {
+                let padding = max_name_len - name.len();
+                let spaces = " ".repeat(padding);
+                output.push_str(&format!("my ${}{} = {};\n", name, spaces, value));
+            }
         }
         if !self.constants.is_empty() {
             output.push_str("\n");
