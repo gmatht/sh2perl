@@ -60,18 +60,34 @@ impl PerlCriticCache {
     }
 
     /// Get cached result if it exists
-    pub fn get_cached_result(&self, perl_code: &str) -> Option<String> {
+    pub fn get_cached_result(&self, perl_code: &str) -> Option<(String, bool)> {
         let cache_path = self.get_cache_path(perl_code);
         
         // Always return cached result if it exists, regardless of validity
         match fs::read_to_string(&cache_path) {
-            Ok(content) => Some(content),
+            Ok(content) => {
+                // Parse the success status and content
+                if content.starts_with("SUCCESS:") {
+                    if let Some(newline_pos) = content.find('\n') {
+                        let success_str = &content[8..newline_pos]; // Skip "SUCCESS:"
+                        let result_content = &content[newline_pos + 1..];
+                        let is_success = success_str == "true";
+                        Some((result_content.to_string(), is_success))
+                    } else {
+                        // Fallback for old cache format
+                        Some((content, true))
+                    }
+                } else {
+                    // Fallback for old cache format
+                    Some((content, true))
+                }
+            }
             Err(_) => None,
         }
     }
 
     /// Store result in cache
-    pub fn store_result(&self, perl_code: &str, result: &str) -> Result<(), String> {
+    pub fn store_result(&self, perl_code: &str, result: &str, is_success: bool) -> Result<(), String> {
         // Ensure cache directory exists
         if let Err(e) = fs::create_dir_all(&self.cache_dir) {
             return Err(format!("Failed to create cache directory: {}", e));
@@ -79,7 +95,10 @@ impl PerlCriticCache {
 
         let cache_path = self.get_cache_path(perl_code);
         
-        if let Err(e) = fs::write(&cache_path, result) {
+        // Store both the result and the success status
+        let cache_content = format!("SUCCESS:{}\n{}", is_success, result);
+        
+        if let Err(e) = fs::write(&cache_path, cache_content) {
             return Err(format!("Failed to write cache file: {}", e));
         }
 
