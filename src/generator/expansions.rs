@@ -32,17 +32,17 @@ pub fn generate_parameter_expansion_impl(generator: &mut Generator, pe: &Paramet
         }
         ParameterExpansionOperator::DefaultValue(default) => {
             // ${var:-default} - use default if var is empty
-            format!("defined(${{{}}}) && ${{{}}} ne '' ? ${{{}}} : '{}'", 
+            format!("defined ${{{}}} && ${{{}}} ne q{{}} ? ${{{}}} : '{}'", 
                    pe.variable, pe.variable, pe.variable, default)
         }
         ParameterExpansionOperator::AssignDefault(default) => {
             // ${var:=default} - assign default if var is empty
-            format!("defined(${{{}}}) && ${{{}}} ne '' ? ${{{}}} : do {{ ${{{}}} = '{}'; ${{{}}} }}", 
+            format!("defined ${{{}}} && ${{{}}} ne q{{}} ? ${{{}}} : do {{ ${{{}}} = '{}'; ${{{}}} }}", 
                    pe.variable, pe.variable, pe.variable, pe.variable, default, pe.variable)
         }
         ParameterExpansionOperator::ErrorIfUnset(error) => {
             // ${var:?error} - error if var is empty
-            format!("defined(${{{}}}) && ${{{}}} ne '' ? ${{{}}} : die('{}')", 
+            format!("defined ${{{}}} && ${{{}}} ne q{{}} ? ${{{}}} : die('{}')", 
                    pe.variable, pe.variable, pe.variable, error)
         }
         ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {

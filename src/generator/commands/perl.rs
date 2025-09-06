@@ -46,7 +46,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                     
                     // Initialize environment variables to empty strings to avoid Perl warnings
                     // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
-                    output.push_str("local $ENV{SHELL_VAR} = '' unless defined $ENV{SHELL_VAR};\n");
+                    output.push_str("local $ENV{SHELL_VAR} = q{} unless defined $ENV{SHELL_VAR};\n");
                     
                     // Execute the perl code - split by newlines and add proper indentation
                     for line in clean_code.lines() {
@@ -169,12 +169,12 @@ pub fn generate_perl_pipeline_command(generator: &mut Generator, cmd: &SimpleCom
         
         // For pipeline context, we need to capture output instead of printing directly
         let output_var = format!("perl_output_{}", generator.get_unique_id());
-        output.push_str(&format!("my ${} = '';\n", output_var));
+        output.push_str(&format!("my ${} = q{{}};\n", output_var));
         
         // For pipeline context, we need to set $_ to the input
         if is_ne {
             // For -ne mode, process each line of input
-            output.push_str(&format!("for my $line (split /\\n/, ${}) {{\n", input_var));
+            output.push_str(&format!("for my $line (split /\\n/msx, ${}) {{\n", input_var));
             output.push_str(&format!("    chomp $line;\n"));
             output.push_str(&format!("    $_ = $line;\n"));
         } else {
@@ -184,7 +184,7 @@ pub fn generate_perl_pipeline_command(generator: &mut Generator, cmd: &SimpleCom
         
         // Initialize environment variables to empty strings to avoid Perl warnings
         // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
-        output.push_str("local $ENV{SHELL_VAR} = '' unless defined $ENV{SHELL_VAR};\n");
+        output.push_str("local $ENV{SHELL_VAR} = q{} unless defined $ENV{SHELL_VAR};\n");
         
         // Execute the perl code - split by newlines and add proper indentation
         for line in clean_code.lines() {

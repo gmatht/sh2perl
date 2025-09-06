@@ -164,7 +164,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     if pattern.is_empty() && pattern_file.is_none() {
         // No pattern provided, return error
         output.push_str("carp \"grep: no pattern specified\";\n");
-        output.push_str("exit(1);\n");
+        output.push_str("exit 1;\n");
         return output;
     }
     
@@ -257,7 +257,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     conditions.push(format!("$file =~ {}", generator.format_regex_pattern(&regex_pattern)));
                 } else {
                     // Only include .txt files by default for recursive search
-                    conditions.push(format!("$file =~ {}", generator.format_regex_pattern(r"\\.txt$")));
+                    conditions.push(format!("$file =~ {}", generator.format_regex_pattern(r"[.]txt$")));
                 }
                 
                 if let Some(ref exclude_pat) = exclude_pattern {
@@ -273,7 +273,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 }
                 
                 if conditions.is_empty() {
-                    output.push_str(&format!("                if ($file =~ {}) {{\n", generator.format_regex_pattern(r"\\.txt$")));
+                    output.push_str(&format!("                if ($file =~ {}) {{\n", generator.format_regex_pattern(r"[.]txt$")));
                 } else {
                     output.push_str(&format!("                if ({}) {{\n", conditions.join(" && ")));
                 }
@@ -339,7 +339,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             };
             
             // Split input into lines and apply grep logic
-            output.push_str(&format!("my @grep_lines_{} = split(/\\n/, {});\n", command_index, input_source));
+            output.push_str(&format!("my @grep_lines_{} = split /\\n/msx, {};\n", command_index, input_source));
         } else {
             // Standalone grep with no input and no files - this shouldn't happen in practice
             output.push_str(&format!("my @grep_lines_{} = ();\n", command_index));
@@ -364,7 +364,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             
             output.push_str(&format!("    while (my $line = <$fh_{}>) {{\n", command_index));
             output.push_str(&format!("        chomp($line);\n"));
-            output.push_str(&format!("        push @patterns_{}, $line if $line ne '';\n", command_index));
+            output.push_str(&format!("        push @patterns_{}, $line if $line ne q{{}};\n", command_index));
             output.push_str(&format!("    }}\n"));
             output.push_str(&format!("    close($fh_{});\n", command_index));
             output.push_str(&format!("}}\n"));
@@ -380,7 +380,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("            last;\n"));
                 output.push_str(&format!("        }}\n"));
                 output.push_str(&format!("    }}\n"));
-                output.push_str(&format!("    push @grep_filtered_{}, $line unless $match;\n", command_index));
+                output.push_str(&format!("    if (!$match) {{ push @grep_filtered_{}, $line; }}\n", command_index));
             } else {
                 output.push_str(&format!("        if ($line =~ {}{}) {{\n", generator.format_regex_pattern("$pattern"), regex_flags));
                 output.push_str(&format!("            $match = 1;\n"));
@@ -422,10 +422,10 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             // Apply grep filtering
             if invert_match {
                 // Negative grep: exclude lines that match the pattern
-                output.push_str(&format!("my @grep_filtered_{} = grep !{}{}, @grep_lines_{};\n", command_index, generator.format_regex_pattern(&regex_pattern), regex_flags, command_index));
+                output.push_str(&format!("my @grep_filtered_{} = grep {{ !{}{} }} @grep_lines_{};\n", command_index, generator.format_regex_pattern(&regex_pattern), regex_flags, command_index));
             } else {
                 // Positive grep: include lines that match the pattern
-                output.push_str(&format!("my @grep_filtered_{} = grep {}{}, @grep_lines_{};\n", command_index, generator.format_regex_pattern(&regex_pattern), regex_flags, command_index));
+                output.push_str(&format!("my @grep_filtered_{} = grep {{ {}{} }} @grep_lines_{};\n", command_index, generator.format_regex_pattern(&regex_pattern), regex_flags, command_index));
             }
         }
         
@@ -489,7 +489,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("        $file_counts_{}{{$grep_filenames_{}[$i]}}++;\n", command_index, command_index));
                 output.push_str("    }\n");
                 output.push_str("}\n");
-                output.push_str(&format!("$grep_result_{} = '';\n", command_index));
+                output.push_str(&format!("$grep_result_{} = q{{}};\n", command_index));
                 output.push_str(&format!("for my $file (sort keys %file_counts_{}) {{\n", command_index));
                 output.push_str(&format!("    $grep_result_{} .= \"$file:$file_counts_{}{{$file}}\\n\";\n", command_index, command_index));
                 output.push_str("}\n");
@@ -527,7 +527,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             }
             output.push_str("    }\n");
             output.push_str("}\n");
-            output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_with_context_{});\n", command_index, command_index));
+            output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_with_context_{};\n", command_index, command_index));
             if should_print && !quiet_mode {
                 output.push_str(&format!("print $grep_result_{};\n", command_index));
                 output.push_str("print \"\\n\";\n");
@@ -536,10 +536,10 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             output.push_str(&format!("my @grep_numbered_{};\n", command_index));
             output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
             output.push_str(&format!("    if (grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
-            output.push_str(&format!("        push @grep_numbered_{}, sprintf(\"%d:%s\", $i + 1, $grep_lines_{}[$i]);\n", command_index, command_index));
+            output.push_str(&format!("        push @grep_numbered_{}, sprintf \"%d:%s\", $i + 1, $grep_lines_{}[$i];\n", command_index, command_index));
             output.push_str("    }\n");
             output.push_str("}\n");
-            output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_numbered_{});\n", command_index, command_index));
+            output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_numbered_{};\n", command_index, command_index));
             if should_print && !quiet_mode {
                 output.push_str(&format!("print $grep_result_{};\n", command_index));
                 output.push_str("print \"\\n\";\n");
@@ -552,7 +552,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             output.push_str(&format!("        push @grep_matches_{}, $1;\n", command_index));
             output.push_str("    }\n");
             output.push_str("}\n");
-            output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_matches_{});\n", command_index, command_index));
+            output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_matches_{};\n", command_index, command_index));
             if should_print && !quiet_mode {
                 output.push_str(&format!("print $grep_result_{};\n", command_index));
                 output.push_str("print \"\\n\";\n");
@@ -572,7 +572,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     output.push_str(&format!("for my $file (sort keys %file_has_match_{}) {{\n", command_index));
                     output.push_str(&format!("    push @matching_files_{}, $file;\n", command_index));
                     output.push_str("}\n");
-                    output.push_str(&format!("$grep_result_{} = join(\"\\n\", @matching_files_{});\n", command_index, command_index));
+                    output.push_str(&format!("$grep_result_{} = join \"\\n\", @matching_files_{};\n", command_index, command_index));
                 } else {
                     output.push_str(&format!("$grep_result_{} = @grep_filtered_{} > 0 ? \"{}\" : \"\";\n", 
                         command_index, command_index, file_args[0]));
@@ -619,7 +619,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     output.push_str(&format!("        push @non_matching_files_{}, $file;\n", command_index));
                     output.push_str("    }\n");
                     output.push_str("}\n");
-                    output.push_str(&format!("$grep_result_{} = join(\"\\n\", @non_matching_files_{});\n", command_index, command_index));
+                    output.push_str(&format!("$grep_result_{} = join \"\\n\", @non_matching_files_{};\n", command_index, command_index));
                 } else {
                     output.push_str(&format!("$grep_result_{} = @grep_filtered_{} == 0 ? \"{}\" : \"\";\n", 
                         command_index, command_index, file_args[0]));
@@ -644,11 +644,11 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("my $offset_{} = 0;\n", command_index));
                 output.push_str(&format!("for my $line (@grep_lines_{}) {{\n", command_index));
                 output.push_str(&format!("    if (grep {{ $_ eq $line }} @grep_filtered_{}) {{\n", command_index));
-                output.push_str(&format!("        push @grep_with_offset_{}, sprintf(\"%d:%s\", $offset_{}, $line);\n", command_index, command_index));
+                output.push_str(&format!("        push @grep_with_offset_{}, sprintf \"%d:%s\", $offset_{}, $line;\n", command_index, command_index));
                 output.push_str("    }\n");
                 output.push_str(&format!("    $offset_{} += length($line) + 1; # +1 for newline\n", command_index));
                 output.push_str("}\n");
-                output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_with_offset_{});\n", command_index, command_index));
+                output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_with_offset_{};\n", command_index, command_index));
             } else if show_filename && has_file_args {
                 // Handle -H flag: always show filename even with single file
                 output.push_str(&format!("my @grep_with_filename_{};\n", command_index));
@@ -663,7 +663,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     output.push_str(&format!("    push @grep_with_filename_{}, \"{}:$line\";\n", command_index, file_args[0]));
                     output.push_str("}\n");
                 }
-                output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_with_filename_{});\n", command_index, command_index));
+                output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_with_filename_{};\n", command_index, command_index));
                     } else {
             // Default: just output matching lines (handles -h flag implicitly by not adding filename)
             if recursive && has_file_args {
@@ -674,7 +674,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("        push @grep_with_filename_{}, \"$grep_filenames_{}[$i]:$grep_lines_{}[$i]\";\n", command_index, command_index, command_index));
                 output.push_str("    }\n");
                 output.push_str("}\n");
-                output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_with_filename_{});\n", command_index, command_index));
+                output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_with_filename_{};\n", command_index, command_index));
             } else if color_always {
                 // Add color support for --color=always
                 output.push_str(&format!("my @grep_colored_{};\n", command_index));
@@ -683,9 +683,9 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("    $colored_line =~ s/({})/\\x1b[01;31m\\x1b[K$1\\x1b[m\\x1b[K/g;\n", regex_pattern));
                 output.push_str(&format!("    push @grep_colored_{}, $colored_line;\n", command_index));
                 output.push_str("}\n");
-                output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_colored_{});\n", command_index, command_index));
+                output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_colored_{};\n", command_index, command_index));
             } else {
-                output.push_str(&format!("$grep_result_{} = join(\"\\n\", @grep_filtered_{});\n", command_index, command_index));
+                output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_filtered_{};\n", command_index, command_index));
             }
         }
             
@@ -694,7 +694,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("$grep_result_{} =~ s/\\n/\\0/g;\n", command_index));
             } else {
                 // Ensure output ends with newline to match shell behavior, but only if there are matches
-                output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("$grep_result_{} =~ {} || $grep_result_{} eq ''", command_index, generator.newline_end_regex(), command_index), &format!("$grep_result_{} .= \"\\n\"", command_index))));
+                output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("$grep_result_{} =~ {} || $grep_result_{} eq q{{}}", command_index, generator.newline_end_regex(), command_index), &format!("$grep_result_{} .= \"\\n\"", command_index))));
             }
             
             if should_print && !quiet_mode {
@@ -704,7 +704,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         
         // Set exit status for all grep commands
         // For quiet mode, set exit code based on whether matches were found
-        output.push_str(&format!("$? = scalar(@grep_filtered_{}) > 0 ? 0 : 1;\n", command_index));
+        output.push_str(&format!("local $CHILD_ERROR = scalar @grep_filtered_{} > 0 ? 0 : 1;\n", command_index));
     
     output
 }

@@ -28,13 +28,13 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
         if sort_files {
             // For sorting, we still need to collect files first
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (opendir my $dh, '{}') {{\n", search_dir));
+            output.push_str(&format!("if (opendir my $dh, q{{{}}}) {{\n", search_dir));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str("while (my $file = readdir $dh) {\n");
             generator.indent_level += 1;
             output.push_str(&generator.indent());
-            output.push_str("next if $file eq '.' || $file eq '..';\n");
+            output.push_str("next if $file eq q{.} || $file eq q{..};\n");
             output.push_str(&generator.indent());
             output.push_str(&format!("push @{}, $file;\n", array_name));
             generator.indent_level -= 1;
@@ -51,13 +51,13 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             // For non-sorting, collect to array instead of printing directly
             // This is needed for pipeline context where we need the array
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (opendir my $dh, '{}') {{\n", search_dir));
+            output.push_str(&format!("if (opendir my $dh, q{{{}}}) {{\n", search_dir));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str("while (my $file = readdir $dh) {\n");
             generator.indent_level += 1;
             output.push_str(&generator.indent());
-            output.push_str("next if $file eq '.' || $file eq '..';\n");
+            output.push_str("next if $file eq q{.} || $file eq q{..};\n");
             output.push_str(&generator.indent());
             output.push_str(&format!("push @{}, $file;\n", array_name));
             generator.indent_level -= 1;
@@ -106,7 +106,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
     output.push_str(&generate_ls_helper(generator, dir, "ls_files", should_sort));
         if let Some(var) = output_var {
             output.push_str(&generator.indent());
-            output.push_str(&format!("${} = join(\"\\n\", @ls_files);\n", var));
+            output.push_str(&format!("${} = join \"\\n\", @ls_files;\n", var));
             // Ensure output ends with newline to match shell behavior
             output.push_str(&generator.indent());
             output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", var))));
@@ -118,12 +118,12 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             // -1 flag: one file per line, preserve directory order (no sorting)
             output.push_str(&generate_ls_helper(generator, dir, "ls_files", false));
             output.push_str(&generator.indent());
-            output.push_str("print join(\"\\n\", @ls_files) . \"\\n\";\n");
+            output.push_str("print join \"\\n\", @ls_files . \"\\n\";\n");
         } else {
             // Default: one file per line (like ls -1) for predictable output
             output.push_str(&generate_ls_helper(generator, dir, "ls_files", false));
             output.push_str(&generator.indent());
-            output.push_str("print join(\"\\n\", @ls_files) . \"\\n\";\n");
+            output.push_str("print join \"\\n\", @ls_files . \"\\n\";\n");
         }
     }
     
@@ -163,7 +163,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     output.push_str(&generator.indent());
     // In command substitution context, always join with newlines to match shell behavior
     // The shell's ls command outputs one file per line by default in command substitution
-    output.push_str("join(\"\\n\", @ls_files_sub);\n");
+    output.push_str("join \"\\n\", @ls_files_sub;\n");
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("}");

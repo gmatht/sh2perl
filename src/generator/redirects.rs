@@ -33,7 +33,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 let fh = generator.get_unique_file_handle();
                 output.push_str(&format!("use File::Path qw(make_path);\n"));
                 let temp_dir = get_temp_dir();
-                output.push_str(&format!("make_path({}) unless -d {};\n", temp_dir, temp_dir));
+                output.push_str(&format!("if (!-d {}) {{ make_path({}); }}\n", temp_dir, temp_dir));
                 output.push_str(&format!("open(my ${}, '>', {} . '/heredoc_temp') or die \"Cannot create temp file: $!\\n\";\n", fh, temp_dir));
                 output.push_str(&format!("print ${} $temp_content;\n", fh));
                 output.push_str(&format!("close(${});\n", fh));
@@ -73,7 +73,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
             
             output.push_str(&format!("use File::Path qw(make_path);\n"));
             output.push_str(&format!("my $temp_dir_{} = dirname(${});\n", global_counter, temp_var));
-            output.push_str(&format!("make_path($temp_dir_{}) unless -d $temp_dir_{};\n", global_counter, global_counter));
+            output.push_str(&format!("if (!-d $temp_dir_{}) {{ make_path($temp_dir_{}); }}\n", global_counter, global_counter));
             output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
             output.push_str(&format!("print ${} ${};\n", fh_var, output_var));
             output.push_str(&format!("close(${});\n", fh_var));

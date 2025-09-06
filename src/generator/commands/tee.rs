@@ -26,7 +26,7 @@ pub fn generate_tee_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
         output.push_str(&format!("{} = {};\n", input_var, input_var));
     } else {
         // Write to specified files
-        output.push_str(&format!("my @lines = split(/\\n/, {});\n", input_var));
+        output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
         
         for file in &files {
             let mode = if append_mode { ">>" } else { ">" };
@@ -41,7 +41,7 @@ pub fn generate_tee_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
         }
         
         // Keep the output for further processing
-        output.push_str(&format!("{} = join(\"\\n\", @lines);\n", input_var));
+        output.push_str(&format!("{} = join \"\\n\", @lines;\n", input_var));
     }
     output.push_str("\n");
     

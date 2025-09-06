@@ -133,20 +133,20 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         .replace(&format!("print {};", output_var), "")
                         .replace("print \"\\n\";", "")
                         .replace(&format!("print \"\\n\" unless {} =~ {};", output_var, generator.newline_end_regex()), "")
-                        .replace(&format!("$main_exit_code = 1 unless {};", success_var), "");
+                        .replace(&format!("if (!{}) {{ $main_exit_code = 1; }}", success_var), "");
                     
                     // Remove conditional print blocks that are common in pipelines
                     // Use a simpler approach with string replacement for the specific pattern
                     let output_var_num = output_var.trim_start_matches("$output_");
                     let print_block_to_remove = format!(
-                        "if ({} ne q{} && !defined($output_printed_{})) {{\n\n        print {};\n        print \"\\n\" unless {} =~ {};\n    }}", 
+                        "if ({} ne q{} && !defined $output_printed_{}) {{\n\n        print {};\n        print \"\\n\" unless {} =~ {};\n    }}", 
                         output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
                     );
                     captured_pipeline = captured_pipeline.replace(&print_block_to_remove, "");
                     
                     // Also try without the extra newlines in case formatting is different
                     let print_block_compact = format!(
-                        "if ({} ne q{} && !defined($output_printed_{})) {{ print {}; print \"\\n\" unless {} =~ {}; }}", 
+                        "if ({} ne q{} && !defined $output_printed_{}) {{ print {}; print \"\\n\" unless {} =~ {}; }}", 
                         output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
                     );
                     captured_pipeline = captured_pipeline.replace(&print_block_compact, "");
@@ -284,8 +284,25 @@ pub fn get_unique_file_handle_impl(generator: &mut Generator) -> String {
 
 /// Generate a properly formatted regex pattern with appropriate flags
 pub fn format_regex_pattern(pattern: &str) -> String {
+    // Convert escaped metacharacters to character classes for better Perl::Critic compliance
+    let converted_pattern = convert_escaped_metacharacters(pattern);
     // Add common flags: /s for dot matching newlines, /x for extended formatting, /m for multiline
-    format!("/{}/msx", pattern)
+    format!("/{}/msx", converted_pattern)
+}
+
+/// Convert escaped metacharacters to character classes for better Perl::Critic compliance
+pub fn convert_escaped_metacharacters(pattern: &str) -> String {
+    pattern.replace("\\.", "[.]")
+           .replace("\\+", "[+]")
+           .replace("\\*", "[*]")
+           .replace("\\?", "[?]")
+           .replace("\\^", "[^]")
+           .replace("\\$", "[$]")
+           .replace("\\[", "[\\[]")
+           .replace("\\]", "[\\]]")
+           .replace("\\(", "[(]")
+           .replace("\\)", "[)]")
+           .replace("\\|", "[|]")
 }
 
 /// Generate a regex pattern for checking if string ends with newline
@@ -295,5 +312,5 @@ pub fn newline_end_regex() -> String {
 
 /// Convert postfix unless statement to block form
 pub fn convert_postfix_unless_to_block(condition: &str, statement: &str) -> String {
-    format!("unless ({} ) {{\n    {};\n}}", condition, statement)
+    format!("if (!({}) ) {{\n    {};\n}}", condition, statement)
 }

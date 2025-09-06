@@ -37,11 +37,11 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
     
     if command == "grep" && args.contains(&"function".to_string()) {
         // Handle grep -l "function" on the input files
-        output.push_str(&format!("my @xargs_files_{} = split(/\\n/, ${});\n", command_index, input_var));
+        output.push_str(&format!("my @xargs_files_{} = split /\\n/msx, ${};\n", command_index, input_var));
         output.push_str(&format!("my @xargs_matching_files_{};\n", command_index));
         output.push_str(&format!("foreach my $file (@xargs_files_{}) {{\n", command_index));
-        output.push_str("next unless $file && -f $file;\n");
-        output.push_str("if (open(my $fh, '<', $file)) {\n");
+        output.push_str("next if !($file && -f $file);\n");
+        output.push_str("if (open my $fh, '<', $file) {\n");
         output.push_str(&format!("my $xargs_found_{} = 0;\n", command_index));
         output.push_str("while (my $line = <$fh>) {\n");
         output.push_str(&format!("if ($line =~ {}) {{\n", generator.format_regex_pattern("function")));
@@ -49,12 +49,12 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         output.push_str("last;\n");
         output.push_str("}\n");
         output.push_str("}\n");
-        output.push_str("close($fh);\n");
-        output.push_str(&format!("push @xargs_matching_files_{}, $file if $xargs_found_{};\n", command_index, command_index));
+        output.push_str("close $fh or carp \"Close failed: $OS_ERROR\";\n");
+        output.push_str(&format!("if ($xargs_found_{}) {{ push @xargs_matching_files_{}, $file; }}\n", command_index, command_index));
         output.push_str("}\n");
         output.push_str("}\n");
         // Write into a result variable expected by the pipeline
-        output.push_str(&format!("${} = join(\"\\n\", @xargs_matching_files_{});\n", output_var, command_index));
+        output.push_str(&format!("${} = join \"\\n\", @xargs_matching_files_{};\n", output_var, command_index));
         // Ensure output ends with newline to match shell behavior
         output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", output_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", output_var))));
     } else {

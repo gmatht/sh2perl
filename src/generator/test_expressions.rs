@@ -165,11 +165,11 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
     } else if expr.contains(" -z ") {
         // String is empty: [[ -z $var ]]
         let var = expr.replace("-z ", "").trim().to_string();
-        format!("{} eq ''", var)
+        format!("{} eq q{{}}", var)
     } else if expr.contains(" -n ") {
         // String is not empty: [[ -n $var ]]
         let var = expr.replace("-n ", "").trim().to_string();
-        format!("{} ne ''", var)
+        format!("{} ne q{{}}", var)
     } else if expr.contains(" -f ") || expr.starts_with("-f ") {
         // File exists and is regular file: [[ -f $var ]]
         let var = expr.replace("-f ", "").trim().to_string();
@@ -440,7 +440,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
         }
         
         if result.trim().starts_with('$') {
-            format!("({} ne '')", result.trim())
+            format!("({} ne q{{}})", result.trim())
         } else {
             format!("({})", result)
         }

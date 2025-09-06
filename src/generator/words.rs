@@ -77,20 +77,20 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         .replace(&format!("print {};", output_var), "")
                         .replace("print \"\\n\";", "")
                         .replace(&format!("print \"\\n\" unless {} =~ {};", output_var, generator.newline_end_regex()), "")
-                        .replace(&format!("$main_exit_code = 1 unless {};", success_var), "");
+                        .replace(&format!("if (!{}) {{ $main_exit_code = 1; }}", success_var), "");
                     
                     // Remove conditional print blocks that are common in pipelines
                     // Use a simpler approach with string replacement for the specific pattern
                     let output_var_num = output_var.trim_start_matches("$output_");
                     let print_block_to_remove = format!(
-                        "if ({} ne q{} && !defined($output_printed_{})) {{\n\n        print {};\n        print \"\\n\" unless {} =~ {};\n    }}", 
+                        "if ({} ne q{} && !defined $output_printed_{}) {{\n\n        print {};\n        print \"\\n\" unless {} =~ {};\n    }}", 
                         output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
                     );
                     captured_pipeline = captured_pipeline.replace(&print_block_to_remove, "");
                     
                     // Also try without the extra newlines in case formatting is different
                     let print_block_compact = format!(
-                        "if ({} ne q{} && !defined($output_printed_{})) {{ print {}; print \"\\n\" unless {} =~ {}; }}", 
+                        "if ({} ne q{} && !defined $output_printed_{}) {{ print {}; print \"\\n\" unless {} =~ {}; }}", 
                         output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
                     );
                     captured_pipeline = captured_pipeline.replace(&print_block_compact, "");

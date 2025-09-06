@@ -42,15 +42,15 @@ pub fn generate_head_command(_generator: &mut Generator, cmd: &SimpleCommand, in
     // Use line-by-line processing instead of arrays
     output.push_str(&format!("my $num_lines = {};\n", num_lines));
     output.push_str(&format!("my $line_count = 0;\n"));
-    output.push_str(&format!("my $result = '';\n"));
+    output.push_str(&format!("my $result = q{{}};\n"));
     output.push_str(&format!("my $input = ${};\n", input_var));
     output.push_str(&format!("my $pos = 0;\n"));
-    output.push_str(&format!("while ($pos < length($input) && $line_count < $num_lines) {{\n"));
-    output.push_str(&format!("    my $line_end = index($input, \"\\n\", $pos);\n"));
+    output.push_str(&format!("while ($pos < length $input && $line_count < $num_lines) {{\n"));
+    output.push_str(&format!("    my $line_end = index $input, \"\\n\", $pos;\n"));
     output.push_str(&format!("    if ($line_end == -1) {{\n"));
-    output.push_str(&format!("        $line_end = length($input);\n"));
+    output.push_str(&format!("        $line_end = length $input;\n"));
     output.push_str(&format!("    }}\n"));
-    output.push_str(&format!("    my $line = substr($input, $pos, $line_end - $pos);\n"));
+    output.push_str(&format!("    my $line = substr $input, $pos, $line_end - $pos;\n"));
     output.push_str(&format!("    $result .= $line . \"\\n\";\n"));
     output.push_str(&format!("    $pos = $line_end + 1;\n"));
     output.push_str(&format!("    $line_count++;\n"));

@@ -34,30 +34,30 @@ pub fn generate_wc_command_with_output(_generator: &mut Generator, cmd: &SimpleC
     }
     
     // Generate Perl code for wc
-    output.push_str(&format!("my @wc_lines_{} = split(/\\n/, ${});\n", command_index, input_var));
+    output.push_str(&format!("my @wc_lines_{} = split /\\n/msx, ${};\n", command_index, input_var));
     
     if count_lines {
-        output.push_str(&format!("my $wc_line_count_{} = scalar(@wc_lines_{});\n", command_index, command_index));
+        output.push_str(&format!("my $wc_line_count_{} = scalar @wc_lines_{};\n", command_index, command_index));
     }
     
     if count_words {
         output.push_str(&format!("my $wc_word_count_{} = 0;\n", command_index));
         output.push_str(&format!("foreach my $line (@wc_lines_{}) {{\n", command_index));
-        output.push_str(&format!("    my @wc_words_{} = split(/\\s+/, $line);\n", command_index));
+        output.push_str(&format!("    my @wc_words_{} = split /\\s+/msx, $line;\n", command_index));
         output.push_str(&format!("    $wc_word_count_{} += scalar(@wc_words_{});\n", command_index, command_index));
         output.push_str("}\n");
     }
     
     if count_chars {
-        output.push_str(&format!("my $wc_char_count_{} = length(join('', @wc_lines_{}));\n", command_index, command_index));
+        output.push_str(&format!("my $wc_char_count_{} = length(join '', @wc_lines_{});\n", command_index, command_index));
     }
     
     if count_bytes {
-        output.push_str(&format!("my $wc_byte_count_{} = length(join('', @wc_lines_{}));\n", command_index, command_index));
+        output.push_str(&format!("my $wc_byte_count_{} = length(join '', @wc_lines_{});\n", command_index, command_index));
     }
     
     // Format output into a result variable expected by the pipeline
-    output.push_str(&format!("${} = '';\n", output_var));
+    output.push_str(&format!("${} = q{{}};\n", output_var));
     if count_lines {
         output.push_str(&format!("${} .= \"$wc_line_count_{} \";\n", output_var, command_index));
     }
@@ -70,7 +70,7 @@ pub fn generate_wc_command_with_output(_generator: &mut Generator, cmd: &SimpleC
     if count_bytes {
         output.push_str(&format!("${} .= \"$wc_byte_count_{} \";\n", output_var, command_index));
     }
-    output.push_str(&format!("${} =~ s/\\s+$//;\n", output_var)); // Remove trailing space
+    output.push_str(&format!("${} =~ s/\\s+$//msx;\n", output_var)); // Remove trailing space
     // Don't add newline for pipeline commands - shell wc doesn't add trailing newline in pipelines
     
     output

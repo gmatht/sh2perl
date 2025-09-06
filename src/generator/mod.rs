@@ -60,6 +60,7 @@ impl Generator {
         output.push_str("use strict;\n");
         output.push_str("use warnings;\n");
         output.push_str("use Carp;\n");
+        output.push_str("use English qw( -no_match_vars );\n");
         
         if needs_basename {
             output.push_str("use File::Basename;\n");
@@ -107,7 +108,7 @@ impl Generator {
         
         // Add final exit statement
         if needs_exit_code {
-            output.push_str("\nexit($main_exit_code);\n");
+            output.push_str("\nexit $main_exit_code;\n");
         }
         
         // Ensure the output ends with a newline

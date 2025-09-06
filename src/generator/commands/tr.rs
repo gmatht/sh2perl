@@ -94,9 +94,9 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str(&format!("my $input = ${};\n", input_var));
         
         // Delete characters in SET1 from input
-        output.push_str(&format!("${} = '';\n", output_var));
-        output.push_str("for my $char (split //, $input) {\n");
-        output.push_str("    if (index($set1, $char) == -1) {\n");
+        output.push_str(&format!("${} = q{{}};\n", output_var));
+        output.push_str("for my $char (split //msx, $input) {\n");
+        output.push_str("    if (index $set1, $char == -1) {\n");
         output.push_str(&format!("        ${} .= $char;\n", output_var));
         output.push_str("    }\n");
         output.push_str("}\n");
@@ -112,11 +112,11 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str(&format!("my $input = ${};\n", input_var));
         
         // Character-by-character translation
-        output.push_str(&format!("${} = '';\n", output_var));
-        output.push_str("for my $char (split //, $input) {\n");
-        output.push_str("    my $pos = index($set1, $char);\n");
-        output.push_str("    if ($pos >= 0 && $pos < length($set2)) {\n");
-        output.push_str(&format!("        ${} .= substr($set2, $pos, 1);\n", output_var));
+        output.push_str(&format!("${} = q{{}};\n", output_var));
+        output.push_str("for my $char (split //msx, $input) {\n");
+        output.push_str("    my $pos = index $set1, $char;\n");
+        output.push_str("    if ($pos >= 0 && $pos < length $set2) {\n");
+        output.push_str(&format!("        ${} .= substr $set2, $pos, 1;\n", output_var));
         output.push_str("    } else {\n");
         output.push_str(&format!("        ${} .= $char;\n", output_var));
         output.push_str("    }\n");
