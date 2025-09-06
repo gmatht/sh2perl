@@ -32,35 +32,21 @@ pub fn create_exit_status(exit_code: i32) -> std::process::ExitStatus {
 }
 
 /// Cross-platform function to run shell scripts
-/// Always uses bash -c for consistency across platforms
+/// Optimized for speed - runs bash directly on the script
 pub fn run_shell_script(filename: &str) -> Result<std::process::Output, String> {
     // Extract just the filename part from the full path
     let script_name = filename.split(['\\', '/']).last().unwrap_or(filename);
     
-    // Always use bash -c with cd examples for consistency
+    // Run bash directly on the script file - much faster than bash -c "bash script"
     let mut cmd = Command::new("bash");
     cmd.current_dir("examples");
-    cmd.args(&["-c", &format!("bash {}", script_name)]);
+    cmd.arg(script_name);
     
-    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-        Ok(c) => c,
+    // Use direct execution instead of polling with sleep
+    let output = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output() {
+        Ok(output) => output,
         Err(e) => { 
-            return Err(format!("Failed to spawn bash: {}", e)); 
-        }
-    };
-    
-    let start = std::time::Instant::now();
-    let output = loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break child.wait_with_output().unwrap(),
-            Ok(None) => {
-                if start.elapsed() > Duration::from_millis(10000) { // Increased timeout to 10 seconds
-                    let _ = child.kill(); 
-                    break child.wait_with_output().unwrap(); 
-                }
-                thread::sleep(Duration::from_millis(100)); // Increased sleep interval
-            }
-            Err(_) => break child.wait_with_output().unwrap(),
+            return Err(format!("Failed to run bash script: {}", e)); 
         }
     };
     

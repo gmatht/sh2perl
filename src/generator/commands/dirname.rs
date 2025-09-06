@@ -9,7 +9,7 @@ pub fn generate_dirname_command(generator: &mut Generator, cmd: &SimpleCommand, 
         let path_str = generator.word_to_perl(path);
         
         output.push_str(&format!("my $path = {};\n", path_str));
-        output.push_str("if ($path =~ /\\//) {\n");
+        output.push_str(&format!("if ($path =~ {}) {{\n", generator.format_regex_pattern(r"\\/")));
         output.push_str("$path =~ s/\\/[^\\/]*$//;\n"); // Remove basename part
         output.push_str("$path = '.' if $path eq '';\n"); // Handle root case
         output.push_str("} else {\n");

@@ -112,7 +112,7 @@ pub fn generate_case_statement_impl(generator: &mut Generator, case_stmt: &CaseS
                     word_str
                 };
                 
-                pattern_conditions.push(format!("{} =~ /^{}$/", processed_word, perl_pattern));
+                pattern_conditions.push(format!("{} =~ {}", processed_word, generator.format_regex_pattern(&format!("^{}$", perl_pattern))));
             }
         }
         

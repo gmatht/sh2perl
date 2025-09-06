@@ -32,7 +32,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
             let pattern = parts[1].trim();
             
             // Convert to Perl regex matching
-            format!("{} =~ /{}/", var, pattern)
+            format!("{} =~ {}", var, generator.format_regex_pattern(pattern))
         } else {
             "0".to_string()
         }
@@ -47,19 +47,19 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
                 // Handle extglob patterns
                 let regex_pattern = generator.convert_extglob_to_perl_regex(pattern);
                 if modifiers.nocasematch {
-                    format!("{} =~ /{}/i", var, regex_pattern)
+                    format!("{} =~ {}i", var, generator.format_regex_pattern(&regex_pattern))
                 } else {
-                    format!("{} =~ /{}/", var, regex_pattern)
+                    format!("{} =~ {}", var, generator.format_regex_pattern(&regex_pattern))
                 }
             } else {
                 // Regular glob pattern matching - convert glob to regex
                 let regex_pattern = generator.convert_glob_to_regex(pattern);
                 if modifiers.nocasematch {
                     // Case-insensitive matching
-                    format!("{} =~ /^{}$/i", var, regex_pattern)
+                    format!("{} =~ {}i", var, generator.format_regex_pattern(&format!("^{}$", regex_pattern)))
                 } else {
                     // Case-sensitive matching
-                    format!("{} =~ /^{}$/", var, regex_pattern)
+                    format!("{} =~ {}", var, generator.format_regex_pattern(&format!("^{}$", regex_pattern)))
                 }
             }
         } else {
