@@ -108,12 +108,16 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
     let cache = PerlCriticCache::new();
     
     // Check cache first - always return cached result if it exists
-    if let Some(cached_result) = cache.get_cached_result(perl_code) {
+    if let Some((cached_result, cached_success)) = cache.get_cached_result(perl_code) {
         if cache.should_invalidate_cache(perl_code) {
             eprintln!("perlcritic_cache: Cache hit but invalidated, running Perl::Critic");
         } else {
             eprintln!("perlcritic_cache: Cache hit, returning cached result");
-            return Ok(cached_result);
+            if cached_success {
+                return Ok(cached_result);
+            } else {
+                return Err(cached_result);
+            }
         }
     } else {
         eprintln!("perlcritic_cache: Cache miss, running Perl::Critic");
@@ -247,8 +251,11 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
         }
     };
 
+    // Determine if this is a success or failure
+    let is_success = result.contains("Perl::Critic: No violations found");
+    
     // Store result in cache
-    if let Err(e) = cache.store_result(perl_code, &result) {
+    if let Err(e) = cache.store_result(perl_code, &result, is_success) {
         eprintln!("Warning: Failed to cache Perl::Critic result: {}", e);
     } else {
         eprintln!("perlcritic_cache: Result cached successfully");
@@ -258,7 +265,7 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
     let _ = std::fs::remove_file(&temp_file);
 
     // Return result (convert to Ok/Err based on content)
-    if result.contains("Perl::Critic: No violations found") {
+    if is_success {
         Ok(result)
     } else {
         Err(result)
