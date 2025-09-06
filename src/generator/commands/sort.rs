@@ -5,7 +5,7 @@ pub fn generate_sort_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     generate_sort_command_with_output(generator, cmd, input_var, command_index, input_var)
 }
 
-pub fn generate_sort_command_with_output(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
+pub fn generate_sort_command_with_output(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
     let mut output = String::new();
     
     let mut numeric = false;
@@ -34,8 +34,8 @@ pub fn generate_sort_command_with_output(_generator: &mut Generator, cmd: &Simpl
         output.push_str("    my @b_fields = split(/\\s+/, $b);\n");
         output.push_str("    my $a_num = 0;\n");
         output.push_str("    my $b_num = 0;\n");
-        output.push_str("    if (scalar(@a_fields) > 0 && $a_fields[0] =~ /^\\d+$/) { $a_num = $a_fields[0]; }\n");
-        output.push_str("    if (scalar(@b_fields) > 0 && $b_fields[0] =~ /^\\d+$/) { $b_num = $b_fields[0]; }\n");
+        output.push_str(&format!("    if (scalar(@a_fields) > 0 && $a_fields[0] =~ {}) {{ $a_num = $a_fields[0]; }}\n", generator.format_regex_pattern(r"^\\d+$")));
+        output.push_str(&format!("    if (scalar(@b_fields) > 0 && $b_fields[0] =~ {}) {{ $b_num = $b_fields[0]; }}\n", generator.format_regex_pattern(r"^\\d+$")));
         output.push_str("    $a_num <=> $b_num || $a cmp $b;\n");
         output.push_str(&format!("}} @sort_lines_{};\n", command_index));
     } else {
@@ -46,7 +46,7 @@ pub fn generate_sort_command_with_output(_generator: &mut Generator, cmd: &Simpl
     }
     output.push_str(&format!("${} = join(\"\\n\", @sort_sorted_{});\n", output_var, command_index));
     // Ensure output ends with newline to match shell behavior
-    output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", output_var, output_var));
+    output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", output_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", output_var))));
     
     output
 }

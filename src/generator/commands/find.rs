@@ -302,7 +302,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     // Add name pattern check
     if let Some(pattern) = &name_pattern {
         output.push_str(&indent4);
-        output.push_str(&format!("next unless $file =~ /{}/;\n", escape_glob_pattern(pattern)));
+        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("$file =~ {}", generator.format_regex_pattern(&escape_glob_pattern(pattern))), "next")));
     }
     
     // Add empty check
@@ -381,7 +381,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     // Add not path checks
     for not_path in &not_paths {
         output.push_str(&indent4);
-        output.push_str(&format!("next if $full_path =~ /{}/;\n", escape_glob_pattern(not_path)));
+        output.push_str(&format!("next if $full_path =~ {};\n", generator.format_regex_pattern(&escape_glob_pattern(not_path))));
     }
     
     // Handle exec command
@@ -469,7 +469,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         output.push_str(&indent1);
         output.push_str(&format!("${} = join(\"\\n\", @find_results);\n", input_var));
         output.push_str(&indent1);
-        output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", input_var, input_var));
+        output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", input_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", input_var))));
     } else {
         output.push_str(&indent1);
         output.push_str("print join(\"\\n\", @find_results) . \"\\n\";\n");

@@ -750,5 +750,20 @@ impl Generator {
             _ => false
         }
     }
+    
+    /// Generate a properly formatted regex pattern with appropriate flags
+    pub fn format_regex_pattern(&self, pattern: &str) -> String {
+        utils::format_regex_pattern(pattern)
+    }
+    
+    /// Generate a regex pattern for checking if string ends with newline
+    pub fn newline_end_regex(&self) -> String {
+        utils::newline_end_regex()
+    }
+    
+    /// Convert postfix unless statement to block form
+    pub fn convert_postfix_unless_to_block(&self, condition: &str, statement: &str) -> String {
+        utils::convert_postfix_unless_to_block(condition, statement)
+    }
 }
 

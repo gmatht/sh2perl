@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str) -> String {
+pub fn generate_strings_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str) -> String {
     let mut output = String::new();
     
     // strings command syntax: strings [options] file
@@ -27,7 +27,7 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
     output.push_str("foreach my $line (@lines) {\n");
     output.push_str("chomp($line);\n");
     output.push_str(&format!("if (length($line) >= {}) {{\n", min_length));
-    output.push_str("if ($line =~ /^[\\x20-\\x7E]+$/) {\n"); // Printable ASCII only
+    output.push_str(&format!("if ($line =~ {}) {{\n", generator.format_regex_pattern(r"^[\\x20-\\x7E]+$"))); // Printable ASCII only
     output.push_str("push @result, $line;\n");
     output.push_str("}\n");
     output.push_str("}\n");
