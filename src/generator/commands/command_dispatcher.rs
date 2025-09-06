@@ -198,7 +198,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                         result.push_str(&generator.indent());
                         result.push_str(&format!("my $temp_dir_{} = dirname(${});\n", global_counter, temp_var));
                         result.push_str(&generator.indent());
-                        result.push_str(&format!("make_path($temp_dir_{}) unless -d $temp_dir_{};\n", global_counter, global_counter));
+                        result.push_str(&format!("if (!-d $temp_dir_{}) {{ make_path($temp_dir_{}); }}\n", global_counter, global_counter));
                         result.push_str(&generator.indent());
                         result.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
                         result.push_str(&generator.indent());

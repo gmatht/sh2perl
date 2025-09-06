@@ -10,7 +10,6 @@ use crate::utils::{check_generator_available, cleanup_tmp, generate_unified_diff
                    check_perl_must_contain, check_perl_must_not_contain, check_ast_must_not_contain, check_ast_must_contain};
 use debashl::shared_utils;
 use debashl::{Lexer, Parser, Generator, lexer::Token};
-use debashl::perlcritic_cache::PerlCriticCache;
 
 #[derive(Debug)]
 pub struct TestResult {
@@ -105,23 +104,19 @@ pub fn check_perl_critic_available() -> bool {
 /// Run Perl::Critic on generated Perl code with Brutal level (if enabled)
 pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
     // Create cache manager
-    let cache = PerlCriticCache::new();
+    // let cache = PerlCriticCache::new();
     
     // Check cache first - always return cached result if it exists
-    if let Some((cached_result, cached_success)) = cache.get_cached_result(perl_code) {
-        if cache.should_invalidate_cache(perl_code) {
-            eprintln!("perlcritic_cache: Cache hit but invalidated, running Perl::Critic");
-        } else {
-            eprintln!("perlcritic_cache: Cache hit, returning cached result");
-            if cached_success {
-                return Ok(cached_result);
-            } else {
-                return Err(cached_result);
-            }
-        }
-    } else {
-        eprintln!("perlcritic_cache: Cache miss, running Perl::Critic");
-    }
+    // if let Some(cached_result) = cache.get_cached_result(perl_code) {
+    //     if cache.should_invalidate_cache(perl_code) {
+    //         eprintln!("perlcritic_cache: Cache hit but invalidated, running Perl::Critic");
+    //     } else {
+    //         eprintln!("perlcritic_cache: Cache hit, returning cached result");
+    //         return Ok(cached_result);
+    //     }
+    // } else {
+    //     eprintln!("perlcritic_cache: Cache miss, running Perl::Critic");
+    // }
 
     if !check_perl_critic_available() {
         return Err("Perl::Critic not found in PATH. Please install it with: cpan Perl::Critic".to_string());
@@ -161,14 +156,18 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
     };
 
     // Check if Perl::Critic found any issues
-    let result = if output.status.success() {
-        "Perl::Critic: No violations found".to_string()
+    if output.status.success() {
+        // Clean up temp file
+        let _ = std::fs::remove_file(&temp_file);
+        Ok("Perl::Critic: No violations found".to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         
         if stderr.is_empty() && stdout.is_empty() {
-            "Perl::Critic: No violations found".to_string()
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_file);
+            Ok("Perl::Critic: No violations found".to_string())
         } else {
             let mut result = String::new();
             
@@ -247,28 +246,10 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
                 result.push_str(&stdout);
             }
             
-            result
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_file);
+            Err(result)
         }
-    };
-
-    // Determine if this is a success or failure
-    let is_success = result.contains("Perl::Critic: No violations found");
-    
-    // Store result in cache
-    if let Err(e) = cache.store_result(perl_code, &result, is_success) {
-        eprintln!("Warning: Failed to cache Perl::Critic result: {}", e);
-    } else {
-        eprintln!("perlcritic_cache: Result cached successfully");
-    }
-
-    // Clean up temp file
-    let _ = std::fs::remove_file(&temp_file);
-
-    // Return result (convert to Ok/Err based on content)
-    if is_success {
-        Ok(result)
-    } else {
-        Err(result)
     }
 }
 

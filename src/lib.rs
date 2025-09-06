@@ -9,7 +9,6 @@ pub mod shared_utils;
 pub mod generator;
 pub mod variable_analysis;
 pub mod wasm;
-pub mod perlcritic_cache;
 
 // Only export the main types to avoid conflicts
 pub use lexer::{Lexer, Token};

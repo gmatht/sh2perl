@@ -25,26 +25,26 @@ pub fn generate_sort_command_with_output(generator: &mut Generator, cmd: &Simple
         }
     }
     
-    output.push_str(&format!("my @sort_lines_{} = split(/\\n/, ${});\n", command_index, input_var));
+    output.push_str(&format!("my @sort_lines_{} = split /\\n/msx, ${};\n", command_index, input_var));
     if numeric {
-        // For numeric sort, extract the first field (number) and sort by that
-        // Use the entire line as secondary sort key for stable sort behavior
-        output.push_str(&format!("my @sort_sorted_{} = sort {{\n", command_index));
-        output.push_str("    my @a_fields = split(/\\s+/, $a);\n");
-        output.push_str("    my @b_fields = split(/\\s+/, $b);\n");
+        // For numeric sort, use a separate function to avoid complex sort blocks
+        output.push_str(&format!("sub sort_numeric_{} {{\n", command_index));
+        output.push_str("    my @a_fields = split /\\s+/msx, $a;\n");
+        output.push_str("    my @b_fields = split /\\s+/msx, $b;\n");
         output.push_str("    my $a_num = 0;\n");
         output.push_str("    my $b_num = 0;\n");
         output.push_str(&format!("    if (scalar(@a_fields) > 0 && $a_fields[0] =~ {}) {{ $a_num = $a_fields[0]; }}\n", generator.format_regex_pattern(r"^\\d+$")));
         output.push_str(&format!("    if (scalar(@b_fields) > 0 && $b_fields[0] =~ {}) {{ $b_num = $b_fields[0]; }}\n", generator.format_regex_pattern(r"^\\d+$")));
-        output.push_str("    $a_num <=> $b_num || $a cmp $b;\n");
-        output.push_str(&format!("}} @sort_lines_{};\n", command_index));
+        output.push_str("    return $a_num <=> $b_num || $a cmp $b;\n");
+        output.push_str("}\n");
+        output.push_str(&format!("my @sort_sorted_{} = sort sort_numeric_{} @sort_lines_{};\n", command_index, command_index, command_index));
     } else {
         output.push_str(&format!("my @sort_sorted_{} = sort @sort_lines_{};\n", command_index, command_index));
     }
     if reverse {
-        output.push_str(&format!("@sort_sorted_{} = reverse(@sort_sorted_{});\n", command_index, command_index));
+        output.push_str(&format!("@sort_sorted_{} = reverse @sort_sorted_{};\n", command_index, command_index));
     }
-    output.push_str(&format!("${} = join(\"\\n\", @sort_sorted_{});\n", output_var, command_index));
+    output.push_str(&format!("${} = join \"\\n\", @sort_sorted_{};\n", output_var, command_index));
     // Ensure output ends with newline to match shell behavior
     output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", output_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", output_var))));
     

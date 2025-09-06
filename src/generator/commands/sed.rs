@@ -6,7 +6,7 @@ pub fn generate_sed_command(_generator: &mut Generator, cmd: &SimpleCommand, inp
     
     // For now, implement basic sed-like functionality
     // This can be extended to handle more complex sed patterns
-    output.push_str(&format!("my @sed_lines_{} = split(/\\n/, ${});\n", command_index, input_var));
+    output.push_str(&format!("my @sed_lines_{} = split /\\n/msx, ${};\n", command_index, input_var));
     output.push_str(&format!("my @sed_result_{};\n", command_index));
     output.push_str(&format!("foreach my $line (@sed_lines_{}) {{\n", command_index));
     output.push_str("chomp($line);\n");
@@ -52,7 +52,7 @@ pub fn generate_sed_command(_generator: &mut Generator, cmd: &SimpleCommand, inp
     
     output.push_str(&format!("push @sed_result_{}, $line;\n", command_index));
     output.push_str("}\n");
-    output.push_str(&format!("${} = join(\"\\n\", @sed_result_{});\n", input_var, command_index));
+    output.push_str(&format!("${} = join \"\\n\", @sed_result_{};\n", input_var, command_index));
     output.push_str("\n");
     
     output

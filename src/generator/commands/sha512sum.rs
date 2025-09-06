@@ -23,7 +23,7 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
     
     if check_mode {
         // Check mode: verify checksums from input
-        output.push_str(&format!("my @lines = split(/\\n/, {});\n", input_var));
+        output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
         output.push_str("my @results;\n");
         output.push_str("foreach my $line (@lines) {\n");
         output.push_str("chomp($line);\n");
@@ -42,7 +42,7 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
         output.push_str("}\n");
         output.push_str("}\n");
         output.push_str("}\n");
-        output.push_str(&format!("{} = join(\"\\n\", @results);\n", input_var));
+        output.push_str(&format!("{} = join \"\\n\", @results;\n", input_var));
     } else if files.is_empty() {
         // No files specified, calculate hash of input
         output.push_str(&format!("my $hash = `echo -n \"${}\" | sha512sum | cut -d' ' -f1`;\n", input_var));
@@ -60,7 +60,7 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
             output.push_str(&format!("push @results, \"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", file));
             output.push_str("}\n");
         }
-        output.push_str(&format!("{} = join(\"\\n\", @results);\n", input_var));
+        output.push_str(&format!("{} = join \"\\n\", @results;\n", input_var));
     }
     output.push_str("\n");
     

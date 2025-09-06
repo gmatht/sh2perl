@@ -17,7 +17,7 @@ fn escape_glob_pattern(pattern: &str) -> String {
                 }
             },
             '?' => result.push_str("."),
-            '.' => result.push_str("\\."),
+            '.' => result.push_str("[.]"),
             '[' => result.push_str("\\["),
             ']' => result.push_str("\\]"),
             '(' => result.push_str("\\("),
@@ -271,7 +271,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     output.push_str("while (my $file = readdir $dh) {\n");
     
     output.push_str(&indent4);
-    output.push_str("next if $file eq '.' || $file eq '..';\n");
+    output.push_str("next if $file eq q{.} || $file eq q{..};\n");
     
     output.push_str(&indent4);
     output.push_str("my $full_path = \"$dir/$file\";\n");
@@ -316,7 +316,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         output.push_str(&indent5);
         output.push_str("opendir my $empty_dh, $full_path or next;\n");
         output.push_str(&indent5);
-        output.push_str("my @entries = grep { $_ ne '.' && $_ ne '..' } readdir $empty_dh;\n");
+        output.push_str("my @entries = grep { $_ ne q{.} && $_ ne q{..} } readdir $empty_dh;\n");
         output.push_str(&indent5);
         output.push_str("closedir $empty_dh;\n");
         output.push_str(&indent5);
@@ -335,14 +335,14 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         if mtime.starts_with('-') {
             // Negative mtime means "less than N days old"
             let days = &mtime[1..];
-            output.push_str(&format!("next unless (0 + -M $full_path) < {};\n", days));
+            output.push_str(&format!("next if !((0 + -M $full_path) < {});\n", days));
         } else if mtime.starts_with('+') {
             // Positive mtime means "more than N days old"
             let days = &mtime[1..];
-            output.push_str(&format!("next unless (0 + -M $full_path) > {};\n", days));
+            output.push_str(&format!("next if !((0 + -M $full_path) > {});\n", days));
         } else {
             // Exact mtime means "exactly N days old"
-            output.push_str(&format!("next unless (0 + -M $full_path) == {};\n", mtime));
+            output.push_str(&format!("next if !((0 + -M $full_path) == {});\n", mtime));
         }
     }
     
@@ -352,14 +352,14 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         if mmin.starts_with('-') {
             // Negative mmin means "less than N minutes old"
             let minutes = &mmin[1..];
-            output.push_str(&format!("next unless (0 + -M $full_path) * 24 * 60 < {};\n", minutes));
+            output.push_str(&format!("next if !((0 + -M $full_path) * 24 * 60 < {});\n", minutes));
         } else if mmin.starts_with('+') {
             // Positive mmin means "more than N minutes old"
             let minutes = &mmin[1..];
-            output.push_str(&format!("next unless (0 + -M $full_path) * 24 * 60 > {};\n", minutes));
+            output.push_str(&format!("next if !((0 + -M $full_path) * 24 * 60 > {});\n", minutes));
     } else {
             // Exact mmin means "exactly N minutes old"
-            output.push_str(&format!("next unless (0 + -M $full_path) * 24 * 60 == {};\n", mmin));
+            output.push_str(&format!("next if !((0 + -M $full_path) * 24 * 60 == {});\n", mmin));
         }
     }
     
@@ -369,12 +369,12 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
             let size_val = &size[1..];
             let size_bytes = parse_size_to_bytes(size_val);
             output.push_str(&indent4);
-            output.push_str(&format!("next unless (stat($full_path))[7] > {};\n", size_bytes));
+            output.push_str(&format!("next if !((stat($full_path))[7] > {});\n", size_bytes));
         } else if size.starts_with('-') {
             let size_val = &size[1..];
             let size_bytes = parse_size_to_bytes(size_val);
             output.push_str(&indent4);
-            output.push_str(&format!("next unless (stat($full_path))[7] < {};\n", size_bytes));
+            output.push_str(&format!("next if !((stat($full_path))[7] < {});\n", size_bytes));
         }
     }
     
@@ -411,7 +411,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
             output.push_str(&indent4);
             output.push_str("my $blocks = int(($stat[7] + 511) / 512);\n");
             output.push_str(&indent4);
-            output.push_str("my $perms = '';\n");
+            output.push_str("my $perms = q{};\n");
             output.push_str(&indent4);
             output.push_str("$perms .= ($stat[2] & 0400) ? 'r' : '-';\n");
             output.push_str(&indent4);
@@ -437,10 +437,10 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
             output.push_str(&indent4);
             output.push_str("my $mtime = scalar localtime($stat[9]);\n");
             output.push_str(&indent4);
-            output.push_str("push @$results, sprintf(\"%d %d -%s %d %s %s %d %s %s\", $inode, $blocks, $perms, $stat[3], $owner, $group, $stat[7], $mtime, $full_path);\n");
+            output.push_str("push @{$results}, sprintf \"%d %d -%s %d %s %s %d %s %s\", $inode, $blocks, $perms, $stat[3], $owner, $group, $stat[7], $mtime, $full_path;\n");
         } else {
             output.push_str(&indent4);
-            output.push_str("push @$results, $full_path;\n");
+            output.push_str("push @{$results}, $full_path;\n");
         }
     }
     
@@ -463,16 +463,16 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     output.push_str(&indent1);
     output.push_str("my @find_results;\n");
     output.push_str(&indent1);
-    output.push_str(&format!("{}(\"{}\", \\@find_results);\n", subroutine_name, start_path));
+    output.push_str(&format!("{}(q{{.}}, \\@find_results);\n", subroutine_name));
     
     if generate_output {
         output.push_str(&indent1);
-        output.push_str(&format!("${} = join(\"\\n\", @find_results);\n", input_var));
+        output.push_str(&format!("${} = join \"\\n\", @find_results;\n", input_var));
         output.push_str(&indent1);
         output.push_str(&format!("{}\n", generator.convert_postfix_unless_to_block(&format!("${} =~ {}", input_var, generator.newline_end_regex()), &format!("${} .= \"\\n\"", input_var))));
     } else {
         output.push_str(&indent1);
-        output.push_str("print join(\"\\n\", @find_results) . \"\\n\";\n");
+        output.push_str("print join \"\\n\", @find_results . \"\\n\";\n");
     }
     
     output.push_str(&base_indent);

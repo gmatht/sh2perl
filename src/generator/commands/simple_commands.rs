@@ -142,7 +142,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $temp_dir_{}_{} = dirname(${});\n", global_counter, temp_file_counter, temp_var));
                 output.push_str(&generator.indent());
-                output.push_str(&format!("make_path($temp_dir_{}_{}) unless -d $temp_dir_{}_{};\n", global_counter, temp_file_counter, global_counter, temp_file_counter));
+                output.push_str(&format!("if (!-d $temp_dir_{}_{}) {{ make_path($temp_dir_{}_{}); }}\n", global_counter, temp_file_counter, global_counter, temp_file_counter));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
                 output.push_str(&generator.indent());

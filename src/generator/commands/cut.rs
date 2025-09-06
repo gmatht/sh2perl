@@ -27,7 +27,7 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
         i += 1;
     }
     
-    output.push_str(&format!("my @lines = split(/\\n/, {});\n", input_var));
+    output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
     output.push_str("my @result;\n");
     output.push_str("foreach my $line (@lines) {\n");
     output.push_str("chomp($line);\n");
@@ -38,7 +38,7 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
     output.push_str(&format!("push @result, $fields[0];\n")); // Default to first field
     output.push_str("}\n");
     output.push_str("}\n");
-    output.push_str(&format!("{} = join(\"\\n\", @result);\n", input_var));
+    output.push_str(&format!("{} = join \"\\n\", @result;\n", input_var));
     output.push_str("\n");
     
     output

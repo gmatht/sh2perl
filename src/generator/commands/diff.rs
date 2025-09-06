@@ -72,9 +72,9 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     output.push_str(&generator.indent());
     output.push_str("        \n");
     output.push_str(&generator.indent());
-    output.push_str("        if (!defined($line1) || !defined($line2) || $line1 ne $line2) {\n");
+    output.push_str("        if (!defined $line1 || !defined $line2 || $line1 ne $line2) {\n");
     output.push_str(&generator.indent());
-    output.push_str("            if (defined($line1) && defined($line2)) {\n");
+    output.push_str("            if (defined $line1 && defined $line2) {\n");
     output.push_str(&generator.indent());
     output.push_str("                # Lines differ\n");
     output.push_str(&generator.indent());

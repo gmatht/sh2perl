@@ -34,7 +34,7 @@ pub fn generate_yes_command_with_context(generator: &mut Generator, cmd: &Simple
         // For yes command in pipeline, we need to generate a reasonable number of lines
         // that can be consumed by the next command (like head)
         output.push_str(&format!("my $string = {};\n", string_to_repeat));
-        output.push_str(&format!("${} = '';\n", output_var));
+        output.push_str(&format!("${} = q{{}};\n", output_var));
         output.push_str("for (my $i = 0; $i < 1000; $i++) {\n");
         output.push_str(&format!("    ${} .= \"$string\\n\";\n", output_var));
         output.push_str("}\n");

@@ -11,14 +11,14 @@ pub fn generate_dirname_command(generator: &mut Generator, cmd: &SimpleCommand, 
         output.push_str(&format!("my $path = {};\n", path_str));
         output.push_str(&format!("if ($path =~ {}) {{\n", generator.format_regex_pattern(r"\\/")));
         output.push_str("$path =~ s/\\/[^\\/]*$//;\n"); // Remove basename part
-        output.push_str("$path = '.' if $path eq '';\n"); // Handle root case
+        output.push_str("$path = q{.} if $path eq q{};\n"); // Handle root case
         output.push_str("} else {\n");
-        output.push_str("$path = '.';\n"); // No slashes, current directory
+        output.push_str("$path = q{.};\n"); // No slashes, current directory
         output.push_str("}\n");
         output.push_str(&format!("{} = $path;\n", input_var));
     } else {
         // Default to current directory
-        output.push_str(&format!("{} = '.';\n", input_var));
+        output.push_str(&format!("{} = q{{.}};\n", input_var));
     }
     output.push_str("\n");
     

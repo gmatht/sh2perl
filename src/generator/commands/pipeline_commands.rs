@@ -39,8 +39,8 @@ fn generate_command_using_builtins(
             let mut while_output = String::new();
             
             // Generate a while loop that processes the input line by line
-            while_output.push_str(&format!("my @lines = split(/\\n/, ${});\n", input_var));
-            while_output.push_str(&format!("my $result_{} = '';\n", command_index));
+            while_output.push_str(&format!("my @lines = split /\\n/msx, ${};\n", input_var));
+            while_output.push_str(&format!("my $result_{} = q{{}};\n", command_index));
             while_output.push_str("for my $line (@lines) {\n");
             while_output.push_str("    chomp $line;\n");
             while_output.push_str("    my $L = $line;\n");
@@ -61,7 +61,7 @@ fn generate_command_using_builtins(
             if input_var.is_empty() {
                 // First command in pipeline - generate for loop that outputs to the output variable
                 let mut output = String::new();
-                output.push_str(&format!("${} = '';\n", output_var));
+                output.push_str(&format!("${} = q{{}};\n", output_var));
                 output.push_str(&format!("my @{}_items = (", output_var));
                 
                 // Generate the items list
@@ -217,7 +217,7 @@ fn generate_command_using_builtins(
                         output.push_str(&format!("$pipeline_success_{} = 1;\n", output_var.replace("output_", "")));
                         // Clear the output variable to avoid printing input data for grep -q
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("${} = '';\n", output_var));
+                        output.push_str(&format!("${} = q{{}};\n", output_var));
                         return output;
                         }
                     }
@@ -1293,7 +1293,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                         if let Word::Literal(cmd_name, _) = &cmd.name {
                             if cmd_name == "cat" {
                                 output.push_str(&generator.indent());
-                                output.push_str(&format!("if ($output_{} eq '') {{\n", unique_id));
+                                output.push_str(&format!("if ($output_{} eq q{{}}) {{\n", unique_id));
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
                                 output.push_str(&generator.indent());
@@ -1380,7 +1380,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         // Output the final result
         if should_print {
             output.push_str(&generator.indent());
-            output.push_str(&format!("if ($output_{} ne '' && !defined($output_printed_{})) {{\n", unique_id, unique_id));
+            output.push_str(&format!("if ($output_{} ne q{{}} && !defined $output_printed_{}) {{\n", unique_id, unique_id));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str(&format!("print $output_{};\n", unique_id));
@@ -1394,7 +1394,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         
         // Track pipeline success for overall script exit code
         output.push_str(&generator.indent());
-        output.push_str(&format!("$main_exit_code = 1 unless $pipeline_success_{};\n", unique_id));
+        output.push_str(&format!("if (!$pipeline_success_{}) {{ $main_exit_code = 1; }}\n", unique_id));
         output.push_str(&generator.indent());
         // output.push_str("exit(1) if $main_exit_code == 1;\n");
         
@@ -1463,7 +1463,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 
                 // Track pipeline success for overall script exit code
                 output.push_str(&generator.indent());
-                output.push_str(&format!("$main_exit_code = 1 unless $pipeline_success_{};\n", unique_id));
+                output.push_str(&format!("if (!$pipeline_success_{}) {{ $main_exit_code = 1; }}\n", unique_id));
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
             } else {
@@ -1535,7 +1535,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 
                 // Track pipeline success for overall script exit code
                 output.push_str(&generator.indent());
-                output.push_str(&format!("$main_exit_code = 1 unless $pipeline_success_{};\n", unique_id));
+                output.push_str(&format!("if (!$pipeline_success_{}) {{ $main_exit_code = 1; }}\n", unique_id));
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
             }

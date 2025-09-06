@@ -106,14 +106,14 @@ pub fn generate_comm_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             }
             
             if !suppress_col3 {
-                output.push_str(&format!("${} .= join(\"\\n\", @common_lines) . \"\\n\";\n", input_var));
+                output.push_str(&format!("${} .= join \"\\n\", @common_lines . \"\\n\";\n", input_var));
             }
             
             // Remove trailing newline
             output.push_str(&format!("chomp(${}); \n", input_var));
         } else {
             // Fallback: treat input as a single file
-            output.push_str(&format!("my @lines = split(/\\n/, ${});\n", input_var));
+            output.push_str(&format!("my @lines = split /\\n/msx, ${};\n", input_var));
             output.push_str("my %seen;\n");
             output.push_str("my @result;\n");
             output.push_str("foreach my $line (@lines) {\n");
@@ -125,12 +125,12 @@ pub fn generate_comm_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             output.push_str("        $seen{$line}++;\n");
             output.push_str("    }\n");
             output.push_str("}\n");
-            output.push_str(&format!("${} = join(\"\\n\", @result);\n", input_var));
+            output.push_str(&format!("${} = join \"\\n\", @result;\n", input_var));
         }
     } else {
         // For now, implement a basic version that works with input
         // The process substitution files will be handled by the main generator
-        output.push_str(&format!("my @lines = split(/\\n/, ${});\n", input_var));
+        output.push_str(&format!("my @lines = split /\\n/, ${};\n", input_var));
         output.push_str("my %seen;\n");
         output.push_str("my @result;\n");
         output.push_str("foreach my $line (@lines) {\n");
@@ -142,7 +142,7 @@ pub fn generate_comm_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         output.push_str("        $seen{$line}++;\n");
         output.push_str("    }\n");
         output.push_str("}\n");
-        output.push_str(&format!("${} = join(\"\\n\", @result);\n", input_var));
+        output.push_str(&format!("${} = join \"\\n\", @result;\n", input_var));
     }
     
     output
