@@ -1271,7 +1271,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     // For builtin commands, ensure output assignment for those with separate result vars
                     if let Command::Simple(cmd) = command {
                         if let Word::Literal(cmd_name, _) = &cmd.name {
-                            if matches!(cmd_name.as_str(), "grep" | "wc" | "xargs" | "tr") {
+                            if matches!(cmd_name.as_str(), "grep" | "xargs" | "tr") {
                                 let result_var = format!("{}_result_{}_{}", cmd_name, unique_id, i);
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("$output_{} = ${};\n", unique_id, result_var));
@@ -1356,7 +1356,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                             // For builtin commands, ensure output assignment for those with separate result vars
                             if let Command::Simple(cmd) = command {
                                 if let Word::Literal(cmd_name, _) = &cmd.name {
-                                    if matches!(cmd_name.as_str(), "grep" | "wc" | "xargs" | "tr") {
+                                    if matches!(cmd_name.as_str(), "grep" | "xargs" | "tr") {
                                         let result_var = format!("{}_result_{}_{}", cmd_name, unique_id, i);
                                         output.push_str(&generator.indent());
                                         output.push_str(&format!("$output_{} = ${};\n", unique_id, result_var));
