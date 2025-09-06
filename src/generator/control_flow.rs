@@ -307,10 +307,10 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                                     // Simple range: 1..5 - use constants for magic numbers
                                     if end_num > 2 {
                                         // Use constant for magic numbers > 2
-                                        let const_name = format!("MAX_LOOP_{}", end_num);
-                                        all_items.push(format!("{}..{}", start_num, const_name));
+                                        let const_name = format!("$MAX_LOOP_{}", end_num);
+                                        all_items.push(format!(" {} .. {} ", start_num, const_name));
                                     } else {
-                                        all_items.push(format!("{}..{}", start_num, end_num));
+                                        all_items.push(format!(" {} .. {} ", start_num, end_num));
                                     }
                                 } else {
                                     // Step range: use list with step

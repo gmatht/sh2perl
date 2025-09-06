@@ -255,8 +255,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     if matches!(cmd.args[0], Word::CommandSubstitution(_, _)) {
                         // For command substitution, don't add extra newline as it already contains proper formatting
                         output.push_str(&format!("print {};\n", args[0]));
+                    } else if args[0].starts_with('"') && args[0].ends_with('"') && !args[0].contains("\\n") {
+                        // Extract the string content and add newline directly
+                        let content = &args[0][1..args[0].len()-1]; // Remove quotes
+                        output.push_str(&format!("print \"{}\\n\";\n", content));
+                    } else if args[0].starts_with('$') && !args[0].contains("\\n") {
+                        // For variables, use comma to avoid string interpolation
+                        output.push_str(&format!("print {}, \"\\n\";\n", args[0]));
                     } else {
-                    output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
+                        output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
                     }
                 } else {
                     // Check if we have multiple brace expansions that need cartesian product
@@ -928,7 +935,7 @@ fn generate_cartesian_product_for_echo(
             .collect::<Vec<_>>()
             .join(" . \" \" . ");
         output.push_str(&generator.indent());
-        output.push_str(&format!("print {}. \"\\n\";\n", args_str));
+        output.push_str(&format!("print {} . \"\\n\";\n", args_str));
         return output;
     }
     
