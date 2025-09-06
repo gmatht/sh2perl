@@ -5,7 +5,7 @@ echo "To run a specific test: ./fail TEST_PREFIX"
 echo "Examples: ./fail 062_02, ./fail 044, ./fail find"
 
 #git stash push examples ./fail.bat ./fail ./src/main.rs src/testing.rs src/execution.rs
-cargo run --bin debashc -- fail "$@"
+cargo run --bin debashc -- fail "$@" --perl-critic
 
 # Note: The Windows-specific powershell command for simulating keypresses
 # cannot be directly converted to shell script. If you need similar functionality

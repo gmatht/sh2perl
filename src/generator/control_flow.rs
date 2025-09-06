@@ -1,5 +1,6 @@
 use crate::ast::*;
 use super::Generator;
+use regex::Regex;
 
 pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStatement) -> String {
     let mut output = String::new();
@@ -173,8 +174,12 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
     } else if let Command::TestExpression(test_expr) = &*while_loop.condition {
         // For test expressions, check if variables are used in the expression
         // and mark them as function-level variables so for loops know to preserve them
-        if test_expr.expression.contains("$i") {
-            generator.function_level_vars.insert("i".to_string());
+        // Extract variable names from the test expression
+        let re = Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
+        for cap in re.captures_iter(&test_expr.expression) {
+            if let Some(var_name) = cap.get(1) {
+                generator.function_level_vars.insert(var_name.as_str().to_string());
+            }
         }
     }
     
@@ -183,6 +188,9 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
     match &*while_loop.condition {
         Command::Simple(cmd) if cmd.name == "[" || cmd.name == "test" => {
             generator.generate_test_command(cmd, &mut output);
+        }
+        Command::TestExpression(test_expr) => {
+            output.push_str(&generator.generate_test_expression(test_expr));
         }
         _ => {
             output.push_str(&generator.generate_command(&while_loop.condition));
@@ -247,10 +255,10 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
         generator.declared_locals.insert(loop_var.clone());
     }
     
-    // Generate for loop using the actual variable name from the AST (without 'my')
+    // Generate for loop using the actual variable name from the AST (with 'my' for lexical scoping)
     // We need to store the last value to mimic shell behavior
     output.push_str(&generator.indent());
-    output.push_str(&format!("for ${} (", for_loop.variable));
+    output.push_str(&format!("for my ${} (", for_loop.variable));
     
     // Handle different types of for loop items
     let mut all_items = Vec::new();
@@ -296,8 +304,14 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                             if let (Ok(start_num), Ok(end_num)) = (range.start.parse::<i64>(), range.end.parse::<i64>()) {
                                 let step = range.step.as_ref().and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
                                 if step == 1 {
-                                    // Simple range: 1..5
-                                    all_items.push(format!("{}..{}", start_num, end_num));
+                                    // Simple range: 1..5 - use constants for magic numbers
+                                    if end_num > 2 {
+                                        // Use constant for magic numbers > 2
+                                        let const_name = format!("MAX_LOOP_{}", end_num);
+                                        all_items.push(format!("{}..{}", start_num, const_name));
+                                    } else {
+                                        all_items.push(format!("{}..{}", start_num, end_num));
+                                    }
                                 } else {
                                     // Step range: use list with step
                                     let mut values = Vec::new();
