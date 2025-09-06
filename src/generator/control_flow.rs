@@ -38,8 +38,9 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
     
     // Generate else branch if present
     if let Some(else_branch) = &if_stmt.else_branch {
+        output.push_str("}\n");
         output.push_str(&generator.indent());
-        output.push_str("} else {\n");
+        output.push_str("else {\n");
         generator.indent_level += 1;
         
         // Check if the else branch is a single command that doesn't need block wrapping
@@ -184,19 +185,25 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
     }
     
     // Generate while loop
-    output.push_str("while (");
+    output.push_str("while ( ");
     match &*while_loop.condition {
         Command::Simple(cmd) if cmd.name == "[" || cmd.name == "test" => {
             generator.generate_test_command(cmd, &mut output);
         }
         Command::TestExpression(test_expr) => {
-            output.push_str(&generator.generate_test_expression(test_expr));
+            let test_result = generator.generate_test_expression(test_expr);
+            // Remove outer parentheses if present to avoid double parentheses
+            if test_result.starts_with('(') && test_result.ends_with(')') {
+                output.push_str(&test_result[1..test_result.len()-1]);
+            } else {
+                output.push_str(&test_result);
+            }
         }
         _ => {
             output.push_str(&generator.generate_command(&while_loop.condition));
         }
     }
-    output.push_str(") {\n");
+    output.push_str(" ) {\n");
     
     // Generate body
     generator.indent_level += 1;
@@ -421,10 +428,21 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
         if all_items.len() == 1 && items_str.contains("..") {
             // This is a range like "1..3"
             let range_parts: Vec<&str> = items_str.split("..").collect();
-            if range_parts.len() == 2 {
-                let end_value = range_parts[1];
-                output.push_str(&generator.indent());
-                output.push_str(&format!("${} = {};\n", for_loop.variable, end_value));
+        if range_parts.len() == 2 {
+            let end_value = range_parts[1].trim();
+            // Don't use constants in post-loop assignments, use the actual value
+            let actual_end_value = if end_value.starts_with('$') && end_value.contains("MAX_LOOP_") {
+                // Extract the number from the constant name (e.g., $MAX_LOOP_5 -> 5)
+                if let Some(num_str) = end_value.strip_prefix("$MAX_LOOP_") {
+                    num_str.to_string()
+                } else {
+                    end_value.to_string()
+                }
+            } else {
+                end_value.to_string()
+            };
+            output.push_str(&generator.indent());
+            output.push_str(&format!("${} = {};\n", for_loop.variable, actual_end_value));
             }
         } else if all_items.len() > 1 {
             // For multiple items, set to the last item
@@ -441,6 +459,9 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
 pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> String {
     let mut output = String::new();
     
+    // Add blank line before function definition for better formatting
+    output.push_str("\n");
+    
     // Generate function definition
     output.push_str(&format!("sub {} {{\n", func.name));
     
@@ -456,15 +477,22 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
         output.push_str(") = @_;\n");
         
         // Generate function body
-        output.push_str(&generator.indent());
         output.push_str(&generator.generate_block_commands(&func.body));
+        
+        // Add return statement with proper indentation
+        output.push_str(&generator.indent());
+        output.push_str("return;\n");
         
         generator.indent_level -= 1;
     } else {
         // No parameters
         generator.indent_level += 1;
-        output.push_str(&generator.indent());
         output.push_str(&generator.generate_block_commands(&func.body));
+        
+        // Add return statement with proper indentation
+        output.push_str(&generator.indent());
+        output.push_str("return;\n");
+        
         generator.indent_level -= 1;
     }
     

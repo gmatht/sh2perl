@@ -160,7 +160,7 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         } else if args.len() == 1 {
             // Check if the argument is a simple string literal that we can combine with newline
             if args[0].starts_with('"') && args[0].ends_with('"') && !args[0].contains("\\n") {
-                // Extract the string content and add newline directly
+                // Extract the string content and add newline directly using double quotes for escape sequences
                 let content = &args[0][1..args[0].len()-1]; // Remove quotes
                 output.push_str(&format!("${} .= \"{}\\n\";\n", output_var, content));
             } else if args[0].contains("\\n") {

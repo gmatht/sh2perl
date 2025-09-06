@@ -11,6 +11,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
             } else if s.contains(',') {
                 generator.handle_comma_expansion(s)
             } else {
+                // For literal strings, only replace constants in specific contexts
+                // Don't replace numbers that are part of arithmetic expressions
                 s.clone()
             }
         },
@@ -444,11 +446,11 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &Generator, interp: 
     format!("\"{}\"", escaped_string)
 }
 
-pub fn convert_arithmetic_to_perl_impl(_generator: &Generator, expr: &str) -> String {
+pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> String {
     // Convert shell arithmetic expression to Perl syntax
-    let result = expr.to_string();
+    let mut result = expr.to_string();
     
-    // Convert shell variables to Perl variables (e.g., i -> $i)
+    // Convert shell variables to Perl variables (e.g., i -> $i) first
     // Use regex to find variable names and replace them with Perl variable syntax
     
     // Create a regex to match variable names (letters followed by alphanumeric/underscore)

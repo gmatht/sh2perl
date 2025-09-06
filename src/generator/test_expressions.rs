@@ -326,7 +326,7 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
             // Replace magic numbers with constants
             for (const_name, value) in &generator.constants {
                 let value_str = value.to_string();
-                right_perl = right_perl.replace(&value_str, const_name);
+                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
             }
             
             format!("({} < {})", left_perl, right_perl)
@@ -340,7 +340,14 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
             let left = parts[0].trim();
             let right = parts[1].trim();
             let left_perl = convert_shell_var_to_perl(left);
-            let right_perl = convert_shell_var_to_perl(right);
+            let mut right_perl = convert_shell_var_to_perl(right);
+            
+            // Replace magic numbers with constants
+            for (const_name, value) in &generator.constants {
+                let value_str = value.to_string();
+                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
+            }
+            
             format!("({} <= {})", left_perl, right_perl)
         } else {
             "0".to_string()
@@ -352,7 +359,14 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
             let left = parts[0].trim();
             let right = parts[1].trim();
             let left_perl = convert_shell_var_to_perl(left);
-            let right_perl = convert_shell_var_to_perl(right);
+            let mut right_perl = convert_shell_var_to_perl(right);
+            
+            // Replace magic numbers with constants
+            for (const_name, value) in &generator.constants {
+                let value_str = value.to_string();
+                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
+            }
+            
             format!("({} > {})", left_perl, right_perl)
         } else {
             "0".to_string()
@@ -364,7 +378,14 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
             let left = parts[0].trim();
             let right = parts[1].trim();
             let left_perl = convert_shell_var_to_perl(left);
-            let right_perl = convert_shell_var_to_perl(right);
+            let mut right_perl = convert_shell_var_to_perl(right);
+            
+            // Replace magic numbers with constants
+            for (const_name, value) in &generator.constants {
+                let value_str = value.to_string();
+                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
+            }
+            
             format!("({} >= {})", left_perl, right_perl)
         } else {
             "0".to_string()
@@ -376,7 +397,14 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
             let left = parts[0].trim();
             let right = parts[1].trim();
             let left_perl = convert_shell_var_to_perl(left);
-            let right_perl = convert_shell_var_to_perl(right);
+            let mut right_perl = convert_shell_var_to_perl(right);
+            
+            // Replace magic numbers with constants
+            for (const_name, value) in &generator.constants {
+                let value_str = value.to_string();
+                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
+            }
+            
             format!("({} == {})", left_perl, right_perl)
         } else {
             "0".to_string()
@@ -388,7 +416,14 @@ pub fn generate_test_expression_impl(generator: &mut Generator, test_expr: &Test
             let left = parts[0].trim();
             let right = parts[1].trim();
             let left_perl = convert_shell_var_to_perl(left);
-            let right_perl = convert_shell_var_to_perl(right);
+            let mut right_perl = convert_shell_var_to_perl(right);
+            
+            // Replace magic numbers with constants
+            for (const_name, value) in &generator.constants {
+                let value_str = value.to_string();
+                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
+            }
+            
             format!("({} != {})", left_perl, right_perl)
         } else {
             "0".to_string()
