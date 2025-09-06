@@ -362,7 +362,7 @@ impl Parser {
                     self.lexer.next();
                     pipe_operators.push(());
                     self.lexer.skip_whitespace_and_comments();
-                    let command = self.parse_command()?;
+                    let command = self.parse_simple_command()?;
                     // Parse redirects for this command
                     let command_with_redirects = self.parse_command_redirects(command)?;
                     commands.push(command_with_redirects);
@@ -370,7 +370,7 @@ impl Parser {
                 Token::And => {
                     self.lexer.next();
                     self.lexer.skip_whitespace_and_comments();
-                    let right_command = self.parse_command()?;
+                    let right_command = self.parse_simple_command()?;
                     let right_command_with_redirects = self.parse_command_redirects(right_command)?;
                     
                     // Create Command::And(left, right)
@@ -381,7 +381,7 @@ impl Parser {
                 Token::Or => {
                     self.lexer.next();
                     self.lexer.skip_whitespace_and_comments();
-                    let right_command = self.parse_command()?;
+                    let right_command = self.parse_simple_command()?;
                     let right_command_with_redirects = self.parse_command_redirects(right_command)?;
                     
                     // Create Command::Or(left, right)

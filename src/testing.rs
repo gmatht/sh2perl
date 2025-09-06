@@ -107,14 +107,18 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
     // Create cache manager
     let cache = PerlCriticCache::new();
     
-    // Check cache first
+    // Check cache first - always return cached result if it exists
     if let Some(cached_result) = cache.get_cached_result(perl_code) {
-        eprintln!("perlcritic_cache: Cache hit, returning cached result");
-        return Ok(cached_result);
+        if cache.should_invalidate_cache(perl_code) {
+            eprintln!("perlcritic_cache: Cache hit but invalidated, running Perl::Critic");
+        } else {
+            eprintln!("perlcritic_cache: Cache hit, returning cached result");
+            return Ok(cached_result);
+        }
+    } else {
+        eprintln!("perlcritic_cache: Cache miss, running Perl::Critic");
     }
-    
-    eprintln!("perlcritic_cache: Cache miss, running Perl::Critic");
-    
+
     if !check_perl_critic_available() {
         return Err("Perl::Critic not found in PATH. Please install it with: cpan Perl::Critic".to_string());
     }
@@ -144,14 +148,7 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
 
     // Run Perl::Critic
     let output = match cmd.output() {
-        Ok(output) => {
-            // Print stderr for timing logs
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.is_empty() {
-                eprintln!("{}", stderr);
-            }
-            output
-        },
+        Ok(output) => output,
         Err(e) => {
             // Clean up temp file
             let _ = std::fs::remove_file(&temp_file);
@@ -249,17 +246,17 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
             result
         }
     };
-    
+
     // Store result in cache
     if let Err(e) = cache.store_result(perl_code, &result) {
         eprintln!("Warning: Failed to cache Perl::Critic result: {}", e);
     } else {
         eprintln!("perlcritic_cache: Result cached successfully");
     }
-    
+
     // Clean up temp file
     let _ = std::fs::remove_file(&temp_file);
-    
+
     // Return result (convert to Ok/Err based on content)
     if result.contains("Perl::Critic: No violations found") {
         Ok(result)
@@ -416,10 +413,20 @@ pub fn test_file_equivalence_with_critic(lang: &str, filename: &str, enable_perl
             // Run compiled binary directly (first arg of run_cmd)
             let bin = "__tmp_test_bin";
             let abs_bin = std::env::current_dir().unwrap_or_default().join(bin);
-            // Use direct execution instead of polling with sleep
-            let out = match Command::new(&abs_bin).stdout(Stdio::piped()).stderr(Stdio::piped()).output() {
-                Ok(output) => output,
+            let mut child = match Command::new(&abs_bin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                Ok(c) => c,
                 Err(e) => { cleanup_tmp(lang, &tmp_file); return Err(format!("Failed to run compiled Rust: {} ({})", e, abs_bin.display())); }
+            };
+            let start = std::time::Instant::now();
+            let out = loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break child.wait_with_output().unwrap(),
+                    Ok(None) => {
+                        if start.elapsed() > Duration::from_millis(1000) { let _ = child.kill(); break child.wait_with_output().unwrap(); }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break child.wait_with_output().unwrap(),
+                }
             };
             out
         } else {
@@ -762,11 +769,20 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
             // Run compiled binary directly (first arg of run_cmd)
             let bin = "__tmp_test_bin";
             let abs_bin = std::env::current_dir().unwrap_or_default().join(bin);
-            // Use direct execution instead of polling with sleep
-            let start = std::time::Instant::now();
-            let out = match Command::new(&abs_bin).stdout(Stdio::piped()).stderr(Stdio::piped()).output() {
-                Ok(output) => output,
+            let mut child = match Command::new(&abs_bin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                Ok(c) => c,
                 Err(e) => { cleanup_tmp(lang, &tmp_file); return Err(format!("Failed to run compiled Rust: {} ({})", e, abs_bin.display())); }
+            };
+            let start = std::time::Instant::now();
+            let out = loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break child.wait_with_output().unwrap(),
+                    Ok(None) => {
+                        if start.elapsed() > Duration::from_millis(1000) { let _ = child.kill(); break child.wait_with_output().unwrap(); }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break child.wait_with_output().unwrap(),
+                }
             };
             let duration = start.elapsed();
             (out, duration)
@@ -788,11 +804,20 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 for a in &run_cmd[1..] { cmd.arg(a); }
             }
             
-            // Use direct execution instead of polling with sleep
-            let start = std::time::Instant::now();
-            let out = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output() {
-                Ok(output) => output,
+            let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                Ok(c) => c,
                 Err(e) => { cleanup_tmp(lang, &tmp_file); return Err(format!("Failed to run translated program: {}", e)); }
+            };
+            let start = std::time::Instant::now();
+            let out = loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break child.wait_with_output().unwrap(),
+                    Ok(None) => {
+                        if start.elapsed() > Duration::from_millis(1000) { let _ = child.kill(); break child.wait_with_output().unwrap(); }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break child.wait_with_output().unwrap(),
+                }
             };
             let duration = start.elapsed();
             (out, duration)
