@@ -43,11 +43,11 @@ pub fn generate_cat_command(generator: &mut Generator, cmd: &SimpleCommand, redi
         output.push_str("while (my $line = <$fh>) {\n");
         output.push_str(&format!("${} .= $line;\n", input_var));
         output.push_str("}\n");
-        output.push_str("close($fh);\n");
+        output.push_str("close($fh) or croak \"Close failed: $!\";\n");
         output.push_str(&format!("# Ensure content ends with newline to prevent line concatenation\n"));
         output.push_str(&format!("${} .= \"\\n\" unless ${} =~ /\\n$/;\n", input_var, input_var));
         output.push_str("} else {\n");
-        output.push_str(&format!("warn \"cat: {}: No such file or directory\";\n", adjusted_filename));
+        output.push_str(&format!("carp \"cat: {}: No such file or directory\";\n", adjusted_filename));
         // Instead of calling exit(1), set the output to empty and let the pipeline handle the failure
         output.push_str(&format!("${} = '';\n", input_var));
         output.push_str("}\n");

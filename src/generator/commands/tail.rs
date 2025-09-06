@@ -33,7 +33,7 @@ pub fn generate_tail_command(_generator: &mut Generator, cmd: &SimpleCommand, in
     
     if follow {
         // Follow mode - this would require more complex logic in a real implementation
-        output.push_str("warn \"tail: -f option not fully implemented in this version\\n\";\n");
+        output.push_str("carp \"tail: -f option not fully implemented in this version\\n\";\n");
     }
     
     output.push_str(&format!("my @lines = split(/\\n/, {});\n", input_var));

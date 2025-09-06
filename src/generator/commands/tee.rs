@@ -36,7 +36,7 @@ pub fn generate_tee_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
             output.push_str("}\n");
             output.push_str("close($fh);\n");
             output.push_str("} else {\n");
-            output.push_str(&format!("warn \"tee: Cannot open {}: $!\";\n", file));
+            output.push_str(&format!("carp \"tee: Cannot open {}: $!\";\n", file));
             output.push_str("}\n");
         }
         

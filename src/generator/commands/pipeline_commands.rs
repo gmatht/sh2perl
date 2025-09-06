@@ -971,7 +971,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         output.push_str(&generator.indent());
         output.push_str("}\n");
         output.push_str(&generator.indent());
-        output.push_str("close($fh);\n");
+        output.push_str("close($fh) or croak \"Close failed: $!\";\n");
         
         // Output wc results if wc was used
         let has_wc = pipeline.commands.iter().any(|cmd| {
@@ -996,7 +996,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         output.push_str("} else {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str("warn \"cat: can't open file\";\n");
+        output.push_str("carp \"cat: can't open file\";\n");
         output.push_str(&generator.indent());
         output.push_str("exit(1);\n");
         generator.indent_level -= 1;

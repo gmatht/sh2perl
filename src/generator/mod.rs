@@ -59,6 +59,7 @@ impl Generator {
         output.push_str("#!/usr/bin/env perl\n");
         output.push_str("use strict;\n");
         output.push_str("use warnings;\n");
+        output.push_str("use Carp;\n");
         
         if needs_basename {
             output.push_str("use File::Basename;\n");

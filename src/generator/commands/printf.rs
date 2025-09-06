@@ -26,7 +26,7 @@ pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, i
     
     if format_string.is_empty() {
         // No format string provided, return error
-        output.push_str("warn \"printf: no format string specified\";\n");
+        output.push_str("carp \"printf: no format string specified\";\n");
         output.push_str("exit(1);\n");
     } else {
         // Handle special case for array expansion like "${lines[@]}" or @"lines"

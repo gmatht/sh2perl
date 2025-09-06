@@ -265,10 +265,10 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     output.push_str("my ($dir, $results) = @_;\n");
     
     output.push_str(&indent2);
-    output.push_str("if (opendir(my $dh, $dir)) {\n");
+    output.push_str("if (opendir my $dh, $dir) {\n");
     
     output.push_str(&indent3);
-    output.push_str("while (my $file = readdir($dh)) {\n");
+    output.push_str("while (my $file = readdir $dh) {\n");
     
     output.push_str(&indent4);
     output.push_str("next if $file eq '.' || $file eq '..';\n");
@@ -314,11 +314,11 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         output.push_str(&indent4);
         output.push_str("} elsif (-d $full_path) {\n");
         output.push_str(&indent5);
-        output.push_str("opendir(my $empty_dh, $full_path) or next;\n");
+        output.push_str("opendir my $empty_dh, $full_path or next;\n");
         output.push_str(&indent5);
-        output.push_str("my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($empty_dh);\n");
+        output.push_str("my @entries = grep { $_ ne '.' && $_ ne '..' } readdir $empty_dh;\n");
         output.push_str(&indent5);
-        output.push_str("closedir($empty_dh);\n");
+        output.push_str("closedir $empty_dh;\n");
         output.push_str(&indent5);
         output.push_str("next unless @entries == 0;\n");
         output.push_str(&indent4);
@@ -448,10 +448,13 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     output.push_str("}\n");
     
     output.push_str(&indent2);
-    output.push_str("closedir($dh);\n");
+    output.push_str("closedir $dh;\n");
     
     output.push_str(&indent2);
     output.push_str("}\n");
+    
+    output.push_str(&indent2);
+    output.push_str("return;\n");
     
     output.push_str(&indent1);
     output.push_str("}\n");
