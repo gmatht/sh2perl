@@ -128,9 +128,21 @@ pub fn parse_system_to_perl(input: &str) {
     
     let perl_code = generator.generate(&commands);
     
-    // Extract just the core logic from the generated code
-    let clean_code = extract_core_perl_logic(&perl_code);
-    println!("{}", clean_code);
+    // Debug: print the full generated code
+    println!("FULL GENERATED CODE:");
+    println!("{}", perl_code);
+    println!("END FULL CODE");
+    
+    // Extract preamble and core logic separately
+    let (preamble, core_code) = extract_preamble_and_core(&perl_code);
+    
+    // Output in a format that purify.pl can parse
+    if !preamble.is_empty() {
+        println!("PREAMBLE:");
+        println!("{}", preamble);
+        println!("CORE:");
+    }
+    println!("{}", core_code);
     
     println!("{}", "=".repeat(50));
 }
@@ -191,6 +203,96 @@ fn extract_core_perl_logic(perl_code: &str) -> String {
         } else {
             // Return the original code if we can't extract anything
             perl_code.to_string()
+        }
+    }
+}
+
+fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
+    // Check if this is an ls command by looking for ls-specific patterns
+    if perl_code.contains("my @ls_files") && perl_code.contains("opendir my $dh") {
+        // This is an ls command - generate generic preamble and extract core logic
+        let preamble = "my @ls_files;\nmy $ls_dir;\nif (opendir my $dh, $ls_dir) {\n    while (my $file = readdir $dh) {\n        next if $file eq q{.} || $file eq q{..};\n        push @ls_files, $file;\n    }\n    closedir $dh;\n}";
+        
+        // Extract the core logic (directory assignment and print statement)
+        if let Some(captures) = regex::Regex::new(r"my \$ls_dir = '([^']+)';\n.*?\n(print.*?;?)\s*$")
+            .unwrap()
+            .captures(perl_code) {
+            let dir = captures.get(1).unwrap().as_str();
+            let print_stmt = captures.get(2).unwrap().as_str();
+            let core_code = format!("$ls_dir = '{}';\n{}", dir, print_stmt);
+            let final_core = if core_code.ends_with(';') {
+                core_code[..core_code.len()-1].to_string()
+            } else {
+                core_code.to_string()
+            };
+            return (preamble.to_string(), final_core);
+        }
+        
+        // Alternative pattern: look for the directory assignment in the preamble and print in core
+        if let Some(captures) = regex::Regex::new(r"my \$ls_dir = '([^']+)';\n.*?\n(print.*?;?)\s*$")
+            .unwrap()
+            .captures(perl_code) {
+            let dir = captures.get(1).unwrap().as_str();
+            let print_stmt = captures.get(2).unwrap().as_str();
+            let core_code = format!("$ls_dir = '{}';\n{}", dir, print_stmt);
+            let final_core = if core_code.ends_with(';') {
+                core_code[..core_code.len()-1].to_string()
+            } else {
+                core_code.to_string()
+            };
+            return (preamble.to_string(), final_core);
+        }
+    }
+    
+    // Look for the main logic after variable declarations
+    if let Some(captures) = regex::Regex::new(r"(.*?my \$main_exit_code = 0;\s*\n)(.*?)(?:\n\s*$|$)")
+        .unwrap()
+        .captures(perl_code) {
+        let preamble = captures.get(1).unwrap().as_str().trim().to_string();
+        let core_code = captures.get(2).unwrap().as_str();
+        // Clean up the core code - remove trailing semicolons and extra whitespace
+        let cleaned = core_code.trim_end();
+        let final_core = if cleaned.ends_with(';') {
+            cleaned[..cleaned.len()-1].to_string()
+        } else {
+            cleaned.to_string()
+        };
+        (preamble, final_core)
+    } else {
+        // Try to extract variable declarations and core logic separately
+        // Look for variable declarations (my @...; or my $...;) followed by the main logic
+        if let Some(captures) = regex::Regex::new(r"(?s)(.*?)(my @[^;]+;.*?)(print.*?;?)\s*$")
+            .unwrap()
+            .captures(perl_code) {
+            let header = captures.get(1).unwrap().as_str().trim().to_string();
+            let var_decls = captures.get(2).unwrap().as_str().trim().to_string();
+            let core_code = captures.get(3).unwrap().as_str().trim().to_string();
+            
+            let preamble = if header.is_empty() {
+                var_decls
+            } else {
+                format!("{}\n{}", header, var_decls)
+            };
+            
+            let final_core = if core_code.ends_with(';') {
+                core_code[..core_code.len()-1].to_string()
+            } else {
+                core_code.to_string()
+            };
+            
+            (preamble, final_core)
+        } else {
+            // If we can't find the pattern, try to extract just the core logic
+            // Look for print statements or other core logic
+            if let Some(captures) = regex::Regex::new(r"(print.*?;?)\s*$")
+                .unwrap()
+                .captures(perl_code) {
+                let code = captures.get(1).unwrap().as_str();
+                ("".to_string(), code.trim_end().to_string())
+            } else {
+                // Return empty preamble and original code if we can't extract anything
+                ("".to_string(), perl_code.to_string())
+            }
         }
     }
 }

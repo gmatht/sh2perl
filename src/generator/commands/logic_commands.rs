@@ -79,15 +79,31 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
                 output.push_str(&generator.indent());
                 output.push_str("}");
             } else {
-                // For other simple commands, use the default approach
-                output.push_str(&generator.generate_command(left));
+                // For other simple commands, generate the command and check exit code
+                let command = generator.generate_command(left);
+                // Remove trailing semicolon and newline if present
+                let trimmed_command = command.trim_end_matches(";\n").trim_end_matches(';');
+                output.push_str("do { ");
+                output.push_str(&trimmed_command);
+                output.push_str("; $? == 0 }");
             }
         } else {
-            // For non-literal command names, use the default approach
-            output.push_str(&generator.generate_command(left));
+            // For non-literal command names, generate the command and check exit code
+            let command = generator.generate_command(left);
+            // Remove trailing semicolon and newline if present
+            let trimmed_command = command.trim_end_matches(";\n").trim_end_matches(';');
+            output.push_str("do { ");
+            output.push_str(&trimmed_command);
+            output.push_str("; $? == 0 }");
         }
     } else {
-        output.push_str(&generator.generate_command(left));
+        // For other command types, generate the command and check exit code
+        let command = generator.generate_command(left);
+        // Remove trailing semicolon and newline if present
+        let trimmed_command = command.trim_end_matches(";\n").trim_end_matches(';');
+        output.push_str("do { ");
+        output.push_str(&trimmed_command);
+        output.push_str("; $? == 0 }");
     }
     
     output.push_str(") {\n");

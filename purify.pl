@@ -11,6 +11,10 @@ my $inplace = 0;
 my $output_file;
 my $debashc_path = 'target/debug/debashc.exe';
 
+# Global variables to store preamble blocks and track declared variables
+my @preamble_blocks;
+my %declared_vars;
+
 GetOptions(
     'help|h' => \$help,
     'verbose|v' => \$verbose,
@@ -119,11 +123,40 @@ EOF
 sub purify_perl_code {
     my ($content) = @_;
     
+    # Clear any previous preamble blocks and declared variables
+    @preamble_blocks = ();
+    %declared_vars = ();
+    
     # Process system() calls
     $content = process_system_calls($content);
     
     # Process backtick command substitution
     $content = process_backticks($content);
+    
+    # Insert preamble blocks at the top of the file
+    if (@preamble_blocks) {
+        # Find the end of the initial use statements and shebang
+        my $insertion_point = 0;
+        my @lines = split(/\n/, $content);
+        
+        # Find the last use statement or shebang
+        for my $i (0..$#lines) {
+            if ($lines[$i] =~ /^#!/ || $lines[$i] =~ /^use\s+/ || $lines[$i] =~ /^require\s+/) {
+                $insertion_point = $i + 1;
+            } elsif ($lines[$i] =~ /^\s*$/) {
+                # Skip empty lines after use statements
+                next;
+            } else {
+                # Found non-use statement, stop here
+                last;
+            }
+        }
+        
+        # Insert all preamble blocks
+        my $preamble_text = join("\n", @preamble_blocks);
+        splice(@lines, $insertion_point, 0, $preamble_text);
+        $content = join("\n", @lines);
+    }
     
     return $content;
 }
@@ -141,11 +174,18 @@ sub process_system_calls {
         my $command = $2;
         my $quote2 = $3;
         my $args = $4;
-        # Reconstruct the full command
-        my $full_command = "$command $args";
-        my $perl_code = convert_shell_to_perl($full_command, 0);
-        if ($perl_code) {
-            $perl_code;
+        # Reconstruct the full command with proper quoting
+        my $full_command = "$command $quote2$args$quote2";
+        my $perl_result = convert_shell_to_perl($full_command, 0);
+        if ($perl_result) {
+            if (ref($perl_result) eq 'HASH') {
+                # New format: insert preamble and return core
+                insert_preamble($perl_result->{preamble});
+                $perl_result->{core};
+            } else {
+                # Old format: just return the code
+                $perl_result;
+            }
         } else {
             "system($quote1$command$quote1, $quote2$args$quote2)";  # Keep original if conversion fails
         }
@@ -159,10 +199,22 @@ sub process_system_calls {
     }{
         my $quote = $1;
         my $command = $2;
-        my $perl_code = convert_shell_to_perl($command, 0);
-        if ($perl_code) {
-            $perl_code;
+        print "DEBUG: Processing system call: $command\n" if $verbose;
+        my $perl_result = convert_shell_to_perl($command, 0);
+        if ($perl_result) {
+            if (ref($perl_result) eq 'HASH') {
+                # New format: insert preamble and return core
+                print "DEBUG: Inserting preamble for: $command\n" if $verbose;
+                insert_preamble($perl_result->{preamble});
+                print "DEBUG: Core code: $perl_result->{core}\n" if $verbose;
+                $perl_result->{core};
+            } else {
+                # Old format: just return the code
+                print "DEBUG: Old format result: $perl_result\n" if $verbose;
+                $perl_result;
+            }
         } else {
+            print "DEBUG: Conversion failed for: $command\n" if $verbose;
             "system($quote$command$quote)";  # Keep original if conversion fails
         }
     }gex;
@@ -173,22 +225,61 @@ sub process_system_calls {
 sub process_backticks {
     my ($content) = @_;
     
-    # Pattern to match backtick command substitution
-    $content =~ s{
-        `([^`]+)`
-    }{
+    # Process backtick commands one by one to handle complex cases
+    while ($content =~ /`([^`]+)`/) {
         my $command = $1;
-        my $perl_code = convert_shell_to_perl($command, 1);
-        if ($perl_code) {
-            # Wrap in parentheses to maintain precedence
-            "($perl_code)";
+        my $perl_result = convert_shell_to_perl($command, 1);
+        my $core_code = ref($perl_result) eq 'HASH' ? $perl_result->{core} : $perl_result;
+        if ($perl_result && $core_code !~ /^`.*`$/) {
+            if (ref($perl_result) eq 'HASH') {
+                # New format: insert preamble and use core
+                insert_preamble($perl_result->{preamble});
+                # Wrap in parentheses to maintain precedence
+                $content =~ s/`$command`/($perl_result->{core})/;
+            } else {
+                # Old format: just use the code
+                # Wrap in parentheses to maintain precedence
+                $content =~ s/`$command`/($perl_result)/;
+            }
         } else {
-            "`$command`";  # Keep original if conversion fails
+            # Keep original if conversion fails - no change needed
+            last;
         }
-    }gex;
+    }
     
     return $content;
 }
+
+sub insert_preamble {
+    my ($preamble) = @_;
+    
+    # Extract only the variable declarations from the preamble
+    # Skip the shebang and use statements as they're already in the original file
+    my @lines = split(/\n/, $preamble);
+    my @var_decls = ();
+    
+    for my $line (@lines) {
+        # Skip shebang, use statements, and empty lines
+        next if $line =~ /^#!/;
+        next if $line =~ /^use\s+/;
+        next if $line =~ /^require\s+/;
+        next if $line =~ /^my \$main_exit_code/;
+        next if $line =~ /^\s*$/;
+        
+        # Skip directory assignments as they'll be handled in core logic
+        next if $line =~ /^\$ls_dir = /;
+        
+        # Keep variable declarations and logic
+        push @var_decls, $line;
+    }
+    
+    # Always add the preamble (no deduplication)
+    my $var_decl_text = join("\n", @var_decls);
+    if ($var_decl_text) {
+        push @preamble_blocks, $var_decl_text;
+    }
+}
+
 
 sub convert_shell_to_perl {
     my ($shell_command, $is_backticks) = @_;
@@ -220,22 +311,54 @@ sub convert_shell_to_perl {
     }
     
     # Extract the Perl code from debashc output
-    my $perl_code = extract_perl_from_debashc_output($stdout);
+    my $perl_result = extract_perl_from_debashc_output($stdout);
     
-    if (!$perl_code) {
-        warn "Failed to extract Perl code from debashc output\n";
+    if (!$perl_result) {
+        warn "Failed to extract Perl code from debashc output\n" if $verbose;
         return undef;
     }
     
-    print "Converted to Perl: $perl_code\n" if $verbose;
-    return $perl_code;
+    # Handle both old format (string) and new format (hash reference)
+    if (ref($perl_result) eq 'HASH') {
+        # New format: preamble and core
+        my $preamble = $perl_result->{preamble};
+        my $core = $perl_result->{core};
+        print "Converted to Perl (preamble): $preamble\n" if $verbose;
+        print "Converted to Perl (core): $core\n" if $verbose;
+        return { preamble => $preamble, core => $core };
+    } else {
+        # Old format: just the core code
+        print "Converted to Perl: $perl_result\n" if $verbose;
+        return $perl_result;
+    }
 }
 
 sub extract_perl_from_debashc_output {
     my ($output) = @_;
     
+    # Check if this is an error message first
+    if ($output =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
+        return undef;
+    }
+    
     # Look for Perl code in the output
     # The output format might vary, so we try different patterns
+    
+    # Pattern 0: New preamble/core format
+    if ($output =~ /PREAMBLE:\s*\n(.*?)\nCORE:\s*\n(.*?)\n={50}/s) {
+        my $preamble = $1;
+        my $core = $2;
+        # Check if the code contains error messages
+        if ($preamble =~ /Parse error:|Error:|Failed:|Unexpected token:/ || 
+            $core =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
+            return undef;
+        }
+        # Clean up the core code - remove trailing semicolons and extra whitespace
+        $core =~ s/;\s*$//;
+        $core =~ s/\n\s*$//;
+        # Return both preamble and core as a hash reference
+        return { preamble => $preamble, core => $core };
+    }
     
     # Pattern 1: Look for code between markers (old format)
     if ($output =~ /Generated Perl code:\s*\n(.*?)\n---/s) {
@@ -245,6 +368,10 @@ sub extract_perl_from_debashc_output {
     # Pattern 2: Look for code after "Converting system command to Perl:" and before the separator line
     if ($output =~ /Converting system command to Perl:\s*\n={50}\s*\n(.*?)\n={50}/s) {
         my $code = $1;
+        # Check if the code contains error messages
+        if ($code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
+            return undef;
+        }
         # Clean up the code - remove trailing semicolons and extra whitespace
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
@@ -254,6 +381,10 @@ sub extract_perl_from_debashc_output {
     # Pattern 2b: Look for code after "Converting backticks command to Perl:" and before the separator line
     if ($output =~ /Converting backticks command to Perl:\s*\n={50}\s*\n(.*?)\n={50}/s) {
         my $code = $1;
+        # Check if the code contains error messages
+        if ($code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
+            return undef;
+        }
         # Clean up the code - remove trailing semicolons and extra whitespace
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
@@ -263,6 +394,10 @@ sub extract_perl_from_debashc_output {
     # Pattern 2c: Look for code after "Converting snippet to Perl:" and before the separator line (old format)
     if ($output =~ /Converting snippet to Perl:\s*\n={50}\s*\n(.*?)\n={50}/s) {
         my $code = $1;
+        # Check if the code contains error messages
+        if ($code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
+            return undef;
+        }
         # Clean up the code - remove trailing semicolons and extra whitespace
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
@@ -272,6 +407,10 @@ sub extract_perl_from_debashc_output {
     # Pattern 3: Look for code after "Converting to Perl:" and before the separator line (old format)
     if ($output =~ /Converting to Perl:\s*\n={50}\s*\n(.*?)\n={50}/s) {
         my $code = $1;
+        # Check if the code contains error messages
+        if ($code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
+            return undef;
+        }
         # Extract just the main logic after the variable declarations
         if ($code =~ /my \$main_exit_code = 0;\s*\n(.*?)(?:\n\s*$|$)/s) {
             my $main_code = $1;
@@ -285,6 +424,10 @@ sub extract_perl_from_debashc_output {
     # Pattern 4: Extract just the main logic from the full script
     if ($output =~ /my \$main_exit_code = 0;\s*\n(.*?)(?:\n\s*$|$)/s) {
         my $code = $1;
+        # Check if the code contains error messages
+        if ($code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
+            return undef;
+        }
         # Clean up the code - remove trailing semicolons and extra whitespace
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
@@ -292,7 +435,11 @@ sub extract_perl_from_debashc_output {
     }
     
     # Pattern 5: If the output is just Perl code
-    if ($output =~ /^[^=]/ && $output !~ /Error|Failed/) {
+    if ($output =~ /^[^=]/ && $output !~ /Error|Failed|Parse error|Unexpected token/) {
+        # Check if the code contains undefined variables or invalid syntax
+        if ($output =~ /@\w+[^=]/ || $output =~ /undefined|undefined variable/i) {
+            return undef;
+        }
         return $output;
     }
     
