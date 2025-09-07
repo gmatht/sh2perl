@@ -307,7 +307,7 @@ pub fn convert_escaped_metacharacters(pattern: &str) -> String {
 
 /// Generate a regex pattern for checking if string ends with newline
 pub fn newline_end_regex() -> String {
-    format_regex_pattern(r"\\n$")
+    format_regex_pattern(r"\n$")
 }
 
 /// Convert postfix unless statement to block form

@@ -52,6 +52,8 @@ pub fn show_help(program_name: &str) {
         println!("  fail [NUM] [gen1 gen2 ...]      - Shorthand for --next-fail");
                         println!("  --clear-cache                    - Clear the command cache");
     println!("  --perl-critic                    - Enable Perl::Critic code quality checks (Brutal level)");
+    println!("  --perl-critic-only <input>       - Test Perl code with specific exit codes:");
+    println!("                                     0=pass, 101=lex, 102=parse, 104=generate, 137=critic");
     println!();
     println!("AST FORMATTING OPTIONS (for --next-fail):");
     println!();
@@ -79,6 +81,7 @@ pub fn show_help(program_name: &str) {
     println!("  {} --next-fail perl", program_name);
     println!("  {} --next-fail 10 perl --ast-pretty", program_name);
     println!("  {} --clear-cache", program_name);
+    println!("  {} --perl-critic-only 'print \"hello\";'", program_name);
     println!("  {} --debug parse 'echo hello'", program_name);
     println!("  {} --no-debug parse 'echo hello'", program_name);
     println!();

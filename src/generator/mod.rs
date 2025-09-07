@@ -24,6 +24,7 @@ pub struct Generator {
     pub current_process_sub_file: Option<String>,
     pub function_level_vars: HashSet<String>,
     pub constants: HashMap<String, i64>,
+    pub translation_mode: bool, // New field for pure translation mode
 }
 
 impl Generator {
@@ -39,6 +40,23 @@ impl Generator {
             current_process_sub_file: None,
             function_level_vars: HashSet::new(),
             constants: HashMap::new(),
+            translation_mode: false,
+        }
+    }
+
+    pub fn new_translation_mode() -> Self {
+        Self {
+            indent_level: 0,
+            declared_locals: HashSet::new(),
+            declared_functions: HashSet::new(),
+            file_handle_counter: 0,
+            extglob_enabled: false,
+            nocasematch_enabled: false,
+            process_sub_files: HashMap::new(),
+            current_process_sub_file: None,
+            function_level_vars: HashSet::new(),
+            constants: HashMap::new(),
+            translation_mode: true,
         }
     }
 
