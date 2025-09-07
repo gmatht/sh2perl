@@ -102,13 +102,13 @@ pub fn parse_to_perl(input: &str) {
     println!("{}", "=".repeat(50));
 }
 
-pub fn parse_snippet_to_perl(input: &str) {
+pub fn parse_system_to_perl(input: &str) {
     let mut generator = Generator::new();
     
-    println!("Converting snippet to Perl:");
+    println!("Converting system command to Perl:");
     println!("{}", "=".repeat(50));
     
-    // For snippets, we need to be more lenient with parsing
+    // For system commands, we need to be more lenient with parsing
     // Try to parse as-is first
     let commands = match Parser::new(input).parse() {
         Ok(c) => c,
@@ -135,6 +135,38 @@ pub fn parse_snippet_to_perl(input: &str) {
     println!("{}", "=".repeat(50));
 }
 
+pub fn parse_backticks_to_perl(input: &str) {
+    let mut generator = Generator::new();
+    
+    println!("Converting backticks command to Perl:");
+    println!("{}", "=".repeat(50));
+    
+    // For backticks, we need to generate code that captures output
+    let commands = match Parser::new(input).parse() {
+        Ok(c) => c,
+        Err(e) => { 
+            // If parsing fails, try to wrap in a simple command structure
+            let wrapped_input = format!("{}", input);
+            match Parser::new(&wrapped_input).parse() {
+                Ok(c) => c,
+                Err(e2) => {
+                    println!("Parse error: {}", e);
+                    println!("Tried wrapped version, error: {}", e2);
+                    return;
+                }
+            }
+        }
+    };
+    
+    let perl_code = generator.generate(&commands);
+    
+    // For backticks, we need to modify the output to capture it
+    let clean_code = extract_backticks_perl_logic(&perl_code);
+    println!("{}", clean_code);
+    
+    println!("{}", "=".repeat(50));
+}
+
 fn extract_core_perl_logic(perl_code: &str) -> String {
     // Look for the main logic after variable declarations
     if let Some(captures) = regex::Regex::new(r"my \$main_exit_code = 0;\s*\n(.*?)(?:\n\s*$|$)")
@@ -156,6 +188,54 @@ fn extract_core_perl_logic(perl_code: &str) -> String {
             .captures(perl_code) {
             let code = captures.get(1).unwrap().as_str();
             code.trim_end().to_string()
+        } else {
+            // Return the original code if we can't extract anything
+            perl_code.to_string()
+        }
+    }
+}
+
+fn extract_backticks_perl_logic(perl_code: &str) -> String {
+    // For backticks, we need to capture the output instead of just printing it
+    // Look for the main logic after variable declarations
+    if let Some(captures) = regex::Regex::new(r"my \$main_exit_code = 0;\s*\n(.*?)(?:\n\s*$|$)")
+        .unwrap()
+        .captures(perl_code) {
+        let code = captures.get(1).unwrap().as_str();
+        // Convert print statements to capture output using backticks
+        let modified_code = code.replace("print ", "`");
+        let cleaned = modified_code.trim_end();
+        if cleaned.ends_with(';') {
+            let result = cleaned[..cleaned.len()-1].to_string();
+            if result.ends_with('`') {
+                result
+            } else {
+                // Remove any trailing semicolon from the command part
+                let without_semicolon = result.replace(";`", "`");
+                without_semicolon
+            }
+        } else {
+            if cleaned.ends_with('`') {
+                cleaned.to_string()
+            } else {
+                format!("{}`", cleaned)
+            }
+        }
+    } else {
+        // If we can't find the pattern, try to extract and modify print statements
+        if let Some(captures) = regex::Regex::new(r"(print.*?;?)\s*$")
+            .unwrap()
+            .captures(perl_code) {
+            let code = captures.get(1).unwrap().as_str();
+            let modified_code = code.replace("print ", "`");
+            let result = modified_code.trim_end().to_string();
+            if result.ends_with('`') {
+                result
+            } else {
+                let with_backtick = format!("{}`", result);
+                // Remove any trailing semicolon from the command part
+                with_backtick.replace(";`", "`")
+            }
         } else {
             // Return the original code if we can't extract anything
             perl_code.to_string()
@@ -258,5 +338,104 @@ pub fn export_mir_to_json(input: &str, optimize: bool) {
     match serde_json::to_string_pretty(&mir_commands) {
         Ok(json) => println!("{}", json),
         Err(e) => println!("JSON serialization error: {}", e),
+    }
+}
+
+pub fn parse_perl_critic_only(input: &str) {
+    // Test if the input can be lexed (syntax check)
+    let lex_result = test_perl_lex(input);
+    if lex_result != 0 {
+        std::process::exit(101);  // Lex failure
+    }
+    
+    // Test if the input can be parsed (compilation check)
+    let parse_result = test_perl_parse(input);
+    if parse_result != 0 {
+        std::process::exit(102);  // Parse failure
+    }
+    
+    // Test if the input can be generated/executed
+    let generate_result = test_perl_generate(input);
+    if generate_result != 0 {
+        std::process::exit(104);  // Generate failure
+    }
+    
+    // Test if the generated code passes Perl Critic
+    let critic_result = test_perl_critic(input);
+    if critic_result != 0 {
+        std::process::exit(137);  // Perl Critic failure
+    }
+    
+    // All tests passed
+    std::process::exit(0);
+}
+
+fn test_perl_lex(input: &str) -> i32 {
+    // Test basic syntax with perl -c
+    let mut child = Command::new("perl")
+        .arg("-c")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    
+    match child {
+        Ok(mut child) => {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(input.as_bytes());
+            }
+            match child.wait() {
+                Ok(status) => status.code().unwrap_or(1),
+                Err(_) => 1
+            }
+        }
+        Err(_) => 1
+    }
+}
+
+fn test_perl_parse(input: &str) -> i32 {
+    // Test compilation with perl -c (same as syntax for now)
+    test_perl_lex(input)
+}
+
+fn test_perl_generate(input: &str) -> i32 {
+    // Test if the code can be executed without errors
+    let mut child = Command::new("perl")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    
+    match child {
+        Ok(mut child) => {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(input.as_bytes());
+            }
+            match child.wait() {
+                Ok(status) => status.code().unwrap_or(1),
+                Err(_) => 1
+            }
+        }
+        Err(_) => 1
+    }
+}
+
+fn test_perl_critic(input: &str) -> i32 {
+    // Write input to temporary file
+    let temp_file = "__tmp_perl_critic_test.pl";
+    if let Err(_) = fs::write(temp_file, input) {
+        return 1;
+    }
+    
+    // Run Perl Critic on the file
+    let output = Command::new("perl")
+        .arg("perlcritic_wrapper.pl")
+        .arg(temp_file)
+        .output();
+    
+    // Clean up temporary file
+    let _ = fs::remove_file(temp_file);
+    
+    match output {
+        Ok(child) => child.status.code().unwrap_or(1),
+        Err(_) => 1
     }
 }

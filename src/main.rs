@@ -17,7 +17,7 @@ use crate::utils::generate_unified_diff;
 use crate::testing::{test_all_examples, test_all_examples_next_fail, find_uses_of_system,
                     test_file_equivalence, AstFormatOptions};
 use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, 
-                     parse_file_to_perl, parse_snippet_to_perl, interactive_mode, export_mir};
+                     parse_file_to_perl, parse_system_to_perl, parse_backticks_to_perl, interactive_mode, export_mir, parse_perl_critic_only};
 use crate::help::show_help;
 
 fn main() {
@@ -51,6 +51,7 @@ fn main() {
     let mut output_file: Option<String> = None;
     let mut optimize_mir = false;
     let mut enable_perl_critic = false;
+    let mut perl_critic_only = false;
     let mut i = 2;
     
     // Special case: if the first argument is -i or -o, start parsing from index 1
@@ -90,6 +91,9 @@ fn main() {
             }
             "--perl-critic" => {
                 enable_perl_critic = true;
+            }
+            "--perl-critic-only" => {
+                perl_critic_only = true;
             }
             "-i" => {
                 if i + 1 < args.len() {
@@ -306,13 +310,20 @@ fn main() {
                 }
                 let input = &args[3];
                 parse_to_perl(input);
-            } else if args.len() >= 3 && args[2] == "--snippet" {
+            } else if args.len() >= 3 && args[2] == "--system" {
                 if args.len() < 4 {
-                    println!("Error: parse --snippet command requires input");
+                    println!("Error: parse --system command requires input");
                     return;
                 }
                 let input = &args[3];
-                parse_snippet_to_perl(input);
+                parse_system_to_perl(input);
+            } else if args.len() >= 3 && args[2] == "--backticks" {
+                if args.len() < 4 {
+                    println!("Error: parse --backticks command requires input");
+                    return;
+                }
+                let input = &args[3];
+                parse_backticks_to_perl(input);
             } else if args.len() >= 3 && args[2] == "--run" {
                 // parse --run <lang> <input>
                 if args.len() < 5 {
@@ -399,6 +410,28 @@ fn main() {
         }
         "interactive" => {
             interactive_mode();
+        }
+        "--perl-critic-only" => {
+            if args.len() < 3 {
+                println!("Error: --perl-critic-only requires input");
+                return;
+            }
+            let input = &args[2];
+            // Check if input looks like a filename (contains .sh or doesn't contain spaces)
+            if input.contains(".sh") || !input.contains(' ') {
+                // Try to read as file first
+                match fs::read_to_string(input) {
+                    Ok(content) => {
+                        cli_commands::parse_perl_critic_only(&content);
+                    }
+                    Err(_) => {
+                        // If file read fails, treat as direct input
+                        cli_commands::parse_perl_critic_only(input);
+                    }
+                }
+            } else {
+                cli_commands::parse_perl_critic_only(input);
+            }
         }
         "--mir" => {
             if args.len() < 3 {
