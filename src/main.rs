@@ -389,6 +389,21 @@ fn main() {
                     println!("Error: Only 'perl' language is supported");
                     return;
                 }
+            } else if args.len() >= 3 && args[2] == "--perl-critic-only" {
+                if args.len() < 4 {
+                    println!("Error: file --perl-critic-only requires filename");
+                    return;
+                }
+                let filename = &args[3];
+                match fs::read_to_string(filename) {
+                    Ok(content) => {
+                        cli_commands::parse_perl_critic_only(&content);
+                    }
+                    Err(e) => {
+                        println!("Error reading file {}: {}", filename, e);
+                        std::process::exit(1);
+                    }
+                }
             } else {
                 let filename = &args[2];
                 parse_file(filename);
