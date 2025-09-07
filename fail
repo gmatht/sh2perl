@@ -4,6 +4,15 @@ echo "To run this test: ./fail FAILING_TEST_PREFIX"
 echo "To run a specific test: ./fail TEST_PREFIX"
 echo "Examples: ./fail 062_02, ./fail 044, ./fail find"
 
+# Run test_purify.pl first and only continue if it passes
+echo "Running test_purify.pl --next --verbose..."
+if ! perl test_purify.pl --next --verbose; then
+    echo "test_purify.pl failed, aborting other commands"
+    exit 1
+fi
+
+echo "test_purify.pl passed, continuing with other commands..."
+
 #git stash push examples ./fail.bat ./fail ./src/main.rs src/testing.rs src/execution.rs
 cargo run --bin debashc -- fail "$@" --perl-critic
 
