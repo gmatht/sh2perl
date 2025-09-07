@@ -193,19 +193,25 @@ sub process_system_calls {
         $escaped_arg2 =~ s/"/\\"/g;
         my $full_command = "$command \"$escaped_arg1\" \"$escaped_arg2\"";
         print "DEBUG: Processing system call with 3 args: $full_command\n" if $verbose;
-        my $perl_result = convert_shell_to_perl($full_command, 0);
-        if ($perl_result) {
-            if (ref($perl_result) eq 'HASH') {
-                # New format: insert preamble and return core
-                insert_preamble($perl_result->{preamble});
-                $perl_result->{core};
-            } else {
-                # Old format: just use the code
-                $perl_result;
-            }
-        } else {
-            # Fallback to original system call
+        # Skip conversion for ls commands to preserve original formatting
+        if ($command eq 'ls') {
+            print "DEBUG: Skipping ls conversion to preserve formatting\n" if $verbose;
             "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3)";
+        } else {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
+                } else {
+                    # Old format: just use the code
+                    $perl_result;
+                }
+            } else {
+                # Fallback to original system call
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3)";
+            }
         }
     }gex;
 
@@ -225,34 +231,40 @@ sub process_system_calls {
         $escaped_args =~ s/"/\\"/g;
         my $full_command = "$command \"$escaped_args\"";
         print "DEBUG: Processing system call with multiple args: $full_command\n" if $verbose;
-        my $perl_result = convert_shell_to_perl($full_command, 0);
-        if ($perl_result) {
-            if (ref($perl_result) eq 'HASH') {
-                # New format: insert preamble and return core
-                insert_preamble($perl_result->{preamble});
-                # Fix quote handling for echo commands
-                my $core = $perl_result->{core};
-                if ($command eq 'echo') {
-                    # Fix single quotes
-                    $core =~ s/'quoted'/"'quoted'"/g;
-                    # Fix double quotes
-                    $core =~ s/"double quoted"/"\\"double quoted\\""/g;
-                }
-                $core;
-            } else {
-                # Old format: just return the code
-                $perl_result;
-            }
+        # Skip conversion for ls commands to preserve original formatting
+        if ($command eq 'ls') {
+            print "DEBUG: Skipping ls conversion to preserve formatting\n" if $verbose;
+            "system($quote1$command$quote1, $quote2$args$quote2)";
         } else {
-            # Try fallback for basic echo commands
-            if ($command eq 'echo') {
-                my $text = $args;
-                # Escape quotes properly for Perl
-                $text =~ s/\\/\\\\/g;  # Escape backslashes first
-                $text =~ s/"/\\"/g;    # Escape double quotes
-                "print \"$text\\n\"";
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    # Fix quote handling for echo commands
+                    my $core = $perl_result->{core};
+                    if ($command eq 'echo') {
+                        # Fix single quotes
+                        $core =~ s/'quoted'/"'quoted'"/g;
+                        # Fix double quotes
+                        $core =~ s/"double quoted"/"\\"double quoted\\""/g;
+                    }
+                    $core;
+                } else {
+                    # Old format: just return the code
+                    $perl_result;
+                }
             } else {
-                "system($quote1$command$quote1, $quote2$args$quote2)";  # Keep original if conversion fails
+                # Try fallback for basic echo commands
+                if ($command eq 'echo') {
+                    my $text = $args;
+                    # Escape quotes properly for Perl
+                    $text =~ s/\\/\\\\/g;  # Escape backslashes first
+                    $text =~ s/"/\\"/g;    # Escape double quotes
+                    "print \"$text\\n\"";
+                } else {
+                    "system($quote1$command$quote1, $quote2$args$quote2)";  # Keep original if conversion fails
+                }
             }
         }
     }gex;
@@ -266,22 +278,29 @@ sub process_system_calls {
         my $quote = $1;
         my $command = $2;
         print "DEBUG: Processing system call: $command\n" if $verbose;
-        my $perl_result = convert_shell_to_perl($command, 0);
-        if ($perl_result) {
-            if (ref($perl_result) eq 'HASH') {
-                # New format: insert preamble and return core
-                print "DEBUG: Inserting preamble for: $command\n" if $verbose;
-                insert_preamble($perl_result->{preamble});
-                print "DEBUG: Core code: $perl_result->{core}\n" if $verbose;
-                $perl_result->{core};
-            } else {
-                # Old format: just return the code
-                print "DEBUG: Old format result: $perl_result\n" if $verbose;
-                $perl_result;
-            }
+        # Skip conversion for ls commands to preserve original formatting
+        my $command_name = (split /\s+/, $command)[0];
+        if ($command_name eq 'ls') {
+            print "DEBUG: Skipping ls conversion to preserve formatting\n" if $verbose;
+            "system($quote$command$quote)";
         } else {
-            print "DEBUG: Conversion failed for: $command\n" if $verbose;
-            "system($quote$command$quote)";  # Keep original if conversion fails
+            my $perl_result = convert_shell_to_perl($command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    # New format: insert preamble and return core
+                    print "DEBUG: Inserting preamble for: $command\n" if $verbose;
+                    insert_preamble($perl_result->{preamble});
+                    print "DEBUG: Core code: $perl_result->{core}\n" if $verbose;
+                    $perl_result->{core};
+                } else {
+                    # Old format: just return the code
+                    print "DEBUG: Old format result: $perl_result\n" if $verbose;
+                    $perl_result;
+                }
+            } else {
+                print "DEBUG: Conversion failed for: $command\n" if $verbose;
+                "system($quote$command$quote)";  # Keep original if conversion fails
+            }
         }
     }gex;
     
