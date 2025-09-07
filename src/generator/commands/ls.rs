@@ -8,67 +8,45 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
     output.push_str(&generator.indent());
     output.push_str(&format!("my @{};\n", array_name));
     
-    // For ls . command, search from current directory
-    let search_dir = if dir == "." { "." } else { dir };
-    
     // Check if this is a glob pattern (contains * or ?)
-    let is_glob = search_dir.contains('*') || search_dir.contains('?');
+    let is_glob = dir.contains('*') || dir.contains('?');
     
     if is_glob {
         // For glob patterns, use Perl's glob function
         output.push_str(&generator.indent());
-        output.push_str(&format!("@{} = glob('{}');\n", array_name, search_dir));
+        output.push_str(&format!("@{} = glob('{}');\n", array_name, dir));
         
         if sort_files {
             output.push_str(&generator.indent());
             output.push_str(&format!("@{} = sort {{ $a cmp $b }} @{};\n", array_name, array_name));
         }
     } else {
-        // For regular directories, use opendir/readdir
+        // For regular directories, use opendir/readdir with the directory as a variable
+        // The directory assignment will be handled in the core logic
+        output.push_str(&generator.indent());
+        output.push_str("if (opendir my $dh, $ls_dir) {\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str("while (my $file = readdir $dh) {\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str("next if $file eq q{.} || $file eq q{..};\n");
+        output.push_str(&generator.indent());
+        output.push_str(&format!("push @{}, $file;\n", array_name));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
+        output.push_str(&generator.indent());
+        output.push_str("closedir $dh;\n");
+        
         if sort_files {
-            // For sorting, we still need to collect files first
-            output.push_str(&generator.indent());
-            output.push_str(&format!("if (opendir my $dh, q{{{}}}) {{\n", search_dir));
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str("while (my $file = readdir $dh) {\n");
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str("next if $file eq q{.} || $file eq q{..};\n");
-            output.push_str(&generator.indent());
-            output.push_str(&format!("push @{}, $file;\n", array_name));
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
-            output.push_str(&generator.indent());
-            output.push_str("closedir $dh;\n");
             output.push_str(&generator.indent());
             output.push_str(&format!("@{} = sort {{ $a cmp $b }} @{};\n", array_name, array_name));
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
-        } else {
-            // For non-sorting, collect to array instead of printing directly
-            // This is needed for pipeline context where we need the array
-            output.push_str(&generator.indent());
-            output.push_str(&format!("if (opendir my $dh, q{{{}}}) {{\n", search_dir));
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str("while (my $file = readdir $dh) {\n");
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str("next if $file eq q{.} || $file eq q{..};\n");
-            output.push_str(&generator.indent());
-            output.push_str(&format!("push @{}, $file;\n", array_name));
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
-            output.push_str(&generator.indent());
-            output.push_str("closedir $dh;\n");
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
         }
+        
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     }
     
     output
@@ -120,6 +98,10 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
         // No print statement in pipeline context
     } else {
         // Standalone ls command: print files
+        // Add directory assignment to core logic
+        output.push_str(&generator.indent());
+        output.push_str(&format!("$ls_dir = '{}';\n", dir));
+        
         if single_column {
             // -1 flag: one file per line, preserve directory order (no sorting)
             output.push_str(&generate_ls_helper(generator, dir, "ls_files", false));
@@ -132,6 +114,36 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             output.push_str("print join \"\\n\", @ls_files . \"\\n\";\n");
         }
     }
+    
+    output
+}
+
+pub fn generate_ls_preamble(generator: &mut Generator) -> String {
+    let mut output = String::new();
+    
+    // Generate a generic preamble that can handle any directory
+    output.push_str(&generator.indent());
+    output.push_str("my @ls_files;\n");
+    output.push_str(&generator.indent());
+    output.push_str("my $ls_dir;\n");
+    output.push_str(&generator.indent());
+    output.push_str("if (opendir my $dh, $ls_dir) {\n");
+    generator.indent_level += 1;
+    output.push_str(&generator.indent());
+    output.push_str("while (my $file = readdir $dh) {\n");
+    generator.indent_level += 1;
+    output.push_str(&generator.indent());
+    output.push_str("next if $file eq q{.} || $file eq q{..};\n");
+    output.push_str(&generator.indent());
+    output.push_str("push @ls_files, $file;\n");
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
+    output.push_str("}\n");
+    output.push_str(&generator.indent());
+    output.push_str("closedir $dh;\n");
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
+    output.push_str("}\n");
     
     output
 }

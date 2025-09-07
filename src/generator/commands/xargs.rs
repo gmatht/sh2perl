@@ -54,7 +54,7 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         output.push_str("}\n");
         output.push_str("}\n");
         // Write into a result variable expected by the pipeline
-        output.push_str(&format!("${} = join \"\\n\", @xargs_matching_files_{};\n", output_var, command_index));
+        output.push_str(&format!("my ${} = join \"\\n\", @xargs_matching_files_{};\n", output_var, command_index));
         // Ensure output ends with newline to match shell behavior
         output.push_str(&generator.indent());
         output.push_str(&format!("if (!(${} =~ {})) {{\n", output_var, generator.newline_end_regex()));
