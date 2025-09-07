@@ -173,8 +173,44 @@ sub purify_perl_code {
 sub process_system_calls {
     my ($content) = @_;
     
-    # Pattern to match system() calls with multiple arguments (comma-separated)
+    # Pattern to match system() calls with 3 arguments (comma-separated)
     # This must come first to avoid partial matches
+    $content =~ s{
+        system\s*\(\s*
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["'])(.*?)\5\s*\)
+    }{
+        my $quote1 = $1;
+        my $command = $2;
+        my $quote2 = $3;
+        my $arg1 = $4;
+        my $quote3 = $5;
+        my $arg2 = $6;
+        # Reconstruct the full command with proper quoting
+        # Escape double quotes in the args
+        my $escaped_arg1 = $arg1;
+        $escaped_arg1 =~ s/"/\\"/g;
+        my $escaped_arg2 = $arg2;
+        $escaped_arg2 =~ s/"/\\"/g;
+        my $full_command = "$command \"$escaped_arg1\" \"$escaped_arg2\"";
+        print "DEBUG: Processing system call with 3 args: $full_command\n" if $verbose;
+        my $perl_result = convert_shell_to_perl($full_command, 0);
+        if ($perl_result) {
+            if (ref($perl_result) eq 'HASH') {
+                # New format: insert preamble and return core
+                insert_preamble($perl_result->{preamble});
+                $perl_result->{core};
+            } else {
+                # Old format: just use the code
+                $perl_result;
+            }
+        } else {
+            # Fallback to original system call
+            "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3)";
+        }
+    }gex;
+
+    # Pattern to match system() calls with 2 arguments (comma-separated)
+    # This must come after the 3-argument pattern to avoid partial matches
     $content =~ s{
         system\s*\(\s*
         (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*\)
