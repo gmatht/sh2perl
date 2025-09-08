@@ -3,6 +3,9 @@ echo To run this test: ./fail FAILING_TEST_PREFIX
 echo To run a specific test: ./fail TEST_PREFIX
 echo Examples: ./fail 062_02, ./fail 044, ./fail find
 
+REM Add Git usr/bin to the beginning of PATH for proper ls command
+set "PATH=C:\Program Files\Git\usr\bin;%PATH%"
+
 REM Run test_purify.pl first and only continue if it passes
 echo Running test_purify.pl --next --verbose...
 SET LOCALE=C
