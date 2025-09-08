@@ -3,6 +3,17 @@ use strict;
 use warnings;
 use File::Spec;
 use Getopt::Long;
+# Try to load PPI, fall back to regex if not available
+my $PPI_AVAILABLE = 0;
+eval {
+    require PPI;
+    require PPI::Find;
+    $PPI_AVAILABLE = 1;
+};
+if ($@) {
+    warn "Warning: PPI not available, falling back to regex-based parsing\n";
+    warn "To install PPI, run: cpan PPI\n";
+}
 
 # Command line options
 my $help = 0;
@@ -110,7 +121,7 @@ OPTIONS:
     --debashc-path <path>   Path to debashc executable (default: target/debug/debashc.exe)
 
 DESCRIPTION:
-    This script uses regex-based parsing to find instances of:
+    This script uses PPI (Perl Parsing Interface) to find instances of:
     - system() calls with shell commands
     - Backtick (`) command substitution
     
@@ -136,42 +147,105 @@ sub purify_perl_code {
     @preamble_blocks = ();
     %declared_vars = ();
     
-    # Process system() calls
-    $content = process_system_calls($content);
-    
-    # Process backtick command substitution
-    $content = process_backticks($content);
-    
-    # Insert preamble blocks at the top of the file
-    if (@preamble_blocks) {
-        # Find the end of the initial use statements and shebang
-        my $insertion_point = 0;
-        my @lines = split(/\n/, $content);
-        
-        # Find the last use statement or shebang
-        for my $i (0..$#lines) {
-            if ($lines[$i] =~ /^#!/ || $lines[$i] =~ /^use\s+/ || $lines[$i] =~ /^require\s+/) {
-                $insertion_point = $i + 1;
-            } elsif ($lines[$i] =~ /^\s*$/) {
-                # Skip empty lines after use statements
-                next;
-            } else {
-                # Found non-use statement, stop here
-                last;
-            }
+    if ($PPI_AVAILABLE) {
+        # Use PPI-based parsing
+        my $document = PPI::Document->new(\$content);
+        if (!$document) {
+            die "Error: Failed to parse Perl code with PPI\n";
         }
         
-        # Insert all preamble blocks
-        my $preamble_text = join("\n", @preamble_blocks);
-        splice(@lines, $insertion_point, 0, $preamble_text);
-        $content = join("\n", @lines);
+        # Process system() calls using PPI
+        process_system_calls_ppi($document);
+        
+        # Process backtick command substitution using PPI
+        process_backticks_ppi($document);
+        
+        # Insert preamble blocks at the top of the file
+        if (@preamble_blocks) {
+            insert_preamble_blocks_ppi($document);
+        }
+        
+        # Return the modified content
+        return $document->serialize;
+    } else {
+        # Fall back to regex-based parsing
+        print "Using regex-based parsing (PPI not available)\n" if $verbose;
+        
+        # Process system() calls
+        $content = process_system_calls($content);
+        
+        # Process backtick command substitution
+        $content = process_backticks($content);
+        
+        # Insert preamble blocks at the top of the file
+        if (@preamble_blocks) {
+            # Find the end of the initial use statements and shebang
+            my $insertion_point = 0;
+            my @lines = split(/\n/, $content);
+            
+            # Find the last use statement or shebang
+            for my $i (0..$#lines) {
+                if ($lines[$i] =~ /^#!/ || $lines[$i] =~ /^use\s+/ || $lines[$i] =~ /^require\s+/) {
+                    $insertion_point = $i + 1;
+                } elsif ($lines[$i] =~ /^\s*$/) {
+                    # Skip empty lines after use statements
+                    next;
+                } else {
+                    # Found non-use statement, stop here
+                    last;
+                }
+            }
+            
+            # Insert all preamble blocks
+            my $preamble_text = join("\n", @preamble_blocks);
+            splice(@lines, $insertion_point, 0, $preamble_text);
+            $content = join("\n", @lines);
+        }
+        
+        return $content;
     }
-    
-    return $content;
 }
 
 sub process_system_calls {
     my ($content) = @_;
+    
+    # Pattern to match system() calls followed by conditional statements
+    # This must come FIRST to avoid partial matches by non-conditional patterns
+    $content =~ s{
+        system\s*\(\s*
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["'])(.*?)\5\s*\)\s*if\s+(-d\s+['"][^'"]+['"])
+    }{
+        my $quote1 = $1; my $command = $2; my $quote2 = $3; my $arg1 = $4; my $quote3 = $5; my $arg2 = $6; my $condition = $7;
+        my $escaped_arg1 = $arg1; $escaped_arg1 =~ s/"/\\"/g;
+        my $escaped_arg2 = $arg2; $escaped_arg2 =~ s/"/\\"/g;
+        my $full_command = "$command \"$escaped_arg1\" \"$escaped_arg2\"";
+        print "DEBUG: Processing system call with conditional: $full_command if $condition\n" if $verbose;
+        if ($command eq 'ls') {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    insert_preamble($perl_result->{preamble});
+                    "if ($condition) {\n$perl_result->{core}\n}";
+                } else {
+                    "if ($condition) {\n$perl_result\n}";
+                }
+            } else {
+                "if ($condition) {\nsystem($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3);\n}";
+            }
+        } else {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    insert_preamble($perl_result->{preamble});
+                    "if ($condition) {\n$perl_result->{core}\n}";
+                } else {
+                    "if ($condition) {\n$perl_result\n}";
+                }
+            } else {
+                "if ($condition) {\nsystem($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3);\n}";
+            }
+        }
+    }gex;
     
     # Pattern to match system() calls with 9 arguments (comma-separated)
     # This must come first to avoid partial matches
@@ -187,7 +261,9 @@ sub process_system_calls {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
-                    $perl_result->{code}
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
                 } else {
                     $perl_result
                 }
@@ -222,7 +298,9 @@ sub process_system_calls {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
-                    $perl_result->{code}
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
                 } else {
                     $perl_result
                 }
@@ -257,7 +335,9 @@ sub process_system_calls {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
-                    $perl_result->{code}
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
                 } else {
                     $perl_result
                 }
@@ -292,7 +372,9 @@ sub process_system_calls {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
-                    $perl_result->{code}
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
                 } else {
                     $perl_result
                 }
@@ -327,7 +409,9 @@ sub process_system_calls {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
-                    $perl_result->{code}
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
                 } else {
                     $perl_result
                 }
@@ -378,7 +462,9 @@ sub process_system_calls {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
-                    $perl_result->{code}
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
                 } else {
                     $perl_result
                 }
@@ -432,7 +518,9 @@ sub process_system_calls {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
-                    $perl_result->{code}
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
                 } else {
                     $perl_result
                 }
@@ -478,7 +566,9 @@ sub process_system_calls {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
-                    $perl_result->{code}
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
                 } else {
                     $perl_result
                 }
@@ -534,7 +624,9 @@ sub process_system_calls {
             my $perl_result = convert_shell_to_perl($command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
-                    $perl_result->{code}
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
                 } else {
                     $perl_result
                 }
@@ -562,6 +654,42 @@ sub process_system_calls {
         }
     }gex;
     
+    # Pattern to match system() calls with 2 arguments followed by conditional statements
+    $content =~ s{
+        system\s*\(\s*
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*\)\s*if\s+(-d\s+['"][^'"]+['"])
+    }{
+        my $quote1 = $1; my $command = $2; my $quote2 = $3; my $arg1 = $4; my $condition = $5;
+        my $escaped_arg1 = $arg1; $escaped_arg1 =~ s/"/\\"/g;
+        my $full_command = "$command \"$escaped_arg1\"";
+        print "DEBUG: Processing system call with conditional (2 args): $full_command $condition\n" if $verbose;
+        if ($command eq 'ls') {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    insert_preamble($perl_result->{preamble});
+                    "if ($condition) {\n$perl_result->{core}\n}";
+                } else {
+                    "if ($condition) {\n$perl_result\n}";
+                }
+            } else {
+                "if ($condition) {\nsystem($quote1$command$quote1, $quote2$arg1$quote2);\n}";
+            }
+        } else {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    insert_preamble($perl_result->{preamble});
+                    "if ($condition) {\n$perl_result->{core}\n}";
+                } else {
+                    "if ($condition) {\n$perl_result\n}";
+                }
+            } else {
+                "if ($condition) {\nsystem($quote1$command$quote1, $quote2$arg1$quote2);\n}";
+            }
+        }
+    }gex;
+    
     return $content;
 }
 
@@ -583,8 +711,8 @@ sub process_backticks {
         my $is_builtin = is_builtin_command($command_name);
         print "DEBUG: Command '$command_name' is builtin: " . ($is_builtin ? "yes" : "no") . "\n" if $verbose;
         
-        # Special handling for ls commands
-        if ($command_name eq 'ls') {
+        # Special handling for basic ls commands (no options)
+        if ($command_name eq 'ls' && $command eq 'ls') {
             my $ls_code = q{do {
 my @ls_files = ();
 if (opendir my $dh, '.') {
@@ -593,7 +721,7 @@ if (opendir my $dh, '.') {
         push @ls_files, $file;
     }
     closedir $dh;
-    @ls_files = sort @ls_files;
+    @ls_files = sort { $a cmp $b } @ls_files;
 }
 join "\\n", @ls_files
 }};
@@ -955,16 +1083,14 @@ sub extract_perl_from_debashc_output {
                 }
                 
                 # For ls commands, return inline code instead of using preamble
-                print "DEBUG: Checking ls pattern: main_code contains \@ls_files: " . ($main_code =~ /\@ls_files/ ? "yes" : "no") . "\n" if $verbose;
-                print "DEBUG: Checking ls pattern: main_code contains opendir: " . ($main_code =~ /opendir/ ? "yes" : "no") . "\n" if $verbose;
-                print "DEBUG: Checking ls pattern: main_code contains sort \@ls_files: " . ($main_code =~ /sort \@ls_files/ ? "yes" : "no") . "\n" if $verbose;
-                if ($main_code =~ /\@ls_files/ && $main_code =~ /opendir/ && $main_code =~ /sort \@ls_files/) {
+                # This applies to all ls commands to ensure they work correctly
+                if ($main_code =~ /\@ls_files/ && $main_code =~ /opendir/) {
                     print "DEBUG: Matched ls pattern, converting to inline code\n" if $verbose;
                     # Convert the full main_code to inline code
                     my $inline_code = $main_code;
-                    # Replace print statement with assignment to $ls_output
-                    $inline_code =~ s/print join "\\n", \@ls_files;/my \$ls_output = join "\\n", \@ls_files/g;
-                    return $inline_code;
+                    # Replace print statement with return value for backtick commands
+                    $inline_code =~ s/print join "\\n", \@ls_files, "\\n";/join "\\n", \@ls_files, "\\n"/g;
+                    return "do { $inline_code }";
                 }
                 
                 # For printf commands, return inline code that captures output
@@ -1110,6 +1236,220 @@ sub extract_perl_from_debashc_output {
     return undef;
 }
 
+# PPI-based system() call processing
+sub process_system_calls_ppi {
+    my ($document) = @_;
+    
+    # Find all function calls
+    my $find = PPI::Find->new(sub {
+        my $node = shift;
+        return 1 if $node->isa('PPI::Statement::Expression') && 
+                   $node->first_token && 
+                   $node->first_token->content eq 'system';
+    });
+    
+    my @system_calls = $find->in($document);
+    
+    for my $system_call (@system_calls) {
+        process_single_system_call_ppi($system_call);
+    }
+}
+
+sub process_single_system_call_ppi {
+    my ($system_call) = @_;
+    
+    # Get the arguments to the system call
+    my $args = $system_call->find('PPI::Structure::List');
+    return unless $args && @{$args};
+    
+    my $arg_list = $args->[0];
+    my @arguments = $arg_list->find('PPI::Statement::Expression');
+    
+    # Extract the command and arguments
+    my $command = extract_string_from_ppi($arguments[0]) if @arguments;
+    return unless $command;
+    
+    # Build the full command with all arguments
+    my @cmd_args = ($command);
+    for my $i (1..$#arguments) {
+        my $arg = extract_string_from_ppi($arguments[$i]);
+        push @cmd_args, $arg if defined $arg;
+    }
+    
+    my $full_command = join(' ', @cmd_args);
+    print "DEBUG: Processing system call: $full_command\n" if $verbose;
+    
+    # Convert to Perl using debashc
+    my $perl_result = convert_shell_to_perl($full_command, 0);
+    if ($perl_result) {
+        if (ref($perl_result) eq 'HASH') {
+            insert_preamble($perl_result->{preamble});
+            replace_system_call_with_code($system_call, $perl_result->{core});
+        } else {
+            replace_system_call_with_code($system_call, $perl_result);
+        }
+    }
+}
+
+sub extract_string_from_ppi {
+    my ($expr) = @_;
+    return unless $expr;
+    
+    # Look for string literals
+    my $strings = $expr->find('PPI::Token::Quote');
+    if ($strings && @{$strings}) {
+        my $string = $strings->[0];
+        return $string->string;
+    }
+    
+    # Look for barewords or other expressions
+    my $tokens = $expr->find('PPI::Token::Word');
+    if ($tokens && @{$tokens}) {
+        return $tokens->[0]->content;
+    }
+    
+    return undef;
+}
+
+sub replace_system_call_with_code {
+    my ($system_call, $replacement_code) = @_;
+    
+    # Create a new PPI document from the replacement code
+    my $replacement_doc = PPI::Document->new(\$replacement_code);
+    return unless $replacement_doc;
+    
+    # Get the parent statement
+    my $parent = $system_call->parent;
+    return unless $parent;
+    
+    # Find the statement that contains this system call
+    my $statement = $parent;
+    while ($statement && !$statement->isa('PPI::Statement')) {
+        $statement = $statement->parent;
+    }
+    return unless $statement;
+    
+    # Replace the entire statement with the new code
+    my $new_statement = $replacement_doc->child(0);
+    if ($new_statement) {
+        $statement->replace($new_statement);
+    }
+}
+
+# PPI-based backtick processing
+sub process_backticks_ppi {
+    my ($document) = @_;
+    
+    # Find all backtick expressions
+    my $find = PPI::Find->new(sub {
+        my $node = shift;
+        return 1 if $node->isa('PPI::Token::QuoteLike::Backtick');
+    });
+    
+    my @backticks = $find->in($document);
+    
+    for my $backtick (@backticks) {
+        process_single_backtick_ppi($backtick);
+    }
+}
+
+sub process_single_backtick_ppi {
+    my ($backtick) = @_;
+    
+    my $command = $backtick->string;
+    print "DEBUG: Processing backtick command: $command\n" if $verbose;
+    
+    # Special handling for basic ls commands
+    if ($command eq 'ls') {
+        my $ls_code = q{do {
+my @ls_files = ();
+if (opendir my $dh, '.') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        push @ls_files, $file;
+    }
+    closedir $dh;
+    @ls_files = sort { $a cmp $b } @ls_files;
+}
+join "\\n", @ls_files
+}};
+        replace_backtick_with_code($backtick, $ls_code);
+        return;
+    }
+    
+    # Convert using debashc
+    my $perl_result = convert_shell_to_perl($command, 1);
+    if ($perl_result) {
+        if (ref($perl_result) eq 'HASH') {
+            insert_preamble($perl_result->{preamble});
+            replace_backtick_with_code($backtick, $perl_result->{core});
+        } else {
+            replace_backtick_with_code($backtick, $perl_result);
+        }
+    }
+}
+
+sub replace_backtick_with_code {
+    my ($backtick, $replacement_code) = @_;
+    
+    # Create a new PPI document from the replacement code
+    my $replacement_doc = PPI::Document->new(\$replacement_code);
+    return unless $replacement_doc;
+    
+    # Get the first child (the actual code)
+    my $new_code = $replacement_doc->child(0);
+    return unless $new_code;
+    
+    # Replace the backtick with the new code
+    $backtick->replace($new_code);
+}
+
+# PPI-based preamble insertion
+sub insert_preamble_blocks_ppi {
+    my ($document) = @_;
+    
+    # Find the insertion point after use statements
+    my $insertion_point = find_preamble_insertion_point($document);
+    return unless defined $insertion_point;
+    
+    # Create preamble code
+    my $preamble_text = join("\n", @preamble_blocks);
+    my $preamble_doc = PPI::Document->new(\$preamble_text);
+    return unless $preamble_doc;
+    
+    # Insert preamble blocks
+    my $children = $document->children;
+    for my $i (reverse 0..$preamble_doc->children - 1) {
+        my $preamble_child = $preamble_doc->child($i);
+        $document->insert_before($children->[$insertion_point], $preamble_child);
+    }
+}
+
+sub find_preamble_insertion_point {
+    my ($document) = @_;
+    
+    my $children = $document->children;
+    my $insertion_point = 0;
+    
+    for my $i (0..$children - 1) {
+        my $child = $children->[$i];
+        
+        # Check if this is a use statement, require, or shebang
+        if ($child->isa('PPI::Statement::Include') || 
+            ($child->isa('PPI::Token::Comment') && $child->content =~ /^#!/)) {
+            $insertion_point = $i + 1;
+        } elsif ($child->isa('PPI::Token::Whitespace') && $child->content =~ /^\n$/) {
+            # Skip empty lines after use statements
+            next;
+        } else {
+            # Found non-use statement, stop here
+            last;
+        }
+    }
+    
+    return $insertion_point;
+}
+
 __END__
 
 =head1 NAME
@@ -1122,7 +1462,7 @@ purify.pl - Convert system() calls and backticks to native Perl
 
 =head1 DESCRIPTION
 
-This script uses regex-based parsing to find instances of:
+This script uses PPI (Perl Parsing Interface) to find instances of:
 - system() calls with shell commands
 - Backtick (`) command substitution
 
@@ -1164,6 +1504,7 @@ Path to debashc executable (default: target/debug/debashc.exe)
 =head1 REQUIREMENTS
 
 - debashc executable (built from this project)
+- PPI (Perl Parsing Interface)
 - File::Temp
 - IPC::Run3
 - Getopt::Long
