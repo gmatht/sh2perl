@@ -5,6 +5,7 @@ echo "To run a specific test: ./fail TEST_PREFIX"
 echo "Examples: ./fail 062_02, ./fail 044, ./fail find"
 
 export LOCALE=C
+export LC_COLLATE=C
 
 # Run test_purify.pl first and only continue if it passes
 echo "Running test_purify.pl --next --verbose..."
