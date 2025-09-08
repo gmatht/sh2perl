@@ -202,6 +202,9 @@ sub purify_perl_code {
             $content = join("\n", @lines);
         }
         
+        # Fix sorting for locale if needed
+        $content = fix_sorting_for_locale($content);
+        
         return $content;
     }
 }
@@ -618,22 +621,27 @@ sub process_system_calls {
         my $quote = $1;
         my $command = $2;
         print "DEBUG: Processing system call: $command\n" if $verbose;
-        # Convert ls commands to native Perl
-        my $command_name = (split /\s+/, $command)[0];
-        if ($command_name eq 'ls') {
-            my $perl_result = convert_shell_to_perl($command, 0);
-            if ($perl_result) {
-                if (ref($perl_result) eq 'HASH') {
-                    # New format: insert preamble and return core
-                    insert_preamble($perl_result->{preamble});
-                    $perl_result->{core};
-                } else {
-                    $perl_result
-                }
+    # Convert commands to native Perl
+    my $command_name = (split /\s+/, $command)[0];
+    if ($command_name eq 'ls') {
+        add_locale_use_statement();
+        my $perl_result = convert_shell_to_perl($command, 0);
+        if ($perl_result) {
+            if (ref($perl_result) eq 'HASH') {
+                # New format: insert preamble and return core
+                insert_preamble($perl_result->{preamble});
+                $perl_result->{core};
             } else {
-                "system($quote$command$quote)";
+                $perl_result
             }
         } else {
+            "system($quote$command$quote)";
+        }
+    } elsif ($command_name eq 'pwd') {
+        # Special handling for pwd command
+        add_cwd_use_statement();
+        "print Cwd::getcwd(), \"\\n\"";
+    } else {
             my $perl_result = convert_shell_to_perl($command, 0);
             if ($perl_result) {
                 if (ref($perl_result) eq 'HASH') {
@@ -711,9 +719,10 @@ sub process_backticks {
         my $is_builtin = is_builtin_command($command_name);
         print "DEBUG: Command '$command_name' is builtin: " . ($is_builtin ? "yes" : "no") . "\n" if $verbose;
         
-        # Special handling for basic ls commands (no options)
-        if ($command_name eq 'ls' && $command eq 'ls') {
-            my $ls_code = q{do {
+    # Special handling for basic ls commands (no options)
+    if ($command_name eq 'ls' && $command eq 'ls') {
+        add_locale_use_statement();
+        my $ls_code = q{do {
 my @ls_files = ();
 if (opendir my $dh, '.') {
     while (my $file = readdir $dh) {
@@ -721,13 +730,23 @@ if (opendir my $dh, '.') {
         push @ls_files, $file;
     }
     closedir $dh;
-    @ls_files = sort { $a cmp $b } @ls_files;
+    @ls_files = sort @ls_files;
 }
 join "\\n", @ls_files
 }};
-            $content =~ s/`\Q$command\E`/$ls_code/;
-            print "DEBUG: Converted backtick command '$command' to Perl (special ls handling)\n" if $verbose;
-        } else {
+        $content =~ s/`\Q$command\E`/$ls_code/;
+        print "DEBUG: Converted backtick command '$command' to Perl (special ls handling)\n" if $verbose;
+    } elsif ($command_name eq 'ls' && $command =~ /ls \*\.pl 2>\/dev\/null/) {
+        # Special handling for ls *.pl 2>/dev/null
+        my $ls_code = q{do {
+my @ls_files = ();
+@ls_files = glob('*.pl');
+@ls_files = sort @ls_files;
+join "\\n", @ls_files
+}};
+        $content =~ s/`\Q$command\E`/$ls_code/;
+        print "DEBUG: Converted backtick command '$command' to Perl (special ls with glob handling)\n" if $verbose;
+    } else {
             # Convert the backtick command to Perl
             my $perl_result = convert_shell_to_perl($command, 1);  # 1 = is_backticks
             if ($perl_result) {
@@ -758,7 +777,7 @@ sub is_builtin_command {
         ls cat find grep sed awk sort uniq wc head tail cut paste comm diff tr xargs perl cd read
         cp mv rm mkdir touch
         echo printf basename dirname
-        date time sleep which yes
+        date time sleep which yes pwd
         gzip zcat
         wget curl
         kill nohup nice
@@ -767,6 +786,63 @@ sub is_builtin_command {
     );
     
     return grep { $_ eq $command_name } @builtin_commands;
+}
+
+sub convert_system_command_to_perl {
+    my ($command, $full_command, $is_conditional, $condition) = @_;
+    
+    my $command_name = (split /\s+/, $command)[0];
+    
+    if ($command_name eq 'ls') {
+        my $perl_result = convert_shell_to_perl($full_command, 0);
+        if ($perl_result) {
+            if (ref($perl_result) eq 'HASH') {
+                insert_preamble($perl_result->{preamble});
+                my $core = $perl_result->{core};
+                if ($is_conditional) {
+                    return "if ($condition) {\n$core\n}";
+                } else {
+                    return $core;
+                }
+            } else {
+                if ($is_conditional) {
+                    return "if ($condition) {\n$perl_result\n}";
+                } else {
+                    return $perl_result;
+                }
+            }
+        } else {
+            return undef; # Fall back to original system call
+        }
+    } elsif ($command_name eq 'pwd') {
+        my $pwd_code = "print Cwd::getcwd(), \"\\n\";";
+        if ($is_conditional) {
+            return "if ($condition) {\n$pwd_code\n}";
+        } else {
+            return $pwd_code;
+        }
+    } else {
+        my $perl_result = convert_shell_to_perl($full_command, 0);
+        if ($perl_result) {
+            if (ref($perl_result) eq 'HASH') {
+                insert_preamble($perl_result->{preamble});
+                my $core = $perl_result->{core};
+                if ($is_conditional) {
+                    return "if ($condition) {\n$core\n}";
+                } else {
+                    return $core;
+                }
+            } else {
+                if ($is_conditional) {
+                    return "if ($condition) {\n$perl_result\n}";
+                } else {
+                    return $perl_result;
+                }
+            }
+        } else {
+            return undef; # Fall back to original system call
+        }
+    }
 }
 
 sub insert_preamble {
@@ -808,6 +884,44 @@ sub insert_preamble {
     my $var_decl_text = join("\n", @var_decls);
     if ($var_decl_text && !grep { $_ eq $var_decl_text } @preamble_blocks) {
         push @preamble_blocks, $var_decl_text;
+    }
+}
+
+sub fix_sorting_for_locale {
+    my ($content) = @_;
+    
+    # If locale is being used, replace sort { $a cmp $b } with just sort
+    if ($content =~ /use locale/) {
+        # More comprehensive regex to catch various spacing and formatting
+        # Try multiple patterns to catch all variations
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+        $content =~ s/sort\s*\{\s*\$a\s+cmp\s+\$b\s*\}/sort/g;
+    }
+    
+    return $content;
+}
+
+sub add_cwd_use_statement {
+    # Add Cwd module to preamble if not already present
+    my $cwd_use = "use Cwd;";
+    if (!grep { $_ eq $cwd_use } @preamble_blocks) {
+        unshift @preamble_blocks, $cwd_use;
+    }
+}
+
+sub add_locale_use_statement {
+    # Add locale pragma to preamble if not already present
+    my $locale_use = "use locale;";
+    if (!grep { $_ eq $locale_use } @preamble_blocks) {
+        unshift @preamble_blocks, $locale_use;
     }
 }
 
@@ -938,6 +1052,11 @@ sub extract_perl_from_debashc_output {
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
         
+        # Apply sorting fix for locale if needed
+        if ($output =~ /use locale/) {
+            $code = fix_sorting_for_locale($code);
+        }
+        
         # For system calls, remove print statements since system() doesn't print
         # But keep print statements that are part of redirection blocks
         # For backtick commands, we need to capture the output
@@ -970,6 +1089,11 @@ sub extract_perl_from_debashc_output {
         # Clean up the code - remove trailing semicolons and extra whitespace
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
+        
+        # Apply sorting fix for locale if needed
+        if ($output =~ /use locale/) {
+            $code = fix_sorting_for_locale($code);
+        }
         
         # For system calls, remove print statements since system() doesn't print
         # But keep print statements that are part of redirection blocks
@@ -1008,6 +1132,11 @@ sub extract_perl_from_debashc_output {
         # Clean up the code - remove trailing semicolons and extra whitespace
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
+        
+        # Apply sorting fix for locale if needed
+        if ($output =~ /use locale/) {
+            $code = fix_sorting_for_locale($code);
+        }
         
         # For system calls, remove print statements since system() doesn't print
         # But keep print statements that are part of redirection blocks
@@ -1188,6 +1317,11 @@ sub extract_perl_from_debashc_output {
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
         
+        # Apply sorting fix for locale if needed
+        if ($output =~ /use locale/) {
+            $code = fix_sorting_for_locale($code);
+        }
+        
         # For system calls, remove print statements since system() doesn't print
         # But keep print statements that are part of redirection blocks
         # For backtick commands, convert print statements to return values
@@ -1228,6 +1362,11 @@ sub extract_perl_from_debashc_output {
         if (!$is_backticks) {
             $output =~ s/print[^;]*;//g;
             $output =~ s/print\s+join[^;]*;//g;
+        }
+        
+        # Apply sorting fix for locale if needed
+        if ($output =~ /use locale/) {
+            $output = fix_sorting_for_locale($output);
         }
         
         return $output;
@@ -1369,7 +1508,7 @@ if (opendir my $dh, '.') {
         push @ls_files, $file;
     }
     closedir $dh;
-    @ls_files = sort { $a cmp $b } @ls_files;
+    @ls_files = sort @ls_files;
 }
 join "\\n", @ls_files
 }};
