@@ -61,9 +61,16 @@ pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, i
                 output.push_str(&format!("printf(\"{}\");\n", format_string));
             } else {
                 // Build the printf call with format string and arguments properly separated
+                // For compatibility with broken printf system call behavior, convert numeric arguments to strings
                 let mut printf_call = format!("printf(\"{}\"", format_string);
-                for arg in &args {
-                    printf_call.push_str(&format!(", {}", arg));
+                for (i, arg) in args.iter().enumerate() {
+                    // Check if the argument is a numeric literal and if the corresponding format specifier is %c
+                    if arg.chars().all(|c| c.is_ascii_digit() || c == '.') && format_string.contains("%c") {
+                        // For numeric arguments with %c format, use ord to get ASCII value of first character to match broken printf behavior
+                        printf_call.push_str(&format!(", ord(substr(\"{}\", 0, 1))", arg));
+                    } else {
+                        printf_call.push_str(&format!(", {}", arg));
+                    }
                 }
                 printf_call.push_str(");\n");
                 output.push_str(&printf_call);
