@@ -19,10 +19,11 @@ if (-d 'src') {
     system("ls");
 }
 
+# Lets not try to implement cross-platform linux permission bits right now.
 # ls with options using backticks
-print "\nls -l (long format):\n";
-my $long_output = `ls -l`;
-print $long_output;
+# print "\nls -l (long format):\n";
+# my $long_output = `ls -l`;
+# print $long_output;
 
 # ls with file type filtering using system()
 print "\nls -p (directories with / suffix):\n";

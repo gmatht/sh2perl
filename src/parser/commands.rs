@@ -548,6 +548,74 @@ impl Parser {
         // Check if this is a builtin command
         if let Word::Literal(name_str, _) = &name {
             if is_builtin_command(&name_str) {
+                // Special handling for local command with assignments
+                if name_str == "local" {
+                    // Parse local assignments like: local var=value
+                    while let Some(token) = self.lexer.peek() {
+                        match token {
+                            Token::Space | Token::Tab | Token::Comment => {
+                                self.lexer.next();
+                                continue;
+                            }
+                            Token::Newline | Token::CarriageReturn => break,
+                            Token::Identifier => {
+                                // Check if this is an assignment: var=value
+                                if matches!(self.lexer.peek_n(1), Some(Token::Assign)) {
+                                    let var_name = self.lexer.get_identifier_text()?;
+                                    self.lexer.next(); // consume =
+                                    
+                                    // Handle different types of values after =
+                                    let value_word = match self.lexer.peek() {
+                                        Some(Token::Dollar) => {
+                                            // Handle $1, $2, $variable, etc.
+                                            self.lexer.next(); // consume $
+                                            match self.lexer.peek() {
+                                                Some(Token::Number) => {
+                                                    let num = self.lexer.get_number_text()?;
+                                                    self.lexer.next(); // consume number
+                                                    Word::Literal(format!("${}", num), None)
+                                                }
+                                                Some(Token::Identifier) => {
+                                                    let var_name = self.lexer.get_identifier_text()?;
+                                                    self.lexer.next(); // consume identifier
+                                                    Word::Literal(format!("${}", var_name), None)
+                                                }
+                                                _ => {
+                                                    return Err(ParserError::InvalidSyntax("Expected identifier or number after $ in local assignment".to_string()));
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            // For other types, use parse_word
+                                            parse_word(&mut self.lexer)?
+                                        }
+                                    };
+                                    
+                                    // Create assignment word: var=value
+                                    let assignment_word = Word::Literal(format!("{}={}", var_name, value_word.as_literal().unwrap_or(&value_word.to_string())), None);
+                                    args.push(assignment_word);
+                                } else {
+                                    // Regular argument
+                                    args.push(parse_word_no_newline_skip(&mut self.lexer)?);
+                                }
+                            }
+                            Token::Pipe | Token::And | Token::Or | Token::Semicolon | Token::Background => break,
+                            _ => {
+                                args.push(parse_word_no_newline_skip(&mut self.lexer)?);
+                            }
+                        }
+                    }
+                    
+                    return Ok(Command::BuiltinCommand(BuiltinCommand {
+                        name: name_str.clone(),
+                        args,
+                        redirects,
+                        env_vars,
+                        stdout_used: true,
+                        stderr_used: true,
+                    }));
+                }
+                
                 // Parse as builtin command
                 while let Some(token) = self.lexer.peek() {
                     match token {

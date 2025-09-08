@@ -247,6 +247,14 @@ pub fn handle_brace_expansion_for_echo(_generator: &mut Generator, expansion: &B
 fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command) -> String {
     match cmd {
         Command::Simple(simple_cmd) => {
+            // Check if this is an ls command that we can convert properly
+            if let Word::Literal(name, _) = &simple_cmd.name {
+                if name == "ls" {
+                    // Use the ls substitution function for proper conversion
+                    return crate::generator::commands::ls::generate_ls_for_substitution(generator, simple_cmd);
+                }
+            }
+            
             let cmd_name = generator.word_to_perl(&simple_cmd.name);
             let args: Vec<String> = simple_cmd.args.iter()
                 .map(|arg| generator.word_to_perl(arg))

@@ -16,7 +16,7 @@ use debashl::{Parser, Generator, shared_utils::SharedUtils};
 use crate::utils::generate_unified_diff;
 use crate::testing::{test_all_examples, test_all_examples_next_fail, find_uses_of_system,
                     test_file_equivalence, AstFormatOptions};
-use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, 
+use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, parse_to_perl_inline, 
                      parse_file_to_perl, parse_system_to_perl, parse_backticks_to_perl, interactive_mode, export_mir, parse_perl_critic_only};
 use crate::help::show_help;
 
@@ -310,6 +310,13 @@ fn main() {
                 }
                 let input = &args[3];
                 parse_to_perl(input);
+            } else if args.len() >= 3 && args[2] == "--inline" {
+                if args.len() < 4 {
+                    println!("Error: parse --inline command requires input");
+                    return;
+                }
+                let input = &args[3];
+                parse_to_perl_inline(input);
             } else if args.len() >= 3 && args[2] == "--system" {
                 if args.len() < 4 {
                     println!("Error: parse --system command requires input");

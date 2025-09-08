@@ -93,7 +93,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 Command::Simple(simple_cmd) => {
                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
                     
-                    // Check if this is an ls command that we can convert properly
+                    // Check if this is a builtin command that we can convert properly
                     if let Word::Literal(name, _) = &simple_cmd.name {
                         if name == "ls" {
                             // Use the ls substitution function for proper conversion
@@ -102,6 +102,28 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             // For backtick commands, we need to return the value, not print it
                             // The generate_ls_for_substitution already returns the joined string
                             perl_code
+                        } else if generator.inline_mode && cmd_name == "echo" {
+                            // In inline mode for echo, generate the output value directly
+                            if simple_cmd.args.is_empty() {
+                                "\"\\n\"".to_string()
+                            } else {
+                                let args: Vec<String> = simple_cmd.args.iter()
+                                    .map(|arg| generator.word_to_perl(arg))
+                                    .collect();
+                                format!("{} . \"\\n\"", args.join(" . \" \" . "))
+                            }
+                        } else if generator.inline_mode {
+                            // In inline mode, generate inline Perl code for other builtins
+                            // For now, fall back to system command for non-ls/echo builtins
+                            let args: Vec<String> = simple_cmd.args.iter()
+                                .map(|arg| generator.word_to_perl(arg))
+                                .collect();
+                            
+                            if args.is_empty() {
+                                format!("`{}`", cmd_name)
+                            } else {
+                                format!("`{} {}`", cmd_name, args.join(" "))
+                            }
                         } else {
                             // Fall back to system command for non-ls commands
                             let args: Vec<String> = simple_cmd.args.iter()
