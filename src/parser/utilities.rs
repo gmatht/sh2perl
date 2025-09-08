@@ -171,7 +171,7 @@ impl ParserUtilities for Lexer {
     }
 
     fn get_number_text(&mut self) -> Result<String, ParserError> {
-        if let Some(Token::Number) | Some(Token::PaddedNumber) = self.peek() {
+        if let Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) = self.peek() {
             if let Some(text) = self.get_current_text() {
                 self.next();
                 Ok(text)

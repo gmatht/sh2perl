@@ -667,7 +667,7 @@ sub insert_preamble {
 
 
 sub convert_shell_to_perl {
-    my ($shell_command, $is_backticks) = @_;
+    my ($shell_command, $is_backticks, $output_var) = @_;
     
     return undef unless $shell_command;
     
@@ -832,6 +832,11 @@ sub extract_perl_from_debashc_output {
             $print_value =~ s/;\s*$//;  # Remove trailing semicolon
             $code = $print_value;
         }
+        # Also handle sprintf calls that return values
+        elsif ($code =~ /sprintf\s*\(.+?\)/) {
+            # sprintf calls are already return values, no conversion needed
+            $code =~ s/;\s*$//;  # Remove trailing semicolon if present
+        }
         print "DEBUG: After conversion: $code\n" if $verbose;
         }
         
@@ -864,6 +869,11 @@ sub extract_perl_from_debashc_output {
             my $print_value = $1;
             $print_value =~ s/;\s*$//;  # Remove trailing semicolon
             $code = $print_value;
+        }
+        # Also handle sprintf calls that return values
+        elsif ($code =~ /sprintf\s*\(.+?\)/) {
+            # sprintf calls are already return values, no conversion needed
+            $code =~ s/;\s*$//;  # Remove trailing semicolon if present
         }
         print "DEBUG: After conversion: $code\n" if $verbose;
         }
@@ -926,6 +936,24 @@ sub extract_perl_from_debashc_output {
                     return "do { $inline_code }";
                 }
                 
+                # For printf commands, return inline code that captures output
+                if ($main_code =~ /printf\s*\(/) {
+                    # Convert printf call to capture output using sprintf
+                    my $inline_code = $main_code;
+                    # Replace printf with sprintf to capture output
+                    $inline_code =~ s/printf\s*\(/sprintf(/;
+                    # Remove any trailing semicolon since this will be used in assignment
+                    $inline_code =~ s/;\s*$//;
+                    # For backtick commands, extract just the sprintf call
+                    if ($is_backticks) {
+                        # Extract just the sprintf call from the multi-line result
+                        if ($inline_code =~ /sprintf\s*\(.+?\)/) {
+                            return $&;  # Return just the sprintf call
+                        }
+                    }
+                    return $inline_code;
+                }
+                
                 if (@preamble_lines) {
                     my $preamble = join("\n", @preamble_lines);
                     insert_preamble($preamble);
@@ -979,6 +1007,11 @@ sub extract_perl_from_debashc_output {
             $print_value =~ s/;\s*$//;  # Remove trailing semicolon
             $code = $print_value;
         }
+        # Also handle sprintf calls that return values
+        elsif ($code =~ /sprintf\s*\(.+?\)/) {
+            # sprintf calls are already return values, no conversion needed
+            $code =~ s/;\s*$//;  # Remove trailing semicolon if present
+        }
         print "DEBUG: After conversion: $code\n" if $verbose;
         }
         
@@ -1013,6 +1046,11 @@ sub extract_perl_from_debashc_output {
             my $print_value = $1;
             $print_value =~ s/;\s*$//;  # Remove trailing semicolon
             $code = $print_value;
+        }
+        # Also handle sprintf calls that return values
+        elsif ($code =~ /sprintf\s*\(.+?\)/) {
+            # sprintf calls are already return values, no conversion needed
+            $code =~ s/;\s*$//;  # Remove trailing semicolon if present
         }
         print "DEBUG: After conversion: $code\n" if $verbose;
         }

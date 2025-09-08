@@ -91,6 +91,18 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
             // This case should not be reached
             output.push_str("# Here-string handling moved to command dispatcher\n");
         }
+        RedirectOperator::StderrOutput => {
+            // Stderr redirection: command 2> file
+            output.push_str(&format!("open(STDERR, '>', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+        }
+        RedirectOperator::StderrAppend => {
+            // Stderr append: command 2>> file
+            output.push_str(&format!("open(STDERR, '>>', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+        }
+        RedirectOperator::StderrInput => {
+            // Stderr input: command 2< file
+            output.push_str(&format!("open(STDERR, '<', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+        }
         _ => {
             // Other redirects not yet implemented
             output.push_str(&format!("# Redirect {:?} not yet implemented\n", redirect.operator));
@@ -164,6 +176,15 @@ fn generate_bash_command_string(cmd: &Command) -> String {
                     }
                     RedirectOperator::HereString => {
                         result.push_str(&format!(" <<< {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::StderrOutput => {
+                        result.push_str(&format!(" 2> {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::StderrAppend => {
+                        result.push_str(&format!(" 2>> {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::StderrInput => {
+                        result.push_str(&format!(" 2< {}", word_to_bash_string(&redirect.target)));
                     }
                     _ => {
                         // Skip other redirect types for now

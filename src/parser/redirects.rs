@@ -14,15 +14,45 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     };
     
     let operator = match lexer.next() {
-        Some(Token::RedirectIn) => RedirectOperator::Input,
-        Some(Token::RedirectOut) => RedirectOperator::Output,
-        Some(Token::RedirectAppend) => RedirectOperator::Append,
+        Some(Token::RedirectIn) => {
+            if let Some(fd_num) = fd {
+                if fd_num == 2 {
+                    RedirectOperator::StderrInput
+                } else {
+                    RedirectOperator::Input
+                }
+            } else {
+                RedirectOperator::Input
+            }
+        },
+        Some(Token::RedirectOut) => {
+            if let Some(fd_num) = fd {
+                if fd_num == 2 {
+                    RedirectOperator::StderrOutput
+                } else {
+                    RedirectOperator::Output
+                }
+            } else {
+                RedirectOperator::Output
+            }
+        },
+        Some(Token::RedirectAppend) => {
+            if let Some(fd_num) = fd {
+                if fd_num == 2 {
+                    RedirectOperator::StderrAppend
+                } else {
+                    RedirectOperator::Append
+                }
+            } else {
+                RedirectOperator::Append
+            }
+        },
         Some(Token::RedirectInOut) => RedirectOperator::Input, // Use Input as fallback
         Some(Token::Heredoc) => RedirectOperator::Heredoc,
         Some(Token::HeredocTabs) => RedirectOperator::HeredocTabs,
         Some(Token::HereString) => RedirectOperator::HereString,
-        Some(Token::RedirectOutErr) => RedirectOperator::Output, // Use Output as fallback
-        Some(Token::RedirectInErr) => RedirectOperator::Input, // Use Input as fallback
+        Some(Token::RedirectOutErr) => RedirectOperator::StderrOutput,
+        Some(Token::RedirectInErr) => RedirectOperator::StderrInput,
         Some(Token::RedirectOutClobber) => RedirectOperator::Output, // Use Output as fallback
         Some(Token::RedirectAll) => RedirectOperator::Output, // Use Output as fallback
         Some(Token::RedirectAllAppend) => RedirectOperator::Append, // Use Append as fallback

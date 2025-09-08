@@ -162,6 +162,9 @@ pub enum RedirectOperator {
     HereString, // <<<
     ProcessSubstitutionInput(Box<Command>),  // <(command)
     ProcessSubstitutionOutput(Box<Command>), // >(command)
+    StderrOutput,    // 2>
+    StderrAppend,    // 2>>
+    StderrInput,     // 2<
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

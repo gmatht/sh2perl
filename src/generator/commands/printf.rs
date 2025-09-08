@@ -1,7 +1,7 @@
 use crate::generator::Generator;
 use crate::ast::*;
 
-pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize) -> String {
+pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize, output_var: Option<&str>) -> String {
     let mut output = String::new();
     
     // Parse printf format string and arguments
@@ -58,7 +58,17 @@ pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, i
             // Regular printf with individual arguments
             // For printf, format string and arguments should be separate
             if args.is_empty() {
-                output.push_str(&format!("printf(\"{}\");\n", format_string));
+                if let Some(var) = output_var {
+                    // Capture printf output to variable
+                    output.push_str(&format!("my ${};\n", var));
+                    output.push_str(&format!("{{\n"));
+                    output.push_str(&format!("    local *STDOUT;\n"));
+                    output.push_str(&format!("    open(STDOUT, '>', \\${}) or die \"Cannot redirect STDOUT\";\n", var));
+                    output.push_str(&format!("    printf(\"{}\");\n", format_string));
+                    output.push_str(&format!("}}\n"));
+                } else {
+                    output.push_str(&format!("printf(\"{}\");\n", format_string));
+                }
             } else {
                 // Build the printf call with format string and arguments properly separated
                 // For compatibility with broken printf system call behavior, convert numeric arguments to strings
@@ -73,7 +83,18 @@ pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, i
                     }
                 }
                 printf_call.push_str(");\n");
-                output.push_str(&printf_call);
+                
+                if let Some(var) = output_var {
+                    // Capture printf output to variable
+                    output.push_str(&format!("my ${};\n", var));
+                    output.push_str(&format!("{{\n"));
+                    output.push_str(&format!("    local *STDOUT;\n"));
+                    output.push_str(&format!("    open(STDOUT, '>', \\${}) or die \"Cannot redirect STDOUT\";\n", var));
+                    output.push_str(&format!("    {}\n", printf_call.trim()));
+                    output.push_str(&format!("}}\n"));
+                } else {
+                    output.push_str(&printf_call);
+                }
             }
         }
     }
