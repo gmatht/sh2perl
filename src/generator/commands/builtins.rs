@@ -236,10 +236,10 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             crate::generator::commands::echo::generate_echo_command(generator, cmd, input_var, output_var)
         },
         "printf" => {
-            // For now, use the existing signature but we should standardize this
             // Parse command_index to get the numeric part for printf
             let index_num = command_index.split('_').next().unwrap_or("0").parse::<usize>().unwrap_or(0);
-            crate::generator::commands::printf::generate_printf_command(generator, cmd, input_var, index_num)
+            let output_var_option = if output_var.is_empty() { None } else { Some(output_var) };
+            crate::generator::commands::printf::generate_printf_command(generator, cmd, input_var, index_num, output_var_option)
         },
         "cat" => {
             // For now, use the existing signature but we should standardize this

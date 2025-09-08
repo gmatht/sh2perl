@@ -8,11 +8,11 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
     // and also handles find arguments like "+1M" by combining Plus + Number + Identifier
-    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon)) {
+    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star)) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
-                Some(Token::Identifier) | Some(Token::Number) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) => {
+                Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -32,6 +32,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
     let result = match lexer.peek() {
         Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?, None)),
         Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
+        Some(Token::Float) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::DoubleQuotedString) => {
             // Always parse as string interpolation for double-quoted strings
@@ -191,19 +192,27 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         }
         Some(Token::LongOption) => {
             // Treat long options like --color=always as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::RegexPattern) => {
             // Treat regex patterns as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::RegexMatch) => {
             // Treat regex match operator as literal
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::NameFlag) | Some(Token::MaxDepthFlag) | Some(Token::TypeFlag) => {
             // Treat command-line flags as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::Minus) => {
             // Handle minus tokens like -l, -c, etc.
@@ -225,7 +234,9 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         Some(Token::Character) | Some(Token::NonZero) | Some(Token::SymlinkH) | Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block) | Some(Token::SetGid) | Some(Token::Sticky) | Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned) | Some(Token::Modified) | Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le) | Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) => {
             // Handle test operator tokens like -e, -f, -d, etc.
             // These are already complete flags, just get their text
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::Dollar) => Ok(parse_variable_expansion(lexer)?),
         Some(Token::DollarBrace) | Some(Token::DollarParen) | Some(Token::DollarHashSimple) | Some(Token::DollarAtSimple) | Some(Token::DollarStarSimple)
@@ -262,11 +273,11 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
     // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
     // and also handles find arguments like "+1M" by combining Plus + Number + Identifier
-    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon)) {
+    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star)) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
-                Some(Token::Identifier) | Some(Token::Number) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) => {
+                Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -286,6 +297,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
     let result = match lexer.peek() {
         Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?, None)),
         Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
+        Some(Token::Float) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::DoubleQuotedString) => {
             // Always parse as string interpolation for double-quoted strings
@@ -445,19 +457,27 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         }
         Some(Token::LongOption) => {
             // Treat long options like --color=always as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::RegexPattern) => {
             // Treat regex patterns as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::RegexMatch) => {
             // Treat regex match operator as literal
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::NameFlag) | Some(Token::MaxDepthFlag) | Some(Token::TypeFlag) => {
             // Treat command-line flags as literals
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::Minus) => {
             // Handle minus tokens like -l, -c, etc.
@@ -479,7 +499,9 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         Some(Token::Character) | Some(Token::NonZero) | Some(Token::SymlinkH) | Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block) | Some(Token::SetGid) | Some(Token::Sticky) | Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned) | Some(Token::Modified) | Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le) | Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) => {
             // Handle test operator tokens like -e, -f, -d, etc.
             // These are already complete flags, just get their text
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+            let text = lexer.get_raw_token_text()?;
+            eprintln!("DEBUG: CasePattern token text: '{}'", text);
+            Ok(Word::Literal(text, None))
         }
         Some(Token::Dollar) => Ok(parse_variable_expansion(lexer)?),
         Some(Token::DollarBrace) | Some(Token::DollarParen) | Some(Token::DollarHashSimple) | Some(Token::DollarAtSimple) | Some(Token::DollarStarSimple)
@@ -1269,7 +1291,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 lexer.next(); // consume '}'
                 break;
             }
-            Some(Token::Number) | Some(Token::PaddedNumber) => {
+            Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) => {
                 let start = lexer.get_number_text()?;
 //                 debug_eprintln!("DEBUG: Found start number: {}", start);
 //                 debug_eprintln!("DEBUG: After getting start number, current token: {:?}", lexer.peek());

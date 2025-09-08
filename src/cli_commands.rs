@@ -128,11 +128,6 @@ pub fn parse_system_to_perl(input: &str) {
     
     let perl_code = generator.generate(&commands);
     
-    // Debug: print the full generated code
-    println!("FULL GENERATED CODE:");
-    println!("{}", perl_code);
-    println!("END FULL CODE");
-    
     // Extract preamble and core logic separately
     let (preamble, core_code) = extract_preamble_and_core(&perl_code);
     
@@ -208,18 +203,20 @@ fn extract_core_perl_logic(perl_code: &str) -> String {
 }
 
 fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
-    // Check if this is an ls command by looking for ls-specific patterns
-    if perl_code.contains("my @ls_files") && perl_code.contains("opendir my $dh") {
-        // This is an ls command - generate generic preamble and extract core logic
-        let preamble = "my @ls_files;\nmy $ls_dir;\nif (opendir my $dh, $ls_dir) {\n    while (my $file = readdir $dh) {\n        next if $file eq q{.} || $file eq q{..};\n        push @ls_files, $file;\n    }\n    closedir $dh;\n}";
+    // Check if this is an ls command by looking for ls-specific patterns FIRST
+    // (before checking for full Perl script, so ls commands get special handling)
+    if perl_code.contains("@ls_files") && perl_code.contains("opendir my $dh") && perl_code.contains("$ls_dir = ") {
+        // This is an ls command - generate generic preamble (just variable declarations) and extract core logic
+        let preamble = "my @ls_files;\nmy $ls_dir;";
         
-        // Extract the core logic (directory assignment and print statement)
-        if let Some(captures) = regex::Regex::new(r"my \$ls_dir = '([^']+)';\n.*?\n(print.*?;?)\s*$")
+        // Extract the core logic (directory assignment, opendir logic, and print statement)
+        if let Some(captures) = regex::Regex::new(r"(?s)\$ls_dir = '([^']+)';\s*\n@ls_files = \(\);\s*\n(.*?)(print.*?;?)\s*$")
             .unwrap()
             .captures(perl_code) {
             let dir = captures.get(1).unwrap().as_str();
-            let print_stmt = captures.get(2).unwrap().as_str();
-            let core_code = format!("$ls_dir = '{}';\n{}", dir, print_stmt);
+            let opendir_logic = captures.get(2).unwrap().as_str().trim();
+            let print_stmt = captures.get(3).unwrap().as_str();
+            let core_code = format!("$ls_dir = '{}';\n@ls_files = ();\n{}\n{}", dir, opendir_logic, print_stmt);
             let final_core = if core_code.ends_with(';') {
                 core_code[..core_code.len()-1].to_string()
             } else {
@@ -229,12 +226,13 @@ fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
         }
         
         // Alternative pattern: look for the directory assignment in the preamble and print in core
-        if let Some(captures) = regex::Regex::new(r"my \$ls_dir = '([^']+)';\n.*?\n(print.*?;?)\s*$")
+        if let Some(captures) = regex::Regex::new(r"my \$ls_dir = '([^']+)';\n@ls_files = \(\);\n(.*?)(print.*?;?)\s*$")
             .unwrap()
             .captures(perl_code) {
             let dir = captures.get(1).unwrap().as_str();
-            let print_stmt = captures.get(2).unwrap().as_str();
-            let core_code = format!("$ls_dir = '{}';\n{}", dir, print_stmt);
+            let opendir_logic = captures.get(2).unwrap().as_str().trim();
+            let print_stmt = captures.get(3).unwrap().as_str();
+            let core_code = format!("$ls_dir = '{}';\n@ls_files = ();\n{}\n{}", dir, opendir_logic, print_stmt);
             let final_core = if core_code.ends_with(';') {
                 core_code[..core_code.len()-1].to_string()
             } else {
@@ -257,7 +255,7 @@ fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
         } else {
             cleaned.to_string()
         };
-        (preamble, final_core)
+        return (preamble, final_core);
     } else {
         // Try to extract variable declarations and core logic separately
         // Look for variable declarations (my @...; or my $...;) followed by the main logic
@@ -280,7 +278,7 @@ fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
                 core_code.to_string()
             };
             
-            (preamble, final_core)
+            return (preamble, final_core);
         } else {
             // If we can't find the pattern, try to extract just the core logic
             // Look for print statements or other core logic
@@ -288,13 +286,35 @@ fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
                 .unwrap()
                 .captures(perl_code) {
                 let code = captures.get(1).unwrap().as_str();
-                ("".to_string(), code.trim_end().to_string())
+                return ("".to_string(), code.trim_end().to_string());
             } else {
                 // Return empty preamble and original code if we can't extract anything
-                ("".to_string(), perl_code.to_string())
+                return ("".to_string(), perl_code.to_string());
             }
         }
     }
+    
+    // Check if this is a full Perl script (has shebang and use statements)
+    if perl_code.contains("#!/usr/bin/env perl") && perl_code.contains("use strict") {
+        // This is a full Perl script - extract preamble and core
+        if let Some(captures) = regex::Regex::new(r"(?s)(#!/usr/bin/env perl.*?my \$main_exit_code = 0;\s*\n)(.*?)(?:\n\s*$|$)")
+            .unwrap()
+            .captures(perl_code) {
+            let preamble = captures.get(1).unwrap().as_str().trim().to_string();
+            let core_code = captures.get(2).unwrap().as_str().trim().to_string();
+            
+            let final_core = if core_code.ends_with(';') {
+                core_code[..core_code.len()-1].to_string()
+            } else {
+                core_code.to_string()
+            };
+            
+            return (preamble, final_core);
+        }
+    }
+    
+    // Default fallback - return original code as core with empty preamble
+    ("".to_string(), perl_code.to_string())
 }
 
 fn extract_backticks_perl_logic(perl_code: &str) -> String {

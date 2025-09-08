@@ -549,6 +549,24 @@ impl Parser {
                         Token::RedirectIn | Token::RedirectOut | Token::RedirectAppend | Token::RedirectInErr | Token::RedirectOutErr | Token::RedirectInOut | Token::Heredoc | Token::HeredocTabs | Token::HereString => {
                             break;
                         }
+                        Token::Number => {
+                            // Check if this number is followed by a redirect operator (file descriptor redirection)
+                            if let Some(next_token) = self.lexer.peek_n(1) {
+                                match next_token {
+                                    Token::RedirectIn | Token::RedirectOut | Token::RedirectAppend | Token::RedirectInErr | Token::RedirectOutErr | Token::RedirectInOut | Token::Heredoc | Token::HeredocTabs | Token::HereString => {
+                                        // This is a file descriptor redirection, break out of argument parsing
+                                        break;
+                                    }
+                                    _ => {
+                                        // This is just a regular number argument
+                                        args.push(parse_word_no_newline_skip(&mut self.lexer)?);
+                                    }
+                                }
+                            } else {
+                                // No next token, treat as regular number argument
+                                args.push(parse_word_no_newline_skip(&mut self.lexer)?);
+                            }
+                        }
                         Token::Pipe | Token::And | Token::Or | Token::Semicolon | Token::Background => {
                             break;
                         }
@@ -596,6 +614,24 @@ impl Parser {
                 }
                 Token::RedirectIn | Token::RedirectOut | Token::RedirectAppend | Token::RedirectInErr | Token::RedirectOutErr | Token::RedirectInOut | Token::Heredoc | Token::HeredocTabs | Token::HereString => {
                     break;
+                }
+                Token::Number => {
+                    // Check if this number is followed by a redirect operator (file descriptor redirection)
+                    if let Some(next_token) = self.lexer.peek_n(1) {
+                        match next_token {
+                            Token::RedirectIn | Token::RedirectOut | Token::RedirectAppend | Token::RedirectInErr | Token::RedirectOutErr | Token::RedirectInOut | Token::Heredoc | Token::HeredocTabs | Token::HereString => {
+                                // This is a file descriptor redirection, break out of argument parsing
+                                break;
+                            }
+                            _ => {
+                                // This is just a regular number argument
+                                args.push(parse_word_no_newline_skip(&mut self.lexer)?);
+                            }
+                        }
+                    } else {
+                        // No next token, treat as regular number argument
+                        args.push(parse_word_no_newline_skip(&mut self.lexer)?);
+                    }
                 }
                 Token::Pipe | Token::And | Token::Or | Token::Semicolon | Token::Background => {
                     break;
