@@ -21,7 +21,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             if sort_by_time {
                 output.push_str(&format!("@{} = sort {{ -M \"{}/$b\" <=> -M \"{}/$a\" }} @{};\n", array_name, dir, dir, array_name));
             } else {
-                output.push_str(&format!("@{} = sort @{};\n", array_name, array_name));
+                output.push_str(&format!("@{} = sort {{ $a cmp $b }} @{};\n", array_name, array_name));
             }
         }
     } else {
@@ -67,7 +67,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             if sort_by_time {
                 output.push_str(&format!("@{} = sort {{ -M \"{}/$b\" <=> -M \"{}/$a\" }} @{};\n", array_name, dir, dir, array_name));
             } else {
-                output.push_str(&format!("@{} = sort @{};\n", array_name, array_name));
+                output.push_str(&format!("@{} = sort {{ $a cmp $b }} @{};\n", array_name, array_name));
             }
         }
         
@@ -198,17 +198,35 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             // -l flag: long format (simplified - just list files for now)
             output.push_str(&generate_ls_helper(generator, dir, "ls_files", true, add_slash_to_dirs, sort_by_time, show_hidden));
             output.push_str(&generator.indent());
-            output.push_str("print join \"\\n\", @ls_files;\n");
+            output.push_str("if (@ls_files) {\n");
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str("print join \"\\n\", @ls_files, \"\\n\";\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
         } else if single_column {
             // -1 flag: one file per line, preserve directory order (no sorting)
             output.push_str(&generate_ls_helper(generator, dir, "ls_files", false, add_slash_to_dirs, sort_by_time, show_hidden));
             output.push_str(&generator.indent());
-            output.push_str("print join \"\\n\", @ls_files;\n");
+            output.push_str("if (@ls_files) {\n");
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str("print join \"\\n\", @ls_files, \"\\n\";\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
         } else {
             // Default: one file per line (like ls -1) for predictable output, but sort files to match shell behavior
             output.push_str(&generate_ls_helper(generator, dir, "ls_files", true, add_slash_to_dirs, sort_by_time, show_hidden));
             output.push_str(&generator.indent());
-            output.push_str("print join \"\\n\", @ls_files;\n");
+            output.push_str("if (@ls_files) {\n");
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str("print join \"\\n\", @ls_files, \"\\n\";\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
         }
     }
     

@@ -47,7 +47,7 @@ impl Generator {
     pub fn new_translation_mode() -> Self {
         Self {
             indent_level: 0,
-            declared_locals: HashSet::new(),
+            declared_locals: HashSet::new(),se 
             declared_functions: HashSet::new(),
             file_handle_counter: 0,
             extglob_enabled: false,
@@ -80,6 +80,7 @@ impl Generator {
         output.push_str("use warnings;\n");
         output.push_str("use Carp;\n");
         output.push_str("use English qw( -no_match_vars );\n");
+        output.push_str("use locale;\n");
         
         if needs_basename {
             output.push_str("use File::Basename;\n");
