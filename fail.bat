@@ -6,6 +6,7 @@ echo Examples: ./fail 062_02, ./fail 044, ./fail find
 REM Run test_purify.pl first and only continue if it passes
 echo Running test_purify.pl --next --verbose...
 SET LOCALE=C
+SET LC_COLLATE=C
 perl test_purify.pl --next --verbose
 if errorlevel 1 (
     echo test_purify.pl failed, aborting other commands
