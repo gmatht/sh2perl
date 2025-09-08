@@ -389,6 +389,24 @@ impl Parser {
                     let or_command = Command::Or(Box::new(left_command), Box::new(right_command_with_redirects));
                     commands.push(or_command);
                 }
+                Token::If => {
+                    // Check if this is a postfix if statement: command if condition
+                    self.lexer.next(); // consume the 'if' token
+                    self.lexer.skip_whitespace_and_comments();
+                    
+                    // Parse the condition as a test expression
+                    let condition = self.parse_test_expression()?;
+                    
+                    // Convert the postfix if to a proper if statement
+                    let left_command = commands.pop().unwrap();
+                    let if_command = Command::If(IfStatement {
+                        condition: Box::new(condition),
+                        then_branch: Box::new(left_command),
+                        else_branch: None,
+                    });
+                    commands.push(if_command);
+                    break; // Postfix if ends the pipeline
+                }
                 Token::Semicolon | Token::Newline => {
                     // Stop parsing pipeline when we hit a command separator
                     break;
