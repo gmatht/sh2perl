@@ -4,7 +4,9 @@ use crate::generator::Generator;
 fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, sort_files: bool, add_slash_to_dirs: bool, sort_by_time: bool, show_hidden: bool) -> String {
     let mut output = String::new();
     
-    // Note: Array declaration is handled in the preamble, not here
+    // Declare the array
+    output.push_str(&generator.indent());
+    output.push_str(&format!("my @{} = ();\n", array_name));
     
     // Check if this is a glob pattern (contains * or ?)
     let is_glob = dir.contains('*') || dir.contains('?');
@@ -25,9 +27,6 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
     } else {
         // For regular directories, use opendir/readdir with the directory as a variable
         // The directory assignment will be handled in the core logic
-        // Clear the array before populating it
-        output.push_str(&generator.indent());
-        output.push_str(&format!("@{} = ();\n", array_name));
         output.push_str(&generator.indent());
         output.push_str(&format!("if (opendir my $dh, '{}') {{\n", dir));
         generator.indent_level += 1;
@@ -36,11 +35,11 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
         generator.indent_level += 1;
         if !show_hidden {
             output.push_str(&generator.indent());
-            output.push_str("next if $file eq q{.} || $file eq q{..};\n");
+            output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^\\./;\n");
         }
         if add_slash_to_dirs {
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (-d \"$ls_dir/$file\") {{\n"));
+            output.push_str(&format!("if (-d \"{}/$file\") {{\n", dir));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str(&format!("push @{}, \"$file/\";\n", array_name));
@@ -83,6 +82,11 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
 pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipeline_context: bool, output_var: Option<&str>) -> String {
     let mut output = String::new();
     
+    eprintln!("DEBUG: generate_ls_command called with {} arguments", cmd.args.len());
+    for (i, arg) in cmd.args.iter().enumerate() {
+        eprintln!("DEBUG: argument {}: {:?}", i, arg);
+    }
+    
     // Parse ls arguments to determine directory and flags
     let mut dir = ".";
     let mut single_column = false;
@@ -91,26 +95,80 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
     let mut sort_by_time = false; // -t flag: sort by modification time
     let mut show_hidden = false; // -a flag: show hidden files
     
+    // First pass: collect all directory arguments
+    let mut dir_args = Vec::new();
     for arg in &cmd.args {
-        if let Word::Literal(s, _) = arg {
-            if s.starts_with('-') {
-                // Parse flags
-                for flag in s.chars().skip(1) {
-                    match flag {
-                        '1' => single_column = true,
-                        'p' => add_slash_to_dirs = true, // -p flag: add / to directories
-                        'l' => long_format = true, // -l flag: long format
-                        't' => sort_by_time = true, // -t flag: sort by modification time
-                        'a' => show_hidden = true, // -a flag: show hidden files
-                        _ => {} // Ignore other flags for now
+        match arg {
+            Word::Literal(s, _) => {
+                if !s.starts_with('-') {
+                    // This is a directory argument
+                    eprintln!("DEBUG: ls command directory argument: '{}'", s);
+                    dir_args.push(s.as_str());
+                }
+            }
+            Word::StringInterpolation(interp, _) => {
+                // Handle string interpolation - extract the literal part
+                if interp.parts.len() == 1 {
+                    if let StringPart::Literal(s) = &interp.parts[0] {
+                        if !s.starts_with('-') {
+                            // This is a directory argument
+                            eprintln!("DEBUG: ls command directory argument (from interpolation): '{}'", s);
+                            dir_args.push(s.as_str());
+                        }
                     }
                 }
-            } else {
-                // This is a directory argument
-                dir = s;
             }
+            _ => {} // Ignore other argument types for now
         }
     }
+    
+    // Use the last directory argument if any, otherwise default to "."
+    if let Some(last_dir) = dir_args.last() {
+        dir = last_dir;
+    }
+    
+    // Second pass: parse flags
+    for arg in &cmd.args {
+        match arg {
+            Word::Literal(s, _) => {
+                if s.starts_with('-') {
+                    // Parse flags
+                    for flag in s.chars().skip(1) {
+                        match flag {
+                            '1' => single_column = true,
+                            'p' => add_slash_to_dirs = true, // -p flag: add / to directories
+                            'l' => long_format = true, // -l flag: long format
+                            't' => sort_by_time = true, // -t flag: sort by modification time
+                            'a' => show_hidden = true, // -a flag: show hidden files
+                            _ => {} // Ignore other flags for now
+                        }
+                    }
+                }
+            }
+            Word::StringInterpolation(interp, _) => {
+                // Handle string interpolation - extract the literal part
+                if interp.parts.len() == 1 {
+                    if let StringPart::Literal(s) = &interp.parts[0] {
+                        if s.starts_with('-') {
+                            // Parse flags
+                            for flag in s.chars().skip(1) {
+                                match flag {
+                                    '1' => single_column = true,
+                                    'p' => add_slash_to_dirs = true, // -p flag: add / to directories
+                                    'l' => long_format = true, // -l flag: long format
+                                    't' => sort_by_time = true, // -t flag: sort by modification time
+                                    'a' => show_hidden = true, // -a flag: show hidden files
+                                    _ => {} // Ignore other flags for now
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {} // Ignore other argument types for now
+        }
+    }
+    eprintln!("DEBUG: ls command final directory: '{}'", dir);
     
     // Handle context-based logic
     if pipeline_context {
