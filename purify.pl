@@ -173,11 +173,187 @@ sub purify_perl_code {
 sub process_system_calls {
     my ($content) = @_;
     
-    # Pattern to match system() calls with 3 arguments (comma-separated)
+    # Pattern to match system() calls with 9 arguments (comma-separated)
     # This must come first to avoid partial matches
     $content =~ s{
         system\s*\(\s*
-        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["'])(.*?)\5\s*\)
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["'])(.*?)\5\s*,\s*(["'])(.*?)\7\s*,\s*(["'])(.*?)\9\s*,\s*(["'])(.*?)\11\s*,\s*(["'])(.*?)\13\s*,\s*(["'])(.*?)\15\s*,\s*(["'])(.*?)\17\s*\)
+    }{
+        my $quote1 = $1; my $command = $2; my $quote2 = $3; my $arg1 = $4; my $quote3 = $5; my $arg2 = $6; my $quote4 = $7; my $arg3 = $8; my $quote5 = $9; my $arg4 = $10; my $quote6 = $11; my $arg5 = $12; my $quote7 = $13; my $arg6 = $14; my $quote8 = $15; my $arg7 = $16; my $quote9 = $17; my $arg8 = $18; my $quote10 = $19; my $arg9 = $20;
+        my $escaped_args = join(" ", map { my $escaped = $_; $escaped =~ s/"/\\"/g; "\"$escaped\""; } ($arg1, $arg2, $arg3, $arg4, $arg5, $arg6, $arg7, $arg8, $arg9));
+        my $full_command = "$command $escaped_args";
+        print "DEBUG: Processing system call with 9 args: $full_command\n" if $verbose;
+        if ($command eq 'ls') {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    $perl_result->{code}
+                } else {
+                    $perl_result
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6, $quote7$arg6$quote7, $quote8$arg7$quote8, $quote9$arg8$quote9, $quote10$arg9$quote10)";
+            }
+        } else {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
+                } else {
+                    $perl_result;
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6, $quote7$arg6$quote7, $quote8$arg7$quote8, $quote9$arg8$quote9, $quote10$arg9$quote10)";
+            }
+        }
+    }gex;
+
+    # Pattern to match system() calls with 8 arguments (comma-separated)
+    $content =~ s{
+        system\s*\(\s*
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["'])(.*?)\5\s*,\s*(["'])(.*?)\7\s*,\s*(["'])(.*?)\9\s*,\s*(["'])(.*?)\11\s*,\s*(["'])(.*?)\13\s*,\s*(["'])(.*?)\15\s*\)
+    }{
+        my $quote1 = $1; my $command = $2; my $quote2 = $3; my $arg1 = $4; my $quote3 = $5; my $arg2 = $6; my $quote4 = $7; my $arg3 = $8; my $quote5 = $9; my $arg4 = $10; my $quote6 = $11; my $arg5 = $12; my $quote7 = $13; my $arg6 = $14; my $quote8 = $15; my $arg7 = $16; my $quote9 = $17; my $arg8 = $18;
+        my $escaped_args = join(" ", map { my $escaped = $_; $escaped =~ s/"/\\"/g; "\"$escaped\""; } ($arg1, $arg2, $arg3, $arg4, $arg5, $arg6, $arg7, $arg8));
+        my $full_command = "$command $escaped_args";
+        print "DEBUG: Processing system call with 8 args: $full_command\n" if $verbose;
+        if ($command eq 'ls') {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    $perl_result->{code}
+                } else {
+                    $perl_result
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6, $quote7$arg6$quote7, $quote8$arg7$quote8, $quote9$arg8$quote9)";
+            }
+        } else {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
+                } else {
+                    $perl_result;
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6, $quote7$arg6$quote7, $quote8$arg7$quote8, $quote9$arg8$quote9)";
+            }
+        }
+    }gex;
+
+    # Pattern to match system() calls with 7 arguments (comma-separated)
+    $content =~ s{
+        system\s*\(\s*
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["'])(.*?)\5\s*,\s*(["'])(.*?)\7\s*,\s*(["'])(.*?)\9\s*,\s*(["'])(.*?)\11\s*,\s*(["'])(.*?)\13\s*\)
+    }{
+        my $quote1 = $1; my $command = $2; my $quote2 = $3; my $arg1 = $4; my $quote3 = $5; my $arg2 = $6; my $quote4 = $7; my $arg3 = $8; my $quote5 = $9; my $arg4 = $10; my $quote6 = $11; my $arg5 = $12; my $quote7 = $13; my $arg6 = $14; my $quote8 = $15; my $arg7 = $16;
+        my $escaped_args = join(" ", map { my $escaped = $_; $escaped =~ s/"/\\"/g; "\"$escaped\""; } ($arg1, $arg2, $arg3, $arg4, $arg5, $arg6, $arg7));
+        my $full_command = "$command $escaped_args";
+        print "DEBUG: Processing system call with 7 args: $full_command\n" if $verbose;
+        if ($command eq 'ls') {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    $perl_result->{code}
+                } else {
+                    $perl_result
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6, $quote7$arg6$quote7, $quote8$arg7$quote8)";
+            }
+        } else {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
+                } else {
+                    $perl_result;
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6, $quote7$arg6$quote7, $quote8$arg7$quote8)";
+            }
+        }
+    }gex;
+
+    # Pattern to match system() calls with 6 arguments (comma-separated)
+    $content =~ s{
+        system\s*\(\s*
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["'])(.*?)\5\s*,\s*(["'])(.*?)\7\s*,\s*(["'])(.*?)\9\s*,\s*(["'])(.*?)\11\s*\)
+    }{
+        my $quote1 = $1; my $command = $2; my $quote2 = $3; my $arg1 = $4; my $quote3 = $5; my $arg2 = $6; my $quote4 = $7; my $arg3 = $8; my $quote5 = $9; my $arg4 = $10; my $quote6 = $11; my $arg5 = $12; my $quote7 = $13; my $arg6 = $14;
+        my $escaped_args = join(" ", map { my $escaped = $_; $escaped =~ s/"/\\"/g; "\"$escaped\""; } ($arg1, $arg2, $arg3, $arg4, $arg5, $arg6));
+        my $full_command = "$command $escaped_args";
+        print "DEBUG: Processing system call with 6 args: $full_command\n" if $verbose;
+        if ($command eq 'ls') {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    $perl_result->{code}
+                } else {
+                    $perl_result
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6, $quote7$arg6$quote7)";
+            }
+        } else {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
+                } else {
+                    $perl_result;
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6, $quote7$arg6$quote7)";
+            }
+        }
+    }gex;
+
+    # Pattern to match system() calls with 5 arguments (comma-separated)
+    $content =~ s{
+        system\s*\(\s*
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["'])(.*?)\5\s*,\s*(["'])(.*?)\7\s*,\s*(["'])(.*?)\9\s*\)
+    }{
+        my $quote1 = $1; my $command = $2; my $quote2 = $3; my $arg1 = $4; my $quote3 = $5; my $arg2 = $6; my $quote4 = $7; my $arg3 = $8; my $quote5 = $9; my $arg4 = $10; my $quote6 = $11; my $arg5 = $12;
+        my $escaped_args = join(" ", map { my $escaped = $_; $escaped =~ s/"/\\"/g; "\"$escaped\""; } ($arg1, $arg2, $arg3, $arg4, $arg5));
+        my $full_command = "$command $escaped_args";
+        print "DEBUG: Processing system call with 5 args: $full_command\n" if $verbose;
+        if ($command eq 'ls') {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    $perl_result->{code}
+                } else {
+                    $perl_result
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6)";
+            }
+        } else {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
+                } else {
+                    $perl_result;
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4, $quote5$arg4$quote5, $quote6$arg5$quote6)";
+            }
+        }
+    }gex;
+
+    # Pattern to match system() calls with 4 arguments (comma-separated)
+    # This must come after the higher argument patterns to avoid partial matches
+    $content =~ s{
+        system\s*\(\s*
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*(["'])(.*?)\5\s*,\s*(["'])(.*?)\7\s*\)
     }{
         my $quote1 = $1;
         my $command = $2;
@@ -185,18 +361,30 @@ sub process_system_calls {
         my $arg1 = $4;
         my $quote3 = $5;
         my $arg2 = $6;
+        my $quote4 = $7;
+        my $arg3 = $8;
         # Reconstruct the full command with proper quoting
         # Escape double quotes in the args
         my $escaped_arg1 = $arg1;
         $escaped_arg1 =~ s/"/\\"/g;
         my $escaped_arg2 = $arg2;
         $escaped_arg2 =~ s/"/\\"/g;
-        my $full_command = "$command \"$escaped_arg1\" \"$escaped_arg2\"";
-        print "DEBUG: Processing system call with 3 args: $full_command\n" if $verbose;
-        # Skip conversion for ls commands to preserve original formatting
+        my $escaped_arg3 = $arg3;
+        $escaped_arg3 =~ s/"/\\"/g;
+        my $full_command = "$command \"$escaped_arg1\" \"$escaped_arg2\" \"$escaped_arg3\"";
+        print "DEBUG: Processing system call with 4 args: $full_command\n" if $verbose;
+        # Convert ls commands to native Perl
         if ($command eq 'ls') {
-            print "DEBUG: Skipping ls conversion to preserve formatting\n" if $verbose;
-            "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3)";
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    $perl_result->{code}
+                } else {
+                    $perl_result
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4)";
+            }
         } else {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
@@ -210,7 +398,61 @@ sub process_system_calls {
                 }
             } else {
                 # Fallback to original system call
-                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3)";
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $quote3$arg2$quote3, $quote4$arg3$quote4)";
+            }
+        }
+    }gex;
+
+    # Pattern to match system() calls with 3 arguments (comma-separated)
+    # This must come after the 4-argument pattern to avoid partial matches
+    $content =~ s{
+        system\s*\(\s*
+        (["'])(.*?)\1\s*,\s*(["'])(.*?)\3\s*,\s*((?:["'][^"']*["']|[^,)]+?))\s*\)
+    }{
+        my $quote1 = $1;
+        my $command = $2;
+        my $quote2 = $3;
+        my $arg1 = $4;
+        my $arg2 = $5;
+        # Reconstruct the full command with proper quoting
+        # Escape double quotes in the args
+        my $escaped_arg1 = $arg1;
+        $escaped_arg1 =~ s/"/\\"/g;
+        my $escaped_arg2 = $arg2;
+        # Remove quotes from arg2 if it's quoted, otherwise keep as-is
+        if ($escaped_arg2 =~ /^["'](.*)["']$/) {
+            $escaped_arg2 = $1;
+            $escaped_arg2 =~ s/"/\\"/g;
+            $escaped_arg2 = "\"$escaped_arg2\"";
+        }
+        my $full_command = "$command \"$escaped_arg1\" $escaped_arg2";
+        print "DEBUG: Processing system call with 3 args: $full_command\n" if $verbose;
+        # Convert ls commands to native Perl
+        if ($command eq 'ls') {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    $perl_result->{code}
+                } else {
+                    $perl_result
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $arg2)";
+            }
+        } else {
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    # New format: insert preamble and return core
+                    insert_preamble($perl_result->{preamble});
+                    $perl_result->{core};
+                } else {
+                    # Old format: just use the code
+                    $perl_result;
+                }
+            } else {
+                # Fallback to original system call
+                "system($quote1$command$quote1, $quote2$arg1$quote2, $arg2)";
             }
         }
     }gex;
@@ -231,10 +473,18 @@ sub process_system_calls {
         $escaped_args =~ s/"/\\"/g;
         my $full_command = "$command \"$escaped_args\"";
         print "DEBUG: Processing system call with multiple args: $full_command\n" if $verbose;
-        # Skip conversion for ls commands to preserve original formatting
+        # Convert ls commands to native Perl
         if ($command eq 'ls') {
-            print "DEBUG: Skipping ls conversion to preserve formatting\n" if $verbose;
-            "system($quote1$command$quote1, $quote2$args$quote2)";
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    $perl_result->{code}
+                } else {
+                    $perl_result
+                }
+            } else {
+                "system($quote1$command$quote1, $quote2$args$quote2)";
+            }
         } else {
             my $perl_result = convert_shell_to_perl($full_command, 0);
             if ($perl_result) {
@@ -278,11 +528,19 @@ sub process_system_calls {
         my $quote = $1;
         my $command = $2;
         print "DEBUG: Processing system call: $command\n" if $verbose;
-        # Skip conversion for ls commands to preserve original formatting
+        # Convert ls commands to native Perl
         my $command_name = (split /\s+/, $command)[0];
         if ($command_name eq 'ls') {
-            print "DEBUG: Skipping ls conversion to preserve formatting\n" if $verbose;
-            "system($quote$command$quote)";
+            my $perl_result = convert_shell_to_perl($command, 0);
+            if ($perl_result) {
+                if (ref($perl_result) eq 'HASH') {
+                    $perl_result->{code}
+                } else {
+                    $perl_result
+                }
+            } else {
+                "system($quote$command$quote)";
+            }
         } else {
             my $perl_result = convert_shell_to_perl($command, 0);
             if ($perl_result) {
@@ -325,10 +583,22 @@ sub process_backticks {
         my $is_builtin = is_builtin_command($command_name);
         print "DEBUG: Command '$command_name' is builtin: " . ($is_builtin ? "yes" : "no") . "\n" if $verbose;
         
-        # For now, leave backtick commands unchanged since debashc doesn't convert them properly
-        # This is a temporary solution until debashc can properly handle backtick commands
-        print "DEBUG: Leaving backtick command '$command' unchanged\n" if $verbose;
-        last;
+        # Convert the backtick command to Perl
+        my $perl_result = convert_shell_to_perl($command, 1);  # 1 = is_backticks
+        if ($perl_result) {
+            if (ref($perl_result) eq 'HASH') {
+                insert_preamble($perl_result->{preamble});
+                $content =~ s/`\Q$command\E`/$perl_result->{core}/;
+            } else {
+                # For backtick commands, just use the result as-is
+                # This includes inline code generated by extract_perl_from_debashc_output
+                $content =~ s/`\Q$command\E`/$perl_result/;
+            }
+            print "DEBUG: Converted backtick command '$command' to Perl\n" if $verbose;
+        } else {
+            print "DEBUG: Failed to convert backtick command '$command', leaving unchanged\n" if $verbose;
+            last;  # Stop processing if conversion fails
+        }
     }
     
     return $content;
@@ -361,6 +631,7 @@ sub insert_preamble {
     my @lines = split(/\n/, $preamble);
     my @var_decls = ();
     
+    my $in_ls_block = 0;
     for my $line (@lines) {
         # Skip shebang, use statements, and empty lines
         next if $line =~ /^#!/;
@@ -369,11 +640,22 @@ sub insert_preamble {
         next if $line =~ /^my \$main_exit_code/;
         next if $line =~ /^\s*$/;
         
-        # Skip directory assignments as they'll be handled in core logic
-        next if $line =~ /^\$ls_dir = /;
+        # Detect start of ls block
+        if ($line =~ /^\$ls_dir = / || $line =~ /^\@ls_files/) {
+            $in_ls_block = 1;
+        }
         
-        # Keep variable declarations and logic
-        push @var_decls, $line;
+        # If we're in an ls block, keep all lines including control structures
+        if ($in_ls_block) {
+            push @var_decls, $line;
+            # End of ls block when we hit a closing brace or print statement
+            if ($line =~ /^}$/ || $line =~ /^print /) {
+                $in_ls_block = 0;
+            }
+        } else {
+            # Keep variable declarations and logic
+            push @var_decls, $line;
+        }
     }
     
     # Add the preamble with deduplication for variable declarations
@@ -470,6 +752,16 @@ sub extract_perl_from_debashc_output {
         # Clean up the core code - remove trailing semicolons and extra whitespace
         $core =~ s/;\s*$//;
         $core =~ s/\n\s*$//;
+        
+        # For backtick ls commands, return the full preamble as inline code
+        if ($is_backticks && $preamble =~ /\$ls_dir = / && $preamble =~ /\@ls_files = /) {
+            # Convert the preamble to inline code
+            my $inline_preamble = $preamble;
+            # Replace print statement with return value
+            $inline_preamble =~ s/print join "\\n", \@ls_files;/join "\\n", \@ls_files/g;
+            return "do { $inline_preamble }";
+        }
+        
         # Return both preamble and core as a hash reference
         return { preamble => $preamble, core => $core };
     }
@@ -493,16 +785,20 @@ sub extract_perl_from_debashc_output {
         
         # For system calls, remove print statements since system() doesn't print
         # But keep print statements that are part of redirection blocks
-        # For backtick commands, convert print statements to return values
+        # For backtick commands, we need to capture the output
         if (!$is_backticks) {
             # For system calls, don't remove print statements for now
             # TODO: Need better logic to handle redirection vs normal commands
         } else {
-            # For backtick commands, convert print statements to return values
-            # Handle multi-line print statements with optional semicolon
+            # For backtick commands, we need to capture the output instead of printing it
             print "DEBUG: Before conversion: $code\n" if $verbose;
-            # Remove print statements and just return the values
-            $code =~ s/print\s+(.+?);?/$1;/gs;
+            # For backtick commands, we need to return the printed value
+            # Look for print statements and convert them to return values
+            if ($code =~ /print\s+(.+?);?\s*$/) {
+                my $print_value = $1;
+                $print_value =~ s/;\s*$//;  # Remove trailing semicolon
+                $code = $print_value;
+            }
             print "DEBUG: After conversion: $code\n" if $verbose;
         }
         
@@ -527,12 +823,16 @@ sub extract_perl_from_debashc_output {
             # For system calls, don't remove print statements for now
             # TODO: Need better logic to handle redirection vs normal commands
         } else {
-            # For backtick commands, convert print statements to return values
-            # Handle multi-line print statements with optional semicolon
-            print "DEBUG: Before conversion: $code\n" if $verbose;
-            # Remove print statements and just return the values
-            $code =~ s/print\s+(.+?);?/$1;/gs;
-            print "DEBUG: After conversion: $code\n" if $verbose;
+        # For backtick commands, we need to return the printed value
+        print "DEBUG: Before conversion: $code\n" if $verbose;
+        # For backtick commands, we need to return the printed value
+        # Look for the last print statement and return its value
+        if ($code =~ /print\s+(.+?);?\s*$/) {
+            my $print_value = $1;
+            $print_value =~ s/;\s*$//;  # Remove trailing semicolon
+            $code = $print_value;
+        }
+        print "DEBUG: After conversion: $code\n" if $verbose;
         }
         
         return $code;
@@ -556,12 +856,16 @@ sub extract_perl_from_debashc_output {
             # For system calls, don't remove print statements for now
             # TODO: Need better logic to handle redirection vs normal commands
         } else {
-            # For backtick commands, convert print statements to return values
-            # Handle multi-line print statements with optional semicolon
-            print "DEBUG: Before conversion: $code\n" if $verbose;
-            # Remove print statements and just return the values
-            $code =~ s/print\s+(.+?);?/$1;/gs;
-            print "DEBUG: After conversion: $code\n" if $verbose;
+        # For backtick commands, we need to return the printed value
+        print "DEBUG: Before conversion: $code\n" if $verbose;
+        # For backtick commands, we need to return the printed value
+        # Look for the last print statement and return its value
+        if ($code =~ /print\s+(.+?);?\s*$/) {
+            my $print_value = $1;
+            $print_value =~ s/;\s*$//;  # Remove trailing semicolon
+            $code = $print_value;
+        }
+        print "DEBUG: After conversion: $code\n" if $verbose;
         }
         
         return $code;
@@ -588,6 +892,72 @@ sub extract_perl_from_debashc_output {
             # TODO: Need better logic to handle redirection vs normal commands
             if (!$is_backticks) {
                 # Disabled print removal for now
+            } else {
+                # For backtick commands, we need to handle variable declarations
+                # Extract variable declarations and move them to preamble
+                my @lines = split(/\n/, $main_code);
+                my @preamble_lines = ();
+                my @core_lines = ();
+                my $in_preamble = 1;
+                
+                # Generate unique variable names for this backtick command
+                my $unique_suffix = int(rand(10000));
+                my %var_mapping = ();
+                
+                for my $line (@lines) {
+                    if ($in_preamble && $line =~ /^(?:my\s+)?([\$@]\w+).*?;?\s*$/) {
+                        my $original_var = $1;
+                        my $new_var = $original_var . "_$unique_suffix";
+                        $var_mapping{$original_var} = $new_var;
+                        $line =~ s/\Q$original_var\E/$new_var/g;
+                        push @preamble_lines, $line;
+                    } else {
+                        $in_preamble = 0;
+                        push @core_lines, $line;
+                    }
+                }
+                
+                # For ls commands, return inline code instead of using preamble
+                if ($main_code =~ /\@ls_files/ && $main_code =~ /opendir/ && $main_code =~ /sort \@ls_files/) {
+                    # Convert the full main_code to inline code
+                    my $inline_code = $main_code;
+                    # Replace print statement with return value
+                    $inline_code =~ s/print join "\\n", \@ls_files;/join "\\n", \@ls_files/g;
+                    return "do { $inline_code }";
+                }
+                
+                if (@preamble_lines) {
+                    my $preamble = join("\n", @preamble_lines);
+                    insert_preamble($preamble);
+                }
+                
+                # Return the print statement value with updated variable names
+                if ($main_code =~ /print\s+(.+?);?\s*$/) {
+                    my $print_value = $1;
+                    $print_value =~ s/;\s*$//;  # Remove trailing semicolon
+                    
+                    # Update variable names in the print value
+                    for my $original_var (keys %var_mapping) {
+                        my $new_var = $var_mapping{$original_var};
+                        $print_value =~ s/\Q$original_var\E/$new_var/g;
+                    }
+                    
+                    return $print_value;
+                } elsif ($main_code =~ /^\{.*\}$/s) {
+                    # Handle complex blocks - for now, just execute them and return empty string
+                    # since they typically redirect to /dev/null
+                    my $block_code = $main_code;
+                    
+                    # Update variable names in the block
+                    for my $original_var (keys %var_mapping) {
+                        my $new_var = $var_mapping{$original_var};
+                        $block_code =~ s/\Q$original_var\E/$new_var/g;
+                    }
+                    
+                    # Add the block to preamble and return empty string
+                    insert_preamble($block_code);
+                    return '""';
+                }
             }
             
             return $main_code;
@@ -600,12 +970,16 @@ sub extract_perl_from_debashc_output {
             # For system calls, don't remove print statements for now
             # TODO: Need better logic to handle redirection vs normal commands
         } else {
-            # For backtick commands, convert print statements to return values
-            # Handle multi-line print statements with optional semicolon
-            print "DEBUG: Before conversion: $code\n" if $verbose;
-            # Remove print statements and just return the values
-            $code =~ s/print\s+(.+?);?/$1;/gs;
-            print "DEBUG: After conversion: $code\n" if $verbose;
+        # For backtick commands, we need to return the printed value
+        print "DEBUG: Before conversion: $code\n" if $verbose;
+        # For backtick commands, we need to return the printed value
+        # Look for the last print statement and return its value
+        if ($code =~ /print\s+(.+?);?\s*$/) {
+            my $print_value = $1;
+            $print_value =~ s/;\s*$//;  # Remove trailing semicolon
+            $code = $print_value;
+        }
+        print "DEBUG: After conversion: $code\n" if $verbose;
         }
         
         return $code;
@@ -631,12 +1005,16 @@ sub extract_perl_from_debashc_output {
             # For system calls, don't remove print statements for now
             # TODO: Need better logic to handle redirection vs normal commands
         } else {
-            # For backtick commands, convert print statements to return values
-            # Handle multi-line print statements with optional semicolon
-            print "DEBUG: Before conversion: $code\n" if $verbose;
-            # Remove print statements and just return the values
-            $code =~ s/print\s+(.+?);?/$1;/gs;
-            print "DEBUG: After conversion: $code\n" if $verbose;
+        # For backtick commands, we need to return the printed value
+        print "DEBUG: Before conversion: $code\n" if $verbose;
+        # For backtick commands, we need to return the printed value
+        # Look for the last print statement and return its value
+        if ($code =~ /print\s+(.+?);?\s*$/) {
+            my $print_value = $1;
+            $print_value =~ s/;\s*$//;  # Remove trailing semicolon
+            $code = $print_value;
+        }
+        print "DEBUG: After conversion: $code\n" if $verbose;
         }
         
         return $code;
