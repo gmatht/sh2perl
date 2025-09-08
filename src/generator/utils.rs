@@ -92,15 +92,39 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
             match cmd.as_ref() {
                 Command::Simple(simple_cmd) => {
                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
-                    let args: Vec<String> = simple_cmd.args.iter()
-                        .map(|arg| generator.word_to_perl(arg))
-                        .collect();
                     
-                    // For simple commands, fall back to system command for now
-                    if args.is_empty() {
-                        format!("`{}`", cmd_name)
+                    // Check if this is an ls command that we can convert properly
+                    if let Word::Literal(name, _) = &simple_cmd.name {
+                        if name == "ls" {
+                            // Use the ls substitution function for proper conversion
+                            let perl_code = crate::generator::commands::ls::generate_ls_for_substitution(generator, simple_cmd);
+                            
+                            // For backtick commands, we need to return the value, not print it
+                            // The generate_ls_for_substitution already returns the joined string
+                            perl_code
+                        } else {
+                            // Fall back to system command for non-ls commands
+                            let args: Vec<String> = simple_cmd.args.iter()
+                                .map(|arg| generator.word_to_perl(arg))
+                                .collect();
+                            
+                            if args.is_empty() {
+                                format!("`{}`", cmd_name)
+                            } else {
+                                format!("`{} {}`", cmd_name, args.join(" "))
+                            }
+                        }
                     } else {
-                        format!("`{} {}`", cmd_name, args.join(" "))
+                        // Fall back to system command for non-literal command names
+                        let args: Vec<String> = simple_cmd.args.iter()
+                            .map(|arg| generator.word_to_perl(arg))
+                            .collect();
+                        
+                        if args.is_empty() {
+                            format!("`{}`", cmd_name)
+                        } else {
+                            format!("`{} {}`", cmd_name, args.join(" "))
+                        }
                     }
                 },
                 Command::Pipeline(pipeline) => {

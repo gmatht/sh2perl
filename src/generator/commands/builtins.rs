@@ -226,8 +226,8 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             crate::generator::commands::xargs::generate_xargs_command(generator, cmd, input_var, command_index)
         },
         "ls" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::ls::generate_ls_command(generator, cmd, true, Some(output_var))
+            // Use the substitution-specific function for backtick commands
+            crate::generator::commands::ls::generate_ls_for_substitution(generator, cmd)
         },
         // Echo is handled in simple_commands.rs, so use generic fallback
         // "echo" => { ... },

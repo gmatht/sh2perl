@@ -60,6 +60,7 @@ impl Generator {
         }
     }
 
+
     pub fn generate(&mut self, ast: &[Command]) -> String {
         let mut output = String::new();
         
