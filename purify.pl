@@ -566,17 +566,59 @@ sub process_system_calls {
         print "DEBUG: Processing system call with multiple args: $full_command\n" if $verbose;
         # Convert ls commands to native Perl
         if ($command eq 'ls') {
-            my $perl_result = convert_shell_to_perl($full_command, 0);
-            if ($perl_result) {
-                if (ref($perl_result) eq 'HASH') {
-                    # New format: insert preamble and return core
-                    insert_preamble($perl_result->{preamble});
-                    $perl_result->{core};
-                } else {
-                    $perl_result
-                }
+            # Special handling for ls -l
+            if ($args eq '-l') {
+                add_locale_use_statement();
+                my $ls_code = q{my @ls_files = ();
+if (opendir my $dh, '.') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        my @stat = stat("./$file");
+        if (@stat) {
+            my $mode = $stat[2];
+            my $nlink = $stat[3];
+            my $uid = $stat[4];
+            my $gid = $stat[5];
+            my $size = $stat[7];
+            my $mtime = $stat[9];
+            my $mtime_str = scalar localtime($mtime);
+            my $type = -d "./$file" ? "d" : -l "./$file" ? "l" : "-";
+            my $perms = sprintf("%s%s%s%s%s%s%s%s%s%s",
+                $type,
+                ($mode & 0400) ? "r" : "-",
+                ($mode & 0200) ? "w" : "-",
+                ($mode & 0100) ? "x" : "-",
+                ($mode & 0040) ? "r" : "-",
+                ($mode & 0020) ? "w" : "-",
+                ($mode & 0010) ? "x" : "-",
+                ($mode & 0004) ? "r" : "-",
+                ($mode & 0002) ? "w" : "-",
+                ($mode & 0001) ? "x" : "-"
+            );
+            push @ls_files, sprintf("%s %2d %4d %4d %8d %s %s", 
+                $perms, $nlink, $uid, $gid, $size, $mtime_str, $file);
+        }
+    }
+    closedir $dh;
+    @ls_files = sort @ls_files;
+}
+if (@ls_files) {
+    print (@ls_files ? join("\n", @ls_files) . "\n" : "");
+}};
+                $ls_code;
             } else {
-                "system($quote1$command$quote1, $quote2$args$quote2)";
+                my $perl_result = convert_shell_to_perl($full_command, 0);
+                if ($perl_result) {
+                    if (ref($perl_result) eq 'HASH') {
+                        # New format: insert preamble and return core
+                        insert_preamble($perl_result->{preamble});
+                        $perl_result->{core};
+                    } else {
+                        $perl_result
+                    }
+                } else {
+                    "system($quote1$command$quote1, $quote2$args$quote2)";
+                }
             }
         } else {
             my $perl_result = convert_shell_to_perl($full_command, 0);
@@ -701,14 +743,38 @@ sub process_system_calls {
     return $content;
 }
 
+# Helper function to check if a position is inside a comment
+sub is_inside_comment {
+    my ($content, $pos) = @_;
+    
+    # Find the last newline before this position
+    my $before_pos = substr($content, 0, $pos);
+    my $last_newline = rindex($before_pos, "\n");
+    my $line_start = ($last_newline == -1) ? 0 : $last_newline + 1;
+    my $current_line = substr($content, $line_start, $pos - $line_start);
+    
+    # Check if this line contains a comment marker before the position
+    return $current_line =~ /#/;
+}
+
 sub process_backticks {
     my ($content) = @_;
     
     print "DEBUG: Processing backticks in content\n" if $verbose;
     
     # Process backtick commands one by one to handle complex cases
+    # Skip backticks that are inside comments
     while ($content =~ /`([^`]+)`/) {
         my $command = $1;
+        my $match_pos = $-[0];  # Position where the match started
+        
+        # Check if this backtick is inside a comment
+        if (is_inside_comment($content, $match_pos)) {
+            print "DEBUG: Skipping backtick in comment: $command\n" if $verbose;
+            # Replace with a placeholder to avoid infinite loop
+            $content =~ s/`\Q$command\E`/__COMMENTED_BACKTICK__/;
+            next;
+        }
         
         # Extract the command name (first word)
         my $command_name = $command;
@@ -732,7 +798,7 @@ if (opendir my $dh, '.') {
     closedir $dh;
     @ls_files = sort @ls_files;
 }
-join "\\n", @ls_files
+(@ls_files ? join("\n", @ls_files) . "\n" : "")
 }};
         $content =~ s/`\Q$command\E`/$ls_code/;
         print "DEBUG: Converted backtick command '$command' to Perl (special ls handling)\n" if $verbose;
@@ -742,10 +808,51 @@ join "\\n", @ls_files
 my @ls_files = ();
 @ls_files = glob('*.pl');
 @ls_files = sort @ls_files;
-join "\\n", @ls_files
+(@ls_files ? join("\n", @ls_files) . "\n" : "")
 }};
         $content =~ s/`\Q$command\E`/$ls_code/;
         print "DEBUG: Converted backtick command '$command' to Perl (special ls with glob handling)\n" if $verbose;
+    } elsif ($command_name eq 'ls' && $command =~ /ls -l/) {
+        # Special handling for ls -l (long format)
+        add_locale_use_statement();
+        my $ls_code = q{do {
+my @ls_files = ();
+if (opendir my $dh, '.') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        my @stat = stat("./$file");
+        if (@stat) {
+            my $mode = $stat[2];
+            my $nlink = $stat[3];
+            my $uid = $stat[4];
+            my $gid = $stat[5];
+            my $size = $stat[7];
+            my $mtime = $stat[9];
+            my $mtime_str = scalar localtime($mtime);
+            my $type = -d "./$file" ? "d" : -l "./$file" ? "l" : "-";
+            my $perms = sprintf("%s%s%s%s%s%s%s%s%s%s",
+                $type,
+                ($mode & 0400) ? "r" : "-",
+                ($mode & 0200) ? "w" : "-",
+                ($mode & 0100) ? "x" : "-",
+                ($mode & 0040) ? "r" : "-",
+                ($mode & 0020) ? "w" : "-",
+                ($mode & 0010) ? "x" : "-",
+                ($mode & 0004) ? "r" : "-",
+                ($mode & 0002) ? "w" : "-",
+                ($mode & 0001) ? "x" : "-"
+            );
+            push @ls_files, sprintf("%s %2d %4d %4d %8d %s %s", 
+                $perms, $nlink, $uid, $gid, $size, $mtime_str, $file);
+        }
+    }
+    closedir $dh;
+    @ls_files = sort @ls_files;
+}
+join "\\n", @ls_files
+}};
+        $content =~ s/`\Q$command\E`/$ls_code/;
+        print "DEBUG: Converted backtick command '$command' to Perl (special ls -l handling)\n" if $verbose;
     } else {
             # Convert the backtick command to Perl
             my $perl_result = convert_shell_to_perl($command, 1);  # 1 = is_backticks
@@ -765,6 +872,9 @@ join "\\n", @ls_files
             }
         }
     }
+    
+    # Restore commented backticks
+    $content =~ s/__COMMENTED_BACKTICK__/`ls -l`/g;
     
     return $content;
 }
@@ -946,7 +1056,9 @@ sub convert_shell_to_perl {
     $escaped_command = "'$escaped_command'";  # Wrap in single quotes
     
     # Use debashc to convert to Perl
-    my $stdout = `"$debashc_path" parse --perl $escaped_command 2>&1`;
+    # Use --inline mode for backtick commands to get inline Perl code
+    my $mode = $is_backticks ? "--inline" : "--perl";
+    my $stdout = `"$debashc_path" parse $mode $escaped_command 2>&1`;
     my $exit_code = $? >> 8;
     
     if ($exit_code != 0) {
@@ -1018,7 +1130,7 @@ sub extract_perl_from_debashc_output {
             # Convert the preamble to inline code
             my $inline_preamble = $preamble;
             # Replace print statement with return value
-            $inline_preamble =~ s/print join "\\n", \@ls_files;/join "\\n", \@ls_files/g;
+            $inline_preamble =~ s|print join "\\n", \@ls_files;|join "\n", \\\@ls_files|g;
             return "do { $inline_preamble }";
         }
         
@@ -1027,7 +1139,7 @@ sub extract_perl_from_debashc_output {
             # Convert the core code to inline code, removing the print statement
             my $inline_core = $core;
             # Replace print statement with return value
-            $inline_core =~ s/print join "\\n", \@ls_files;/join "\\n", \@ls_files/g;
+            $inline_core =~ s|print join "\\n", \@ls_files;|join "\n", \\\@ls_files|g;
             return "do { $inline_core }";
         }
         
@@ -1035,19 +1147,52 @@ sub extract_perl_from_debashc_output {
         return { preamble => $preamble, core => $core };
     }
     
+    # Pattern 0.5: Inline mode output (no preamble/core separation)
+    if ($output =~ /==================================================\n(.*?)\n\n==================================================/s) {
+        my $inline_code = $1;
+        # Clean up the extracted code - remove trailing whitespace
+        $inline_code =~ s/\n\s*$//;
+        # Check if the code contains error messages
+        if ($inline_code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
+            return undef;
+        }
+        
+        # For backtick commands, we need to return the value instead of printing it
+        if ($is_backticks) {
+            # Handle ls commands - replace print with return value
+            if ($inline_code =~ /my \@ls_files = \(\)/ && $inline_code =~ /opendir my \$dh/) {
+                my $inline_ls = $inline_code;
+                # Replace print statement with return value
+                $inline_ls =~ s|print join "\\n", \@ls_files, "\\n";|join "\\n", \\\@ls_files, "\\n";|g;
+                return "do { $inline_ls }";
+            }
+            # For other commands, return as-is (they should already be in the right format)
+            return $inline_code;
+        }
+        
+        # For non-backtick commands, return as-is
+        return $inline_code;
+    }
+    
     # Pattern 1: Look for code between markers (old format)
     if ($output =~ /Generated Perl code:\s*\n(.*?)\n---/s) {
         return $1;
     }
     
-    # Pattern 2: Look for code after "Converting system command to Perl:" and before the separator line
+    # Pattern 2: Look for code after "Converting to Perl:" and between separator lines
     print "DEBUG: Trying Pattern 2\n" if $verbose;
-    if ($output =~ /Converting system command to Perl:\s*\n={50}\s*\n(.*?)\n={50}/s) {
+    if ($output =~ /Converting to Perl:\s*\n={50}\s*\n(.*?)\n={50}/s) {
         my $code = $1;
         # Check if the code contains error messages
         if ($code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
             return undef;
         }
+        # For system calls, extract just the core logic (skip headers and shebang)
+        if (!$is_backticks && $code =~ /#!/) {
+            # This is a full Perl script, extract just the core logic using PPI
+            $code = extract_core_perl_logic_with_ppi($code);
+        }
+        
         # Clean up the code - remove trailing semicolons and extra whitespace
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
@@ -1218,7 +1363,7 @@ sub extract_perl_from_debashc_output {
                     # Convert the full main_code to inline code
                     my $inline_code = $main_code;
                     # Replace print statement with return value for backtick commands
-                    $inline_code =~ s/print join "\\n", \@ls_files, "\\n";/join "\\n", \@ls_files, "\\n"/g;
+                    $inline_code =~ s|print join "\\n", \@ls_files, "\\n";|join "\\n", \\\@ls_files, "\\n"|g;
                     return "do { $inline_code }";
                 }
                 
@@ -1450,6 +1595,64 @@ sub extract_string_from_ppi {
     return undef;
 }
 
+sub extract_core_perl_logic_with_ppi {
+    my ($perl_code) = @_;
+    return $perl_code unless $perl_code;
+    
+    # Parse the Perl code with PPI
+    my $document = PPI::Document->new(\$perl_code);
+    return $perl_code unless $document;
+    
+    # Find all statements in the document
+    my $statements = $document->find('PPI::Statement');
+    return $perl_code unless $statements;
+    
+    my @core_statements = ();
+    my $found_main_exit_code = 0;
+    
+    foreach my $stmt (@{$statements}) {
+        my $content = $stmt->content;
+        
+        # Skip shebang, use statements, and variable declarations
+        next if $content =~ /^#!/;
+        next if $content =~ /^use\s+/;
+        next if $content =~ /^my\s+\$main_exit_code/;
+        next if $content =~ /^my\s+\$[a-zA-Z_]/;
+        next if $content =~ /^$/;
+        
+        # Mark that we found the main_exit_code declaration
+        if ($content =~ /my\s+\$main_exit_code/) {
+            $found_main_exit_code = 1;
+            next;
+        }
+        
+        # Only include statements after we've found the main_exit_code declaration
+        if ($found_main_exit_code) {
+            push @core_statements, $content;
+        }
+    }
+    
+    # If we didn't find main_exit_code, try a different approach
+    if (!@core_statements) {
+        # Look for print statements or other core logic
+        foreach my $stmt (@{$statements}) {
+            my $content = $stmt->content;
+            next if $content =~ /^#!/;
+            next if $content =~ /^use\s+/;
+            next if $content =~ /^my\s+/;
+            next if $content =~ /^$/;
+            
+            # Include print statements and other executable code
+            if ($content =~ /print\s+/ || $content =~ /if\s*\(/ || $content =~ /while\s*\(/ || $content =~ /for\s*\(/) {
+                push @core_statements, $content;
+            }
+        }
+    }
+    
+    return join("", @core_statements) if @core_statements;
+    return $perl_code; # Fallback to original if extraction failed
+}
+
 sub replace_system_call_with_code {
     my ($system_call, $replacement_code) = @_;
     
@@ -1510,7 +1713,7 @@ if (opendir my $dh, '.') {
     closedir $dh;
     @ls_files = sort @ls_files;
 }
-join "\\n", @ls_files
+(@ls_files ? join("\n", @ls_files) . "\n" : "")
 }};
         replace_backtick_with_code($backtick, $ls_code);
         return;

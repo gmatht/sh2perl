@@ -192,6 +192,29 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     if let Word::Literal(ref name, _) = cmd.name {
         if name == "echo" {
             // Use the echo command generator for non-pipeline echo commands
+            if generator.inline_mode {
+                // In inline mode, generate the output value directly instead of print statements
+                if cmd.args.is_empty() {
+                    output.push_str("\"\\n\"");
+                } else {
+                    // Check for -e flag and filter it out
+                    let filtered_args: Vec<&Word> = cmd.args.iter().filter(|&arg| {
+                        if let Word::Literal(s, _) = arg {
+                            s != "-e"
+                        } else {
+                            true
+                        }
+                    }).collect();
+                    
+                    // Convert arguments to Perl format
+                    let args: Vec<String> = filtered_args.iter()
+                        .map(|arg| generator.word_to_perl(arg))
+                        .collect();
+                    output.push_str(&format!("{} . \"\\n\"", args.join(" . \" \" . ")));
+                }
+                return output;
+            }
+            
             if cmd.args.is_empty() {
                 output.push_str(&generator.indent());
                 output.push_str("print \"\\n\";\n");
@@ -397,7 +420,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 }
             } else {
                 // System call fallback
-                if cmd.args.is_empty() {
+                if name == "ls" {
+                    // Special handling for ls command - use the dedicated ls handler
+                    output.push_str(&crate::generator::commands::ls::generate_ls_command(generator, cmd, false, None));
+                } else if cmd.args.is_empty() {
                     output.push_str(&generator.indent());
                     output.push_str(&format!("system('{}');\n", name));
                 } else {

@@ -255,7 +255,8 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             Ok(Word::Literal("false".to_string(), None))
         }
         _ => {
-            let (line, col) = lexer.offset_to_line_col(0);
+            let current_pos = lexer.current_position();
+            let (line, col) = lexer.offset_to_line_col(current_pos);
             let token = lexer.peek().unwrap_or(Token::Identifier).to_owned();
             Err(ParserError::UnexpectedToken { token, line, col })
         }
@@ -520,7 +521,8 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             Ok(Word::Literal("false".to_string(), None))
         }
         _ => {
-            let (line, col) = lexer.offset_to_line_col(0);
+            let current_pos = lexer.current_position();
+            let (line, col) = lexer.offset_to_line_col(current_pos);
             let token = lexer.peek().unwrap_or(Token::Identifier).to_owned();
             Err(ParserError::UnexpectedToken { token, line, col })
         }
@@ -792,7 +794,8 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
             Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
         }
         _ => {
-            let (line, col) = lexer.offset_to_line_col(0);
+            let current_pos = lexer.current_position();
+            let (line, col) = lexer.offset_to_line_col(current_pos);
             Err(ParserError::UnexpectedToken { token: Token::Identifier, line, col })
         }
     }

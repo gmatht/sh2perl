@@ -966,6 +966,10 @@ pub fn parse_simple_command(parser: &mut Parser) -> Result<Command, ParserError>
             let name_text = parser.lexer.get_identifier_text()?;
             Word::literal(name_text)
         }
+        Some(Token::Local) => {
+            parser.lexer.next(); // consume the local token
+            Word::literal("local".to_string())
+        }
         _ => {
             return Err(ParserError::InvalidSyntax("Expected command name".to_string()));
         }
@@ -975,7 +979,77 @@ pub fn parse_simple_command(parser: &mut Parser) -> Result<Command, ParserError>
     parser.lexer.skip_whitespace_and_comments();
     while let Some(token) = parser.lexer.peek() {
         match token {
-            Token::Identifier | Token::DoubleQuotedString | Token::SingleQuotedString | 
+            Token::Identifier => {
+                // Check if this is a local command with an assignment
+                if name.as_literal().unwrap_or("") == "local" {
+                    // Parse as an assignment: local var=value
+                    let var_name = parser.lexer.get_identifier_text()?;
+                    // Check if the next token is an assignment operator
+                    if matches!(parser.lexer.peek(), Some(Token::Assign | Token::PlusAssign | Token::MinusAssign | Token::StarAssign | Token::SlashAssign | Token::PercentAssign)) {
+                    
+                    // Consume the assignment operator
+                    let assignment_op = parser.lexer.peek().cloned().unwrap();
+                    match assignment_op {
+                        Token::Assign | Token::PlusAssign | Token::MinusAssign | Token::StarAssign | Token::SlashAssign | Token::PercentAssign => {
+                            parser.lexer.next();
+                        }
+                        _ => return Err(ParserError::InvalidSyntax("Expected assignment operator".to_string())),
+                    }
+                    
+                    // Parse the value - handle various cases
+                    let value_word = match parser.lexer.peek() {
+                        Some(Token::Dollar) => {
+                            parser.lexer.next(); // consume $
+                            if let Some(Token::Number) = parser.lexer.peek() {
+                                let num = parser.lexer.get_number_text()?;
+                                parser.lexer.next(); // consume the number
+                                Word::Literal(format!("${}", num), None)
+                            } else if let Some(Token::Identifier) = parser.lexer.peek() {
+                                let var_name = parser.lexer.get_identifier_text()?;
+                                parser.lexer.next(); // consume the identifier
+                                Word::Literal(format!("${}", var_name), None)
+                            } else {
+                                return Err(ParserError::InvalidSyntax("Expected number or identifier after $ in local assignment".to_string()));
+                            }
+                        }
+                        Some(Token::Identifier) => {
+                            let var_name = parser.lexer.get_identifier_text()?;
+                            parser.lexer.next(); // consume the identifier
+                            Word::Literal(var_name, None)
+                        }
+                        Some(Token::Number) => {
+                            let num = parser.lexer.get_number_text()?;
+                            parser.lexer.next(); // consume the number
+                            Word::Literal(num, None)
+                        }
+                        Some(Token::DoubleQuotedString) | Some(Token::SingleQuotedString) => {
+                            let str_val = parser.lexer.get_string_text()?;
+                            parser.lexer.next(); // consume the string
+                            Word::Literal(str_val, None)
+                        }
+                        _ => {
+                            // Fallback to parse_word for other cases
+                            parse_word(&mut parser.lexer)?
+                        }
+                    };
+                    
+                        // Create a word that represents the assignment
+                        let assignment_word = Word::Literal(format!("{}={}", var_name, value_word.as_literal().unwrap_or("")), None);
+                        args.push(assignment_word);
+                    } else {
+                        // Not an assignment, parse as a regular word
+                        // Put the identifier back by creating a word from it
+                        let word = Word::Literal(var_name, None);
+                        args.push(word);
+                    }
+                } else {
+                    let word = parse_word(&mut parser.lexer)?;
+                    args.push(word);
+                }
+                // Skip whitespace after the word
+                parser.lexer.skip_whitespace_and_comments();
+            }
+            Token::DoubleQuotedString | Token::SingleQuotedString | 
             Token::Dollar | Token::DollarParen | Token::BacktickString |
             Token::File | Token::Directory | Token::Exists | Token::Readable | Token::Writable | 
             Token::Executable | Token::Size | Token::Symlink => {
@@ -1138,6 +1212,10 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
             }
             Some(Token::Equality) => {
                 expression_parts.push("==".to_string());
+                lexer.next();
+            }
+            Some(Token::Assign) => {
+                expression_parts.push("=".to_string());
                 lexer.next();
             }
             Some(Token::RegexMatch) => {

@@ -102,6 +102,25 @@ pub fn parse_to_perl(input: &str) {
     println!("{}", "=".repeat(50));
 }
 
+pub fn parse_to_perl_inline(input: &str) {
+    let mut generator = Generator::new_inline_mode();
+    
+    println!("Converting to inline Perl:");
+    println!("{}", "=".repeat(50));
+    
+    let commands = match Parser::new(input).parse() {
+        Ok(c) => c,
+        Err(e) => { 
+            println!("Parse error: {}", e); 
+            return; 
+        }
+    };
+    let perl_code = generator.generate(&commands);
+    println!("{}", perl_code);
+    
+    println!("{}", "=".repeat(50));
+}
+
 pub fn parse_system_to_perl(input: &str) {
     let mut generator = Generator::new();
     

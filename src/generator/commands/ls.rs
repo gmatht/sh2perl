@@ -21,6 +21,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             if sort_by_time {
                 output.push_str(&format!("@{} = sort {{ -M \"{}/$b\" <=> -M \"{}/$a\" }} @{};\n", array_name, dir, dir, array_name));
             } else {
+                // Simple alphabetical sorting to match native ls behavior
                 output.push_str(&format!("@{} = sort {{ $a cmp $b }} @{};\n", array_name, array_name));
             }
         }
@@ -67,6 +68,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             if sort_by_time {
                 output.push_str(&format!("@{} = sort {{ -M \"{}/$b\" <=> -M \"{}/$a\" }} @{};\n", array_name, dir, dir, array_name));
             } else {
+                // Simple alphabetical sorting to match native ls behavior
                 output.push_str(&format!("@{} = sort {{ $a cmp $b }} @{};\n", array_name, array_name));
             }
         }
@@ -82,10 +84,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
 pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipeline_context: bool, output_var: Option<&str>) -> String {
     let mut output = String::new();
     
-    eprintln!("DEBUG: generate_ls_command called with {} arguments", cmd.args.len());
-    for (i, arg) in cmd.args.iter().enumerate() {
-        eprintln!("DEBUG: argument {}: {:?}", i, arg);
-    }
+    // Debug messages removed for cleaner output
     
     // Parse ls arguments to determine directory and flags
     let mut dir = ".";
@@ -168,7 +167,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             _ => {} // Ignore other argument types for now
         }
     }
-    eprintln!("DEBUG: ls command final directory: '{}'", dir);
+    // Debug message removed for cleaner output
     
     // Handle context-based logic
     if pipeline_context {
@@ -302,7 +301,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     output.push_str(&generator.indent());
     // In command substitution context, always join with newlines to match shell behavior
     // The shell's ls command outputs one file per line by default in command substitution
-    output.push_str("join \"\\n\", @ls_files_sub;\n");
+    output.push_str("join \"\\n\", @ls_files_sub, \"\\n\";\n");
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("}");

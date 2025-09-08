@@ -25,6 +25,7 @@ pub struct Generator {
     pub function_level_vars: HashSet<String>,
     pub constants: HashMap<String, i64>,
     pub translation_mode: bool, // New field for pure translation mode
+    pub inline_mode: bool, // New field for inline mode (for backticks)
 }
 
 impl Generator {
@@ -41,13 +42,14 @@ impl Generator {
             function_level_vars: HashSet::new(),
             constants: HashMap::new(),
             translation_mode: false,
+            inline_mode: false,
         }
     }
 
     pub fn new_translation_mode() -> Self {
         Self {
             indent_level: 0,
-            declared_locals: HashSet::new(),se 
+            declared_locals: HashSet::new(), 
             declared_functions: HashSet::new(),
             file_handle_counter: 0,
             extglob_enabled: false,
@@ -57,6 +59,24 @@ impl Generator {
             function_level_vars: HashSet::new(),
             constants: HashMap::new(),
             translation_mode: true,
+            inline_mode: false,
+        }
+    }
+
+    pub fn new_inline_mode() -> Self {
+        Self {
+            indent_level: 0,
+            declared_locals: HashSet::new(),
+            declared_functions: HashSet::new(),
+            file_handle_counter: 0,
+            extglob_enabled: false,
+            nocasematch_enabled: false,
+            process_sub_files: HashMap::new(),
+            current_process_sub_file: None,
+            function_level_vars: HashSet::new(),
+            constants: HashMap::new(),
+            translation_mode: false,
+            inline_mode: true,
         }
     }
 
@@ -69,6 +89,28 @@ impl Generator {
         
         // Pre-analysis pass: identify constants needed for magic numbers
         self.analyze_constants_needed(ast);
+        
+        // In inline mode, skip the script header and just generate the command code
+        if self.inline_mode {
+            for command in ast {
+                // Reset indentation level for each top-level command to prevent staircase effect
+                self.indent_level = 0;
+                let command_output = self.generate_command(command);
+                output.push_str(&command_output);
+                
+                // Ensure proper newline separation between commands
+                if !command_output.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            
+            // Ensure the output ends with a newline
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            
+            return output;
+        }
         
         // Analyze what imports and variables are needed
         let needs_basename = self.needs_basename_import(ast);
