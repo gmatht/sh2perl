@@ -164,13 +164,13 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         for file in &expanded_files {
             output.push_str(&format!("if (-e {}) {{\n", file));
             // File exists, update timestamp
-            output.push_str(&format!("my $current_time = time();\n"));
-            output.push_str(&format!("utime($current_time, $current_time, {});\n", file));
+            output.push_str(&format!("my $current_time = time;\n"));
+            output.push_str(&format!("utime $current_time, $current_time, {};\n", file));
             // Silent operation - no output unless error
             output.push_str("} else {\n");
             // File doesn't exist, create it
-            output.push_str(&format!("if (open(my $fh, '>', {})) {{\n", file));
-            output.push_str("close($fh);\n");
+            output.push_str(&format!("if (open my $fh, '>', {}) {{\n", file));
+            output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
             // Silent operation - no output unless error
             output.push_str("} else {\n");
             output.push_str(&format!("croak \"touch: cannot create \", {}, \": $ERRNO\\n\";\n", file));

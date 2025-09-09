@@ -1,8 +1,4 @@
-use std::fs;
 use std::process::{Command, Stdio};
-use std::time::Duration;
-use std::thread;
-use debashl::shared_utils;
 
 /// Cross-platform helper to create ExitStatus from exit code
 /// This is a workaround since ExitStatus::from_raw is platform-specific

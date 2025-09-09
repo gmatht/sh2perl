@@ -114,7 +114,12 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         .join(" ");
     
     let output_var = format!("perl_output_{}", generator.get_unique_id());
-    output.push_str(&format!("{} = `{} {}`;\n", output_var, "perl", args_str));
+    output.push_str(&format!("my ($in, $out, $err);
+my $pid = open3($in, $out, $err, '{}', {});
+close $in or croak 'Close failed: $!';
+{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
+close $out or croak 'Close failed: $!';
+waitpid $pid, 0;\n", output_var, "perl", args_str));
     output.push_str(&format!("print ${};\n", output_var));
     
     output
@@ -247,7 +252,12 @@ pub fn generate_perl_pipeline_command(generator: &mut Generator, cmd: &SimpleCom
             .join(" ");
         
         let output_var = format!("perl_output_{}", generator.get_unique_id());
-        output.push_str(&format!("{} = `{} {}`;\n", output_var, "perl", args_str));
+        output.push_str(&format!("my ($in, $out, $err);
+my $pid = open3($in, $out, $err, '{}', {});
+close $in or croak 'Close failed: $!';
+{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
+close $out or croak 'Close failed: $!';
+waitpid $pid, 0;\n", output_var, "perl", args_str));
         output.push_str(&format!("print ${};\n", output_var));
     }
     

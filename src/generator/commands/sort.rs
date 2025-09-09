@@ -33,8 +33,8 @@ pub fn generate_sort_command_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str("    my @b_fields = split /\\s+/msx, $b;\n");
         output.push_str("    my $a_num = 0;\n");
         output.push_str("    my $b_num = 0;\n");
-        output.push_str(&format!("    if ( scalar(@a_fields) > 0 && $a_fields[0] =~ {} ) {{ $a_num = $a_fields[0]; }}\n", generator.format_regex_pattern(r"^\d+$")));
-        output.push_str(&format!("    if ( scalar(@b_fields) > 0 && $b_fields[0] =~ {} ) {{ $b_num = $b_fields[0]; }}\n", generator.format_regex_pattern(r"^\d+$")));
+        output.push_str(&format!("    if ( scalar @a_fields > 0 && $a_fields[0] =~ {} ) {{ $a_num = $a_fields[0]; }}\n", generator.format_regex_pattern(r"^\d+$")));
+        output.push_str(&format!("    if ( scalar @b_fields > 0 && $b_fields[0] =~ {} ) {{ $b_num = $b_fields[0]; }}\n", generator.format_regex_pattern(r"^\d+$")));
         output.push_str("    return $a_num <=> $b_num || $a cmp $b;\n");
         output.push_str("}\n");
         output.push_str(&format!("my @sort_sorted_{} = sort sort_numeric_{} @sort_lines_{};\n", command_index, command_index, command_index));

@@ -32,9 +32,9 @@ pub fn generate_wget_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
             output.push_str(&format!("my $output_file = {};\n", output_file));
             output.push_str("my $content = get($url);\n");
             output.push_str("if (defined $content) {\n");
-            output.push_str(&format!("open(my $fh, '>', $output_file) or die \"Cannot open $output_file: $ERRNO\";\n"));
+            output.push_str(&format!("open my $fh, '>', $output_file or die \"Cannot open $output_file: $ERRNO\";\n"));
             output.push_str("print $fh $content;\n");
-            output.push_str("close($fh);\n");
+            output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
             output.push_str("print \"Downloaded to $output_file\\n\";\n");
             output.push_str("} else {\n");
             output.push_str("die \"Failed to download $url\\n\";\n");

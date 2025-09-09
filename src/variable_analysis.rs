@@ -1,5 +1,5 @@
 use crate::ast::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Tracks variable usage throughout the AST
 #[derive(Debug, Clone)]

@@ -10,7 +10,7 @@ fn collect_all_redirects(command: &Command) -> (Vec<Redirect>, Command) {
     match command {
         Command::Redirect(redirect_cmd) => {
             let mut all_redirects = Vec::new();
-            let (mut inner_redirects, base_cmd) = collect_all_redirects(&redirect_cmd.command);
+            let (inner_redirects, base_cmd) = collect_all_redirects(&redirect_cmd.command);
             // For nested RedirectCommand, we want inner redirects first, then outer redirects
             // This matches the order they appear in the original Bash command
             all_redirects.extend(inner_redirects);
@@ -74,7 +74,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
             generator.generate_assignment(assignment)
         },
         Command::BlankLine => "\n".to_string(),
-        Command::Redirect(redirect_cmd) => {
+        Command::Redirect(_redirect_cmd) => {
 //             eprintln!("DEBUG: Processing Redirect command with {} redirects", redirect_cmd.redirects.len());
             
                     // Check if the base command is a Pipeline with logical operators
@@ -160,7 +160,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     RedirectOperator::ProcessSubstitutionInput(cmd) => {
                         // Process substitution input: <(command)
                         let global_counter = generator.get_unique_file_handle();
-                        let temp_file = format!("{}/process_sub_{}.tmp", get_temp_dir(), global_counter);
+                        let _temp_file = format!("{}/process_sub_{}.tmp", get_temp_dir(), global_counter);
                         let temp_var = format!("temp_file_ps_{}", global_counter);
                         
                         result.push_str(&generator.indent());
@@ -188,7 +188,13 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                             // Use backticks when not in STDOUT context for simple commands
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("my $output_ps_{} = `{}`;\n", global_counter, cmd_str));
+                            result.push_str("\n");
+            result.push_str("my ($in, $out, $err);\n");
+            result.push_str(&format!("my $pid = open3($in, $out, $err, 'bash', '-c', '{}');\n", cmd_str));
+            result.push_str("close $in or croak 'Close failed: $!';\n");
+            result.push_str(&format!("my $output_ps_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};\n", global_counter));
+            result.push_str("close $out or croak 'Close failed: $!';\n");
+            result.push_str("waitpid $pid, 0;\n");
                         }
                         
                         // Write the output to the temporary file
@@ -245,7 +251,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                             result.push_str(&generator.indent());
                             result.push_str("    while (my $line = <$fh1>) {\n");
                             result.push_str(&generator.indent());
-                            result.push_str("        chomp($line);\n");
+                            result.push_str("        chomp $line;\n");
                             result.push_str(&generator.indent());
                             result.push_str("        push @file1_lines, $line;\n");
                             result.push_str(&generator.indent());
@@ -261,7 +267,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                             result.push_str(&generator.indent());
                             result.push_str("    while (my $line = <$fh2>) {\n");
                             result.push_str(&generator.indent());
-                            result.push_str("        chomp($line);\n");
+                            result.push_str("        chomp $line;\n");
                             result.push_str(&generator.indent());
                             result.push_str("        push @file2_lines, $line;\n");
                             result.push_str(&generator.indent());
@@ -343,7 +349,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                             
                             // Remove trailing newline and print result
                             result.push_str(&generator.indent());
-                            result.push_str("chomp($result);\n");
+                            result.push_str("chomp $result;\n");
                             result.push_str(&generator.indent());
                             result.push_str("print $result;\n");
                             result.push_str(&generator.indent());
@@ -381,7 +387,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                             result.push_str("    while (my $line = <$mapfile_fh>) {\n");
                             if trim_trailing {
                                 result.push_str(&generator.indent());
-                                result.push_str("        chomp($line);\n");
+                                result.push_str("        chomp $line;\n");
                             }
                             result.push_str(&generator.indent());
                             result.push_str(&format!("        push @{}, $line;\n", var_name));
@@ -399,7 +405,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     // For grep with here-string, pass the here-string content
                     if cmd_name == "grep" && has_here_string {
 //                         eprintln!("DEBUG: Generating grep with here-string, content: {}", here_string_content);
-                        let mut grep_cmd = cmd.clone();
+                        let grep_cmd = cmd.clone();
                         // Create a temporary variable for the here-string content
                         let temp_var = format!("here_string_content_{}", generator.get_unique_file_handle());
                         result.push_str(&generator.indent());
@@ -480,8 +486,8 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     if cmd_name == "paste" && !process_sub_files.is_empty() {
 //                         eprintln!("DEBUG: Handling paste command with {} process substitution files", process_sub_files.len());
                         if process_sub_files.len() >= 2 {
-                            let file1 = &process_sub_files[0];
-                            let file2 = &process_sub_files[1];
+                            let _file1 = &process_sub_files[0];
+                            let _file2 = &process_sub_files[1];
                             
                             // Use the paste generator for proper output handling
                             let paste_output = generate_paste_command(generator, cmd, &process_sub_files);

@@ -1,11 +1,8 @@
 use std::fs;
 use std::process::Command;
 use std::io::Write;
-use debashl::shared_utils;
-use crate::utils::{extract_line_col, caret_snippet};
 use debashl::{Lexer, Parser, Generator};
-use debashl::mir_simple::{MirCommand, MirWord};
-use debashl::ast::Word;
+use debashl::mir_simple::MirCommand;
 
 pub fn run_generated(lang: &str, input: &str) {
     let source = if input.ends_with(".sh") || std::path::Path::new(input).exists() {

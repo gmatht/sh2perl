@@ -42,7 +42,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
         }
         RedirectOperator::ProcessSubstitutionInput(cmd) => {
             let global_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let temp_file = format!("{}/process_sub_{}.tmp", get_temp_dir(), global_counter);
+            let _temp_file = format!("{}/process_sub_{}.tmp", get_temp_dir(), global_counter);
             let temp_var = format!("temp_file_ps_{}", global_counter);
             let output_var = format!("output_ps_{}", global_counter);
             let fh_var = format!("fh_ps_{}", global_counter);
@@ -68,7 +68,12 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 output.push_str(&format!("}}\n"));
             } else {
                 let cmd_str = generate_bash_command_string(cmd);
-                output.push_str(&format!("my ${} = `{}`;\n", output_var, cmd_str));
+                output.push_str(&format!("my ($in, $out, $err);
+my $pid = open3($in, $out, $err, 'bash', '-c', '{}');
+close $in or croak 'Close failed: $!';
+my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
+close $out or croak 'Close failed: $!';
+waitpid $pid, 0;\n", output_var, cmd_str));
             }
             
             output.push_str(&format!("use File::Path qw(make_path);\n"));
@@ -254,7 +259,7 @@ fn word_to_bash_string(word: &Word) -> String {
             }
             result
         }
-        Word::CommandSubstitution(cmd, _) => {
+        Word::CommandSubstitution(_cmd, _) => {
             // This would need to be handled by the caller
             format!("$({})", "command")
         }

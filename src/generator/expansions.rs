@@ -1,7 +1,7 @@
 use crate::ast::*;
 use super::Generator;
 
-pub fn generate_parameter_expansion_impl(generator: &mut Generator, pe: &ParameterExpansion) -> String {
+pub fn generate_parameter_expansion_impl(_generator: &mut Generator, pe: &ParameterExpansion) -> String {
     match &pe.operator {
         ParameterExpansionOperator::None => {
             // ${var} - just the variable

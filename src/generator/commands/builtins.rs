@@ -396,7 +396,7 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             // Handle read command - read from input_var if available, otherwise from STDIN
             if input_var.is_empty() {
                 // No input variable, read from STDIN
-                format!("my $L = <STDIN>;\nchomp $L;\n")
+                format!("my $L = <>;\nchomp $L;\n")
             } else {
                 // Read from input variable (pipeline context)
                 format!("my $L = ${};\n", input_var)
@@ -407,7 +407,7 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             if output_var.is_empty() {
                 "system 'true';\n".to_string()
             } else {
-                format!("system 'true';\n${} = '';\n", output_var)
+                format!("system 'true';\n${} = q{};\n", output_var, "")
             }
         },
         "false" => {
@@ -415,20 +415,20 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             if output_var.is_empty() {
                 "system 'false';\n".to_string()
             } else {
-                format!("system 'false';\n${} = '';\n", output_var)
+                format!("system 'false';\n${} = q{};\n", output_var, "")
             }
         },
 
         _ => {
             // Fallback for unknown commands - use system call
-            generate_system_call_fallback(command_name, cmd, input_var, output_var)
+            generate_system_call_fallback(generator, command_name, cmd, input_var, output_var)
         }
     }
 }
 
 
 /// Generate a system call fallback for unknown commands
-fn generate_system_call_fallback(command_name: &str, cmd: &SimpleCommand, input_var: &str, output_var: &str) -> String {
+fn generate_system_call_fallback(generator: &mut Generator, command_name: &str, cmd: &SimpleCommand, input_var: &str, output_var: &str) -> String {
     let args: Vec<String> = cmd.args.iter()
         .filter_map(|arg| match arg {
             Word::Literal(s, _) => Some(s.clone()),
@@ -437,11 +437,12 @@ fn generate_system_call_fallback(command_name: &str, cmd: &SimpleCommand, input_
         .collect();
     let args_str = args.join(" ");
     
+    let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
     if input_var.is_empty() {
         // First command in pipeline
-        format!("${} = `{} {}`;\n", output_var, command_name, args_str)
+        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $!';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
     } else {
         // Subsequent command
-        format!("${} = `echo \"${}\" | {} {}`;\n", output_var, input_var, command_name, args_str)
+        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | {} {}');\nclose {} or croak 'Close failed: $!';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, input_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
     }
 }

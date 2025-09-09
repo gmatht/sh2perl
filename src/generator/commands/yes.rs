@@ -19,7 +19,7 @@ pub fn generate_yes_command(generator: &mut Generator, cmd: &SimpleCommand) -> S
     output
 }
 
-pub fn generate_yes_command_with_context(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, output_var: &str, command_index: &str) -> String {
+pub fn generate_yes_command_with_context(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, output_var: &str, _command_index: &str) -> String {
     let mut output = String::new();
     
     // yes command syntax: yes [string]
