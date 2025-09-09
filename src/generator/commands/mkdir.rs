@@ -25,7 +25,7 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     }
     
     if directories.is_empty() {
-        output.push_str("die \"mkdir: missing operand\\n\";\n");
+        output.push_str("croak \"mkdir: missing operand\\n\";\n");
     } else {
         output.push_str("use File::Path qw(make_path);\n");
         if !generator.declared_locals.contains("err") {
@@ -38,7 +38,7 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                 output.push_str(&format!("if (!-d \"{}\") {{\n", dir));
                 output.push_str(&format!("make_path(\"{}\", {{error => \\$err}});\n", dir));
                 output.push_str("if (@$err) {\n");
-                output.push_str(&format!("die \"mkdir: cannot create directory {}: $err->[0]\\n\";\n", dir));
+                output.push_str(&format!("croak \"mkdir: cannot create directory {}: $err->[0]\\n\";\n", dir));
                 output.push_str("} else {\n");
                 output.push_str(&format!("print \"mkdir: created directory {}\\n\";\n", dir));
                 output.push_str("}\n");
@@ -50,10 +50,10 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                 output.push_str(&format!("if (mkdir({})) {{\n", dir));
                 output.push_str(&format!("print \"mkdir: created directory {}\\n\";\n", dir));
                 output.push_str("} else {\n");
-                output.push_str(&format!("die \"mkdir: cannot create directory {}: $!\\n\";\n", dir));
+                output.push_str(&format!("croak \"mkdir: cannot create directory {}: $ERRNO\\n\";\n", dir));
                 output.push_str("}\n");
                 output.push_str("} else {\n");
-                output.push_str(&format!("die \"mkdir: cannot create directory {}: File exists\\n\";\n", dir));
+                output.push_str(&format!("croak \"mkdir: cannot create directory {}: File exists\\n\";\n", dir));
                 output.push_str("}\n");
             }
         }

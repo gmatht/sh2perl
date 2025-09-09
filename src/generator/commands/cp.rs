@@ -56,7 +56,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str("}\n");
                 output.push_str("}\n");
                 output.push_str(&format!("my $cmd = \"cp -r {} $dest_dir\";\n", source));
-                output.push_str("my $result = system($cmd);\n");
+                output.push_str("my $result = system $cmd;\n");
                 output.push_str("if ($result == 0) {\n");
                 output.push_str(&format!("print \"cp: copied directory {} to $dest_dir\\n\";\n", source));
                 output.push_str("} else {\n");
@@ -75,7 +75,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 }
                 output.push_str(&format!("print \"cp: copied {} to $dest\\n\";\n", source));
                 output.push_str("} else {\n");
-                output.push_str(&format!("die \"cp: cannot copy {} to $dest: $!\\n\";\n", source));
+                output.push_str(&format!("die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n", source));
                 output.push_str("}\n");
                 output.push_str("}\n");
             } else {
@@ -91,7 +91,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 }
                 output.push_str(&format!("print \"cp: copied {} to $dest\\n\";\n", source));
                 output.push_str("} else {\n");
-                output.push_str(&format!("die \"cp: cannot copy {} to $dest: $!\\n\";\n", source));
+                output.push_str(&format!("die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n", source));
                 output.push_str("}\n");
                 output.push_str("}\n");
             }

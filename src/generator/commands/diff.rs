@@ -126,7 +126,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     output.push_str(&generator.indent());
     output.push_str("    # Fallback: use system diff if available\n");
     output.push_str(&generator.indent());
-    output.push_str("    my $exit_code = system('diff', @ARGV);\n");
+    output.push_str("    my $exit_code = system 'diff', @ARGV;\n");
     output.push_str(&generator.indent());
     output.push_str("    $diff_exit_code = $exit_code >> 8;\n");
     output.push_str(&generator.indent());

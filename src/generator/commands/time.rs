@@ -12,7 +12,7 @@ pub fn generate_time_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     // Execute the command (if any arguments provided)
     if let Some(command) = cmd.args.first() {
         let command_str = generator.word_to_perl(command);
-        output.push_str(&format!("system({});\n", command_str));
+        output.push_str(&format!("system {};\n", command_str));
     }
     
     output.push_str("my $end_time = [gettimeofday];\n");

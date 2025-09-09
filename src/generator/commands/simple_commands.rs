@@ -144,7 +144,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 output.push_str(&generator.indent());
                 output.push_str(&format!("if (!-d $temp_dir_{}_{}) {{ make_path($temp_dir_{}_{}); }}\n", global_counter, temp_file_counter, global_counter, temp_file_counter));
                 output.push_str(&generator.indent());
-                output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
+                output.push_str(&format!("open my ${}, '>', ${} or croak \"Cannot create temp file: $ERRNO\\n\";\n", fh_var, temp_var));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("print ${} $output_ps_{};\n", fh_var, global_counter));
                 output.push_str(&generator.indent());
@@ -175,7 +175,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 if let Some(content) = &redir.heredoc_body {
                     let fh_var = format!("fh_hs_{}_{}", global_counter, temp_file_counter);
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
+                    output.push_str(&format!("open my ${}, '>', ${} or croak \"Cannot create temp file: $ERRNO\\n\";\n", fh_var, temp_var));
                     output.push_str(&generator.indent());
                     output.push_str(&format!("print ${} {};\n", fh_var, generator.perl_string_literal(&Word::literal(content.clone()))));
                     output.push_str(&generator.indent());
@@ -381,7 +381,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         if cmd.args.is_empty() {
                             // cd with no arguments goes to home directory
                             output.push_str(&generator.indent());
-                            output.push_str("chdir($ENV{HOME} || $ENV{USERPROFILE} || '.');\n");
+                            output.push_str("chdir($ENV{HOME} || $ENV{USERPROFILE} || '.';\n");
                         } else {
                             // cd with directory argument
                             let dir = generator.perl_string_literal(&cmd.args[0]);
@@ -425,7 +425,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&crate::generator::commands::ls::generate_ls_command(generator, cmd, false, None));
                 } else if cmd.args.is_empty() {
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("system('{}');\n", name));
+                    output.push_str(&format!("system '{}';\n", name));
                 } else {
                     let args: Vec<String> = if name == "perl" {
                         // Special handling for perl command - embed Perl code directly instead of system call
@@ -558,11 +558,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // Fallback to system call for other Perl usage
                         let args_str = args.join(", ");
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("system('{}', {});\n", name, args_str));
+                        output.push_str(&format!("system '{}', {});\n", name, args_str));
                     } else {
                     let args_str = args.join(", ");
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("system('{}', {});\n", name, args_str));
+                    output.push_str(&format!("system '{}', {});\n", name, args_str));
                     }
                 }
             }
@@ -574,13 +574,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
         // Fallback to system call
         if cmd.args.is_empty() {
             output.push_str(&generator.indent());
-            output.push_str(&format!("system('{}');\n", cmd_name));
+            output.push_str(&format!("system '{}';\n", cmd_name));
         } else {
             let args: Vec<String> = cmd.args.iter()
                 .map(|arg| generator.perl_string_literal(arg))
                 .collect();
             output.push_str(&generator.indent());
-            output.push_str(&format!("system('{}', {});\n", cmd_name, args.join(", ")));
+            output.push_str(&format!("system '{}', {});\n", cmd_name, args.join(", ")));
         }
     }
 

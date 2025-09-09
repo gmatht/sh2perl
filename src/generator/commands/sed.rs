@@ -32,7 +32,7 @@ pub fn generate_sed_command(_generator: &mut Generator, cmd: &SimpleCommand, inp
                             _ => "".to_string(),
                         };
                         
-                        output.push_str(&format!("$line =~ s/{}/{}/g;\n", pattern, replacement));
+                        output.push_str(&format!("$line =~ s/{}/{}/gs;\n", pattern, replacement));
                     }
                 } else {
                     // Single argument case: s/pattern/replacement/
@@ -40,7 +40,7 @@ pub fn generate_sed_command(_generator: &mut Generator, cmd: &SimpleCommand, inp
                     if parts.len() >= 3 {
                         let pattern = parts[1];
                         let replacement = parts[2];
-                        output.push_str(&format!("$line =~ s/{}/{}/g;\n", pattern, replacement));
+                        output.push_str(&format!("$line =~ s/{}/{}/gs;\n", pattern, replacement));
                     }
                 }
             } else if first_arg == "d" {
