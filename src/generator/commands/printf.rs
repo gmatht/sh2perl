@@ -1,7 +1,7 @@
 use crate::generator::Generator;
 use crate::ast::*;
 
-pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize, output_var: Option<&str>) -> String {
+pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, _command_index: usize, output_var: Option<&str>) -> String {
     let mut output = String::new();
     
     // Parse printf format string and arguments
@@ -63,7 +63,7 @@ pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, i
                     output.push_str(&format!("my ${};\n", var));
                     output.push_str(&format!("{{\n"));
                     output.push_str(&format!("    local *STDOUT;\n"));
-                    output.push_str(&format!("    open(STDOUT, '>', \\${}) or die \"Cannot redirect STDOUT\";\n", var));
+                    output.push_str(&format!("    open STDOUT, '>', \\${} or die \"Cannot redirect STDOUT\";\n", var));
                     output.push_str(&format!("    printf(\"{}\");\n", format_string));
                     output.push_str(&format!("}}\n"));
                 } else {
@@ -73,7 +73,7 @@ pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, i
                 // Build the printf call with format string and arguments properly separated
                 // For compatibility with broken printf system call behavior, convert numeric arguments to strings
                 let mut printf_call = format!("printf(\"{}\"", format_string);
-                for (i, arg) in args.iter().enumerate() {
+                for (_i, arg) in args.iter().enumerate() {
                     // Check if the argument is a numeric literal and if the corresponding format specifier is %c
                     if arg.chars().all(|c| c.is_ascii_digit() || c == '.') && format_string.contains("%c") {
                         // For numeric arguments with %c format, use ord to get ASCII value of first character to match broken printf behavior
@@ -89,7 +89,7 @@ pub fn generate_printf_command(generator: &mut Generator, cmd: &SimpleCommand, i
                     output.push_str(&format!("my ${};\n", var));
                     output.push_str(&format!("{{\n"));
                     output.push_str(&format!("    local *STDOUT;\n"));
-                    output.push_str(&format!("    open(STDOUT, '>', \\${}) or die \"Cannot redirect STDOUT\";\n", var));
+                    output.push_str(&format!("    open STDOUT, '>', \\${} or die \"Cannot redirect STDOUT\";\n", var));
                     output.push_str(&format!("    {}\n", printf_call.trim()));
                     output.push_str(&format!("}}\n"));
                 } else {

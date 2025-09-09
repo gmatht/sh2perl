@@ -1,0 +1,19 @@
+use locale;
+use Cwd;
+print 'Working Directory:';
+print Cwd::getcwd(), "\n";
+
+print 'Files: ';
+my $ls_output = do {
+my @ls_files = ();
+if (opendir my $dh, '.') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        push @ls_files, $file;
+    }
+    closedir $dh;
+    @ls_files = sort @ls_files;
+}
+(@ls_files ? join("\n", @ls_files) . "\n" : "")
+};
+print $ls_output;

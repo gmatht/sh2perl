@@ -18,13 +18,13 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         output.push_str(&generator.indent());
         output.push_str(&generator.generate_command(right));
         output.push_str(&generator.indent());
-        output.push_str("$? = 0;\n");
+        output.push_str("$CHILD_ERROR = 0;\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("} else {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str("$? = 1;\n");
+        output.push_str("$CHILD_ERROR = 1;\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
@@ -55,12 +55,12 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
                 let grep_result = generator.generate_command(left);
                 
                 // Extract the grep_result variable name from the generated code
-                let mut grep_result_var = String::new();
+                let mut _grep_result_var = String::new();
                 for line in grep_result.lines() {
                     if line.trim_start().starts_with("my $grep_result_") {
                         if let Some(end) = line.find(';') {
                             let var_decl = &line[3..end]; // Remove "my " prefix
-                            grep_result_var = var_decl.to_string();
+                            _grep_result_var = var_decl.to_string();
                         }
                     }
                     if !line.trim().is_empty() {
@@ -72,8 +72,8 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
                 
                 output.push_str(&generator.indent());
                 // For grep commands, check if matches were found by looking at the filtered array
-                // The grep command should have already set $? correctly
-                output.push_str("$? == 0\n");
+                // The grep command should have already set $CHILD_ERROR correctly
+                output.push_str("$CHILD_ERROR == 0\n");
                 
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
@@ -85,7 +85,7 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
                 let trimmed_command = command.trim_end_matches(";\n").trim_end_matches(';');
                 output.push_str("do { ");
                 output.push_str(&trimmed_command);
-                output.push_str("; $? == 0 }");
+                output.push_str("; $CHILD_ERROR == 0 }");
             }
         } else {
             // For non-literal command names, generate the command and check exit code
@@ -94,7 +94,7 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
             let trimmed_command = command.trim_end_matches(";\n").trim_end_matches(';');
             output.push_str("do { ");
             output.push_str(&trimmed_command);
-            output.push_str("; $? == 0 }");
+            output.push_str("; $CHILD_ERROR == 0 }");
         }
     } else {
         // For other command types, generate the command and check exit code
@@ -103,7 +103,7 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         let trimmed_command = command.trim_end_matches(";\n").trim_end_matches(';');
         output.push_str("do { ");
         output.push_str(&trimmed_command);
-        output.push_str("; $? == 0 }");
+        output.push_str("; $CHILD_ERROR == 0 }");
     }
     
     output.push_str(") {\n");
@@ -137,13 +137,13 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
-    } else if let Command::And(and_left, and_right) = left {
+    } else if let Command::And(_and_left, _and_right) = left {
         // Special handling for AND operations in OR context
         // Use the logical AND generation function to handle the AND operation properly
         let and_result = generator.generate_command(left);
         output.push_str(&and_result);
         output.push_str(&generator.indent());
-        output.push_str("if ($? != 0) {\n");
+        output.push_str("if ($CHILD_ERROR != 0) {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
         output.push_str(&generator.generate_command(right));
@@ -160,7 +160,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                     // For grep commands in logical OR, generate the command and check exit code
                     output.push_str(&generator.generate_command(left));
                     output.push_str(&generator.indent());
-                    output.push_str("if ($? != 0) {\n");
+                    output.push_str("if ($CHILD_ERROR != 0) {\n");
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
                     output.push_str(&generator.generate_command(right));
@@ -176,11 +176,11 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         output.push_str(&generator.generate_command(left));
         
         // Execute right command if left command fails
-        // For diff commands, check $diff_exit_code; for others, check $?
+        // For diff commands, check $diff_exit_code; for others, check $CHILD_ERROR
         let exit_code_var = if contains_diff_command(left) {
             "$diff_exit_code"
         } else {
-            "$?"
+            "$CHILD_ERROR"
         };
         
         output.push_str(&generator.indent());

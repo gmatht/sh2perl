@@ -1,0 +1,14 @@
+# Perl::Critic configuration for sh2perl generated code
+# This configuration disables violations 2, 3, and 5 but keeps 1, 4, 6
+
+# Disable specific violations that are acceptable for generated code
+[ValuesAndExpressions::ProhibitMagicNumbers]
+severity = 5
+
+# Note: Modules::RequireVersionVar policy may not be available
+# The "No package-scoped $VERSION variable found" violation may not be suppressible
+
+# Keep violations 1, 4, 6 enabled (they should still be detected):
+# Violation 1: Loop iterator is not lexical
+# Violation 4: Useless interpolation of literal string  
+# Violation 6: Code is not tidy (enabled - will be detected)

@@ -35,15 +35,27 @@ pub fn generate_gzip_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     if files.is_empty() {
         // No files specified, compress/decompress input
         if decompress_mode {
-            output.push_str(&format!("my $decompressed = `echo \"${}\" | gunzip 2>/dev/null`;\n", input_var));
+            let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+            output.push_str(&format!("my ({});
+my {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | gunzip 2>/dev/null');
+close {} or croak 'Close failed: $!';
+my $decompressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
+close {} or croak 'Close failed: $!';
+waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, input_var, in_var, out_var, out_var, pid_var));
             output.push_str("if (defined $decompressed) {\n");
             output.push_str(&format!("{} = $decompressed;\n", input_var));
             output.push_str("} else {\n");
             output.push_str(&format!("{} = \"gunzip: input not in gzip format\\n\";\n", input_var));
             output.push_str("}\n");
         } else {
-            output.push_str(&format!("my $compressed = `echo \"${}\" | gzip | base64`;\n", input_var));
-            output.push_str("chomp($compressed);\n");
+            let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+            output.push_str(&format!("my ({});
+my {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | gzip | base64');
+close {} or croak 'Close failed: $!';
+my $compressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
+close {} or croak 'Close failed: $!';
+waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, input_var, in_var, out_var, out_var, pid_var));
+            output.push_str("chomp $compressed;\n");
             output.push_str(&format!("{} = $compressed;\n", input_var));
         }
     } else {
@@ -54,7 +66,13 @@ pub fn generate_gzip_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 // Decompress file
                 output.push_str(&format!("if (-f {}) {{\n", file));
                 output.push_str(&format!("if ({}.gz =~ {}) {{\n", file, generator.format_regex_pattern(r"\\.gz$")));
-                output.push_str(&format!("my $decompressed = `gunzip -c {}.gz`;\n", file));
+                let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+                output.push_str(&format!("my ({});
+my {} = open3({}, {}, {}, 'gunzip', '-c', '{}.gz');
+close {} or croak 'Close failed: $!';
+my $decompressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
+close {} or croak 'Close failed: $!';
+waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, file, in_var, out_var, out_var, pid_var));
                 output.push_str("if (defined $decompressed) {\n");
                 output.push_str(&format!("push @results, \"Decompressed: {}\";\n", file));
                 output.push_str("} else {\n");
@@ -74,8 +92,14 @@ pub fn generate_gzip_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 } else {
                     format!("gzip {}", file)
                 };
-                output.push_str(&format!("my $result = `{}`;\n", gzip_cmd));
-                output.push_str("if ($? == 0) {\n");
+                let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+                output.push_str(&format!("my ({});
+my {} = open3({}, {}, {}, 'bash', '-c', '{}');
+close {} or croak 'Close failed: $!';
+my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
+close {} or croak 'Close failed: $!';
+waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, gzip_cmd, in_var, out_var, out_var, pid_var));
+                output.push_str("if ($CHILD_ERROR == 0) {\n");
                 output.push_str(&format!("push @results, \"Compressed: {}\";\n", file));
                 output.push_str("} else {\n");
                 output.push_str(&format!("push @results, \"Failed to compress: {}\";\n", file));

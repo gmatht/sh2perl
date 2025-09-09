@@ -51,7 +51,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str("}\n");
                 output.push_str("if (!-d $dest_dir) {\n");
                 output.push_str("make_path($dest_dir, {error => \\$err});\n");
-                output.push_str("if (@$err) {\n");
+                output.push_str("if (@{$err}) {\n");
                 output.push_str(&format!("die \"cp: cannot create directory $dest_dir: $err->[0]\\n\";\n"));
                 output.push_str("}\n");
                 output.push_str("}\n");
@@ -71,7 +71,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&format!("if (copy({}, $dest)) {{\n", source));
                 if preserve {
                     output.push_str("my ($atime, $mtime) = (stat($source))[8,9];\n");
-                    output.push_str("utime($atime, $mtime, $dest);\n");
+                    output.push_str("utime $atime, $mtime, $dest;\n");
                 }
                 output.push_str(&format!("print \"cp: copied {} to $dest\\n\";\n", source));
                 output.push_str("} else {\n");
@@ -87,7 +87,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&format!("if (copy({}, $dest)) {{\n", source));
                 if preserve {
                     output.push_str("my ($atime, $mtime) = (stat($source))[8,9];\n");
-                    output.push_str("utime($atime, $mtime, $dest);\n");
+                    output.push_str("utime $atime, $mtime, $dest;\n");
                 }
                 output.push_str(&format!("print \"cp: copied {} to $dest\\n\";\n", source));
                 output.push_str("} else {\n");

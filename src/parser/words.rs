@@ -802,6 +802,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
 }
 
 // Placeholder functions - these would need to be implemented based on the actual AST structures
+
 fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     use crate::ast::{StringInterpolation, StringPart};
     
@@ -1559,7 +1560,29 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
     // Remove the surrounding backticks
     let command_text = &backtick_text[1..backtick_text.len()-1];
     
-    // Check if the command contains a pipeline (|)
+    // Check if the command contains logical operators or pipelines
+    if command_text.contains("&&") {
+        // Parse as AND operation
+        let and_parts: Vec<&str> = command_text.split("&&").collect();
+        if and_parts.len() == 2 {
+            let left_cmd = parse_simple_command_from_text(and_parts[0].trim())?;
+            let right_cmd = parse_simple_command_from_text(and_parts[1].trim())?;
+            let and_command = Command::And(Box::new(left_cmd), Box::new(right_cmd));
+            return Ok(Word::CommandSubstitution(Box::new(and_command), None));
+        }
+    }
+    
+    if command_text.contains("||") {
+        // Parse as OR operation
+        let or_parts: Vec<&str> = command_text.split("||").collect();
+        if or_parts.len() == 2 {
+            let left_cmd = parse_simple_command_from_text(or_parts[0].trim())?;
+            let right_cmd = parse_simple_command_from_text(or_parts[1].trim())?;
+            let or_command = Command::Or(Box::new(left_cmd), Box::new(right_cmd));
+            return Ok(Word::CommandSubstitution(Box::new(or_command), None));
+        }
+    }
+    
     if command_text.contains('|') {
         // Parse as a pipeline
         let pipeline_parts: Vec<&str> = command_text.split('|').collect();
@@ -1576,41 +1599,85 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
             Ok(Word::CommandSubstitution(Box::new(pipeline), None))
         }
     } else {
-        // Parse as a simple command (original logic)
-        let parts: Vec<&str> = command_text.split_whitespace().collect();
-        if parts.is_empty() {
-            return Err(ParserError::InvalidSyntax("Empty command in backticks".to_string()));
-        }
-        
-        let name = Word::Literal(parts[0].to_string(), None);
-        let args: Vec<Word> = parts[1..].iter().map(|&s| Word::Literal(s.to_string(), None)).collect();
-        
-        let cmd = Command::Simple(SimpleCommand {
-            name,
-            args,
-            redirects: vec![],
-            env_vars: HashMap::new(),
-            stdout_used: true,
-            stderr_used: true,
-        });
-        
+        // Parse as a simple command using proper parsing instead of split_whitespace
+        let cmd = parse_simple_command_from_text(command_text.trim())?;
         Ok(Word::CommandSubstitution(Box::new(cmd), None))
     }
 }
 
 // Helper function to parse a simple command from text
 fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
-    let cmd_parts: Vec<&str> = text.split_whitespace().collect();
-    if cmd_parts.is_empty() {
-        return Err(ParserError::InvalidSyntax("Empty command in process substitution".to_string()));
+    use crate::lexer::{Lexer, Token};
+    
+    // Create a lexer for the command text
+    let mut lexer = Lexer::new(text);
+    let mut args = Vec::new();
+    let mut current_arg = String::new();
+    let mut in_quotes = false;
+    let mut quote_char = '\0';
+    
+    // Process tokens and group them into arguments
+    while let Some(token) = lexer.next() {
+        match token {
+            Token::Space => {
+                if in_quotes {
+                    current_arg.push(' ');
+                } else if !current_arg.is_empty() {
+                    args.push(current_arg.clone());
+                    current_arg.clear();
+                }
+            }
+            Token::Comment => break, // Stop at comments
+            _ => {
+                // Get the token text from the current position
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+                    
+                    // Handle quoted strings
+                    if (token_text.starts_with('"') || token_text.starts_with('\'')) && !in_quotes {
+                        quote_char = token_text.chars().next().unwrap();
+                        if token_text.ends_with(quote_char) && token_text.len() > 1 {
+                            // Complete quoted string in one token
+                            current_arg.push_str(&token_text[1..token_text.len()-1]);
+                        } else {
+                            // Start of quoted string
+                            in_quotes = true;
+                            current_arg.push_str(&token_text[1..]);
+                        }
+                    } else if in_quotes && token_text.ends_with(quote_char) {
+                        // End of quoted string
+                        current_arg.push_str(&token_text[..token_text.len()-1]);
+                        in_quotes = false;
+                    } else {
+                        // Regular token - add to current argument
+                        current_arg.push_str(token_text);
+                    }
+                }
+            }
+        }
     }
     
-    let name = Word::Literal(cmd_parts[0].to_string(), None);
-    let args: Vec<Word> = cmd_parts[1..].iter().map(|&s| Word::Literal(s.to_string(), None)).collect();
+    // Add the last argument if it exists
+    if !current_arg.is_empty() {
+        args.push(current_arg);
+    }
+    
+    if args.is_empty() {
+        return Err(ParserError::InvalidSyntax("Empty command in backticks".to_string()));
+    }
+    
+    // First argument is the command name
+    let name = Word::Literal(args[0].clone(), None);
+    
+    // Remaining arguments
+    let mut word_args = Vec::new();
+    for arg in &args[1..] {
+        word_args.push(Word::Literal(arg.clone(), None));
+    }
     
     let cmd = Command::Simple(SimpleCommand {
         name,
-        args,
+        args: word_args,
         redirects: vec![],
         env_vars: HashMap::new(),
         stdout_used: true,
