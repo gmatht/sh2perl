@@ -550,7 +550,7 @@ pub fn convert_extglob_to_perl_regex_impl(generator: &Generator, pattern: &str) 
                     } else {
                         // No dot found, treat the whole pattern as negated
                         let negated_pattern = pattern_after_open;
-                        let after_pattern = "";
+                        let _after_pattern = "";
                         
 //                         eprintln!("DEBUG: No dot found - negated_pattern: '{}', after_pattern: '{}'", negated_pattern, after_pattern);
                         

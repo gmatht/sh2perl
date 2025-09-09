@@ -66,7 +66,7 @@ fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, inp
     generate_tr_buffered_impl_with_output(generator, cmd, input_var, command_index, &format!("tr_result_{}", command_index))
 }
 
-fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
+fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str, output_var: &str) -> String {
     let mut output = String::new();
     
     // tr command syntax: tr [OPTION]... SET1 [SET2]

@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize, is_final_command: bool) -> String {
+pub fn generate_diff_command(generator: &mut Generator, _cmd: &SimpleCommand, _input_var: &str, _command_index: usize, _is_final_command: bool) -> String {
     let mut output = String::new();
     
     // Check if we have environment variables for diff temp files
@@ -24,11 +24,11 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     output.push_str(&generator.indent());
     output.push_str("    \n");
     output.push_str(&generator.indent());
-    output.push_str("    if (open(my $fh1, '<', $file1)) {\n");
+    output.push_str("    if (open my $fh1, '<', $file1) {\n");
     output.push_str(&generator.indent());
     output.push_str("        while (my $line = <$fh1>) {\n");
     output.push_str(&generator.indent());
-    output.push_str("            chomp($line);\n");
+    output.push_str("            chomp $line;\n");
     output.push_str(&generator.indent());
     output.push_str("            push @file1_lines, $line;\n");
     output.push_str(&generator.indent());
@@ -40,11 +40,11 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     output.push_str(&generator.indent());
     output.push_str("    \n");
     output.push_str(&generator.indent());
-    output.push_str("    if (open(my $fh2, '<', $file2)) {\n");
+    output.push_str("    if (open my $fh2, '<', $file2) {\n");
     output.push_str(&generator.indent());
     output.push_str("        while (my $line = <$fh2>) {\n");
     output.push_str(&generator.indent());
-    output.push_str("            chomp($line);\n");
+    output.push_str("            chomp $line;\n");
     output.push_str(&generator.indent());
     output.push_str("            push @file2_lines, $line;\n");
     output.push_str(&generator.indent());

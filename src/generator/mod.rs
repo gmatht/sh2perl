@@ -115,6 +115,7 @@ impl Generator {
         // Analyze what imports and variables are needed
         let needs_basename = self.needs_basename_import(ast);
         let needs_exit_code = self.needs_exit_code_tracking(ast);
+        let needs_ipc_open3 = self.needs_ipc_open3(ast);
         
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
@@ -126,6 +127,9 @@ impl Generator {
         
         if needs_basename {
             output.push_str("use File::Basename;\n");
+        }
+        if needs_ipc_open3 {
+            output.push_str("use IPC::Open3;\n");
         }
         output.push_str("\n");
         
@@ -177,6 +181,13 @@ impl Generator {
         if !output.ends_with('\n') {
             output.push('\n');
         }
+        
+        // Remove trailing whitespace from all lines
+        let lines: Vec<&str> = output.split('\n').collect();
+        let cleaned_lines: Vec<String> = lines.iter()
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        output = cleaned_lines.join("\n");
         
         output
     }
@@ -355,6 +366,17 @@ impl Generator {
     pub fn get_unique_id(&mut self) -> String {
         let id = GLOBAL_UNIQUE_COUNTER.fetch_add(1, Ordering::SeqCst);
         format!("{}", id)
+    }
+
+    pub fn get_unique_ipc_vars(&mut self) -> (String, String, String, String, String) {
+        let id = self.get_unique_id();
+        (
+            format!("$in_{}", id),
+            format!("$out_{}", id),
+            format!("$err_{}", id),
+            format!("$pid_{}", id),
+            format!("$result_{}", id)
+        )
     }
 
     pub fn add_constant(&mut self, name: &str, value: i64) {
@@ -573,7 +595,7 @@ impl Generator {
         for command in &block.commands {
             if let Command::Simple(cmd) = command {
                 // Check environment variables for arithmetic expressions
-                for (env_var, value) in &cmd.env_vars {
+                for (_env_var, value) in &cmd.env_vars {
                     if let Word::Arithmetic(arith_expr, _) = value {
                         // Extract variable names from arithmetic expression
                         // Simple approach: look for identifiers in the expression
@@ -776,7 +798,7 @@ impl Generator {
                 // Simple pipelines like "cmd1 | cmd2" don't need it
                 pipeline.commands.len() > 2
             },
-            Command::And(left, right) | Command::Or(left, right) => {
+            Command::And(_left, _right) | Command::Or(_left, _right) => {
                 // Logical operators need exit code tracking
                 true
             },
@@ -812,6 +834,81 @@ impl Generator {
             },
             _ => false
         }
+    }
+    
+    /// Check if the AST needs IPC::Open3
+    fn needs_ipc_open3(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_ipc_open3(command) {
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Check if a specific command needs IPC::Open3
+    fn command_needs_ipc_open3(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                // Check if it's a command that uses open3
+                if let Word::Literal(name, _) = &cmd.name {
+                    // Commands that typically use open3 for IPC
+                    match name.as_str() {
+                        "pwd" | "whoami" | "date" | "id" | "uname" | "hostname" | "uptime" | "w" | "who" => true,
+                        _ => {
+                            // Check if it's a pipeline command or has complex arguments
+                            cmd.args.len() > 0 || self.is_pipeline_command(name)
+                        }
+                    }
+                } else {
+                    // Non-literal command names often need open3
+                    true
+                }
+            },
+            Command::Pipeline(pipeline) => {
+                // Pipelines need IPC::Open3
+                true
+            },
+            Command::And(left, right) | Command::Or(left, right) => {
+                self.command_needs_ipc_open3(left) || self.command_needs_ipc_open3(right)
+            },
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_ipc_open3(&redirect_cmd.command)
+            },
+            Command::For(for_loop) => {
+                for cmd in &for_loop.body.commands {
+                    if self.command_needs_ipc_open3(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::While(while_loop) => {
+                for cmd in &while_loop.body.commands {
+                    if self.command_needs_ipc_open3(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::If(if_stmt) => {
+                if self.command_needs_ipc_open3(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_ipc_open3(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+    
+    /// Check if a command name is typically used in pipelines
+    fn is_pipeline_command(&self, name: &str) -> bool {
+        matches!(name, "grep" | "sed" | "awk" | "cut" | "sort" | "uniq" | "head" | "tail" | "wc" | "tr" | "cat" | "echo" | "printf")
     }
     
     /// Generate a properly formatted regex pattern with appropriate flags

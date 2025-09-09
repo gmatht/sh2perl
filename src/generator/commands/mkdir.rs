@@ -37,7 +37,7 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
             if create_parents {
                 output.push_str(&format!("if (!-d \"{}\") {{\n", dir));
                 output.push_str(&format!("make_path(\"{}\", {{error => \\$err}});\n", dir));
-                output.push_str("if (@$err) {\n");
+                output.push_str("if (@{$err}) {\n");
                 output.push_str(&format!("croak \"mkdir: cannot create directory {}: $err->[0]\\n\";\n", dir));
                 output.push_str("} else {\n");
                 output.push_str(&format!("print \"mkdir: created directory {}\\n\";\n", dir));

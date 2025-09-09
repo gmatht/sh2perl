@@ -13,7 +13,7 @@ pub fn generate_sleep_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         if cmd.args.len() == 1 {
             // Single argument - use directly
             let duration_str = generator.word_to_perl(&cmd.args[0]);
-            output.push_str(&format!("sleep({});\n", duration_str));
+            output.push_str(&format!("sleep {};\n", duration_str));
         } else {
             // Multiple arguments - sum them together
             output.push_str("my $total_sleep = 0;\n");
@@ -21,12 +21,12 @@ pub fn generate_sleep_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                 let duration_str = generator.word_to_perl(arg);
                 output.push_str(&format!("$total_sleep += {};\n", duration_str));
             }
-            output.push_str("sleep($total_sleep);\n");
+            output.push_str("sleep $total_sleep;\n");
         }
     } else {
         // Default to 1 second if no argument provided
         output.push_str("use Time::HiRes qw(sleep);\n");
-        output.push_str("sleep(1);\n");
+        output.push_str("sleep 1;\n");
     }
     
     output

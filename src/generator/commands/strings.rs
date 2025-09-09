@@ -25,7 +25,7 @@ pub fn generate_strings_command(generator: &mut Generator, cmd: &SimpleCommand, 
     output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
     output.push_str("my @result;\n");
     output.push_str("foreach my $line (@lines) {\n");
-    output.push_str("chomp($line);\n");
+    output.push_str("chomp $line;\n");
     output.push_str(&format!("if (length($line) >= {}) {{\n", min_length));
     output.push_str(&format!("if ($line =~ {}) {{\n", generator.format_regex_pattern(r"^[\\x20-\\x7E]+$"))); // Printable ASCII only
     output.push_str("push @result, $line;\n");
