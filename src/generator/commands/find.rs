@@ -57,7 +57,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     let subroutine_name = format!("find_files_{}", subroutine_id);
     
     // Parse find arguments to understand what we're looking for
-    let mut start_path = ".".to_string();
+    let mut _start_path = ".".to_string();
     let mut name_pattern = None;
     let mut file_type = None;
     let mut mtime_days = None;
@@ -187,7 +187,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                                     break;
                                 }
                                 exec_args.push(exec_arg.clone());
-                            } else if let Word::BraceExpansion(be, _) = &reconstructed_args[i] {
+                            } else if let Word::BraceExpansion(_be, _) = &reconstructed_args[i] {
                                 // Handle {} placeholder - even if empty
                                 exec_args.push("{}".to_string());
                             } else {
@@ -223,7 +223,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                     _ => {
                         // This might be the starting path
                         if i == 0 {
-                            start_path = s.clone();
+                            _start_path = s.clone();
                         }
                     }
                 }
@@ -238,7 +238,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                             _ => ".".to_string(),
                         })
                         .collect::<String>();
-                    start_path = path;
+                    _start_path = path;
                 }
             },
             _ => {}
@@ -492,47 +492,43 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
 fn generate_system_find_fallback(generator: &mut Generator, cmd: &SimpleCommand, generate_output: bool, input_var: &str) -> String {
     let mut output = String::new();
     
-    // Build the find command arguments
-    let mut find_args = vec!["find".to_string()];
+    // Build the find command arguments for open3
+    let mut find_args = Vec::new();
     for arg in &cmd.args {
         match arg {
-            Word::Literal(s, _) => find_args.push(s.clone()),
+            Word::Literal(s, _) => {
+                let word = Word::Literal(s.clone(), Default::default());
+                find_args.push(generator.perl_string_literal(&word));
+            },
             Word::StringInterpolation(interp, _) => {
-                let arg_str = interp.parts.iter()
-                    .map(|part| match part {
-                        StringPart::Literal(s) => s.clone(),
-                        StringPart::Variable(var) => format!("$ENV{{{}}}", var),
-                        StringPart::MapAccess(map, key) => format!("$ENV{{{}}}[{}]", map, key),
-                        StringPart::ParameterExpansion(param) => format!("$ENV{{{}}}", param),
-                        StringPart::MapKeys(_) => "*".to_string(), // Fallback for unsupported
-                        StringPart::MapLength(_) => "*".to_string(), // Fallback for unsupported
-                        StringPart::ArraySlice(_, _, _) => "*".to_string(), // Fallback for unsupported
-                        StringPart::Arithmetic(_) => "*".to_string(), // Fallback for unsupported
-                        StringPart::CommandSubstitution(_) => "*".to_string(), // Fallback for unsupported
-                    })
-                    .collect::<String>();
-                find_args.push(arg_str);
+                // Use the convert_string_interpolation_to_perl function directly
+                find_args.push(generator.convert_string_interpolation_to_perl(interp));
             },
             _ => {
                 // For other word types, convert to Perl
-                find_args.push(generator.word_to_perl(arg));
+                find_args.push(generator.perl_string_literal(arg));
             }
         }
     }
     
-    // Join arguments with spaces and escape properly
-    let find_cmd = find_args.join(" ");
-    
     if generate_output {
         // For pipeline context, capture output to variable
         output.push_str(&generator.indent());
-        output.push_str(&format!("${} = `{}`;\n", input_var, find_cmd));
+        let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+        let formatted_args = find_args.join(", ");
+        output.push_str(&format!("my ({});
+my {} = open3({}, {}, {}, 'find', {});
+close {} or croak 'Close failed: $!';
+${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
+close {} or croak 'Close failed: $!';
+waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, input_var, out_var, out_var, pid_var));
         output.push_str(&generator.indent());
-        output.push_str(&format!("chomp(${});\n", input_var));
+        output.push_str(&format!("chomp ${};\n", input_var));
     } else {
         // For standalone commands, execute directly
         output.push_str(&generator.indent());
-        output.push_str(&format!("system \"{}\";\n", find_cmd));
+        let formatted_args = find_args.join(", ");
+        output.push_str(&format!("system 'find', {};\n", formatted_args));
     }
     
     output

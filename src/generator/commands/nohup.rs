@@ -30,10 +30,10 @@ pub fn generate_nohup_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         output.push_str("setsid();\n"); // Create new session
         
         // Redirect output
-        output.push_str("if (open(my $fh, '>', $ENV{NOHUP_OUT})) {\n");
+        output.push_str("if (open my $fh, '>', $ENV{NOHUP_OUT}) {\n");
         output.push_str("dup2(fileno($fh), STDOUT->fileno());\n");
         output.push_str("dup2(fileno($fh), STDERR->fileno());\n");
-        output.push_str("close($fh);\n");
+        output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
         output.push_str("}\n");
         
         // Execute the command

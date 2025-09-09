@@ -66,7 +66,12 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         output.push_str("}\n");
     } else {
         // Fallback to system command for other cases
-        output.push_str(&format!("${} = `echo \"${}\" | {}`;\n", input_var, input_var, command));
+        output.push_str(&format!("my ($in, $out, $err);
+my $pid = open3($in, $out, $err, 'bash', '-c', 'echo \"${}\" | {}');
+close $in or croak 'Close failed: $!';
+${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
+close $out or croak 'Close failed: $!';
+waitpid $pid, 0;\n", input_var, input_var, command));
     }
     output.push_str("\n");
     

@@ -51,7 +51,7 @@ impl Parser {
         }
         
         while !self.lexer.is_eof() {
-            let current_token = self.lexer.peek();
+            let _current_token = self.lexer.peek();
             
             if self.lexer.is_eof() {
                 break;
@@ -758,7 +758,7 @@ impl Parser {
                         Token::Identifier => {
                             // Check if we're at a newline boundary - if so, this identifier
                             // might be the start of a new command, not an argument
-                            let current_pos = self.lexer.get_position();
+                            let _current_pos = self.lexer.get_position();
                             
                             // Look backwards to see if there was a newline before this identifier
                             // This is a heuristic to detect command boundaries

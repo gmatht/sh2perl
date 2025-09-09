@@ -57,7 +57,7 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             output.push_str("$dest_dir =~ s/\\/[^\\/]*$//;\n");
             output.push_str("if ($dest_dir ne q{} && !-d $dest_dir) {\n");
             output.push_str("make_path($dest_dir, {error => \\$err});\n");
-            output.push_str("if (@$err) {\n");
+            output.push_str("if (@{$err}) {\n");
             output.push_str("die \"mv: cannot create directory $dest_dir: $err->[0]\\n\";\n");
             output.push_str("}\n");
             output.push_str("}\n");

@@ -1,0 +1,190 @@
+#!/usr/bin/perl
+use locale;
+
+# Example 003: Basic ls command using system() and backticks
+# This demonstrates the ls builtin called from Perl
+
+print "=== Example 003: Basic ls command ===\n";
+
+# Simple ls command using backticks
+print "Using backticks to call ls:\n";
+my $ls_output = do {
+my @ls_files = ();
+if (opendir my $dh, '.') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        push @ls_files, $file;
+    }
+    closedir $dh;
+    @ls_files = sort @ls_files;
+}
+(@ls_files ? join("\n", @ls_files) . "\n" : "")
+};
+print $ls_output;
+
+# ls with specific directory using system()
+print "\nls with specific directory:\n";
+if (-d 'src') {
+    DEBUG: ls command directory argument (from interpolation): 'src'
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+
+my $main_exit_code = 0;
+
+my @ls_files = ();
+if (opendir my $dh, 'src') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        push @ls_files, $file;
+    }
+    closedir $dh;
+    @ls_files = sort @ls_files;
+}
+if (@ls_files) {
+    print join "\n", @ls_files, "\n";
+};
+} else {
+    print "src directory not found, listing current directory:\n";
+    #!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+
+my $main_exit_code = 0;
+
+my @ls_files = ();
+if (opendir my $dh, '.') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        push @ls_files, $file;
+    }
+    closedir $dh;
+    @ls_files = sort @ls_files;
+}
+if (@ls_files) {
+    print join "\n", @ls_files, "\n";
+};
+}
+
+# Lets not try to implement cross-platform linux permission bits right now.
+# ls with options using backticks
+# print "\nls -l (long format):\n";
+# my $long_output = `ls -l`;
+# print $long_output;
+
+# ls with file type filtering using system()
+print "\nls -p (directories with / suffix):\n";
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+
+my $main_exit_code = 0;
+
+my @ls_files = ();
+if (opendir my $dh, '.') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        if (-d "./$file") {
+            push @ls_files, "$file/";
+        } else {
+            push @ls_files, $file;
+        }
+    }
+    closedir $dh;
+    @ls_files = sort @ls_files;
+}
+if (@ls_files) {
+    print join "\n", @ls_files, "\n";
+};
+
+# ls with hidden files using backticks
+print "\nls -a (including hidden files):\n";
+my $hidden_output = do { my @ls_files = ();
+if (opendir my $dh, '.') {
+    while (my $file = readdir $dh) {
+        push @ls_files, $file;
+    }
+    closedir $dh;
+    @ls_files = sort @ls_files;
+}
+if (@ls_files) {
+    join "\n", \@ls_files, "\n";
+} };
+print $hidden_output;
+
+# ls with sorting using system()
+print "\nls -t (sorted by modification time):\n";
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+
+my $main_exit_code = 0;
+
+my @ls_files = ();
+if (opendir my $dh, '.') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        push @ls_files, $file;
+    }
+    closedir $dh;
+    @ls_files = sort { -M "./$b" <=> -M "./$a" } @ls_files;
+}
+if (@ls_files) {
+    print join "\n", @ls_files, "\n";
+};
+
+# ls with specific pattern using backticks
+print "\nls *.pl (Perl files only):\n";
+my $perl_files = do {
+my @ls_files = ();
+@ls_files = glob('*.pl');
+@ls_files = sort @ls_files;
+(@ls_files ? join("\n", @ls_files) . "\n" : "")
+};
+if ($perl_files) {
+    print $perl_files;
+} else {
+    print "No .pl files found\n";
+}
+
+# ls with multiple directories using system()
+print "\nls multiple directories:\n";
+if (-d 'src') {
+DEBUG: ls command directory argument (from interpolation): '.'
+DEBUG: ls command directory argument (from interpolation): 'src'
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+
+my $main_exit_code = 0;
+
+my @ls_files = ();
+if (opendir my $dh, 'src') {
+    while (my $file = readdir $dh) {
+        next if $file eq q{.} || $file eq q{..} || $file =~ /^\./;
+        push @ls_files, $file;
+    }
+    closedir $dh;
+    @ls_files = sort @ls_files;
+}
+if (@ls_files) {
+    print join "\n", @ls_files, "\n";
+}
+};
+
+print "=== Example 003 completed successfully ===\n";

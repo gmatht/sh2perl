@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_tail_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize) -> String {
+pub fn generate_tail_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: usize) -> String {
     let mut output = String::new();
     
     // tail command syntax: tail [options] [file...]
@@ -38,10 +38,10 @@ pub fn generate_tail_command(_generator: &mut Generator, cmd: &SimpleCommand, in
     
     output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
     output.push_str(&format!("my $num_lines = {};\n", num_lines));
-    output.push_str("if ($num_lines > scalar(@lines)) {\n");
-    output.push_str("$num_lines = scalar(@lines);\n");
+    output.push_str("if ($num_lines > scalar @lines) {\n");
+    output.push_str("$num_lines = scalar @lines;\n");
     output.push_str("}\n");
-    output.push_str("my $start_index = scalar(@lines) - $num_lines;\n");
+    output.push_str("my $start_index = scalar @lines - $num_lines;\n");
     output.push_str("if ($start_index < 0) { $start_index = 0; }\n");
     output.push_str("my @result = @lines[$start_index..$#lines];\n");
     output.push_str(&format!("{} = join \"\\n\", @result;\n", input_var));
