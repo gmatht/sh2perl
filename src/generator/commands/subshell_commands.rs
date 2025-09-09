@@ -47,7 +47,7 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
     output.push_str("} else {\n");
     generator.indent_level += 1;
     output.push_str(&generator.indent());
-    output.push_str("die \"Cannot fork: $!\\n\";\n");
+    output.push_str("die \"Cannot fork: $ERRNO\\n\";\n");
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("}\n");

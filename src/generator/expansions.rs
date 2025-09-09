@@ -51,7 +51,7 @@ pub fn generate_parameter_expansion_impl(generator: &mut Generator, pe: &Paramet
         }
         ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
             // ${var%%suffix} - remove longest suffix
-            format!("${{{}}} =~ s/{}$//gr", pe.variable, escape_regex_pattern(pattern))
+            format!("${{{}}} =~ s/{}$//grs", pe.variable, escape_regex_pattern(pattern))
         }
         ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
             // ${var#prefix} - remove shortest prefix
@@ -59,11 +59,11 @@ pub fn generate_parameter_expansion_impl(generator: &mut Generator, pe: &Paramet
         }
         ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
             // ${var##prefix} - remove longest prefix
-            format!("${{{}}} =~ s/^{}//gr", pe.variable, escape_regex_pattern(pattern))
+            format!("${{{}}} =~ s/^{}//grs", pe.variable, escape_regex_pattern(pattern))
         }
         ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
             // ${var//pattern/replacement} - substitute all occurrences
-            format!("${{{}}} =~ s/{}/{}/gr", 
+            format!("${{{}}} =~ s/{}/{}/grs", 
                    pe.variable, 
                    escape_regex_pattern(pattern),
                    escape_regex_replacement(replacement))

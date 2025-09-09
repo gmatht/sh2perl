@@ -59,9 +59,9 @@ pub fn generate_nice_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         
         // Execute the command
         if args.is_empty() {
-            output.push_str(&format!("system({});\n", command));
+            output.push_str(&format!("system {};\n", command));
         } else {
-            output.push_str(&format!("system({}, @args);\n", command));
+            output.push_str(&format!("system {}, @args;\n", command));
         }
         
         // Restore original priority
