@@ -27,7 +27,7 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str("    while (my $line = <$fh1>) {\n");
             result.push_str(&generator.indent());
-            result.push_str("        chomp($line);\n");
+            result.push_str("        chomp $line;\n");
             result.push_str(&generator.indent());
             result.push_str(&format!("        push @paste_file1_lines_{}, $line;\n", paste_id));
             result.push_str(&generator.indent());
@@ -43,7 +43,7 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str("    while (my $line = <$fh2>) {\n");
             result.push_str(&generator.indent());
-            result.push_str("        chomp($line);\n");
+            result.push_str("        chomp $line;\n");
             result.push_str(&generator.indent());
             result.push_str(&format!("        push @paste_file2_lines_{}, $line;\n", paste_id));
             result.push_str(&generator.indent());

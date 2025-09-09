@@ -61,10 +61,28 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                               .replace("\r", "\\r");
                 format!("\"{}\"", escaped)
             } else {
-                // Use single quotes for strings that don't need interpolation
-                let escaped = s.replace("\\", "\\\\")
-                              .replace("'", "\\'");
-                format!("'{}'", escaped)
+                // Check if string contains newlines, tabs, or carriage returns
+                // If it does, we need to use double quotes with escape sequences
+                if s.contains('\n') || s.contains('\t') || s.contains('\r') {
+                    // Use double quotes and escape special characters
+                    let escaped = s.replace("\\", "\\\\")
+                                  .replace("\"", "\\\"")
+                                  .replace("\n", "\\n")
+                                  .replace("\t", "\\t")
+                                  .replace("\r", "\\r");
+                    format!("\"{}\"", escaped)
+                } else {
+                    // Use q{} for single characters to avoid "noisy quotes" violations
+                    // Use single quotes for longer strings that don't need interpolation
+                    if s.len() == 1 {
+                        // Always use q{} for single characters to avoid Perl::Critic violations
+                        format!("q{{{}}}", s)
+                    } else {
+                        let escaped = s.replace("\\", "\\\\")
+                                      .replace("'", "\\'");
+                        format!("'{}'", escaped)
+                    }
+                }
             }
         }
         Word::Variable(var, _, _) => {
@@ -102,6 +120,13 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             // For backtick commands, we need to return the value, not print it
                             // The generate_ls_for_substitution already returns the joined string
                             perl_code
+                        } else if name == "find" {
+                            // Use the find command handler for proper conversion
+                            let perl_code = crate::generator::commands::find::generate_find_command(generator, simple_cmd, true, "found_files");
+                            
+                            // For backtick commands, we need to return the value, not print it
+                            // The generate_find_command already returns the joined string
+                            perl_code
                         } else if generator.inline_mode && cmd_name == "echo" {
                             // In inline mode for echo, generate the output value directly
                             if simple_cmd.args.is_empty() {
@@ -110,7 +135,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 let args: Vec<String> = simple_cmd.args.iter()
                                     .map(|arg| generator.word_to_perl(arg))
                                     .collect();
-                                format!("{} . \"\\n\"", args.join(" . \" \" . "))
+                                format!("{} . \"\\n\"", args.join(" . q{ } . "))
                             }
                         } else if generator.inline_mode {
                             // In inline mode, generate inline Perl code for other builtins
@@ -119,10 +144,11 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 .map(|arg| generator.word_to_perl(arg))
                                 .collect();
                             
+                            let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
                             if args.is_empty() {
-                                format!("`{}`", cmd_name)
+                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                             } else {
-                                format!("`{} {}`", cmd_name, args.join(" "))
+                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         } else {
                             // Fall back to system command for non-ls commands
@@ -130,10 +156,11 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 .map(|arg| generator.word_to_perl(arg))
                                 .collect();
                             
+                            let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
                             if args.is_empty() {
-                                format!("`{}`", cmd_name)
+                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                             } else {
-                                format!("`{} {}`", cmd_name, args.join(" "))
+                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         }
                     } else {
@@ -142,10 +169,11 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             .map(|arg| generator.word_to_perl(arg))
                             .collect();
                         
+                        let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
                         if args.is_empty() {
-                            format!("`{}`", cmd_name)
+                            format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                         } else {
-                            format!("`{} {}`", cmd_name, args.join(" "))
+                            format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
                         }
                     }
                 },
@@ -209,7 +237,8 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 },
                 _ => {
                     // For other command types, use system command fallback
-                    format!("`{}`", generator.generate_command_string_for_system(cmd))
+                    let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+                    format!(" my ({}); my {} = open3({}, {}, {}, 'bash', '-c', '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd), in_var, result_var, out_var, out_var, pid_var, result_var)
                 }
             }
         }
@@ -245,10 +274,18 @@ pub fn strip_shell_quotes_and_convert_to_perl_impl(generator: &mut Generator, wo
                                     .replace("\r", "\\r");
                 format!("\"{}\"", escaped)
             } else {
-                // Use single quotes for strings that don't need interpolation
-                let escaped = stripped.replace("\\", "\\\\")
-                                    .replace("'", "\\'");
-                format!("'{}'", escaped)
+                // Use q{} for single characters to avoid "noisy quotes" violations
+                if stripped.len() == 1 && !stripped.contains('\'') && !stripped.contains('{') && !stripped.contains('}') {
+                    format!("q{{{}}}", stripped)
+                } else if stripped.len() == 1 && stripped.contains('\'') {
+                    // Handle single quotes in single character strings
+                    format!("q{{{}}}", stripped)
+                } else {
+                    // Use single quotes for strings that don't need interpolation
+                    let escaped = stripped.replace("\\", "\\\\")
+                                        .replace("'", "\\'");
+                    format!("'{}'", escaped)
+                }
             }
         }
         Word::Arithmetic(expr, _) => {

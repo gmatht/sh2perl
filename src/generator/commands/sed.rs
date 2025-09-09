@@ -9,7 +9,7 @@ pub fn generate_sed_command(_generator: &mut Generator, cmd: &SimpleCommand, inp
     output.push_str(&format!("my @sed_lines_{} = split /\\n/msx, ${};\n", command_index, input_var));
     output.push_str(&format!("my @sed_result_{};\n", command_index));
     output.push_str(&format!("foreach my $line (@sed_lines_{}) {{\n", command_index));
-    output.push_str("chomp($line);\n");
+    output.push_str("chomp $line;\n");
     
     // Handle common sed operations
     if !cmd.args.is_empty() {
@@ -18,7 +18,7 @@ pub fn generate_sed_command(_generator: &mut Generator, cmd: &SimpleCommand, inp
                 // Basic substitution: s/pattern/replacement/
                 if cmd.args.len() >= 3 {
                     // Arguments are split: "s/pattern/", replacement, "/"
-                    if let (Word::Literal(pattern_part, _), replacement_arg, Word::Literal(end_part, _)) = 
+                    if let (Word::Literal(pattern_part, _), replacement_arg, Word::Literal(_end_part, _)) = 
                         (&cmd.args[0], &cmd.args[1], &cmd.args[2]) {
                         
                         // Extract pattern from "s/pattern/"
@@ -32,7 +32,7 @@ pub fn generate_sed_command(_generator: &mut Generator, cmd: &SimpleCommand, inp
                             _ => "".to_string(),
                         };
                         
-                        output.push_str(&format!("$line =~ s/{}/{}/gs;\n", pattern, replacement));
+                        output.push_str(&format!("$line =~ s/{}/{}/gmsx;\n", pattern, replacement));
                     }
                 } else {
                     // Single argument case: s/pattern/replacement/
@@ -40,7 +40,7 @@ pub fn generate_sed_command(_generator: &mut Generator, cmd: &SimpleCommand, inp
                     if parts.len() >= 3 {
                         let pattern = parts[1];
                         let replacement = parts[2];
-                        output.push_str(&format!("$line =~ s/{}/{}/gs;\n", pattern, replacement));
+                        output.push_str(&format!("$line =~ s/{}/{}/gmsx;\n", pattern, replacement));
                     }
                 }
             } else if first_arg == "d" {

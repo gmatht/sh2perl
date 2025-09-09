@@ -57,7 +57,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str(&generator.indent());
                     output.push_str("remove_tree($file_to_remove, {error => \\$err});\n");
                     output.push_str(&generator.indent());
-                    output.push_str("if (@$err) {\n");
+                    output.push_str("if (@{$err}) {\n");
                     generator.indent_level += 1;
                     if force {
                         output.push_str(&generator.indent());
@@ -77,7 +77,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("} else {\n");
                     // File removal
                     output.push_str(&generator.indent());
-                    output.push_str("if (unlink($file_to_remove)) {\n");
+                    output.push_str("if (unlink $file_to_remove) {\n");
                     // Silent operation - no output unless error
                     output.push_str(&generator.indent());
                     output.push_str("} else {\n");
@@ -111,7 +111,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("} else {\n");
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
-                    output.push_str("if (unlink($file_to_remove)) {\n");
+                    output.push_str("if (unlink $file_to_remove) {\n");
                     // Silent operation - no output unless error
                     output.push_str(&generator.indent());
                     output.push_str("} else {\n");
@@ -157,7 +157,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     // Recursive removal
                     output.push_str(&format!("if (-d {}) {{\n", file));
                     output.push_str(&format!("remove_tree({}, {{error => \\$err}});\n", file));
-                    output.push_str("if (@$err) {\n");
+                    output.push_str("if (@{$err}) {\n");
                     if force {
                         output.push_str(&format!("carp \"rm: carping: could not remove \", {}, \": $err->[0]\\n\";\n", file));
                     } else {
@@ -169,7 +169,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("}\n");
                     output.push_str("} else {\n");
                     // File removal
-                    output.push_str(&format!("if (unlink({})) {{\n", file));
+                    output.push_str(&format!("if (unlink {}) {{\n", file));
                     // Silent operation - no output unless error
                     output.push_str("$main_exit_code = 0;\n");
                     output.push_str("} else {\n");
@@ -189,7 +189,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                         output.push_str(&format!("croak \"rm: \", {}, \" is a directory (use -r to remove recursively)\\n\";\n", file));
                     }
                     output.push_str("} else {\n");
-                    output.push_str(&format!("if (unlink({})) {{\n", file));
+                    output.push_str(&format!("if (unlink {}) {{\n", file));
                     // Silent operation - no output unless error
                     output.push_str("$main_exit_code = 0;\n");
                     output.push_str("} else {\n");

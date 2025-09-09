@@ -30,11 +30,11 @@ pub fn generate_tee_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
         
         for file in &files {
             let mode = if append_mode { ">>" } else { ">" };
-            output.push_str(&format!("if (open(my $fh, '{}', {})) {{\n", mode, file));
+            output.push_str(&format!("if (open my $fh, '{}', {}) {{\n", mode, file));
             output.push_str("foreach my $line (@lines) {\n");
-            output.push_str("print $fh \"$line\\n\";\n");
+            output.push_str("print {$fh} \"$line\\n\";\n");
             output.push_str("}\n");
-            output.push_str("close($fh);\n");
+            output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
             output.push_str("} else {\n");
             output.push_str(&format!("carp \"tee: Cannot open {}: $ERRNO\";\n", file));
             output.push_str("}\n");

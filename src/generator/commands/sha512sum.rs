@@ -26,12 +26,19 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
         output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
         output.push_str("my @results;\n");
         output.push_str("foreach my $line (@lines) {\n");
-        output.push_str("chomp($line);\n");
+        output.push_str("chomp $line;\n");
         output.push_str(&format!("if ($line =~ {}) {{\n", generator.format_regex_pattern(r"^([a-f0-9]{128})\\s+(.+)$")));
         output.push_str("my ($expected_hash, $filename) = ($1, $2);\n");
         output.push_str("if (-f $filename) {\n");
-        output.push_str("my $actual_hash = `sha512sum \"$filename\" | cut -d' ' -f1`;\n");
-        output.push_str("chomp($actual_hash);\n");
+        output.push_str("\n");
+        output.push_str("my ($in, $out, $err);\n");
+        output.push_str("my $pid = open3($in, $out, $err, 'sha512sum', \\\"$filename\\\");\n");
+        output.push_str("close $in or croak 'Close failed: $!';\n");
+        output.push_str("my $actual_hash = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };\n");
+        output.push_str("close $out or croak 'Close failed: $!';\n");
+        output.push_str("waitpid $pid, 0;\n");
+        output.push_str("$actual_hash =~ s/\\\\s+.*//; # Remove filename from output\n");
+        output.push_str("chomp $actual_hash;\n");
         output.push_str("if ($expected_hash eq $actual_hash) {\n");
         output.push_str("push @results, \"$filename: OK\";\n");
         output.push_str("} else {\n");
@@ -45,16 +52,30 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
         output.push_str(&format!("{} = join \"\\n\", @results;\n", input_var));
     } else if files.is_empty() {
         // No files specified, calculate hash of input
-        output.push_str(&format!("my $hash = `echo -n \"${}\" | sha512sum | cut -d' ' -f1`;\n", input_var));
-        output.push_str("chomp($hash);\n");
+        output.push_str("\n");
+        output.push_str("my ($in, $out, $err);\n");
+        output.push_str(&format!("my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -n \\\"${}\\\" | sha512sum');\n", input_var));
+        output.push_str("close $in or croak 'Close failed: $!';\n");
+        output.push_str("my $hash = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };\n");
+        output.push_str("close $out or croak 'Close failed: $!';\n");
+        output.push_str("waitpid $pid, 0;\n");
+        output.push_str("$hash =~ s/\\\\s+.*//; # Remove filename from output\n");
+        output.push_str("chomp $hash;\n");
         output.push_str(&format!("{} = $hash;\n", input_var));
     } else {
         // Calculate hashes of specified files
         output.push_str("my @results;\n");
         for file in &files {
             output.push_str(&format!("if (-f {}) {{\n", file));
-            output.push_str(&format!("my $hash = `sha512sum {} | cut -d' ' -f1`;\n", file));
-            output.push_str("chomp($hash);\n");
+            output.push_str("\n");
+            output.push_str("my ($in, $out, $err);\n");
+            output.push_str(&format!("my $pid = open3($in, $out, $err, 'sha512sum', {});\n", file));
+            output.push_str("close $in or croak 'Close failed: $!';\n");
+            output.push_str("my $hash = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };\n");
+            output.push_str("close $out or croak 'Close failed: $!';\n");
+            output.push_str("waitpid $pid, 0;\n");
+            output.push_str("$hash =~ s/\\\\s+.*//; # Remove filename from output\n");
+            output.push_str("chomp $hash;\n");
             output.push_str(&format!("push @results, \"$hash  {}\";\n", file));
             output.push_str("} else {\n");
             output.push_str(&format!("push @results, \"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", file));

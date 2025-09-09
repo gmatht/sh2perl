@@ -126,9 +126,9 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         // Handle response
         output.push_str("if ($response->is_success) {\n");
         if !output_file.is_empty() {
-            output.push_str(&format!("if (open(my $fh, '>', {})) {{\n", output_file));
+            output.push_str(&format!("if (open my $fh, '>', {}) {{\n", output_file));
             output.push_str("print $fh $response->content;\n");
-            output.push_str("close($fh);\n");
+            output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
             output.push_str(&format!("print \"Content saved to {}\\n\";\n", output_file));
             output.push_str("} else {\n");
             output.push_str(&format!("die \"curl: Cannot write to {}: $!\\n\";\n", output_file));

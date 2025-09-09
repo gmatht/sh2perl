@@ -1,11 +1,11 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: usize) -> String {
+pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: usize) -> String {
     let mut output = String::new();
     
     // cut command syntax: cut -d delimiter -f fields
-    let mut delimiter = "\t".to_string(); // Default tab delimiter
+    let mut delimiter = "\\t".to_string(); // Default tab delimiter
     let mut _fields = "1".to_string(); // Default to first field
     
     // Parse cut options
@@ -30,8 +30,8 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
     output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
     output.push_str("my @result;\n");
     output.push_str("foreach my $line (@lines) {\n");
-    output.push_str("chomp($line);\n");
-    output.push_str(&format!("my @fields = split(/{}/, $line);\n", delimiter));
+    output.push_str("chomp $line;\n");
+    output.push_str(&format!("my @fields = split /{}/msx, $line;\n", delimiter));
     
     // Handle field selection (simple implementation for now)
     output.push_str(&format!("if (@fields > 0) {{\n"));

@@ -10,7 +10,7 @@ pub fn generate_which_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         
         output.push_str(&format!("my $command = {};\n", command_str));
         output.push_str("my $found = 0;\n");
-        output.push_str("foreach my $dir (split(/:/, $ENV{PATH})) {\n");
+        output.push_str("foreach my $dir (split /:/, $ENV{PATH}) {\n");
         output.push_str("my $full_path = \"$dir/$command\";\n");
         output.push_str("if (-x $full_path) {\n");
         output.push_str("print \"$full_path\\n\";\n");

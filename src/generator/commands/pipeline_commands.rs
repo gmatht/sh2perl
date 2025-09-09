@@ -13,7 +13,7 @@ fn generate_command_using_builtins(
 ) -> String {
     match command {
         Command::Simple(cmd) => {
-            let cmd_name = match &cmd.name {
+                    let cmd_name = match &cmd.name {
                 Word::Literal(s, _) => s,
                 _ => "unknown_command"
             };
@@ -114,18 +114,45 @@ fn generate_command_using_builtins(
                                 output.push_str(&echo_output);
                             } else {
                                 // For other commands, execute and capture output
+                                let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
                                 output.push_str(&generator.indent());
-                                output.push_str(&format!("${} .= `{}`;\n", output_var, generator.generate_command_string_for_system(cmd)));
+                                output.push_str(&format!("\n"));
+                            output.push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
+                            output.push_str(&format!("my {} = open3({}, {}, {}, '{}');\n", pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd)));
+                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", in_var));
+                            output.push_str(&format!("while (my $line = <{}>) {{\n", out_var));
+                            output.push_str(&format!("    ${} .= $line;\n", output_var));
+                            output.push_str(&format!("}}\n"));
+                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", out_var));
+                            output.push_str(&format!("waitpid {}, 0;\n", pid_var));
                             }
                         } else {
                             // For other command types, execute and capture output
+                            let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
                             output.push_str(&generator.indent());
-                            output.push_str(&format!("${} .= `{}`;\n", output_var, generator.generate_command_string_for_system(cmd)));
+                            output.push_str(&format!("\n"));
+                            output.push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
+                            output.push_str(&format!("my {} = open3({}, {}, {}, '{}');\n", pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd)));
+                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", in_var));
+                            output.push_str(&format!("while (my $line = <{}>) {{\n", out_var));
+                            output.push_str(&format!("    ${} .= $line;\n", output_var));
+                            output.push_str(&format!("}}\n"));
+                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", out_var));
+                            output.push_str(&format!("waitpid {}, 0;\n", pid_var));
                         }
                     } else {
                         // For non-simple commands, execute and capture output
+                        let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("${} .= `{}`;\n", output_var, generator.generate_command_string_for_system(cmd)));
+                        output.push_str(&format!("\n"));
+                            output.push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
+                            output.push_str(&format!("my {} = open3({}, {}, {}, '{}');\n", pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd)));
+                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", in_var));
+                            output.push_str(&format!("while (my $line = <{}>) {{\n", out_var));
+                            output.push_str(&format!("    ${} .= $line;\n", output_var));
+                            output.push_str(&format!("}}\n"));
+                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", out_var));
+                            output.push_str(&format!("waitpid {}, 0;\n", pid_var));
                     }
                 }
                 
@@ -189,7 +216,7 @@ fn generate_command_using_builtins(
                             }
                         }
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("$grep_exit_code_{} = scalar({}) > 0 ? 0 : 1;\n", unique_id, grep_filtered_var));
+                        output.push_str(&format!("$grep_exit_code_{} = scalar {} > 0 ? 0 : 1;\n", unique_id, grep_filtered_var));
                         
                         // Handle the nested AND operation: grep -q && echo "found"
                         output.push_str(&generator.indent());
@@ -258,7 +285,7 @@ fn generate_command_using_builtins(
             }
             
             output.push_str(&generator.indent());
-            output.push_str(&format!("$exit_code_{} = $?;\n", unique_id));
+            output.push_str(&format!("$exit_code_{} = $CHILD_ERROR;\n", unique_id));
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str(&format!("}}\n"));
@@ -301,7 +328,7 @@ fn generate_command_using_builtins(
             }
             
             output.push_str(&generator.indent());
-            output.push_str(&format!("$exit_code_{} = $?;\n", unique_id));
+            output.push_str(&format!("$exit_code_{} = $CHILD_ERROR;\n", unique_id));
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str(&format!("}}\n"));
@@ -315,7 +342,7 @@ fn generate_command_using_builtins(
             output.push_str("}\n");
             output
         },
-        Command::Redirect(redirect_cmd) => {
+        Command::Redirect(_redirect_cmd) => {
             // Handle Redirect commands in pipeline context
             if input_var.is_empty() {
                 // First command in pipeline - generate the redirect command normally
@@ -328,16 +355,15 @@ fn generate_command_using_builtins(
         },
         _ => {
             // Other non-simple commands - use system call fallback
+            let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
             if input_var.is_empty() {
                 // First command in pipeline
-                format!("${} = `{}`;\n", 
-                    output_var, 
-                    generator.generate_command_string_for_system(command))
+                format!("\nmy ({});\nmy {} = open3({}, {}, {}, '{}');\nclose {} or croak 'Close failed: $!';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", 
+                    in_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(command), in_var, output_var, out_var, out_var, pid_var)
             } else {
                 // Subsequent command - use a different approach that works
-                format!("${} = `echo \"${}\" | {}`;\n", 
-                    output_var, input_var, 
-                    generator.generate_command_string_for_system(command))
+                format!("\nmy ({});\nmy {} = open3({}, {}, {}, 'echo \"${}\" | {}');\nclose {} or croak 'Close failed: $!';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", 
+                    in_var, pid_var, in_var, out_var, err_var, input_var, generator.generate_command_string_for_system(command), in_var, output_var, out_var, out_var, pid_var)
             }
         }
     }
@@ -401,7 +427,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 };
                 
                 // Parse head command parameters dynamically
-                let mut head_max = 10; // Default value
+                let mut _head_max = 10; // Default value
                 if pipeline.commands.len() > 1 {
                     if let Command::Pipeline(nested_pipeline) = &pipeline.commands[1] {
                         if let Command::Simple(head_cmd) = &nested_pipeline.commands[0] {
@@ -413,7 +439,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                             if arg_str == "-n" && i + 1 < head_cmd.args.len() {
                                                 if let Word::Literal(num_str, _) = &head_cmd.args[i + 1] {
                                                     if let Ok(num) = num_str.parse::<usize>() {
-                                                        head_max = num;
+                                                        _head_max = num;
                                                         break;
                                                     }
                                                 }
@@ -813,7 +839,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         }
         
         output.push_str(&generator.indent());
-        output.push_str("while (my $line = <STDIN>) {\n");
+        output.push_str("while (my $line = <>) {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
         output.push_str("chomp $line;\n");
@@ -1029,7 +1055,7 @@ fn generate_linebyline_command_for_pipeline(generator: &mut Generator, pipeline:
 
 /// Generate line-by-line processing for a single command
 fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, line_var: &str, cmd_index: usize) -> String {
-    let cmd_name = match &cmd.name {
+                    let cmd_name = match &cmd.name {
         Word::Literal(s, _) => s,
         _ => "unknown_command"
     };
@@ -1165,7 +1191,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             // For wc, count characters/words in the line
             let mut output = String::new();
             output.push_str("$char_count += length($line);\n");
-            output.push_str(&format!("$word_count += scalar(split({}, $line));\n", generator.format_regex_pattern(r"\\s+")));
+            output.push_str(&format!("$word_count += scalar split({}, $line));\n", generator.format_regex_pattern(r"\\s+")));
             output.push_str("$line_count++;\n");
             output.push_str("next; # Skip normal line processing for wc\n");
             output
@@ -1284,7 +1310,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                                 output.push_str(&format!("$output_{} = ${};\n", unique_id, result_var));
                                 if cmd_name == "grep" {
                                     output.push_str(&generator.indent());
-                                    output.push_str(&format!("if (scalar(@grep_filtered_{}_{}) == 0) {{\n", unique_id, i));
+                                    output.push_str(&format!("if (scalar @grep_filtered_{}_{}) == 0) {{\n", unique_id, i));
                                     output.push_str(&generator.indent());
                                     output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
                                     output.push_str(&generator.indent());
@@ -1369,7 +1395,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                                         output.push_str(&format!("$output_{} = ${};\n", unique_id, result_var));
                                         if cmd_name == "grep" {
                                             output.push_str(&generator.indent());
-                                            output.push_str(&format!("if (scalar(@grep_filtered_{}_{}) == 0) {{\n", unique_id, i));
+                                            output.push_str(&format!("if (scalar @grep_filtered_{}_{}) == 0) {{\n", unique_id, i));
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
                                             output.push_str(&generator.indent());
@@ -1465,7 +1491,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 
                 // Track exit code for grep (exit 1 if no matches found)
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (scalar(@grep_filtered_{}_1) == 0) {{\n", unique_id));
+                output.push_str(&format!("if (scalar @grep_filtered_{}_1) == 0) {{\n", unique_id));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
                 output.push_str(&generator.indent());
@@ -1534,7 +1560,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                         // Track exit code for grep commands (exit 1 if no matches found)
                         if cmd_name == "grep" {
                             output.push_str(&generator.indent());
-                            output.push_str(&format!("if (scalar(@grep_filtered_{}_{}) == 0) {{\n", unique_id, i + 1));
+                            output.push_str(&format!("if (scalar @grep_filtered_{}_{}) == 0) {{\n", unique_id, i + 1));
                             output.push_str(&generator.indent());
                             output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
                             output.push_str(&generator.indent());

@@ -7,7 +7,8 @@ use std::thread;
 use crate::cache::CommandCache;
 use crate::execution::{run_shell_script, create_exit_status};
 use crate::utils::{check_generator_available, cleanup_tmp, generate_unified_diff, 
-                   check_perl_must_contain, check_perl_must_not_contain, check_ast_must_not_contain, check_ast_must_contain};
+                   check_perl_must_contain, check_perl_must_not_contain, check_ast_must_not_contain, check_ast_must_contain,
+                   check_perl_no_open3_builtins};
 use debashl::shared_utils;
 use debashl::{Lexer, Parser, Generator, lexer::Token};
 
@@ -699,6 +700,27 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 ast,
                 _lexer_output: String::new(),
                 failure_reason: format!("PERL_MUST_CONTAIN violations:\n{}", violation_msg),
+                shell_duration: std::time::Duration::from_secs(0),
+                translated_duration: std::time::Duration::from_secs(0),
+            });
+        }
+        
+        // Check for open3 usage with builtin commands (should use native Perl instead)
+        if let Err(violation_msg) = check_perl_no_open3_builtins(&translated_code) {
+            cleanup_tmp(lang, &tmp_file);
+            return Ok(TestResult {
+                success: false,
+                shell_stdout: String::from_utf8_lossy(&shell_output.stdout).to_string().replace("\r\n", "\n").trim().to_string(),
+                shell_stderr: String::from_utf8_lossy(&shell_output.stderr).to_string().replace("\r\n", "\n").trim().to_string(),
+                translated_stdout: String::new(),
+                translated_stderr: String::new(),
+                shell_exit: shell_output.status.code().unwrap_or(-1),
+                translated_exit: -1,
+                original_code: shell_content,
+                translated_code,
+                ast,
+                _lexer_output: String::new(),
+                failure_reason: format!("OPEN3_BUILTIN violations:\n{}", violation_msg),
                 shell_duration: std::time::Duration::from_secs(0),
                 translated_duration: std::time::Duration::from_secs(0),
             });

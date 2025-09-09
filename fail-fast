@@ -1,0 +1,8 @@
+#!/bin/bash
+
+echo "To run this test: ./fail-fast FAILING_TEST_PREFIX"
+echo "To run a specific test: ./fail-fast TEST_PREFIX"
+echo "Examples: ./fail-fast 062_02, ./fail-fast 044, ./fail-fast find"
+
+# Use pre-compiled binary instead of cargo run
+./target/debug/debashc.exe fail "$@" --perl-critic

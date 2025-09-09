@@ -42,7 +42,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
         false
     };
     
-    let has_non_array_env = !is_standalone_assignment && cmd.env_vars.iter().any(|(var, value)| {
+    let has_non_array_env = !is_standalone_assignment && cmd.env_vars.iter().any(|(_var, value)| {
         !matches!(value, Word::Array(..)) && 
         !matches!(value, Word::Literal(s, _) if generator.extract_array_elements(s).is_some())
     });
@@ -126,12 +126,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 // Store the command string in a local variable to avoid borrowing issues
                 let cmd_str = generator.generate_command_string_for_system(&**cmd);
                 output.push_str(&generator.indent());
-                output.push_str(&format!("open(my $pipe, '-|', 'bash', '-c', {});\n", 
+                output.push_str(&format!("open my $pipe, '-|', 'bash', '-c', {};\n", 
                     generator.perl_string_literal(&Word::literal(cmd_str))));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $output_ps_{} = <$pipe>;\n", global_counter));
                 output.push_str(&generator.indent());
-                output.push_str(&format!("close($pipe);\n"));
+                output.push_str(&format!("close $pipe;\n"));
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str(&format!("}}\n"));
@@ -156,7 +156,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 // Process substitution output: >(command)
                 temp_file_counter += 1;
                 let global_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let temp_file = format!("{}/process_sub_out_{}_{}.tmp", get_temp_dir(), global_counter, temp_file_counter);
+                let _temp_file = format!("{}/process_sub_out_{}_{}.tmp", get_temp_dir(), global_counter, temp_file_counter);
                 let temp_var = format!("temp_file_out_{}_{}", global_counter, temp_file_counter);
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my ${} = {} . '/process_sub_out_{}_{}.tmp';\n", temp_var, get_temp_dir(), global_counter, temp_file_counter));
@@ -210,7 +210,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     let args: Vec<String> = filtered_args.iter()
                         .map(|arg| generator.word_to_perl(arg))
                         .collect();
-                    output.push_str(&format!("{} . \"\\n\"", args.join(" . \" \" . ")));
+                    output.push_str(&format!("{} . \"\\n\"", args.join(" . q{ } . ")));
                 }
                 return output;
             }
@@ -281,7 +281,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     } else if args[0].starts_with('"') && args[0].ends_with('"') && !args[0].contains("\\n") {
                         // Extract the string content and add newline directly using double quotes for escape sequences
                         let content = &args[0][1..args[0].len()-1]; // Remove quotes
-                        output.push_str(&format!("print \"{}\\n\";\n", content));
+                        // Escape newlines, tabs, and carriage returns in the content
+                        let escaped_content = content.replace("\\", "\\\\")
+                                                   .replace("\"", "\\\"")
+                                                   .replace("\n", "\\n")
+                                                   .replace("\t", "\\t")
+                                                   .replace("\r", "\\r");
+                        output.push_str(&format!("print \"{}\\n\";\n", escaped_content));
                     } else if args[0].starts_with('$') && !args[0].contains("\\n") {
                         // For variables, use comma to avoid string interpolation
                         output.push_str(&format!("print {}, \"\\n\";\n", args[0]));
@@ -299,7 +305,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         output.push_str(&generate_cartesian_product_for_echo(generator, &cmd.args));
                     } else {
                         // For multiple arguments, join them with spaces
-                        let args_str = args.join(" . \" \" . ");
+                        let args_str = args.join(" . q{ } . ");
                         output.push_str(&generator.indent());
                         output.push_str(&format!("print {} . \"\\n\";\n", args_str));
                     }
@@ -410,7 +416,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     // Handle brace expansion for command arguments
                                     handle_brace_expansion_for_command(generator, expansion)
                                 }
-                                _ => generator.word_to_perl(arg)
+                                _ => generator.perl_string_literal(arg)
                             }
                         })
                         .collect();
@@ -483,12 +489,8 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                 clean_code = clean_code[1..clean_code.len()-1].to_string();
                                             }
                                             
-                                            // Handle backslash escapes
-                                            clean_code = clean_code
-                                                .replace("\\n", "\n")
-                                                .replace("\\t", "\t")
-                                                .replace("\\r", "\r")
-                                                .replace("\\\\", "\\");
+                                            // Handle backslash escapes - keep them as escape sequences for Perl
+                                            // Don't convert \n to actual newlines in the generated code
                                             
                                             // Embed the Perl code directly - ensure it's properly formatted
                                             output.push_str(&generator.indent());
@@ -532,12 +534,8 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                 clean_code = clean_code[1..clean_code.len()-1].to_string();
                                             }
                                             
-                                            // Handle backslash escapes
-                                            clean_code = clean_code
-                                                .replace("\\n", "\n")
-                                                .replace("\\t", "\t")
-                                                .replace("\\r", "\r")
-                                                .replace("\\\\", "\\");
+                                            // Handle backslash escapes - keep them as escape sequences for Perl
+                                            // Don't convert \n to actual newlines in the generated code
                                             
                                             // For -ne, we need to process each line
                                             // This will be handled in pipeline context
@@ -679,12 +677,8 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                                 interpreted = interpreted[1..interpreted.len()-1].to_string();
                                             }
                                             
-                                            // Interpret backslash escapes
-                                            interpreted = interpreted
-                                                .replace("\\n", "\n")
-                                                .replace("\\t", "\t")
-                                                .replace("\\r", "\r")
-                                                .replace("\\\\", "\\");
+                                            // Interpret backslash escapes - keep them as escape sequences for Perl
+                                            // Don't convert \n to actual newlines in the generated code
                                             
                                             result.push_str(&interpreted);
                                         },
@@ -746,7 +740,7 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
             output.push_str(&format!("${} .= {}. \"\\n\";\n", output_var, args[0]));
         } else {
             // For multiple arguments, join them with spaces
-            let args_str = args.join(" . \" \" . ");
+            let args_str = args.join(" . q{ } . ");
             output.push_str(&format!("${} .= {}. \"\\n\";\n", output_var, args_str));
         }
     }
