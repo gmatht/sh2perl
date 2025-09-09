@@ -63,6 +63,8 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     commands.insert("sleep", BuiltinCommand::new("sleep", "Delay execution", false));
     commands.insert("which", BuiltinCommand::new("which", "Locate command", false));
     commands.insert("yes", BuiltinCommand::new("yes", "Output string repeatedly", true));
+    commands.insert("true", BuiltinCommand::new("true", "Return true (exit status 0)", false));
+    commands.insert("false", BuiltinCommand::new("false", "Return false (exit status 1)", false));
     
     // Compression and archiving
     commands.insert("gzip", BuiltinCommand::new("gzip", "Compress files", true));
@@ -398,6 +400,22 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             } else {
                 // Read from input variable (pipeline context)
                 format!("my $L = ${};\n", input_var)
+            }
+        },
+        "true" => {
+            // true command always succeeds (exit status 0)
+            if output_var.is_empty() {
+                "system 'true';\n".to_string()
+            } else {
+                format!("system 'true';\n${} = '';\n", output_var)
+            }
+        },
+        "false" => {
+            // false command always fails (exit status 1)
+            if output_var.is_empty() {
+                "system 'false';\n".to_string()
+            } else {
+                format!("system 'false';\n${} = '';\n", output_var)
             }
         },
 

@@ -404,7 +404,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         }
         output.push_str("\";\n");
         output.push_str(&indent4);
-        output.push_str("system($exec_cmd);\n");
+        output.push_str("system $exec_cmd;\n");
     } else {
         // Add to results
         if ls_format {
@@ -532,7 +532,7 @@ fn generate_system_find_fallback(generator: &mut Generator, cmd: &SimpleCommand,
     } else {
         // For standalone commands, execute directly
         output.push_str(&generator.indent());
-        output.push_str(&format!("system(\"{}\");\n", find_cmd));
+        output.push_str(&format!("system \"{}\";\n", find_cmd));
     }
     
     output

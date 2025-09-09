@@ -75,10 +75,10 @@ pub fn generate_paste_command(
         
         if !args.is_empty() {
             result.push_str(&generator.indent());
-            result.push_str(&format!("system('paste {}');\n", args.join(" ")));
+            result.push_str(&format!("system 'paste {}';\n", args.join(" ")));
         } else {
             result.push_str(&generator.indent());
-            result.push_str("system('paste');\n");
+            result.push_str("system 'paste';\n");
         }
     }
     

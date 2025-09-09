@@ -110,7 +110,7 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     }
     
     if files.is_empty() {
-        output.push_str("die \"touch: missing file operand\\n\";\n");
+        output.push_str("croak \"touch: missing file operand\\n\";\n");
     } else {
         output.push_str("use POSIX qw(time);\n");
         
@@ -173,7 +173,7 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
             output.push_str("close($fh);\n");
             // Silent operation - no output unless error
             output.push_str("} else {\n");
-            output.push_str(&format!("die \"touch: cannot create \", {}, \": $!\\n\";\n", file));
+            output.push_str(&format!("croak \"touch: cannot create \", {}, \": $ERRNO\\n\";\n", file));
             output.push_str("}\n");
             output.push_str("}\n");
         }

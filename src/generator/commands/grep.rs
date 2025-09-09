@@ -290,13 +290,13 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     output.push_str(&format!("my @files_{} = find_files_recursive_{}('{}', '{}');\n", command_index, command_index, file, include_pattern.as_ref().unwrap_or(&"*".to_string())));
                     output.push_str(&format!("for my $file (@files_{}) {{\n", command_index));
                     output.push_str(&format!("    if (-f $file) {{\n"));
-                    output.push_str(&format!("        open(my $fh, '<', $file) or die \"Cannot open $file: $!\";\n"));
+                    output.push_str(&format!("        open(my $fh, '<', $file) or die \"Cannot open $file: $ERRNO\";\n"));
                     output.push_str(&format!("        while (my $line = <$fh>) {{\n"));
                     output.push_str(&format!("            chomp $line;\n"));
                     output.push_str(&format!("            push @grep_lines_{}, $line;\n", command_index));
                     output.push_str(&format!("            push @grep_filenames_{}, $file;\n", command_index));
                     output.push_str(&format!("        }}\n"));
-                    output.push_str(&format!("        close($fh) or croak \"Close failed: $!\";\n"));
+                    output.push_str(&format!("        close($fh) or croak \"Close failed: $ERRNO\";\n"));
                     output.push_str(&format!("    }}\n"));
                     output.push_str(&format!("}}\n"));
                 }
@@ -308,24 +308,24 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                         output.push_str(&format!("my @glob_files_{} = glob('{}');\n", command_index, file));
                         output.push_str(&format!("for my $glob_file (@glob_files_{}) {{\n", command_index));
                         output.push_str(&format!("    if (-f $glob_file) {{\n"));
-                        output.push_str(&format!("        open(my $fh, '<', $glob_file) or die \"Cannot open $glob_file: $!\";\n"));
+                        output.push_str(&format!("        open(my $fh, '<', $glob_file) or die \"Cannot open $glob_file: $ERRNO\";\n"));
                         output.push_str("        while (my $line = <$fh>) {\n");
                         output.push_str("            chomp($line);\n");
                         output.push_str(&format!("            push @grep_lines_{}, $line;\n", command_index));
                         output.push_str(&format!("            push @grep_filenames_{}, $glob_file;\n", command_index));
                         output.push_str("        }\n");
-                        output.push_str("        close($fh) or croak \"Close failed: $!\";\n");
+                        output.push_str("        close($fh) or croak \"Close failed: $ERRNO\";\n");
                         output.push_str("    }\n");
                         output.push_str("}\n");
                     } else {
                         output.push_str(&format!("if (-f '{}') {{\n", file));
-                        output.push_str(&format!("    open(my $fh, '<', '{}') or die \"Cannot open {}: $!\";\n", file, file));
+                        output.push_str(&format!("    open(my $fh, '<', '{}') or die \"Cannot open {}: $ERRNO\";\n", file, file));
                         output.push_str("    while (my $line = <$fh>) {\n");
                         output.push_str("        chomp($line);\n");
                         output.push_str(&format!("        push @grep_lines_{}, $line;\n", command_index));
                         output.push_str(&format!("        push @grep_filenames_{}, '{}';\n", command_index, file));
                         output.push_str("    }\n");
-                        output.push_str("    close($fh) or croak \"Close failed: $!\";\n");
+                        output.push_str("    close($fh) or croak \"Close failed: $ERRNO\";\n");
                         output.push_str("}\n");
                     }
                 }
@@ -356,10 +356,10 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             // Check if this is a process substitution variable (starts with $)
             if pattern_file_name.starts_with('$') {
                 output.push_str(&format!("if (-f {}) {{\n", pattern_file_name));
-                output.push_str(&format!("    open(my $fh_{}, '<', {}) or die \"Cannot open pattern file: $!\";\n", command_index, pattern_file_name));
+                output.push_str(&format!("    open(my $fh_{}, '<', {}) or die \"Cannot open pattern file: $ERRNO\";\n", command_index, pattern_file_name));
             } else {
                 output.push_str(&format!("if (-f '{}') {{\n", pattern_file_name));
-                output.push_str(&format!("    open(my $fh_{}, '<', '{}') or die \"Cannot open pattern file {}: $!\";\n", command_index, pattern_file_name, pattern_file_name));
+                output.push_str(&format!("    open(my $fh_{}, '<', '{}') or die \"Cannot open pattern file {}: $ERRNO\";\n", command_index, pattern_file_name, pattern_file_name));
             }
             
             output.push_str(&format!("    while (my $line = <$fh_{}>) {{\n", command_index));
@@ -680,7 +680,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("my @grep_colored_{};\n", command_index));
                 output.push_str(&format!("for my $line (@grep_filtered_{}) {{\n", command_index));
                 output.push_str(&format!("    my $colored_line = $line;\n"));
-                output.push_str(&format!("    $colored_line =~ s/({})/\\x1b[01;31m\\x1b[K$1\\x1b[m\\x1b[K/g;\n", regex_pattern));
+                output.push_str(&format!("    $colored_line =~ s/({})/\\x1b[01;31m\\x1b[K$1\\x1b[m\\x1b[K/gs;\n", regex_pattern));
                 output.push_str(&format!("    push @grep_colored_{}, $colored_line;\n", command_index));
                 output.push_str("}\n");
                 output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_colored_{};\n", command_index, command_index));

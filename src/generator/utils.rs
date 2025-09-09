@@ -205,7 +205,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     
                     // Return the code that executes the pipeline and captures output
                     // Command substitution should convert newlines to spaces (bash behavior)
-                    format!("do {{ {} chomp({}); {} =~ s/\\n/ /g; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
+                    format!("do {{ {} chomp {}; {} =~ s/\\n/ /gsxm; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
                 },
                 _ => {
                     // For other command types, use system command fallback

@@ -11,17 +11,17 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
     match &redirect.operator {
         RedirectOperator::Input => {
             // Input redirection: command < file
-            output.push_str(&format!("open(STDIN, '<', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+            output.push_str(&format!("open STDIN, '<', '{}' or croak \"Cannot open file: $ERRNO\\n\";\n", redirect.target));
         }
         RedirectOperator::Output => {
             // Output redirection: command > file
             // Note: This function doesn't have access to the command name, so it can't handle echo specially
             // The special handling is done in generate_simple_command
-            output.push_str(&format!("open(STDOUT, '>', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+            output.push_str(&format!("open STDOUT, '>', '{}' or croak \"Cannot open file: $ERRNO\\n\";\n", redirect.target));
         }
         RedirectOperator::Append => {
             // Append redirection: command >> file
-            output.push_str(&format!("open(STDOUT, '>>', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+            output.push_str(&format!("open STDOUT, '>>', '{}' or croak \"Cannot open file: $ERRNO\\n\";\n", redirect.target));
         }
         RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => {
             // Heredoc: command << delimiter
@@ -34,10 +34,10 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 output.push_str(&format!("use File::Path qw(make_path);\n"));
                 let temp_dir = get_temp_dir();
                 output.push_str(&format!("if (!-d {}) {{ make_path({}); }}\n", temp_dir, temp_dir));
-                output.push_str(&format!("open(my ${}, '>', {} . '/heredoc_temp') or die \"Cannot create temp file: $!\\n\";\n", fh, temp_dir));
+                output.push_str(&format!("open my ${}, '>', {} . '/heredoc_temp' or croak \"Cannot create temp file: $ERRNO\\n\";\n", fh, temp_dir));
                 output.push_str(&format!("print ${} $temp_content;\n", fh));
-                output.push_str(&format!("close(${});\n", fh));
-                output.push_str(&format!("open(STDIN, '<', {} . '/heredoc_temp') or die \"Cannot open temp file: $!\\n\";\n", temp_dir));
+                output.push_str(&format!("close ${} or croak \"Close failed: $ERRNO\\n\";\n", fh));
+                output.push_str(&format!("open STDIN, '<', {} . '/heredoc_temp' or croak \"Cannot open temp file: $ERRNO\\n\";\n", temp_dir));
             }
         }
         RedirectOperator::ProcessSubstitutionInput(cmd) => {
@@ -53,7 +53,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 output.push_str(&format!("my ${};\n", output_var));
                 output.push_str(&format!("{{\n"));
                 output.push_str(&format!("    local *STDOUT;\n"));
-                output.push_str(&format!("    open(STDOUT, '>', \\${}) or die \"Cannot redirect STDOUT\";\n", output_var));
+                output.push_str(&format!("    open STDOUT, '>', \\${} or croak \"Cannot redirect STDOUT\";\n", output_var));
                 output.push_str(&format!("    {{\n"));
                 
                 // Use the Perl generator instead of bash execution
@@ -74,9 +74,9 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
             output.push_str(&format!("use File::Path qw(make_path);\n"));
             output.push_str(&format!("my $temp_dir_{} = dirname(${});\n", global_counter, temp_var));
             output.push_str(&format!("if (!-d $temp_dir_{}) {{ make_path($temp_dir_{}); }}\n", global_counter, global_counter));
-            output.push_str(&format!("open(my ${}, '>', ${}) or die \"Cannot create temp file: $!\\n\";\n", fh_var, temp_var));
+            output.push_str(&format!("open my ${}, '>', ${} or croak \"Cannot create temp file: $ERRNO\\n\";\n", fh_var, temp_var));
             output.push_str(&format!("print ${} ${};\n", fh_var, output_var));
-            output.push_str(&format!("close(${});\n", fh_var));
+            output.push_str(&format!("close ${} or croak \"Close failed: $ERRNO\\n\";\n", fh_var));
             
             generator.process_sub_files.insert(format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter), temp_var.clone());
             
@@ -93,15 +93,15 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
         }
         RedirectOperator::StderrOutput => {
             // Stderr redirection: command 2> file
-            output.push_str(&format!("open(STDERR, '>', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+            output.push_str(&format!("open STDERR, '>', '{}' or croak \"Cannot open file: $ERRNO\\n\";\n", redirect.target));
         }
         RedirectOperator::StderrAppend => {
             // Stderr append: command 2>> file
-            output.push_str(&format!("open(STDERR, '>>', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+            output.push_str(&format!("open STDERR, '>>', '{}' or croak \"Cannot open file: $ERRNO\\n\";\n", redirect.target));
         }
         RedirectOperator::StderrInput => {
             // Stderr input: command 2< file
-            output.push_str(&format!("open(STDERR, '<', '{}') or die \"Cannot open file: $!\\n\";\n", redirect.target));
+            output.push_str(&format!("open STDERR, '<', '{}' or croak \"Cannot open file: $ERRNO\\n\";\n", redirect.target));
         }
         _ => {
             // Other redirects not yet implemented

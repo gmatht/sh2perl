@@ -66,7 +66,7 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             output.push_str(&format!("if (move({}, $dest)) {{\n", source));
             output.push_str(&format!("print \"mv: moved {} to $dest\\n\";\n", source));
             output.push_str("} else {\n");
-            output.push_str(&format!("die \"mv: cannot move {} to $dest: $!\\n\";\n", source));
+            output.push_str(&format!("die \"mv: cannot move {} to $dest: $ERRNO\\n\";\n", source));
             output.push_str("}\n");
             
             output.push_str("} else {\n");
