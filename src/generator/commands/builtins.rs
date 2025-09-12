@@ -58,6 +58,8 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     commands.insert("dirname", BuiltinCommand::new("dirname", "Extract directory name", true));
     
     // System utilities
+    commands.insert("pwd", BuiltinCommand::new("pwd", "Print working directory", false));
+    commands.insert("seq", BuiltinCommand::new("seq", "Generate sequence of numbers", true));
     commands.insert("date", BuiltinCommand::new("date", "Display date and time", false));
     commands.insert("time", BuiltinCommand::new("time", "Time command execution", false));
     commands.insert("sleep", BuiltinCommand::new("sleep", "Delay execution", false));
@@ -329,6 +331,14 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         "sleep" => {
             // For now, use the existing signature but we should standardize this
             crate::generator::commands::sleep::generate_sleep_command(generator, cmd)
+        },
+        "pwd" => {
+            // For now, use the existing signature but we should standardize this
+            crate::generator::commands::pwd::generate_pwd_command(generator, cmd)
+        },
+        "seq" => {
+            // For now, use the existing signature but we should standardize this
+            crate::generator::commands::seq::generate_seq_command(generator, cmd)
         },
         "which" => {
             // For now, use the existing signature but we should standardize this
