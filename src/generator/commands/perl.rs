@@ -46,7 +46,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                     
                     // Initialize environment variables to empty strings to avoid Perl warnings
                     // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
-                    output.push_str("local $ENV{SHELL_VAR} = q{} unless defined $ENV{SHELL_VAR};\n");
+                    output.push_str("if (!defined $ENV{SHELL_VAR}) { local $ENV{SHELL_VAR} = q{}; }\n");
                     
                     // Execute the perl code - split by newlines and add proper indentation
                     for line in clean_code.lines() {
@@ -189,7 +189,7 @@ pub fn generate_perl_pipeline_command(generator: &mut Generator, cmd: &SimpleCom
         
         // Initialize environment variables to empty strings to avoid Perl warnings
         // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
-        output.push_str("local $ENV{SHELL_VAR} = q{} unless defined $ENV{SHELL_VAR};\n");
+        output.push_str("if (!defined $ENV{SHELL_VAR}) { local $ENV{SHELL_VAR} = q{}; }\n");
         
         // Execute the perl code - split by newlines and add proper indentation
         for line in clean_code.lines() {

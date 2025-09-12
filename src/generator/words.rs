@@ -61,7 +61,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 let args: Vec<String> = simple_cmd.args.iter()
                                     .map(|arg| generator.word_to_perl(arg))
                                     .collect();
-                                format!("{} . \"\\n\"", args.join(" . q{ } . "))
+                                format!("({}) . \"\\n\"", args.join(" . q{ } . "))
                             }
                         } else if name == "printf" {
                             // Special handling for printf in command substitution
@@ -85,7 +85,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             if format_string.is_empty() {
                                 "\"\"".to_string()
                             } else {
-                                format!("sprintf({}, {})", 
+                                format!("sprintf {}, {}", 
                                     generator.perl_string_literal(&Word::Literal(format_string, Default::default())),
                                     args.join(", "))
                             }
@@ -107,9 +107,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 let suffix = if simple_cmd.args.len() > 1 {
                                     generator.word_to_perl(&simple_cmd.args[1])
                                 } else {
-                                    "\"\"".to_string()
+                                    "q{}".to_string()
                                 };
-                                format!("do {{ my $path = {}; my $suffix = {}; $path =~ s/\\Q$suffix\\E$// if $suffix ne q{{}}; $path =~ s/.*\\///; $path; }}", path_str, suffix)
+                                format!("do {{ my $path = {}; my $suffix = {}; if ($suffix ne q{{}}) {{ $path =~ s/\\Q$suffix\\E$//msx; }} $path =~ s/.*\\///msx; $path; }}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
                             } else {
                                 "\".\"".to_string()
                             }
@@ -117,7 +117,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for dirname in command substitution
                             if let Some(path) = simple_cmd.args.first() {
                                 let path_str = generator.word_to_perl(path);
-                                format!("do {{ my $path = {}; if ($path =~ /\\//) {{ $path =~ s/\\/[^\\/]*$//; $path = q{{.}} if $path eq q{{}}; }} else {{ $path = q{{.}}; }} $path; }}", path_str)
+                                format!("do {{ my $path = {}; if ($path =~ /\\//msx) {{ $path =~ s/\\/[^\\/]*$//msx; if ($path eq q{{}}) {{ $path = q{{.}}; }} }} else {{ $path = q{{.}}; }} $path; }}", path_str.replace("$0", "$PROGRAM_NAME"))
                             } else {
                                 "\".\"".to_string()
                             }
@@ -125,9 +125,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for which in command substitution
                             if let Some(command) = simple_cmd.args.first() {
                                 let command_str = generator.word_to_perl(command);
-                                format!("do {{ my $command = {}; my $found = 0; my $result = q{{}}; foreach my $dir (split /:/, $ENV{{PATH}}) {{ my $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
+                                format!("do {{ my $command = {}; my $found = 0; my $result = q{{}}; foreach my $dir (split /:/msx, $ENV{{PATH}}) {{ my $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
                             } else {
-                                "\"\"".to_string()
+                                "q{}".to_string()
                             }
                         } else if name == "seq" {
                             // Special handling for seq in command substitution
@@ -164,7 +164,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 let args: Vec<String> = simple_cmd.args.iter()
                                     .map(|arg| generator.word_to_perl(arg))
                                     .collect();
-                                format!("{} . \"\\n\"", args.join(" . q{ } . "))
+                                format!("({}) . \"\\n\"", args.join(" . q{ } . "))
                             }
                         } else {
                             // Fall back to system command for non-builtin commands
@@ -483,7 +483,7 @@ fn expand_range(range: &BraceRange) -> String {
     }
 }
 
-pub fn convert_string_interpolation_to_perl_impl(_generator: &Generator, interp: &StringInterpolation) -> String {
+pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, interp: &StringInterpolation) -> String {
     // Convert string interpolation to a single Perl interpolated string
     let mut combined_string = String::new();
     
@@ -521,6 +521,12 @@ pub fn convert_string_interpolation_to_perl_impl(_generator: &Generator, interp:
                     combined_string.push_str(&format!("${}{{{}}}", map_name, key));
                 }
             }
+            StringPart::CommandSubstitution(cmd) => {
+                // Handle command substitutions in string interpolation
+                // Convert the command to Perl and embed it in the string
+                let cmd_result = generator.word_to_perl(&Word::CommandSubstitution(cmd.clone(), None));
+                combined_string.push_str(&format!("{}", cmd_result));
+            },
             StringPart::ParameterExpansion(pe) => {
                 // Handle parameter expansions like ${arr[1]}, ${#arr[@]}, etc.
                 // We need to convert the ParameterExpansion to Perl code
@@ -590,7 +596,7 @@ pub fn convert_string_interpolation_to_perl_impl(_generator: &Generator, interp:
     }
     
     // Check if the string actually needs interpolation
-    let needs_interpolation = combined_string.contains('$') || combined_string.contains('@') || combined_string.contains('\\');
+    let needs_interpolation = combined_string.contains('$') || combined_string.contains('@') || combined_string.contains('\\') || combined_string.contains('`');
     
     if needs_interpolation {
         // Return as a double-quoted interpolated string
@@ -598,6 +604,7 @@ pub fn convert_string_interpolation_to_perl_impl(_generator: &Generator, interp:
         let escaped_string = combined_string
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
+            .replace("`", "\\`")
             .replace("\n", "\\n")
             .replace("\t", "\\t")
             .replace("\r", "\\r");

@@ -822,7 +822,71 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     let mut i = 0;
     
     while i < content.len() {
-        if content[i..].starts_with("$") && i + 1 < content.len() {
+        if content[i..].starts_with("\\\\`") {
+            // We found an escaped backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            
+            // Find the closing escaped backtick
+            i += 3; // skip the \\`
+            let cmd_start = i;
+            while i < content.len() && !content[i..].starts_with("\\\\`") {
+                i += 1;
+            }
+            
+            if i < content.len() {
+                // We found a complete escaped command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 3; // skip the closing \\`
+                
+                // Parse the command content as a simple command
+                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
+                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                } else {
+                    // Fall back to treating it as a literal
+                    parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
+                }
+            } else {
+                // Unmatched escaped backtick, treat as literal
+                parts.push(StringPart::Literal("\\\\`".to_string()));
+                i = cmd_start;
+            }
+        } else if content[i..].starts_with("`") {
+            // We found a backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            
+            // Find the closing backtick
+            i += 1; // skip the opening `
+            let cmd_start = i;
+            while i < content.len() && content[i..].chars().next() != Some('`') {
+                i += 1;
+            }
+            
+            if i < content.len() {
+                // We found a complete command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 1; // skip the closing `
+                
+                // Parse the command content as a simple command
+                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
+                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                } else {
+                    // Fall back to treating it as a literal
+                    parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
+                }
+            } else {
+                // Unmatched backtick, treat as literal
+                parts.push(StringPart::Literal("`".to_string()));
+                i = cmd_start;
+            }
+        } else if content[i..].starts_with("$") && i + 1 < content.len() {
             // We found a variable reference
             // First, add any accumulated literal text
             if !current_literal.is_empty() {
@@ -916,6 +980,76 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     }
     
     Ok(Word::StringInterpolation(StringInterpolation { parts }, None))
+}
+
+/// Parse a literal string as string interpolation to handle escaped backticks
+pub fn parse_string_interpolation_from_literal(literal: &str) -> Result<StringInterpolation, ParserError> {
+    use crate::ast::{StringInterpolation, StringPart};
+    
+    // Remove outer quotes if present
+    let content = if (literal.starts_with('"') && literal.ends_with('"')) || 
+                     (literal.starts_with('\'') && literal.ends_with('\'')) {
+        &literal[1..literal.len()-1]
+    } else {
+        literal
+    };
+    
+    // Parse the string content to extract literal parts and command substitutions
+    let mut parts = Vec::new();
+    let mut current_literal = String::new();
+    let mut i = 0;
+    
+    while i < content.len() {
+        if content[i..].starts_with("\\\\`") {
+            // We found an escaped backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            
+            // Find the closing escaped backtick
+            i += 3; // skip the \\`
+            let cmd_start = i;
+            while i < content.len() && !content[i..].starts_with("\\\\`") {
+                i += 1;
+            }
+            
+            if i < content.len() {
+                // We found a complete escaped command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 3; // skip the closing \\`
+                
+                // Parse the command content as a simple command
+                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
+                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                } else {
+                    // Fall back to treating it as a literal
+                    parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
+                }
+            } else {
+                // Unmatched escaped backtick, treat as literal
+                parts.push(StringPart::Literal("\\\\`".to_string()));
+                i = cmd_start;
+            }
+        } else {
+            // Add to current literal
+            current_literal.push(content[i..].chars().next().unwrap());
+            i += 1;
+        }
+    }
+    
+    // Add any remaining literal text
+    if !current_literal.is_empty() {
+        parts.push(StringPart::Literal(current_literal));
+    }
+    
+    // If we have no parts, this shouldn't happen, but handle it gracefully
+    if parts.is_empty() {
+        parts.push(StringPart::Literal(content.to_string()));
+    }
+    
+    Ok(StringInterpolation { parts })
 }
 
 fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion, ParserError> {

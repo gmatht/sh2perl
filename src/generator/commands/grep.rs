@@ -646,7 +646,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("    if (grep {{ $_ eq $line }} @grep_filtered_{}) {{\n", command_index));
                 output.push_str(&format!("        push @grep_with_offset_{}, sprintf \"%d:%s\", $offset_{}, $line;\n", command_index, command_index));
                 output.push_str("    }\n");
-                output.push_str(&format!("    $offset_{} += length($line) + 1; # +1 for newline\n", command_index));
+                output.push_str(&format!("    $offset_{} += length $line + 1; # +1 for newline\n", command_index));
                 output.push_str("}\n");
                 output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_with_offset_{};\n", command_index, command_index));
             } else if show_filename && has_file_args {

@@ -6,7 +6,11 @@ pub fn generate_awk_command(generator: &mut Generator, _cmd: &SimpleCommand, inp
     
     // For now, implement a basic awk-like functionality
     // This can be extended to handle more complex awk patterns
-    output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
+    if input_var.starts_with('$') {
+        output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
+    } else {
+        output.push_str(&format!("my @lines = split /\\n/msx, ${};\n", input_var));
+    }
     output.push_str("my @result;\n");
     output.push_str("foreach my $line (@lines) {\n");
     output.push_str("chomp $line;\n");
@@ -16,7 +20,11 @@ pub fn generate_awk_command(generator: &mut Generator, _cmd: &SimpleCommand, inp
     output.push_str("push @result, $line;\n");
     output.push_str("}\n");
     output.push_str("}\n");
-    output.push_str(&format!("{} = join \"\\n\", @result;\n", input_var));
+    if input_var.starts_with('$') {
+        output.push_str(&format!("{} = join \"\\n\", @result;\n", input_var));
+    } else {
+        output.push_str(&format!("${} = join \"\\n\", @result;\n", input_var));
+    }
     output.push_str("\n");
     
     output

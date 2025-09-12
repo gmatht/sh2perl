@@ -44,16 +44,16 @@ pub fn generate_wc_command_with_output(_generator: &mut Generator, cmd: &SimpleC
         output.push_str(&format!("my $wc_word_count_{} = 0;\n", command_index));
         output.push_str(&format!("foreach my $line (@wc_lines_{}) {{\n", command_index));
         output.push_str(&format!("    my @wc_words_{} = split /\\s+/msx, $line;\n", command_index));
-        output.push_str(&format!("    $wc_word_count_{} += scalar @wc_words_{});\n", command_index, command_index));
+        output.push_str(&format!("    $wc_word_count_{} += scalar @wc_words_{};\n", command_index, command_index));
         output.push_str("}\n");
     }
     
     if count_chars {
-        output.push_str(&format!("my $wc_char_count_{} = length(join q{{}}, @wc_lines_{});\n", command_index, command_index));
+        output.push_str(&format!("my $wc_char_count_{} = length join q{{}}, @wc_lines_{};\n", command_index, command_index));
     }
     
     if count_bytes {
-        output.push_str(&format!("my $wc_byte_count_{} = length(join q{{}}, @wc_lines_{});\n", command_index, command_index));
+        output.push_str(&format!("my $wc_byte_count_{} = length join q{{}}, @wc_lines_{};\n", command_index, command_index));
     }
     
     // Format output into a result variable expected by the pipeline

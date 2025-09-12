@@ -69,9 +69,9 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         output.push_str(&format!("my ($in, $out, $err);
 my $pid = open3($in, $out, $err, 'bash', '-c', 'echo \"${}\" | {}');
 close $in or croak 'Close failed: $!';
-${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
+my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
 close $out or croak 'Close failed: $!';
-waitpid $pid, 0;\n", input_var, input_var, command));
+waitpid $pid, 0;\n", input_var, command, output_var));
     }
     output.push_str("\n");
     

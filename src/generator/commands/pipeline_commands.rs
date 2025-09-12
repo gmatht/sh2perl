@@ -456,7 +456,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str("my $i = 0;\n");
                 output.push_str(&generator.indent());
-                output.push_str("my $head_count_0 = 0;\n");
+                output.push_str("my $head_count_1 = 0;\n");
                 output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
                 generator.indent_level += 1;
@@ -464,6 +464,8 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 // Generate the yes command inside the loop
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $line = {};\n", string_to_repeat));
+                output.push_str(&generator.indent());
+                output.push_str("$output_6 .= $line . \"\\n\";\n");
                 start_index = 1; // Skip the yes command in the loop below
                 
                 // Process the remaining commands in the loop
@@ -1179,19 +1181,44 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
         "cut" => {
             // For cut, extract specific fields
             let mut output = String::new();
-            if let Some(fields_arg) = cmd.args.iter().find(|arg| {
-                if let Word::Literal(s, _) = arg { s.starts_with('-') && s.contains('f') } else { false }
-            }) {
-                // Extract field specification and apply cut logic
-                output.push_str(&format!("# cut processing for {}\n", fields_arg));
+            let mut delimiter = "\\t".to_string(); // Default tab delimiter
+            let mut field_num = 1; // Default to first field
+            
+            // Parse cut options
+            let mut i = 0;
+            while i < cmd.args.len() {
+                if let Word::Literal(arg, _) = &cmd.args[i] {
+                    if arg == "-d" && i + 1 < cmd.args.len() {
+                        if let Some(next_arg) = cmd.args.get(i + 1) {
+                            delimiter = generator.word_to_perl(next_arg);
+                            i += 1; // Skip the delimiter argument
+                        }
+                    } else if arg == "-f" && i + 1 < cmd.args.len() {
+                        if let Some(next_arg) = cmd.args.get(i + 1) {
+                            if let Word::Literal(field_str, _) = next_arg {
+                                if let Ok(field) = field_str.parse::<usize>() {
+                                    field_num = field;
+                                }
+                            }
+                            i += 1; // Skip the field argument
+                        }
+                    }
+                }
+                i += 1;
             }
+            
+            // Generate cut logic for the current line
+            output.push_str(&format!("my @fields = split /{}/msx, $line;\n", delimiter));
+            output.push_str(&format!("if (@fields > {}) {{\n", field_num - 1));
+            output.push_str(&format!("    $line = $fields[{}];\n", field_num - 1));
+            output.push_str("}\n");
             output
         },
         "wc" => {
             // For wc, count characters/words in the line
             let mut output = String::new();
-            output.push_str("$char_count += length($line);\n");
-            output.push_str(&format!("$word_count += scalar split({}, $line));\n", generator.format_regex_pattern(r"\\s+")));
+            output.push_str("$char_count += length $line;\n");
+            output.push_str(&format!("$word_count += scalar split({}, $line);\n", generator.format_regex_pattern(r"\\s+")));
             output.push_str("$line_count++;\n");
             output.push_str("next; # Skip normal line processing for wc\n");
             output
@@ -1199,6 +1226,30 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
         "perl" => {
             // Use the dedicated Perl pipeline command generator
             crate::generator::commands::perl::generate_perl_pipeline_command(generator, cmd, line_var)
+        },
+        "cp" => {
+            // File operation commands should be executed directly, not in pipeline context
+            crate::generator::commands::cp::generate_cp_command(generator, cmd)
+        },
+        "mv" => {
+            // File operation commands should be executed directly, not in pipeline context
+            crate::generator::commands::mv::generate_mv_command(generator, cmd)
+        },
+        "rm" => {
+            // File operation commands should be executed directly, not in pipeline context
+            crate::generator::commands::rm::generate_rm_command(generator, cmd)
+        },
+        "mkdir" => {
+            // File operation commands should be executed directly, not in pipeline context
+            crate::generator::commands::mkdir::generate_mkdir_command(generator, cmd)
+        },
+        "touch" => {
+            // File operation commands should be executed directly, not in pipeline context
+            crate::generator::commands::touch::generate_touch_command(generator, cmd)
+        },
+        "strings" => {
+            // Use the dedicated strings command generator
+            crate::generator::commands::strings::generate_strings_command(generator, cmd, line_var)
         },
         _ => {
             // Fallback for unsupported commands

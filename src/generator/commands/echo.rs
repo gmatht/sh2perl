@@ -281,7 +281,9 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
             let output_var = if let Some(cap) = re.captures(&pipeline_code) {
                 format!("$output_{}", cap.get(1).unwrap().as_str())
             } else {
-                "$output_0".to_string()
+                // Generate a unique output variable if none found
+                let unique_id = generator.get_unique_id();
+                format!("$output_{}", unique_id)
             };
             
             // Find the pipeline success variable
@@ -300,21 +302,21 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
             let mut captured_pipeline = pipeline_code
                 .replace(&format!("print {};", output_var), "")
                 .replace("print \"\\n\";", "")
-                .replace(&format!("print \"\\n\" unless {} =~ {};", output_var, generator.newline_end_regex()), "")
-                .replace(&format!("$main_exit_code = 1 unless {};", success_var), "");
+                .replace(&format!("if (!({} =~ {})) {{ print \"\\n\"; }}", output_var, generator.newline_end_regex()), "")
+                .replace(&format!("if (!{}) {{ $main_exit_code = 1; }}", success_var), "");
             
             // Remove conditional print blocks that are common in pipelines
             // Use a simpler approach with string replacement for the specific pattern
             let output_var_num = output_var.trim_start_matches("$output_");
             let print_block_to_remove = format!(
-                "if ({} ne q{} && !defined($output_printed_{})) {{\n\n        print {};\n        print \"\\n\" unless {} =~ {};\n    }}", 
+                "if ({} ne q{} && !defined($output_printed_{})) {{\n\n        print {};\n        if (!({} =~ {})) {{ print \"\\n\"; }}\n    }}", 
                 output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
             );
             captured_pipeline = captured_pipeline.replace(&print_block_to_remove, "");
             
             // Also try without the extra newlines in case formatting is different
             let print_block_compact = format!(
-                "if ({} ne q{} && !defined($output_printed_{})) {{ print {}; print \"\\n\" unless {} =~ {}; }}", 
+                "if ({} ne q{} && !defined($output_printed_{})) {{ print {}; if (!({} =~ {})) {{ print \"\\n\"; }} }}", 
                 output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
             );
             captured_pipeline = captured_pipeline.replace(&print_block_compact, "");
