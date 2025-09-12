@@ -264,7 +264,7 @@ echo "SHA512 result: $sha512_result"
 
 # strings command with backticks
 #PERL_MUST_NOT_CONTAIN `strings
-strings_result=`strings /bin/ls | head -3`
+strings_result=`strings target/debug/debashc.exe | head -3`
 echo "Strings result:"
 echo "$strings_result"
 
@@ -321,7 +321,7 @@ get_file_size() {
     echo "File $file has $size bytes"
 }
 
-get_file_size /etc/passwd
+get_file_size $0
 
 # Backticks in array
 files=(`ls -1 examples/*.sh 2>/dev/null`)
