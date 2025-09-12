@@ -14,10 +14,56 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
         if let Word::Array(_, elements, _) = value {
             // Handle array assignment like arr=(one two three)
             let elements_perl: Vec<String> = elements.iter()
-                .map(|s| format!("\"{}\"", generator.escape_perl_string(s)))
+                .map(|s| {
+                    // Check if this element contains backticks (command substitution)
+                    if s.contains('`') {
+                        // Extract the command from backticks and convert to native Perl
+                        if s.starts_with('`') && s.ends_with('`') {
+                            let cmd_text = &s[1..s.len()-1]; // Remove backticks
+                            // For now, handle common cases like `ls -1 examples/*.sh 2>/dev/null`
+                            if cmd_text.starts_with("ls ") {
+                                // Convert ls command to native Perl glob
+                                let args = cmd_text.strip_prefix("ls ").unwrap_or("");
+                                if args.contains("*.sh") {
+                                    // Handle glob pattern
+                                    let pattern = args.split_whitespace()
+                                        .find(|arg| arg.contains("*.sh"))
+                                        .unwrap_or("*.sh");
+                                    format!("glob('{}')", pattern)
+                                } else {
+                                    // Fallback for other ls commands - use native Perl
+                                    format!("do {{ use File::Find; my @files; find(sub {{ push @files, $File::Find::name if -f }}, '.'); @files }}")
+                                }
+                            } else if cmd_text.starts_with("date") {
+                                // Handle date command
+                                if let Some(format) = cmd_text.strip_prefix("date ") {
+                                    format!("do {{ use POSIX qw(strftime); strftime({}, localtime) }}", format)
+                                } else {
+                                    "do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime) }".to_string()
+                                }
+                            } else {
+                                // For other commands, use the command substitution handler from words.rs
+                                // This ensures consistency with other command substitutions
+                                format!("do {{ chomp(my $result = `{}`); $result }}", cmd_text)
+                            }
+                        } else {
+                            // Element contains backticks but not at start/end - treat as literal
+                            format!("\"{}\"", generator.escape_perl_string(s))
+                        }
+                    } else {
+                        // Normal string element
+                        format!("\"{}\"", generator.escape_perl_string(s))
+                    }
+                })
                 .collect();
             output.push_str(&generator.indent());
-            output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
+            // For array elements that are command substitutions, we need to expand them
+            if elements_perl.iter().any(|e| e.starts_with("glob(") || e.starts_with("do {")) {
+                // Use array expansion for glob results
+                output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
+            } else {
+                output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
+            }
             // Mark array as declared
             if !generator.declared_locals.contains(var) {
                 generator.declared_locals.insert(var.clone());

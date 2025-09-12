@@ -150,8 +150,103 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             } else {
                                 format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
+                        } else if name == "echo" {
+                            // Special handling for echo in command substitution
+                            if simple_cmd.args.is_empty() {
+                                "\"\\n\"".to_string()
+                            } else {
+                                let args: Vec<String> = simple_cmd.args.iter()
+                                    .map(|arg| generator.word_to_perl(arg))
+                                    .collect();
+                                format!("{} . \"\\n\"", args.join(" . q{ } . "))
+                            }
+                        } else if name == "printf" {
+                            // Special handling for printf in command substitution
+                            let mut format_string = String::new();
+                            let mut args = Vec::new();
+                            
+                            for (i, arg) in simple_cmd.args.iter().enumerate() {
+                                if i == 0 {
+                                    format_string = generator.word_to_perl(arg);
+                                    // Remove quotes if they exist around the format string
+                                    if format_string.starts_with('\'') && format_string.ends_with('\'') {
+                                        format_string = format_string[1..format_string.len()-1].to_string();
+                                    } else if format_string.starts_with('"') && format_string.ends_with('"') {
+                                        format_string = format_string[1..format_string.len()-1].to_string();
+                                    }
+                                } else {
+                                    args.push(generator.word_to_perl(arg));
+                                }
+                            }
+                            
+                            if format_string.is_empty() {
+                                "\"\"".to_string()
+                            } else {
+                                format!("sprintf({}, {})", 
+                                    generator.perl_string_literal(&Word::Literal(format_string, Default::default())),
+                                    args.join(", "))
+                            }
+                        } else if name == "date" {
+                            // Special handling for date in command substitution
+                            if let Some(format) = simple_cmd.args.first() {
+                                let format_str = generator.word_to_perl(format);
+                                format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", format_str)
+                            } else {
+                                "do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime); }".to_string()
+                            }
+                        } else if name == "pwd" {
+                            // Special handling for pwd in command substitution
+                            "do { use Cwd; getcwd(); }".to_string()
+                        } else if name == "basename" {
+                            // Special handling for basename in command substitution
+                            if let Some(path) = simple_cmd.args.first() {
+                                let path_str = generator.word_to_perl(path);
+                                let suffix = if simple_cmd.args.len() > 1 {
+                                    generator.word_to_perl(&simple_cmd.args[1])
+                                } else {
+                                    "\"\"".to_string()
+                                };
+                                format!("do {{ my $path = {}; my $suffix = {}; $path =~ s/\\Q$suffix\\E$// if $suffix ne q{{}}; $path =~ s/.*\\///; $path; }}", path_str, suffix)
+                            } else {
+                                "\".\"".to_string()
+                            }
+                        } else if name == "dirname" {
+                            // Special handling for dirname in command substitution
+                            if let Some(path) = simple_cmd.args.first() {
+                                let path_str = generator.word_to_perl(path);
+                                format!("do {{ my $path = {}; if ($path =~ /\\//) {{ $path =~ s/\\/[^\\/]*$//; $path = q{{.}} if $path eq q{{}}; }} else {{ $path = q{{.}}; }} $path; }}", path_str)
+                            } else {
+                                "\".\"".to_string()
+                            }
+                        } else if name == "which" {
+                            // Special handling for which in command substitution
+                            if let Some(command) = simple_cmd.args.first() {
+                                let command_str = generator.word_to_perl(command);
+                                format!("do {{ my $command = {}; my $found = 0; my $result = q{{}}; foreach my $dir (split /:/, $ENV{{PATH}}) {{ my $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
+                            } else {
+                                "\"\"".to_string()
+                            }
+                        } else if name == "seq" {
+                            // Special handling for seq in command substitution
+                            if simple_cmd.args.is_empty() {
+                                "\"1\"".to_string()
+                            } else if simple_cmd.args.len() == 1 {
+                                let last_str = generator.word_to_perl(&simple_cmd.args[0]);
+                                format!("do {{ my $last = {}; join \"\\n\", 1..$last; }}", last_str)
+                            } else if simple_cmd.args.len() == 2 {
+                                let first_str = generator.word_to_perl(&simple_cmd.args[0]);
+                                let last_str = generator.word_to_perl(&simple_cmd.args[1]);
+                                format!("do {{ my $first = {}; my $last = {}; join \"\\n\", $first..$last; }}", first_str, last_str)
+                            } else if simple_cmd.args.len() == 3 {
+                                let first_str = generator.word_to_perl(&simple_cmd.args[0]);
+                                let increment_str = generator.word_to_perl(&simple_cmd.args[1]);
+                                let last_str = generator.word_to_perl(&simple_cmd.args[2]);
+                                format!("do {{ my $first = {}; my $increment = {}; my $last = {}; my @result; for (my $i = $first; $i <= $last; $i += $increment) {{ push @result, $i; }} join \"\\n\", @result; }}", first_str, increment_str, last_str)
+                            } else {
+                                "\"\"".to_string()
+                            }
                         } else {
-                            // Fall back to system command for non-ls commands
+                            // Fall back to system command for non-builtin commands
                             let args: Vec<String> = simple_cmd.args.iter()
                                 .map(|arg| generator.word_to_perl(arg))
                                 .collect();
@@ -187,7 +282,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     let output_var = if let Some(cap) = re.captures(&pipeline_code) {
                         format!("$output_{}", cap.get(1).unwrap().as_str())
                     } else {
-                        "$output_0".to_string()
+                        // Generate a unique output variable if none found
+                        let unique_id = generator.get_unique_id();
+                        format!("$output_{}", unique_id)
                     };
                     
                     // Find the pipeline success variable
@@ -206,21 +303,21 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     let mut captured_pipeline = pipeline_code
                         .replace(&format!("print {};", output_var), "")
                         .replace("print \"\\n\";", "")
-                        .replace(&format!("print \"\\n\" unless {} =~ {};", output_var, generator.newline_end_regex()), "")
+                        .replace(&format!("if (!({} =~ {})) {{ print \"\\n\"; }}", output_var, generator.newline_end_regex()), "")
                         .replace(&format!("if (!{}) {{ $main_exit_code = 1; }}", success_var), "");
                     
                     // Remove conditional print blocks that are common in pipelines
                     // Use a simpler approach with string replacement for the specific pattern
                     let output_var_num = output_var.trim_start_matches("$output_");
                     let print_block_to_remove = format!(
-                        "if ({} ne q{} && !defined $output_printed_{}) {{\n\n        print {};\n        print \"\\n\" unless {} =~ {};\n    }}", 
+                        "if ({} ne q{} && !defined $output_printed_{}) {{\n\n        print {};\n        if (!({} =~ {})) {{ print \"\\n\"; }}\n    }}", 
                         output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
                     );
                     captured_pipeline = captured_pipeline.replace(&print_block_to_remove, "");
                     
                     // Also try without the extra newlines in case formatting is different
                     let print_block_compact = format!(
-                        "if ({} ne q{} && !defined $output_printed_{}) {{ print {}; print \"\\n\" unless {} =~ {}; }}", 
+                        "if ({} ne q{} && !defined $output_printed_{}) {{ print {}; if (!({} =~ {})) {{ print \"\\n\"; }} }}", 
                         output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
                     );
                     captured_pipeline = captured_pipeline.replace(&print_block_compact, "");
@@ -233,7 +330,12 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     
                     // Return the code that executes the pipeline and captures output
                     // Command substitution should convert newlines to spaces (bash behavior)
-                    format!("do {{ {} chomp {}; {} =~ s/\\n/ /gsxm; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
+                    if captured_pipeline.contains(&output_var) {
+                        format!("do {{ {} chomp {}; {} =~ s/\\n/ /gsxm; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
+                    } else {
+                        // If the pipeline doesn't contain the output variable, declare it and assign the result
+                        format!("do {{ my {} = q{{}}; {} chomp {}; {} =~ s/\\n/ /gsxm; {} }}", output_var, captured_pipeline.trim(), output_var, output_var, output_var)
+                    }
                 },
                 _ => {
                     // For other command types, use system command fallback

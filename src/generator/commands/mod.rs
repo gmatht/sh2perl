@@ -52,6 +52,8 @@ pub mod paste;
 pub mod diff;
 pub mod perl;
 pub mod echo;
+pub mod pwd;
+pub mod seq;
 
 // Re-export main functions
 pub use command_dispatcher::*;
@@ -100,3 +102,5 @@ pub use paste::*;
 pub use diff::*;
 pub use perl::*;
 pub use echo::*;
+pub use pwd::*;
+pub use seq::*;
