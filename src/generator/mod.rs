@@ -400,7 +400,7 @@ impl Generator {
         words::brace_item_to_word_impl(self, item)
     }
 
-    pub fn convert_string_interpolation_to_perl(&self, interp: &StringInterpolation) -> String {
+    pub fn convert_string_interpolation_to_perl(&mut self, interp: &StringInterpolation) -> String {
         words::convert_string_interpolation_to_perl_impl(self, interp)
     }
 

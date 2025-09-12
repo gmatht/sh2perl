@@ -289,11 +289,15 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         match ftype.as_str() {
             "f" => {
                 output.push_str(&indent4);
-                output.push_str("next unless -f $full_path;\n");
+                output.push_str("if (!(-f $full_path)) {\n");
+                output.push_str(&format!("{}    next;\n", indent4));
+                output.push_str(&format!("{}}}\n", indent4));
             },
             "d" => {
                 output.push_str(&indent4);
-                output.push_str("next unless -d $full_path;\n");
+                output.push_str("if (!(-d $full_path)) {\n");
+                output.push_str(&format!("{}    next;\n", indent4));
+                output.push_str(&format!("{}}}\n", indent4));
             },
             _ => {}
         }
@@ -314,7 +318,9 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         output.push_str(&indent4);
         output.push_str("if (-f $full_path) {\n");
         output.push_str(&indent5);
-        output.push_str("next unless -z $full_path;\n");
+        output.push_str("if (!(-z $full_path)) {\n");
+        output.push_str(&format!("{}    next;\n", indent5));
+        output.push_str(&format!("{}}}\n", indent5));
         output.push_str(&indent4);
         output.push_str("} elsif (-d $full_path) {\n");
         output.push_str(&indent5);
@@ -324,7 +330,9 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         output.push_str(&indent5);
         output.push_str("closedir $empty_dh;\n");
         output.push_str(&indent5);
-        output.push_str("next unless @entries == 0;\n");
+        output.push_str("if (!(@entries == 0)) {\n");
+        output.push_str(&format!("{}    next;\n", indent5));
+        output.push_str(&format!("{}}}\n", indent5));
         output.push_str(&indent4);
         output.push_str("} else {\n");
         output.push_str(&indent5);

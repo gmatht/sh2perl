@@ -50,12 +50,13 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
             }
             
             // Check if string needs interpolation (contains variables or special chars)
-            let needs_interpolation = s.contains('$') || s.contains('@') || s.contains('\\');
+            let needs_interpolation = s.contains('$') || s.contains('@') || s.contains('\\') || s.contains('`');
             
             if needs_interpolation {
                 // Escape quotes and backslashes for Perl string literals
                 let escaped = s.replace("\\", "\\\\")
                               .replace("\"", "\\\"")
+                              .replace("`", "\\`")
                               .replace("\n", "\\n")
                               .replace("\t", "\\t")
                               .replace("\r", "\\r");
@@ -106,11 +107,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
             generator.convert_string_interpolation_to_perl(interp)
         }
         Word::CommandSubstitution(cmd, _) => {
-            // Handle command substitution
+            // Handle command substitution - always convert to native Perl, never use backticks
             match cmd.as_ref() {
                 Command::Simple(simple_cmd) => {
-                    let cmd_name = generator.word_to_perl(&simple_cmd.name);
-                    
                     // Check if this is a builtin command that we can convert properly
                     if let Word::Literal(name, _) = &simple_cmd.name {
                         if name == "ls" {
@@ -127,29 +126,6 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             // For backtick commands, we need to return the value, not print it
                             // The generate_find_command already returns the joined string
                             perl_code
-                        } else if generator.inline_mode && cmd_name == "echo" {
-                            // In inline mode for echo, generate the output value directly
-                            if simple_cmd.args.is_empty() {
-                                "\"\\n\"".to_string()
-                            } else {
-                                let args: Vec<String> = simple_cmd.args.iter()
-                                    .map(|arg| generator.word_to_perl(arg))
-                                    .collect();
-                                format!("{} . \"\\n\"", args.join(" . q{ } . "))
-                            }
-                        } else if generator.inline_mode {
-                            // In inline mode, generate inline Perl code for other builtins
-                            // For now, fall back to system command for non-ls/echo builtins
-                            let args: Vec<String> = simple_cmd.args.iter()
-                                .map(|arg| generator.word_to_perl(arg))
-                                .collect();
-                            
-                            let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                            if args.is_empty() {
-                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
-                            } else {
-                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
-                            }
                         } else if name == "echo" {
                             // Special handling for echo in command substitution
                             if simple_cmd.args.is_empty() {
@@ -158,7 +134,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 let args: Vec<String> = simple_cmd.args.iter()
                                     .map(|arg| generator.word_to_perl(arg))
                                     .collect();
-                                format!("{} . \"\\n\"", args.join(" . q{ } . "))
+                                format!("({}) . \"\\n\"", args.join(" . q{ } . "))
                             }
                         } else if name == "printf" {
                             // Special handling for printf in command substitution
@@ -182,7 +158,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             if format_string.is_empty() {
                                 "\"\"".to_string()
                             } else {
-                                format!("sprintf({}, {})", 
+                                format!("sprintf {}, {}", 
                                     generator.perl_string_literal(&Word::Literal(format_string, Default::default())),
                                     args.join(", "))
                             }
@@ -204,9 +180,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 let suffix = if simple_cmd.args.len() > 1 {
                                     generator.word_to_perl(&simple_cmd.args[1])
                                 } else {
-                                    "\"\"".to_string()
+                                    "q{}".to_string()
                                 };
-                                format!("do {{ my $path = {}; my $suffix = {}; $path =~ s/\\Q$suffix\\E$// if $suffix ne q{{}}; $path =~ s/.*\\///; $path; }}", path_str, suffix)
+                                format!("do {{ my $path = {}; my $suffix = {}; if ($suffix ne q{{}}) {{ $path =~ s/\\Q$suffix\\E$//msx; }} $path =~ s/.*\\///msx; $path; }}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
                             } else {
                                 "\".\"".to_string()
                             }
@@ -214,7 +190,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             // Special handling for dirname in command substitution
                             if let Some(path) = simple_cmd.args.first() {
                                 let path_str = generator.word_to_perl(path);
-                                format!("do {{ my $path = {}; if ($path =~ /\\//) {{ $path =~ s/\\/[^\\/]*$//; $path = q{{.}} if $path eq q{{}}; }} else {{ $path = q{{.}}; }} $path; }}", path_str)
+                                format!("do {{ my $path = {}; if ($path =~ /\\//msx) {{ $path =~ s/\\/[^\\/]*$//msx; if ($path eq q{{}}) {{ $path = q{{.}}; }} }} else {{ $path = q{{.}}; }} $path; }}", path_str.replace("$0", "$PROGRAM_NAME"))
                             } else {
                                 "\".\"".to_string()
                             }
@@ -222,9 +198,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             // Special handling for which in command substitution
                             if let Some(command) = simple_cmd.args.first() {
                                 let command_str = generator.word_to_perl(command);
-                                format!("do {{ my $command = {}; my $found = 0; my $result = q{{}}; foreach my $dir (split /:/, $ENV{{PATH}}) {{ my $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
+                                format!("do {{ my $command = {}; my $found = 0; my $result = q{{}}; foreach my $dir (split /:/msx, $ENV{{PATH}}) {{ my $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
                             } else {
-                                "\"\"".to_string()
+                                "q{}".to_string()
                             }
                         } else if name == "seq" {
                             // Special handling for seq in command substitution
@@ -246,29 +222,30 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 "\"\"".to_string()
                             }
                         } else {
-                            // Fall back to system command for non-builtin commands
+                            // For non-builtin commands, use open3 to capture output without backticks
                             let args: Vec<String> = simple_cmd.args.iter()
                                 .map(|arg| generator.word_to_perl(arg))
                                 .collect();
                             
                             let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
                             if args.is_empty() {
-                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, name, in_var, result_var, out_var, out_var, pid_var, result_var)
                             } else {
-                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         }
                     } else {
-                        // Fall back to system command for non-literal command names
+                        // For non-literal command names, use open3 to capture output without backticks
+                        let cmd_name = generator.word_to_perl(&simple_cmd.name);
                         let args: Vec<String> = simple_cmd.args.iter()
                             .map(|arg| generator.word_to_perl(arg))
                             .collect();
                         
                         let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
                         if args.is_empty() {
-                            format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
+                            format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                         } else {
-                            format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
+                            format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, {}, {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
                         }
                     }
                 },

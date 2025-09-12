@@ -38,7 +38,7 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
     output.push_str(&format!("push @result, $fields[0];\n")); // Default to first field
     output.push_str("}\n");
     output.push_str("}\n");
-    output.push_str(&format!("{} = join \"\\n\", @result;\n", input_var));
+    output.push_str(&format!("${} = join \"\\n\", @result;\n", input_var));
     output.push_str("\n");
     
     output

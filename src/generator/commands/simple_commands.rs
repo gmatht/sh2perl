@@ -42,9 +42,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     "do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime) }".to_string()
                                 }
                             } else {
-                                // For other commands, use the command substitution handler from words.rs
-                                // This ensures consistency with other command substitutions
-                                format!("do {{ chomp(my $result = `{}`); $result }}", cmd_text)
+                                // For other commands, use open3 to capture output without backticks
+                                let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+                                format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_text, in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         } else {
                             // Element contains backticks but not at start/end - treat as literal
@@ -256,7 +256,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     let args: Vec<String> = filtered_args.iter()
                         .map(|arg| generator.word_to_perl(arg))
                         .collect();
-                    output.push_str(&format!("{} . \"\\n\"", args.join(" . q{ } . ")));
+                    output.push_str(&format!("({}) . \"\\n\"", args.join(" . q{ } . ")));
                 }
                 return output;
             }
@@ -748,7 +748,15 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                         handle_brace_expansion_for_echo(generator, expansion)
                     }
                     Word::Literal(literal, _) => {
-                        if has_e_flag {
+                        // Check if the literal contains escaped backticks that should be processed as command substitutions
+                        if literal.contains("\\\\`") {
+                            // Parse the string as string interpolation to handle escaped backticks
+                            if let Ok(interp) = crate::parser::words::parse_string_interpolation_from_literal(literal) {
+                                generator.convert_string_interpolation_to_perl(&interp)
+                            } else {
+                                generator.perl_string_literal(arg)
+                            }
+                        } else if has_e_flag {
                             // If -e flag is present, interpret backslash escapes
                             let mut interpreted = literal.clone();
                             // Remove outer quotes if present

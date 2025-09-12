@@ -22,15 +22,22 @@ pub fn generate_strings_command(generator: &mut Generator, cmd: &SimpleCommand, 
         }
     }
     
-    output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
+    // For strings command, we need to process the input as binary data
+    output.push_str(&format!("my $input_data = {};\n", input_var));
     output.push_str("my @result;\n");
-    output.push_str("foreach my $line (@lines) {\n");
-    output.push_str("chomp $line;\n");
-    output.push_str(&format!("if (length($line) >= {}) {{\n", min_length));
-    output.push_str(&format!("if ($line =~ {}) {{\n", generator.format_regex_pattern(r"^[\\x20-\\x7E]+$"))); // Printable ASCII only
-    output.push_str("push @result, $line;\n");
+    output.push_str("my $current_string = q{};\n");
+    output.push_str("for my $char (split //msx, $input_data) {\n");
+    output.push_str("if ($char =~ /[\\x20-\\x7E]/msx) {\n"); // Printable ASCII
+    output.push_str("$current_string .= $char;\n");
+    output.push_str("} else {\n");
+    output.push_str(&format!("if (length $current_string >= {}) {{\n", min_length));
+    output.push_str("push @result, $current_string;\n");
+    output.push_str("}\n");
+    output.push_str("$current_string = q{};\n");
     output.push_str("}\n");
     output.push_str("}\n");
+    output.push_str(&format!("if (length $current_string >= {}) {{\n", min_length));
+    output.push_str("push @result, $current_string;\n");
     output.push_str("}\n");
     output.push_str(&format!("{} = join \"\\n\", @result;\n", input_var));
     output.push_str("\n");
