@@ -33,6 +33,8 @@ fn escape_glob_pattern(pattern: &str) -> String {
         }
     }
     
+    // Add end anchor for proper matching
+    result.push('$');
     result
 }
 
@@ -123,14 +125,20 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
                 match s.as_str() {
                     "-name" => {
                         if i + 1 < reconstructed_args.len() {
-                            if let Word::StringInterpolation(interp, _) = &reconstructed_args[i + 1] {
-                                let pattern = interp.parts.iter()
-                                    .map(|part| match part {
-                                        StringPart::Literal(s) => s.clone(),
-                                        _ => "*".to_string(),
-                                    })
-                                    .collect::<String>();
-                                name_pattern = Some(pattern);
+                            match &reconstructed_args[i + 1] {
+                                Word::StringInterpolation(interp, _) => {
+                                    let pattern = interp.parts.iter()
+                                        .map(|part| match part {
+                                            StringPart::Literal(s) => s.clone(),
+                                            _ => "*".to_string(),
+                                        })
+                                        .collect::<String>();
+                                    name_pattern = Some(pattern);
+                                },
+                                Word::Literal(pattern, _) => {
+                                    name_pattern = Some(pattern.clone());
+                                },
+                                _ => {}
                             }
                             i += 1;
                         }
@@ -314,7 +322,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     // Add name pattern check
     if let Some(pattern) = &name_pattern {
         output.push_str(&indent4);
-        output.push_str(&format!("if (!($file =~ {})) {{\n", generator.format_regex_pattern(&escape_glob_pattern(pattern))));
+        output.push_str(&format!("if (!($filename =~ {})) {{\n", generator.format_regex_pattern(&escape_glob_pattern(pattern))));
         output.push_str(&indent4);
         output.push_str("    next;\n");
         output.push_str(&indent4);
@@ -605,14 +613,20 @@ fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCommand
                 match s.as_str() {
                     "-name" => {
                         if i + 1 < reconstructed_args.len() {
-                            if let Word::StringInterpolation(interp, _) = &reconstructed_args[i + 1] {
-                                let pattern = interp.parts.iter()
-                                    .map(|part| match part {
-                                        StringPart::Literal(s) => s.clone(),
-                                        _ => "*".to_string(),
-                                    })
-                                    .collect::<String>();
-                                name_pattern = Some(pattern);
+                            match &reconstructed_args[i + 1] {
+                                Word::StringInterpolation(interp, _) => {
+                                    let pattern = interp.parts.iter()
+                                        .map(|part| match part {
+                                            StringPart::Literal(s) => s.clone(),
+                                            _ => "*".to_string(),
+                                        })
+                                        .collect::<String>();
+                                    name_pattern = Some(pattern);
+                                },
+                                Word::Literal(pattern, _) => {
+                                    name_pattern = Some(pattern.clone());
+                                },
+                                _ => {}
                             }
                             i += 1;
                         }
@@ -662,6 +676,7 @@ fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCommand
     output.push_str("    use File::Find;\n");
     output.push_str("    find(sub {\n");
     output.push_str("        my $file = $File::Find::name;\n");
+    output.push_str("        my $filename = $_;\n");
     
     // Add file type check
     if let Some(ftype) = &file_type {
@@ -683,7 +698,7 @@ fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCommand
     // Add name pattern check
     if let Some(pattern) = &name_pattern {
         let escaped_pattern = escape_glob_pattern(pattern);
-        output.push_str("        if ($file !~ ");
+        output.push_str("        if ($filename !~ ");
         output.push_str(&generator.format_regex_pattern(&escaped_pattern));
         output.push_str(") {\n");
         output.push_str("            return;\n");
