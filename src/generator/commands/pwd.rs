@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_pwd_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
+pub fn generate_pwd_command(_generator: &mut Generator, _cmd: &SimpleCommand) -> String {
     let mut output = String::new();
     
     // pwd command - get current working directory

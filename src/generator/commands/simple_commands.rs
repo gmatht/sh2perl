@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 use crate::generator::utils::get_temp_dir;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Static counter for generating unique temp file names
@@ -29,7 +30,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     let pattern = args.split_whitespace()
                                         .find(|arg| arg.contains("*.sh"))
                                         .unwrap_or("*.sh");
-                                    format!("glob('{}')", pattern)
+                                    format!("glob '{}'", pattern)
                                 } else {
                                     // Fallback for other ls commands - use native Perl
                                     format!("do {{ use File::Find; my @files; find(sub {{ push @files, $File::Find::name if -f }}, '.'); @files }}")
@@ -37,7 +38,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             } else if cmd_text.starts_with("date") {
                                 // Handle date command
                                 if let Some(format) = cmd_text.strip_prefix("date ") {
-                                    format!("do {{ use POSIX qw(strftime); strftime({}, localtime) }}", format)
+                                    // Strip the + prefix from date format strings (shell date +%Y -> strftime %Y)
+                                    let cleaned_format = if format.starts_with('+') {
+                                        format!("'{}'", &format[1..])
+                                    } else if format.starts_with('"') || format.starts_with("'") || format.starts_with("q{") {
+                                        format.to_string()
+                                    } else {
+                                        format!("'{}'", format)
+                                    };
+                                    format!("do {{ use POSIX qw(strftime); strftime({}, localtime) }}", cleaned_format)
                                 } else {
                                     "do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime) }".to_string()
                                 }
@@ -236,7 +245,64 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
 
     // Generate the actual command
     if let Word::Literal(ref name, _) = cmd.name {
-        if name == "echo" {
+        if name == "local" {
+            // Handle local command - convert to my declarations
+            for arg in &cmd.args {
+                match arg {
+                    Word::Literal(var_name, _) => {
+                        // Check if it's an assignment (var=value)
+                        if var_name.contains('=') {
+                            let parts: Vec<&str> = var_name.splitn(2, '=').collect();
+                            if parts.len() == 2 {
+                                let var = parts[0];
+                                let value = parts[1];
+                                if !generator.declared_locals.contains(var) {
+                                    // Check if the value contains command substitution
+                                    if value.contains('`') {
+                                        // Handle command substitution in local assignment
+                                        // Parse the command substitution and convert to Perl
+                                        let command_substitution = value.trim_start_matches('`').trim_end_matches('`');
+                                        let perl_command = generator.word_to_perl(&Word::CommandSubstitution(
+                                            Box::new(Command::Simple(SimpleCommand {
+                                                name: Word::Literal("bash".to_string(), None),
+                                                args: vec![Word::Literal("-c".to_string(), None), Word::Literal(command_substitution.to_string(), None)],
+                                                redirects: vec![],
+                                                env_vars: HashMap::new(),
+                                                stderr_used: false,
+                                                stdout_used: false,
+                                            })),
+                                            None
+                                        ));
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&format!("my ${} = {};\n", var, perl_command));
+                                    } else {
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&format!("my ${} = {};\n", var, value));
+                                    }
+                                    generator.declared_locals.insert(var.to_string());
+                                }
+                            }
+                        } else {
+                            // Just declaration without assignment
+                            if !generator.declared_locals.contains(var_name) {
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("my ${};\n", var_name));
+                                generator.declared_locals.insert(var_name.clone());
+                            }
+                        }
+                    }
+                    _ => {
+                        // For other word types, try to extract variable name and value
+                        let var_expr = generator.word_to_perl(arg);
+                        if !var_expr.is_empty() && !generator.declared_locals.contains(&var_expr) {
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("my {};\n", var_expr));
+                            generator.declared_locals.insert(var_expr);
+                        }
+                    }
+                }
+            }
+        } else if name == "echo" {
             // Use the echo command generator for non-pipeline echo commands
             if generator.inline_mode {
                 // In inline mode, generate the output value directly instead of print statements
@@ -254,7 +320,27 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     
                     // Convert arguments to Perl format
                     let args: Vec<String> = filtered_args.iter()
-                        .map(|arg| generator.word_to_perl(arg))
+                        .map(|arg| {
+                            match arg {
+                                Word::StringInterpolation(interp, _) => {
+                                    generator.convert_string_interpolation_to_perl(interp)
+                                },
+                                Word::Literal(literal, _) => {
+                                    // Check if the literal contains escaped backticks that should be processed as command substitutions
+                                    if literal.contains("\\`") {
+                                        // Parse the string as string interpolation to handle escaped backticks
+                                        if let Ok(interp) = crate::parser::words::parse_string_interpolation_from_literal(literal) {
+                                            generator.convert_string_interpolation_to_perl(&interp)
+                                        } else {
+                                            generator.perl_string_literal(arg)
+                                        }
+                                    } else {
+                                        generator.perl_string_literal(arg)
+                                    }
+                                },
+                                _ => generator.word_to_perl(arg)
+                            }
+                        })
                         .collect();
                     output.push_str(&format!("({}) . \"\\n\"", args.join(" . q{ } . ")));
                 }

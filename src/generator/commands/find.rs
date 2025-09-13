@@ -52,6 +52,14 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
         return generate_system_find_fallback(generator, cmd, generate_output, input_var);
     }
     
+    // For command substitution, use a simpler approach that doesn't define subroutines
+    eprintln!("DEBUG: generate_find_command called with generate_output: {}, input_var: '{}'", generate_output, input_var);
+    if generate_output && input_var != "" {
+        eprintln!("DEBUG: Using generate_find_for_substitution with input_var: '{}'", input_var);
+        return generate_find_for_substitution(generator, cmd, input_var);
+    }
+    eprintln!("DEBUG: Using complex find generation instead");
+    
     // Generate a unique subroutine name
     let subroutine_id = generator.get_unique_id();
     let subroutine_name = format!("find_files_{}", subroutine_id);
@@ -538,6 +546,154 @@ waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, formatted_args, in
         let formatted_args = find_args.join(", ");
         output.push_str(&format!("system 'find', {};\n", formatted_args));
     }
+    
+    output
+}
+
+fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str) -> String {
+    let mut output = String::new();
+    
+    // Parse find arguments to understand what we're looking for
+    let mut _start_path = ".".to_string();
+    let mut name_pattern = None;
+    let mut file_type = None;
+    
+    // First, reconstruct split arguments (e.g., "-s" + "ize" = "-size")
+    let mut reconstructed_args = Vec::new();
+    let mut i = 0;
+    while i < cmd.args.len() {
+        if let Word::Literal(s, _) = &cmd.args[i] {
+            // Check if this is a split argument that needs reconstruction
+            if (s == "-s" || s == "-e" || s == "-p" || s == "-n") && i + 1 < cmd.args.len() {
+                if let Word::Literal(next_s, _) = &cmd.args[i + 1] {
+                    // Reconstruct common find arguments
+                    match (s.as_str(), next_s.as_str()) {
+                        ("-s", "ize") => {
+                            reconstructed_args.push(Word::Literal("-size".to_string(), None));
+                            i += 2;
+                            continue;
+                        },
+                        ("-e", "mpty") => {
+                            reconstructed_args.push(Word::Literal("-empty".to_string(), None));
+                            i += 2;
+                            continue;
+                        },
+                        ("-p", "ath") => {
+                            reconstructed_args.push(Word::Literal("-path".to_string(), None));
+                            i += 2;
+                            continue;
+                        },
+                        ("-n", "ot") => {
+                            reconstructed_args.push(Word::Literal("-not".to_string(), None));
+                            i += 2;
+                            continue;
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+        reconstructed_args.push(cmd.args[i].clone());
+        i += 1;
+    }
+    
+    // Now parse the reconstructed arguments
+    let mut i = 0;
+    while i < reconstructed_args.len() {
+        match &reconstructed_args[i] {
+            Word::Literal(s, _) => {
+                match s.as_str() {
+                    "-name" => {
+                        if i + 1 < reconstructed_args.len() {
+                            if let Word::StringInterpolation(interp, _) = &reconstructed_args[i + 1] {
+                                let pattern = interp.parts.iter()
+                                    .map(|part| match part {
+                                        StringPart::Literal(s) => s.clone(),
+                                        _ => "*".to_string(),
+                                    })
+                                    .collect::<String>();
+                                name_pattern = Some(pattern);
+                            }
+                            i += 1;
+                        }
+                    },
+                    "-type" => {
+                        if i + 1 < reconstructed_args.len() {
+                            if let Word::Literal(type_str, _) = &reconstructed_args[i + 1] {
+                                file_type = Some(type_str.clone());
+                            }
+                            i += 1;
+                        }
+                    },
+                    _ => {
+                        // This might be the starting path
+                        if i == 0 {
+                            _start_path = s.clone();
+                        }
+                    }
+                }
+            },
+            Word::StringInterpolation(interp, _) => {
+                // This might be the starting path
+                if i == 0 {
+                    let path = interp.parts.iter()
+                        .map(|part| match part {
+                            StringPart::Literal(s) => s.clone(),
+                            StringPart::Variable(var) => format!("$ENV{{{}}}", var),
+                            _ => ".".to_string(),
+                        })
+                        .collect::<String>();
+                    _start_path = path;
+                }
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    // Generate simple Perl code for find functionality using glob
+    output.push_str("do {\n");
+    output.push_str("    my @results;\n");
+    output.push_str("    my $start_path = ");
+    output.push_str(&generator.perl_string_literal(&Word::Literal(_start_path, Default::default())));
+    output.push_str(";\n");
+    
+    // Use File::Find for recursive directory traversal
+    output.push_str("    use File::Find;\n");
+    output.push_str("    find(sub {\n");
+    output.push_str("        my $file = $File::Find::name;\n");
+    
+    // Add file type check
+    if let Some(ftype) = &file_type {
+        match ftype.as_str() {
+            "f" => {
+                output.push_str("        if (!-f $file) {\n");
+                output.push_str("            return;\n");
+                output.push_str("        }\n");
+            },
+            "d" => {
+                output.push_str("        if (!-d $file) {\n");
+                output.push_str("            return;\n");
+                output.push_str("        }\n");
+            },
+            _ => {}
+        }
+    }
+    
+    // Add name pattern check
+    if let Some(pattern) = &name_pattern {
+        let escaped_pattern = escape_glob_pattern(pattern);
+        output.push_str("        if ($file !~ ");
+        output.push_str(&generator.format_regex_pattern(&escaped_pattern));
+        output.push_str(") {\n");
+        output.push_str("            return;\n");
+        output.push_str("        }\n");
+    }
+    
+    output.push_str("        push @results, $file;\n");
+    output.push_str("    }, $start_path);\n");
+    output.push_str("    join \"\\n\", @results;\n");
+    output.push_str("}");
     
     output
 }

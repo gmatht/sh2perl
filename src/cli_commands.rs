@@ -459,7 +459,7 @@ pub fn export_mir(input: &str, optimize: bool) {
     println!("{}", "=".repeat(50));
 }
 
-pub fn export_mir_to_json(input: &str, optimize: bool) {
+pub fn export_mir_to_json(input: &str, _optimize: bool) {
     let commands = match Parser::new(input).parse() {
         Ok(c) => c,
         Err(e) => { 
@@ -510,7 +510,7 @@ pub fn parse_perl_critic_only(input: &str) {
 
 fn test_perl_lex(input: &str) -> i32 {
     // Test basic syntax with perl -c
-    let mut child = Command::new("perl")
+    let child = Command::new("perl")
         .arg("-c")
         .arg("-")
         .stdin(std::process::Stdio::piped())
@@ -537,7 +537,7 @@ fn test_perl_parse(input: &str) -> i32 {
 
 fn test_perl_generate(input: &str) -> i32 {
     // Test if the code can be executed without errors
-    let mut child = Command::new("perl")
+    let child = Command::new("perl")
         .arg("-")
         .stdin(std::process::Stdio::piped())
         .spawn();

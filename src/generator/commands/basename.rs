@@ -16,13 +16,21 @@ pub fn generate_basename_command(generator: &mut Generator, cmd: &SimpleCommand,
         output.push_str(&format!("my $path = {};\n", path_str));
         if !suffix.is_empty() {
             output.push_str(&format!("my $suffix = {};\n", suffix));
-            output.push_str("$path =~ s/\\Q$suffix\\E$//;\n");
+            output.push_str("$path =~ s/\\Q$suffix\\E$//msx;\n");
         }
-        output.push_str("$path =~ s/.*\\///;\n"); // Remove directory part
-        output.push_str(&format!("{} = $path;\n", input_var));
+        output.push_str("$path =~ s/.*\\///msx;\n"); // Remove directory part
+        if !input_var.is_empty() {
+            output.push_str(&format!("{} = $path;\n", input_var));
+        } else {
+            output.push_str("print $path, \"\\n\";\n");
+        }
     } else {
         // Default to current directory
-        output.push_str(&format!("{} = q{{.}};\n", input_var));
+        if !input_var.is_empty() {
+            output.push_str(&format!("{} = q{{.}};\n", input_var));
+        } else {
+            output.push_str("print q{.}, \"\\n\";\n");
+        }
     }
     output.push_str("\n");
     

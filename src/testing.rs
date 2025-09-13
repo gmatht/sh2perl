@@ -737,7 +737,7 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 .output() {
                 
                 let tidy_stdout = String::from_utf8_lossy(&tidy_output.stdout);
-                let tidy_stderr = String::from_utf8_lossy(&tidy_output.stderr);
+                let _tidy_stderr = String::from_utf8_lossy(&tidy_output.stderr);
                 
                 // Check if there are formatting differences
                 if tidy_stdout.contains("Original:") && tidy_stdout.contains("Tidied:") {

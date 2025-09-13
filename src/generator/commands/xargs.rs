@@ -29,7 +29,7 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
-                .map(|s| s.clone())
+                .map(|s| s)
                 .collect::<String>();
             args.push(pattern);
         }

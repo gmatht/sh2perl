@@ -103,10 +103,28 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                             
                                             result.push_str(&interpreted);
                                         },
+                                        crate::ast::StringPart::Variable(var) => {
+                                            // Handle variables in string interpolation
+                                            match var.as_str() {
+                                                "#" => result.push_str("scalar(@ARGV)"),
+                                                "@" => result.push_str("@ARGV"),
+                                                _ => result.push_str(&format!("${}", var))
+                                            }
+                                        },
+                                        crate::ast::StringPart::CommandSubstitution(cmd) => {
+                                            // Handle command substitutions in string interpolation
+                                            let cmd_result = generator.word_to_perl(&Word::CommandSubstitution(cmd.clone(), None));
+                                            result.push_str(&cmd_result);
+                                        },
+                                        crate::ast::StringPart::ParameterExpansion(pe) => {
+                                            // Handle parameter expansions
+                                            result.push_str(&generator.generate_parameter_expansion(pe));
+                                        },
                                         _ => {
                                             // For other parts, use default processing
-                                            // This is a simplified approach - in reality, we'd need more complex handling
-                                            result.push_str(&format!("{:?}", part));
+                                            result.push_str(&generator.convert_string_interpolation_to_perl(&crate::ast::StringInterpolation {
+                                                parts: vec![part.clone()]
+                                            }));
                                         }
                                     }
                                 }
@@ -114,7 +132,8 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                 // Escape quotes, backslashes, newlines, and tabs
                                 format!("\"{}\"", result.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
                             } else {
-                                generator.perl_string_literal(arg)
+                                // For multi-part string interpolation without -e flag, use the general string interpolation handler
+                                generator.convert_string_interpolation_to_perl(interp)
                             }
                         }
                     }
@@ -143,7 +162,17 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                             // Escape quotes, backslashes, newlines, and tabs
                             format!("\"{}\"", interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
                         } else {
-                            generator.perl_string_literal(arg)
+                            // Check if the literal contains escaped backticks that should be processed as command substitutions
+                            if literal.contains("\\`") {
+                                // Parse the string as string interpolation to handle escaped backticks
+                                if let Ok(interp) = crate::parser::words::parse_string_interpolation_from_literal(literal) {
+                                    generator.convert_string_interpolation_to_perl(&interp)
+                                } else {
+                                    generator.perl_string_literal(arg)
+                                }
+                            } else {
+                                generator.perl_string_literal(arg)
+                            }
                         }
                     }
                     Word::CommandSubstitution(cmd, _) => {

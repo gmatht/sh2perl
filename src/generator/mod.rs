@@ -865,7 +865,7 @@ impl Generator {
                     true
                 }
             },
-            Command::Pipeline(pipeline) => {
+            Command::Pipeline(_pipeline) => {
                 // Pipelines need IPC::Open3
                 true
             },
