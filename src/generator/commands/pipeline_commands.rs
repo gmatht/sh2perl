@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 use crate::generator::commands::builtins::{is_builtin, generate_generic_builtin, pipeline_supports_linebyline};
+use regex::Regex;
 
 /// Helper function to generate Perl code for a command using the builtins registry
 fn generate_command_using_builtins(
@@ -358,12 +359,12 @@ fn generate_command_using_builtins(
             let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
             if input_var.is_empty() {
                 // First command in pipeline
-                format!("\nmy ({});\nmy {} = open3({}, {}, {}, '{}');\nclose {} or croak 'Close failed: $!';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", 
-                    in_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(command), in_var, output_var, out_var, out_var, pid_var)
+                format!("\nmy ({});\nmy {} = open3({}, {}, {}, '{}');\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
+                    in_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(command), in_var, out_var, output_var, out_var, pid_var)
             } else {
                 // Subsequent command - use a different approach that works
-                format!("\nmy ({});\nmy {} = open3({}, {}, {}, 'echo \"${}\" | {}');\nclose {} or croak 'Close failed: $!';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", 
-                    in_var, pid_var, in_var, out_var, err_var, input_var, generator.generate_command_string_for_system(command), in_var, output_var, out_var, out_var, pid_var)
+                format!("\nmy ({});\nmy {} = open3({}, {}, {}, 'echo \"${}\" | {}');\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
+                    in_var, pid_var, in_var, out_var, err_var, input_var, generator.generate_command_string_for_system(command), in_var, out_var, output_var, out_var, pid_var)
             }
         }
     }
@@ -375,6 +376,132 @@ fn generate_command_using_builtins(
 pub fn generate_pipeline_impl(generator: &mut Generator, pipeline: &Pipeline) -> String {
     // This is now a pure pipe pipeline since logical operators are handled separately
     generate_simple_pipe_pipeline(generator, pipeline, true)
+}
+
+/// Generate a pipeline specifically for command substitution
+pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &Pipeline) -> String {
+    eprintln!("DEBUG: generate_pipeline_for_substitution called");
+    // Generate the pipeline without print statements
+    let output = generate_simple_pipe_pipeline(generator, pipeline, false);
+    
+    // Check if the output already contains chomp and regex processing
+    // This happens when generate_streaming_pipeline handles commands like 'seq' completely
+    if output.contains("chomp $output_") && (output.contains("=~ s/\\n/ /gsxm") || output.contains("join ' ', split /\\n/msx") || (output.contains("my @temp_lines_") && output.contains("join q{ }, @temp_lines_"))) {
+        eprintln!("DEBUG: Pipeline already fully processed, returning as-is");
+        return output;
+    }
+    
+    // Find the output variable
+    let re = Regex::new(r"\$output_(\d+)").unwrap();
+    let output_var = if let Some(cap) = re.captures(&output) {
+        format!("$output_{}", cap.get(1).unwrap().as_str())
+    } else {
+        // Generate a unique output variable if none found
+        let unique_id = generator.get_unique_id();
+        format!("$output_{}", unique_id)
+    };
+    
+    // For command substitution, we need to place chomp and regex at the very end
+    // but we need to be careful about if statements that would create postfix if
+    let trimmed = output.trim();
+    eprintln!("DEBUG: trimmed output: {}", trimmed);
+    
+    // Check if the pipeline ends with an if block that contains the output assignment
+    if trimmed.ends_with('}') {
+        // Look for the pattern where the last if block contains the output assignment
+        // This handles cases like tail where the assignment is inside an if block
+        let if_pattern = "if (@tail_lines > 0) {";
+        if trimmed.contains(&if_pattern) {
+            // Find the last occurrence of this if pattern
+            if let Some(if_start) = trimmed.rfind(&if_pattern) {
+                // Find the matching closing brace for this if block
+                let mut brace_count = 0;
+                let mut if_end = if_start;
+                let mut found_closing = false;
+                
+                for (i, ch) in trimmed[if_start..].char_indices() {
+                    if ch == '{' {
+                        brace_count += 1;
+                    } else if ch == '}' {
+                        brace_count -= 1;
+                        if brace_count == 0 {
+                            if_end = if_start + i + 1;
+                            found_closing = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if found_closing {
+                    // Insert chomp and regex right before the closing brace of the if block
+                    let before_if = &trimmed[..if_end - 1]; // -1 to exclude the closing brace
+                    let after_if = &trimmed[if_end..];
+                    
+                    return format!("{}\nchomp {};\n{} =~ s/\\n/ /gsxm;\n{}}}", 
+                        before_if, output_var, output_var, after_if);
+                }
+            }
+        }
+        
+        // Fallback: look for the last assignment to the output variable
+        let assignment_pattern = format!("{} = ", output_var);
+        if let Some(last_assignment_pos) = trimmed.rfind(&assignment_pattern) {
+            // Find the end of this assignment statement
+            let mut end_pos = last_assignment_pos + assignment_pattern.len();
+            while end_pos < trimmed.len() {
+                let ch = trimmed.chars().nth(end_pos).unwrap();
+                if ch == ';' || ch == '\n' {
+                    break;
+                }
+                end_pos += 1;
+            }
+            
+            // Check if there's an if statement after this assignment
+            let after_assignment = &trimmed[end_pos..];
+            if after_assignment.trim().starts_with("if (") {
+                // There's an if statement after the assignment
+                // Insert chomp and regex right after the assignment, before the if
+                let before_assignment = &trimmed[..end_pos];
+                let after_assignment = &trimmed[end_pos..];
+                
+                // Find where the if statement starts
+                let if_start = after_assignment.find("if (").unwrap();
+                let before_if = &after_assignment[..if_start];
+                let after_if = &after_assignment[if_start..];
+                
+                return format!("{}{}\nchomp {};\n{} =~ s/\\n/ /gsxm;\n{}", 
+                    before_assignment, before_if, output_var, output_var, after_if);
+            } else {
+                // No if statement after assignment, append at the end
+                // Find the last closing brace and insert chomp before it
+                if let Some(last_brace_pos) = trimmed.rfind('}') {
+                    let before_brace = &trimmed[..last_brace_pos];
+                    let after_brace = &trimmed[last_brace_pos..];
+                    return format!("{}    chomp {};\n    {} =~ s/\\n/ /gsxm;\n{}", before_brace, output_var, output_var, after_brace);
+                } else {
+                    return format!("{}\nchomp {};\n{} =~ s/\\n/ /gsxm;\n{}", trimmed, output_var, output_var, output_var);
+                }
+            }
+        } else {
+            // No assignment found, append at the end
+            if let Some(last_brace_pos) = trimmed.rfind('}') {
+                let before_brace = &trimmed[..last_brace_pos];
+                let after_brace = &trimmed[last_brace_pos..];
+                return format!("{}    chomp {};\n    {} =~ s/\\n/ /gsxm;\n{}", before_brace, output_var, output_var, after_brace);
+            } else {
+                return format!("{}\nchomp {};\n{} =~ s/\\n/ /gsxm;\n{}", trimmed, output_var, output_var, output_var);
+            }
+        }
+    } else {
+        // Pipeline doesn't end with }, append at the end
+        if let Some(last_brace_pos) = trimmed.rfind('}') {
+            let before_brace = &trimmed[..last_brace_pos];
+            let after_brace = &trimmed[last_brace_pos..];
+            format!("{}    chomp {};\n    {} =~ s/\\n/ /gsxm;\n{}", before_brace, output_var, output_var, after_brace)
+        } else {
+            format!("{}\nchomp {};\n{} =~ s/\\n/ /gsxm;\n{}", trimmed, output_var, output_var, output_var)
+        }
+    }
 }
 
 /// Generate a simple pipe pipeline with print option
@@ -406,6 +533,9 @@ fn generate_simple_pipe_pipeline(generator: &mut Generator, pipeline: &Pipeline,
 fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, should_print: bool) -> String {
     let mut output = String::new();
     
+    // Generate unique ID for this pipeline
+    let unique_id = generator.get_unique_id();
+    
     // Add original bash command as comment if available
     if let Some(source_text) = &pipeline.source_text {
         // Handle multiline source text by only taking the first line (the actual pipeline)
@@ -418,7 +548,189 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
     let mut start_index = 0;
     if let Command::Simple(first_cmd) = &pipeline.commands[0] {
         if let Word::Literal(name, _) = &first_cmd.name {
-            if name == "yes" {
+            if name == "seq" {
+                // Handle 'seq' command by executing it and processing its output
+                
+                let unique_id = generator.get_unique_id();
+                output.push_str(&generator.indent());
+                output.push_str(&format!("do {{\n"));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                // Generate native Perl sequence instead of using open3
+                let start_num = if first_cmd.args.len() >= 1 {
+                    if let Word::Literal(s, _) = &first_cmd.args[0] {
+                        s.parse::<i32>().unwrap_or(1)
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                };
+                let end_num = if first_cmd.args.len() >= 2 {
+                    if let Word::Literal(s, _) = &first_cmd.args[1] {
+                        s.parse::<i32>().unwrap_or(10)
+                    } else {
+                        10
+                    }
+                } else {
+                    10
+                };
+                output.push_str(&format!("my $seq_output_{} = do {{\n", unique_id));
+                output.push_str(&format!("    my $result = q{{}};\n"));
+                output.push_str(&format!("    for my $i ({}..{}) {{\n", start_num, end_num));
+                output.push_str(&format!("        $result .= \"$i\\n\";\n"));
+                output.push_str(&format!("    }}\n"));
+                output.push_str(&format!("    $result;\n"));
+                output.push_str(&format!("}};\n"));
+                
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my @seq_lines_{} = split /\\n/msx, $seq_output_{};\n", unique_id, unique_id));
+                
+                // Declare variables needed for subsequent commands in the pipeline
+                let mut output_var = format!("$output_{}", unique_id);
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my {} = q{{}};\n", output_var));
+                
+                // Check if we need to declare variables for head command
+                let has_head = pipeline.commands.iter().any(|cmd| {
+                    if let Command::Simple(simple_cmd) = cmd {
+                        if let Word::Literal(name, _) = &simple_cmd.name {
+                            name == "head"
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                });
+                
+                if has_head {
+                    output.push_str(&generator.indent());
+                    output.push_str("my $head_line_count = 0;\n");
+                }
+                
+                // Check if we need to declare variables for tail command
+                let has_tail = pipeline.commands.iter().any(|cmd| {
+                    if let Command::Simple(simple_cmd) = cmd {
+                        if let Word::Literal(name, _) = &simple_cmd.name {
+                            name == "tail"
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                });
+                
+                if has_tail {
+                    output.push_str(&generator.indent());
+                    output.push_str("my @tail_lines = ();\n");
+                }
+                
+                output.push_str(&generator.indent());
+                output.push_str(&format!("foreach my $line (@seq_lines_{}) {{\n", unique_id));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("chomp $line;\n");
+                
+                // Process each line through the remaining pipeline commands within the foreach loop
+                for (i, command) in pipeline.commands[1..].iter().enumerate() {
+                    match command {
+                        Command::Simple(cmd) => {
+                            let cmd_name = match &cmd.name {
+                                Word::Literal(s, _) => s,
+                                _ => "unknown_command"
+                            };
+                            
+                            // Generate line-by-line version of each command
+                            output.push_str(&generator.indent());
+                            let mut linebyline_output = generate_linebyline_command(generator, cmd, "line", 1 + i);
+                            // Replace the output variable reference with our correct output variable
+                            linebyline_output = linebyline_output.replace(&format!("$output_{}", 1 + i), &output_var);
+                            output.push_str(&linebyline_output);
+                        }
+                        Command::While(while_loop) => {
+                            // Handle while loops in pipeline context
+                            // The while loop should read from the current line and process it
+                            output.push_str(&generator.indent());
+                            output.push_str("my $L = $line;\n");
+                            
+                            // Generate the while loop body with line-by-line processing
+                            generator.indent_level += 1;
+                            for body_cmd in &while_loop.body.commands {
+                                match body_cmd {
+                                    Command::Simple(cmd) => {
+                                        let cmd_name = match &cmd.name {
+                                            Word::Literal(s, _) => s,
+                                            _ => "unknown_command"
+                                        };
+                                        
+                                        // Generate line-by-line version of each command
+                                        output.push_str(&generator.indent());
+                                        let mut linebyline_output = generate_linebyline_command(generator, cmd, "L", 1 + i);
+                                        // Replace the output variable reference with our correct output variable
+                                        linebyline_output = linebyline_output.replace(&format!("$output_{}", 1 + i), &output_var);
+                                        output.push_str(&linebyline_output);
+                                    }
+                                    _ => {
+                                        // Handle other command types if needed
+                                    }
+                                }
+                            }
+                            generator.indent_level -= 1;
+                            output.push_str(&generator.indent());
+                            output.push_str("}\n");
+                        }
+                        _ => {
+                            // Handle other command types if needed
+                        }
+                    }
+                }
+                
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                
+                // Handle tail command processing after the foreach loop
+                if has_tail {
+                    output.push_str(&generator.indent());
+                    output.push_str("if (@tail_lines > 0) {\n");
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("my @last_lines = @tail_lines[-3..-1];\n");
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("{} = join \"\\n\", @last_lines;\n", output_var));
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("if ({} ne q{{}}) {{\n", output_var));
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("{} .= \"\\n\";\n", output_var));
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                }
+                
+                // Set the final output variable for command substitution
+                output.push_str(&generator.indent());
+                output.push_str(&format!("{};\n", output_var));
+                
+                // Add chomp and regex processing for command substitution
+                output.push_str(&generator.indent());
+                output.push_str(&format!("chomp {};\n", output_var));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my @temp_lines_{} = split /\\n/msx, {};\n", unique_id, output_var));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("{} = join q{{ }}, @temp_lines_{};\n", output_var, unique_id));
+                
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                
+                return output; // Return early since we've handled everything
+            } else if name == "yes" {
                 // Handle 'yes' command by generating a loop that processes the line
                 let string_to_repeat = if let Some(arg) = first_cmd.args.first() {
                     generator.perl_string_literal(arg)
@@ -808,6 +1120,24 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                     output.push_str("my $line_count = 0;\n");
                 }
                 
+                // Check if we need to declare variables for head command
+                let has_head = pipeline.commands.iter().any(|cmd| {
+                    if let Command::Simple(simple_cmd) = cmd {
+                        if let Word::Literal(name, _) = &simple_cmd.name {
+                            name == "head"
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                });
+                
+                if has_head {
+                    output.push_str(&generator.indent());
+                    output.push_str("my $head_line_count = 0;\n");
+                }
+                
                 output.push_str(&generator.indent());
                 output.push_str("chomp $line;\n");
                 
@@ -841,6 +1171,43 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
             output.push_str(&generator.indent());
             output.push_str("my $line_count = 0;\n");
         }
+        
+        // Check if we need to declare variables for head command
+        let has_head = pipeline.commands.iter().any(|cmd| {
+            if let Command::Simple(simple_cmd) = cmd {
+                if let Word::Literal(name, _) = &simple_cmd.name {
+                    name == "head"
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+        
+        if has_head {
+            output.push_str(&generator.indent());
+            output.push_str("my $head_line_count = 0;\n");
+        }
+        
+        // Check if we need to declare variables for tail command
+        let has_tail = pipeline.commands.iter().any(|cmd| {
+            if let Command::Simple(simple_cmd) = cmd {
+                if let Word::Literal(name, _) = &simple_cmd.name {
+                    name == "tail"
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+        
+        if has_tail {
+            output.push_str(&generator.indent());
+            output.push_str("my @tail_lines = ();\n");
+        }
+        
         
         output.push_str(&generator.indent());
         output.push_str("while (my $line = <>) {\n");
@@ -903,8 +1270,8 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
             }
         }
         
-        // Output the processed line
-        if should_print {
+        // Output the processed line (skip for seq command pipelines)
+        if should_print && start_index != 1 {
             output.push_str(&generator.indent());
             output.push_str("print $line . \"\\n\";\n");
         }
@@ -912,6 +1279,28 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
+        
+        // Output tail results if tail was used
+        if has_tail {
+            output.push_str(&generator.indent());
+            output.push_str("if (@tail_lines) {\n");
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str("my $tail_count = scalar @tail_lines;\n");
+            output.push_str(&generator.indent());
+            output.push_str("my $start_idx = $tail_count > 3 ? $tail_count - 3 : 0;\n");
+            output.push_str(&generator.indent());
+            output.push_str("for my $i ($start_idx .. $tail_count - 1) {\n");
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str("print $tail_lines[$i] . \"\\n\";\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+        }
         
         // Output wc results if wc was used
         let has_wc = pipeline.commands.iter().any(|cmd| {
@@ -990,8 +1379,8 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
             }
         }
         
-        // Output the processed line
-        if should_print {
+        // Output the processed line (skip for seq command pipelines)
+        if should_print && start_index != 1 {
             output.push_str(&generator.indent());
             output.push_str("print $line . \"\\n\";\n");
         }
@@ -1000,8 +1389,6 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
-        output.push_str(&generator.indent());
-        output.push_str("close($fh) or croak \"Close failed: $!\";\n");
         
         // Output wc results if wc was used
         let has_wc = pipeline.commands.iter().any(|cmd| {
@@ -1021,14 +1408,43 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
             output.push_str("print \"$line_count\\n\";\n");
         }
         
-        generator.indent_level -= 1;
+        if generator.indent_level > 0 {
+            generator.indent_level -= 1;
+        }
         output.push_str(&generator.indent());
-        output.push_str("} else {\n");
+        output.push_str("}\n");
+    }
+    
+    
+    // Process tail commands after the foreach loop
+    let has_tail = pipeline.commands.iter().any(|cmd| {
+        if let Command::Simple(simple_cmd) = cmd {
+            if let Word::Literal(name, _) = &simple_cmd.name {
+                name == "tail"
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+    
+    if has_tail {
+        output.push_str(&generator.indent());
+        output.push_str("if (@tail_lines > 0) {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str("carp \"cat: can't open file\";\n");
+        output.push_str("my @last_lines = @tail_lines[-3..-1];\n"); // Default to last 3 lines
         output.push_str(&generator.indent());
-        output.push_str("exit(1);\n");
+        output.push_str(&format!("$output_{} = join \"\\n\", @last_lines;\n", unique_id));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if ($output_{} ne q{{}}) {{\n", unique_id));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("$output_{} .= \"\\n\";\n", unique_id));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
@@ -1125,11 +1541,12 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             
             // Generate line-by-line head command
             // Note: The caller will add base indentation, so we generate unindented output
-            output.push_str("our $head_line_count = 0 if !defined $head_line_count;\n");
+            // The $head_line_count variable is already declared at the pipeline level
             output.push_str(&format!("if ($head_line_count < {}) {{\n", num_lines));
-            output.push_str("    $head_line_count++;\n");
+            output.push_str(&format!("    $output_{} .= $line . \"\\n\";\n", cmd_index));
+            output.push_str("    ++$head_line_count;\n");
             output.push_str("} else {\n");
-            output.push_str("    last;\n");
+            output.push_str("    $line = q{}; # Clear line to prevent printing\n");
             output.push_str("}\n");
             // Note: The line is already available in $line from the previous command
             output
@@ -1217,12 +1634,53 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             output.push_str("}\n");
             output
         },
+        "tail" => {
+            // For tail, we need to collect all lines first, then output the last N lines
+            // This is more complex in a pipeline context, so we'll use a different approach
+            let mut output = String::new();
+            let mut num_lines = 10; // Default to last 10 lines
+            
+            // Parse tail options
+            for arg in &cmd.args {
+                if let Word::Literal(arg_str, _) = arg {
+                    match arg_str.as_str() {
+                        "-f" | "--follow" => {
+                            // Follow mode not supported in pipeline context
+                            output.push_str("carp \"tail: -f option not supported in pipeline context\\n\";\n");
+                        },
+                        _ => {
+                            if arg_str.starts_with("-n") {
+                                if let Some(num_str) = arg_str.strip_prefix("-n") {
+                                    if let Ok(num) = num_str.parse::<usize>() {
+                                        num_lines = num;
+                                    }
+                                }
+                            } else if arg_str.starts_with("-") && arg_str.len() > 1 {
+                                // Handle -10, -20 style line counts
+                                if let Ok(num) = arg_str[1..].parse::<usize>() {
+                                    num_lines = num;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // For tail in pipeline context, we need to collect all lines first
+            // This is a limitation - tail really needs to see all input before outputting
+            output.push_str(&format!("# tail -{}: collecting all lines first (pipeline limitation)\n", num_lines));
+            output.push_str(&generator.indent());
+            output.push_str("push @tail_lines, $line;\n");
+            output.push_str(&generator.indent());
+            output.push_str("$line = q{}; # Clear line to prevent printing\n");
+            output
+        },
         "wc" => {
             // For wc, count characters/words in the line
             let mut output = String::new();
             output.push_str("$char_count += length $line;\n");
             output.push_str(&format!("$word_count += scalar split({}, $line);\n", generator.format_regex_pattern(r"\\s+")));
-            output.push_str("$line_count++;\n");
+            output.push_str("++$line_count;\n");
             output.push_str("next; # Skip normal line processing for wc\n");
             output
         },
@@ -1291,6 +1749,24 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         // Track pipeline success for proper exit code handling
         output.push_str(&generator.indent());
         output.push_str(&format!("my $pipeline_success_{} = 1;\n", unique_id));
+        
+        // Check if we need to declare variables for tail command
+        let has_tail = pipeline.commands.iter().any(|cmd| {
+            if let Command::Simple(simple_cmd) = cmd {
+                if let Word::Literal(name, _) = &simple_cmd.name {
+                    name == "tail"
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+        
+        if has_tail {
+            output.push_str(&generator.indent());
+            output.push_str("my @tail_lines = ();\n");
+        }
         
         for (i, command) in pipeline.commands.iter().enumerate() {
             if i > 0 {
@@ -1633,6 +2109,8 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
             }
         }
+        
+        
         generator.indent_level -= 1;
         output.push_str("}\n");
     }

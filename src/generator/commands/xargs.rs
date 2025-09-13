@@ -66,12 +66,13 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         output.push_str("}\n");
     } else {
         // Fallback to system command for other cases
-        output.push_str(&format!("my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'echo \"${}\" | {}');
-close $in or croak 'Close failed: $!';
-my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
-close $out or croak 'Close failed: $!';
-waitpid $pid, 0;\n", input_var, command, output_var));
+        let unique_id = generator.get_unique_id();
+        output.push_str(&format!("my ($in_{}, $out_{}, $err_{});
+my $pid_{} = open3($in_{}, $out_{}, $err_{}, 'bash', '-c', 'echo \"${}\" | {}');
+close $in_{} or croak 'Close failed: $!';
+my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out_{}> }};
+close $out_{} or croak 'Close failed: $!';
+waitpid $pid_{}, 0;\n", unique_id, unique_id, unique_id, unique_id, unique_id, unique_id, unique_id, input_var, command, unique_id, output_var, unique_id, unique_id, unique_id));
     }
     output.push_str("\n");
     

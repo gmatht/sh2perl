@@ -136,8 +136,8 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     // This matches bash behavior where variables are only exported to environment after export command
                 }
             } else {
-                // Handle other Word types
-                let val = generator.perl_string_literal(value);
+                // Handle other Word types (including CommandSubstitution)
+                let val = generator.word_to_perl(value);
                 // Always assign the value, but only declare if not already declared
                 if !generator.declared_locals.contains(var) {
                     output.push_str(&generator.indent());

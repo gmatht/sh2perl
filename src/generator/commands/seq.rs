@@ -36,7 +36,7 @@ pub fn generate_seq_command(generator: &mut Generator, cmd: &SimpleCommand) -> S
         output.push_str("}\n");
     } else {
         output.push_str("carp \"seq: too many arguments\";\n");
-        output.push_str("exit(1);\n");
+        output.push_str("exit 1;\n");
     }
     
     output

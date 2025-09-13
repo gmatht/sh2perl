@@ -1,6 +1,5 @@
 use crate::ast::*;
 use super::Generator;
-use regex::Regex;
 
 /// Get the appropriate temporary directory for the current platform
 pub fn get_temp_dir() -> &'static str {
@@ -308,69 +307,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     }
                 },
                 Command::Pipeline(pipeline) => {
-                    // For command substitution pipelines, we need to execute the pipeline
-                    // and capture its output instead of printing it
-                    let pipeline_code = generator.generate_command(&Command::Pipeline(pipeline.clone()));
-                    
-                    // Find the actual output variable name that was generated
-                    let re = Regex::new(r"\$output_(\d+)").unwrap();
-                    let output_var = if let Some(cap) = re.captures(&pipeline_code) {
-                        format!("$output_{}", cap.get(1).unwrap().as_str())
-                    } else {
-                        // Generate a unique output variable if none found
-                        let unique_id = generator.get_unique_id();
-                        format!("$output_{}", unique_id)
-                    };
-                    
-                    // Find the pipeline success variable
-                    let success_var = if pipeline_code.contains("$pipeline_success_") {
-                        let re = Regex::new(r"\$pipeline_success_(\d+)").unwrap();
-                        if let Some(cap) = re.captures(&pipeline_code) {
-                            format!("$pipeline_success_{}", cap.get(1).unwrap().as_str())
-                        } else {
-                            "$pipeline_success_0".to_string()
-                        }
-                    } else {
-                        "$pipeline_success_0".to_string()
-                    };
-                    
-                    // Remove the print statements and exit code assignment using the actual variable names
-                    let mut captured_pipeline = pipeline_code
-                        .replace(&format!("print {};", output_var), "")
-                        .replace("print \"\\n\";", "")
-                        .replace(&format!("if (!({} =~ {})) {{ print \"\\n\"; }}", output_var, generator.newline_end_regex()), "")
-                        .replace(&format!("if (!{}) {{ $main_exit_code = 1; }}", success_var), "");
-                    
-                    // Remove conditional print blocks that are common in pipelines
-                    // Use a simpler approach with string replacement for the specific pattern
-                    let output_var_num = output_var.trim_start_matches("$output_");
-                    let print_block_to_remove = format!(
-                        "if ({} ne q{} && !defined $output_printed_{}) {{\n\n        print {};\n        if (!({} =~ {})) {{ print \"\\n\"; }}\n    }}", 
-                        output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
-                    );
-                    captured_pipeline = captured_pipeline.replace(&print_block_to_remove, "");
-                    
-                    // Also try without the extra newlines in case formatting is different
-                    let print_block_compact = format!(
-                        "if ({} ne q{} && !defined $output_printed_{}) {{ print {}; if (!({} =~ {})) {{ print \"\\n\"; }} }}", 
-                        output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
-                    );
-                    captured_pipeline = captured_pipeline.replace(&print_block_compact, "");
-                    
-                    // Remove the outer braces if they exist, as we'll wrap in our own do block
-                    captured_pipeline = captured_pipeline.trim().to_string();
-                    if captured_pipeline.starts_with('{') && captured_pipeline.ends_with('}') {
-                        captured_pipeline = captured_pipeline[1..captured_pipeline.len()-1].to_string();
-                    }
-                    
-                    // Return the code that executes the pipeline and captures output
-                    // Command substitution should convert newlines to spaces (bash behavior)
-                    if captured_pipeline.contains(&output_var) {
-                        format!("do {{ {} chomp {}; {} =~ s/\\n/ /gsxm; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
-                    } else {
-                        // If the pipeline doesn't contain the output variable, declare it and assign the result
-                        format!("do {{ my {} = q{{}}; {} chomp {}; {} =~ s/\\n/ /gsxm; {} }}", output_var, captured_pipeline.trim(), output_var, output_var, output_var)
-                    }
+                    // For command substitution pipelines, use the specialized function
+                    // Wrap in do block for utils context
+                    format!("do {{ {} }}", crate::generator::commands::pipeline_commands::generate_pipeline_for_substitution(generator, pipeline))
                 },
                 _ => {
                     // For other command types, use system command fallback

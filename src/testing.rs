@@ -559,6 +559,26 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
     
     // If we have cached Perl code but need to set up temp file and run command
     if lang == "perl" && cached_perl_code.is_some() && tmp_file.is_empty() {
+        // Create examples.out directory if it doesn't exist
+        if let Err(_) = fs::create_dir_all("examples.out") {
+            eprintln!("Warning: Could not create examples.out directory");
+        }
+        
+        // Generate output filename in examples.out/SH_FILE.sh.pl format
+        let output_filename = if let Some(script_name) = filename.split(['\\', '/']).last() {
+            // Remove .sh extension and add .sh.pl
+            let base_name = script_name.strip_suffix(".sh").unwrap_or(script_name);
+            format!("examples.out/{}.sh.pl", base_name)
+        } else {
+            format!("examples.out/{}.sh.pl", "unknown")
+        };
+        
+        // Write to examples.out directory
+        if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&output_filename, &translated_code) { 
+            return Err(format!("Failed to write Perl file to {}: {}", output_filename, e)); 
+        }
+        
+        // Also create a temporary file for execution
         let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
         let tmp_str = tmp.to_string_lossy().to_string();
         if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &translated_code) { 
@@ -648,9 +668,32 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 }
                 let code = gen.generate(&commands);
                 
+                // Create examples.out directory if it doesn't exist
+                if let Err(_) = fs::create_dir_all("examples.out") {
+                    eprintln!("Warning: Could not create examples.out directory");
+                }
+                
+                // Generate output filename in examples.out/SH_FILE.sh.pl format
+                let output_filename = if let Some(script_name) = filename.split(['\\', '/']).last() {
+                    // Remove .sh extension and add .sh.pl
+                    let base_name = script_name.strip_suffix(".sh").unwrap_or(script_name);
+                    format!("examples.out/{}.sh.pl", base_name)
+                } else {
+                    format!("examples.out/{}.sh.pl", "unknown")
+                };
+                
+                // Write to examples.out directory
+                if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&output_filename, &code) { 
+                    return Err(format!("Failed to write Perl file to {}: {}", output_filename, e)); 
+                }
+                
+                // Also create a temporary file for execution
                 let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
                 let tmp_str = tmp.to_string_lossy().to_string();
-                if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) { return Err(format!("Failed to write Perl temp file: {}", e)); }
+                if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) { 
+                    return Err(format!("Failed to write Perl temp file: {}", e)); 
+                }
+                
                 (tmp_str.clone(), vec!["perl".to_string(), tmp_str], code)
             }
             _ => { return Err(format!("Unsupported language for --test-file: {}", lang)); }

@@ -33,12 +33,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         },
         Word::CommandSubstitution(cmd, _) => {
             // Handle command substitution
+            eprintln!("DEBUG: words.rs - Processing CommandSubstitution");
             match cmd.as_ref() {
                 Command::Simple(simple_cmd) => {
                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
+                    eprintln!("DEBUG: words.rs - Command name: {}", cmd_name);
                     
                     // Check if this is a builtin command that we can convert properly
                     if let Word::Literal(name, _) = &simple_cmd.name {
+                        eprintln!("DEBUG: words.rs - Found literal command: {}", name);
                         if name == "ls" {
                             // Use the ls substitution function for proper conversion
                             let perl_code = crate::generator::commands::ls::generate_ls_for_substitution(generator, simple_cmd);
@@ -84,6 +87,50 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     })
                                     .collect();
                                 format!("({}) . \"\\n\"", args.join(" . q{ } . "))
+                            }
+                        } else if name == "grep" {
+                            // Special handling for grep in command substitution
+                            // Use a simplified approach similar to ls substitution
+                            eprintln!("DEBUG: words.rs - Using native grep implementation for command substitution");
+                            let unique_id = generator.get_unique_id();
+                            let args: Vec<String> = simple_cmd.args.iter()
+                                .map(|arg| generator.word_to_perl(arg))
+                                .collect();
+                            
+                            if args.is_empty() {
+                                "\"\"".to_string()
+                            } else {
+                                // Parse grep arguments properly
+                                let mut pattern_idx = 0;
+                                let mut file_idx = 1;
+                                
+                                // Skip flags like -n, -i, etc.
+                                while pattern_idx < args.len() && args[pattern_idx].starts_with('-') {
+                                    pattern_idx += 1;
+                                    file_idx += 1;
+                                }
+                                
+                                if pattern_idx >= args.len() {
+                                    return "\"\"".to_string();
+                                }
+                                
+                                let pattern = &args[pattern_idx];
+                                let files = if file_idx < args.len() { &args[file_idx..] } else { &[] };
+                                
+                                if files.is_empty() {
+                                    // No files specified, grep will fail (no input)
+                                    format!("do {{ carp \"grep: {}: No such file or directory\"; \"\" }}", pattern)
+                                } else {
+                                    let file = &files[0];
+                                    // Ensure the file is properly quoted
+                                    let quoted_file = if file.starts_with('\'') || file.starts_with('"') {
+                                        file.clone()
+                                    } else {
+                                        format!("'{}'", file)
+                                    };
+                                    format!("do {{ my @grep_lines_{}; my $fh_{}; if (-f {}) {{ open $fh_{}, '<', {} or croak \"Cannot open file: $OS_ERROR\"; @grep_lines_{} = <$fh_{}>; close $fh_{} or croak \"Close failed: $OS_ERROR\"; chomp @grep_lines_{}; @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{}; }} join \"\\n\", @grep_lines_{}; }}", 
+                                        unique_id, unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id)
+                                }
                             }
                         } else if name == "printf" {
                             // Special handling for printf in command substitution
@@ -151,7 +198,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 } else {
                                     "q{}".to_string()
                                 };
-                                format!("do {{ my $basename_path = {}; my $basename_suffix = {}; if ($basename_suffix ne q{{}}) {{ $basename_path =~ s/\\Q$basename_suffix\\E$//msx; }} $basename_path =~ s/.*\\///msx; $basename_path; }}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
+                                format!("do {{ my $basename_path; my $basename_suffix; $basename_path = {}; $basename_suffix = {}; if ($basename_suffix ne q{{}}) {{ $basename_path =~ s/\\Q$basename_suffix\\E$//msx; }} $basename_path =~ s/.*\\///msx; $basename_path; }}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
                             } else {
                                 "\".\"".to_string()
                             }
@@ -159,7 +206,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for dirname in command substitution
                             if let Some(path) = simple_cmd.args.first() {
                                 let path_str = generator.word_to_perl(path);
-                                format!("do {{ my $path = {}; if ($path =~ /\\//msx) {{ $path =~ s/\\/[^\\/]*$//msx; if ($path eq q{{}}) {{ $path = q{{.}}; }} }} else {{ $path = q{{.}}; }} $path; }}", path_str.replace("$0", "$PROGRAM_NAME"))
+                                format!("do {{ my $path; $path = {}; if ($path =~ /\\//msx) {{ $path =~ s/\\/[^\\/]*$//msx; if ($path eq q{{}}) {{ $path = q{{.}}; }} }} else {{ $path = q{{.}}; }} $path; }}", path_str.replace("$0", "$PROGRAM_NAME"))
                             } else {
                                 "\".\"".to_string()
                             }
@@ -167,7 +214,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for which in command substitution
                             if let Some(command) = simple_cmd.args.first() {
                                 let command_str = generator.word_to_perl(command);
-                                format!("do {{ my $command = {}; my $found = 0; my $result = q{{}}; foreach my $dir (split /:/msx, $ENV{{PATH}}) {{ my $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
+                                format!("do {{ my $command; my $found; my $result; my $dir; my $full_path; $command = {}; $found = 0; $result = q{{}}; foreach $dir (split /:/msx, $ENV{{PATH}}) {{ $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
                             } else {
                                 "q{}".to_string()
                             }
@@ -177,27 +224,19 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 "\"1\"".to_string()
                             } else if simple_cmd.args.len() == 1 {
                                 let last_str = generator.word_to_perl(&simple_cmd.args[0]);
-                                format!("do {{ my $last = {}; join \"\\n\", 1..$last; }}", last_str)
+                                format!("do {{ my $last; $last = {}; join \"\\n\", 1..$last; }}", last_str)
                             } else if simple_cmd.args.len() == 2 {
                                 let first_str = generator.word_to_perl(&simple_cmd.args[0]);
                                 let last_str = generator.word_to_perl(&simple_cmd.args[1]);
-                                format!("do {{ my $first = {}; my $last = {}; join \"\\n\", $first..$last; }}", first_str, last_str)
+                                format!("do {{ my $first; my $last; $first = {}; $last = {}; join \"\\n\", $first..$last; }}", first_str, last_str)
                             } else if simple_cmd.args.len() == 3 {
                                 let first_str = generator.word_to_perl(&simple_cmd.args[0]);
                                 let increment_str = generator.word_to_perl(&simple_cmd.args[1]);
                                 let last_str = generator.word_to_perl(&simple_cmd.args[2]);
-                                format!("do {{ my $first = {}; my $increment = {}; my $last = {}; my @result; for (my $i = $first; $i <= $last; $i += $increment) {{ push @result, $i; }} join \"\\n\", @result; }}", first_str, increment_str, last_str)
+                                format!("do {{ my $first; my $increment; my $last; my @result; my $i; $first = {}; $increment = {}; $last = {}; for ($i = $first; $i <= $last; $i += $increment) {{ push @result, $i; }} join \"\\n\", @result; }}", first_str, increment_str, last_str)
                             } else {
                                 "\"\"".to_string()
                             }
-                        } else if name == "grep" {
-                            // Special handling for grep in command substitution
-                            // For now, fall back to system grep until we implement a full native version
-                            let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                            format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'grep', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", 
-                                in_var, out_var, err_var, pid_var, in_var, out_var, err_var, 
-                                simple_cmd.args.iter().map(|arg| generator.word_to_perl(arg)).collect::<Vec<_>>().join(", "),
-                                in_var, result_var, out_var, out_var, pid_var, result_var)
                         } else if generator.inline_mode && name == "echo" {
                             // In inline mode for echo, generate the output value directly
                             if simple_cmd.args.is_empty() {
@@ -244,69 +283,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     }
                 },
                 Command::Pipeline(pipeline) => {
-                    // For command substitution pipelines, we need to execute the pipeline
-                    // and capture its output instead of printing it
-                    let pipeline_code = generator.generate_command(&Command::Pipeline(pipeline.clone()));
-                    
-                    // Find the actual output variable name that was generated
-                    let re = Regex::new(r"\$output_(\d+)").unwrap();
-                    let output_var = if let Some(cap) = re.captures(&pipeline_code) {
-                        format!("$output_{}", cap.get(1).unwrap().as_str())
-                    } else {
-                        // Generate a unique output variable if none found
-                        let unique_id = generator.get_unique_id();
-                        format!("$output_{}", unique_id)
-                    };
-                    
-                    // Find the pipeline success variable
-                    let success_var = if pipeline_code.contains("$pipeline_success_") {
-                        let re = Regex::new(r"\$pipeline_success_(\d+)").unwrap();
-                        if let Some(cap) = re.captures(&pipeline_code) {
-                            format!("$pipeline_success_{}", cap.get(1).unwrap().as_str())
-                        } else {
-                            "$pipeline_success_0".to_string()
-                        }
-                    } else {
-                        "$pipeline_success_0".to_string()
-                    };
-                    
-                    // Remove the print statements and exit code assignment using the actual variable names
-                    let mut captured_pipeline = pipeline_code
-                        .replace(&format!("print {};", output_var), "")
-                        .replace("print \"\\n\";", "")
-                        .replace(&format!("if (!({} =~ {})) {{ print \"\\n\"; }}", output_var, generator.newline_end_regex()), "")
-                        .replace(&format!("if (!{}) {{ $main_exit_code = 1; }}", success_var), "");
-                    
-                    // Remove conditional print blocks that are common in pipelines
-                    // Use a simpler approach with string replacement for the specific pattern
-                    let output_var_num = output_var.trim_start_matches("$output_");
-                    let print_block_to_remove = format!(
-                        "if ({} ne q{} && !defined $output_printed_{}) {{\n\n        print {};\n        if (!({} =~ {})) {{ print \"\\n\"; }}\n    }}", 
-                        output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
-                    );
-                    captured_pipeline = captured_pipeline.replace(&print_block_to_remove, "");
-                    
-                    // Also try without the extra newlines in case formatting is different
-                    let print_block_compact = format!(
-                        "if ({} ne q{} && !defined $output_printed_{}) {{ print {}; if (!({} =~ {})) {{ print \"\\n\"; }} }}", 
-                        output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
-                    );
-                    captured_pipeline = captured_pipeline.replace(&print_block_compact, "");
-                    
-                    // Remove the outer braces if they exist, as we'll wrap in our own do block
-                    captured_pipeline = captured_pipeline.trim().to_string();
-                    if captured_pipeline.starts_with('{') && captured_pipeline.ends_with('}') {
-                        captured_pipeline = captured_pipeline[1..captured_pipeline.len()-1].to_string();
-                    }
-                    
-                    // Return the code that executes the pipeline and captures output
-                    // Command substitution should convert newlines to spaces (bash behavior)
-                    if captured_pipeline.contains(&output_var) {
-                        format!("do {{ {} chomp {}; {} =~ s/\\n/ /gsxm; {} }}", captured_pipeline.trim(), output_var, output_var, output_var)
-                    } else {
-                        // If the pipeline doesn't contain the output variable, declare it and assign the result
-                        format!("do {{ my {} = q{{}}; {} chomp {}; {} =~ s/\\n/ /gsxm; {} }}", output_var, captured_pipeline.trim(), output_var, output_var, output_var)
-                    }
+                    // For command substitution pipelines, use the specialized function
+                    crate::generator::commands::pipeline_commands::generate_pipeline_for_substitution(generator, pipeline)
                 },
                 _ => {
                     // For other command types, use system command fallback

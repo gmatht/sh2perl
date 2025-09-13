@@ -20,11 +20,11 @@ pub fn generate_which_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         output.push_str("}\n");
         output.push_str("if (!$found) {\n");
         output.push_str("print STDERR \"$command: command not found\\n\";\n");
-        output.push_str("exit(1);\n");
+        output.push_str("exit 1;\n");
         output.push_str("}\n");
     } else {
         output.push_str("print STDERR \"which: missing command name\\n\";\n");
-        output.push_str("exit(1);\n");
+        output.push_str("exit 1;\n");
     }
     
     output
