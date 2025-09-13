@@ -143,15 +143,7 @@ impl Generator {
         
         // Add main exit code variable for pipeline tracking
         // Always declare it since it's used in pipeline generation
-        output.push_str("my $main_exit_code = 0;\n");
-        
-        // Set $0 to the original script name for compatibility with basename $0 and dirname $0
-        if let Some(script_name) = &self.original_script_name {
-            output.push_str(&format!("local $0 = '{}'; ## no critic (ProhibitPunctuationVars)\n", script_name));
-        } else {
-            // Debug: No original script name set
-            output.push_str("# DEBUG: No original script name set\n");
-        }
+        output.push_str("my $main_exit_code = 0;\n\n");
         
         // Add declarations for variables that are used in arithmetic expressions
         for var in &self.function_level_vars {

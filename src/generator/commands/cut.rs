@@ -27,18 +27,19 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
         i += 1;
     }
     
-    output.push_str(&format!("my @lines = split /\\n/msx, ${};\n", input_var));
-    output.push_str("my @result;\n");
-    output.push_str("foreach my $line (@lines) {\n");
+    let unique_id = generator.get_unique_id();
+    output.push_str(&format!("my @lines_{} = split /\\n/msx, ${};\n", unique_id, input_var));
+    output.push_str(&format!("my @result_{};\n", unique_id));
+    output.push_str(&format!("foreach my $line (@lines_{}) {{\n", unique_id));
     output.push_str("chomp $line;\n");
     output.push_str(&format!("my @fields = split /{}/msx, $line;\n", delimiter));
     
     // Handle field selection (simple implementation for now)
     output.push_str(&format!("if (@fields > 0) {{\n"));
-    output.push_str(&format!("push @result, $fields[0];\n")); // Default to first field
+    output.push_str(&format!("push @result_{}, $fields[0];\n", unique_id)); // Default to first field
     output.push_str("}\n");
     output.push_str("}\n");
-    output.push_str(&format!("${} = join \"\\n\", @result;\n", input_var));
+    output.push_str(&format!("${} = join \"\\n\", @result_{};\n", input_var, unique_id));
     output.push_str("\n");
     
     output

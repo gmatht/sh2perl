@@ -1146,12 +1146,30 @@ pub fn parse_string_interpolation_from_literal(literal: &str) -> Result<StringIn
                 let cmd_content = &content[cmd_start..i];
                 i += 1; // skip the closing `
                 
-                // Parse the command content using the simple command parser
-                match parse_simple_command_from_text(cmd_content) {
-                    Ok(command) => {
-                        parts.push(StringPart::CommandSubstitution(Box::new(command)));
+                // Parse the command content using the full parser to handle pipelines
+                let sub_lexer = Lexer::new(cmd_content);
+                let mut sub_parser = Parser::new_with_lexer(sub_lexer);
+                match sub_parser.parse() {
+                    Ok(commands) => {
+                        if commands.len() == 1 {
+                            parts.push(StringPart::CommandSubstitution(Box::new(commands[0].clone())));
+                        } else if commands.is_empty() {
+                            // If no commands parsed, treat as a simple command with the text as argument
+                            let placeholder_cmd = Command::Simple(SimpleCommand {
+                                name: Word::Literal("echo".to_string(), None),
+                                args: vec![Word::Literal(cmd_content.to_string(), None)],
+                                redirects: Vec::new(),
+                                env_vars: HashMap::new(),
+                                stdout_used: true,
+                                stderr_used: true,
+                            });
+                            parts.push(StringPart::CommandSubstitution(Box::new(placeholder_cmd)));
+                        } else {
+                            // If multiple commands, use the first one
+                            parts.push(StringPart::CommandSubstitution(Box::new(commands[0].clone())));
+                        }
                     }
-                    Err(e) => {
+                    Err(_) => {
                         // Fall back to treating it as a literal
                         parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
                     }
@@ -1823,9 +1841,9 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
     // Remove the surrounding backticks
     let command_text = &backtick_text[1..backtick_text.len()-1];
     
-    // Check if the command contains command substitutions (like $(pwd))
-    if command_text.contains("$(") {
-        // Use the full parser for commands with command substitutions
+    // Check if the command contains command substitutions (like $(pwd)) or pipelines (like |)
+    if command_text.contains("$(") || command_text.contains("|") {
+        // Use the full parser for commands with command substitutions or pipelines
         let sub_lexer = Lexer::new(command_text);
         let mut sub_parser = Parser::new_with_lexer(sub_lexer);
         match sub_parser.parse() {

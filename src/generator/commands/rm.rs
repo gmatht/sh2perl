@@ -30,10 +30,6 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         output.push_str("croak \"rm: missing operand\\n\";\n");
     } else {
         output.push_str("use File::Path qw(remove_tree);\n");
-        if !generator.declared_locals.contains("err") {
-            output.push_str("my $err;\n");
-            generator.declared_locals.insert("err".to_string());
-        }
         
         // Process each file/pattern
         for file in &files {

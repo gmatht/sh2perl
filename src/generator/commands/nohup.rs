@@ -42,7 +42,7 @@ pub fn generate_nohup_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         } else {
             output.push_str(&format!("exec({}, @args);\n", command));
         }
-        output.push_str("exit(1);\n"); // Should not reach here
+        output.push_str("exit 1;\n"); // Should not reach here
         output.push_str("} elsif ($pid > 0) {\n"); // Parent process
         output.push_str("print \"nohup: ignoring input and appending output to '$ENV{NOHUP_OUT}'\\n\";\n");
         output.push_str("print \"nohup: process $pid started\\n\";\n");

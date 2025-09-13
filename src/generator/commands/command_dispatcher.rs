@@ -629,7 +629,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                                 
                                 // If we can't find the temp file, fall back to generating an error
                                 result.push_str("carp \"grep: no pattern specified\";\n");
-                                result.push_str("exit(1);\n");
+                                result.push_str("exit 1;\n");
                                 return result;
                             }
                         }

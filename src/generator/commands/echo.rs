@@ -281,6 +281,49 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                 if name == "ls" {
                     // Use the ls substitution function for proper conversion
                     return crate::generator::commands::ls::generate_ls_for_substitution(generator, simple_cmd);
+                } else if name == "grep" {
+                    // Special handling for grep in command substitution
+                    eprintln!("DEBUG: echo.rs - Using native grep implementation for command substitution");
+                    let unique_id = generator.get_unique_id();
+                    let args: Vec<String> = simple_cmd.args.iter()
+                        .map(|arg| generator.word_to_perl(arg))
+                        .collect();
+                    
+                    if args.is_empty() {
+                        return "\"\"".to_string();
+                    } else {
+                        // Parse grep arguments properly
+                        let mut pattern_idx = 0;
+                        let mut file_idx = 1;
+                        
+                        // Skip flags like -n, -i, etc.
+                        while pattern_idx < args.len() && args[pattern_idx].starts_with('-') {
+                            pattern_idx += 1;
+                            file_idx += 1;
+                        }
+                        
+                        if pattern_idx >= args.len() {
+                            return "\"\"".to_string();
+                        }
+                        
+                        let pattern = &args[pattern_idx];
+                        let files = if file_idx < args.len() { &args[file_idx..] } else { &[] };
+                        
+                        if files.is_empty() {
+                            // No files specified, grep will fail (no input)
+                            return format!("do {{ carp \"grep: {}: No such file or directory\"; \"\" }}", pattern);
+                        } else {
+                            let file = &files[0];
+                            // Ensure the file is properly quoted
+                            let quoted_file = if file.starts_with('\'') || file.starts_with('"') {
+                                file.clone()
+                            } else {
+                                format!("'{}'", file)
+                            };
+                            return format!("do {{ my @grep_lines_{}; if (-f {}) {{ open my $fh_{}, '<', {} or croak \"Cannot open file: $OS_ERROR\"; @grep_lines_{} = <$fh_{}>; close $fh_{} or croak \"Close failed: $OS_ERROR\"; chomp @grep_lines_{}; @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{}; }} join \"\\n\", @grep_lines_{}; }}", 
+                                unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id);
+                        }
+                    }
                 }
             }
             

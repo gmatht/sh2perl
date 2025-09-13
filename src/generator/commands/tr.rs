@@ -90,13 +90,14 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         // tr -d SET1: delete characters in SET1
         let set1 = generator.strip_shell_quotes_and_convert_to_perl(&args[0]);
         
-        output.push_str(&format!("my $set1 = {};\n", set1));
-        output.push_str(&format!("my $input = ${};\n", input_var));
+        let unique_id = generator.get_unique_id();
+        output.push_str(&format!("my $set1_{} = {};\n", unique_id, set1));
+        output.push_str(&format!("my $input_{} = ${};\n", unique_id, input_var));
         
         // Delete characters in SET1 from input
         output.push_str(&format!("my ${} = q{{}};\n", output_var));
-        output.push_str("for my $char ( split //msx, $input ) {\n");
-        output.push_str("    if ( index $set1, $char == -1 ) {\n");
+        output.push_str(&format!("for my $char ( split //msx, $input_{} ) {{\n", unique_id));
+        output.push_str(&format!("    if ( index $set1_{}, $char == -1 ) {{\n", unique_id));
         output.push_str(&format!("        ${} .= $char;\n", output_var));
         output.push_str("    }\n");
         output.push_str("}\n");
@@ -114,16 +115,17 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         let set1 = generator.strip_shell_quotes_and_convert_to_perl(&args[0]);
         let set2 = generator.strip_shell_quotes_and_convert_to_perl(&args[1]);
         
-        output.push_str(&format!("my $set1 = {};\n", set1));
-        output.push_str(&format!("my $set2 = {};\n", set2));
-        output.push_str(&format!("my $input = ${};\n", input_var));
+        let unique_id = generator.get_unique_id();
+        output.push_str(&format!("my $set1_{} = {};\n", unique_id, set1));
+        output.push_str(&format!("my $set2_{} = {};\n", unique_id, set2));
+        output.push_str(&format!("my $input_{} = ${};\n", unique_id, input_var));
         
         // Character-by-character translation
         output.push_str(&format!("my ${} = q{{}};\n", output_var));
-        output.push_str("for my $char ( split //msx, $input ) {\n");
-        output.push_str("    my $pos = index $set1, $char;\n");
-        output.push_str("    if ( $pos >= 0 && $pos < length $set2 ) {\n");
-        output.push_str(&format!("        ${} .= substr $set2, $pos, 1;\n", output_var));
+        output.push_str(&format!("for my $char ( split //msx, $input_{} ) {{\n", unique_id));
+        output.push_str(&format!("    my $pos_{} = index $set1_{}, $char;\n", unique_id, unique_id));
+        output.push_str(&format!("    if ( $pos_{} >= 0 && $pos_{} < length $set2_{} ) {{\n", unique_id, unique_id, unique_id));
+        output.push_str(&format!("        ${} .= substr $set2_{}, $pos_{}, 1;\n", output_var, unique_id, unique_id));
         output.push_str("    } else {\n");
         output.push_str(&format!("        ${} .= $char;\n", output_var));
         output.push_str("    }\n");
