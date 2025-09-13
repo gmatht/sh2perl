@@ -456,7 +456,9 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str("my $i = 0;\n");
                 output.push_str(&generator.indent());
-                output.push_str("my $head_count_1 = 0;\n");
+                output.push_str("my $head_line_count = 0;\n");
+                output.push_str(&generator.indent());
+                output.push_str("my $output_6 = q{};\n");
                 output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
                 generator.indent_level += 1;
@@ -1057,7 +1059,7 @@ fn generate_linebyline_command_for_pipeline(generator: &mut Generator, pipeline:
 
 /// Generate line-by-line processing for a single command
 fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, line_var: &str, cmd_index: usize) -> String {
-                    let cmd_name = match &cmd.name {
+    let cmd_name = match &cmd.name {
         Word::Literal(s, _) => s,
         _ => "unknown_command"
     };
@@ -1121,10 +1123,11 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
                 i += 1;
             }
             
-            // Generate line-by-line head command (variables already declared in yes command)
+            // Generate line-by-line head command
             // Note: The caller will add base indentation, so we generate unindented output
-            output.push_str(&format!("if ($head_count_{} < {}) {{\n", cmd_index, num_lines));
-            output.push_str(&format!("    $head_count_{}++;\n", cmd_index));
+            output.push_str("our $head_line_count = 0 if !defined $head_line_count;\n");
+            output.push_str(&format!("if ($head_line_count < {}) {{\n", num_lines));
+            output.push_str("    $head_line_count++;\n");
             output.push_str("} else {\n");
             output.push_str("    last;\n");
             output.push_str("}\n");

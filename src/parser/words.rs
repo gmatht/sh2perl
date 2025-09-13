@@ -2,6 +2,8 @@ use crate::ast::*;
 use crate::lexer::{Lexer, Token};
 use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;
+use crate::parser::redirects::parse_redirect;
+use crate::parser::commands::Parser;
 use std::collections::HashMap;
 
 pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
@@ -49,7 +51,9 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             };
             Ok(Word::Literal(content, None))
         },
-        Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
+        Some(Token::BacktickString) => {
+            parse_backtick_command_substitution(lexer)
+        },
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
         Some(Token::DollarDoubleQuotedString) => Ok(parse_string_interpolation(lexer)?),
         Some(Token::BraceOpen) => Ok(parse_brace_expansion(lexer)?),
@@ -193,25 +197,21 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         Some(Token::LongOption) => {
             // Treat long options like --color=always as literals
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::RegexPattern) => {
             // Treat regex patterns as literals
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::RegexMatch) => {
             // Treat regex match operator as literal
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::NameFlag) | Some(Token::MaxDepthFlag) | Some(Token::TypeFlag) => {
             // Treat command-line flags as literals
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::Minus) => {
@@ -235,7 +235,6 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             // Handle test operator tokens like -e, -f, -d, etc.
             // These are already complete flags, just get their text
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::Dollar) => Ok(parse_variable_expansion(lexer)?),
@@ -315,7 +314,9 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             };
             Ok(Word::Literal(content, None))
         },
-        Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
+        Some(Token::BacktickString) => {
+            parse_backtick_command_substitution(lexer)
+        },
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
         Some(Token::DollarDoubleQuotedString) => Ok(parse_string_interpolation(lexer)?),
         Some(Token::BraceOpen) => Ok(parse_brace_expansion(lexer)?),
@@ -459,25 +460,21 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         Some(Token::LongOption) => {
             // Treat long options like --color=always as literals
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::RegexPattern) => {
             // Treat regex patterns as literals
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::RegexMatch) => {
             // Treat regex match operator as literal
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::NameFlag) | Some(Token::MaxDepthFlag) | Some(Token::TypeFlag) => {
             // Treat command-line flags as literals
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::Minus) => {
@@ -501,7 +498,6 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             // Handle test operator tokens like -e, -f, -d, etc.
             // These are already complete flags, just get their text
             let text = lexer.get_raw_token_text()?;
-            eprintln!("DEBUG: CasePattern token text: '{}'", text);
             Ok(Word::Literal(text, None))
         }
         Some(Token::Dollar) => Ok(parse_variable_expansion(lexer)?),
@@ -601,8 +597,12 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 }
                 
                 Ok(Word::Variable(var_name, false, None))
+            } else if let Some(Token::Number) = lexer.peek() {
+                // Handle special shell variables like $0, $1, $2, etc.
+                let var_name = lexer.get_number_text()?;
+                Ok(Word::Variable(var_name, false, None))
             } else {
-                Err(ParserError::InvalidSyntax("Expected identifier after $".to_string()))
+                Err(ParserError::InvalidSyntax("Expected identifier or number after $".to_string()))
             }
         }
         Some(Token::DollarHashSimple) => { 
@@ -779,19 +779,43 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
         }
         Some(Token::DollarParen) => {
             // Parse $(...) command substitution
-            lexer.next();
             let command_text = lexer.capture_parenthetical_text()?;
-            // For now, create a simple command as a placeholder
-            // TODO: Parse the command_text into an actual Command
-            let placeholder_cmd = Command::Simple(SimpleCommand {
-                name: Word::Literal("echo".to_string(), None),
-                args: vec![Word::Literal(command_text, None)],
-                redirects: Vec::new(),
-                env_vars: HashMap::new(),
-                stdout_used: true,
-                stderr_used: true,
-            });
-            Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
+            // Parse the command_text into an actual Command
+            let sub_lexer = Lexer::new(&command_text);
+            let mut sub_parser = Parser::new_with_lexer(sub_lexer);
+            match sub_parser.parse() {
+                Ok(commands) => {
+                    if commands.is_empty() {
+                        // If no commands parsed, treat as a simple command with the text as argument
+                        let placeholder_cmd = Command::Simple(SimpleCommand {
+                            name: Word::Literal("echo".to_string(), None),
+                            args: vec![Word::Literal(command_text, None)],
+                            redirects: Vec::new(),
+                            env_vars: HashMap::new(),
+                            stdout_used: true,
+                            stderr_used: true,
+                        });
+                        Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
+                    } else if commands.len() == 1 {
+                        Ok(Word::CommandSubstitution(Box::new(commands[0].clone()), None))
+                    } else {
+                        // If multiple commands, wrap in a pipeline or use the first one
+                        Ok(Word::CommandSubstitution(Box::new(commands[0].clone()), None))
+                    }
+                }
+                Err(_) => {
+                    // Fallback: treat as a simple command with the text as argument
+                    let placeholder_cmd = Command::Simple(SimpleCommand {
+                        name: Word::Literal("echo".to_string(), None),
+                        args: vec![Word::Literal(command_text, None)],
+                        redirects: Vec::new(),
+                        env_vars: HashMap::new(),
+                        stdout_used: true,
+                        stderr_used: true,
+                    });
+                    Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
+                }
+            }
         }
         _ => {
             let current_pos = lexer.current_position();
@@ -816,12 +840,15 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
         &string_content
     };
     
+    // Debug output
+    
     // Parse the string content to extract literal parts and variable references
     let mut parts = Vec::new();
     let mut current_literal = String::new();
     let mut i = 0;
     
     while i < content.len() {
+        let ch = content.chars().nth(i).unwrap_or('?');
         if content[i..].starts_with("\\\\`") {
             // We found an escaped backtick command substitution
             // First, add any accumulated literal text
@@ -854,6 +881,38 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 parts.push(StringPart::Literal("\\\\`".to_string()));
                 i = cmd_start;
             }
+        } else if content[i..].starts_with("\\`") {
+            // We found a single-escaped backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            
+            // Find the closing escaped backtick
+            i += 2; // skip the \`
+            let cmd_start = i;
+            while i < content.len() && !content[i..].starts_with("\\`") {
+                i += 1;
+            }
+            
+            if i < content.len() {
+                // We found a complete escaped command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 2; // skip the closing \`
+                
+                // Parse the command content as a simple command
+                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
+                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                } else {
+                    // Fall back to treating it as a literal
+                    parts.push(StringPart::Literal(format!("\\`{}\\`", cmd_content)));
+                }
+            } else {
+                // Unmatched escaped backtick, treat as literal
+                parts.push(StringPart::Literal("\\`".to_string()));
+                i = cmd_start;
+            }
         } else if content[i..].starts_with("`") {
             // We found a backtick command substitution
             // First, add any accumulated literal text
@@ -874,12 +933,15 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 let cmd_content = &content[cmd_start..i];
                 i += 1; // skip the closing `
                 
-                // Parse the command content as a simple command
-                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
-                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
-                } else {
-                    // Fall back to treating it as a literal
-                    parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
+                // Parse the command content using the simple command parser
+                match parse_simple_command_from_text(cmd_content) {
+                    Ok(command) => {
+                        parts.push(StringPart::CommandSubstitution(Box::new(command)));
+                    }
+                    Err(e) => {
+                        // Fall back to treating it as a literal
+                        parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
+                    }
                 }
             } else {
                 // Unmatched backtick, treat as literal
@@ -1030,6 +1092,73 @@ pub fn parse_string_interpolation_from_literal(literal: &str) -> Result<StringIn
             } else {
                 // Unmatched escaped backtick, treat as literal
                 parts.push(StringPart::Literal("\\\\`".to_string()));
+                i = cmd_start;
+            }
+        } else if content[i..].starts_with("\\`") {
+            // We found a single-escaped backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            
+            // Find the closing escaped backtick
+            i += 2; // skip the \`
+            let cmd_start = i;
+            while i < content.len() && !content[i..].starts_with("\\`") {
+                i += 1;
+            }
+            
+            if i < content.len() {
+                // We found a complete escaped command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 2; // skip the closing \`
+                
+                // Parse the command content as a simple command
+                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
+                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                } else {
+                    // Fall back to treating it as a literal
+                    parts.push(StringPart::Literal(format!("\\`{}\\`", cmd_content)));
+                }
+            } else {
+                // Unmatched escaped backtick, treat as literal
+                parts.push(StringPart::Literal("\\`".to_string()));
+                i = cmd_start;
+            }
+        } else if content[i..].starts_with("`") {
+            // We found a backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            
+            // Find the closing backtick
+            i += 1; // skip the opening `
+            let cmd_start = i;
+            while i < content.len() && content[i..].chars().next() != Some('`') {
+                i += 1;
+            }
+            
+            if i < content.len() {
+                // We found a complete command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 1; // skip the closing `
+                
+                // Parse the command content using the simple command parser
+                match parse_simple_command_from_text(cmd_content) {
+                    Ok(command) => {
+                        parts.push(StringPart::CommandSubstitution(Box::new(command)));
+                    }
+                    Err(e) => {
+                        // Fall back to treating it as a literal
+                        parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
+                    }
+                }
+            } else {
+                // Unmatched backtick, treat as literal
+                parts.push(StringPart::Literal("`".to_string()));
                 i = cmd_start;
             }
         } else {
@@ -1694,48 +1823,55 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
     // Remove the surrounding backticks
     let command_text = &backtick_text[1..backtick_text.len()-1];
     
-    // Check if the command contains logical operators or pipelines
-    if command_text.contains("&&") {
-        // Parse as AND operation
-        let and_parts: Vec<&str> = command_text.split("&&").collect();
-        if and_parts.len() == 2 {
-            let left_cmd = parse_simple_command_from_text(and_parts[0].trim())?;
-            let right_cmd = parse_simple_command_from_text(and_parts[1].trim())?;
-            let and_command = Command::And(Box::new(left_cmd), Box::new(right_cmd));
-            return Ok(Word::CommandSubstitution(Box::new(and_command), None));
-        }
-    }
-    
-    if command_text.contains("||") {
-        // Parse as OR operation
-        let or_parts: Vec<&str> = command_text.split("||").collect();
-        if or_parts.len() == 2 {
-            let left_cmd = parse_simple_command_from_text(or_parts[0].trim())?;
-            let right_cmd = parse_simple_command_from_text(or_parts[1].trim())?;
-            let or_command = Command::Or(Box::new(left_cmd), Box::new(right_cmd));
-            return Ok(Word::CommandSubstitution(Box::new(or_command), None));
-        }
-    }
-    
-    if command_text.contains('|') {
-        // Parse as a pipeline
-        let pipeline_parts: Vec<&str> = command_text.split('|').collect();
-        let mut commands = Vec::new();
-        for part in pipeline_parts {
-            let command = parse_simple_command_from_text(part.trim())?;
-            commands.push(command);
-        }
-        
-        if commands.len() == 1 {
-            Ok(Word::CommandSubstitution(Box::new(commands.remove(0)), None))
-        } else {
-            let pipeline = Command::Pipeline(Pipeline { commands, source_text: None, stdout_used: true, stderr_used: true });
-            Ok(Word::CommandSubstitution(Box::new(pipeline), None))
+    // Check if the command contains command substitutions (like $(pwd))
+    if command_text.contains("$(") {
+        // Use the full parser for commands with command substitutions
+        let sub_lexer = Lexer::new(command_text);
+        let mut sub_parser = Parser::new_with_lexer(sub_lexer);
+        match sub_parser.parse() {
+            Ok(commands) => {
+                if commands.len() == 1 {
+                    Ok(Word::CommandSubstitution(Box::new(commands[0].clone()), None))
+                } else if commands.is_empty() {
+                    // If no commands parsed, treat as a simple command with the text as argument
+                    let placeholder_cmd = Command::Simple(SimpleCommand {
+                        name: Word::Literal("echo".to_string(), None),
+                        args: vec![Word::Literal(command_text.to_string(), None)],
+                        redirects: Vec::new(),
+                        env_vars: HashMap::new(),
+                        stdout_used: true,
+                        stderr_used: true,
+                    });
+                    Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
+                } else {
+                    // If multiple commands, use the first one
+                    Ok(Word::CommandSubstitution(Box::new(commands[0].clone()), None))
+                }
+            }
+            Err(_) => {
+                // Fall back to using the simple command parser
+                match parse_simple_command_from_text(command_text) {
+                    Ok(command) => {
+                        Ok(Word::CommandSubstitution(Box::new(command), None))
+                    }
+                    Err(_) => {
+                        // Fall back to treating it as a literal
+                        Ok(Word::Literal(format!("`{}`", command_text), None))
+                    }
+                }
+            }
         }
     } else {
-        // Parse as a simple command using proper parsing instead of split_whitespace
-        let cmd = parse_simple_command_from_text(command_text.trim())?;
-        Ok(Word::CommandSubstitution(Box::new(cmd), None))
+        // Use the simple command parser for commands without command substitutions
+        match parse_simple_command_from_text(command_text) {
+            Ok(command) => {
+                Ok(Word::CommandSubstitution(Box::new(command), None))
+            }
+            Err(_) => {
+                // Fall back to treating it as a literal
+                Ok(Word::Literal(format!("`{}`", command_text), None))
+            }
+        }
     }
 }
 
@@ -1746,14 +1882,16 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
     // Create a lexer for the command text
     let mut lexer = Lexer::new(text);
     let mut args = Vec::new();
+    let mut redirects = Vec::new();
     let mut current_arg = String::new();
     let mut in_quotes = false;
     let mut quote_char = '\0';
     
-    // Process tokens and group them into arguments
-    while let Some(token) = lexer.next() {
+    // Process tokens and group them into arguments or redirections
+    while let Some(token) = lexer.peek() {
         match token {
             Token::Space => {
+                lexer.next(); // consume the space
                 if in_quotes {
                     current_arg.push(' ');
                 } else if !current_arg.is_empty() {
@@ -1762,7 +1900,70 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
                 }
             }
             Token::Comment => break, // Stop at comments
+            Token::RedirectIn | Token::RedirectOut | Token::RedirectAppend | Token::RedirectInErr | Token::RedirectOutErr | Token::RedirectInOut | Token::Heredoc | Token::HeredocTabs | Token::HereString => {
+                // This is a redirection operator
+                // First, add any current argument
+                if !current_arg.is_empty() {
+                    args.push(current_arg.clone());
+                    current_arg.clear();
+                }
+                
+                // Parse the redirection (don't consume the token here, let parse_redirect handle it)
+                let redirect = parse_redirect(&mut lexer)?;
+                redirects.push(redirect);
+            }
+            Token::Number => {
+                // Check if this is a file descriptor redirection (number followed by redirect operator)
+                if let Some(next_token) = lexer.peek_n(1) {
+                    match next_token {
+                        Token::RedirectIn | Token::RedirectOut | Token::RedirectAppend | Token::RedirectInErr | Token::RedirectOutErr | Token::RedirectInOut | Token::Heredoc | Token::HeredocTabs | Token::HereString => {
+                            // This is a file descriptor redirection
+                            // First, add any current argument
+                            if !current_arg.is_empty() {
+                                args.push(current_arg.clone());
+                                current_arg.clear();
+                            }
+                            
+                            // Parse the redirection (don't consume the number token here, let parse_redirect handle it)
+                            let redirect = parse_redirect(&mut lexer)?;
+                            redirects.push(redirect);
+                        }
+                        _ => {
+                            // This is just a regular number argument
+                            lexer.next(); // consume the number
+                            if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                                let token_text = &text[*start..*end];
+                                current_arg.push_str(token_text);
+                            }
+                        }
+                    }
+                } else {
+                    // No next token, treat as regular number argument
+                    lexer.next(); // consume the number
+                    if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                        let token_text = &text[*start..*end];
+                        current_arg.push_str(token_text);
+                    }
+                }
+            }
+            Token::Percent => {
+                // Handle percent character as literal
+                lexer.next();
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+                    current_arg.push_str(token_text);
+                }
+            }
+            Token::DollarParen => {
+                // Handle $(...) command substitution
+                let command_text = lexer.capture_parenthetical_text()?;
+                // For now, just add as literal - this is a limitation of parse_simple_command_from_text
+                // The proper fix would require changing the return type to handle command substitutions
+                args.push(format!("$({})", command_text));
+            }
             _ => {
+                // Consume the token
+                lexer.next();
                 // Get the token text from the current position
                 if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
                     let token_text = &text[*start..*end];
@@ -1812,7 +2013,7 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
     let cmd = Command::Simple(SimpleCommand {
         name,
         args: word_args,
-        redirects: vec![],
+        redirects,
         env_vars: HashMap::new(),
         stdout_used: true,
         stderr_used: true,

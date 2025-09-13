@@ -17,7 +17,7 @@ use crate::utils::generate_unified_diff;
 use crate::testing::{test_all_examples, test_all_examples_next_fail, find_uses_of_system,
                     test_file_equivalence, AstFormatOptions};
 use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, parse_to_perl_inline, 
-                     parse_file_to_perl, parse_system_to_perl, parse_backticks_to_perl, interactive_mode, export_mir, parse_perl_critic_only};
+                     parse_file_to_perl, parse_system_to_perl, parse_backticks_to_perl, interactive_mode, export_mir};
 use crate::help::show_help;
 
 fn main() {
@@ -29,7 +29,7 @@ fn main() {
         return;
     }
     
-    let mut command = &args[1];
+    let command = &args[1];
     
     if command == "--help" || command == "-h" {
         show_help(&args[0]);
@@ -49,9 +49,9 @@ fn main() {
     let mut ast_options = AstFormatOptions::default();
     let mut input_file: Option<String> = None;
     let mut output_file: Option<String> = None;
-    let mut optimize_mir = false;
+    let _optimize_mir = false;
     let mut enable_perl_critic = false;
-    let mut perl_critic_only = false;
+    let mut _perl_critic_only = false;
     let mut i = 2;
     
     // Special case: if the first argument is -i or -o, start parsing from index 1
@@ -93,7 +93,7 @@ fn main() {
                 enable_perl_critic = true;
             }
             "--perl-critic-only" => {
-                perl_critic_only = true;
+                _perl_critic_only = true;
             }
             "-i" => {
                 if i + 1 < args.len() {

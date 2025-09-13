@@ -48,6 +48,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             perl_code
                         } else if name == "find" {
                             // Use the find command handler for proper conversion
+                            eprintln!("DEBUG: words.rs calling generate_find_command with found_files");
                             let perl_code = crate::generator::commands::find::generate_find_command(generator, simple_cmd, true, "found_files");
                             
                             // For backtick commands, we need to return the value, not print it
@@ -58,8 +59,29 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             if simple_cmd.args.is_empty() {
                                 "\"\\n\"".to_string()
                             } else {
+                                // Process arguments with proper string interpolation handling
                                 let args: Vec<String> = simple_cmd.args.iter()
-                                    .map(|arg| generator.word_to_perl(arg))
+                                    .map(|arg| {
+                                        match arg {
+                                            Word::StringInterpolation(interp, _) => {
+                                                generator.convert_string_interpolation_to_perl(interp)
+                                            },
+                                            Word::Literal(literal, _) => {
+                                                // Check if the literal contains escaped backticks that should be processed as command substitutions
+                                                if literal.contains("\\`") {
+                                                    // Parse the string as string interpolation to handle escaped backticks
+                                                    if let Ok(interp) = crate::parser::words::parse_string_interpolation_from_literal(literal) {
+                                                        generator.convert_string_interpolation_to_perl(&interp)
+                                                    } else {
+                                                        generator.perl_string_literal(arg)
+                                                    }
+                                                } else {
+                                                    generator.perl_string_literal(arg)
+                                                }
+                                            },
+                                            _ => generator.word_to_perl(arg)
+                                        }
+                                    })
                                     .collect();
                                 format!("({}) . \"\\n\"", args.join(" . q{ } . "))
                             }
@@ -93,7 +115,27 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for date in command substitution
                             if let Some(format) = simple_cmd.args.first() {
                                 let format_str = generator.word_to_perl(format);
-                                format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", format_str)
+                                // Strip the + prefix from date format strings (shell date +%Y -> strftime %Y)
+                                let cleaned_format = if format_str.starts_with("'+") && format_str.ends_with("'") {
+                                    // Remove quotes, strip +, add quotes back
+                                    let inner = &format_str[1..format_str.len()-1];
+                                    if inner.starts_with('+') {
+                                        format!("'{}'", &inner[1..])
+                                    } else {
+                                        format_str
+                                    }
+                                } else if format_str.starts_with('+') {
+                                    // No quotes, just strip the +
+                                    format!("'{}'", &format_str[1..])
+                                } else {
+                                    // Ensure the format string is properly quoted for strftime
+                                    if format_str.starts_with('"') || format_str.starts_with("'") || format_str.starts_with("q{") {
+                                        format_str
+                                    } else {
+                                        format!("'{}'", format_str)
+                                    }
+                                };
+                                format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", cleaned_format)
                             } else {
                                 "do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime); }".to_string()
                             }
@@ -109,7 +151,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 } else {
                                     "q{}".to_string()
                                 };
-                                format!("do {{ my $path = {}; my $suffix = {}; if ($suffix ne q{{}}) {{ $path =~ s/\\Q$suffix\\E$//msx; }} $path =~ s/.*\\///msx; $path; }}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
+                                format!("do {{ my $basename_path = {}; my $basename_suffix = {}; if ($basename_suffix ne q{{}}) {{ $basename_path =~ s/\\Q$basename_suffix\\E$//msx; }} $basename_path =~ s/.*\\///msx; $basename_path; }}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
                             } else {
                                 "\".\"".to_string()
                             }
@@ -484,48 +526,52 @@ fn expand_range(range: &BraceRange) -> String {
 }
 
 pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, interp: &StringInterpolation) -> String {
-    // Convert string interpolation to a single Perl interpolated string
-    let mut combined_string = String::new();
+    // Convert string interpolation to Perl concatenation when command substitutions are present
+    let mut parts = Vec::new();
+    let mut current_string = String::new();
     
     for part in &interp.parts {
         match part {
             StringPart::Literal(s) => {
-                // Keep escape sequences as literal characters for Perl
-                // Don't process them here - let Perl handle them
-                combined_string.push_str(s);
+                // Accumulate literal parts into the current string
+                current_string.push_str(s);
             },
             StringPart::Variable(var) => {
                 // Handle special shell variables
                 match var.as_str() {
-                    "#" => combined_string.push_str("scalar(@ARGV)"),  // $# -> scalar(@ARGV) for argument count
-                    "@" => combined_string.push_str("@ARGV"),          // Arrays don't need $ in interpolation
-                    "*" => combined_string.push_str("@ARGV"),          // Arrays don't need $ in interpolation
+                    "#" => current_string.push_str("${scalar(@ARGV)}"),  // $# -> ${scalar(@ARGV)} for interpolation
+                    "@" => current_string.push_str("@ARGV"),             // Arrays don't need $ in interpolation
+                    "*" => current_string.push_str("@ARGV"),             // Arrays don't need $ in interpolation
                     _ => {
                         // Check if this is a shell positional parameter ($1, $2, etc.)
                         if var.chars().all(|c| c.is_digit(10)) {
                             // Convert $1 to $_[0], $2 to $_[1], etc.
                             let index = var.parse::<usize>().unwrap_or(0);
-                            combined_string.push_str(&format!("$_[{}]", index - 1)); // Perl arrays are 0-indexed
+                            current_string.push_str(&format!("${{$_[{}]}}", index - 1)); // Perl arrays are 0-indexed
                         } else {
                             // Regular variable - add directly for interpolation
-                            // In bash, $ENV{SHELL_VAR} is treated as variable $ENV followed by literal {SHELL_VAR}
-                            combined_string.push_str(&format!("${}", var));
+                            current_string.push_str(&format!("${}", var));
                         }
                     }
                 }
             },
             StringPart::MapAccess(map_name, key) => {
                 if map_name == "map" {
-                    combined_string.push_str(&format!("$map{{{}}}", key));
+                    current_string.push_str(&format!("$map{{{}}}", key));
                 } else {
-                    combined_string.push_str(&format!("${}{{{}}}", map_name, key));
+                    current_string.push_str(&format!("${}{{{}}}", map_name, key));
                 }
             }
             StringPart::CommandSubstitution(cmd) => {
-                // Handle command substitutions in string interpolation
-                // Convert the command to Perl and embed it in the string
+                // Command substitutions require concatenation, not interpolation
+                // First, add any accumulated string as a quoted part
+                if !current_string.is_empty() {
+                    parts.push(format!("\"{}\"", current_string.replace("\\", "\\\\").replace("\"", "\\\"")));
+                    current_string.clear();
+                }
+                // Add the command substitution as a separate part
                 let cmd_result = generator.word_to_perl(&Word::CommandSubstitution(cmd.clone(), None));
-                combined_string.push_str(&format!("{}", cmd_result));
+                parts.push(format!("({})", cmd_result));
             },
             StringPart::ParameterExpansion(pe) => {
                 // Handle parameter expansions like ${arr[1]}, ${#arr[@]}, etc.
@@ -540,22 +586,22 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, inte
                             if pe.variable.starts_with('#') {
                                 // ${#arr[@]} -> scalar(@arr)
                                 let array_name = &pe.variable[1..];
-                                combined_string.push_str(&format!("scalar(@{})", array_name));
+                                    current_string.push_str(&format!("${{scalar(@{})}}", array_name));
                             } else if pe.variable.starts_with('!') {
                                 // ${!map[@]} -> keys %map (map keys iteration)
                                 let map_name = &pe.variable[1..]; // Remove ! prefix
-                                combined_string.push_str(&format!("keys %{}", map_name));
+                                current_string.push_str(&format!("keys %{}", map_name));
                             } else {
                                 // ${arr[@]} -> @arr (for array iteration)
                                 let array_name = &pe.variable;
-                                combined_string.push_str(&format!("@{}", array_name));
+                                current_string.push_str(&format!("@{}", array_name));
                             }
                         } else {
                             // Regular array slice
                             if let Some(length_str) = length {
-                                combined_string.push_str(&format!("@${{{}}}[{}..{}]", pe.variable, offset, length_str));
+                                current_string.push_str(&format!("@${{{}}}[{}..{}]", pe.variable, offset, length_str));
                             } else {
-                                combined_string.push_str(&format!("@${{{}}}[{}..]", pe.variable, offset));
+                                current_string.push_str(&format!("@${{{}}}[{}..]", pe.variable, offset));
                             }
                         }
                     }
@@ -570,57 +616,46 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, inte
                                     // Check if the key is numeric (indexed array) or string (associative array)
                                     if key.parse::<usize>().is_ok() {
                                         // Indexed array access: arr[1] -> $arr[1]
-                                        combined_string.push_str(&format!("${}[{}]", var_name, key));
+                                        current_string.push_str(&format!("${}[{}]", var_name, key));
                                     } else {
                                         // Associative array access: map[foo] -> $map{foo}
-                                        combined_string.push_str(&format!("${}{{{}}}", var_name, key));
+                                        current_string.push_str(&format!("${}{{{}}}", var_name, key));
                                     }
                                 } else {
-                                    combined_string.push_str(&format!("${{{}}}", pe.variable));
+                                    current_string.push_str(&format!("${{{}}}", pe.variable));
                                 }
                             } else {
-                                combined_string.push_str(&format!("${{{}}}", pe.variable));
+                                current_string.push_str(&format!("${{{}}}", pe.variable));
                             }
                         } else {
                             // Simple variable reference
-                            combined_string.push_str(&format!("${{{}}}", pe.variable));
+                            current_string.push_str(&format!("${{{}}}", pe.variable));
                         }
                     }
                 }
             }
             _ => {
                 // Handle other StringPart variants by converting them to debug format for now
-                combined_string.push_str(&format!("{:?}", part));
+                current_string.push_str(&format!("{:?}", part));
             }
         }
     }
     
-    // Check if the string actually needs interpolation
-    let needs_interpolation = combined_string.contains('$') || combined_string.contains('@') || combined_string.contains('\\') || combined_string.contains('`');
+    // Add any remaining string content
+    if !current_string.is_empty() {
+        parts.push(format!("\"{}\"", current_string.replace("\\", "\\\\").replace("\"", "\\\"")));
+    }
     
-    if needs_interpolation {
-        // Return as a double-quoted interpolated string
-        // Escape newlines, tabs, and other special characters for proper Perl formatting
-        let escaped_string = combined_string
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("`", "\\`")
-            .replace("\n", "\\n")
-            .replace("\t", "\\t")
-            .replace("\r", "\\r");
-        format!("\"{}\"", escaped_string)
+    // Return the result
+    if parts.is_empty() {
+        // No parts, return empty string
+        "\"\"".to_string()
+    } else if parts.len() == 1 {
+        // Single part, return it directly
+        parts.into_iter().next().unwrap()
     } else {
-        // Return as a single-quoted string since no interpolation is needed
-        // Use q{} for single characters to avoid "noisy quotes" violations
-        if combined_string.len() == 1 && !combined_string.contains('\'') && !combined_string.contains('{') && !combined_string.contains('}') {
-            format!("q{{{}}}", combined_string)
-        } else if combined_string.len() == 1 && combined_string.contains('\'') {
-            // Handle single quotes in single character strings
-            format!("q{{{}}}", combined_string)
-        } else {
-            let escaped = combined_string.replace("\\", "\\\\").replace("'", "\\'");
-            format!("'{}'", escaped)
-        }
+        // Multiple parts, concatenate them
+        parts.join(" . ")
     }
 }
 
