@@ -89,6 +89,9 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     // I/O redirection
     commands.insert("tee", BuiltinCommand::new("tee", "Read from stdin, write to stdout and files", true));
     
+    // Variable declarations
+    commands.insert("local", BuiltinCommand::new("local", "Declare local variables", false));
+    
     // Output generation
     commands.insert("yes", BuiltinCommand::new("yes", "Output a string repeatedly", true));
     
@@ -231,7 +234,13 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         },
         "ls" => {
             // Use the substitution-specific function for backtick commands
-            crate::generator::commands::ls::generate_ls_for_substitution(generator, cmd)
+            let ls_output = crate::generator::commands::ls::generate_ls_for_substitution(generator, cmd);
+            if !output_var.is_empty() {
+                // Assign the ls output to the output variable
+                format!("${} = {};\n", output_var, ls_output)
+            } else {
+                ls_output
+            }
         },
         // Echo is handled in simple_commands.rs, so use generic fallback
         // "echo" => { ... },
