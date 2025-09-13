@@ -306,7 +306,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     output.push_str(&generator.indent());
     // In command substitution context, always join with newlines to match shell behavior
     // The shell's ls command outputs one file per line by default in command substitution
-    output.push_str(&format!("join \"\\n\", @{}, \"\\n\";\n", array_name));
+    output.push_str(&format!("join \"\\n\", @{};\n", array_name));
     output.push_str("}");
     
     output

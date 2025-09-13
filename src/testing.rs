@@ -368,6 +368,13 @@ pub fn test_file_equivalence_with_critic(lang: &str, filename: &str, enable_perl
     let (tmp_file, run_cmd) = match lang {
         "perl" => {
             let mut gen = Generator::new();
+            // Set the original script name for $0 compatibility
+            if let Some(script_name) = filename.split(['\\', '/']).last() {
+                eprintln!("DEBUG: Setting original script name to: {}", script_name);
+                gen.set_original_script_name(script_name.to_string());
+            } else {
+                eprintln!("DEBUG: Could not extract script name from: {}", filename);
+            }
             let code = gen.generate(&commands);
             
             // Check PERL_MUST_NOT_CONTAIN constraints for Perl code
@@ -423,6 +430,7 @@ pub fn test_file_equivalence_with_critic(lang: &str, filename: &str, enable_perl
             
             // For Perl scripts, handle the file path replacement
             if lang == "perl" {
+                // Run Perl from the same directory as shell (examples directory)
                 cmd.current_dir("examples");
                 // Replace TEMP_FILE placeholder with actual file path
                 for a in &run_cmd[1..] {
@@ -631,6 +639,13 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
         let (tmp, run_cmd_vec, code) = match lang {
             "perl" => {
                 let mut gen = Generator::new();
+                // Set the original script name for $0 compatibility
+                if let Some(script_name) = filename.split(['\\', '/']).last() {
+                    eprintln!("DEBUG: Setting original script name to: {}", script_name);
+                    gen.set_original_script_name(script_name.to_string());
+                } else {
+                    eprintln!("DEBUG: Could not extract script name from: {}", filename);
+                }
                 let code = gen.generate(&commands);
                 
                 let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
@@ -801,6 +816,7 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
             
             // For Perl scripts, handle the file path replacement
             if lang == "perl" {
+                // Run Perl from the same directory as shell (examples directory)
                 cmd.current_dir("examples");
                 // Replace TEMP_FILE placeholder with actual file path
                 for a in &run_cmd[1..] {
