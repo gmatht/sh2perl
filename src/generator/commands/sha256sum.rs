@@ -30,7 +30,7 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
         output.push_str("chomp $line;\n");
         output.push_str(&format!("if ($line =~ {}) {{\n", generator.format_regex_pattern(r"^([a-f0-9]{64})\\s+(.+)$")));
         output.push_str("my ($expected_hash, $filename) = ($1, $2);\n");
-        output.push_str("if (-f $filename) {\n");
+        output.push_str("if (-f \"$filename\") {\n");
         output.push_str("my $actual_hash = sha256_hex(do { local $/; open my $fh, '<', $filename or die \"Cannot open $filename: $!\"; my $content = <$fh>; close $fh or die \"Close failed: $!\"; $content });\n");
         output.push_str("if ($expected_hash eq $actual_hash) {\n");
         output.push_str("push @results, \"$filename: OK\";\n");
@@ -57,8 +57,8 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
             output.push_str("do {\n");
             output.push_str("my @results;\n");
             for file in &files {
-                output.push_str(&format!("if (-f {}) {{\n", file));
-                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', {} or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
+                output.push_str(&format!("if (-f \"{}\") {{\n", file));
+                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', \"{}\" or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
                 output.push_str(&format!("push @results, \"$hash  {}\";\n", file));
                 output.push_str("} else {\n");
                 output.push_str(&format!("push @results, \"0000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", file));
@@ -69,8 +69,8 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
         } else {
             output.push_str("my @results;\n");
             for file in &files {
-                output.push_str(&format!("if (-f {}) {{\n", file));
-                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', {} or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
+                output.push_str(&format!("if (-f \"{}\") {{\n", file));
+                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', \"{}\" or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
                 output.push_str(&format!("push @results, \"$hash  {}\";\n", file));
                 output.push_str("} else {\n");
                 output.push_str(&format!("push @results, \"0000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", file));

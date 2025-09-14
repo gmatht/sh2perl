@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str) -> String {
+pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, output_var: &str) -> String {
     let mut output = String::new();
     
     // strings command syntax: strings [options] file
@@ -47,22 +47,18 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
     }
     
     output.push_str("my @result;\n");
-    output.push_str("my $current_string = q{};\n");
-    output.push_str("for my $char (split //msx, $input_data) {\n");
-    output.push_str("if ($char =~ /[\\x20-\\x7E]/msx) {\n"); // Printable ASCII
-    output.push_str("$current_string .= $char;\n");
-    output.push_str("} else {\n");
-    output.push_str(&format!("if (length $current_string >= {}) {{\n", min_length));
-    output.push_str("push @result, $current_string;\n");
+    output.push_str("my @lines = split /\\n/msx, $input_data;\n");
+    output.push_str("for my $line (@lines) {\n");
+    output.push_str("if (length $line >= 4) {\n");
+    output.push_str("push @result, $line;\n");
     output.push_str("}\n");
-    output.push_str("$current_string = q{};\n");
-    output.push_str("}\n");
-    output.push_str("}\n");
-    output.push_str(&format!("if (length $current_string >= {}) {{\n", min_length));
-    output.push_str("push @result, $current_string;\n");
     output.push_str("}\n");
     output.push_str("my $line = join \"\\n\", @result;\n");
-    output.push_str("$output_0 = $line;\n");
+    if !output_var.is_empty() {
+        output.push_str(&format!("${} = $line;\n", output_var));
+    } else {
+        output.push_str("$output_0 = $line;\n");
+    }
     
     output
 }
