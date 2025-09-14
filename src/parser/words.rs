@@ -848,7 +848,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     let mut i = 0;
     
     while i < content.len() {
-        let ch = content.chars().nth(i).unwrap_or('?');
+        let _ch = content.chars().nth(i).unwrap_or('?');
         if content[i..].starts_with("\\\\`") {
             // We found an escaped backtick command substitution
             // First, add any accumulated literal text
@@ -938,7 +938,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     Ok(command) => {
                         parts.push(StringPart::CommandSubstitution(Box::new(command)));
                     }
-                    Err(e) => {
+                    Err(_e) => {
                         // Fall back to treating it as a literal
                         parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
                     }

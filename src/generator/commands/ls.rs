@@ -299,6 +299,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     
     let mut output = String::new();
     output.push_str("do {\n");
+    generator.indent_level += 1;
     // Sort by default to match GNU ls behavior
     let should_sort = true; // Default to sorting to match shell behavior
     let array_name = format!("ls_files_{}", generator.get_unique_id());
@@ -307,6 +308,8 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     // In command substitution context, always join with newlines to match shell behavior
     // The shell's ls command outputs one file per line by default in command substitution
     output.push_str(&format!("join \"\\n\", @{};\n", array_name));
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
     output.push_str("}");
     
     output

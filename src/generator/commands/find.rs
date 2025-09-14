@@ -476,6 +476,7 @@ pub fn generate_find_command(generator: &mut Generator, cmd: &SimpleCommand, gen
     output.push_str("}\n");
     
     output.push_str(&indent2);
+    output.push_str(&generator.indent());
     output.push_str("closedir $dh;\n");
     
     output.push_str(&indent2);
@@ -667,47 +668,109 @@ fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCommand
     
     // Generate simple Perl code for find functionality using glob
     output.push_str("do {\n");
-    output.push_str("    my @results;\n");
-    output.push_str("    my $start_path = ");
+    generator.indent_level += 1;
+    output.push_str(&generator.indent());
+    output.push_str("my @results;\n");
+    output.push_str(&generator.indent());
+    output.push_str("my $start_path = ");
     output.push_str(&generator.perl_string_literal(&Word::Literal(_start_path, Default::default())));
     output.push_str(";\n");
     
-    // Use File::Find for recursive directory traversal
-    output.push_str("    use File::Find;\n");
-    output.push_str("    find(sub {\n");
-    output.push_str("        my $file = $File::Find::name;\n");
-    output.push_str("        my $filename = $_;\n");
+    // Use recursive function for directory traversal (works better on Windows)
+    output.push_str(&generator.indent());
+    output.push_str("sub find_files {\n");
+    generator.indent_level += 1;
+    output.push_str(&generator.indent());
+    output.push_str("my ($dir) = @_;\n");
+    output.push_str(&generator.indent());
+    output.push_str("if (opendir my $dh, $dir) {\n");
+    generator.indent_level += 1;
+    output.push_str(&generator.indent());
+    output.push_str("while (my $file = readdir $dh) {\n");
+    generator.indent_level += 1;
+    output.push_str(&generator.indent());
+    output.push_str("next if $file eq q{.} or $file eq q{..};\n");
+    output.push_str(&generator.indent());
+    output.push_str("my $full_path = \"$dir/$file\";\n");
+    output.push_str(&generator.indent());
+    output.push_str("if (-d $full_path) {\n");
+    generator.indent_level += 1;
+    output.push_str(&generator.indent());
+    output.push_str("find_files($full_path);\n");
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
+    output.push_str("} else {\n");
+    generator.indent_level += 1;
     
     // Add file type check
     if let Some(ftype) = &file_type {
         match ftype.as_str() {
             "f" => {
-                output.push_str("        if (!-f $file) {\n");
-                output.push_str("            return;\n");
-                output.push_str("        }\n");
+                output.push_str(&generator.indent());
+                output.push_str("if (-f $full_path) {\n");
+                generator.indent_level += 1;
             },
             "d" => {
-                output.push_str("        if (!-d $file) {\n");
-                output.push_str("            return;\n");
-                output.push_str("        }\n");
+                output.push_str(&generator.indent());
+                output.push_str("if (-d $full_path) {\n");
+                generator.indent_level += 1;
             },
-            _ => {}
+            _ => {
+                output.push_str(&generator.indent());
+                output.push_str("{\n");
+                generator.indent_level += 1;
+            }
         }
+    } else {
+        output.push_str(&generator.indent());
+        output.push_str("{\n");
+        generator.indent_level += 1;
     }
     
     // Add name pattern check
     if let Some(pattern) = &name_pattern {
         let escaped_pattern = escape_glob_pattern(pattern);
-        output.push_str("        if ($filename !~ ");
+        output.push_str(&generator.indent());
+        output.push_str("if ($file =~ ");
         output.push_str(&generator.format_regex_pattern(&escaped_pattern));
         output.push_str(") {\n");
-        output.push_str("            return;\n");
-        output.push_str("        }\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str("push @results, $full_path;\n");
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
+    } else {
+        output.push_str(&generator.indent());
+        output.push_str("push @results, $full_path;\n");
     }
     
-    output.push_str("        push @results, $file;\n");
-    output.push_str("    }, $start_path);\n");
-    output.push_str("    join \"\\n\", @results;\n");
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
+    output.push_str("}\n");
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
+    output.push_str("}\n");
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
+    output.push_str("}\n");
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
+    output.push_str("closedir $dh;\n");
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
+    output.push_str("}\n");
+    output.push_str(&generator.indent());
+    output.push_str("return;\n");
+    generator.indent_level -= 1;
+    output.push_str(&generator.indent());
+    output.push_str("}\n");
+    output.push_str(&generator.indent());
+    output.push_str("find_files($start_path);\n");
+    
+    output.push_str(&generator.indent());
+    output.push_str("join \"\\n\", @results;\n");
+    output.push_str(&generator.indent());
     output.push_str("}");
     
     output

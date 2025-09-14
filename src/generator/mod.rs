@@ -124,6 +124,7 @@ impl Generator {
         let needs_basename = self.needs_basename_import(ast);
         let needs_exit_code = self.needs_exit_code_tracking(ast);
         let needs_ipc_open3 = self.needs_ipc_open3(ast);
+        let needs_file_find = self.needs_file_find_import(ast);
         
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
@@ -138,6 +139,9 @@ impl Generator {
         }
         if needs_ipc_open3 {
             output.push_str("use IPC::Open3;\n");
+        }
+        if needs_file_find {
+            // No additional imports needed for glob-based approach
         }
         output.push_str("\n");
         
@@ -856,6 +860,105 @@ impl Generator {
             }
         }
         false
+    }
+
+    fn needs_file_find_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_file_find(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a specific command needs File::Find
+    fn command_needs_file_find(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                // Check if this is a find command
+                if let Word::Literal(name, _) = &cmd.name {
+                    if name == "find" {
+                        return true;
+                    }
+                }
+                // Also check arguments for find commands
+                for arg in &cmd.args {
+                    if self.word_needs_file_find(arg) {
+                        return true;
+                    }
+                }
+                // Check env_vars for command substitutions with find commands
+                for (_, env_value) in &cmd.env_vars {
+                    if self.word_needs_file_find(env_value) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::Pipeline(pipeline) => {
+                for cmd in &pipeline.commands {
+                    if self.command_needs_file_find(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_file_find(&redirect_cmd.command)
+            },
+            Command::Background(bg_cmd) => {
+                if self.command_needs_file_find(bg_cmd) {
+                    return true;
+                }
+                false
+            },
+            Command::Subshell(sub_cmd) => {
+                if self.command_needs_file_find(sub_cmd) {
+                    return true;
+                }
+                false
+            },
+            Command::If(if_stmt) => {
+                if self.command_needs_file_find(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_file_find(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+
+    /// Check if a word needs File::Find (e.g., command substitution with find)
+    fn word_needs_file_find(&self, word: &Word) -> bool {
+        match word {
+            Word::CommandSubstitution(cmd, _) => {
+                self.command_needs_file_find(cmd)
+            },
+            Word::StringInterpolation(interp, _) => {
+                for part in &interp.parts {
+                    if self.string_part_needs_file_find(part) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+
+    /// Check if a string interpolation part needs File::Find
+    fn string_part_needs_file_find(&self, part: &StringPart) -> bool {
+        match part {
+            StringPart::CommandSubstitution(cmd) => {
+                self.command_needs_file_find(cmd)
+            },
+            _ => false
+        }
     }
     
     /// Check if a specific command needs IPC::Open3

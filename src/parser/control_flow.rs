@@ -49,8 +49,8 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
             stderr_used: true,
         }))
     } else {
-        // Parse as a pipeline to handle test expressions, commands, and && || operators
-        Box::new(parse_pipeline(parser)?)
+        // Parse as a simple command to handle test expressions and single commands
+        Box::new(parser.parse_simple_command()?)
     };
     
     // Consume optional separator (semicolon or newline) after condition

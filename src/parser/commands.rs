@@ -390,22 +390,10 @@ impl Parser {
                     commands.push(or_command);
                 }
                 Token::If => {
-                    // Check if this is a postfix if statement: command if condition
-                    self.lexer.next(); // consume the 'if' token
-                    self.lexer.skip_whitespace_and_comments();
-                    
-                    // Parse the condition as a test expression
-                    let condition = self.parse_test_expression()?;
-                    
-                    // Convert the postfix if to a proper if statement
-                    let left_command = commands.pop().unwrap();
-                    let if_command = Command::If(IfStatement {
-                        condition: Box::new(condition),
-                        then_branch: Box::new(left_command),
-                        else_branch: None,
-                    });
-                    commands.push(if_command);
-                    break; // Postfix if ends the pipeline
+                    // If we encounter an 'if' token in the middle of a pipeline,
+                    // it means we've reached the start of a new command
+                    // Break out of the pipeline parsing and let the main parser handle it
+                    break;
                 }
                 Token::Semicolon | Token::Newline => {
                     // Stop parsing pipeline when we hit a command separator
@@ -439,12 +427,14 @@ impl Parser {
         }
     }
 
-    fn parse_simple_command(&mut self) -> Result<Command, ParserError> {
+    pub fn parse_simple_command(&mut self) -> Result<Command, ParserError> {
         // Skip whitespace and comments at the beginning
         self.lexer.skip_whitespace_and_comments();
         
-
-
+        // Check if this is a test expression first
+        if matches!(self.lexer.peek(), Some(Token::TestBracket)) {
+            return self.parse_test_expression();
+        }
         
         let mut args = Vec::new();
         let redirects = Vec::new();
@@ -983,7 +973,7 @@ impl Parser {
         }))
     }
 
-    fn parse_test_expression(&mut self) -> Result<Command, ParserError> {
+    pub fn parse_test_expression(&mut self) -> Result<Command, ParserError> {
         use crate::ast::TestExpression;
         
                             // Check if this is being called for double brackets (already consumed) or single bracket
