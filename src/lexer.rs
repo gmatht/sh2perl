@@ -348,7 +348,7 @@ pub enum Token {
     DoubleQuote,
     #[token("\\", priority = 2)]
     Escape,
-    #[regex(r"\n", priority = 3)]
+    #[regex(r"\n", priority = 5)]
     Newline,
     #[token("\r")]
     CarriageReturn,
