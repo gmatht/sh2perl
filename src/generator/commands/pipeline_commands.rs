@@ -587,7 +587,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&format!("my @seq_lines_{} = split /\\n/msx, $seq_output_{};\n", unique_id, unique_id));
                 
                 // Declare variables needed for subsequent commands in the pipeline
-                let mut output_var = format!("$output_{}", unique_id);
+                let output_var = format!("$output_{}", unique_id);
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my {} = q{{}};\n", output_var));
                 
@@ -771,6 +771,8 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str("my $head_line_count = 0;\n");
                 output.push_str(&generator.indent());
                 output.push_str("my $output_6 = q{};\n");
+                output.push_str(&generator.indent());
+                output.push_str("my $output_1 = q{};\n");
                 output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
                 generator.indent_level += 1;
@@ -1208,6 +1210,10 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
             output.push_str("my @tail_lines = ();\n");
         }
         
+        // Declare output variable for pipeline commands that need it
+        let unique_id = generator.get_unique_id();
+        output.push_str(&generator.indent());
+        output.push_str(&format!("my $output_{} = q{{}};\n", unique_id));
         
         output.push_str(&generator.indent());
         output.push_str("while (my $line = <>) {\n");
@@ -1226,7 +1232,10 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                     
                     // Generate line-by-line version of each command
                     output.push_str(&generator.indent());
-                    output.push_str(&generate_linebyline_command(generator, cmd, "line", start_index + i));
+                    let mut linebyline_output = generate_linebyline_command(generator, cmd, "line", start_index + i);
+                    // Replace the output variable reference with our correct output variable
+                    linebyline_output = linebyline_output.replace(&format!("$output_{}", start_index + i), &format!("$output_{}", unique_id));
+                    output.push_str(&linebyline_output);
                 }
                 Command::While(while_loop) => {
                     // Handle while loops in pipeline context
@@ -1475,7 +1484,7 @@ fn generate_linebyline_command_for_pipeline(generator: &mut Generator, pipeline:
 
 /// Generate line-by-line processing for a single command
 fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, line_var: &str, cmd_index: usize) -> String {
-    let cmd_name = match &cmd.name {
+                    let cmd_name = match &cmd.name {
         Word::Literal(s, _) => s,
         _ => "unknown_command"
     };

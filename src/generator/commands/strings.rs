@@ -38,7 +38,12 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
         output.push_str("}\n");
     } else {
         // For pipeline context or no filename, use input_var
-        output.push_str(&format!("my $input_data = {};\n", input_var));
+        let var_name = if input_var.starts_with('$') {
+            input_var.to_string()
+        } else {
+            format!("${}", input_var)
+        };
+        output.push_str(&format!("my $input_data = {};\n", var_name));
     }
     
     output.push_str("my @result;\n");

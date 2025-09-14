@@ -177,9 +177,13 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             if format_string.is_empty() {
                                 "\"\"".to_string()
                             } else {
+                                let formatted_args = args.iter()
+                                    .map(|arg| generator.perl_string_literal(&Word::Literal(arg.clone(), Default::default())))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
                                 format!("sprintf {}, {}", 
                                     generator.perl_string_literal(&Word::Literal(format_string, Default::default())),
-                                    args.join(", "))
+                                    formatted_args)
                             }
                         } else if name == "date" {
                             // Special handling for date in command substitution
