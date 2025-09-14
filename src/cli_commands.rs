@@ -310,25 +310,6 @@ fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
         }
     }
     
-    // Check if this is a full Perl script (has shebang and use statements)
-    if perl_code.contains("#!/usr/bin/env perl") && perl_code.contains("use strict") {
-        // This is a full Perl script - extract preamble and core
-        if let Some(captures) = regex::Regex::new(r"(?s)(#!/usr/bin/env perl.*?my \$main_exit_code = 0;\s*\n)(.*?)(?:\n\s*$|$)")
-            .unwrap()
-            .captures(perl_code) {
-            let preamble = captures.get(1).unwrap().as_str().trim().to_string();
-            let core_code = captures.get(2).unwrap().as_str().trim().to_string();
-            
-            let final_core = if core_code.ends_with(';') {
-                core_code[..core_code.len()-1].to_string()
-            } else {
-                core_code.to_string()
-            };
-            
-            return (preamble, final_core);
-        }
-    }
-    
     // Default fallback - return original code as core with empty preamble
     ("".to_string(), perl_code.to_string())
 }

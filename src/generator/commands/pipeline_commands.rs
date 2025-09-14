@@ -637,7 +637,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 for (i, command) in pipeline.commands[1..].iter().enumerate() {
                     match command {
                         Command::Simple(cmd) => {
-                            let cmd_name = match &cmd.name {
+                            let _cmd_name = match &cmd.name {
                                 Word::Literal(s, _) => s,
                                 _ => "unknown_command"
                             };
@@ -660,7 +660,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                             for body_cmd in &while_loop.body.commands {
                                 match body_cmd {
                                     Command::Simple(cmd) => {
-                                        let cmd_name = match &cmd.name {
+                                        let _cmd_name = match &cmd.name {
                                             Word::Literal(s, _) => s,
                                             _ => "unknown_command"
                                         };
@@ -788,7 +788,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
                     match command {
                         Command::Simple(cmd) => {
-                            let cmd_name = match &cmd.name {
+                            let _cmd_name = match &cmd.name {
                                 Word::Literal(s, _) => s,
                                 _ => "unknown_command"
                             };
@@ -981,7 +981,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                             for body_cmd in &while_loop.body.commands {
                                 match body_cmd {
                                     Command::Simple(cmd) => {
-                                        let cmd_name = match &cmd.name {
+                                        let _cmd_name = match &cmd.name {
                                             Word::Literal(s, _) => s,
                                             _ => "unknown_command"
                                         };
@@ -1014,7 +1014,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                     for body_cmd in &while_loop.body.commands {
                                         match body_cmd {
                                             Command::Simple(cmd) => {
-                                                let cmd_name = match &cmd.name {
+                                                let _cmd_name = match &cmd.name {
                                                     Word::Literal(s, _) => s,
                                                     _ => "unknown_command"
                                                 };
@@ -1047,7 +1047,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                 for body_cmd in &while_loop.body.commands {
                                     match body_cmd {
                                         Command::Simple(cmd) => {
-                                            let cmd_name = match &cmd.name {
+                                            let _cmd_name = match &cmd.name {
                                                 Word::Literal(s, _) => s,
                                                 _ => "unknown_command"
                                             };
@@ -1225,7 +1225,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
             match command {
                 Command::Simple(cmd) => {
-                    let cmd_name = match &cmd.name {
+                    let _cmd_name = match &cmd.name {
                         Word::Literal(s, _) => s,
                         _ => "unknown_command"
                     };
@@ -1248,7 +1248,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                     for body_cmd in &while_loop.body.commands {
                         match body_cmd {
                             Command::Simple(cmd) => {
-                                let cmd_name = match &cmd.name {
+                                let _cmd_name = match &cmd.name {
                                     Word::Literal(s, _) => s,
                                     _ => "unknown_command"
                                 };
@@ -1336,7 +1336,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
         for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
             match command {
                 Command::Simple(cmd) => {
-                    let cmd_name = match &cmd.name {
+                    let _cmd_name = match &cmd.name {
                         Word::Literal(s, _) => s,
                         _ => "unknown_command"
                     };
@@ -1357,7 +1357,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                     for body_cmd in &while_loop.body.commands {
                         match body_cmd {
                             Command::Simple(cmd) => {
-                                let cmd_name = match &cmd.name {
+                                let _cmd_name = match &cmd.name {
                                     Word::Literal(s, _) => s,
                                     _ => "unknown_command"
                                 };

@@ -72,7 +72,7 @@ echo "SHA512 result: $sha512_result"
 
 # strings command with backticks
 #PERL_MUST_NOT_CONTAIN `strings
-strings_result=`strings target/debug/debashc.exe | head -3`
+strings_result=`strings test_binary.txt | head -3`
 echo "Strings result:"
 echo "$strings_result"
 
