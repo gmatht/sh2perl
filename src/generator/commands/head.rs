@@ -50,8 +50,8 @@ pub fn generate_head_command(_generator: &mut Generator, cmd: &SimpleCommand, in
     output.push_str(&format!("    if ($line_end == -1) {{\n"));
     output.push_str(&format!("        $line_end = length $input;\n"));
     output.push_str(&format!("    }}\n"));
-    output.push_str(&format!("    my $line = substr $input, $pos, $line_end - $pos;\n"));
-    output.push_str(&format!("    $result .= $line . \"\\n\";\n"));
+    output.push_str(&format!("    my $head_line = substr $input, $pos, $line_end - $pos;\n"));
+    output.push_str(&format!("    $result .= $head_line . \"\\n\";\n"));
     output.push_str(&format!("    $pos = $line_end + 1;\n"));
     output.push_str(&format!("    ++$head_line_count;\n"));
     output.push_str(&format!("}}\n"));

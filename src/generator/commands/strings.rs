@@ -26,13 +26,13 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
         }
     }
     
-    // If we have a filename and no input_var (not in pipeline), read from file
-    if !filename.is_empty() && input_var.is_empty() {
+    // If we have a filename, always read from file (even in pipeline context)
+    if !filename.is_empty() {
         output.push_str(&format!("my $input_data;\n"));
-        output.push_str(&format!("if (open(my $fh, '<', '{}')) {{\n", filename));
-        output.push_str("local $/;  # Read entire file at once\n");
+        output.push_str(&format!("if (open my $fh, '<', '{}') {{\n", filename));
+        output.push_str("local $INPUT_RECORD_SEPARATOR = undef;  # Read entire file at once\n");
         output.push_str("$input_data = <$fh>;\n");
-        output.push_str("close $fh;\n");
+        output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
         output.push_str("} else {\n");
         output.push_str("$input_data = q{};\n");
         output.push_str("}\n");
@@ -62,7 +62,7 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
     output.push_str("push @result, $current_string;\n");
     output.push_str("}\n");
     output.push_str("my $line = join \"\\n\", @result;\n");
-    output.push_str("\n");
+    output.push_str("$output_0 = $line;\n");
     
     output
 }

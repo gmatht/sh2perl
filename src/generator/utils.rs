@@ -155,6 +155,12 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                     .collect();
                                 format!("({}) . \"\\n\"", args.join(" . q{ } . "))
                             }
+                        } else if name == "sha256sum" {
+                            // Use the sha256sum command handler for proper conversion
+                            crate::generator::commands::sha256sum::generate_sha256sum_command(generator, simple_cmd, "")
+                        } else if name == "sha512sum" {
+                            // Use the sha512sum command handler for proper conversion
+                            crate::generator::commands::sha512sum::generate_sha512sum_command(generator, simple_cmd, "")
                         } else if name == "printf" {
                             // Special handling for printf in command substitution
                             let mut format_string = String::new();
@@ -162,7 +168,26 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             
                             for (i, arg) in simple_cmd.args.iter().enumerate() {
                                 if i == 0 {
-                                    format_string = generator.word_to_perl(arg);
+                                    // For printf format strings, handle string interpolation specially
+                                    match arg {
+                                        Word::StringInterpolation(interp, _) => {
+                                            // For printf format strings, we want the raw string without escape processing
+                                            // Reconstruct the original string from the interpolation parts
+                                            format_string = interp.parts.iter()
+                                                .map(|part| match part {
+                                                    StringPart::Literal(s) => s.clone(),
+                                                    _ => "".to_string(), // Skip variables in format strings for now
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("");
+                                        },
+                                        Word::Literal(s, _) => {
+                                            format_string = s.clone();
+                                        },
+                                        _ => {
+                                            format_string = generator.word_to_perl(arg);
+                                        }
+                                    }
                                     // Remove quotes if they exist around the format string
                                     if format_string.starts_with('\'') && format_string.ends_with('\'') {
                                         format_string = format_string[1..format_string.len()-1].to_string();
@@ -181,8 +206,8 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                     .map(|arg| generator.perl_string_literal(&Word::Literal(arg.clone(), Default::default())))
                                     .collect::<Vec<_>>()
                                     .join(", ");
-                                format!("sprintf {}, {}", 
-                                    generator.perl_string_literal(&Word::Literal(format_string, Default::default())),
+                                format!("sprintf \"{}\", {}", 
+                                    format_string.replace("\"", "\\\"").replace("\\\\", "\\"),
                                     formatted_args)
                             }
                         } else if name == "date" {
