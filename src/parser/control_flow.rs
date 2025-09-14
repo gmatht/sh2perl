@@ -36,11 +36,8 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
     // Skip whitespace
     parser.lexer.skip_whitespace_and_comments();
     
-    // Parse condition - check for test expression first, then arithmetic evaluation
-    let condition = if let Some(Token::TestBracket) = parser.lexer.peek() {
-        // Handle test expression like: if [ -f "file.txt" ]; then
-        Box::new(parse_test_expression(&mut parser.lexer)?)
-    } else if let Some(Token::ArithmeticEval) = parser.lexer.peek() {
+    // Parse condition - use parse_pipeline which handles test expressions internally
+    let condition = if let Some(Token::ArithmeticEval) = parser.lexer.peek() {
         // Handle arithmetic evaluation like: if (( a > b )); then
         let arithmetic_word = parse_arithmetic_expression(parser)?;
         Box::new(Command::Simple(SimpleCommand {
@@ -52,7 +49,7 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
             stderr_used: true,
         }))
     } else {
-        // Parse as a pipeline to handle && and || operators
+        // Parse as a pipeline to handle test expressions, commands, and && || operators
         Box::new(parse_pipeline(parser)?)
     };
     
