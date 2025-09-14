@@ -391,6 +391,18 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
         return output;
     }
     
+    // Check if this is a strings command pipeline - strings should preserve newlines
+    if output.contains("split /\\n/msx") && output.contains("for my $line (@lines)") {
+        eprintln!("DEBUG: Strings command pipeline detected, preserving newlines");
+        return format!("do {{\n{}\n}}", output);
+    }
+    
+    // Check if this is a tee command pipeline - tee should preserve newlines
+    if output.contains("tee") && output.contains("print {$fh}") {
+        eprintln!("DEBUG: Tee command pipeline detected, preserving newlines");
+        return format!("do {{\n{}\n}}", output);
+    }
+    
     // Find the output variable
     let re = Regex::new(r"\$output_(\d+)").unwrap();
     let output_var = if let Some(cap) = re.captures(&output) {
@@ -1719,7 +1731,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
         },
         "strings" => {
             // Use the dedicated strings command generator
-            crate::generator::commands::strings::generate_strings_command(generator, cmd, line_var)
+            crate::generator::commands::strings::generate_strings_command(generator, cmd, line_var, "")
         },
         _ => {
             // Fallback for unsupported commands

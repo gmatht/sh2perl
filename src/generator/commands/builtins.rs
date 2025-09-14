@@ -405,7 +405,7 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         },
         "strings" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::strings::generate_strings_command(generator, cmd, input_var)
+            crate::generator::commands::strings::generate_strings_command(generator, cmd, input_var, output_var)
         },
         "tee" => {
             // For now, use the existing signature but we should standardize this

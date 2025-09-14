@@ -268,6 +268,58 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             } else {
                                 "\"\"".to_string()
                             }
+                        } else if name == "perl" {
+                            // Special handling for perl in command substitution
+                            // For perl -e 'print "..."' commands, capture the output instead of printing
+                            if simple_cmd.args.len() >= 2 {
+                                if let (Word::Literal(flag, _), Word::Literal(code, _)) = (&simple_cmd.args[0], &simple_cmd.args[1]) {
+                                    if flag == "-e" {
+                                        // Clean the code by removing outer quotes and fixing escaping
+                                        let mut clean_code = code.clone();
+                                        if (clean_code.starts_with('"') && clean_code.ends_with('"')) ||
+                                           (clean_code.starts_with('\'') && clean_code.ends_with('\'')) {
+                                            clean_code = clean_code[1..clean_code.len()-1].to_string();
+                                        }
+                                        // Fix double-escaped quotes and newlines
+                                        clean_code = clean_code.replace("\\\"", "\"").replace("\\\\n", "\\n");
+                                        
+                                        // For command substitution, capture output instead of printing
+                                        let output_var = format!("perl_output_{}", generator.get_unique_id());
+                                        // Build the code manually to avoid quote escaping issues
+                                        let mut result = String::new();
+                                        result.push_str("do { use Capture::Tiny qw(capture_stdout); capture_stdout(sub { ");
+                                        result.push_str(&clean_code);
+                                        result.push_str("; }); }");
+                                        result
+                                    } else {
+                                        // Fallback to system command for other perl flags
+                                        let args: Vec<String> = simple_cmd.args.iter()
+                                            .map(|arg| generator.word_to_perl(arg))
+                                            .collect();
+                                        let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+                                        let formatted_args = args.iter().map(|arg| {
+                                            let word = Word::Literal(arg.clone(), Default::default());
+                                            generator.perl_string_literal(&word)
+                                        }).collect::<Vec<_>>().join(", ");
+                                        format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'perl', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                    }
+                                } else {
+                                    // Fallback to system command for non-literal args
+                                    let args: Vec<String> = simple_cmd.args.iter()
+                                        .map(|arg| generator.word_to_perl(arg))
+                                        .collect();
+                                    let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+                                    let formatted_args = args.iter().map(|arg| {
+                                        let word = Word::Literal(arg.clone(), Default::default());
+                                        generator.perl_string_literal(&word)
+                                    }).collect::<Vec<_>>().join(", ");
+                                    format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'perl', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                }
+                            } else {
+                                // No arguments, fallback to system command
+                                let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'perl'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, in_var, result_var, out_var, out_var, pid_var, result_var)
+                            }
                         } else if generator.inline_mode && name == "echo" {
                             // In inline mode for echo, generate the output value directly
                             if simple_cmd.args.is_empty() {
