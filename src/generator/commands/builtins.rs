@@ -84,7 +84,7 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     // Checksums and verification
     commands.insert("sha256sum", BuiltinCommand::new("sha256sum", "Compute SHA256 checksums", true));
     commands.insert("sha512sum", BuiltinCommand::new("sha512sum", "Compute SHA512 checksums", true));
-    commands.insert("strings", BuiltinCommand::new("strings", "Extract printable strings", true));
+    commands.insert("strings", BuiltinCommand::new("strings", "Extract printable strings", false));
     
     // I/O redirection
     commands.insert("tee", BuiltinCommand::new("tee", "Read from stdin, write to stdout and files", true));

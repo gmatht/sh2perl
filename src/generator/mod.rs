@@ -125,6 +125,7 @@ impl Generator {
         let needs_exit_code = self.needs_exit_code_tracking(ast);
         let needs_ipc_open3 = self.needs_ipc_open3(ast);
         let needs_file_find = self.needs_file_find_import(ast);
+        let needs_digest_sha = self.needs_digest_sha_import(ast);
         
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
@@ -142,6 +143,9 @@ impl Generator {
         }
         if needs_file_find {
             // No additional imports needed for glob-based approach
+        }
+        if needs_digest_sha {
+            output.push_str("use Digest::SHA qw(sha256_hex sha512_hex);\n");
         }
         output.push_str("\n");
         
@@ -1039,6 +1043,108 @@ impl Generator {
     /// Convert postfix unless statement to block form
     pub fn convert_postfix_unless_to_block(&self, condition: &str, statement: &str) -> String {
         utils::convert_postfix_unless_to_block_no_indent(condition, statement)
+    }
+
+    /// Check if the AST needs Digest::SHA import
+    fn needs_digest_sha_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_digest_sha(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a specific command needs Digest::SHA
+    fn command_needs_digest_sha(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                // Check if it's a sha256sum or sha512sum command
+                if let Word::Literal(name, _) = &cmd.name {
+                    if name == "sha256sum" || name == "sha512sum" {
+                        return true;
+                    }
+                }
+                // Check arguments for command substitutions with sha commands
+                for arg in &cmd.args {
+                    if self.word_needs_digest_sha(arg) {
+                        return true;
+                    }
+                }
+                // Check env_vars for command substitutions with sha commands
+                for (_, env_value) in &cmd.env_vars {
+                    if self.word_needs_digest_sha(env_value) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::Pipeline(pipeline) => {
+                for cmd in &pipeline.commands {
+                    if self.command_needs_digest_sha(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::And(left, right) | Command::Or(left, right) => {
+                self.command_needs_digest_sha(left) || self.command_needs_digest_sha(right)
+            },
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_digest_sha(&redirect_cmd.command)
+            },
+            Command::For(for_loop) => {
+                for cmd in &for_loop.body.commands {
+                    if self.command_needs_digest_sha(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::While(while_loop) => {
+                for cmd in &while_loop.body.commands {
+                    if self.command_needs_digest_sha(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::If(if_stmt) => {
+                if self.command_needs_digest_sha(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_digest_sha(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+
+    /// Check if a word needs Digest::SHA functionality
+    fn word_needs_digest_sha(&self, word: &Word) -> bool {
+        match word {
+            Word::CommandSubstitution(cmd, _) => {
+                self.command_needs_digest_sha(cmd)
+            },
+            Word::StringInterpolation(interp, _) => {
+                for part in &interp.parts {
+                    match part {
+                        StringPart::CommandSubstitution(cmd) => {
+                            if self.command_needs_digest_sha(cmd) {
+                                return true;
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+                false
+            },
+            _ => false
+        }
     }
 }
 

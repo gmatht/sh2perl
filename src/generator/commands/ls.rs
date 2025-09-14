@@ -91,7 +91,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
     let mut dir = ".";
     let mut single_column = false;
     let mut add_slash_to_dirs = false; // -p flag: add / to directories
-    let mut long_format = false; // -l flag: long format
+    let mut _long_format = false; // -l flag: long format
     let mut sort_by_time = false; // -t flag: sort by modification time
     let mut show_hidden = false; // -a flag: show hidden files
     
@@ -137,7 +137,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                         match flag {
                             '1' => single_column = true,
                             'p' => add_slash_to_dirs = true, // -p flag: add / to directories
-                            'l' => long_format = true, // -l flag: long format
+                            'l' => _long_format = true, // -l flag: long format
                             't' => sort_by_time = true, // -t flag: sort by modification time
                             'a' => show_hidden = true, // -a flag: show hidden files
                             _ => {} // Ignore other flags for now
@@ -155,7 +155,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                                 match flag {
                                     '1' => single_column = true,
                                     'p' => add_slash_to_dirs = true, // -p flag: add / to directories
-                                    'l' => long_format = true, // -l flag: long format
+                                    'l' => _long_format = true, // -l flag: long format
                                     't' => sort_by_time = true, // -t flag: sort by modification time
                                     'a' => show_hidden = true, // -a flag: show hidden files
                                     _ => {} // Ignore other flags for now
@@ -195,7 +195,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
         // Standalone ls command: print files
         // Directory is now used directly in the helper function
         
-        if long_format {
+        if _long_format {
             // -l flag: long format (simplified - just list files for now)
             let array_name = format!("ls_files_{}", generator.get_unique_id());
             output.push_str(&generate_ls_helper(generator, dir, &array_name, true, add_slash_to_dirs, sort_by_time, show_hidden));
@@ -272,7 +272,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let mut dir = ".";
     let mut _single_column = false; // Default to multi-column (space-separated) like shell ls
     let mut add_slash_to_dirs = false; // -p flag: add / to directories
-    let mut long_format = false; // -l flag: long format
+    let mut _long_format = false; // -l flag: long format
     let mut show_hidden = false; // -a flag: show hidden files
     
     for arg in &cmd.args {
@@ -285,7 +285,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
                         'C' => _single_column = false, // -C flag: multi-column (space-separated)
                         'x' => _single_column = false, // -x flag: multi-column (space-separated)
                         'p' => add_slash_to_dirs = true, // -p flag: add / to directories
-                        'l' => long_format = true, // -l flag: long format
+                        'l' => _long_format = true, // -l flag: long format
                         'a' => show_hidden = true, // -a flag: show hidden files
                         _ => {} // Ignore other flags for now
                     }
