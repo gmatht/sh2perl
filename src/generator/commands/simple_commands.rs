@@ -125,12 +125,22 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     // Always assign the value, but only declare if not already declared
                     if !generator.declared_locals.contains(var) {
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("my ${} = {};\n", var, val));
+                        // If the value is a block, wrap it in do {...}
+                        if val.starts_with('{') && val.ends_with('}') {
+                            output.push_str(&format!("my ${} = do {};\n", var, val));
+                        } else {
+                            output.push_str(&format!("my ${} = {};\n", var, val));
+                        }
                         generator.declared_locals.insert(var.clone());
                     } else {
                         // Variable already declared, just assign the value
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("${} = {};\n", var, val));
+                        // If the value is a block, wrap it in do {...}
+                        if val.starts_with('{') && val.ends_with('}') {
+                            output.push_str(&format!("${} = do {};\n", var, val));
+                        } else {
+                            output.push_str(&format!("${} = {};\n", var, val));
+                        }
                     }
                     // Don't set environment variable immediately - only set it when export command is encountered
                     // This matches bash behavior where variables are only exported to environment after export command
@@ -141,12 +151,22 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 // Always assign the value, but only declare if not already declared
                 if !generator.declared_locals.contains(var) {
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("my ${} = {};\n", var, val));
+                    // If the value is a block, wrap it in do {...}
+                    if val.starts_with('{') && val.ends_with('}') {
+                        output.push_str(&format!("my ${} = do {};\n", var, val));
+                    } else {
+                        output.push_str(&format!("my ${} = {};\n", var, val));
+                    }
                     generator.declared_locals.insert(var.clone());
                 } else {
                     // Variable already declared, just assign the value
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("${} = {};\n", var, val));
+                    // If the value is a block, wrap it in do {...}
+                    if val.starts_with('{') && val.ends_with('}') {
+                        output.push_str(&format!("${} = do {};\n", var, val));
+                    } else {
+                        output.push_str(&format!("${} = {};\n", var, val));
+                    }
                 }
                 // Don't set environment variable immediately - only set it when export command is encountered
                 // This matches bash behavior where variables are only exported to environment after export command

@@ -281,9 +281,13 @@ impl Generator {
         output.push_str(&self.indent());
         match assignment.operator {
             AssignmentOperator::Assign => {
-                output.push_str(&format!("${} = {};\n", 
-                    assignment.variable, 
-                    words::word_to_perl_impl(self, &assignment.value)));
+                let value_perl = words::word_to_perl_impl(self, &assignment.value);
+                // If the value is a block, wrap it in do {...}
+                if value_perl.starts_with('{') && value_perl.ends_with('}') {
+                    output.push_str(&format!("${} = do {};\n", assignment.variable, value_perl));
+                } else {
+                    output.push_str(&format!("${} = {};\n", assignment.variable, value_perl));
+                }
             }
             AssignmentOperator::PlusAssign => {
                 output.push_str(&format!("${} += {};\n", 
