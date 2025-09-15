@@ -26,11 +26,8 @@ pub fn generate_tee_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
         output.push_str(&format!("{} = {};\n", input_var, input_var));
     } else {
         // Write to specified files
-        if input_var.starts_with('$') {
-            output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
-        } else {
-            output.push_str(&format!("my @lines = split /\\n/msx, ${};\n", input_var));
-        }
+        let input_ref = if input_var.starts_with('$') { input_var } else { &format!("${}", input_var) };
+        output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_ref));
         
         for file in &files {
             let mode = if append_mode { ">>" } else { ">" };
@@ -44,12 +41,7 @@ pub fn generate_tee_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
             output.push_str("}\n");
         }
         
-        // Keep the output for further processing
-        if input_var.starts_with('$') {
-            output.push_str(&format!("{} = join \"\\n\", @lines;\n", input_var));
-        } else {
-            output.push_str(&format!("${} = join \"\\n\", @lines;\n", input_var));
-        }
+        // Keep the output for further processing - the input is already preserved in the variable
     }
     output.push_str("\n");
     
