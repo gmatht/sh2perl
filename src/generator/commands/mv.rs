@@ -54,7 +54,7 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             
             // Create destination directory if it doesn't exist
             output.push_str("my $dest_dir = $dest;\n");
-            output.push_str("$dest_dir =~ s/\\/[^\\/]*$//;\n");
+            output.push_str("$dest_dir =~ s/\\/[^\\/]*$//msx;\n");
             output.push_str("if ($dest_dir ne q{} && !-d $dest_dir) {\n");
             output.push_str("make_path($dest_dir, {error => \\$err});\n");
             output.push_str("if (@{$err}) {\n");

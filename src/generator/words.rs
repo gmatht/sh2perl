@@ -350,27 +350,27 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Use native Perl cp implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native cp implementation for command substitution");
                             let cp_code = crate::generator::commands::cp::generate_cp_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; eval {{ {}; $CHILD_ERROR = 0; 1; }} or do {{ $CHILD_ERROR = 256; }}; q{{}} }}", cp_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak "))
+                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", cp_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
                         } else if name == "mv" {
                             // Use native Perl mv implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native mv implementation for command substitution");
                             let mv_code = crate::generator::commands::mv::generate_mv_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; eval {{ {}; $CHILD_ERROR = 0; 1; }} or do {{ $CHILD_ERROR = 256; }}; q{{}} }}", mv_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak "))
+                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", mv_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
                         } else if name == "rm" {
                             // Use native Perl rm implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native rm implementation for command substitution");
                             let rm_code = crate::generator::commands::rm::generate_rm_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; eval {{ {}; $CHILD_ERROR = 0; 1; }} or do {{ $CHILD_ERROR = 256; }}; q{{}} }}", rm_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak "))
+                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", rm_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
                         } else if name == "mkdir" {
                             // Use native Perl mkdir implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native mkdir implementation for command substitution");
                             let mkdir_code = crate::generator::commands::mkdir::generate_mkdir_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; eval {{ {}; $CHILD_ERROR = 0; 1; }} or do {{ $CHILD_ERROR = 256; }}; q{{}} }}", mkdir_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak "))
+                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", mkdir_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
                         } else if name == "touch" {
                             // Use native Perl touch implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native touch implementation for command substitution");
                             let touch_code = crate::generator::commands::touch::generate_touch_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; eval {{ {}; $CHILD_ERROR = 0; 1; }} or do {{ $CHILD_ERROR = 256; }}; q{{}} }}", touch_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak "))
+                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", touch_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
                         } else {
                             // Fall back to system command for non-builtin commands
                             let args: Vec<String> = simple_cmd.args.iter()
