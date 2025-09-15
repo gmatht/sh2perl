@@ -28,17 +28,17 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
     } else {
         // Check if the argument is a file (not a directory)
         output.push_str(&generator.indent());
-        output.push_str(&format!("if (-f '{}') {{\n", dir));
+        let dir_literal = if dir == "." { "q{.}" } else { &format!("'{}'", dir) };
+        output.push_str(&format!("if (-f {}) {{\n", dir_literal));
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str(&format!("push @{}, '{}';\n", array_name, dir));
+        output.push_str(&format!("push @{}, {};\n", array_name, dir_literal));
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
-        output.push_str(&format!("}} elsif (-d '{}') {{\n", dir));
+        output.push_str(&format!("}} elsif (-d {}) {{\n", dir_literal));
         generator.indent_level += 1;
         // For directories, use opendir/readdir
         output.push_str(&generator.indent());
-        let dir_literal = if dir == "." { "q{.}" } else { &format!("'{}'", dir) };
         output.push_str(&format!("if (opendir my $dh, {}) {{\n", dir_literal));
         generator.indent_level += 1;
         output.push_str(&generator.indent());
@@ -192,17 +192,18 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             output.push_str(&format!("my @{} = ();\n", array_name));
             for file_arg in &file_args {
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (-f '{}') {{\n", file_arg));
+                let file_literal = if *file_arg == "." { "q{.}" } else { &format!("'{}'", file_arg) };
+                output.push_str(&format!("if (-f {}) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("push @{}, '{}';\n", array_name, file_arg));
+                output.push_str(&format!("push @{}, {};\n", array_name, file_literal));
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("}} elsif (-d '{}') {{\n", file_arg));
+                output.push_str(&format!("}} elsif (-d {}) {{\n", file_literal));
                 generator.indent_level += 1;
                 // For directories, list their contents
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (opendir my $dh, '{}') {{\n", file_arg));
+                output.push_str(&format!("if (opendir my $dh, {}) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str("while (my $file = readdir $dh) {\n");
@@ -271,17 +272,18 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             output.push_str(&format!("my @{} = ();\n", array_name));
             for file_arg in &file_args {
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (-f '{}') {{\n", file_arg));
+                let file_literal = if *file_arg == "." { "q{.}" } else { &format!("'{}'", file_arg) };
+                output.push_str(&format!("if (-f {}) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("push @{}, '{}';\n", array_name, file_arg));
+                output.push_str(&format!("push @{}, {};\n", array_name, file_literal));
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("}} elsif (-d '{}') {{\n", file_arg));
+                output.push_str(&format!("}} elsif (-d {}) {{\n", file_literal));
                 generator.indent_level += 1;
                 // For directories, list their contents
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (opendir my $dh, '{}') {{\n", file_arg));
+                output.push_str(&format!("if (opendir my $dh, {}) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str("while (my $file = readdir $dh) {\n");
@@ -412,17 +414,18 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
         output.push_str(&format!("my @{} = ();\n", array_name));
         for file_arg in &file_args {
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (-f '{}') {{\n", file_arg));
+            let file_literal = if *file_arg == "." { "q{.}" } else { &format!("'{}'", file_arg) };
+            output.push_str(&format!("if (-f {}) {{\n", file_literal));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
-            output.push_str(&format!("push @{}, '{}';\n", array_name, file_arg));
+            output.push_str(&format!("push @{}, {};\n", array_name, file_literal));
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
-            output.push_str(&format!("}} elsif (-d '{}') {{\n", file_arg));
+            output.push_str(&format!("}} elsif (-d {}) {{\n", file_literal));
             generator.indent_level += 1;
             // For directories, list their contents
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (opendir my $dh, '{}') {{\n", file_arg));
+            output.push_str(&format!("if (opendir my $dh, {}) {{\n", file_literal));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str("while (my $file = readdir $dh) {\n");
