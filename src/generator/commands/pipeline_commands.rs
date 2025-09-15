@@ -394,13 +394,15 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
     // Check if this is a strings command pipeline - strings should preserve newlines
     if output.contains("split /\\n/msx") && output.contains("for my $line (@lines)") {
         eprintln!("DEBUG: Strings command pipeline detected, preserving newlines");
-        return format!("do {{\n{}\n}}", output);
+        // The output already contains the proper structure, just return it as-is
+        return output;
     }
     
     // Check if this is a tee command pipeline - tee should preserve newlines
     if output.contains("tee") && output.contains("print {$fh}") {
         eprintln!("DEBUG: Tee command pipeline detected, preserving newlines");
-        return format!("do {{\n{}\n}}", output);
+        // The output already contains the proper structure, just return it as-is
+        return output;
     }
     
     // Find the output variable
@@ -1992,8 +1994,8 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         output.push_str("}\n");
     } else {
         // For command substitution, use streaming approach
-        // Wrap in block scope to prevent variable contamination
-        output.push_str("{\n");
+        // Wrap in do block scope to prevent variable contamination
+        output.push_str("do {\n");
         generator.indent_level += 1;
         
         if let (Command::Simple(cmd1), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline.commands[1]) {
@@ -2048,14 +2050,15 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
                 
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{};\n", unique_id));
-                
                 // Track pipeline success for overall script exit code
                 output.push_str(&generator.indent());
                 output.push_str(&format!("if (!$pipeline_success_{}) {{ $main_exit_code = 1; }}\n", unique_id));
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
+                
+                // Return the output variable as the last statement
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$output_{};\n", unique_id));
             } else {
                 // Generic 2-command pipeline
                 let unique_id = generator.get_unique_id();
@@ -2120,14 +2123,15 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     }
                 }
                 
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{};\n", unique_id));
-                
                 // Track pipeline success for overall script exit code
                 output.push_str(&generator.indent());
                 output.push_str(&format!("if (!$pipeline_success_{}) {{ $main_exit_code = 1; }}\n", unique_id));
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
+                
+                // Return the output variable as the last statement
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$output_{};\n", unique_id));
             }
         }
         

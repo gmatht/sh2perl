@@ -51,6 +51,8 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("if (-d $file_to_remove) {\n");
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
+                    output.push_str("my $err;\n");
+                    output.push_str(&generator.indent());
                     output.push_str("remove_tree($file_to_remove, {error => \\$err});\n");
                     output.push_str(&generator.indent());
                     output.push_str("if (@{$err}) {\n");
@@ -152,6 +154,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 if recursive {
                     // Recursive removal
                     output.push_str(&format!("if (-d {}) {{\n", file));
+                    output.push_str("my $err;\n");
                     output.push_str(&format!("remove_tree({}, {{error => \\$err}});\n", file));
                     output.push_str("if (@{$err}) {\n");
                     if force {

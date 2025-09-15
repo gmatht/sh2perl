@@ -26,8 +26,17 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             }
         }
     } else {
-        // For regular directories, use opendir/readdir with the directory as a variable
-        // The directory assignment will be handled in the core logic
+        // Check if the argument is a file (not a directory)
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if (-f '{}') {{\n", dir));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("push @{}, '{}';\n", array_name, dir));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("}} elsif (-d '{}') {{\n", dir));
+        generator.indent_level += 1;
+        // For directories, use opendir/readdir
         output.push_str(&generator.indent());
         let dir_literal = if dir == "." { "q{.}" } else { &format!("'{}'", dir) };
         output.push_str(&format!("if (opendir my $dh, {}) {{\n", dir_literal));
@@ -77,6 +86,9 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     }
     
     output
@@ -95,15 +107,15 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
     let mut sort_by_time = false; // -t flag: sort by modification time
     let mut show_hidden = false; // -a flag: show hidden files
     
-    // First pass: collect all directory arguments
-    let mut dir_args = Vec::new();
+    // First pass: collect all file/directory arguments
+    let mut file_args = Vec::new();
     for arg in &cmd.args {
         match arg {
             Word::Literal(s, _) => {
                 if !s.starts_with('-') {
-                    // This is a directory argument
-                    eprintln!("DEBUG: ls command directory argument: '{}'", s);
-                    dir_args.push(s.as_str());
+                    // This is a file/directory argument
+                    eprintln!("DEBUG: ls command file/directory argument: '{}'", s);
+                    file_args.push(s.as_str());
                 }
             }
             Word::StringInterpolation(interp, _) => {
@@ -111,9 +123,9 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                 if interp.parts.len() == 1 {
                     if let StringPart::Literal(s) = &interp.parts[0] {
                         if !s.starts_with('-') {
-                            // This is a directory argument
-                            eprintln!("DEBUG: ls command directory argument (from interpolation): '{}'", s);
-                            dir_args.push(s.as_str());
+                            // This is a file/directory argument
+                            eprintln!("DEBUG: ls command file/directory argument (from interpolation): '{}'", s);
+                            file_args.push(s.as_str());
                         }
                     }
                 }
@@ -122,10 +134,8 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
         }
     }
     
-    // Use the last directory argument if any, otherwise default to "."
-    if let Some(last_dir) = dir_args.last() {
-        dir = last_dir;
-    }
+    // If we have file arguments, we need to handle them differently
+    let has_file_args = !file_args.is_empty();
     
     // Second pass: parse flags
     for arg in &cmd.args {
@@ -173,10 +183,70 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
     // Handle context-based logic
     if pipeline_context {
         // Pipeline context: populate array but don't print - output goes to pipeline
-            // Sort by default to match GNU ls behavior
-    let should_sort = true; // Default to sorting to match shell behavior
-            let array_name = format!("ls_files_{}", generator.get_unique_id());
+        let should_sort = true; // Default to sorting to match shell behavior
+        let array_name = format!("ls_files_{}", generator.get_unique_id());
+        
+        if has_file_args {
+            // Handle multiple file arguments
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my @{} = ();\n", array_name));
+            for file_arg in &file_args {
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (-f '{}') {{\n", file_arg));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("push @{}, '{}';\n", array_name, file_arg));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("}} elsif (-d '{}') {{\n", file_arg));
+                generator.indent_level += 1;
+                // For directories, list their contents
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (opendir my $dh, '{}') {{\n", file_arg));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("while (my $file = readdir $dh) {\n");
+                generator.indent_level += 1;
+                if !show_hidden {
+                    output.push_str(&generator.indent());
+                    output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
+                }
+                if add_slash_to_dirs {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("if (-d \"{}/$file\") {{\n", file_arg));
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("push @{}, \"$file/\";\n", array_name));
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("} else {\n");
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("push @{}, $file;\n", array_name));
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                } else {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("push @{}, $file;\n", array_name));
+                }
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                output.push_str(&generator.indent());
+                output.push_str("closedir $dh;\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+            }
+        } else {
+            // No file arguments, use default directory
             output.push_str(&generate_ls_helper(generator, dir, &array_name, should_sort, add_slash_to_dirs, sort_by_time, show_hidden));
+        }
+        
         if let Some(var) = output_var {
             output.push_str(&generator.indent());
             output.push_str(&format!("${} = join \"\\n\", @{};\n", var, array_name));
@@ -193,45 +263,78 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
         // No print statement in pipeline context
     } else {
         // Standalone ls command: print files
-        // Directory is now used directly in the helper function
+        let array_name = format!("ls_files_{}", generator.get_unique_id());
         
-        if _long_format {
-            // -l flag: long format (simplified - just list files for now)
-            let array_name = format!("ls_files_{}", generator.get_unique_id());
-            output.push_str(&generate_ls_helper(generator, dir, &array_name, true, add_slash_to_dirs, sort_by_time, show_hidden));
+        if has_file_args {
+            // Handle multiple file arguments
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (@{}) {{\n", array_name));
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str(&format!("print join \"\\n\", @{}, \"\\n\";\n", array_name));
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
-        } else if single_column {
-            // -1 flag: one file per line, preserve directory order (no sorting)
-            let array_name = format!("ls_files_{}", generator.get_unique_id());
-            output.push_str(&generate_ls_helper(generator, dir, &array_name, false, add_slash_to_dirs, sort_by_time, show_hidden));
-            output.push_str(&generator.indent());
-            output.push_str(&format!("if (@{}) {{\n", array_name));
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str(&format!("print join \"\\n\", @{}, \"\\n\";\n", array_name));
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
+            output.push_str(&format!("my @{} = ();\n", array_name));
+            for file_arg in &file_args {
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (-f '{}') {{\n", file_arg));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("push @{}, '{}';\n", array_name, file_arg));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("}} elsif (-d '{}') {{\n", file_arg));
+                generator.indent_level += 1;
+                // For directories, list their contents
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (opendir my $dh, '{}') {{\n", file_arg));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("while (my $file = readdir $dh) {\n");
+                generator.indent_level += 1;
+                if !show_hidden {
+                    output.push_str(&generator.indent());
+                    output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
+                }
+                if add_slash_to_dirs {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("if (-d \"{}/$file\") {{\n", file_arg));
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("push @{}, \"$file/\";\n", array_name));
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("} else {\n");
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("push @{}, $file;\n", array_name));
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                } else {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("push @{}, $file;\n", array_name));
+                }
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                output.push_str(&generator.indent());
+                output.push_str("closedir $dh;\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+            }
         } else {
-            // Default: one file per line (like ls -1) for predictable output, but sort files to match shell behavior
-            let array_name = format!("ls_files_{}", generator.get_unique_id());
+            // No file arguments, use default directory
             output.push_str(&generate_ls_helper(generator, dir, &array_name, true, add_slash_to_dirs, sort_by_time, show_hidden));
-            output.push_str(&generator.indent());
-            output.push_str(&format!("if (@{}) {{\n", array_name));
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str(&format!("print join \"\\n\", @{}, \"\\n\";\n", array_name));
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
         }
+        
+        // Print the results
+        output.push_str(&generator.indent());
+        output.push_str(&format!("if (@{}) {{\n", array_name));
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str(&format!("print join \"\\n\", @{}, \"\\n\";\n", array_name));
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
     }
     
     output
@@ -268,8 +371,8 @@ pub fn generate_ls_preamble(generator: &mut Generator) -> String {
 }
 
 pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleCommand) -> String {
-    // Parse ls arguments to determine directory and flags
-    let mut dir = ".";
+    // Parse ls arguments to determine files/directories and flags
+    let mut file_args = Vec::new();
     let mut _single_column = false; // Default to multi-column (space-separated) like shell ls
     let mut add_slash_to_dirs = false; // -p flag: add / to directories
     let mut _long_format = false; // -l flag: long format
@@ -291,8 +394,8 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
                     }
                 }
             } else {
-                // This is a directory argument (not a flag)
-                dir = s;
+                // This is a file/directory argument (not a flag)
+                file_args.push(s.as_str());
             }
         }
     }
@@ -300,10 +403,70 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let mut output = String::new();
     output.push_str("do {\n");
     generator.indent_level += 1;
-    // Sort by default to match GNU ls behavior
-    let should_sort = true; // Default to sorting to match shell behavior
+    
     let array_name = format!("ls_files_{}", generator.get_unique_id());
-    output.push_str(&generate_ls_helper(generator, dir, &array_name, should_sort, add_slash_to_dirs, false, show_hidden));
+    
+    if !file_args.is_empty() {
+        // Handle multiple file arguments
+        output.push_str(&generator.indent());
+        output.push_str(&format!("my @{} = ();\n", array_name));
+        for file_arg in &file_args {
+            output.push_str(&generator.indent());
+            output.push_str(&format!("if (-f '{}') {{\n", file_arg));
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str(&format!("push @{}, '{}';\n", array_name, file_arg));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str(&format!("}} elsif (-d '{}') {{\n", file_arg));
+            generator.indent_level += 1;
+            // For directories, list their contents
+            output.push_str(&generator.indent());
+            output.push_str(&format!("if (opendir my $dh, '{}') {{\n", file_arg));
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str("while (my $file = readdir $dh) {\n");
+            generator.indent_level += 1;
+            if !show_hidden {
+                output.push_str(&generator.indent());
+                output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
+            }
+            if add_slash_to_dirs {
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (-d \"{}/$file\") {{\n", file_arg));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("push @{}, \"$file/\";\n", array_name));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("} else {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("push @{}, $file;\n", array_name));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+            } else {
+                output.push_str(&generator.indent());
+                output.push_str(&format!("push @{}, $file;\n", array_name));
+            }
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+            output.push_str(&generator.indent());
+            output.push_str("closedir $dh;\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+        }
+    } else {
+        // No file arguments, use default directory
+        output.push_str(&generate_ls_helper(generator, ".", &array_name, true, add_slash_to_dirs, false, show_hidden));
+    }
+    
     output.push_str(&generator.indent());
     // In command substitution context, always join with newlines to match shell behavior
     // The shell's ls command outputs one file per line by default in command substitution

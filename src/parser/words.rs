@@ -1841,9 +1841,9 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
     // Remove the surrounding backticks
     let command_text = &backtick_text[1..backtick_text.len()-1];
     
-    // Check if the command contains command substitutions (like $(pwd)) or pipelines (like |)
-    if command_text.contains("$(") || command_text.contains("|") {
-        // Use the full parser for commands with command substitutions or pipelines
+    // Check if the command contains command substitutions (like $(pwd)), pipelines (like |), or logical operators (like && or ||)
+    if command_text.contains("$(") || command_text.contains("|") || command_text.contains("&&") || command_text.contains("||") {
+        // Use the full parser for commands with command substitutions, pipelines, or logical operators
         let sub_lexer = Lexer::new(command_text);
         let mut sub_parser = Parser::new_with_lexer(sub_lexer);
         match sub_parser.parse() {
