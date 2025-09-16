@@ -1,0 +1,28 @@
+# TODO Items for sh2perl Project
+
+## High Priority
+
+### $CHILD_ERROR Scoping Issue in Command Substitution
+- **Issue**: The mkdir command needs to set $CHILD_ERROR without 'local' to persist across conditional blocks for proper command substitution logic
+- **Current Workaround**: Disabled Perl::Critic policy `RequireLocalizedPunctuationVars` in docs/perlcritic.conf
+- **Investigation Needed**: 
+  - Find proper solution for $CHILD_ERROR scoping in command substitution
+  - Ensure Perl::Critic compliance while maintaining correct functionality
+  - Consider alternative approaches for exit code handling in command substitution
+- **Files Affected**: 
+  - src/generator/commands/mkdir.rs
+  - src/generator/words.rs (command substitution logic)
+  - docs/perlcritic.conf (temporarily disabled policy)
+
+## Medium Priority
+
+### Test Suite Improvements
+- Fix remaining STDOUT format mismatches in file manipulation commands
+- Ensure all file operations (cp, mv, rm, mkdir, touch, ls) work correctly in command substitution
+- Improve error handling consistency between shell and Perl versions
+
+## Low Priority
+
+### Code Quality
+- Review and optimize generated Perl code structure
+- Consider refactoring command substitution logic for better maintainability
