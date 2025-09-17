@@ -53,6 +53,42 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // For backtick commands, we need to return the value, not print it
                             // The generate_find_command already returns the joined string
                             perl_code
+                        } else if name == "wc" {
+                            // Special handling for wc in command substitution
+                            if simple_cmd.args.len() >= 2 {
+                                if let (Word::Literal(flag, _), Word::Literal(file, _)) = (&simple_cmd.args[0], &simple_cmd.args[1]) {
+                                    if flag == "-c" {
+                                        // Handle wc -c < file pattern
+                                        if file.starts_with('<') {
+                                            let file_name = file.strip_prefix('<').unwrap_or("").trim();
+                                            format!("do {{ open my $fh, '<', {} or croak \"Cannot open file: $!\"; my $size = -s $fh; close $fh; $size }}", file_name)
+                                        } else {
+                                            format!("do {{ open my $fh, '<', {} or croak \"Cannot open file: $!\"; my $size = -s $fh; close $fh; $size }}", file)
+                                        }
+                                    } else {
+                                        // Fallback to bash execution for other wc options
+                                        let args_str = simple_cmd.args.iter()
+                                            .map(|arg| generator.word_to_perl(arg))
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        format!("do {{ my ($in, $out, $err); my $pid = open3($in, $out, $err, 'wc', {}); close $in or croak 'Close failed: $!'; my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }}; close $out or croak 'Close failed: $!'; waitpid $pid, 0; $result }}", args_str)
+                                    }
+                                } else {
+                                    // Fallback to bash execution
+                                    let args_str = simple_cmd.args.iter()
+                                        .map(|arg| generator.word_to_perl(arg))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    format!("do {{ my ($in, $out, $err); my $pid = open3($in, $out, $err, 'wc', {}); close $in or croak 'Close failed: $!'; my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }}; close $out or croak 'Close failed: $!'; waitpid $pid, 0; $result }}", args_str)
+                                }
+                            } else {
+                                // Fallback to bash execution
+                                let args_str = simple_cmd.args.iter()
+                                    .map(|arg| generator.word_to_perl(arg))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("do {{ my ($in, $out, $err); my $pid = open3($in, $out, $err, 'wc', {}); close $in or croak 'Close failed: $!'; my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }}; close $out or croak 'Close failed: $!'; waitpid $pid, 0; $result }}", args_str)
+                            }
                         } else if name == "echo" {
                             // Special handling for echo in command substitution
                             if simple_cmd.args.is_empty() {
@@ -258,7 +294,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for which in command substitution
                             if let Some(command) = simple_cmd.args.first() {
                                 let command_str = generator.word_to_perl(command);
-                                format!("do {{ my $command; my $found; my $result; my $dir; my $full_path; $command = {}; $found = 0; $result = q{{}}; foreach $dir (split /:/msx, $ENV{{PATH}}) {{ $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
+                                format!("do {{ my $command; my $found; my $result; my $dir; my $full_path; $command = {}; $found = 0; $result = q{{}}; foreach my $dir (split /:/msx, $ENV{{PATH}}) {{ $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
                             } else {
                                 "q{}".to_string()
                             }

@@ -27,6 +27,24 @@ fi
 
 echo "test_purify.pl passed, continuing with other commands..."
 
+# Check if we made progress and commit if so
+if [ -f "first_n_tests_passed.txt" ]; then
+    if [ ! -f "first_n_tests_passed.MAX.txt" ] || [ "first_n_tests_passed.txt" -nt "first_n_tests_passed.MAX.txt" ]; then
+        echo "Progress detected! Committing changes..."
+        git commit . -m "Reached $(cat first_n_tests_passed.txt)"
+        cp first_n_tests_passed.txt first_n_tests_passed.MAX.txt
+        echo "Committed and updated MAX file"
+    else
+        echo "No progress detected, skipping commit"
+    fi
+    # Always copy if MAX doesn't exist yet
+    if [ ! -f "first_n_tests_passed.MAX.txt" ]; then
+        cp first_n_tests_passed.txt first_n_tests_passed.MAX.txt
+        echo "Created MAX file from current result"
+    fi
+else
+    echo "No first_n_tests_passed.txt file found"
+fi
 
 # Note: The Windows-specific powershell command for simulating keypresses
 # cannot be directly converted to shell script. If you need similar functionality
