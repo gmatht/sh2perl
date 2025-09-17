@@ -126,6 +126,9 @@ impl Generator {
         let needs_ipc_open3 = self.needs_ipc_open3(ast);
         let needs_file_find = self.needs_file_find_import(ast);
         let needs_digest_sha = self.needs_digest_sha_import(ast);
+        let needs_file_path = self.needs_file_path_import(ast);
+        let needs_file_copy = self.needs_file_copy_import(ast);
+        let needs_posix = self.needs_posix_import(ast);
         
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
@@ -147,11 +150,24 @@ impl Generator {
         if needs_digest_sha {
             output.push_str("use Digest::SHA qw(sha256_hex sha512_hex);\n");
         }
+        if needs_file_path {
+            output.push_str("use File::Path qw(make_path remove_tree);\n");
+        }
+        if needs_file_copy {
+            output.push_str("use File::Copy qw(copy move);\n");
+        }
+        if needs_posix {
+            output.push_str("use POSIX qw(time);\n");
+        }
         output.push_str("\n");
         
         // Add main exit code variable for pipeline tracking
         // Always declare it since it's used in pipeline generation
-        output.push_str("my $main_exit_code = 0;\n\n");
+        output.push_str("my $main_exit_code = 0;\n");
+        output.push_str("my $ls_success = 0;\n");
+        
+        // Add global CHILD_ERROR variable for command substitution
+        output.push_str("our $CHILD_ERROR;\n\n");
         
         // Add declarations for variables that are used in arithmetic expressions
         for var in &self.function_level_vars {
@@ -1139,6 +1155,230 @@ impl Generator {
                             }
                         },
                         _ => {}
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+
+    /// Check if the AST needs File::Path import
+    fn needs_file_path_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_file_path(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a specific command needs File::Path
+    fn command_needs_file_path(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                // Check if it's a command that uses File::Path
+                if let Word::Literal(name, _) = &cmd.name {
+                    match name.as_str() {
+                        "cp" | "mv" | "rm" | "mkdir" => true,
+                        _ => false
+                    }
+                } else {
+                    false
+                }
+            },
+            Command::Pipeline(pipeline) => {
+                for cmd in &pipeline.commands {
+                    if self.command_needs_file_path(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::And(left, right) | Command::Or(left, right) => {
+                self.command_needs_file_path(left) || self.command_needs_file_path(right)
+            },
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_file_path(&redirect_cmd.command)
+            },
+            Command::For(for_loop) => {
+                for cmd in &for_loop.body.commands {
+                    if self.command_needs_file_path(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::While(while_loop) => {
+                for cmd in &while_loop.body.commands {
+                    if self.command_needs_file_path(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::If(if_stmt) => {
+                if self.command_needs_file_path(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_file_path(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+
+    /// Check if the AST needs File::Copy import
+    fn needs_file_copy_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_file_copy(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a specific command needs File::Copy
+    fn command_needs_file_copy(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                // Check if it's a command that uses File::Copy
+                if let Word::Literal(name, _) = &cmd.name {
+                    match name.as_str() {
+                        "cp" | "mv" => return true,
+                        _ => {}
+                    }
+                }
+                
+                // Check command substitutions in environment variables
+                for (_, word) in &cmd.env_vars {
+                    if self.word_needs_file_copy(word) {
+                        return true;
+                    }
+                }
+                
+                false
+            },
+            Command::Pipeline(pipeline) => {
+                for cmd in &pipeline.commands {
+                    if self.command_needs_file_copy(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::And(left, right) | Command::Or(left, right) => {
+                self.command_needs_file_copy(left) || self.command_needs_file_copy(right)
+            },
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_file_copy(&redirect_cmd.command)
+            },
+            Command::For(for_loop) => {
+                for cmd in &for_loop.body.commands {
+                    if self.command_needs_file_copy(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::While(while_loop) => {
+                for cmd in &while_loop.body.commands {
+                    if self.command_needs_file_copy(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::If(if_stmt) => {
+                if self.command_needs_file_copy(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_file_copy(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+    
+    /// Check if a word contains command substitutions that need File::Copy
+    fn word_needs_file_copy(&self, word: &Word) -> bool {
+        match word {
+            Word::CommandSubstitution(cmd, _) => {
+                self.command_needs_file_copy(cmd)
+            },
+            _ => false
+        }
+    }
+
+    /// Check if the AST needs POSIX import
+    fn needs_posix_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_posix(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a specific command needs POSIX
+    fn command_needs_posix(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                // Check if it's a command that uses POSIX
+                if let Word::Literal(name, _) = &cmd.name {
+                    match name.as_str() {
+                        "touch" => true,
+                        _ => false
+                    }
+                } else {
+                    false
+                }
+            },
+            Command::Pipeline(pipeline) => {
+                for cmd in &pipeline.commands {
+                    if self.command_needs_posix(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::And(left, right) | Command::Or(left, right) => {
+                self.command_needs_posix(left) || self.command_needs_posix(right)
+            },
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_posix(&redirect_cmd.command)
+            },
+            Command::For(for_loop) => {
+                for cmd in &for_loop.body.commands {
+                    if self.command_needs_posix(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::While(while_loop) => {
+                for cmd in &while_loop.body.commands {
+                    if self.command_needs_posix(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::If(if_stmt) => {
+                if self.command_needs_posix(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_posix(else_branch) {
+                        return true;
                     }
                 }
                 false

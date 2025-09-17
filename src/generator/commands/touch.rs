@@ -112,7 +112,6 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     if files.is_empty() {
         output.push_str("croak \"touch: missing file operand\\n\";\n");
     } else {
-        output.push_str("use POSIX qw(time);\n");
         
         // Handle the case where we have prefix + brace expansion + suffix
         // This happens when the parser separates file_{001..005}.txt into [file_, {001..005}, .txt]
@@ -162,18 +161,23 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         }
         
         for file in &expanded_files {
-            output.push_str(&format!("if (-e {}) {{\n", file));
+            let quoted_file = if file.starts_with('"') || file.starts_with("'") {
+                file.clone()
+            } else {
+                format!("\"{}\"", file)
+            };
+            output.push_str(&format!("if (-e {}) {{\n", quoted_file));
             // File exists, update timestamp
             output.push_str(&format!("my $current_time = time;\n"));
-            output.push_str(&format!("utime $current_time, $current_time, {};\n", file));
+            output.push_str(&format!("utime $current_time, $current_time, {};\n", quoted_file));
             // Silent operation - no output unless error
             output.push_str("} else {\n");
             // File doesn't exist, create it
-            output.push_str(&format!("if (open my $fh, '>', {}) {{\n", file));
+            output.push_str(&format!("if (open my $fh, '>', {}) {{\n", quoted_file));
             output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
             // Silent operation - no output unless error
             output.push_str("} else {\n");
-            output.push_str(&format!("croak \"touch: cannot create \", {}, \": $ERRNO\\n\";\n", file));
+            output.push_str(&format!("croak \"touch: cannot create \", {}, \": $ERRNO\\n\";\n", quoted_file));
             output.push_str("}\n");
             output.push_str("}\n");
         }

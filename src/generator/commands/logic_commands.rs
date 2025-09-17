@@ -80,30 +80,57 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
                 output.push_str("}");
             } else {
                 // For other simple commands, generate the command and check exit code
+                output.push_str("do {\n");
+                generator.indent_level += 1;
+                // Temporarily save the current indent level and reset it for command generation
+                let saved_indent_level = generator.indent_level;
+                generator.indent_level = 0;
                 let command = generator.generate_command(left);
-                // Remove trailing semicolon and newline if present
-                let trimmed_command = command.trim_end_matches(";\n").trim_end_matches(';');
-                output.push_str("do { ");
-                output.push_str(&trimmed_command);
-                output.push_str("; $CHILD_ERROR == 0 }");
+                // Restore the indent level
+                generator.indent_level = saved_indent_level;
+                // The command generator already handles indentation, so we don't need to add extra indentation
+                output.push_str(&command);
+                output.push_str(&generator.indent());
+                output.push_str("$CHILD_ERROR == 0\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}");
             }
         } else {
             // For non-literal command names, generate the command and check exit code
+            output.push_str("do {\n");
+            generator.indent_level += 1;
+            // Temporarily save the current indent level and reset it for command generation
+            let saved_indent_level = generator.indent_level;
+            generator.indent_level = 0;
             let command = generator.generate_command(left);
-            // Remove trailing semicolon and newline if present
-            let trimmed_command = command.trim_end_matches(";\n").trim_end_matches(';');
-            output.push_str("do { ");
-            output.push_str(&trimmed_command);
-            output.push_str("; $CHILD_ERROR == 0 }");
+            // Restore the indent level
+            generator.indent_level = saved_indent_level;
+            // The command generator already handles indentation, so we don't need to add extra indentation
+            output.push_str(&command);
+            output.push_str(&generator.indent());
+            output.push_str("$CHILD_ERROR == 0\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}");
         }
     } else {
         // For other command types, generate the command and check exit code
+        output.push_str("do {\n");
+        generator.indent_level += 1;
+        // Temporarily save the current indent level and reset it for command generation
+        let saved_indent_level = generator.indent_level;
+        generator.indent_level = 0;
         let command = generator.generate_command(left);
-        // Remove trailing semicolon and newline if present
-        let trimmed_command = command.trim_end_matches(";\n").trim_end_matches(';');
-        output.push_str("do { ");
-        output.push_str(&trimmed_command);
-        output.push_str("; $CHILD_ERROR == 0 }");
+        // Restore the indent level
+        generator.indent_level = saved_indent_level;
+        // The command generator already handles indentation, so we don't need to add extra indentation
+        output.push_str(&command);
+        output.push_str(&generator.indent());
+        output.push_str("$CHILD_ERROR == 0\n");
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}");
     }
     
     output.push_str(") {\n");
@@ -152,7 +179,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         output.push_str("}\n");
         return output;
     } else {
-        // For commands that generate Perl code (like grep), we need to handle them specially
+        // For commands that generate Perl code (like grep, ls), we need to handle them specially
         // to avoid embedding Perl code inside shell backticks
         if let Command::Simple(simple_cmd) = left {
             if let Word::Literal(name, _) = &simple_cmd.name {
@@ -168,6 +195,37 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
                     return output;
+                } else if name == "ls" {
+                    // For ls commands in logical OR, generate the command and check if files were found
+                    output.push_str(&generator.generate_command(left));
+                    output.push_str(&generator.indent());
+                    output.push_str("if (!defined $ls_success || $ls_success == 0) {\n");
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str(&generator.generate_command(right));
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    return output;
+                }
+            }
+        } else if let Command::Redirect(redirect_cmd) = left {
+            // Handle Redirect commands that might contain ls commands
+            if let Command::Simple(simple_cmd) = &*redirect_cmd.command {
+                if let Word::Literal(name, _) = &simple_cmd.name {
+                    if name == "ls" {
+                        // For ls commands in logical OR, generate the command and check if files were found
+                        output.push_str(&generator.generate_command(left));
+                        output.push_str(&generator.indent());
+                        output.push_str("if (!defined $ls_success || $ls_success == 0) {\n");
+                        generator.indent_level += 1;
+                        output.push_str(&generator.indent());
+                        output.push_str(&generator.generate_command(right));
+                        generator.indent_level -= 1;
+                        output.push_str(&generator.indent());
+                        output.push_str("}\n");
+                        return output;
+                    }
                 }
             }
         }

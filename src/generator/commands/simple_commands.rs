@@ -581,6 +581,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 if name == "ls" {
                     // Special handling for ls command - use the dedicated ls handler
                     output.push_str(&crate::generator::commands::ls::generate_ls_command(generator, cmd, false, None));
+                } else if name == "rmdir" {
+                    // Special handling for rmdir command - use the dedicated rmdir handler
+                    output.push_str(&crate::generator::commands::rmdir::generate_rmdir_command(generator, cmd));
                 } else if cmd.args.is_empty() {
                     output.push_str(&generator.indent());
                     output.push_str(&format!("system '{}';\n", name));
@@ -708,11 +711,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // Fallback to system call for other Perl usage
                         let args_str = args.join(", ");
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("system '{}', {});\n", name, args_str));
+                        output.push_str(&format!("system '{}', {};\n", name, args_str));
                     } else {
                     let args_str = args.join(", ");
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("system '{}', {});\n", name, args_str));
+                    output.push_str(&format!("system '{}', {};\n", name, args_str));
                     }
                 }
             }
@@ -730,7 +733,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 .map(|arg| generator.perl_string_literal(arg))
                 .collect();
             output.push_str(&generator.indent());
-            output.push_str(&format!("system '{}', {});\n", cmd_name, args.join(", ")));
+            output.push_str(&format!("system '{}', {};\n", cmd_name, args.join(", ")));
         }
     }
 

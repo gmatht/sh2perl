@@ -424,17 +424,17 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         "true" => {
             // true command always succeeds (exit status 0)
             if output_var.is_empty() {
-                "system 'true';\n".to_string()
+                "1;\n".to_string()
             } else {
-                format!("system 'true';\n${} = q{};\n", output_var, "")
+                format!("1;\n${} = q{};\n", output_var, "")
             }
         },
         "false" => {
             // false command always fails (exit status 1)
             if output_var.is_empty() {
-                "system 'false';\n".to_string()
+                "exit 1;\n".to_string()
             } else {
-                format!("system 'false';\n${} = q{};\n", output_var, "")
+                format!("exit 1;\n${} = q{};\n", output_var, "")
             }
         },
 
