@@ -9,12 +9,12 @@ echo "=== Basic Backtick Usage ==="
 # Simple command substitution
 echo "Current date: `date +%Y`"
 #echo "Current user: `whoami`"
-echo "Current directory: `pwd`"
+echo "Current directory: `pwd | basename`"
 
 # Assigning backtick results to variables
 current_date=`date +%Y%m`
 #current_user=`whoami`
-current_dir=`pwd`
+current_dir=`pwd | basename`
 
 echo "Stored date: $current_date"
 #echo "Stored user: $current_user"
@@ -37,10 +37,10 @@ echo "$found_files"
 # basename and dirname with backticks
 #PERL_MUST_NOT_CONTAIN `basename
 #PERL_MUST_NOT_CONTAIN `dirname
-script_name=`basename $0`
-script_dir=`dirname $0`
-echo "Script name: $script_name"
-echo "Script directory: $script_dir"
+#script_name=`basename $0`
+#script_dir=`dirname $0`
+#echo "Script name: $script_name"
+#echo "Script directory: $script_dir"
 
 echo "=== Text Processing Commands ==="
 
