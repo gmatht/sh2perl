@@ -1542,7 +1542,8 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                         
                         // Count matching stdout lines before first mismatch
                         let matching_lines = count_matching_stdout_lines(&result.shell_stdout, &result.translated_stdout);
-                        let file_content = format!("{}\n{}", passed_tests, matching_lines);
+                        let example_name = example.replace("examples/", "").replace("examples\\", "").replace(".sh", "");
+                        let file_content = format!("{}:y{:05}", example_name, matching_lines);
                         
                         if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
                             println!("Warning: Failed to write test count to first_n_tests_passed.txt: {}", e);
@@ -1628,12 +1629,15 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                         "parser"
                     };
                     
-                    let file_content = format!("{}\n{}", passed_tests, error_code);
+                    // Format: EXAMPLE_NAME:nN where N is 10 + error_code (for proper alphanumeric sort)
+                    let n_code = 10 + error_code;
+                    let example_name = example.replace("examples/", "").replace("examples\\", "").replace(".sh", "");
+                    let file_content = format!("{}:n{}", example_name, n_code);
                     
                     if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
                         println!("Warning: Failed to write test count to first_n_tests_passed.txt: {}", e);
                     } else {
-                        println!("Successfully wrote test count {} and matching stdout lines {} ({} error) to first_n_tests_passed.txt", passed_tests, error_code, error_type);
+                        println!("Successfully wrote test count {} and error code {} ({} error) to first_n_tests_passed.txt", passed_tests, n_code, error_type);
                     }
                     
                     // Show how to run the test again
@@ -1665,13 +1669,13 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
         println!("Writing total test count {} to first_n_tests_passed.txt", passed_tests);
         println!("Current working directory: {:?}", std::env::current_dir().unwrap_or_default());
         
-        // When all tests pass, we can't determine matching lines, so write -6 (no failure to analyze)
-        let file_content = format!("{}\n-6", passed_tests);
+        // When all tests pass, Perl code ran successfully, so write y99999 (all lines matched)
+        let file_content = format!("ALL_TESTS_PASSED:y99999");
         
         if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
             println!("Warning: Failed to write test count to first_n_tests_passed.txt: {}", e);
         } else {
-            println!("Successfully wrote total test count {} and matching stdout lines -6 to first_n_tests_passed.txt", passed_tests);
+            println!("Successfully wrote total test count {} and perfect match (y99999) to first_n_tests_passed.txt", passed_tests);
         }
     }
 }
