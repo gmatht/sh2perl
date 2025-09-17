@@ -21,6 +21,11 @@ fi
 # Run test_purify.pl first and only continue if it passes
 echo "Running test_purify.pl --next --verbose..."
 if ! perl test_purify.pl --next --verbose; then
+    echo "When fixing this failure please remember than purify.pl is just"
+    echo "meant to be a thin wrapper around PPI and debashc."
+    echo "In particular, if you find a bug in debashc, please fix"
+    echo "debashc rather than try to work around the problem in purify.pl"
+    echo
     echo "test_purify.pl failed, aborting other commands"
     exit 1
 fi
