@@ -272,42 +272,39 @@ fn extract_preamble_and_core(perl_code: &str) -> (String, String) {
             cleaned.to_string()
         };
         return (preamble, final_core);
-    } else {
-        // Try to extract variable declarations and core logic separately
-        // Look for variable declarations (my @...; or my $...;) followed by the main logic
-        if let Some(captures) = regex::Regex::new(r"(?s)(.*?)(my @[^;]+;.*?)(print.*?;?)\s*$")
-            .unwrap()
-            .captures(perl_code) {
-            let header = captures.get(1).unwrap().as_str().trim().to_string();
-            let var_decls = captures.get(2).unwrap().as_str().trim().to_string();
-            let core_code = captures.get(3).unwrap().as_str().trim().to_string();
-            
-            let preamble = if header.is_empty() {
-                var_decls
-            } else {
-                format!("{}\n{}", header, var_decls)
-            };
-            
-            let final_core = if core_code.ends_with(';') {
-                core_code[..core_code.len()-1].to_string()
-            } else {
-                core_code.to_string()
-            };
-            
-            return (preamble, final_core);
+    }
+    
+    // Try to extract variable declarations and core logic separately
+    // Look for variable declarations (my @...; or my $...;) followed by the main logic
+    if let Some(captures) = regex::Regex::new(r"(?s)(.*?)(my @[^;]+;.*?)(print.*?;?)\s*$")
+        .unwrap()
+        .captures(perl_code) {
+        let header = captures.get(1).unwrap().as_str().trim().to_string();
+        let var_decls = captures.get(2).unwrap().as_str().trim().to_string();
+        let core_code = captures.get(3).unwrap().as_str().trim().to_string();
+        
+        let preamble = if header.is_empty() {
+            var_decls
         } else {
-            // If we can't find the pattern, try to extract just the core logic
-            // Look for print statements or other core logic
-            if let Some(captures) = regex::Regex::new(r"(print.*?;?)\s*$")
-                .unwrap()
-                .captures(perl_code) {
-                let code = captures.get(1).unwrap().as_str();
-                return ("".to_string(), code.trim_end().to_string());
-            } else {
-                // Return empty preamble and original code if we can't extract anything
-                return ("".to_string(), perl_code.to_string());
-            }
-        }
+            format!("{}\n{}", header, var_decls)
+        };
+        
+        let final_core = if core_code.ends_with(';') {
+            core_code[..core_code.len()-1].to_string()
+        } else {
+            core_code.to_string()
+        };
+        
+        return (preamble, final_core);
+    }
+    
+    // If we can't find the pattern, try to extract just the core logic
+    // Look for print statements or other core logic
+    if let Some(captures) = regex::Regex::new(r"(print.*?;?)\s*$")
+        .unwrap()
+        .captures(perl_code) {
+        let code = captures.get(1).unwrap().as_str();
+        return ("".to_string(), code.trim_end().to_string());
     }
     
     // Default fallback - return original code as core with empty preamble

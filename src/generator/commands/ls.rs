@@ -97,11 +97,9 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
 pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipeline_context: bool, output_var: Option<&str>) -> String {
     let mut output = String::new();
     
-    // Debug messages removed for cleaner output
-    
     // Parse ls arguments to determine directory and flags
-    let mut dir = ".";
-    let mut single_column = false;
+    let dir = ".";
+    let mut _single_column = false;
     let mut add_slash_to_dirs = false; // -p flag: add / to directories
     let mut _long_format = false; // -l flag: long format
     let mut sort_by_time = false; // -t flag: sort by modification time
@@ -145,7 +143,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                     // Parse flags
                     for flag in s.chars().skip(1) {
                         match flag {
-                            '1' => single_column = true,
+                            '1' => _single_column = true,
                             'p' => add_slash_to_dirs = true, // -p flag: add / to directories
                             'l' => _long_format = true, // -l flag: long format
                             't' => sort_by_time = true, // -t flag: sort by modification time
@@ -163,7 +161,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                             // Parse flags
                             for flag in s.chars().skip(1) {
                                 match flag {
-                                    '1' => single_column = true,
+                                    '1' => _single_column = true,
                                     'p' => add_slash_to_dirs = true, // -p flag: add / to directories
                                     'l' => _long_format = true, // -l flag: long format
                                     't' => sort_by_time = true, // -t flag: sort by modification time
@@ -267,9 +265,11 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
         let array_name = format!("ls_files_{}", generator.get_unique_id());
         
         if has_file_args {
-            // Handle multiple file arguments
+            // Handle multiple file arguments - add files that exist (like shell ls)
             output.push_str(&generator.indent());
             output.push_str(&format!("my @{} = ();\n", array_name));
+            
+            // Add files that exist to the array
             for file_arg in &file_args {
                 output.push_str(&generator.indent());
                 let file_literal = if *file_arg == "." { "q{.}" } else { &format!("'{}'", file_arg) };
@@ -333,7 +333,45 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
         output.push_str(&format!("if (@{}) {{\n", array_name));
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str(&format!("print join \"\\n\", @{}, \"\\n\";\n", array_name));
+        output.push_str(&format!("print join \"\\n\", @{};\n", array_name));
+        output.push_str(&generator.indent());
+        output.push_str("print \"\\n\";\n");
+        output.push_str(&generator.indent());
+        // For ls with specific file arguments, check if all files were found
+        if has_file_args {
+            output.push_str(&format!("my $expected_count = {};\n", file_args.len()));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("if (@{} == $expected_count) {{\n", array_name));
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str("local $CHILD_ERROR = 0;\n");
+            output.push_str(&generator.indent());
+            output.push_str("$ls_success = 1;\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("} else {\n");
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str("local $CHILD_ERROR = 2;\n");
+            output.push_str(&generator.indent());
+            output.push_str("$ls_success = 0;\n");
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+        } else {
+            output.push_str(&generator.indent());
+            output.push_str("local $CHILD_ERROR = 0;\n");
+            output.push_str(&generator.indent());
+            output.push_str("$ls_success = 1;\n");
+        }
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("} else {\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str("local $CHILD_ERROR = 1;\n");
+        output.push_str(&generator.indent());
+        output.push_str("$ls_success = 0;\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
@@ -385,15 +423,15 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
             if s.starts_with('-') {
                 // Parse flags
                 for flag in s.chars().skip(1) {
-                    match flag {
-                        '1' => _single_column = true,  // -1 flag: explicit single column (newline-separated)
-                        'C' => _single_column = false, // -C flag: multi-column (space-separated)
-                        'x' => _single_column = false, // -x flag: multi-column (space-separated)
-                        'p' => add_slash_to_dirs = true, // -p flag: add / to directories
-                        'l' => _long_format = true, // -l flag: long format
-                        'a' => show_hidden = true, // -a flag: show hidden files
-                        _ => {} // Ignore other flags for now
-                    }
+                        match flag {
+                            '1' => _single_column = true,  // -1 flag: explicit single column (newline-separated)
+                            'C' => _single_column = false, // -C flag: multi-column (space-separated)
+                            'x' => _single_column = false, // -x flag: multi-column (space-separated)
+                            'p' => add_slash_to_dirs = true, // -p flag: add / to directories
+                            'l' => _long_format = true, // -l flag: long format
+                            'a' => show_hidden = true, // -a flag: show hidden files
+                            _ => {} // Ignore other flags for now
+                        }
                 }
             } else {
                 // This is a file/directory argument (not a flag)

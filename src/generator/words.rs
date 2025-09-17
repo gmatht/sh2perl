@@ -33,15 +33,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         },
         Word::CommandSubstitution(cmd, _) => {
             // Handle command substitution
-            eprintln!("DEBUG: words.rs - Processing CommandSubstitution");
             let result = match cmd.as_ref() {
                 Command::Simple(simple_cmd) => {
                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
-                    eprintln!("DEBUG: words.rs - Command name: {}", cmd_name);
                     
                     // Check if this is a builtin command that we can convert properly
                     if let Word::Literal(name, _) = &simple_cmd.name {
-                        eprintln!("DEBUG: words.rs - Found literal command: {}", name);
                         if name == "ls" {
                             // Use the ls substitution function for proper conversion
                             let perl_code = crate::generator::commands::ls::generate_ls_for_substitution(generator, simple_cmd);
@@ -51,7 +48,6 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             perl_code
                         } else if name == "find" {
                             // Use the find command handler for proper conversion
-                            eprintln!("DEBUG: words.rs calling generate_find_command with found_files");
                             let perl_code = crate::generator::commands::find::generate_find_command(generator, simple_cmd, true, "found_files");
                             
                             // For backtick commands, we need to return the value, not print it
@@ -317,7 +313,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             let word = Word::Literal(arg.clone(), Default::default());
                                             generator.perl_string_literal(&word)
                                         }).collect::<Vec<_>>().join(", ");
-                                        format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'perl', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                        format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'perl', {});\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
                                     }
                                 } else {
                                     // Fallback to system command for non-literal args
@@ -329,12 +325,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         let word = Word::Literal(arg.clone(), Default::default());
                                         generator.perl_string_literal(&word)
                                     }).collect::<Vec<_>>().join(", ");
-                                    format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'perl', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                    format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'perl', {});\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
                                 }
                             } else {
                                 // No arguments, fallback to system command
                                 let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'perl'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'perl');\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         } else if generator.inline_mode && name == "echo" {
                             // In inline mode for echo, generate the output value directly
@@ -350,27 +346,67 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Use native Perl cp implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native cp implementation for command substitution");
                             let cp_code = crate::generator::commands::cp::generate_cp_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", cp_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
+                            let formatted_code = cp_code.trim_end_matches('\n')
+                                .replace("print ", "# print ")
+                                .replace("die ", "croak ");
+                            let indent1 = generator.indent();
+                            let indent2 = format!("{}{}", generator.indent(), "    ");
+                            let _indent3 = format!("{}{}", indent2, "    ");
+                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if (!$eval_result) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
+                                indent1, indent1, indent2, formatted_code, indent2, indent2, 
+                                indent1, indent1, indent1, indent1, indent1)
                         } else if name == "mv" {
                             // Use native Perl mv implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native mv implementation for command substitution");
                             let mv_code = crate::generator::commands::mv::generate_mv_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", mv_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
+                            let formatted_code = mv_code.trim_end_matches('\n')
+                                .replace("print ", "# print ")
+                                .replace("die ", "croak ");
+                            let indent1 = generator.indent();
+                            let indent2 = format!("{}{}", generator.indent(), "    ");
+                            let _indent3 = format!("{}{}", indent2, "    ");
+                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if (!$eval_result) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
+                                indent1, indent1, indent2, formatted_code, indent2, indent2, 
+                                indent1, indent1, indent1, indent1, indent1)
                         } else if name == "rm" {
                             // Use native Perl rm implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native rm implementation for command substitution");
                             let rm_code = crate::generator::commands::rm::generate_rm_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", rm_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
+                            let formatted_code = rm_code.trim_end_matches('\n')
+                                .replace("print ", "# print ")
+                                .replace("die ", "croak ");
+                            let indent1 = generator.indent();
+                            let indent2 = format!("{}{}", generator.indent(), "    ");
+                            let _indent3 = format!("{}{}", indent2, "    ");
+                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if (!$eval_result) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
+                                indent1, indent1, indent2, formatted_code, indent2, indent2, 
+                                indent1, indent1, indent1, indent1, indent1)
                         } else if name == "mkdir" {
                             // Use native Perl mkdir implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native mkdir implementation for command substitution");
                             let mkdir_code = crate::generator::commands::mkdir::generate_mkdir_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", mkdir_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
+                            let formatted_code = mkdir_code.trim_end_matches('\n')
+                                .replace("print ", "# print ")
+                                .replace("die ", "croak ");
+                            let indent1 = generator.indent();
+                            let indent2 = format!("{}{}", generator.indent(), "    ");
+                            // Don't use eval wrapper for mkdir - let it set $CHILD_ERROR directly
+                            let indented_code = format!("{}{}", indent2, formatted_code.replace("\n", &format!("\n{}", indent2)));
+                            format!("do {{\n{}{};\n{}    q{{}};\n}}", 
+                                indent1, indented_code, indent1)
                         } else if name == "touch" {
                             // Use native Perl touch implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native touch implementation for command substitution");
                             let touch_code = crate::generator::commands::touch::generate_touch_command(generator, simple_cmd);
-                            format!("do {{ local $CHILD_ERROR = 0; my $eval_result = eval {{ {}; local $CHILD_ERROR = 0; 1; }}; if (!$eval_result) {{ local $CHILD_ERROR = 256; }}; q{{}} }}", touch_code.trim_end_matches('\n').replace("print ", "# print ").replace("die ", "croak ").replace("use File::", "require File::").replace("use POSIX", "require POSIX"))
+                            let formatted_code = touch_code.trim_end_matches('\n')
+                                .replace("print ", "# print ")
+                                .replace("die ", "croak ");
+                            let indent1 = generator.indent();
+                            let indent2 = format!("{}{}", generator.indent(), "    ");
+                            let _indent3 = format!("{}{}", indent2, "    ");
+                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if (!$eval_result) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
+                                indent1, indent1, indent2, formatted_code, indent2, indent2, 
+                                indent1, indent1, indent1, indent1, indent1)
                         } else {
                             // Fall back to system command for non-builtin commands
                             let args: Vec<String> = simple_cmd.args.iter()
@@ -379,13 +415,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             
                             let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
                             if args.is_empty() {
-                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, '{}');\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                             } else {
                                 let formatted_args = args.iter().map(|arg| {
                                     let word = Word::Literal(arg.clone(), Default::default());
                                     generator.perl_string_literal(&word)
                                 }).collect::<Vec<_>>().join(", ");
-                                format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, '{}', {});\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         }
                     } else {
@@ -396,13 +432,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         
                         let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
                         if args.is_empty() {
-                            format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
+                            format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, '{}');\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                         } else {
                             let formatted_args = args.iter().map(|arg| {
                                 let word = Word::Literal(arg.clone(), Default::default());
                                 generator.perl_string_literal(&word)
                             }).collect::<Vec<_>>().join(", ");
-                            format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                            format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, '{}', {});\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
                         }
                     }
                 },
@@ -420,13 +456,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     
                     // Generate code that executes left command, checks exit code, then executes right if successful
                     // The result is the concatenation of outputs from both commands (if both succeed)
-                    format!("do {{ my $left_result_{} = {}; if ($CHILD_ERROR == 0) {{ my $right_result_{} = {}; $left_result_{} . $right_result_{}; }} else {{ $left_result_{}; }} }}", 
-                        unique_id, left_result, unique_id, right_result, unique_id, unique_id, unique_id)
+                    // If left command fails, return empty string (shell behavior)
+                    format!("do {{\n    my $left_result_{} = {};\n    if ($CHILD_ERROR == 0) {{\n        my $right_result_{} = {};\n        $left_result_{} . $right_result_{};\n    }} else {{\n        q{{}};\n    }}\n}}", 
+                        unique_id, left_result, unique_id, right_result, unique_id, unique_id)
                 },
                 _ => {
                     // For other command types, use system command fallback
                     let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                    format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {}; }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd), in_var, result_var, out_var, out_var, pid_var, result_var)
+                    format!("do {{\n    my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'bash', '-c', '{}');\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {};\n}}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd), in_var, result_var, out_var, out_var, pid_var, result_var)
                 }
             };
             // Wrap the result with chomp to strip trailing newlines (bash behavior)
@@ -436,7 +473,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
             if result.contains("chomp $result") {
                 result
             } else {
-                format!("do {{ my $cmd_result_{} = {}; chomp $cmd_result_{}; $cmd_result_{}; }}", unique_id, result, unique_id, unique_id)
+                format!("do {{\n{}    my $cmd_result_{} = {};\n{}    chomp $cmd_result_{};\n{}    $cmd_result_{};\n{}}}", 
+                    generator.indent(), unique_id, result, generator.indent(), unique_id, generator.indent(), unique_id, generator.indent())
             }
         },
         Word::Variable(var, _, _) => {

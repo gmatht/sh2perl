@@ -891,7 +891,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::{Lexer, Token};
+    use debashl::lexer::{Lexer, Token};
 
     #[test]
     fn test_lexer_basic() {

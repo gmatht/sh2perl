@@ -6,7 +6,7 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
     
     // strings command syntax: strings [options] file
     // Extracts printable strings from binary files
-    let mut min_length = 4; // Default minimum string length
+    let mut _min_length = 4; // Default minimum string length
     let mut filename = String::new();
     
     // Parse strings options and find the filename
@@ -16,7 +16,7 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
                 // Parse minimum length option
                 if let Some(length_str) = arg_str.strip_prefix("-n") {
                     if let Ok(length) = length_str.parse::<usize>() {
-                        min_length = length;
+                        _min_length = length;
                     }
                 }
             } else if !arg_str.starts_with("-") {

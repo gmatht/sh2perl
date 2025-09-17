@@ -31,73 +31,159 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     } else {
         // Last argument is the destination
         let destination = sources.pop().unwrap();
+        let quoted_destination = if destination.starts_with('"') || destination.starts_with("'") {
+            destination.clone()
+        } else {
+            format!("\"{}\"", destination)
+        };
         
-        output.push_str("use File::Copy qw(copy);\n");
-        output.push_str("use File::Path qw(make_path);\n");
         if !generator.declared_locals.contains("err") {
+            output.push_str(&generator.indent());
             output.push_str("my $err;\n");
             generator.declared_locals.insert("err".to_string());
         }
         
         for source in &sources {
-            output.push_str(&format!("if (-e {}) {{\n", source));
+            let quoted_source = if source.starts_with('"') || source.starts_with("'") {
+                source.clone()
+            } else {
+                format!("\"{}\"", source)
+            };
+            output.push_str(&generator.indent());
+            output.push_str(&format!("if (-e {}) {{\n", quoted_source));
+            generator.indent_level += 1;
             
-            if recursive && format!("-d {}", source).contains("-d") {
+            if recursive && format!("-d {}", quoted_source).contains("-d") {
                 // Recursive copy for directories
-                output.push_str(&format!("if (-d {}) {{\n", source));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (-d {}) {{\n", quoted_source));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
                 output.push_str(&format!("my $dest_dir = {};\n", destination));
+                output.push_str(&generator.indent());
                 output.push_str("if (-e $dest_dir && !-d $dest_dir) {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
                 output.push_str("die \"cp: $dest_dir: not a directory\\n\";\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
+                output.push_str(&generator.indent());
                 output.push_str("if (!-d $dest_dir) {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("my $err;\n");
+                output.push_str(&generator.indent());
                 output.push_str("make_path($dest_dir, {error => \\$err});\n");
+                output.push_str(&generator.indent());
                 output.push_str("if (@{$err}) {\n");
-                output.push_str(&format!("die \"cp: cannot create directory $dest_dir: $err->[0]\\n\";\n"));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("die \"cp: cannot create directory $dest_dir: $err->[0]\\n\";\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
-                output.push_str(&format!("my $cmd = \"cp -r {} $dest_dir\";\n", source));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my $cmd = \"cp -r {} $dest_dir\";\n", quoted_source));
+                output.push_str(&generator.indent());
                 output.push_str("my $result = system $cmd;\n");
+                output.push_str(&generator.indent());
                 output.push_str("if ($result == 0) {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
                 output.push_str(&format!("print \"cp: copied directory {} to $dest_dir\\n\";\n", source));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("} else {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
                 output.push_str(&format!("die \"cp: failed to copy directory {}\\n\";\n", source));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("} else {\n");
+                generator.indent_level += 1;
                 // Copy single file
-                output.push_str(&format!("my $dest = {};\n", destination));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my $dest = {};\n", quoted_destination));
+                output.push_str(&generator.indent());
                 output.push_str("if (-d $dest) {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
                 output.push_str(&format!("$dest = \"$dest/{}\";\n", source));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
-                output.push_str(&format!("if (copy({}, $dest)) {{\n", source));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (copy({}, $dest)) {{\n", quoted_source));
+                generator.indent_level += 1;
                 if preserve {
-                    output.push_str("my ($atime, $mtime) = (stat($source))[8,9];\n");
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my ($atime, $mtime) = (stat({}))[8,9];\n", quoted_source));
+                    output.push_str(&generator.indent());
                     output.push_str("utime $atime, $mtime, $dest;\n");
                 }
+                output.push_str(&generator.indent());
                 output.push_str(&format!("print \"cp: copied {} to $dest\\n\";\n", source));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("} else {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
                 output.push_str(&format!("die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n", source));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
             } else {
                 // Copy single file
-                output.push_str(&format!("my $dest = {};\n", destination));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("my $dest = {};\n", quoted_destination));
+                output.push_str(&generator.indent());
                 output.push_str("if (-d $dest) {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
                 output.push_str(&format!("$dest = \"$dest/{}\";\n", source));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
-                output.push_str(&format!("if (copy({}, $dest)) {{\n", source));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if (copy({}, $dest)) {{\n", quoted_source));
+                generator.indent_level += 1;
                 if preserve {
-                    output.push_str("my ($atime, $mtime) = (stat($source))[8,9];\n");
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my ($atime, $mtime) = (stat({}))[8,9];\n", quoted_source));
+                    output.push_str(&generator.indent());
                     output.push_str("utime $atime, $mtime, $dest;\n");
                 }
+                output.push_str(&generator.indent());
                 output.push_str(&format!("print \"cp: copied {} to $dest\\n\";\n", source));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("} else {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
                 output.push_str(&format!("die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n", source));
-                output.push_str("}\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
             }
             
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
             output.push_str("} else {\n");
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
             output.push_str(&format!("die \"cp: {}: No such file or directory\\n\";\n", source));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
             output.push_str("}\n");
         }
     }

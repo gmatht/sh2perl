@@ -513,7 +513,8 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                 result.push_str("{\n");
                 generator.indent_level += 1;
                 result.push_str(&generator.indent());
-                result.push_str("open my $original_stdout, '>&', STDOUT or croak \"Cannot save STDOUT: $ERRNO\";\n");
+                result.push_str("open my $original_stdout, '>&', STDOUT\n");
+                result.push_str("    or croak \"Cannot save STDOUT: $ERRNO\";\n");
                 
                 // Find the output redirect target
                 let output_redirect = all_redirects.iter().find(|r| {
@@ -524,10 +525,12 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     let target = generator.word_to_perl(&redirect.target);
                     let mode = if matches!(redirect.operator, RedirectOperator::Append) { ">>" } else { ">" };
                     result.push_str(&generator.indent());
-                    result.push_str(&format!("open STDOUT, '{}', '{}' or croak \"Cannot open file: $ERRNO\";\n", mode, target));
+                    result.push_str(&format!("open STDOUT, '{}', '{}'\n", mode, target));
+                    result.push_str("    or croak \"Cannot open file: $ERRNO\";\n");
                 } else {
                     result.push_str(&generator.indent());
-                    result.push_str("open STDOUT, '>', 'temp_file.txt' or croak \"Cannot open file: $ERRNO\";\n");
+                    result.push_str("open STDOUT, '>', 'temp_file.txt'\n");
+                    result.push_str("    or croak \"Cannot open file: $ERRNO\";\n");
                 }
             }
             
@@ -648,7 +651,8 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
             
             if has_output_redirect {
                 result.push_str(&generator.indent());
-                result.push_str("open STDOUT, '>&', $original_stdout or croak \"Cannot restore STDOUT: $ERRNO\";\n");
+                result.push_str("open STDOUT, '>&', $original_stdout\n");
+                result.push_str("    or croak \"Cannot restore STDOUT: $ERRNO\";\n");
                 result.push_str(&generator.indent());
                 result.push_str("close $original_stdout or croak \"Close failed: $ERRNO\";\n");
                 generator.indent_level -= 1;
