@@ -321,7 +321,8 @@ get_file_size() {
     echo "File $file has $size bytes"
 }
 
-get_file_size $0
+get_file_size *
+
 
 # Backticks in array
 files=(`ls -1 examples/*.sh 2>/dev/null`)
