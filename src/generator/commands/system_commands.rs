@@ -33,6 +33,11 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
                 result
             }
         },
+        Word::CommandSubstitution(cmd, _) => {
+            // For command substitutions in system commands, we need to generate the actual bash command
+            // This is a complex case - for now, generate a placeholder that won't break bash
+            format!("\"$(echo 'command substitution not supported in system command context')\"")
+        },
         _ => {
             // For other word types, convert to string and quote if needed
             let s = word.to_string();

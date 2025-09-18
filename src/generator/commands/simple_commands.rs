@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::generator::Generator;
 use crate::generator::utils::get_temp_dir;
+use crate::Parser;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -282,19 +283,52 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         // Handle command substitution in local assignment
                                         // Parse the command substitution and convert to Perl
                                         let command_substitution = value.trim_start_matches('`').trim_end_matches('`');
-                                        let perl_command = generator.word_to_perl(&Word::CommandSubstitution(
-                                            Box::new(Command::Simple(SimpleCommand {
-                                                name: Word::Literal("bash".to_string(), None),
-                                                args: vec![Word::Literal("-c".to_string(), None), Word::Literal(command_substitution.to_string(), None)],
-                                                redirects: vec![],
-                                                env_vars: HashMap::new(),
-                                                stderr_used: false,
-                                                stdout_used: false,
-                                            })),
-                                            None
-                                        ));
-                                        output.push_str(&generator.indent());
-                                        output.push_str(&format!("my ${} = {};\n", var, perl_command));
+                                        
+                                        // Try to parse the command properly instead of wrapping in bash -c
+                                        eprintln!("DEBUG: Parsing command substitution: {}", command_substitution);
+                                        if let Ok(parsed_commands) = Parser::new(command_substitution).parse() {
+                                            eprintln!("DEBUG: Parsed commands: {:?}", parsed_commands);
+                                            if !parsed_commands.is_empty() {
+                                                eprintln!("DEBUG: Creating CommandSubstitution word");
+                                                let perl_command = generator.word_to_perl(&Word::CommandSubstitution(
+                                                    Box::new(parsed_commands[0].clone()),
+                                                    None
+                                                ));
+                                                eprintln!("DEBUG: Generated Perl command: {}", perl_command);
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!("my ${} = {};\n", var, perl_command));
+                                            } else {
+                                                // Fallback to bash -c if parsing fails
+                                                let perl_command = generator.word_to_perl(&Word::CommandSubstitution(
+                                                    Box::new(Command::Simple(SimpleCommand {
+                                                        name: Word::Literal("bash".to_string(), None),
+                                                        args: vec![Word::Literal("-c".to_string(), None), Word::Literal(command_substitution.to_string(), None)],
+                                                        redirects: vec![],
+                                                        env_vars: HashMap::new(),
+                                                        stderr_used: false,
+                                                        stdout_used: false,
+                                                    })),
+                                                    None
+                                                ));
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!("my ${} = {};\n", var, perl_command));
+                                            }
+                                        } else {
+                                            // Fallback to bash -c if parsing fails
+                                            let perl_command = generator.word_to_perl(&Word::CommandSubstitution(
+                                                Box::new(Command::Simple(SimpleCommand {
+                                                    name: Word::Literal("bash".to_string(), None),
+                                                    args: vec![Word::Literal("-c".to_string(), None), Word::Literal(command_substitution.to_string(), None)],
+                                                    redirects: vec![],
+                                                    env_vars: HashMap::new(),
+                                                    stderr_used: false,
+                                                    stdout_used: false,
+                                                })),
+                                                None
+                                            ));
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!("my ${} = {};\n", var, perl_command));
+                                        }
                                     } else {
                                         output.push_str(&generator.indent());
                                         output.push_str(&format!("my ${} = {};\n", var, value));
@@ -546,6 +580,27 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             output.push_str(&generator.indent());
                             output.push_str(&format!("chdir({});\n", dir));
                         }
+                    }
+                    "wc" => {
+                        // Handle wc command with input redirection
+                        if !cmd.redirects.is_empty() {
+                            // Check for input redirection
+                            for redirect in &cmd.redirects {
+                                if let crate::ast::RedirectOperator::Input = redirect.operator {
+                                    let file_name = generator.word_to_perl(&redirect.target);
+                                    output.push_str(&generator.indent());
+                                    output.push_str(&format!("open STDIN, '<', {} or croak \"Cannot open file: $ERRNO\";\n", file_name));
+                                    break;
+                                }
+                            }
+                        }
+                        // Generate wc command
+                        let unique_index = generator.get_unique_id();
+                        let input_var = format!("wc_input_{}", unique_index);
+                        let output_var = format!("wc_output_{}", unique_index);
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <STDIN> }};\n", input_var));
+                        output.push_str(&crate::generator::commands::wc::generate_wc_command_with_output(generator, cmd, &input_var, &unique_index, &output_var));
                     }
 
                     _ => {

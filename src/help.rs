@@ -55,6 +55,11 @@ pub fn show_help(program_name: &str) {
     println!("  --perl-critic-only <input>       - Test Perl code with specific exit codes:");
     println!("                                     0=pass, 101=lex, 102=parse, 104=generate, 137=critic");
     println!();
+    println!("FUNCTION SIGNATURE OPTIONS:");
+    println!();
+    println!("  --function-signatures            - Use modern Perl function signatures (default)");
+    println!("  --no-function-signatures         - Use traditional @_ unpacking instead of function signatures");
+    println!();
     println!("AST FORMATTING OPTIONS (for --next-fail):");
     println!();
     println!("  --ast-pretty                   - Use pretty-printed AST with indentation and newlines");
@@ -84,6 +89,8 @@ pub fn show_help(program_name: &str) {
     println!("  {} --perl-critic-only 'print \"hello\";'", program_name);
     println!("  {} --debug parse 'echo hello'", program_name);
     println!("  {} --no-debug parse 'echo hello'", program_name);
+    println!("  {} --no-function-signatures parse 'echo hello'", program_name);
+    println!("  {} --function-signatures parse 'echo hello'", program_name);
     println!();
     println!("DIRECT EXECUTION EXAMPLES:");
     println!("  {} examples/simple.sh           - Run shell script directly", program_name);

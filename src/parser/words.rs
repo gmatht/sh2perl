@@ -6,7 +6,41 @@ use crate::parser::redirects::parse_redirect;
 use crate::parser::commands::Parser;
 use std::collections::HashMap;
 
+
 pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    // Handle backtick command substitution first
+    if matches!(lexer.peek(), Some(Token::BacktickChar)) {
+        eprintln!("DEBUG: Found backtick in parse_word");
+        lexer.next(); // consume the opening backtick
+        let mut cmd_content = String::new();
+        while let Some(token) = lexer.peek() {
+            match token {
+                Token::BacktickChar => {
+                    lexer.next(); // consume the closing backtick
+                    break;
+                }
+                _ => {
+                    if let Some(text) = lexer.get_current_text() {
+                        cmd_content.push_str(&text);
+                    }
+                    lexer.next();
+                }
+            }
+        }
+        eprintln!("DEBUG: Backtick content: '{}'", cmd_content);
+        // Parse the command content
+        match parse_simple_command_from_text(&cmd_content) {
+            Ok(command) => {
+                eprintln!("DEBUG: Successfully parsed backtick command: {:?}", command);
+                return Ok(Word::CommandSubstitution(Box::new(command), None));
+            },
+            Err(e) => {
+                eprintln!("DEBUG: Failed to parse backtick command '{}': {:?}", cmd_content, e);
+                return Ok(Word::Literal(format!("`{}`", cmd_content), None));
+            }
+        }
+    }
+
     // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
     // and also handles find arguments like "+1M" by combining Plus + Number + Identifier

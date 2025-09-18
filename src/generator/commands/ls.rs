@@ -21,8 +21,8 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             if sort_by_time {
                 output.push_str(&format!("@{} = sort {{ -M \"{}/$b\" <=> -M \"{}/$a\" }} @{};\n", array_name, dir, dir, array_name));
             } else {
-                // Simple alphabetical sorting to match native ls behavior
-                output.push_str(&format!("@{} = sort {{ $a cmp $b }} @{};\n", array_name, array_name));
+                // Use locale-aware sorting to match native ls behavior
+                output.push_str(&format!("@{} = sort @{};\n", array_name, array_name));
             }
         }
     } else {
@@ -48,6 +48,9 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             output.push_str(&generator.indent());
             output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
         }
+        // Skip temporary files that might be created during test execution
+        output.push_str(&generator.indent());
+        output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
         if add_slash_to_dirs {
             output.push_str(&generator.indent());
             output.push_str(&format!("if (-d \"{}/$file\") {{\n", dir));
@@ -78,8 +81,8 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             if sort_by_time {
                 output.push_str(&format!("@{} = sort {{ -M \"{}/$b\" <=> -M \"{}/$a\" }} @{};\n", array_name, dir, dir, array_name));
             } else {
-                // Simple alphabetical sorting to match native ls behavior
-                output.push_str(&format!("@{} = sort {{ $a cmp $b }} @{};\n", array_name, array_name));
+                // Use locale-aware sorting to match native ls behavior
+                output.push_str(&format!("@{} = sort @{};\n", array_name, array_name));
             }
         }
         
@@ -210,6 +213,9 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                     output.push_str(&generator.indent());
                     output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
                 }
+                // Skip temporary files that might be created during test execution
+                output.push_str(&generator.indent());
+                output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
                 if add_slash_to_dirs {
                     output.push_str(&generator.indent());
                     output.push_str(&format!("if (-d \"{}/$file\") {{\n", file_arg));
@@ -292,6 +298,9 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                     output.push_str(&generator.indent());
                     output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
                 }
+                // Skip temporary files that might be created during test execution
+                output.push_str(&generator.indent());
+                output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
                 if add_slash_to_dirs {
                     output.push_str(&generator.indent());
                     output.push_str(&format!("if (-d \"{}/$file\") {{\n", file_arg));

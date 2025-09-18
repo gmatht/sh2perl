@@ -541,13 +541,21 @@ impl Parser {
                 // Special handling for local command with assignments
                 if name_str == "local" {
                     // Parse local assignments like: local var=value
+                    // Stop at newlines to handle multiple local commands on separate lines
                     while let Some(token) = self.lexer.peek() {
                         match token {
                             Token::Space | Token::Tab | Token::Comment => {
                                 self.lexer.next();
                                 continue;
                             }
-                            Token::Newline | Token::CarriageReturn => break,
+                            Token::Newline | Token::CarriageReturn => {
+                                // Stop parsing arguments at newlines to allow separate local commands
+                                break;
+                            }
+                            Token::Local => {
+                                // This is the start of a new local command, stop parsing this one
+                                break;
+                            }
                             Token::Identifier => {
                                 // Check if this is an assignment: var=value
                                 if matches!(self.lexer.peek_n(1), Some(Token::Assign)) {
@@ -582,10 +590,24 @@ impl Parser {
                                     };
                                     
                                     // Create assignment word: var=value
-                                    let assignment_word = Word::Literal(format!("{}={}", var_name, value_word.as_literal().unwrap_or(&value_word.to_string())), None);
+                                    // Handle command substitutions properly
+                                    let assignment_word = match &value_word {
+                                        Word::CommandSubstitution(_cmd, _) => {
+                                            // For command substitutions, create a proper assignment
+                                            Word::Literal(format!("{}=", var_name), None)
+                                        },
+                                        _ => {
+                                            Word::Literal(format!("{}={}", var_name, value_word.as_literal().unwrap_or(&value_word.to_string())), None)
+                                        }
+                                    };
                                     args.push(assignment_word);
+                                    
+                                    // If the value is a command substitution, add it as a separate argument
+                                    if let Word::CommandSubstitution(cmd, _) = value_word {
+                                        args.push(Word::CommandSubstitution(cmd, None));
+                                    }
                                 } else {
-                                    // Regular argument
+                                    // If not an assignment, treat as regular argument
                                     args.push(parse_word_no_newline_skip(&mut self.lexer)?);
                                 }
                             }

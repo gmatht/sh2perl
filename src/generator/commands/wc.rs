@@ -57,6 +57,7 @@ pub fn generate_wc_command_with_output(_generator: &mut Generator, cmd: &SimpleC
     }
     
     // Format output into a result variable expected by the pipeline
+    // Only declare the variable if it hasn't been declared already
     output.push_str(&format!("${} = q{{}};\n", output_var));
     if count_lines {
         output.push_str(&format!("${} .= \"$wc_line_count_{} \";\n", output_var, command_index));

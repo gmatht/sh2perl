@@ -33,6 +33,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         },
         Word::CommandSubstitution(cmd, _) => {
             // Handle command substitution
+            eprintln!("DEBUG: CommandSubstitution called with command: {:?}", cmd);
             let result = match cmd.as_ref() {
                 Command::Simple(simple_cmd) => {
                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
@@ -55,15 +56,33 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             perl_code
                         } else if name == "wc" {
                             // Special handling for wc in command substitution
-                            if simple_cmd.args.len() >= 2 {
-                                if let (Word::Literal(flag, _), Word::Literal(file, _)) = (&simple_cmd.args[0], &simple_cmd.args[1]) {
+                            if simple_cmd.args.len() >= 1 {
+                                if let Word::Literal(flag, _) = &simple_cmd.args[0] {
                                     if flag == "-c" {
-                                        // Handle wc -c < file pattern
-                                        if file.starts_with('<') {
-                                            let file_name = file.strip_prefix('<').unwrap_or("").trim();
-                                            format!("do {{ open my $fh, '<', {} or croak \"Cannot open file: $!\"; my $size = -s $fh; close $fh; $size }}", file_name)
+                                        // Check for input redirects first
+                                        for redirect in &simple_cmd.redirects {
+                                            if let crate::ast::RedirectOperator::Input = redirect.operator {
+                                                let file_name = generator.word_to_perl(&redirect.target);
+                                                return format!("-s {}", file_name);
+                                            }
+                                        }
+                                        
+                                        // If no redirects, check if there's a file argument
+                                        if simple_cmd.args.len() >= 2 {
+                                            if let Word::Literal(file, _) = &simple_cmd.args[1] {
+                                                // Handle wc -c < file pattern
+                                                if file.starts_with('<') {
+                                                    let file_name = file.strip_prefix('<').unwrap_or("").trim();
+                                                    format!("-s {}", file_name)
+                                                } else {
+                                                    format!("-s {}", file)
+                                                }
+                                            } else {
+                                                format!("-s {}", generator.word_to_perl(&simple_cmd.args[1]))
+                                            }
                                         } else {
-                                            format!("do {{ open my $fh, '<', {} or croak \"Cannot open file: $!\"; my $size = -s $fh; close $fh; $size }}", file)
+                                            // No file argument, use stdin
+                                            "do { local $INPUT_RECORD_SEPARATOR = undef; <STDIN> }".to_string()
                                         }
                                     } else {
                                         // Fallback to bash execution for other wc options
@@ -81,6 +100,25 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         .join(", ");
                                     format!("do {{ my ($in, $out, $err); my $pid = open3($in, $out, $err, 'wc', {}); close $in or croak 'Close failed: $!'; my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }}; close $out or croak 'Close failed: $!'; waitpid $pid, 0; $result }}", args_str)
                                 }
+                            } else if simple_cmd.args.len() == 1 {
+                                // Check for wc -c with redirect: wc -c < file
+                                if let Word::Literal(flag, _) = &simple_cmd.args[0] {
+                                    if flag == "-c" && !simple_cmd.redirects.is_empty() {
+                                        // Look for input redirect
+                                        for redirect in &simple_cmd.redirects {
+                                            if let crate::ast::RedirectOperator::Input = redirect.operator {
+                                                let file_name = generator.word_to_perl(&redirect.target);
+                                                return format!("-s {}", file_name);
+                                            }
+                                        }
+                                    }
+                                }
+                                // Fallback to bash execution
+                                let args_str = simple_cmd.args.iter()
+                                    .map(|arg| generator.word_to_perl(arg))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("do {{ my ($in, $out, $err); my $pid = open3($in, $out, $err, 'wc', {}); close $in or croak 'Close failed: $!'; my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }}; close $out or croak 'Close failed: $!'; waitpid $pid, 0; $result }}", args_str)
                             } else {
                                 // Fallback to bash execution
                                 let args_str = simple_cmd.args.iter()
@@ -499,7 +537,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 _ => {
                     // For other command types, use system command fallback
                     let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                    format!("do {{\n    my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'bash', '-c', '{}');\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {};\n}}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd), in_var, result_var, out_var, out_var, pid_var, result_var)
+                    format!("do {{\n    my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'bash', '-c', 'echo ERROR: Command substitution not implemented');\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {};\n}}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, in_var, result_var, out_var, out_var, pid_var, result_var)
                 }
             };
             // Wrap the result with chomp to strip trailing newlines (bash behavior)
@@ -519,6 +557,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 "#" => "scalar(@ARGV)".to_string(),  // $# -> scalar(@ARGV) for argument count
                 "@" => "@ARGV".to_string(),          // $@ -> @ARGV for arguments array
                 "*" => "@ARGV".to_string(),          // $* -> @ARGV for arguments array
+                "0" => "$PROGRAM_NAME".to_string(),  // $0 -> $PROGRAM_NAME (Perl::Critic compliant)
                 _ => format!("${}", var)             // Regular variable
             }
         },

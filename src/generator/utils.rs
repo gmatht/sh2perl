@@ -89,6 +89,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
             match var.as_str() {
                 "#" => "scalar(@ARGV)".to_string(),  // $# -> scalar(@ARGV) for argument count
                 "@" => "@ARGV".to_string(),          // $@ -> @ARGV for arguments array
+                "0" => "$PROGRAM_NAME".to_string(),  // $0 -> $PROGRAM_NAME (Perl::Critic compliant)
                 _ => format!("${}", var)             // Regular variables
             }
         }

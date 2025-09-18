@@ -35,7 +35,8 @@ pub fn run_shell_script(filename: &str) -> Result<std::process::Output, String> 
     
     // Run bash directly on the script file - much faster than bash -c "bash script"
     let mut cmd = Command::new("bash");
-    cmd.current_dir("examples");
+    let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
+    cmd.current_dir(&examples_dir);
     cmd.arg(script_name);
     
     // Use direct execution instead of polling with sleep

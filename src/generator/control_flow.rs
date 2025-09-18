@@ -464,27 +464,96 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     // Add blank line before function definition for better formatting
     output.push_str("\n");
     
-    // Generate function definition
-    output.push_str(&format!("sub {} {{\n", func.name));
+    // Check if function uses positional parameters ($1, $2, etc.) in its body
+    let uses_positional_params = check_function_uses_positional_params(&func.body);
     
-    // Handle function parameters - always unpack @_ first
-    generator.indent_level += 1;
-    if !func.parameters.is_empty() {
-        output.push_str(&generator.indent());
-        output.push_str("my (");
-        let params: Vec<String> = func.parameters.iter()
-            .map(|param| format!("${}", param))
-            .collect();
-        output.push_str(&params.join(", "));
-        output.push_str(") = @_;\n");
+    // Generate function definition with or without parameters based on setting
+    if generator.use_function_signatures {
+        // Use modern function signatures
+        if !func.parameters.is_empty() {
+            // Function has declared parameters
+            let params: Vec<String> = func.parameters.iter()
+                .map(|param| format!("${}", param))
+                .collect();
+            output.push_str(&format!("sub {}({}) {{\n", func.name, params.join(", ")));
+        } else if uses_positional_params {
+            // Function uses $1, $2, etc. but has no declared parameters
+            output.push_str(&format!("sub {}($file) {{\n", func.name));
+        } else {
+            // No parameters
+            output.push_str(&format!("sub {} {{\n", func.name));
+        }
+        
+        generator.indent_level += 1;
+        
+        // No need for @_ unpacking since parameters are in the function signature
     } else {
-        // Even if no parameters, unpack @_ to satisfy Perl::Critic
-        output.push_str(&generator.indent());
-        output.push_str("my @_ = @_;\n");
+        // Use traditional @_ unpacking approach
+        output.push_str(&format!("sub {} {{\n", func.name));
+        generator.indent_level += 1;
+        
+        // Handle function parameters - always unpack @_ first
+        if !func.parameters.is_empty() {
+            output.push_str(&generator.indent());
+            output.push_str("my (");
+            let params: Vec<String> = func.parameters.iter()
+                .map(|param| format!("${}", param))
+                .collect();
+            output.push_str(&params.join(", "));
+            output.push_str(") = @_;\n");
+        } else if uses_positional_params {
+            // Function uses $1, $2, etc. but has no declared parameters
+            // Check if the function body already has local commands that handle parameters
+            let has_local_commands = func.body.commands.iter().any(|cmd| {
+                matches!(cmd, Command::BuiltinCommand(cmd) if cmd.name == "local")
+            });
+            
+            if !has_local_commands {
+                // Generate parameter unpacking for the first parameter using proper @_ unpacking
+                output.push_str(&generator.indent());
+                output.push_str("my ($file) = @_;\n");
+            }
+        } else {
+            // Even if no parameters, unpack @_ to satisfy Perl::Critic
+            // Note: @_ is a special variable and cannot be redeclared, so we don't need to do anything
+        }
     }
     
     // Generate function body
-    output.push_str(&generator.generate_block_commands(&func.body));
+    eprintln!("DEBUG: Generating function body for {}", func.name);
+    eprintln!("DEBUG: Function body commands: {:?}", func.body.commands);
+    
+    // Filter out the first local command that declares the first parameter
+    // when using modern function signature
+    let filtered_commands = if generator.use_function_signatures && uses_positional_params && func.parameters.is_empty() {
+        // Skip the first local command that declares the first parameter
+        let mut filtered = Vec::new();
+        let mut skipped_first_local = false;
+        
+        for cmd in &func.body.commands {
+            if !skipped_first_local {
+                if let Command::BuiltinCommand(builtin) = cmd {
+                    if builtin.name == "local" && !builtin.args.is_empty() {
+                        if let Some(Word::Literal(arg, _)) = builtin.args.first() {
+                            if arg.starts_with("file=") {
+                                skipped_first_local = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            filtered.push(cmd.clone());
+        }
+        filtered
+    } else {
+        // Use all commands when using traditional @_ unpacking or when no filtering needed
+        func.body.commands.clone()
+    };
+    
+    // Create a temporary block with filtered commands
+    let filtered_block = Block { commands: filtered_commands };
+    output.push_str(&generator.generate_block_commands(&filtered_block));
     
     // Add final return statement to satisfy Perl::Critic
     output.push_str(&generator.indent());
@@ -498,6 +567,105 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     generator.declared_functions.insert(func.name.clone());
     
     output
+}
+
+fn check_function_uses_positional_params(block: &Block) -> bool {
+    for command in &block.commands {
+        if check_command_uses_positional_params(command) {
+            return true;
+        }
+    }
+    false
+}
+
+fn check_commands_use_positional_params(commands: &[Command]) -> bool {
+    for command in commands {
+        if check_command_uses_positional_params(command) {
+            return true;
+        }
+    }
+    false
+}
+
+fn check_command_uses_positional_params(command: &Command) -> bool {
+    match command {
+        Command::Simple(cmd) => {
+            // Check command name and arguments
+            if check_word_uses_positional_params(&cmd.name) {
+                return true;
+            }
+            for arg in &cmd.args {
+                if check_word_uses_positional_params(arg) {
+                    return true;
+                }
+            }
+            false
+        },
+        Command::BuiltinCommand(cmd) => {
+            for arg in &cmd.args {
+                if check_word_uses_positional_params(arg) {
+                    return true;
+                }
+            }
+            false
+        },
+        Command::Block(block) => check_function_uses_positional_params(block),
+        Command::Pipeline(pipeline) => {
+            for cmd in &pipeline.commands {
+                if check_command_uses_positional_params(cmd) {
+                    return true;
+                }
+            }
+            false
+        },
+        Command::Function(func) => check_function_uses_positional_params(&func.body),
+        Command::If(if_stmt) => {
+            check_command_uses_positional_params(&if_stmt.then_branch) ||
+            if_stmt.else_branch.as_ref().map_or(false, |else_branch| check_command_uses_positional_params(else_branch))
+        },
+        Command::Case(case_stmt) => {
+            for case_clause in &case_stmt.cases {
+                if check_commands_use_positional_params(&case_clause.body) {
+                    return true;
+                }
+            }
+            false
+        },
+        Command::For(for_loop) => check_function_uses_positional_params(&for_loop.body),
+        Command::While(while_loop) => check_function_uses_positional_params(&while_loop.body),
+        _ => false,
+    }
+}
+
+fn check_word_uses_positional_params(word: &Word) -> bool {
+    match word {
+        Word::Literal(s, _) => {
+            // Check if the literal contains $1, $2, etc.
+            s.contains("$1") || s.contains("$2") || s.contains("$3") || 
+            s.contains("$4") || s.contains("$5") || s.contains("$6") ||
+            s.contains("$7") || s.contains("$8") || s.contains("$9")
+        },
+        Word::StringInterpolation(interp, _) => {
+            for part in &interp.parts {
+                match part {
+                    StringPart::Variable(var) => {
+                        if var.chars().all(|c| c.is_digit(10)) {
+                            return true;
+                        }
+                    },
+                    StringPart::CommandSubstitution(cmd) => {
+                        if check_command_uses_positional_params(cmd) {
+                            return true;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            false
+        },
+        Word::CommandSubstitution(cmd, _) => check_command_uses_positional_params(cmd),
+        _ => false,
+    }
 }
 
 pub fn generate_block_impl(generator: &mut Generator, block: &Block) -> String {
