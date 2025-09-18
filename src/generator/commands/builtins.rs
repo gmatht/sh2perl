@@ -322,8 +322,8 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             crate::generator::commands::touch::generate_touch_command(generator, cmd)
         },
         "basename" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::basename::generate_basename_command(generator, cmd, input_var)
+            // Generate basename command with proper output assignment
+            crate::generator::commands::basename::generate_basename_command(generator, cmd, input_var, output_var)
         },
         "dirname" => {
             // For now, use the existing signature but we should standardize this
