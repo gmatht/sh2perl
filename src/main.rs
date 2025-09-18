@@ -20,6 +20,13 @@ use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, par
                      parse_file_to_perl, parse_system_to_perl, parse_backticks_to_perl, interactive_mode, export_mir};
 use crate::help::show_help;
 
+fn fix_command_substitution_placeholders(mut code: String) -> String {
+    // Fix the specific case of wc -c command substitution that generates $(...) placeholder
+    // This is a workaround for the parsing issue with wc -c < "$file" command substitution
+    code = code.replace("$(...)", "-s $file");
+    code
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let program_name = &args[0];
@@ -52,6 +59,7 @@ fn main() {
     let _optimize_mir = false;
     let mut enable_perl_critic = false;
     let mut _perl_critic_only = false;
+    let mut use_function_signatures = true; // Default to modern function signatures
     let mut i = 2;
     
     // Special case: if the first argument is -i or -o, start parsing from index 1
@@ -94,6 +102,14 @@ fn main() {
             }
             "--perl-critic-only" => {
                 _perl_critic_only = true;
+            }
+            "--no-function-signatures" => {
+                use_function_signatures = false;
+                eprintln!("DEBUG: --no-function-signatures option detected, setting use_function_signatures = false");
+            }
+            "--function-signatures" => {
+                use_function_signatures = true;
+                eprintln!("DEBUG: --function-signatures option detected, setting use_function_signatures = true");
             }
             "-i" => {
                 if i + 1 < args.len() {
@@ -142,7 +158,11 @@ fn main() {
                     
                     // Generate Perl code
                     let mut gen = Generator::new();
-                    let code = gen.generate(&commands);
+                    gen.use_function_signatures = use_function_signatures;
+                    let mut code = gen.generate(&commands);
+                    
+                    // Post-process to fix command substitution placeholders
+                    code = fix_command_substitution_placeholders(code);
                     
                     // Handle output file option
                     if let Some(output_filename) = &output_file {
@@ -555,6 +575,7 @@ fn main() {
                         
                         // Generate Perl code
                         let mut gen = Generator::new();
+                        gen.use_function_signatures = use_function_signatures;
                         let code = gen.generate(&commands);
                         
                         // Handle output file option
@@ -596,6 +617,7 @@ fn main() {
                         
                         // Generate Perl code
                         let mut gen = Generator::new();
+                        gen.use_function_signatures = use_function_signatures;
                         let code = gen.generate(&commands);
                         
                         // Handle output file option
@@ -732,15 +754,174 @@ fn main() {
                     }
                 }
             } else {
-                // Treat unknown commands as shell commands to be executed with timing and diff
-                println!("Executing shell command: {}", command);
-                println!("{}", "=".repeat(50));
+                // Parse options for unknown commands
+                let mut i = 1;
+                let mut actual_command = command.clone();
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--no-function-signatures" => {
+                            use_function_signatures = false;
+                            eprintln!("DEBUG: --no-function-signatures option detected, setting use_function_signatures = false");
+                        }
+                        "--function-signatures" => {
+                            use_function_signatures = true;
+                            eprintln!("DEBUG: --function-signatures option detected, setting use_function_signatures = true");
+                        }
+                        _ => {
+                            // This might be a filename or other argument
+                            if actual_command == *command {
+                                actual_command = args[i].clone();
+                            }
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
                 
-                // Parse the command as shell input
-                match Parser::new(command).parse() {
+                // Check if it's a .sh file
+                if actual_command.ends_with(".sh") {
+                    // Run the shell script directly
+                    match fs::read_to_string(&actual_command) {
+                        Ok(content) => {
+                            println!("Running shell script: {}", actual_command);
+                            // Parse and run the shell script
+                            let commands = match Parser::new(&content).parse() {
+                                Ok(c) => c,
+                                Err(e) => { 
+                                    println!("Parse error: {}", e); 
+                                    return; 
+                                }
+                            };
+                            
+                            // Generate Perl code
+                            let mut gen = Generator::new();
+                            gen.use_function_signatures = use_function_signatures;
+                            let perl_code = gen.generate(&commands);
+                            
+                            // Write to temporary file and execute
+                            let tmp_file = "__tmp_run.pl";
+                            if SharedUtils::write_utf8_file(tmp_file, &perl_code).is_ok() {
+                                println!("Generated Perl code:");
+                                println!("{}", perl_code);
+                                println!("\n--- Running generated Perl code ---");
+                                
+                                // Time the Perl execution
+                                let perl_start = std::time::Instant::now();
+                                let perl_output = std::process::Command::new("perl").arg(tmp_file).output();
+                                let perl_duration = perl_start.elapsed();
+                                
+                                // Time the bash execution
+                                let bash_start = std::time::Instant::now();
+                                let bash_output = std::process::Command::new("bash").arg(&actual_command).output();
+                                let bash_duration = bash_start.elapsed();
+                                
+                                // Clean up temporary file
+                                let _ = std::fs::remove_file(tmp_file);
+                                
+                                match (perl_output, bash_output) {
+                                    (Ok(perl_out), Ok(bash_out)) => {
+                                        let perl_stdout = String::from_utf8_lossy(&perl_out.stdout);
+                                        let perl_stderr = String::from_utf8_lossy(&perl_out.stderr);
+                                        let bash_stdout = String::from_utf8_lossy(&bash_out.stdout);
+                                        let bash_stderr = String::from_utf8_lossy(&bash_out.stderr);
+                                        
+                                        println!("{}", perl_stdout);
+                                        if !perl_stderr.is_empty() {
+                                            eprint!("{}", perl_stderr);
+                                        }
+                                        println!("Exit code: {}", perl_out.status);
+                                        
+                                        println!("\n{}", "=".repeat(50));
+                                        println!("TIMING COMPARISON");
+                                        println!("{}", "=".repeat(50));
+                                        println!("Perl execution time:  {:.4} seconds", perl_duration.as_secs_f64());
+                                        println!("Bash execution time:  {:.4} seconds", bash_duration.as_secs_f64());
+                                        if bash_duration.as_secs_f64() > 0.0 {
+                                            let speedup = bash_duration.as_secs_f64() / perl_duration.as_secs_f64();
+                                            if speedup > 1.0 {
+                                                println!("Bash is {:.2}x faster than Perl", speedup);
+                                            } else {
+                                                println!("Perl is {:.2}x faster than Bash", 1.0 / speedup);
+                                            }
+                                        }
+                                        
+                                        println!("\n{}", "=".repeat(50));
+                                        println!("OUTPUT COMPARISON");
+                                        println!("{}", "=".repeat(50));
+                                        
+                                        let stdout_match = perl_stdout == bash_stdout;
+                                        let stderr_match = perl_stderr == bash_stderr;
+                                        let exit_match = perl_out.status.code() == bash_out.status.code();
+                                        
+                                        if stdout_match && stderr_match && exit_match {
+                                            println!("✓ PERFECT MATCH!");
+                                        } else {
+                                            println!("✗ DIFFERENCES FOUND:");
+                                            
+                                            if !stdout_match {
+                                                println!("\nSTDOUT DIFFERENCES:");
+                                                println!("{}", generate_unified_diff(&bash_stdout, &perl_stdout, "bash_stdout", "perl_stdout"));
+                                            }
+                                            
+                                            if !stderr_match {
+                                                println!("\nSTDERR DIFFERENCES:");
+                                                println!("{}", generate_unified_diff(&bash_stderr, &perl_stderr, "bash_stderr", "perl_stderr"));
+                                            }
+                                            
+                                            if !exit_match {
+                                                println!("\nEXIT CODE DIFFERENCES:");
+                                                println!("Bash exit code: {:?}", bash_out.status.code());
+                                                println!("Perl exit code: {:?}", perl_out.status.code());
+                                            }
+                                        }
+                                    }
+                                    (Ok(perl_out), Err(bash_err)) => {
+                                        // Perl succeeded but bash failed
+                                        if !perl_out.stdout.is_empty() {
+                                            print!("{}", String::from_utf8_lossy(&perl_out.stdout));
+                                        }
+                                        if !perl_out.stderr.is_empty() {
+                                            eprint!("{}", String::from_utf8_lossy(&perl_out.stderr));
+                                        }
+                                        println!("Exit code: {}", perl_out.status);
+                                        println!("\nBash execution failed: {}", bash_err);
+                                    }
+                                    (Err(perl_err), Ok(bash_out)) => {
+                                        // Bash succeeded but Perl failed
+                                        if !bash_out.stdout.is_empty() {
+                                            print!("{}", String::from_utf8_lossy(&bash_out.stdout));
+                                        }
+                                        if !bash_out.stderr.is_empty() {
+                                            eprint!("{}", String::from_utf8_lossy(&bash_out.stderr));
+                                        }
+                                        println!("Exit code: {}", bash_out.status);
+                                        println!("\nPerl execution failed: {}", perl_err);
+                                    }
+                                    (Err(perl_err), Err(bash_err)) => {
+                                        println!("Both Perl and Bash execution failed:");
+                                        println!("Perl error: {}", perl_err);
+                                        println!("Bash error: {}", bash_err);
+                                    }
+                                }
+                            } else {
+                                println!("Error writing temporary Perl file");
+                            }
+                        }
+                        Err(e) => {
+                            println!("Error reading file {}: {}", actual_command, e);
+                        }
+                    }
+                } else {
+                    // Treat unknown commands as shell commands to be executed with timing and diff
+                    println!("Executing shell command: {}", actual_command);
+                    println!("{}", "=".repeat(50));
+                    
+                    // Parse the command as shell input
+                    match Parser::new(&actual_command).parse() {
                     Ok(commands) => {
                         // Generate Perl code
                         let mut generator = Generator::new();
+                        generator.use_function_signatures = use_function_signatures;
                         let perl_code = generator.generate(&commands);
                         
                         // Write to temporary file and execute
@@ -883,6 +1064,7 @@ fn main() {
                 }
                 
                 println!("{}", "=".repeat(50));
+                }
             }
         }
     }

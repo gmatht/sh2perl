@@ -439,8 +439,9 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
         }
         "local" => {
             // Handle local command - convert to my declarations
-            for arg in &cmd.args {
-                match arg {
+            let mut i = 0;
+            while i < cmd.args.len() {
+                match &cmd.args[i] {
                     Word::Literal(var_name, _) => {
                         // Check if it's an assignment (var=value)
                         if var_name.contains('=') {
@@ -449,38 +450,38 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 let var = parts[0];
                                 let value = parts[1];
                                 if !generator.declared_locals.contains(var) {
-                                    // Check if the value contains command substitution
-                                    if value.contains('`') {
-                                        // Handle command substitution in local assignment
-                                        // Parse the command substitution and convert to Perl
-                                        let command_substitution = value.trim_start_matches('`').trim_end_matches('`');
-                                        
-                                        // Try to parse the command substitution properly
-                                        // For now, use a simple approach that handles basic commands
-                                        if command_substitution.starts_with("wc -c < ") {
-                                            // Handle wc -c < file pattern
-                                            let file_var = command_substitution.strip_prefix("wc -c < ").unwrap_or("");
-                                            let file_var_clean = file_var.trim_matches('"').trim_matches('\'');
-                                            output.push_str(&generator.indent());
-                                            output.push_str(&format!("my ${} = do {{ open my $fh, '<', {} or croak \"Cannot open file: $!\"; my $size = -s $fh; close $fh; $size }};\n", var, file_var_clean));
-                                        } else {
-                                            // Fallback to bash execution
-                                            let perl_command = generator.word_to_perl(&Word::CommandSubstitution(
-                                                Box::new(Command::Simple(SimpleCommand {
-                                                    name: Word::Literal("bash".to_string(), None),
-                                                    args: vec![Word::Literal("-c".to_string(), None), Word::Literal(command_substitution.to_string(), None)],
-                                                    redirects: vec![],
-                                                    env_vars: HashMap::new(),
-                                                    stderr_used: false,
-                                                    stdout_used: false,
-                                                })),
-                                                None
-                                            ));
-                                            output.push_str(&generator.indent());
-                                            output.push_str(&format!("my ${} = {};\n", var, perl_command));
+                                    // Check if the next argument is a CommandSubstitution
+                                    if i + 1 < cmd.args.len() {
+                                        match &cmd.args[i + 1] {
+                                            Word::CommandSubstitution(cmd_sub, _) => {
+                                                // Handle command substitution
+                                                let perl_command = generator.word_to_perl(&Word::CommandSubstitution(cmd_sub.clone(), None));
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!("my ${} = {};\n", var, perl_command));
+                                                i += 1; // Skip the CommandSubstitution argument
+                                            }
+                                            _ => {
+                                                // Regular assignment without command substitution
+                                                let perl_value = if value.starts_with('$') {
+                                                    // Handle shell variables like $1, $2, etc.
+                                                    if value.chars().skip(1).all(|c| c.is_digit(10)) {
+                                                        // Convert $1 to $_[0], $2 to $_[1], etc.
+                                                        let index = value[1..].parse::<usize>().unwrap_or(0);
+                                                        format!("$_[{}]", index - 1) // Perl arrays are 0-indexed
+                                                    } else {
+                                                        // Regular variable
+                                                        value.to_string()
+                                                    }
+                                                } else {
+                                                    // Literal value - quote it
+                                                    format!("\"{}\"", value)
+                                                };
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!("my ${} = {};\n", var, perl_value));
+                                            }
                                         }
                                     } else {
-                                        // Convert the value to proper Perl syntax
+                                        // Regular assignment without command substitution
                                         let perl_value = if value.starts_with('$') {
                                             // Handle shell variables like $1, $2, etc.
                                             if value.chars().skip(1).all(|c| c.is_digit(10)) {
@@ -510,16 +511,28 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             }
                         }
                     }
+                    Word::CommandSubstitution(cmd_sub, _) => {
+                        // Handle standalone command substitution (shouldn't happen in local command)
+                        let perl_command = generator.word_to_perl(&Word::CommandSubstitution(cmd_sub.clone(), None));
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("my $result_{} = {};\n", generator.get_unique_id(), perl_command));
+                    }
                     _ => {
-                        // For other word types, try to extract variable name and value
-                        let var_expr = generator.word_to_perl(arg);
-                        if !var_expr.is_empty() && !generator.declared_locals.contains(&var_expr) {
-                            output.push_str(&generator.indent());
-                            output.push_str(&format!("my {};\n", var_expr));
-                            generator.declared_locals.insert(var_expr);
+                        // For other word types, check if it's a command-related argument
+                        if let Word::Literal(s, _) = &cmd.args[i] {
+                            // Skip command-related arguments like "local", "size=", etc.
+                            if s == "local" || s.ends_with('=') {
+                                // Skip these arguments as they're part of the command structure
+                                continue;
+                            }
                         }
+                        
+                        // Skip processing of command-related arguments
+                        // The local command parsing should handle assignments properly
+                        continue;
                     }
                 }
+                i += 1;
             }
         }
         _ => {

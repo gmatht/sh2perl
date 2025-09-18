@@ -27,6 +27,7 @@ pub struct Generator {
     pub translation_mode: bool, // New field for pure translation mode
     pub inline_mode: bool, // New field for inline mode (for backticks)
     pub original_script_name: Option<String>, // Original script name for $0 compatibility
+    pub use_function_signatures: bool, // Control whether to use modern function signatures
 }
 
 impl Generator {
@@ -45,6 +46,7 @@ impl Generator {
             translation_mode: false,
             inline_mode: false,
             original_script_name: None,
+            use_function_signatures: true, // Default to modern function signatures
         }
     }
 
@@ -63,6 +65,7 @@ impl Generator {
             translation_mode: true,
             inline_mode: false,
             original_script_name: None,
+            use_function_signatures: true, // Default to modern function signatures
         }
     }
 
@@ -81,6 +84,7 @@ impl Generator {
             translation_mode: false,
             inline_mode: true,
             original_script_name: None,
+            use_function_signatures: true, // Default to modern function signatures
         }
     }
 
