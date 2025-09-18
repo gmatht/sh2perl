@@ -10,8 +10,68 @@ export LC_COLLATE=C
 # Add Git usr/bin to the beginning of PATH for proper ls command
 export PATH="/c/Strawberry/perl/bin:/c/Program Files/Git/usr/bin:$PATH"
 
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
+# Generate timestamp for this run
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_FILE="logs/fail_run_${TIMESTAMP}.log"
+
+echo "Starting test run at $(date)" | tee -a "$LOG_FILE"
+echo "Logging to: $LOG_FILE" | tee -a "$LOG_FILE"
+echo "Test arguments: $@" | tee -a "$LOG_FILE"
+echo "----------------------------------------" | tee -a "$LOG_FILE"
+
+# Function to run command with timeout and logging
+run_with_timeout() {
+    local cmd="$1"
+    local timeout_seconds="${2:-600}"  # Default 10 minutes
+    local description="$3"
+    
+    echo "Running: $description" | tee -a "$LOG_FILE"
+    echo "Command: $cmd" | tee -a "$LOG_FILE"
+    echo "Timeout: ${timeout_seconds}s" | tee -a "$LOG_FILE"
+    echo "----------------------------------------" | tee -a "$LOG_FILE"
+    
+    # Use timeout command if available, otherwise use a background process with kill
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout_seconds" bash -c "$cmd" 2>&1 | tee -a "$LOG_FILE"
+        local exit_code=${PIPESTATUS[0]}
+    else
+        # Fallback for systems without timeout command
+        bash -c "$cmd" 2>&1 | tee -a "$LOG_FILE" &
+        local cmd_pid=$!
+        
+        # Start a background process to kill the command after timeout
+        (
+            sleep "$timeout_seconds"
+            if kill -0 "$cmd_pid" 2>/dev/null; then
+                echo "Command timed out after ${timeout_seconds}s, killing process $cmd_pid" | tee -a "$LOG_FILE"
+                kill -TERM "$cmd_pid" 2>/dev/null
+                sleep 2
+                kill -KILL "$cmd_pid" 2>/dev/null
+            fi
+        ) &
+        local timeout_pid=$!
+        
+        # Wait for the command to complete
+        wait "$cmd_pid"
+        local exit_code=$?
+        
+        # Kill the timeout process
+        kill "$timeout_pid" 2>/dev/null
+    fi
+    
+    echo "----------------------------------------" | tee -a "$LOG_FILE"
+    echo "Command completed with exit code: $exit_code" | tee -a "$LOG_FILE"
+    echo "----------------------------------------" | tee -a "$LOG_FILE"
+    
+    return $exit_code
+}
+
 #git stash push examples ./fail.bat ./fail ./src/main.rs src/testing.rs src/execution.rs
-if ! cargo run --bin debashc -- fail "$@" --perl-critic
+echo "Starting cargo run with 10 minute timeout..." | tee -a "$LOG_FILE"
+if ! run_with_timeout "cargo run --bin debashc -- fail \"$@\" --perl-critic" 600 "debashc compilation and test generation"
 then
     echo "debashc failed, aborting other commands"
     exit 1
@@ -19,8 +79,7 @@ fi
 
 
 # Run test_purify.pl first and only continue if it passes
-echo "Running test_purify.pl --next --verbose..."
-if ! perl test_purify.pl --next --verbose; then
+if ! run_with_timeout "perl test_purify.pl --next --verbose" 300 "test_purify.pl validation"; then
     echo "When fixing this failure please remember than purify.pl is just"
     echo "meant to be a thin wrapper around PPI and debashc."
     echo "In particular, if you find a bug in debashc, please fix"
@@ -56,3 +115,6 @@ fi
 # on Unix/Linux, you might need to use tools like xdotool or similar.
 # For now, this is commented out as it's not portable.
 # echo "Keypress simulation not available in shell script version"
+
+echo "Test run completed at $(date)" | tee -a "$LOG_FILE"
+echo "Log file saved to: $LOG_FILE"

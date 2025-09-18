@@ -93,6 +93,12 @@ pub fn generate_case_statement_impl(generator: &mut Generator, case_stmt: &CaseS
             } else {
                 // Convert bash glob patterns to Perl regex
                 let mut perl_pattern = pattern_str.trim_matches('"').to_string();
+                
+                // Handle q{} patterns by extracting the content
+                if perl_pattern.starts_with("q{") && perl_pattern.ends_with("}") {
+                    perl_pattern = perl_pattern[2..perl_pattern.len()-1].to_string();
+                }
+                
                 perl_pattern = perl_pattern.replace("*", ".*");
                 perl_pattern = perl_pattern.replace("?", ".");
                 perl_pattern = perl_pattern.replace("[", "\\[");
@@ -478,15 +484,17 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
             output.push_str(&format!("sub {}({}) {{\n", func.name, params.join(", ")));
         } else if uses_positional_params {
             // Function uses $1, $2, etc. but has no declared parameters
-            output.push_str(&format!("sub {}($file) {{\n", func.name));
+            output.push_str(&format!("sub {} {{\n", func.name));
+            generator.indent_level += 1;
+            
+            // Unpack @_ to get positional parameters
+            output.push_str(&generator.indent());
+            output.push_str("my ($file) = @_;\n");
         } else {
             // No parameters
             output.push_str(&format!("sub {} {{\n", func.name));
+            generator.indent_level += 1;
         }
-        
-        generator.indent_level += 1;
-        
-        // No need for @_ unpacking since parameters are in the function signature
     } else {
         // Use traditional @_ unpacking approach
         output.push_str(&format!("sub {} {{\n", func.name));

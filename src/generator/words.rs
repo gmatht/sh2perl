@@ -332,7 +332,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for which in command substitution
                             if let Some(command) = simple_cmd.args.first() {
                                 let command_str = generator.word_to_perl(command);
-                                format!("do {{ my $command; my $found; my $result; my $dir; my $full_path; $command = {}; $found = 0; $result = q{{}}; foreach my $dir (split /:/msx, $ENV{{PATH}}) {{ $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
+                                format!("do {{ my $command; my $found; my $result; my $dir; my $full_path; $command = {}; $found = 0; $result = q{{}}; foreach my $dir (split /:/msx, $ENV{{PATH}}) {{ $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", generator.perl_string_literal(command))
                             } else {
                                 "q{}".to_string()
                             }
@@ -540,13 +540,17 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     format!("do {{\n    my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'bash', '-c', 'echo ERROR: Command substitution not implemented');\n    close {} or croak 'Close failed: $!';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $!';\n    waitpid {}, 0;\n    {};\n}}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, in_var, result_var, out_var, out_var, pid_var, result_var)
                 }
             };
-            // Wrap the result with chomp to strip trailing newlines (bash behavior)
-            // Use unique variable name to avoid Perl::Critic violations
-            let unique_id = generator.get_unique_id();
-            // Skip chomp if the result already contains chomp (to avoid double chomp)
-            if result.contains("chomp $result") {
+            // For simple expressions, avoid unnecessary wrapping
+            if result.contains("use POSIX qw(strftime)") || 
+               result.contains("use Cwd; getcwd()") ||
+               result.starts_with("do { my $") ||
+               result.contains("chomp $result") ||
+               result.len() < 100 {
+                // Simple expressions don't need wrapping
                 result
             } else {
+                // Wrap complex results with chomp to strip trailing newlines (bash behavior)
+                let unique_id = generator.get_unique_id();
                 format!("do {{\n{}    my $cmd_result_{} = {};\n{}    chomp $cmd_result_{};\n{}    $cmd_result_{};\n{}}}", 
                     generator.indent(), unique_id, result, generator.indent(), unique_id, generator.indent(), unique_id, generator.indent())
             }
