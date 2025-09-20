@@ -1,7 +1,12 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_comm_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: usize) -> String {
+pub fn generate_comm_command(
+    _generator: &mut Generator,
+    cmd: &SimpleCommand,
+    input_var: &str,
+    process_sub_files: &[(String, String)],
+) -> String {
     let mut output = String::new();
     
     // comm compares two sorted files and shows lines unique to each
@@ -40,21 +45,87 @@ pub fn generate_comm_command(_generator: &mut Generator, cmd: &SimpleCommand, in
         output.push_str("my @file1_lines;\n");
         output.push_str("my @file2_lines;\n");
         
-        // Find the process substitution files
-        let mut ps_files = Vec::new();
-        for redir in &cmd.redirects {
-            if matches!(redir.operator, RedirectOperator::ProcessSubstitutionInput(_)) {
-                if let Word::Literal(target, _) = &redir.target {
-                    if target.starts_with("/tmp/process_sub_") {
-                        ps_files.push(target.clone());
-                    }
+        if !process_sub_files.is_empty() && process_sub_files.len() >= 2 {
+            let file1 = &process_sub_files[0];
+            let file2 = &process_sub_files[1];
+            
+            // Read first file
+            output.push_str(&format!("if (open my $fh1, '<', ${}) {{\n", file1.0));
+            output.push_str("    while (my $line = <$fh1>) {\n");
+            output.push_str("        chomp $line;\n");
+            output.push_str("        push @file1_lines, $line;\n");
+            output.push_str("    }\n");
+            output.push_str("    close($fh1);\n");
+            output.push_str("}\n");
+            
+            // Read second file
+            output.push_str(&format!("if (open my $fh2, '<', ${}) {{\n", file2.0));
+            output.push_str("    while (my $line = <$fh2>) {\n");
+            output.push_str("        chomp $line;\n");
+            output.push_str("        push @file2_lines, $line;\n");
+            output.push_str("    }\n");
+            output.push_str("    close($fh2);\n");
+            output.push_str("}\n");
+            
+            // Create hashes for efficient lookup
+            output.push_str("my %file1_set = map { $_ => 1 } @file1_lines;\n");
+            output.push_str("my %file2_set = map { $_ => 1 } @file2_lines;\n");
+            
+            // Find common lines
+            output.push_str("my @common_lines;\n");
+            output.push_str("foreach my $line (@file1_lines) {\n");
+            output.push_str("    if (exists($file2_set{$line})) {\n");
+            output.push_str("        push @common_lines, $line;\n");
+            output.push_str("    }\n");
+            output.push_str("}\n");
+            
+            // Generate output based on suppression flags
+            output.push_str("my $comm_output = \"\";\n");
+            
+            if !suppress_col1 {
+                output.push_str("foreach my $line (@file1_lines) {\n");
+                output.push_str("    if (!exists($file2_set{$line})) {\n");
+                output.push_str("        $comm_output .= $line . \"\\n\";\n");
+                output.push_str("    }\n");
+                output.push_str("}\n");
+            }
+            
+            if !suppress_col2 {
+                output.push_str("foreach my $line (@file2_lines) {\n");
+                output.push_str("    if (!exists($file1_set{$line})) {\n");
+                output.push_str("        $comm_output .= $line . \"\\n\";\n");
+                output.push_str("    }\n");
+                output.push_str("}\n");
+            }
+            
+            if !suppress_col3 {
+                output.push_str("foreach my $line (@common_lines) {\n");
+                output.push_str("    $comm_output .= $line . \"\\n\";\n");
+                output.push_str("}\n");
+            }
+            
+            // Remove trailing newline and return the result
+            output.push_str("$comm_output =~ s/\\n$//;\n");
+            output.push_str("$comm_output");
+        } else {
+            // Fallback if we don't have enough process substitution files
+            output.push_str("\"\"");
+        }
+    } else {
+        // Regular comm command without process substitution
+        // Get file names from arguments
+        let mut file_args = Vec::new();
+        for arg in &cmd.args {
+            if let Word::Literal(s, _) = arg {
+                if !s.starts_with('-') {
+                    file_args.push(s.clone());
                 }
             }
         }
         
-        if ps_files.len() >= 2 {
-            let file1 = &ps_files[0];
-            let file2 = &ps_files[1];
+        if file_args.len() >= 2 {
+            let file1 = &file_args[0];
+            let file2 = &file_args[1];
             
             // Read first file
             output.push_str(&format!("if (open my $fh1, '<', '{}') {{\n", file1));
@@ -106,43 +177,17 @@ pub fn generate_comm_command(_generator: &mut Generator, cmd: &SimpleCommand, in
             }
             
             if !suppress_col3 {
-                output.push_str(&format!("${} .= join \"\\n\", @common_lines . \"\\n\";\n", input_var));
+                output.push_str("foreach my $line (@common_lines) {\n");
+                output.push_str(&format!("    ${} .= $line . \"\\n\";\n", input_var));
+                output.push_str("}\n");
             }
             
             // Remove trailing newline
-            output.push_str(&format!("chomp ${}; \n", input_var));
+            output.push_str(&format!("${} =~ s/\\n$//;\n", input_var));
         } else {
-            // Fallback: treat input as a single file
-            output.push_str(&format!("my @lines = split /\\n/msx, ${};\n", input_var));
-            output.push_str("my %seen;\n");
-            output.push_str("my @result;\n");
-            output.push_str("foreach my $line (@lines) {\n");
-            output.push_str("    chomp $line;\n");
-            output.push_str("    if (!exists($seen{$line})) {\n");
-            output.push_str("        $seen{$line} = 1;\n");
-            output.push_str("        push @result, $line;\n");
-            output.push_str("    } else {\n");
-            output.push_str("        $seen{$line}++;\n");
-            output.push_str("    }\n");
-            output.push_str("}\n");
-            output.push_str(&format!("${} = join \"\\n\", @result;\n", input_var));
+            // Fallback if we don't have enough file arguments
+            output.push_str(&format!("${} = \"\";\n", input_var));
         }
-    } else {
-        // For now, implement a basic version that works with input
-        // The process substitution files will be handled by the main generator
-        output.push_str(&format!("my @lines = split /\\n/, ${};\n", input_var));
-        output.push_str("my %seen;\n");
-        output.push_str("my @result;\n");
-        output.push_str("foreach my $line (@lines) {\n");
-        output.push_str("    chomp $line;\n");
-        output.push_str("    if (!exists($seen{$line})) {\n");
-        output.push_str("        $seen{$line} = 1;\n");
-        output.push_str("        push @result, $line;\n");
-        output.push_str("    } else {\n");
-        output.push_str("        $seen{$line}++;\n");
-        output.push_str("    }\n");
-        output.push_str("}\n");
-        output.push_str(&format!("${} = join \"\\n\", @result;\n", input_var));
     }
     
     output

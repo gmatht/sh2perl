@@ -28,8 +28,11 @@ pub fn create_exit_status(exit_code: i32) -> std::process::ExitStatus {
 }
 
 /// Cross-platform function to run shell scripts
-/// Optimized for speed - runs bash directly on the script
+/// Optimized for speed - runs bash directly on the script with timeout
 pub fn run_shell_script(filename: &str) -> Result<std::process::Output, String> {
+    use std::time::{Duration, Instant};
+    use std::thread;
+    
     // Extract just the filename part from the full path
     let script_name = filename.split(['\\', '/']).last().unwrap_or(filename);
     
@@ -39,11 +42,34 @@ pub fn run_shell_script(filename: &str) -> Result<std::process::Output, String> 
     cmd.current_dir(&examples_dir);
     cmd.arg(script_name);
     
-    // Use direct execution instead of polling with sleep
-    let output = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output() {
-        Ok(output) => output,
+    // Add timeout handling to prevent hanging on interactive scripts
+    let timeout_duration = Duration::from_secs(30); // 30 second timeout
+    
+    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(child) => child,
         Err(e) => { 
-            return Err(format!("Failed to run bash script: {}", e)); 
+            return Err(format!("Failed to start bash script: {}", e)); 
+        }
+    };
+    
+    let start = Instant::now();
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process completed
+                break child.wait_with_output().unwrap();
+            }
+            Ok(None) => {
+                // Process still running, check timeout
+                if start.elapsed() > timeout_duration {
+                    let _ = child.kill();
+                    return Err(format!("Script {} timed out after {} seconds", script_name, timeout_duration.as_secs()));
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(format!("Error waiting for script {}: {}", script_name, e));
+            }
         }
     };
     

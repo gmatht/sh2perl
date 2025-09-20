@@ -83,8 +83,11 @@ pub fn parse_file(filename: &str) {
 pub fn parse_to_perl(input: &str) {
     let mut generator = Generator::new();
     
-    println!("Converting to Perl:");
-    println!("{}", "=".repeat(50));
+    // Check if debug is enabled before printing debug output
+    if debashl::debug::is_debug_enabled() {
+        eprintln!("Converting to Perl:");
+        eprintln!("{}", "=".repeat(50));
+    }
     
     let commands = match Parser::new(input).parse() {
         Ok(c) => c,
@@ -96,7 +99,9 @@ pub fn parse_to_perl(input: &str) {
     let perl_code = generator.generate(&commands);
     println!("{}", perl_code);
     
-    println!("{}", "=".repeat(50));
+    if debashl::debug::is_debug_enabled() {
+        eprintln!("{}", "=".repeat(50));
+    }
 }
 
 pub fn parse_to_perl_inline(input: &str) {

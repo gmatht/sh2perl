@@ -97,7 +97,7 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         // Delete characters in SET1 from input
         output.push_str(&format!("my ${} = q{{}};\n", output_var));
         output.push_str(&format!("for my $char ( split //msx, $input_{} ) {{\n", unique_id));
-        output.push_str(&format!("    if ( index $set1_{}, $char == -1 ) {{\n", unique_id));
+        output.push_str(&format!("    if ( (index $set1_{}, $char) == -1 ) {{\n", unique_id));
         output.push_str(&format!("        ${} .= $char;\n", output_var));
         output.push_str("    }\n");
         output.push_str("}\n");
