@@ -7,14 +7,14 @@ echo "=== Text Processing Commands ==="
 
 # cat command with backticks
 #PERL_MUST_NOT_CONTAIN `cat
-file_content=`cat /etc/passwd | head -5`
-echo "First 5 lines of /etc/passwd:"
+file_content=`cat examples/000__04c_text_processing_commands.sh | head -5`
+echo "First 5 lines of this file:"
 echo "$file_content"
 
 # grep command with backticks
 #PERL_MUST_NOT_CONTAIN `grep
-grep_result=`grep -n "bash" /etc/passwd`
-echo "Lines containing 'bash':"
+grep_result=`grep -n "echo" examples/000__04c_text_processing_commands.sh`
+echo "Lines containing 'echo':"
 echo "$grep_result"
 
 # sed command with backticks
@@ -48,7 +48,7 @@ echo "Line count: $line_count"
 
 # head command with backticks
 #PERL_MUST_NOT_CONTAIN `head
-head_result=`seq 1 10 | head -3`:
+head_result=`seq 1 10 | head -3`
 echo "First 3 numbers: $head_result"
 
 # tail command with backticks
@@ -63,9 +63,12 @@ echo "Second field: $cut_result"
 
 # paste command with backticks
 #PERL_MUST_NOT_CONTAIN `paste
-paste_result=`paste <(echo -e "1\n2\n3") <(echo -e "a\nb\nc")`
+echo -e "1\n2\n3" > temp1.txt
+echo -e "a\nb\nc" > temp2.txt
+paste_result=`paste temp1.txt temp2.txt`
 echo "Pasted columns:"
 echo "$paste_result"
+rm -f temp1.txt temp2.txt
 
 # comm command with backticks
 #PERL_MUST_NOT_CONTAIN `comm
