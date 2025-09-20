@@ -806,7 +806,11 @@ impl Generator {
                         StringPart::Literal(_) => {},
                         StringPart::Variable(_) => {}, // Variables are strings, not words
                         StringPart::CommandSubstitution(_) => {}, // Command substitutions don't need basename
-                        StringPart::ParameterExpansion(_) => {}, // Parameter expansions don't need basename
+                        StringPart::ParameterExpansion(pe) => {
+                            if matches!(pe.operator, ParameterExpansionOperator::Basename) {
+                                return true;
+                            }
+                        },
                         StringPart::MapAccess(_, _) => {}, // Map access doesn't need basename
                         StringPart::MapKeys(_) => {}, // Map keys don't need basename
                         StringPart::MapLength(_) => {}, // Map length doesn't need basename
@@ -993,7 +997,7 @@ impl Generator {
                 if let Word::Literal(name, _) = &cmd.name {
                     // Commands that typically use open3 for IPC
                     match name.as_str() {
-                        "pwd" | "whoami" | "date" | "id" | "uname" | "hostname" | "uptime" | "w" | "who" => true,
+                        "pwd" | "whoami" | "date" | "id" | "uname" | "hostname" | "uptime" | "w" | "who" | "perl" => true,
                         _ => {
                             // Check if it's a pipeline command or has complex arguments
                             cmd.args.len() > 0 || self.is_pipeline_command(name)

@@ -108,18 +108,25 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     }
     
     // Fallback to system call if not a -e or -ne command
-    let args_str = cmd.args.iter()
-        .map(|arg| word_to_bash_string_for_system(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let args_list = cmd.args.iter()
+        .map(|arg| {
+            let word = Word::Literal(word_to_bash_string_for_system(arg), Default::default());
+            generator.perl_string_literal(&word)
+        })
+        .collect::<Vec<_>>();
     
     let output_var = format!("perl_output_{}", generator.get_unique_id());
+    let args_str = if args_list.is_empty() { 
+        "".to_string() 
+    } else { 
+        format!(", {}", args_list.join(", ")) 
+    };
     output.push_str(&format!("my ($in, $out, $err);
-my $pid = open3($in, $out, $err, '{}', {});
+my $pid = open3($in, $out, $err, 'perl'{});
 close $in or croak 'Close failed: $!';
-{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
+my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
 close $out or croak 'Close failed: $!';
-waitpid $pid, 0;\n", output_var, "perl", args_str));
+waitpid $pid, 0;\n", args_str, output_var));
     output.push_str(&format!("print ${};\n", output_var));
     
     output
@@ -246,18 +253,25 @@ pub fn generate_perl_pipeline_command(generator: &mut Generator, cmd: &SimpleCom
         output.push_str(&format!("${} = ${};\n", input_var, output_var));
     } else {
         // Fallback to system call
-        let args_str = cmd.args.iter()
-            .map(|arg| word_to_bash_string_for_system(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let args_list = cmd.args.iter()
+            .map(|arg| {
+                let word = Word::Literal(word_to_bash_string_for_system(arg), Default::default());
+                generator.perl_string_literal(&word)
+            })
+            .collect::<Vec<_>>();
         
         let output_var = format!("perl_output_{}", generator.get_unique_id());
+        let args_str = if args_list.is_empty() { 
+            "".to_string() 
+        } else { 
+            format!(", {}", args_list.join(", ")) 
+        };
         output.push_str(&format!("my ($in, $out, $err);
-my $pid = open3($in, $out, $err, '{}', {});
+my $pid = open3($in, $out, $err, 'perl'{});
 close $in or croak 'Close failed: $!';
-{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
+my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
 close $out or croak 'Close failed: $!';
-waitpid $pid, 0;\n", output_var, "perl", args_str));
+waitpid $pid, 0;\n", args_str, output_var));
         output.push_str(&format!("print ${};\n", output_var));
     }
     

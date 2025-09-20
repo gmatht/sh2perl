@@ -212,7 +212,7 @@ fn word_to_bash_string(word: &Word) -> String {
         Word::Literal(s, _) => {
             // If the literal contains spaces or special characters, quote it
             if s.contains(' ') || s.contains('"') || s.contains('\'') || s.contains(';') || s.contains('|') || s.contains('&') || s.contains('<') || s.contains('>') {
-                format!("'{}'", s.replace("'", "'\"'\"'"))
+                format!("'{}'", s.replace("'", "'\''"))
             } else {
                 s.clone()
             }

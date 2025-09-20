@@ -363,7 +363,16 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 if cmd.args.is_empty() {
                     output.push_str("\"\\n\"");
                 } else {
-                    // Check for -e flag and filter it out
+                    // Check for -e flag
+                    let has_e_flag = cmd.args.iter().any(|arg| {
+                        if let Word::Literal(s, _) = arg {
+                            s == "-e"
+                        } else {
+                            false
+                        }
+                    });
+                    
+                    // Filter out the -e flag from arguments
                     let filtered_args: Vec<&Word> = cmd.args.iter().filter(|&arg| {
                         if let Word::Literal(s, _) = arg {
                             s != "-e"
@@ -377,19 +386,74 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         .map(|arg| {
                             match arg {
                                 Word::StringInterpolation(interp, _) => {
-                                    generator.convert_string_interpolation_to_perl(interp)
+                                    if has_e_flag {
+                                        // Process string interpolation with -e flag interpretation
+                                        let mut result = String::new();
+                                        for part in &interp.parts {
+                                            match part {
+                                                crate::ast::StringPart::Literal(literal) => {
+                                                    // Interpret backslash escapes
+                                                    let mut interpreted = literal.clone();
+                                                    // Remove outer quotes if present
+                                                    if (interpreted.starts_with('"') && interpreted.ends_with('"')) ||
+                                                       (interpreted.starts_with('\'') && interpreted.ends_with('\'')) {
+                                                        interpreted = interpreted[1..interpreted.len()-1].to_string();
+                                                    }
+                                                    
+                                                    // Interpret backslash escapes
+                                                    interpreted = interpreted
+                                                        .replace("\\n", "\n")
+                                                        .replace("\\t", "\t")
+                                                        .replace("\\r", "\r")
+                                                        .replace("\\\\", "\\");
+                                                    
+                                                    result.push_str(&interpreted);
+                                                },
+                                                _ => {
+                                                    // For other parts, use default processing
+                                                    result.push_str(&generator.convert_string_interpolation_to_perl(&crate::ast::StringInterpolation {
+                                                        parts: vec![part.clone()]
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                        // Return as a quoted string literal with proper escaping for Perl
+                                        format!("\"{}\"", result.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
+                                    } else {
+                                        generator.convert_string_interpolation_to_perl(interp)
+                                    }
                                 },
                                 Word::Literal(literal, _) => {
-                                    // Check if the literal contains escaped backticks that should be processed as command substitutions
-                                    if literal.contains("\\`") {
-                                        // Parse the string as string interpolation to handle escaped backticks
-                                        if let Ok(interp) = crate::parser::words::parse_string_interpolation_from_literal(literal) {
-                                            generator.convert_string_interpolation_to_perl(&interp)
+                                    if has_e_flag {
+                                        // If -e flag is present, interpret backslash escapes
+                                        let mut interpreted = literal.clone();
+                                        // Remove outer quotes if present
+                                        if (interpreted.starts_with('"') && interpreted.ends_with('"')) ||
+                                           (interpreted.starts_with('\'') && interpreted.ends_with('\'')) {
+                                            interpreted = interpreted[1..interpreted.len()-1].to_string();
+                                        }
+                                        
+                                        // Interpret backslash escapes
+                                        interpreted = interpreted
+                                            .replace("\\n", "\n")
+                                            .replace("\\t", "\t")
+                                            .replace("\\r", "\r")
+                                            .replace("\\\\", "\\");
+                                        
+                                        // Return as a quoted string literal with proper escaping for Perl
+                                        format!("\"{}\"", interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
+                                    } else {
+                                        // Check if the literal contains escaped backticks that should be processed as command substitutions
+                                        if literal.contains("\\`") {
+                                            // Parse the string as string interpolation to handle escaped backticks
+                                            if let Ok(interp) = crate::parser::words::parse_string_interpolation_from_literal(literal) {
+                                                generator.convert_string_interpolation_to_perl(&interp)
+                                            } else {
+                                                generator.perl_string_literal(arg)
+                                            }
                                         } else {
                                             generator.perl_string_literal(arg)
                                         }
-                                    } else {
-                                        generator.perl_string_literal(arg)
                                     }
                                 },
                                 _ => generator.word_to_perl(arg)

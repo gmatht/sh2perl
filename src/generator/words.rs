@@ -54,6 +54,157 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // For backtick commands, we need to return the value, not print it
                             // The generate_find_command already returns the joined string
                             perl_code
+                        } else if name == "paste" {
+                            // Special handling for paste command with process substitution
+                            // Check if this command has process substitution redirects
+                            let mut has_process_sub = false;
+                            for redirect in &simple_cmd.redirects {
+                                if matches!(redirect.operator, crate::ast::RedirectOperator::ProcessSubstitutionInput(_)) {
+                                    has_process_sub = true;
+                                    break;
+                                }
+                            }
+                            
+                            if has_process_sub {
+                                // Handle paste command with process substitution
+                                // This should be handled as a regular command, not command substitution
+                                // We need to generate the proper paste command with process substitution
+                                let mut process_sub_files = Vec::new();
+                                let mut process_sub_code = String::new();
+                                
+                                for redirect in &simple_cmd.redirects {
+                                    if let crate::ast::RedirectOperator::ProcessSubstitutionInput(cmd) = &redirect.operator {
+                                        // Generate the process substitution command and create temp file
+                                        let temp_file_id = generator.get_unique_id();
+                                        let temp_file = format!("temp_file_ps_{}", temp_file_id);
+                                        
+                                        // Check if this is an echo command and use the dedicated echo generator
+                                        let process_sub_output = if let crate::ast::Command::Simple(echo_cmd) = &**cmd {
+                                            if let crate::ast::Word::Literal(name, _) = &echo_cmd.name {
+                                                if name == "echo" {
+                                                    // Use the dedicated echo command generator
+                                                    crate::generator::commands::echo::generate_echo_command(generator, echo_cmd, "", "temp_output")
+                                                } else {
+                                                    generator.generate_command(cmd)
+                                                }
+                                            } else {
+                                                generator.generate_command(cmd)
+                                            }
+                                        } else {
+                                            generator.generate_command(cmd)
+                                        };
+                                        
+                                        // Generate code to execute the process substitution and save to temp file
+                                        process_sub_code.push_str(&format!("my ${} = ($ENV{{TEMP}} || $ENV{{TMP}} || \"C:\\\\temp\") . '/process_sub_{}.tmp';\n", 
+                                            temp_file, temp_file_id));
+                                        process_sub_code.push_str(&format!("{{\n"));
+                                        process_sub_code.push_str(&format!("    open my $fh, '>', ${} or croak \"Cannot create temp file: $ERRNO\\n\";\n", temp_file));
+                                        
+                                        // Check if this is an echo command and handle it specially
+                                        if let crate::ast::Command::Simple(echo_cmd) = &**cmd {
+                                            if let crate::ast::Word::Literal(name, _) = &echo_cmd.name {
+                                                if name == "echo" {
+                                                    // For echo commands, we need to execute the echo command and capture its output
+                                                    process_sub_code.push_str(&format!("    my $temp_output = \"\";\n"));
+                                                    process_sub_code.push_str(&format!("    {}\n", process_sub_output));
+                                                    process_sub_code.push_str(&format!("    print $fh $temp_output;\n"));
+                                                } else {
+                                                    process_sub_code.push_str(&format!("    print $fh {};\n", process_sub_output));
+                                                }
+                                            } else {
+                                                process_sub_code.push_str(&format!("    print $fh {};\n", process_sub_output));
+                                            }
+                                        } else {
+                                            process_sub_code.push_str(&format!("    print $fh {};\n", process_sub_output));
+                                        }
+                                        process_sub_code.push_str(&format!("    close $fh or croak \"Close failed: $ERRNO\\n\";\n"));
+                                        process_sub_code.push_str(&format!("}}\n"));
+                                        
+                                        process_sub_files.push((temp_file.clone(), process_sub_output));
+                                    }
+                                }
+                                
+                                // Use the paste generator for proper output handling
+                                let paste_output = crate::generator::commands::paste::generate_paste_command(generator, simple_cmd, &process_sub_files);
+                                format!("do {{ {} {} }}", process_sub_code, paste_output)
+                            } else {
+                                // Regular paste command without process substitution
+                                let args: Vec<String> = simple_cmd.args.iter()
+                                    .map(|arg| generator.word_to_perl(arg))
+                                    .collect();
+                                
+                                if !args.is_empty() {
+                                    format!("do {{ my $paste_result = qx{{paste {}}}; chomp $paste_result; $paste_result; }}", args.join(" "))
+                                } else {
+                                    format!("do {{ my $paste_result = qx{{paste}}; chomp $paste_result; $paste_result; }}")
+                                }
+                            }
+                        } else if name == "comm" {
+                            // Special handling for comm command with process substitution
+                            // Check if this command has process substitution redirects
+                            eprintln!("DEBUG: comm command detected, checking for process substitution");
+                            let mut has_process_sub = false;
+                            for redirect in &simple_cmd.redirects {
+                                if matches!(redirect.operator, crate::ast::RedirectOperator::ProcessSubstitutionInput(_)) {
+                                    has_process_sub = true;
+                                    eprintln!("DEBUG: comm command has process substitution redirects");
+                                    break;
+                                }
+                            }
+                            
+                            if has_process_sub {
+                                eprintln!("DEBUG: Using builtin comm command generator for process substitution");
+                                // Handle comm command with process substitution like paste command
+                                let mut process_sub_code = String::new();
+                                let mut process_sub_files = Vec::new();
+                                
+                                for redirect in &simple_cmd.redirects {
+                                    if let crate::ast::RedirectOperator::ProcessSubstitutionInput(sub_cmd) = &redirect.operator {
+                                        let temp_file_id = generator.get_unique_id();
+                                        let temp_file = format!("temp_file_ps_{}", temp_file_id);
+                                        
+                                        let process_sub_output = match sub_cmd.as_ref() {
+                                            Command::Simple(simple_sub_cmd) => {
+                                                generator.generate_simple_command(simple_sub_cmd)
+                                            }
+                                            _ => {
+                                                // For non-simple commands, we need to generate the command differently
+                                                // This is a placeholder - we may need to implement this properly
+                                                format!("\"Command not supported in process substitution\"")
+                                            }
+                                        };
+                                        
+                                        // Generate code to execute the process substitution and save to temp file
+                                        process_sub_code.push_str(&format!("my ${} = ($ENV{{TEMP}} || $ENV{{TMP}} || \"C:\\\\temp\") . '/process_sub_{}.tmp';\n", 
+                                            temp_file, temp_file_id));
+                                        process_sub_code.push_str(&format!("{{\n"));
+                                        process_sub_code.push_str(&format!("    open my $fh, '>', ${} or croak \"Cannot create temp file: $ERRNO\\n\";\n", temp_file));
+                                        process_sub_code.push_str(&format!("    my $temp_output = \"\";\n"));
+                                        process_sub_code.push_str(&format!("    $temp_output .= {};\n", process_sub_output));
+                                        process_sub_code.push_str(&format!("    print $fh $temp_output;\n"));
+                                        process_sub_code.push_str(&format!("    close $fh or croak \"Close failed: $ERRNO\\n\";\n"));
+                                        process_sub_code.push_str(&format!("}}\n"));
+                                        
+                                        process_sub_files.push((temp_file.clone(), process_sub_output));
+                                    }
+                                }
+                                
+                                // Use the comm generator for proper output handling
+                                let comm_output = crate::generator::commands::comm::generate_comm_command(generator, simple_cmd, "cmd_result", &process_sub_files);
+                                format!("do {{ {} {} }}", process_sub_code, comm_output)
+                            } else {
+                                eprintln!("DEBUG: comm command has no process substitution, using fallback");
+                                // Regular comm command without process substitution
+                                let args: Vec<String> = simple_cmd.args.iter()
+                                    .map(|arg| generator.word_to_perl(arg))
+                                    .collect();
+                                
+                                if !args.is_empty() {
+                                    format!("do {{ my $comm_result = qx{{comm {}}}; chomp $comm_result; $comm_result; }}", args.join(" "))
+                                } else {
+                                    format!("do {{ my $comm_result = qx{{comm}}; chomp $comm_result; $comm_result; }}")
+                                }
+                            }
                         } else if name == "wc" {
                             // Special handling for wc in command substitution
                             if simple_cmd.args.len() >= 1 {
@@ -788,7 +939,7 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, inte
                         if var.chars().all(|c| c.is_digit(10)) {
                             // Convert $1 to $_[0], $2 to $_[1], etc.
                             let index = var.parse::<usize>().unwrap_or(0);
-                            current_string.push_str(&format!("${{$_[{}]}}", index - 1)); // Perl arrays are 0-indexed
+                            current_string.push_str(&format!("$_[{}]", index - 1)); // Perl arrays are 0-indexed
                         } else {
                             // Regular variable - add directly for interpolation
                             current_string.push_str(&format!("${}", var));
@@ -869,8 +1020,8 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, inte
                                 current_string.push_str(&format!("${{{}}}", pe.variable));
                             }
                         } else {
-                            // Simple variable reference
-                            current_string.push_str(&format!("${{{}}}", pe.variable));
+                            // Simple variable reference - use the proper parameter expansion generation
+                            current_string.push_str(&generator.generate_parameter_expansion(pe));
                         }
                     }
                 }
