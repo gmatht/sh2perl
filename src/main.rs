@@ -14,7 +14,7 @@ use debashl::{Parser, Generator, shared_utils::SharedUtils};
 
 // Import from our new modules
 use crate::utils::generate_unified_diff;
-use crate::testing::{test_all_examples, test_all_examples_next_fail, find_uses_of_system,
+use crate::testing::{test_all_examples, test_all_examples_next_fail, test_all_examples_next_fail_unlimited, find_uses_of_system,
                     test_file_equivalence, AstFormatOptions};
 use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, parse_to_perl_inline, 
                      parse_file_to_perl, parse_system_to_perl, parse_backticks_to_perl, interactive_mode, export_mir};
@@ -29,6 +29,10 @@ fn fix_command_substitution_placeholders(mut code: String) -> String {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    main_with_args(args);
+}
+
+fn main_with_args(args: Vec<String>) {
     let program_name = &args[0];
     
     if args.len() < 2 {
@@ -46,8 +50,22 @@ fn main() {
     // Check for debug control flags early
     if command == "--debug" {
         set_debug_enabled(true);
+        // Process remaining arguments as a command
+        if args.len() > 2 {
+            let remaining_args = &args[2..];
+            let new_args = vec![args[0].clone()].into_iter().chain(remaining_args.iter().cloned()).collect::<Vec<String>>();
+            return main_with_args(new_args);
+        }
+        return;
     } else if command == "--no-debug" {
         set_debug_enabled(false);
+        // Process remaining arguments as a command
+        if args.len() > 2 {
+            let remaining_args = &args[2..];
+            let new_args = vec![args[0].clone()].into_iter().chain(remaining_args.iter().cloned()).collect::<Vec<String>>();
+            return main_with_args(new_args);
+        }
+        return;
     } else if command == "--next-fail" {
         set_debug_enabled(false);
     }
@@ -521,6 +539,7 @@ fn main() {
             // Parse optional test prefix, generator list, and AST options after fail
             let mut test_prefix: Option<String> = None;
             let mut generators = Vec::new();
+            let mut run_all_tests = false;
             let mut i = 2;
             
             // First pass: collect flags and generators
@@ -534,6 +553,12 @@ fn main() {
                     "--perl-critic" => {
                         // Handle --perl-critic flag
                         enable_perl_critic = true;
+                        i += 1;
+                        continue;
+                    }
+                    "--all" => {
+                        // Handle --all flag to run all tests
+                        run_all_tests = true;
                         i += 1;
                         continue;
                     }
@@ -555,7 +580,12 @@ fn main() {
                 generators = vec!["perl".to_string()];
             }
             
-            test_all_examples_next_fail(&generators, test_prefix, enable_perl_critic);
+            // If --all flag is specified, don't limit tests
+            if run_all_tests {
+                test_all_examples_next_fail_unlimited(&generators, test_prefix, enable_perl_critic);
+            } else {
+                test_all_examples_next_fail(&generators, test_prefix, enable_perl_critic);
+            }
         }
         _ => {
             // Handle input file option

@@ -259,8 +259,14 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
             crate::generator::commands::cat::generate_cat_command(generator, cmd, &[], output_var)
         },
         "find" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::find::generate_find_command(generator, cmd, true, output_var)
+            // Use the substitution-specific function for pipeline commands
+            let find_output = crate::generator::commands::find::generate_find_for_substitution(generator, cmd, "");
+            if !output_var.is_empty() {
+                // Assign the find output to the output variable
+                format!("${} = {};\n", output_var, find_output)
+            } else {
+                find_output
+            }
         },
         "sed" => {
             // For now, use the existing signature but we should standardize this
@@ -295,7 +301,7 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
         },
         "comm" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::comm::generate_comm_command(generator, cmd, input_var, 0)
+            crate::generator::commands::comm::generate_comm_command(generator, cmd, input_var, &[])
         },
         "diff" => {
             // For now, use the existing signature but we should standardize this
@@ -459,9 +465,9 @@ fn generate_system_call_fallback(generator: &mut Generator, command_name: &str, 
     let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
     if input_var.is_empty() {
         // First command in pipeline
-        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $!';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
+        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $!';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
     } else {
         // Subsequent command
-        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | {} {}');\nclose {} or croak 'Close failed: $!';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, input_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
+        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | {} {}');\nclose {} or croak 'Close failed: $!';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, input_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
     }
 }

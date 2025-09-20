@@ -21,8 +21,8 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             if sort_by_time {
                 output.push_str(&format!("@{} = sort {{ -M \"{}/$b\" <=> -M \"{}/$a\" }} @{};\n", array_name, dir, dir, array_name));
             } else {
-                // Use locale-aware sorting to match native ls behavior
-                output.push_str(&format!("@{} = sort @{};\n", array_name, array_name));
+                // Use case-insensitive sorting to match native ls behavior
+                output.push_str(&format!("@{} = sort {{ lc $a cmp lc $b }} @{};\n", array_name, array_name));
             }
         }
     } else {
@@ -81,8 +81,8 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
             if sort_by_time {
                 output.push_str(&format!("@{} = sort {{ -M \"{}/$b\" <=> -M \"{}/$a\" }} @{};\n", array_name, dir, dir, array_name));
             } else {
-                // Use locale-aware sorting to match native ls behavior
-                output.push_str(&format!("@{} = sort @{};\n", array_name, array_name));
+                // Use case-insensitive sorting to match native ls behavior
+                output.push_str(&format!("@{} = sort {{ lc $a cmp lc $b }} @{};\n", array_name, array_name));
             }
         }
         

@@ -646,7 +646,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("    if (grep {{ $_ eq $line }} @grep_filtered_{}) {{\n", command_index));
                 output.push_str(&format!("        push @grep_with_offset_{}, sprintf \"%d:%s\", $offset_{}, $line;\n", command_index, command_index));
                 output.push_str("    }\n");
-                output.push_str(&format!("    $offset_{} += length $line + 1; # +1 for newline\n", command_index));
+                output.push_str(&format!("    $offset_{} += length($line) + 1; # +1 for newline\n", command_index));
                 output.push_str("}\n");
                 output.push_str(&format!("$grep_result_{} = join \"\\n\", @grep_with_offset_{};\n", command_index, command_index));
             } else if show_filename && has_file_args {
@@ -711,7 +711,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
         
         // Set exit status for all grep commands
         // For quiet mode, set exit code based on whether matches were found
-        output.push_str(&format!("local $CHILD_ERROR = scalar @grep_filtered_{} > 0 ? 0 : 1;\n", command_index));
+        output.push_str(&format!("$CHILD_ERROR = scalar @grep_filtered_{} > 0 ? 0 : 1;\n", command_index));
     
     output
 }

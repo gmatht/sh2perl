@@ -57,15 +57,19 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str(&format!("my $max_lines = @paste_file1_lines_{} > @paste_file2_lines_{} ? @paste_file1_lines_{} : @paste_file2_lines_{};\n", paste_id, paste_id, paste_id, paste_id));
             result.push_str(&generator.indent());
+            result.push_str("my $paste_output = \"\";\n");
+            result.push_str(&generator.indent());
             result.push_str("for (my $i = 0; $i < $max_lines; $i++) {\n");
             result.push_str(&generator.indent());
             result.push_str(&format!("    my $line1 = $i < @paste_file1_lines_{} ? $paste_file1_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
             result.push_str(&generator.indent());
             result.push_str(&format!("    my $line2 = $i < @paste_file2_lines_{} ? $paste_file2_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
             result.push_str(&generator.indent());
-            result.push_str("    print \"$line1\\t$line2\\n\";\n");
+            result.push_str("    $paste_output .= \"$line1\\t$line2\\n\";\n");
             result.push_str(&generator.indent());
             result.push_str("}\n");
+            result.push_str(&generator.indent());
+            result.push_str("$paste_output");
         }
     } else {
         // Handle regular paste command (fallback to system)
