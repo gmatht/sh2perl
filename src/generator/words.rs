@@ -209,21 +209,38 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for perl in command substitution - execute as external command
                             eprintln!("DEBUG: Processing perl command in command substitution with args: {:?}", simple_cmd.args);
                             
-                            // Generate open3 call for perl command
-                            let unique_id = generator.get_unique_id();
-                            let in_var = format!("in_{}", unique_id);
-                            let out_var = format!("out_{}", unique_id);
-                            let err_var = format!("err_{}", unique_id);
-                            let pid_var = format!("pid_{}", unique_id);
-                            let result_var = format!("result_{}", unique_id);
-                            
-                            // Format arguments for open3
-                            let formatted_args = simple_cmd.args.iter().map(|arg| {
-                                generator.perl_string_literal(arg)
-                            }).collect::<Vec<_>>().join(", ");
-                            
-                            format!("do {{ my (${}, ${}, ${}); my ${} = open3(${}, ${}, ${}, 'perl', {}); close ${} or croak \"Close failed: $!\"; my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <${}> }}; close ${} or croak \"Close failed: $!\"; waitpid ${}, 0; chomp ${}; ${} }}", 
-                                in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var, result_var)
+                            // Check if this is a perl -e command (which has quote issues with qx{})
+                            if simple_cmd.args.len() >= 2 {
+                                if let (Word::Literal(flag, _), Word::Literal(code, _)) = (&simple_cmd.args[0], &simple_cmd.args[1]) {
+                                    if flag == "-e" {
+                                        // Use temporary file approach for perl -e commands
+                                        let temp_file = format!("temp_perl_{}.pl", std::process::id());
+                                        format!("do {{ open my $fh, '>', '{}' or croak 'Cannot create temp file: $!'; print $fh {}; close $fh; my $perl_result = qx{{perl {}}}; chomp $perl_result; unlink '{}' or carp 'Cannot remove temp file: $!'; $perl_result; }}", 
+                                            temp_file, generator.perl_string_literal(&Word::Literal(code.clone(), None)), temp_file, temp_file)
+                                    } else {
+                                        // Use qx for other perl commands
+                                        let args: Vec<String> = simple_cmd.args.iter()
+                                            .map(|arg| generator.perl_string_literal(arg))
+                                            .collect();
+                                        let command = format!("perl {}", args.join(" "));
+                                        format!("do {{ my $perl_result = qx{{{}}}; chomp $perl_result; $perl_result; }}", command)
+                                    }
+                                } else {
+                                    // Use qx for other perl commands
+                                    let args: Vec<String> = simple_cmd.args.iter()
+                                        .map(|arg| generator.perl_string_literal(arg))
+                                        .collect();
+                                    let command = format!("perl {}", args.join(" "));
+                                    format!("do {{ my $perl_result = qx{{{}}}; chomp $perl_result; $perl_result; }}", command)
+                                }
+                            } else {
+                                // Use qx for other perl commands
+                                let args: Vec<String> = simple_cmd.args.iter()
+                                    .map(|arg| generator.perl_string_literal(arg))
+                                    .collect();
+                                let command = format!("perl {}", args.join(" "));
+                                format!("do {{ my $perl_result = qx{{{}}}; chomp $perl_result; $perl_result; }}", command)
+                            }
                         } else if name == "wc" {
                             // Special handling for wc in command substitution
                             if simple_cmd.args.len() >= 1 {

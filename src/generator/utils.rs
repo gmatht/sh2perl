@@ -52,19 +52,13 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
             let needs_interpolation = s.contains('$') || s.contains('@') || s.contains('\\') || s.contains('`');
             
             if needs_interpolation {
-                // Check if the string already has proper escaping for Perl
-                if s.contains("\\\"") || s.contains("\\n") || s.contains("\\t") || s.contains("\\r") || s.contains("\"") {
-                    // String already has proper escaping, use as-is
-                    format!("\"{}\"", s)
-                } else {
-                    // Escape quotes and backslashes for Perl string literals
-                    let escaped = s.replace("\\", "\\\\")
-                                  .replace("\"", "\\\"")
-                                  .replace("\n", "\\n")
-                                  .replace("\t", "\\t")
-                                  .replace("\r", "\\r");
-                    format!("\"{}\"", escaped)
-                }
+                // Always escape quotes and backslashes for Perl string literals
+                let escaped = s.replace("\\", "\\\\")
+                              .replace("\"", "\\\"")
+                              .replace("\n", "\\n")
+                              .replace("\t", "\\t")
+                              .replace("\r", "\\r");
+                format!("\"{}\"", escaped)
             } else {
                 // Check if string contains newlines, tabs, or carriage returns
                 // If it does, we need to use double quotes with escape sequences
