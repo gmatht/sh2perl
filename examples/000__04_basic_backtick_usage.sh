@@ -87,7 +87,7 @@ echo "Line count: $line_count"
 
 # head command with backticks
 #PERL_MUST_NOT_CONTAIN `head
-head_result=`seq 1 10 | head -3`
+head_result=`seq 1 10 | head -3`:
 echo "First 3 numbers: $head_result"
 
 # tail command with backticks
@@ -321,11 +321,12 @@ get_file_size() {
     echo "File $file has $size bytes"
 }
 
-get_file_size *
+get_file_size 000__*.sh | head -5
+
 
 
 # Backticks in array
-files=(`ls -1 examples/*.sh 2>/dev/null`)
+files=(`ls -1 *.sh examples/*.sh 2>/dev/null`)
 echo "Shell scripts found: ${#files[@]}"
 for file in "${files[@]}"; do
     echo "  - $file"

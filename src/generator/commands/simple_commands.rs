@@ -731,25 +731,55 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     
                     if has_glob_patterns {
                         // Handle glob pattern expansion for function arguments
-                        let mut expanded_args = Vec::new();
+                        // In shell, glob expansion calls the function once for each matching file
+                        let mut glob_patterns = Vec::new();
+                        let mut non_glob_args = Vec::new();
+                        
                         for arg in &cmd.args {
                             match arg {
                                 Word::Literal(s, _) if s.contains('*') || s.contains('?') => {
-                                    // Expand glob pattern
-                                    expanded_args.push(format!("glob('{}')", s));
+                                    // Collect glob patterns
+                                    glob_patterns.push(s);
                                 }
                                 Word::BraceExpansion(expansion, _) => {
                                     // Handle brace expansion for command arguments
-                                    expanded_args.push(handle_brace_expansion_for_command(generator, expansion));
+                                    non_glob_args.push(handle_brace_expansion_for_command(generator, expansion));
                                 }
                                 _ => {
-                                    expanded_args.push(generator.perl_string_literal(arg));
+                                    non_glob_args.push(generator.perl_string_literal(arg));
                                 }
                             }
                         }
-                        let args_str = expanded_args.join(", ");
-                        output.push_str(&generator.indent());
-                        output.push_str(&format!("{}({});\n", name, args_str));
+                        
+                        if !glob_patterns.is_empty() {
+                            // Generate a loop that calls the function once for each file matching the glob pattern
+                            output.push_str(&generator.indent());
+                            output.push_str("for my $file (");
+                            for (i, pattern) in glob_patterns.iter().enumerate() {
+                                if i > 0 {
+                                    output.push_str(", ");
+                                }
+                                output.push_str(&format!("glob('{}')", pattern));
+                            }
+                            output.push_str(") {\n");
+                            generator.indent_level += 1;
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("{}({});\n", name, 
+                                if non_glob_args.is_empty() {
+                                    "$file".to_string()
+                                } else {
+                                    format!("$file, {}", non_glob_args.join(", "))
+                                }
+                            ));
+                            generator.indent_level -= 1;
+                            output.push_str(&generator.indent());
+                            output.push_str("}\n");
+                        } else {
+                            // No glob patterns, use the original logic
+                            let args_str = non_glob_args.join(", ");
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("{}({});\n", name, args_str));
+                        }
                     } else {
                         let args: Vec<String> = cmd.args.iter()
                             .map(|arg| {
