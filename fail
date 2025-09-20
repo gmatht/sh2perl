@@ -106,7 +106,10 @@ fi
 
 
 # Run test_purify.pl first and only continue if it passes
-if ! run_with_timeout "perl test_purify.pl --next --verbose" 300 "test_purify.pl validation"; then
+echo "Running test_purify.pl validation..." | tee -a "$LOG_FILE"
+if timeout 30 perl test_purify.pl --next --verbose 2>&1 | tee -a "$LOG_FILE"; then
+    echo "test_purify.pl passed, continuing with other commands..." | tee -a "$LOG_FILE"
+else
     echo "When fixing this failure please remember than purify.pl is just"
     echo "meant to be a thin wrapper around PPI and debashc."
     echo "In particular, if you find a bug in debashc, please fix"
@@ -115,8 +118,6 @@ if ! run_with_timeout "perl test_purify.pl --next --verbose" 300 "test_purify.pl
     echo "test_purify.pl failed, aborting other commands"
     exit 1
 fi
-
-echo "test_purify.pl passed, continuing with other commands..."
 
 # Check if we made progress and commit if so
 if [ -f "first_n_tests_passed.txt" ]; then
