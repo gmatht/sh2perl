@@ -5,6 +5,7 @@ use crate::generator::commands::system_commands::word_to_bash_string_for_system;
 
 /// Handle Perl commands by embedding the Perl code directly
 pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
+    eprintln!("DEBUG: generate_perl_command called with args: {:?}", cmd.args);
     let mut output = String::new();
     
     if cmd.args.len() >= 2 {
@@ -22,12 +23,14 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                 };
 
                 if let Some(perl_code) = perl_code {
+                    eprintln!("DEBUG: Found perl code: {}", perl_code);
                     // Clean up the Perl code - remove outer quotes if present
                     let mut clean_code = perl_code.clone();
                     if (clean_code.starts_with('"') && clean_code.ends_with('"')) ||
                        (clean_code.starts_with('\'') && clean_code.ends_with('\'')) {
                         clean_code = clean_code[1..clean_code.len()-1].to_string();
                     }
+                    eprintln!("DEBUG: Clean perl code: {}", clean_code);
                     
                     // Don't interpret backslash escapes for Perl code - keep them as-is
                     // The Perl interpreter will handle them correctly
@@ -48,6 +51,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                     // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
                     output.push_str("if (!defined $ENV{SHELL_VAR}) { local $ENV{SHELL_VAR} = q{}; }\n");
                     
+                    eprintln!("DEBUG: About to execute perl code lines");
                     // Execute the perl code - split by newlines and add proper indentation
                     for line in clean_code.lines() {
                         let trimmed_line = line.trim();
@@ -71,6 +75,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                             }
                         }
                     }
+                    eprintln!("DEBUG: Returning perl output: {}", output);
                     return output;
                 }
             } else if flag == "-ne" {

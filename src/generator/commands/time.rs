@@ -10,8 +10,11 @@ pub fn generate_time_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     output.push_str("my $start_time = [gettimeofday];\n");
     
     // Execute the command (if any arguments provided)
-    if let Some(command) = cmd.args.first() {
-        let command_str = generator.word_to_perl(command);
+    if !cmd.args.is_empty() {
+        let args: Vec<String> = cmd.args.iter()
+            .map(|arg| generator.word_to_perl(arg))
+            .collect();
+        let command_str = args.join(" ");
         output.push_str(&format!("system {};\n", command_str));
     }
     

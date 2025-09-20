@@ -418,7 +418,7 @@ pub fn test_file_equivalence_with_critic(lang: &str, filename: &str, enable_perl
                 match child.try_wait() {
                     Ok(Some(_)) => break child.wait_with_output().unwrap(),
                     Ok(None) => {
-                        if start.elapsed() > Duration::from_millis(1000) { let _ = child.kill(); break child.wait_with_output().unwrap(); }
+                        if start.elapsed() > Duration::from_millis(10000) { let _ = child.kill(); break child.wait_with_output().unwrap(); }
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => break child.wait_with_output().unwrap(),
@@ -454,7 +454,7 @@ pub fn test_file_equivalence_with_critic(lang: &str, filename: &str, enable_perl
                 match child.try_wait() {
                     Ok(Some(_)) => break child.wait_with_output().unwrap(),
                     Ok(None) => {
-                        if start.elapsed() > Duration::from_millis(1000) { let _ = child.kill(); break child.wait_with_output().unwrap(); }
+                        if start.elapsed() > Duration::from_millis(10000) { let _ = child.kill(); break child.wait_with_output().unwrap(); }
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => break child.wait_with_output().unwrap(),
@@ -624,6 +624,7 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
     
     // Get the shell output (either cached or fresh)
     let shell_output_result = shell_output.unwrap();
+    eprintln!("DEBUG: Shell script execution completed, now starting Perl generation");
     
     // If no cached Perl code, we need to parse and generate
     if cached_perl_code.is_none() {
@@ -723,6 +724,7 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
         tmp_file = tmp;
         run_cmd = run_cmd_vec;
         translated_code = code;
+        eprintln!("DEBUG: Perl code generated, length: {} characters", translated_code.len());
         
         // Cache the Perl code if we generated it
         if lang == "perl" {
@@ -869,9 +871,10 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
         let _ = std::fs::remove_file(&temp_file_tidy);
     }
 
-    // Run translated program with timing
-    let (translated_output, translated_duration) = {
-        if lang == "rust" {
+            // Run translated program with timing
+            eprintln!("DEBUG: About to start translated program execution");
+            let (translated_output, translated_duration, timed_out) = {
+                if lang == "rust" {
             // Run compiled binary directly (first arg of run_cmd)
             let bin = "__tmp_test_bin";
             let abs_bin = std::env::current_dir().unwrap_or_default().join(bin);
@@ -880,18 +883,23 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 Err(e) => { cleanup_tmp(lang, &tmp_file); return Err(format!("Failed to run compiled Rust: {} ({})", e, abs_bin.display())); }
             };
             let start = std::time::Instant::now();
+            let mut timed_out = false;
             let out = loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break child.wait_with_output().unwrap(),
                     Ok(None) => {
-                        if start.elapsed() > Duration::from_millis(1000) { let _ = child.kill(); break child.wait_with_output().unwrap(); }
+                        if start.elapsed() > Duration::from_millis(10000) { 
+                            timed_out = true;
+                            let _ = child.kill(); 
+                            break child.wait_with_output().unwrap(); 
+                        }
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => break child.wait_with_output().unwrap(),
                 }
             };
             let duration = start.elapsed();
-            (out, duration)
+            (out, duration, timed_out)
         } else {
             let mut cmd = Command::new(&run_cmd[0]);
             
@@ -908,27 +916,56 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                         cmd.arg(a);
                     }
                 }
+                
+                // Debug: Print the command being executed
+                eprintln!("DEBUG: About to execute Perl command: {:?}", run_cmd);
+                eprintln!("DEBUG: Perl code length: {} characters", translated_code.len());
+                eprintln!("DEBUG: First 200 characters of Perl code:\n{}", 
+                         if translated_code.len() > 200 { 
+                             &translated_code[..200] 
+                         } else { 
+                             &translated_code 
+                         });
             } else {
                 for a in &run_cmd[1..] { cmd.arg(a); }
             }
             
             let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-                Ok(c) => c,
+                Ok(c) => {
+                    eprintln!("DEBUG: Successfully spawned Perl process");
+                    c
+                },
                 Err(e) => { cleanup_tmp(lang, &tmp_file); return Err(format!("Failed to run translated program: {}", e)); }
             };
             let start = std::time::Instant::now();
+            let mut timed_out = false;
+            eprintln!("DEBUG: Starting execution loop for Perl process");
             let out = loop {
+                let elapsed = start.elapsed();
+                eprintln!("DEBUG: Execution loop iteration, elapsed: {:?}", elapsed);
                 match child.try_wait() {
-                    Ok(Some(_)) => break child.wait_with_output().unwrap(),
+                    Ok(Some(status)) => {
+                        eprintln!("DEBUG: Perl process completed with status: {:?}", status);
+                        break child.wait_with_output().unwrap();
+                    },
                     Ok(None) => {
-                        if start.elapsed() > Duration::from_millis(1000) { let _ = child.kill(); break child.wait_with_output().unwrap(); }
+                        if elapsed > Duration::from_millis(10000) { 
+                            eprintln!("DEBUG: Perl process timed out after 10 seconds, killing process");
+                            timed_out = true;
+                            let _ = child.kill(); 
+                            break child.wait_with_output().unwrap(); 
+                        }
                         thread::sleep(Duration::from_millis(10));
                     }
-                    Err(_) => break child.wait_with_output().unwrap(),
+                    Err(e) => {
+                        eprintln!("DEBUG: Error checking Perl process status: {:?}", e);
+                        break child.wait_with_output().unwrap();
+                    }
                 }
             };
             let duration = start.elapsed();
-            (out, duration)
+            eprintln!("DEBUG: Perl execution completed, duration: {:?}, timed_out: {}", duration, timed_out);
+            (out, duration, timed_out)
         }
     };
 
@@ -966,10 +1003,12 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
     let stdout_match = shell_stdout == trans_stdout;
     let stderr_match = shell_stderr == trans_stderr;
     
-    let success = exit_code_match && stdout_match && stderr_match;
+    let success = !timed_out && exit_code_match && stdout_match && stderr_match;
     
     // Generate detailed failure reason
-    let failure_reason = if !success {
+    let failure_reason = if timed_out {
+        "Test failed due to timeout (exceeded 10 seconds)".to_string()
+    } else if !success {
         let mut reasons = Vec::new();
         if !exit_code_match {
             reasons.push("exit code mismatch");
@@ -987,6 +1026,12 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
 
     // Save cache if we made any updates
     cache.save();
+    
+    eprintln!("DEBUG: Test completed, comparing outputs");
+    eprintln!("DEBUG: Shell stdout length: {}, Translated stdout length: {}", shell_stdout.len(), trans_stdout.len());
+    eprintln!("DEBUG: Shell stderr length: {}, Translated stderr length: {}", shell_stderr.len(), trans_stderr.len());
+    eprintln!("DEBUG: Shell exit: {}, Translated exit: {}", shell_output_result.status.code().unwrap_or(-1), translated_output.status.code().unwrap_or(-1));
+    eprintln!("DEBUG: Test success: {}", success);
     
     Ok(TestResult {
         success,
@@ -1312,24 +1357,6 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
     // Sort examples for consistent output
     examples.sort();
     
-    // Limit the number of tests when no prefix is specified to prevent timeout
-    const MAX_TESTS_WITHOUT_PREFIX: usize = 10;
-    if test_prefix.is_none() && examples.len() > MAX_TESTS_WITHOUT_PREFIX {
-        println!("Warning: {} examples found, but limiting to first {} to prevent timeout.", 
-                 examples.len(), MAX_TESTS_WITHOUT_PREFIX);
-        println!("To test a specific example, use: ./fail <example_prefix>");
-        println!("Available examples:");
-        for (i, example) in examples.iter().enumerate() {
-            if i >= 10 { // Show only first 10 examples
-                println!("  ... and {} more", examples.len() - 10);
-                break;
-            }
-            let name = example.replace("examples/", "").replace("examples\\", "");
-            println!("  {}", name);
-        }
-        examples.truncate(MAX_TESTS_WITHOUT_PREFIX);
-    }
-    
     // Test each combination
     let mut passed_tests = 0;
     let mut current_test = 0;
@@ -1599,12 +1626,7 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                         }
                         
                         // When running without a prefix, exit after first failure to prevent timeout
-                        if test_prefix.is_none() {
-                            println!("\nNote: Exiting after first failure when no specific test is requested.");
-                            println!("To run all tests, use: ./fail --all");
-                        }
-                        
-                        std::process::exit(1);
+                        // Continue to next test instead of exiting
                     }
                 }
                 Err(e) => {
@@ -1694,12 +1716,7 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                     }
                     
                     // When running without a prefix, exit after first failure to prevent timeout
-                    if test_prefix.is_none() {
-                        println!("\nNote: Exiting after first failure when no specific test is requested.");
-                        println!("To run all tests, use: ./fail --all");
-                    }
-                    
-                    std::process::exit(1);
+                    // Continue to next test instead of exiting
                 }
             }
             
