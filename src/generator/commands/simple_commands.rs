@@ -356,6 +356,39 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     }
                 }
             }
+        } else if name == "sort" {
+            // Handle sort command - check if this is in process substitution context
+            let command_index = generator.get_unique_id();
+            let output_var = format!("sort_output_{}", command_index);
+            
+            // Determine the input source - if there are file arguments, use the first one as input
+            let (input_var, file_reading_code) = if !cmd.args.is_empty() {
+                // If there are arguments, assume the first one is the file to sort
+                match &cmd.args[0] {
+                    Word::Literal(filename, _) => {
+                        // Read from file - generate a proper variable assignment
+                        let file_var = format!("file_content_{}", command_index);
+                        let reading_code = format!("my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', '{}' or croak \"Cannot open file: $!\"; <$fh> }};", file_var, filename);
+                        (format!("${}", file_var), reading_code)
+                    }
+                    _ => {
+                        // Fallback to input_data
+                        ("$input_data".to_string(), String::new())
+                    }
+                }
+            } else {
+                // No arguments, use input_data
+                ("$input_data".to_string(), String::new())
+            };
+            
+            // Add file reading code if needed
+            if !file_reading_code.is_empty() {
+                output.push_str(&file_reading_code);
+                output.push_str("\n");
+            }
+            
+            let sort_output = crate::generator::commands::sort::generate_sort_command_with_output(generator, cmd, &input_var, &command_index, &output_var);
+            output.push_str(&sort_output);
         } else if name == "echo" {
             // Use the echo command generator for non-pipeline echo commands
             if generator.inline_mode {

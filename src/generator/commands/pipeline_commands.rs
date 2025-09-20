@@ -754,6 +754,8 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str("my $output_1 = q{};\n");
                 output.push_str(&generator.indent());
+                output.push_str(&format!("my $cmd_result_{} = q{{}};\n", unique_id));
+                output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
                 generator.indent_level += 1;
                 
@@ -762,6 +764,23 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&format!("my $line = {};\n", string_to_repeat));
                 output.push_str(&generator.indent());
                 output.push_str("$output_6 .= $line . \"\\n\";\n");
+                
+                // Check if we have a head command and if we've reached the limit
+                if pipeline.commands.iter().any(|cmd| {
+                    if let Command::Simple(simple_cmd) = cmd {
+                        if let Word::Literal(name, _) = &simple_cmd.name {
+                            name == "head"
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }) {
+                    output.push_str(&generator.indent());
+                    output.push_str("if ($head_line_count >= 3) { last; }\n");
+                }
+                
                 start_index = 1; // Skip the yes command in the loop below
                 
                 // Process the remaining commands in the loop
@@ -784,9 +803,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                     output.push_str("\n");
                                 }
                                 
-                                // Add break condition after head command
-                                output.push_str(&generator.indent());
-                                output.push_str("if ($head_line_count >= 3) { last; }\n");
+                                // Break condition is now checked at the beginning of the loop
                             } else {
                                 // Generate line-by-line version of each command
                                 let command_output = generate_linebyline_command(generator, cmd, "line", start_index + i);
@@ -1091,9 +1108,11 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
                 
-                // Set the result variable to the output
+                // Return the output directly
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$cmd_result_{} = $output_1;\n", unique_id));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$cmd_result_{}", unique_id));
                 
                 return output; // Return early since we've handled everything
             } else if name == "cat" && !first_cmd.args.is_empty() {

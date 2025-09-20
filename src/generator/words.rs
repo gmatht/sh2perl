@@ -205,6 +205,25 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     format!("do {{ my $comm_result = qx{{comm}}; chomp $comm_result; $comm_result; }}")
                                 }
                             }
+                        } else if name == "perl" {
+                            // Special handling for perl in command substitution - execute as external command
+                            eprintln!("DEBUG: Processing perl command in command substitution with args: {:?}", simple_cmd.args);
+                            
+                            // Generate open3 call for perl command
+                            let unique_id = generator.get_unique_id();
+                            let in_var = format!("in_{}", unique_id);
+                            let out_var = format!("out_{}", unique_id);
+                            let err_var = format!("err_{}", unique_id);
+                            let pid_var = format!("pid_{}", unique_id);
+                            let result_var = format!("result_{}", unique_id);
+                            
+                            // Format arguments for open3
+                            let formatted_args = simple_cmd.args.iter().map(|arg| {
+                                generator.perl_string_literal(arg)
+                            }).collect::<Vec<_>>().join(", ");
+                            
+                            format!("my (${}, ${}, ${});\nmy ${} = open3(${}, ${}, ${}, 'perl', {});\nclose ${} or croak 'Close failed: $!';\nmy ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <${}> }};\nclose ${} or croak 'Close failed: $!';\nwaitpid ${}, 0;\nchomp ${};\n${}", 
+                                in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var, result_var)
                         } else if name == "wc" {
                             // Special handling for wc in command substitution
                             if simple_cmd.args.len() >= 1 {

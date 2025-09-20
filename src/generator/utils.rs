@@ -298,8 +298,11 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             time_output.push_str("my $start_time = [gettimeofday];\n");
                             
                             // Execute the command (if any arguments provided)
-                            if let Some(command) = simple_cmd.args.first() {
-                                let command_str = generator.word_to_perl(command);
+                            if !simple_cmd.args.is_empty() {
+                                let args: Vec<String> = simple_cmd.args.iter()
+                                    .map(|arg| generator.word_to_perl(arg))
+                                    .collect();
+                                let command_str = args.join(" ");
                                 time_output.push_str(&format!("system {};\n", command_str));
                             }
                             

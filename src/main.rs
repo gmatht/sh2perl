@@ -14,7 +14,7 @@ use debashl::{Parser, Generator, shared_utils::SharedUtils};
 
 // Import from our new modules
 use crate::utils::generate_unified_diff;
-use crate::testing::{test_all_examples, test_all_examples_next_fail, test_all_examples_next_fail_unlimited, find_uses_of_system,
+use crate::testing::{test_all_examples, test_all_examples_next_fail_unlimited, find_uses_of_system,
                     test_file_equivalence, AstFormatOptions};
 use crate::cli_commands::{run_generated, lex_input, parse_input, parse_file, parse_to_perl, parse_to_perl_inline, 
                      parse_file_to_perl, parse_system_to_perl, parse_backticks_to_perl, interactive_mode, export_mir};
@@ -269,7 +269,7 @@ fn main_with_args(args: Vec<String>) {
                 generators = vec!["perl".to_string()];
             }
             
-            test_all_examples_next_fail(&generators, test_prefix, enable_perl_critic);
+            test_all_examples_next_fail_unlimited(&generators, test_prefix, enable_perl_critic);
         }
         "--clear-cache" => {
             // Clear the unified command cache
@@ -539,7 +539,6 @@ fn main_with_args(args: Vec<String>) {
             // Parse optional test prefix, generator list, and AST options after fail
             let mut test_prefix: Option<String> = None;
             let mut generators = Vec::new();
-            let mut run_all_tests = false;
             let mut i = 2;
             
             // First pass: collect flags and generators
@@ -553,12 +552,6 @@ fn main_with_args(args: Vec<String>) {
                     "--perl-critic" => {
                         // Handle --perl-critic flag
                         enable_perl_critic = true;
-                        i += 1;
-                        continue;
-                    }
-                    "--all" => {
-                        // Handle --all flag to run all tests
-                        run_all_tests = true;
                         i += 1;
                         continue;
                     }
@@ -580,12 +573,8 @@ fn main_with_args(args: Vec<String>) {
                 generators = vec!["perl".to_string()];
             }
             
-            // If --all flag is specified, don't limit tests
-            if run_all_tests {
-                test_all_examples_next_fail_unlimited(&generators, test_prefix, enable_perl_critic);
-            } else {
-                test_all_examples_next_fail(&generators, test_prefix, enable_perl_critic);
-            }
+            // Always run all tests (no limits)
+            test_all_examples_next_fail_unlimited(&generators, test_prefix, enable_perl_critic);
         }
         _ => {
             // Handle input file option
