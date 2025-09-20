@@ -148,41 +148,39 @@ pub fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCom
         i += 1;
     }
     
-    // Generate simple Perl code wrapped in a do block that returns the result
+    // Generate recursive Perl code using File::Find
     let unique_id = generator.get_unique_id();
-    let mut result = format!("do {{\n    my @files_{} = ();\n", unique_id);
+    let mut result = format!("do {{\n    use File::Find;\n    use File::Basename;\n    my @files_{} = ();\n", unique_id);
     result.push_str(&format!("    my $start_{} = q{{{}}};\n", unique_id, start_path));
     
-    if let Some(pattern) = name_pattern {
-        let glob_pattern = pattern.replace("*", ".*");
-        result.push_str(&format!("    if (opendir my $dh_{}, $start_{}) {{\n", unique_id, unique_id));
-        result.push_str(&format!("        for my $file_{} (readdir $dh_{}) {{\n", unique_id, unique_id));
-        result.push_str(&format!("            next if $file_{} =~ m/^[.][.]?$/xms;\n", unique_id));
-        if let Some(ftype) = file_type {
-            if ftype == "f" {
-                result.push_str(&format!("            if (not -f qq{{$start_{}/$file_{}}}) {{\n                next;\n            }}\n", unique_id, unique_id));
-            }
+    // Create a recursive find function
+    result.push_str(&format!("    sub find_files_{} {{\n", unique_id));
+    result.push_str(&format!("        my $file_{} = $File::Find::name;\n", unique_id));
+    
+    if let Some(ftype) = &file_type {
+        if ftype == "f" {
+            result.push_str(&format!("        return unless -f $file_{};\n", unique_id));
+        } else if ftype == "d" {
+            result.push_str(&format!("        return unless -d $file_{};\n", unique_id));
         }
-        result.push_str(&format!("            if ($file_{} =~ m/^{}$/xms) {{\n                push @files_{}, qq{{$start_{}/$file_{}}};\n            }}\n", 
-                                unique_id, glob_pattern, unique_id, unique_id, unique_id));
-        result.push_str(&format!("        }}\n"));
-        result.push_str(&format!("        closedir $dh_{};\n", unique_id));
-        result.push_str("    }\n");
-    } else {
-        result.push_str(&format!("    if (opendir my $dh_{}, $start_{}) {{\n", unique_id, unique_id));
-        result.push_str(&format!("        for my $file_{} (readdir $dh_{}) {{\n", unique_id, unique_id));
-        result.push_str(&format!("            next if $file_{} =~ m/^[.][.]?$/xms;\n", unique_id));
-        if let Some(ftype) = file_type {
-            if ftype == "f" {
-                result.push_str(&format!("            if (not -f qq{{$start_{}/$file_{}}}) {{\n                next;\n            }}\n", unique_id, unique_id));
-            }
-        }
-        result.push_str(&format!("            push @files_{}, qq{{$start_{}/$file_{}}};\n", unique_id, unique_id, unique_id));
-        result.push_str(&format!("        }}\n"));
-        result.push_str(&format!("        closedir $dh_{};\n", unique_id));
-        result.push_str("    }\n");
     }
     
+    if let Some(pattern) = &name_pattern {
+        let glob_pattern = pattern.replace("*", ".*");
+        let filename = if pattern.contains('/') {
+            // If pattern contains path separators, match against full path
+            format!("$file_{}", unique_id)
+        } else {
+            // If pattern doesn't contain path separators, match against basename
+            format!("basename($file_{})", unique_id)
+        };
+        result.push_str(&format!("        return unless {} =~ m/^{}$/xms;\n", filename, glob_pattern));
+    }
+    
+    result.push_str(&format!("        push @files_{}, $file_{};\n", unique_id, unique_id));
+    
+    result.push_str("    }\n");
+    result.push_str(&format!("    find(\\&find_files_{}, $start_{});\n", unique_id, unique_id));
     result.push_str(&format!("    join \"\\n\", @files_{};\n}}", unique_id));
     result
 }
