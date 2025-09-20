@@ -765,22 +765,6 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str("$output_6 .= $line . \"\\n\";\n");
                 
-                // Check if we have a head command and if we've reached the limit
-                if pipeline.commands.iter().any(|cmd| {
-                    if let Command::Simple(simple_cmd) = cmd {
-                        if let Word::Literal(name, _) = &simple_cmd.name {
-                            name == "head"
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                }) {
-                    output.push_str(&generator.indent());
-                    output.push_str("if ($head_line_count >= 3) { last; }\n");
-                }
-                
                 start_index = 1; // Skip the yes command in the loop below
                 
                 // Process the remaining commands in the loop
@@ -803,7 +787,9 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                     output.push_str("\n");
                                 }
                                 
-                                // Break condition is now checked at the beginning of the loop
+                                // Add break condition after head command processing
+                                output.push_str(&generator.indent());
+                                output.push_str("if ($head_line_count >= 3) { last; }\n");
                             } else {
                                 // Generate line-by-line version of each command
                                 let command_output = generate_linebyline_command(generator, cmd, "line", start_index + i);

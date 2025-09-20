@@ -27,11 +27,19 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 // Convert ls command to native Perl glob
                                 let args = cmd_text.strip_prefix("ls ").unwrap_or("");
                                 if args.contains("*.sh") {
-                                    // Handle glob pattern
-                                    let pattern = args.split_whitespace()
-                                        .find(|arg| arg.contains("*.sh"))
-                                        .unwrap_or("*.sh");
-                                    format!("glob '{}'", pattern)
+                                    // Handle multiple glob patterns
+                                    let patterns: Vec<&str> = args.split_whitespace()
+                                        .filter(|arg| arg.contains("*.sh"))
+                                        .collect();
+                                    if patterns.len() == 1 {
+                                        format!("glob '{}'", patterns[0])
+                                    } else {
+                                        // Multiple patterns - combine them
+                                        let glob_exprs: Vec<String> = patterns.iter()
+                                            .map(|pattern| format!("glob '{}'", pattern))
+                                            .collect();
+                                        format!("map {{ glob '{}' }} ('{}')", "{}", patterns.join("', '"))
+                                    }
                                 } else {
                                     // Fallback for other ls commands - use native Perl
                                     format!("do {{ use File::Find; my @files; find(sub {{ push @files, $File::Find::name if -f }}, '.'); @files }}")
@@ -713,20 +721,51 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&generator.indent());
                     output.push_str(&format!("{}();\n", name));
                 } else {
-                    let args: Vec<String> = cmd.args.iter()
-                        .map(|arg| {
+                    // Check if any argument contains glob patterns
+                    let has_glob_patterns = cmd.args.iter().any(|arg| {
+                        match arg {
+                            Word::Literal(s, _) => s.contains('*') || s.contains('?'),
+                            _ => false
+                        }
+                    });
+                    
+                    if has_glob_patterns {
+                        // Handle glob pattern expansion for function arguments
+                        let mut expanded_args = Vec::new();
+                        for arg in &cmd.args {
                             match arg {
+                                Word::Literal(s, _) if s.contains('*') || s.contains('?') => {
+                                    // Expand glob pattern
+                                    expanded_args.push(format!("glob('{}')", s));
+                                }
                                 Word::BraceExpansion(expansion, _) => {
                                     // Handle brace expansion for command arguments
-                                    handle_brace_expansion_for_command(generator, expansion)
+                                    expanded_args.push(handle_brace_expansion_for_command(generator, expansion));
                                 }
-                                _ => generator.perl_string_literal(arg)
+                                _ => {
+                                    expanded_args.push(generator.perl_string_literal(arg));
+                                }
                             }
-                        })
-                        .collect();
-                    let args_str = args.join(", ");
-                    output.push_str(&generator.indent());
-                    output.push_str(&format!("{}({});\n", name, args_str));
+                        }
+                        let args_str = expanded_args.join(", ");
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("{}({});\n", name, args_str));
+                    } else {
+                        let args: Vec<String> = cmd.args.iter()
+                            .map(|arg| {
+                                match arg {
+                                    Word::BraceExpansion(expansion, _) => {
+                                        // Handle brace expansion for command arguments
+                                        handle_brace_expansion_for_command(generator, expansion)
+                                    }
+                                    _ => generator.perl_string_literal(arg)
+                                }
+                            })
+                            .collect();
+                        let args_str = args.join(", ");
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("{}({});\n", name, args_str));
+                    }
                 }
             } else {
                 // System call fallback
