@@ -454,6 +454,30 @@ pub fn generate_generic_builtin(generator: &mut Generator, cmd: &SimpleCommand, 
 
 /// Generate a system call fallback for unknown commands
 fn generate_system_call_fallback(generator: &mut Generator, command_name: &str, cmd: &SimpleCommand, input_var: &str, output_var: &str) -> String {
+    // Check if this is a function call with glob patterns
+    if generator.declared_functions.contains(command_name) {
+        let has_glob_patterns = cmd.args.iter().any(|arg| {
+            match arg {
+                Word::Literal(s, _) => s.contains('*') || s.contains('?'),
+                _ => false
+            }
+        });
+        
+        if has_glob_patterns {
+            // Handle glob pattern expansion for function calls
+            let mut output = String::new();
+            output.push_str(&generator.indent());
+            output.push_str(&format!("for my $file (glob('{}')) {{\n", cmd.args[0].as_literal().unwrap_or("*")));
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str(&format!("{}($file);\n", command_name));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+            return output;
+        }
+    }
+    
     let args: Vec<String> = cmd.args.iter()
         .filter_map(|arg| match arg {
             Word::Literal(s, _) => Some(s.clone()),
