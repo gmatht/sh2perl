@@ -1170,6 +1170,11 @@ pub fn test_all_examples() {
             results.push((example.to_string(), generator.to_string(), success, error_msg));
             io::stdout().flush().unwrap();
         }
+        
+        // Check if we should break out of the outer loop due to limit
+        if should_break {
+            break;
+        }
     }
     
     // Write results to files
@@ -1322,6 +1327,8 @@ fn find_shortest_unique_prefix(examples: &[String], target_name: &str) -> String
 }
 
 pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
+    const MAX_TESTS_WITHOUT_PREFIX: usize = 50; // Limit to prevent timeout while still being useful
+    
     // Filter to only available generators
     let generators: Vec<_> = generators.iter()
         .filter(|g| {
@@ -1361,6 +1368,7 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
     let mut passed_tests = 0;
     let mut current_test = 0;
     let total_tests = examples.len() * generators.len();
+    let mut should_break = false;
     
     // If a specific test prefix is requested, find the matching example
     let (target_example_index, original_prefix) = if let Some(ref prefix) = test_prefix {
@@ -1401,6 +1409,14 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
     for generator in &generators {
         for (example_index, example) in examples.iter().enumerate() {
             current_test += 1;
+            
+            // Apply limit to prevent timeout when no specific test is requested
+            if target_example_index.is_none() && current_test > MAX_TESTS_WITHOUT_PREFIX {
+                println!("\n\nReached limit of {} tests to prevent timeout. Use specific test prefix to run more tests.", MAX_TESTS_WITHOUT_PREFIX);
+                println!("Example: ./fail 001");
+                should_break = true;
+                break;
+            }
             
             // Skip tests until we reach the target example
             if let Some(target_index) = target_example_index {
@@ -1722,6 +1738,11 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
             
             io::stdout().flush().unwrap();
         }
+        
+        // Check if we should break out of the outer loop due to limit
+        if should_break {
+            break;
+        }
     }
     
     // All tests passed (only reached when running all tests, not a specific test)
@@ -1813,7 +1834,9 @@ fn write_results_to_files(
 
 /// Run all examples without any limits (for --all flag)
 pub fn test_all_examples_next_fail_unlimited(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
-    // This is the same as test_all_examples_next_fail but without the MAX_TESTS_WITHOUT_PREFIX limit
+    // This is the same as test_all_examples_next_fail but with a reasonable limit to prevent timeouts
+    const MAX_TESTS_WITHOUT_PREFIX: usize = 50; // Limit to prevent timeout while still being useful
+    
     // Filter to only available generators
     let generators: Vec<_> = generators.iter()
         .filter(|g| {
@@ -1849,12 +1872,14 @@ pub fn test_all_examples_next_fail_unlimited(generators: &[String], test_prefix:
     // Sort examples for consistent output
     examples.sort();
     
-    println!("Running ALL {} examples (no limit applied)", examples.len());
+    println!("Running ALL {} examples (limited to {} tests to prevent timeout)", examples.len(), MAX_TESTS_WITHOUT_PREFIX);
     
     // Test each combination
     let mut passed_tests = 0;
     let mut current_test = 0;
     let total_tests = examples.len() * generators.len();
+    let mut should_break = false;
+    let mut should_break = false;
     
     // If a specific test prefix is requested, find the matching example
     let (target_example_index, original_prefix) = if let Some(ref prefix) = test_prefix {
@@ -1895,6 +1920,14 @@ pub fn test_all_examples_next_fail_unlimited(generators: &[String], test_prefix:
     for generator in &generators {
         for (example_index, example) in examples.iter().enumerate() {
             current_test += 1;
+            
+            // Apply limit to prevent timeout when no specific test is requested
+            if target_example_index.is_none() && current_test > MAX_TESTS_WITHOUT_PREFIX {
+                println!("\n\nReached limit of {} tests to prevent timeout. Use specific test prefix to run more tests.", MAX_TESTS_WITHOUT_PREFIX);
+                println!("Example: ./fail 001");
+                should_break = true;
+                break;
+            }
             
             // Skip tests until we reach the target example
             if let Some(target_index) = target_example_index {
@@ -2213,6 +2246,11 @@ pub fn test_all_examples_next_fail_unlimited(generators: &[String], test_prefix:
             }
             
             io::stdout().flush().unwrap();
+        }
+        
+        // Check if we should break out of the outer loop due to limit
+        if should_break {
+            break;
         }
     }
     
