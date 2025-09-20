@@ -222,7 +222,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 generator.perl_string_literal(arg)
                             }).collect::<Vec<_>>().join(", ");
                             
-                            format!("my (${}, ${}, ${});\nmy ${} = open3(${}, ${}, ${}, 'perl', {});\nclose ${} or croak 'Close failed: $!';\nmy ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <${}> }};\nclose ${} or croak 'Close failed: $!';\nwaitpid ${}, 0;\nchomp ${};\n${}", 
+                            format!("do {{ my (${}, ${}, ${}); my ${} = open3(${}, ${}, ${}, 'perl', {}); close ${} or croak \"Close failed: $!\"; my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <${}> }}; close ${} or croak \"Close failed: $!\"; waitpid ${}, 0; chomp ${}; ${} }}", 
                                 in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var, result_var)
                         } else if name == "wc" {
                             // Special handling for wc in command substitution
