@@ -196,7 +196,12 @@ fn main_with_args(args: Vec<String>) {
                         println!("\n--- Running generated Perl code ---");
                         let tmp = "__tmp_run.pl";
                         if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
-                            let _ = std::process::Command::new("perl").arg(tmp).status();
+                            let mut cmd = std::process::Command::new("perl");
+                            cmd.arg(tmp);
+                            // Run Perl from the examples directory to match the file path adjustments
+                            let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
+                            cmd.current_dir(&examples_dir);
+                            let _ = cmd.status();
                             let _ = fs::remove_file(tmp);
                         }
                     }
@@ -611,7 +616,12 @@ fn main_with_args(args: Vec<String>) {
                             println!("\n--- Running generated Perl code ---");
                             let tmp = "__tmp_run.pl";
                             if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
-                                let _ = std::process::Command::new("perl").arg(tmp).status();
+                                let mut cmd = std::process::Command::new("perl");
+                                cmd.arg(tmp);
+                                // Run Perl from the examples directory to match the file path adjustments
+                                let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
+                                cmd.current_dir(&examples_dir);
+                                let _ = cmd.status();
                                 let _ = fs::remove_file(tmp);
                             }
                         }
@@ -655,7 +665,12 @@ fn main_with_args(args: Vec<String>) {
                             if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
                                 // Time the Perl execution
                                 let perl_start = std::time::Instant::now();
-                                let perl_output = std::process::Command::new("perl").arg(tmp).output();
+                                let mut cmd = std::process::Command::new("perl");
+                                cmd.arg(tmp);
+                                // Run Perl from the examples directory to match the file path adjustments
+                                let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
+                                cmd.current_dir(&examples_dir);
+                                let perl_output = cmd.output();
                                 let perl_duration = perl_start.elapsed();
                                 
                                 // Time the bash execution
@@ -826,7 +841,12 @@ fn main_with_args(args: Vec<String>) {
                                 
                                 // Time the Perl execution
                                 let perl_start = std::time::Instant::now();
-                                let perl_output = std::process::Command::new("perl").arg(tmp_file).output();
+                                let mut cmd = std::process::Command::new("perl");
+                                cmd.arg(tmp_file);
+                                // Run Perl from the examples directory to match the file path adjustments
+                                let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
+                                cmd.current_dir(&examples_dir);
+                                let perl_output = cmd.output();
                                 let perl_duration = perl_start.elapsed();
                                 
                                 // Time the bash execution
@@ -952,7 +972,12 @@ fn main_with_args(args: Vec<String>) {
                             
                             // Time the Perl execution
                             let perl_start = std::time::Instant::now();
-                            let perl_output = std::process::Command::new("perl").arg(tmp_file).output();
+                            let mut cmd = std::process::Command::new("perl");
+                            cmd.arg(tmp_file);
+                            // Run Perl from the examples directory to match the file path adjustments
+                            let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
+                            cmd.current_dir(&examples_dir);
+                            let perl_output = cmd.output();
                             let perl_duration = perl_start.elapsed();
                             
                             // Time the bash execution
