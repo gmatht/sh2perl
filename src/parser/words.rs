@@ -44,11 +44,11 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
     // and also handles find arguments like "+1M" by combining Plus + Number + Identifier
-    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star)) {
+    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star) | Some(Token::Percent)) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
-                Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star) => {
+                Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star) | Some(Token::Percent) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -166,7 +166,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             lexer.next();
             Ok(Word::Literal("..".to_string(), None))
         }
-        Some(Token::Star) => {
+        Some(Token::Star) | Some(Token::Percent) => {
             // Treat standalone '*' as a literal (e.g., `ls *`)
             lexer.next();
             Ok(Word::Literal("*".to_string(), None))
@@ -307,11 +307,11 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
     // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
     // and also handles find arguments like "+1M" by combining Plus + Number + Identifier
-    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star)) {
+    if matches!(lexer.peek(), Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star) | Some(Token::Percent)) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
-                Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star) => {
+                Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range) | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Escape) | Some(Token::Colon) | Some(Token::Star) | Some(Token::Percent) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -429,7 +429,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             lexer.next();
             Ok(Word::Literal("..".to_string(), None))
         }
-        Some(Token::Star) => {
+        Some(Token::Star) | Some(Token::Percent) => {
             // Treat standalone '*' as a literal (e.g., `ls *`)
             lexer.next();
             Ok(Word::Literal("*".to_string(), None))
@@ -1795,7 +1795,7 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 expression_parts.push("-".to_string());
                 lexer.next();
             }
-            Some(Token::Star) => {
+            Some(Token::Star) | Some(Token::Percent) => {
                 expression_parts.push("*".to_string());
                 lexer.next();
             }
@@ -2019,6 +2019,30 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
                         let token_text = &text[*start..*end];
                         current_arg.push_str(token_text);
                     }
+                }
+            }
+            Token::Identifier => {
+                // Handle identifier as literal
+                lexer.next();
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+                    current_arg.push_str(token_text);
+                }
+            }
+            Token::Plus => {
+                // Handle plus character as literal
+                lexer.next();
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+                    current_arg.push_str(token_text);
+                }
+            }
+            Token::Minus => {
+                // Handle minus character as literal
+                lexer.next();
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+                    current_arg.push_str(token_text);
                 }
             }
             Token::Percent => {
