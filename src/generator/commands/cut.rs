@@ -6,7 +6,7 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
     
     // cut command syntax: cut -d delimiter -f fields
     let mut delimiter = "\\t".to_string(); // Default tab delimiter
-    let mut _fields = "1".to_string(); // Default to first field
+    let mut fields = "1".to_string(); // Default to first field
     
     // Parse cut options
     let mut i = 0;
@@ -19,7 +19,7 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
                 }
             } else if arg == "-f" && i + 1 < cmd.args.len() {
                 if let Some(next_arg) = cmd.args.get(i + 1) {
-                    _fields = generator.word_to_perl(next_arg);
+                    fields = generator.word_to_perl(next_arg);
                     i += 1; // Skip the fields argument
                 }
             }
@@ -34,9 +34,14 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
     output.push_str("chomp $line;\n");
     output.push_str(&format!("my @fields = split /{}/msx, $line;\n", delimiter));
     
-    // Handle field selection (simple implementation for now)
-    output.push_str(&format!("if (@fields > 0) {{\n"));
-    output.push_str(&format!("push @result_{}, $fields[0];\n", unique_id)); // Default to first field
+    // Handle field selection - convert field number from 1-based to 0-based indexing
+    let field_index = if fields.trim_matches('"').trim_matches('\'').parse::<usize>().unwrap_or(1) > 0 {
+        fields.trim_matches('"').trim_matches('\'').parse::<usize>().unwrap_or(1) - 1
+    } else {
+        0
+    };
+    output.push_str(&format!("if (@fields > {}) {{\n", field_index));
+    output.push_str(&format!("push @result_{}, $fields[{}];\n", unique_id, field_index));
     output.push_str("}\n");
     output.push_str("}\n");
     output.push_str(&format!("${} = join \"\\n\", @result_{};\n", input_var, unique_id));
