@@ -303,9 +303,11 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             } else {
                 // Non-recursive search
                 for file in &file_args {
+                    // Adjust file path for Perl execution context (runs from examples directory)
+                    let adjusted_file = generator.adjust_file_path_for_perl_execution(file);
                     if file.contains('*') {
                         // Handle glob patterns
-                        output.push_str(&format!("my @glob_files_{} = glob('{}');\n", command_index, file));
+                        output.push_str(&format!("my @glob_files_{} = glob('{}');\n", command_index, adjusted_file));
                         output.push_str(&format!("for my $glob_file (@glob_files_{}) {{\n", command_index));
                         output.push_str(&format!("    if (-f $glob_file) {{\n"));
                         output.push_str(&format!("        open my $fh, '<', $glob_file or die \"Cannot open $glob_file: $ERRNO\";\n"));
@@ -318,12 +320,12 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                         output.push_str("    }\n");
                         output.push_str("}\n");
                     } else {
-                        output.push_str(&format!("if (-f '{}') {{\n", file));
-                        output.push_str(&format!("    open my $fh, '<', '{}' or die \"Cannot open {}: $ERRNO\";\n", file, file));
+                        output.push_str(&format!("if (-f {}) {{\n", adjusted_file));
+                        output.push_str(&format!("    open my $fh, '<', {} or die \"Cannot open {}: $ERRNO\";\n", adjusted_file, adjusted_file));
                         output.push_str("    while (my $line = <$fh>) {\n");
                         output.push_str("        chomp $line;\n");
                         output.push_str(&format!("        push @grep_lines_{}, $line;\n", command_index));
-                        output.push_str(&format!("        push @grep_filenames_{}, '{}';\n", command_index, file));
+                        output.push_str(&format!("        push @grep_filenames_{}, {};\n", command_index, adjusted_file));
                         output.push_str("    }\n");
                         output.push_str("    close $fh or croak \"Close failed: $OS_ERROR\";\n");
                         output.push_str("}\n");

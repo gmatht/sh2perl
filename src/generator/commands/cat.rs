@@ -33,8 +33,8 @@ pub fn generate_cat_command(generator: &mut Generator, cmd: &SimpleCommand, redi
         };
         
         output.push_str(&format!("${} = q{{}};\n", input_var));
-        // Use filename as-is without adding ./ prefix
-        let adjusted_filename = filename.clone();
+        // Adjust filename for Perl execution context (runs from examples directory)
+        let adjusted_filename = generator.adjust_file_path_for_perl_execution(&filename);
         output.push_str(&format!("if (open my $fh, '<', '{}') {{\n", adjusted_filename));
         output.push_str("while (my $line = <$fh>) {\n");
         output.push_str(&format!("${} .= $line;\n", input_var));
