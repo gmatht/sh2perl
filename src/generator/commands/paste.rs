@@ -74,7 +74,7 @@ pub fn generate_paste_command(
     } else {
         // Handle regular paste command with file arguments
         let args: Vec<String> = cmd.args.iter()
-            .map(|arg| generator.word_to_perl(arg))
+            .map(|arg| generator.perl_string_literal(arg))
             .collect();
         
         if args.len() >= 2 {
