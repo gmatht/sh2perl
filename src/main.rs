@@ -4,6 +4,7 @@ mod utils;
 mod testing;
 mod cli_commands;
 mod help;
+mod timeout_manager;
 
 use std::env;
 use std::fs;
@@ -68,6 +69,52 @@ fn main_with_args(args: Vec<String>) {
         return;
     } else if command == "--next-fail" {
         set_debug_enabled(false);
+    } else if command == "--freeze" {
+        crate::timeout_manager::freeze_execution();
+        println!("Execution frozen for debugging. Use --unfreeze to continue.");
+        return;
+    } else if command == "--unfreeze" {
+        crate::timeout_manager::unfreeze_execution();
+        println!("Execution unfrozen, continuing...");
+        return;
+    } else if command == "--timeout-config" {
+        if args.len() < 3 {
+            println!("Usage: {} --timeout-config <fast|normal|slow|debug>", program_name);
+            return;
+        }
+        let config_type = &args[2];
+        let manager = crate::timeout_manager::get_timeout_manager();
+        let mut manager = manager.lock().unwrap();
+        
+        match config_type.as_str() {
+            "fast" => {
+                *manager = crate::timeout_manager::TimeoutManager::with_config(
+                    crate::timeout_manager::TimeoutManager::fast_test_config()
+                );
+                println!("Timeout configuration set to FAST mode");
+            }
+            "normal" => {
+                *manager = crate::timeout_manager::TimeoutManager::new();
+                println!("Timeout configuration set to NORMAL mode");
+            }
+            "slow" => {
+                *manager = crate::timeout_manager::TimeoutManager::with_config(
+                    crate::timeout_manager::TimeoutManager::slow_test_config()
+                );
+                println!("Timeout configuration set to SLOW mode");
+            }
+            "debug" => {
+                *manager = crate::timeout_manager::TimeoutManager::with_config(
+                    crate::timeout_manager::TimeoutManager::debug_config()
+                );
+                println!("Timeout configuration set to DEBUG mode");
+            }
+            _ => {
+                println!("Invalid timeout configuration. Use: fast, normal, slow, or debug");
+                return;
+            }
+        }
+        return;
     }
     
     // Parse AST formatting options and input/output options
