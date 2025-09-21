@@ -72,12 +72,69 @@ pub fn generate_paste_command(
             result.push_str("$paste_output");
         }
     } else {
-        // Handle regular paste command (fallback to system)
+        // Handle regular paste command with file arguments
         let args: Vec<String> = cmd.args.iter()
             .map(|arg| generator.word_to_perl(arg))
             .collect();
         
-        if !args.is_empty() {
+        if args.len() >= 2 {
+            // Read both files and paste them together
+            let paste_id = generator.get_unique_file_handle();
+            result.push_str(&generator.indent());
+            result.push_str(&format!("my @paste_file1_lines_{};\n", paste_id));
+            result.push_str(&generator.indent());
+            result.push_str(&format!("my @paste_file2_lines_{};\n", paste_id));
+            
+            // Read first file
+            result.push_str(&generator.indent());
+            result.push_str(&format!("if (open my $fh1, '<', {}) {{\n", args[0]));
+            result.push_str(&generator.indent());
+            result.push_str("    while (my $line = <$fh1>) {\n");
+            result.push_str(&generator.indent());
+            result.push_str("        chomp $line;\n");
+            result.push_str(&generator.indent());
+            result.push_str(&format!("        push @paste_file1_lines_{}, $line;\n", paste_id));
+            result.push_str(&generator.indent());
+            result.push_str("    }\n");
+            result.push_str(&generator.indent());
+            result.push_str("    close $fh1;\n");
+            result.push_str(&generator.indent());
+            result.push_str("}\n");
+            
+            // Read second file
+            result.push_str(&generator.indent());
+            result.push_str(&format!("if (open my $fh2, '<', {}) {{\n", args[1]));
+            result.push_str(&generator.indent());
+            result.push_str("    while (my $line = <$fh2>) {\n");
+            result.push_str(&generator.indent());
+            result.push_str("        chomp $line;\n");
+            result.push_str(&generator.indent());
+            result.push_str(&format!("        push @paste_file2_lines_{}, $line;\n", paste_id));
+            result.push_str(&generator.indent());
+            result.push_str("    }\n");
+            result.push_str(&generator.indent());
+            result.push_str("    close $fh2;\n");
+            result.push_str(&generator.indent());
+            result.push_str("}\n");
+            
+            // Paste the lines together
+            result.push_str(&generator.indent());
+            result.push_str(&format!("my $max_lines = @paste_file1_lines_{} > @paste_file2_lines_{} ? @paste_file1_lines_{} : @paste_file2_lines_{};\n", paste_id, paste_id, paste_id, paste_id));
+            result.push_str(&generator.indent());
+            result.push_str("my $paste_output = \"\";\n");
+            result.push_str(&generator.indent());
+            result.push_str("for (my $i = 0; $i < $max_lines; $i++) {\n");
+            result.push_str(&generator.indent());
+            result.push_str(&format!("    my $line1 = $i < @paste_file1_lines_{} ? $paste_file1_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
+            result.push_str(&generator.indent());
+            result.push_str(&format!("    my $line2 = $i < @paste_file2_lines_{} ? $paste_file2_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
+            result.push_str(&generator.indent());
+            result.push_str("    $paste_output .= \"$line1\\t$line2\\n\";\n");
+            result.push_str(&generator.indent());
+            result.push_str("}\n");
+            result.push_str(&generator.indent());
+            result.push_str("$paste_output");
+        } else if !args.is_empty() {
             result.push_str(&generator.indent());
             result.push_str(&format!("system 'paste {}';\n", args.join(" ")));
         } else {
