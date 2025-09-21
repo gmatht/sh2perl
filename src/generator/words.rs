@@ -724,12 +724,12 @@ let pattern = &args[pattern_idx];
                                     .map(|arg| generator.word_to_perl(arg))
                                     .collect();
                                 let command_str = args.join(" ");
-                                time_output.push_str(&format!("system {};\n", command_str));
+                                time_output.push_str(&format!("system \"{}\";\n", command_str));
                             }
                             
                             time_output.push_str("my $end_time = [gettimeofday];\n");
                             time_output.push_str("my $elapsed = tv_interval($start_time, $end_time);\n");
-                            time_output.push_str("sprintf \"real\\t%.3fs\\nuser\\t0.000s\\nsys\\t0.000s\\n\", $elapsed;\n");
+                            time_output.push_str("sprintf \"real %.3fs\\nuser 0.000s\\nsys 0.000s\\n\", $elapsed;\n");
                             
                             format!("do {{ {} }}", time_output)
                         } else {
