@@ -331,6 +331,22 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                                 unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id);
                         }
                     }
+                } else if name == "paste" {
+                    // Special handling for paste in command substitution
+                    eprintln!("DEBUG: echo.rs - Using native paste implementation for command substitution");
+                    return crate::generator::commands::paste::generate_paste_command(generator, simple_cmd, &[]);
+                } else if name == "comm" {
+                    // Special handling for comm in command substitution
+                    eprintln!("DEBUG: echo.rs - Using native comm implementation for command substitution");
+                    return crate::generator::commands::comm::generate_comm_command(generator, simple_cmd, "", &[]);
+                } else if name == "diff" {
+                    // Special handling for diff in command substitution
+                    eprintln!("DEBUG: echo.rs - Using native diff implementation for command substitution");
+                    return crate::generator::commands::diff::generate_diff_command(generator, simple_cmd, "", 0, false);
+                } else if name == "xargs" {
+                    // Special handling for xargs in command substitution
+                    eprintln!("DEBUG: echo.rs - Using native xargs implementation for command substitution");
+                    return crate::generator::commands::xargs::generate_xargs_command(generator, simple_cmd, "", "0");
                 }
             }
             
