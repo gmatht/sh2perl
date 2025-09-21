@@ -87,17 +87,25 @@ if ! cargo build --bin debashc 2>&1 | tee -a "$LOG_FILE"; then
     exit 1
 fi
 
-echo "Running debashc with 300 second timeout..." | tee -a "$LOG_FILE"
+echo "Running debashc with fine-grained per-test timeouts..." | tee -a "$LOG_FILE"
 if [ $# -eq 0 ]; then
     # No arguments provided, run with empty string (without --perl-critic to avoid timeout)
-    if ! run_with_timeout "./target/debug/debashc.exe fail" 300 "debashc test generation and execution"
+    echo "Running: debashc test generation and execution" | tee -a "$LOG_FILE"
+    echo "Command: ./target/debug/debashc.exe fail" | tee -a "$LOG_FILE"
+    echo "Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)" | tee -a "$LOG_FILE"
+    echo "----------------------------------------" | tee -a "$LOG_FILE"
+    if ! ./target/debug/debashc.exe fail 2>&1 | tee -a "$LOG_FILE"
     then
         echo "debashc failed, aborting other commands"
         exit 1
     fi
 else
     # Arguments provided, pass them through (without --perl-critic to avoid timeout)
-    if ! run_with_timeout "./target/debug/debashc.exe fail \"$@\"" 300 "debashc test generation and execution"
+    echo "Running: debashc test generation and execution" | tee -a "$LOG_FILE"
+    echo "Command: ./target/debug/debashc.exe fail \"$@\"" | tee -a "$LOG_FILE"
+    echo "Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)" | tee -a "$LOG_FILE"
+    echo "----------------------------------------" | tee -a "$LOG_FILE"
+    if ! ./target/debug/debashc.exe fail "$@" 2>&1 | tee -a "$LOG_FILE"
     then
         echo "debashc failed, aborting other commands"
         exit 1
