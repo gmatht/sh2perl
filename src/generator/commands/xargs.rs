@@ -128,10 +128,6 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         
         output.push_str("}\n");
         output.push_str(&format!("my ${} = join \"\\n\", @xargs_output_{};\n", output_var, command_index));
-        // Also assign to the expected pipeline result variable if needed
-        if !output_var.starts_with("xargs_result_") {
-            output.push_str(&format!("${} = ${};\n", output_var, output_var));
-        }
     }
     output.push_str("\n");
     
