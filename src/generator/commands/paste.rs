@@ -23,7 +23,7 @@ pub fn generate_paste_command(
             
             // Read first file
             result.push_str(&generator.indent());
-            result.push_str(&format!("if (open my $fh1, '<', ${}) {{\n", file1.0));
+            result.push_str(&format!("if (open my $fh1, '<', '{}') {{\n", file1.0));
             result.push_str(&generator.indent());
             result.push_str("    while (my $line = <$fh1>) {\n");
             result.push_str(&generator.indent());
@@ -39,7 +39,7 @@ pub fn generate_paste_command(
             
             // Read second file
             result.push_str(&generator.indent());
-            result.push_str(&format!("if (open my $fh2, '<', ${}) {{\n", file2.0));
+            result.push_str(&format!("if (open my $fh2, '<', '{}') {{\n", file2.0));
             result.push_str(&generator.indent());
             result.push_str("    while (my $line = <$fh2>) {\n");
             result.push_str(&generator.indent());
