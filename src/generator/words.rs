@@ -444,9 +444,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 // Parse grep arguments properly
                                 let mut pattern_idx = 0;
                                 let mut file_idx = 1;
+                                let mut show_line_numbers = false;
                                 
                                 // Skip flags like -n, -i, etc.
                                 while pattern_idx < args.len() && args[pattern_idx].starts_with('-') {
+                                    if args[pattern_idx] == "-n" {
+                                        show_line_numbers = true;
+                                    }
                                     pattern_idx += 1;
                                     file_idx += 1;
                                 }
@@ -455,7 +459,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     return "\"\"".to_string();
                                 }
                                 
-                                let pattern = &args[pattern_idx];
+let pattern = &args[pattern_idx];
                                 let files = if file_idx < args.len() { &args[file_idx..] } else { &[] };
                                 
                                 if files.is_empty() {
@@ -471,8 +475,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     } else {
                                         format!("'{}'", adjusted_file)
                                     };
-                                    format!("do {{ my @grep_lines_{}; my $fh_{}; if (-f {}) {{ open $fh_{}, '<', {} or croak \"Cannot open file: $OS_ERROR\"; @grep_lines_{} = <$fh_{}>; close $fh_{} or croak \"Close failed: $OS_ERROR\"; chomp @grep_lines_{}; @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{}; }} join \"\\n\", @grep_lines_{}; }}", 
-                                        unique_id, unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id)
+                                    
+                                    if show_line_numbers {
+                                        format!("do {{ my @grep_lines_{}; my $fh_{}; my $line_num_{} = 0; if (-f {}) {{ open $fh_{}, '<', {} or croak \"Cannot open file: $OS_ERROR\"; while (my $line = <$fh_{}>) {{ $line_num_{}++; chomp $line; if ($line =~ /{}/msx) {{ push @grep_lines_{}, \"$line_num_{}:$line\"; }} }} close $fh_{} or croak \"Close failed: $OS_ERROR\"; }} join \"\\n\", @grep_lines_{}; }}", 
+                                            unique_id, unique_id, unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id, unique_id, unique_id)
+                                    } else {
+                                        format!("do {{ my @grep_lines_{}; my $fh_{}; if (-f {}) {{ open $fh_{}, '<', {} or croak \"Cannot open file: $OS_ERROR\"; @grep_lines_{} = <$fh_{}>; close $fh_{} or croak \"Close failed: $OS_ERROR\"; chomp @grep_lines_{}; @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{}; }} join \"\\n\", @grep_lines_{}; }}", 
+                                            unique_id, unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id)
+                                    }
                                 }
                             }
                         } else if name == "printf" {
