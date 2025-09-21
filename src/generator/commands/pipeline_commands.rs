@@ -487,7 +487,6 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
             
             if cmd1_name == "echo" && cmd2_name == "tr" {
                 // Special case for echo | tr
-                eprintln!("DEBUG: Processing echo | tr special case");
                 let unique_id = generator.get_unique_id();
                 // Generate echo output directly as a string value
                 let echo_args: Vec<String> = cmd1.args.iter()
