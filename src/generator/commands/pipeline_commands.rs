@@ -823,6 +823,8 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $cmd_result_{} = q{{}};\n", unique_id));
                 output.push_str(&generator.indent());
+                output.push_str("my $output_0 = q{};\n");
+                output.push_str(&generator.indent());
                 output.push_str(&format!("for (my $i = 0; $i < {}; $i++) {{\n", head_max));
                 generator.indent_level += 1;
                 
@@ -868,6 +870,10 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
+                
+                // Assign the output to the final result
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$cmd_result_{} = $output_0;\n", unique_id));
                 
                 return output; // Return early since we've handled everything
             } else if name == "cat" && !first_cmd.args.is_empty() {

@@ -40,6 +40,16 @@ pub fn show_help(program_name: &str) {
     println!();
     println!("  --debug                        - Enable debug output (default)");
     println!("  --no-debug                     - Disable debug output");
+    println!("  --freeze                       - Freeze execution for debugging");
+    println!("  --unfreeze                     - Unfreeze execution and continue");
+    println!();
+    println!("TIMEOUT OPTIONS:");
+    println!();
+    println!("  --timeout-config <mode>        - Set timeout configuration");
+    println!("    fast                         - Fast timeouts (10s shell, 5s perl)");
+    println!("    normal                       - Normal timeouts (30s shell, 10s perl)");
+    println!("    slow                         - Slow timeouts (60s shell, 30s perl)");
+    println!("    debug                        - Debug timeouts (120s shell, 60s perl)");
     println!();
     println!("TESTING OPTIONS:");
     println!();

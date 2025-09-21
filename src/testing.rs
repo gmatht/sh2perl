@@ -6,6 +6,8 @@ use std::thread;
 
 use crate::cache::CommandCache;
 use crate::execution::{run_shell_script, create_exit_status};
+use crate::timeout_manager::{OperationType, execute_with_timeout, execute_with_progress, 
+                           is_execution_frozen};
 use crate::utils::{check_generator_available, cleanup_tmp, generate_unified_diff, 
                    check_perl_must_contain, check_perl_must_not_contain, check_ast_must_not_contain, check_ast_must_contain,
                    check_perl_no_open3_builtins, check_perl_no_system_builtins};
@@ -630,7 +632,10 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
             eprintln!("DEBUG: Running shell script: {}", filename);
             let start = std::time::Instant::now();
             
-            let output = run_shell_script(filename)?;
+            let filename_clone = filename.to_string();
+            let output = execute_with_timeout(OperationType::ShellExecution, move || {
+                run_shell_script(&filename_clone)
+            })?;
             
             shell_duration = start.elapsed();
             eprintln!("DEBUG: Shell script completed in {:.2}s", shell_duration.as_secs_f64());
@@ -898,32 +903,32 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
             eprintln!("DEBUG: About to start translated program execution");
             let (translated_output, translated_duration, timed_out) = {
                 if lang == "rust" {
-            // Run compiled binary directly (first arg of run_cmd)
-            let bin = "__tmp_test_bin";
-            let abs_bin = std::env::current_dir().unwrap_or_default().join(bin);
-            let mut child = match Command::new(&abs_bin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-                Ok(c) => c,
-                Err(e) => { cleanup_tmp(lang, &tmp_file); return Err(format!("Failed to run compiled Rust: {} ({})", e, abs_bin.display())); }
-            };
-            let start = std::time::Instant::now();
-            let mut timed_out = false;
-            let out = loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break child.wait_with_output().unwrap(),
-                    Ok(None) => {
-                        if start.elapsed() > Duration::from_millis(10000) { 
-                            timed_out = true;
-                            let _ = child.kill(); 
-                            break child.wait_with_output().unwrap(); 
+                    // Run compiled binary directly (first arg of run_cmd)
+                    let bin = "__tmp_test_bin";
+                    let abs_bin = std::env::current_dir().unwrap_or_default().join(bin);
+                    let mut child = match Command::new(&abs_bin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                        Ok(c) => c,
+                        Err(e) => { cleanup_tmp(lang, &tmp_file); return Err(format!("Failed to run compiled Rust: {} ({})", e, abs_bin.display())); }
+                    };
+                    let start = std::time::Instant::now();
+                    let mut timed_out = false;
+                    let out = loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break child.wait_with_output().unwrap(),
+                            Ok(None) => {
+                                if start.elapsed() > Duration::from_millis(10000) { 
+                                    timed_out = true;
+                                    let _ = child.kill(); 
+                                    break child.wait_with_output().unwrap(); 
+                                }
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(_) => break child.wait_with_output().unwrap(),
                         }
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break child.wait_with_output().unwrap(),
-                }
-            };
-            let duration = start.elapsed();
-            (out, duration, timed_out)
-        } else {
+                    };
+                    let duration = start.elapsed();
+                    (out, duration, timed_out)
+                } else {
             let mut cmd = Command::new(&run_cmd[0]);
             
             // For Perl scripts, handle the file path replacement
@@ -953,44 +958,50 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 for a in &run_cmd[1..] { cmd.arg(a); }
             }
             
-            let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-                Ok(c) => {
-                    eprintln!("DEBUG: Successfully spawned Perl process");
-                    c
-                },
-                Err(e) => { cleanup_tmp(lang, &tmp_file); return Err(format!("Failed to run translated program: {}", e)); }
-            };
-            let start = std::time::Instant::now();
-            let mut timed_out = false;
-            eprintln!("DEBUG: Starting execution loop for Perl process");
-            let out = loop {
-                let elapsed = start.elapsed();
-                eprintln!("DEBUG: Execution loop iteration, elapsed: {:?}", elapsed);
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        eprintln!("DEBUG: Perl process completed with status: {:?}", status);
-                        break child.wait_with_output().unwrap();
+            // Use timeout manager for Perl execution
+            let lang = lang.to_string();
+            let tmp_file = tmp_file.clone();
+            execute_with_timeout(OperationType::PerlExecution, move || {
+                let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                    Ok(c) => {
+                        eprintln!("DEBUG: Successfully spawned Perl process");
+                        c
                     },
-                    Ok(None) => {
-                        if elapsed > Duration::from_millis(10000) { 
-                            eprintln!("DEBUG: Perl process timed out after 10 seconds, killing process");
-                            timed_out = true;
-                            let _ = child.kill(); 
-                            break child.wait_with_output().unwrap(); 
+                    Err(e) => { cleanup_tmp(&lang, &tmp_file); return Err(format!("Failed to run translated program: {}", e)); }
+                };
+                let start = std::time::Instant::now();
+                let mut timed_out = false;
+                eprintln!("DEBUG: Starting execution loop for Perl process");
+                
+                let out = loop {
+                    let elapsed = start.elapsed();
+                    eprintln!("DEBUG: Execution loop iteration, elapsed: {:?}", elapsed);
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            eprintln!("DEBUG: Perl process completed with status: {:?}", status);
+                            break child.wait_with_output().unwrap();
+                        },
+                        Ok(None) => {
+                            if elapsed > Duration::from_millis(10000) { 
+                                eprintln!("DEBUG: Perl process timed out after 10 seconds, killing process");
+                                timed_out = true;
+                                let _ = child.kill(); 
+                                break child.wait_with_output().unwrap(); 
+                            }
+                            thread::sleep(Duration::from_millis(10));
                         }
-                        thread::sleep(Duration::from_millis(10));
+                        Err(e) => {
+                            eprintln!("DEBUG: Error checking Perl process status: {:?}", e);
+                            break child.wait_with_output().unwrap();
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("DEBUG: Error checking Perl process status: {:?}", e);
-                        break child.wait_with_output().unwrap();
-                    }
+                };
+                let duration = start.elapsed();
+                eprintln!("DEBUG: Perl execution completed, duration: {:?}, timed_out: {}", duration, timed_out);
+                Ok((out, duration, timed_out))
+            })?
                 }
             };
-            let duration = start.elapsed();
-            eprintln!("DEBUG: Perl execution completed, duration: {:?}, timed_out: {}", duration, timed_out);
-            (out, duration, timed_out)
-        }
-    };
 
     // Check if we can use cached Perl output
     if lang == "perl" && cache.is_perl_cache_valid(filename, &translated_code) {
@@ -1479,21 +1490,22 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                   generator);
             io::stdout().flush().unwrap();
             
-            // Run the actual test with fine-grained timeouts
+            // Run the actual test with fine-grained timeouts and debug freeze support
             eprintln!("DEBUG: Starting test execution for {} with generator {}", example, generator);
             let individual_test_start = std::time::Instant::now();
             
-            // Run test with timeout using std::thread::scope
-            let test_result = std::thread::scope(|s| {
-                let handle = s.spawn(|| {
-                    test_file_equivalence_detailed_with_critic(generator, example, Some(AstFormatOptions::default()), enable_perl_critic)
-                });
-                
-                // Wait for completion or timeout
-                match handle.join() {
-                    Ok(result) => result,
-                    Err(_) => Err("Test execution panicked".to_string()),
-                }
+            // Check for debug freeze before starting test
+            if is_execution_frozen() {
+                eprintln!("DEBUG: Execution is frozen for debugging. Test {} will be skipped.", example);
+                print!("⏸️");
+                continue;
+            }
+            
+            // Run test with timeout using the new timeout manager
+            let generator_clone = generator.to_string();
+            let example_clone = example.to_string();
+            let test_result = execute_with_progress(OperationType::TestExecution, move || {
+                test_file_equivalence_detailed_with_critic(&generator_clone, &example_clone, Some(AstFormatOptions::default()), enable_perl_critic)
             });
             
             eprintln!("DEBUG: Test execution completed in {:.2}ms", individual_test_start.elapsed().as_millis());
@@ -2024,21 +2036,22 @@ pub fn test_all_examples_next_fail_unlimited(generators: &[String], test_prefix:
                   generator);
             io::stdout().flush().unwrap();
             
-            // Run the actual test with fine-grained timeouts
+            // Run the actual test with fine-grained timeouts and debug freeze support
             eprintln!("DEBUG: Starting test execution for {} with generator {}", example, generator);
             let individual_test_start = std::time::Instant::now();
             
-            // Run test with timeout using std::thread::scope
-            let test_result = std::thread::scope(|s| {
-                let handle = s.spawn(|| {
-                    test_file_equivalence_detailed_with_critic(generator, example, Some(AstFormatOptions::default()), enable_perl_critic)
-                });
-                
-                // Wait for completion or timeout
-                match handle.join() {
-                    Ok(result) => result,
-                    Err(_) => Err("Test execution panicked".to_string()),
-                }
+            // Check for debug freeze before starting test
+            if is_execution_frozen() {
+                eprintln!("DEBUG: Execution is frozen for debugging. Test {} will be skipped.", example);
+                print!("⏸️");
+                continue;
+            }
+            
+            // Run test with timeout using the new timeout manager
+            let generator_clone = generator.to_string();
+            let example_clone = example.to_string();
+            let test_result = execute_with_progress(OperationType::TestExecution, move || {
+                test_file_equivalence_detailed_with_critic(&generator_clone, &example_clone, Some(AstFormatOptions::default()), enable_perl_critic)
             });
             
             eprintln!("DEBUG: Test execution completed in {:.2}ms", individual_test_start.elapsed().as_millis());

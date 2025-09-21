@@ -42,6 +42,7 @@ sha2 = "0.10"
 md5 = "0.7"
 regex = "1.0"
 filetime = "0.2"
+lazy_static = "1.4"
 
 [dev-dependencies]
 paste = "1.0"
