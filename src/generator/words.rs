@@ -13,7 +13,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
             } else {
                 // For literal strings, only replace constants in specific contexts
                 // Don't replace numbers that are part of arithmetic expressions
-                s.clone()
+                generator.perl_string_literal(word)
             }
         },
         Word::ParameterExpansion(pe, _) => generator.generate_parameter_expansion(pe),
