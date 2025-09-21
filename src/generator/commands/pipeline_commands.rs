@@ -412,6 +412,10 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                             }
                         }
                     }
+                    "paste" => {
+                        // Handle paste command for command substitution
+                        return crate::generator::commands::paste::generate_paste_command(generator, simple_cmd, &[]);
+                    }
                     "comm" => {
                         // Handle comm command with process substitution
                         if !simple_cmd.redirects.is_empty() {
@@ -431,6 +435,16 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                                 return command_output;
                             }
                         }
+                        // Handle comm command for command substitution
+                        return crate::generator::commands::comm::generate_comm_command(generator, simple_cmd, "", &[]);
+                    }
+                    "diff" => {
+                        // Handle diff command for command substitution
+                        return crate::generator::commands::diff::generate_diff_command(generator, simple_cmd, "", 0, false);
+                    }
+                    "xargs" => {
+                        // Handle xargs command for command substitution
+                        return crate::generator::commands::xargs::generate_xargs_command(generator, simple_cmd, "", "0");
                     }
                     _ => {}
                 }

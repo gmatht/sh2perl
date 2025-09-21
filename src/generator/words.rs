@@ -55,7 +55,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // The generate_find_command already returns the joined string
                             perl_code
                         } else if name == "paste" {
-                            // Special handling for paste command with process substitution
+                            // Special handling for paste command
                             // Check if this command has process substitution redirects
                             let mut has_process_sub = false;
                             for redirect in &simple_cmd.redirects {
@@ -128,16 +128,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 let paste_output = crate::generator::commands::paste::generate_paste_command(generator, simple_cmd, &process_sub_files);
                                 format!("do {{ {} {} }}", process_sub_code, paste_output)
                             } else {
-                                // Regular paste command without process substitution
-                                let args: Vec<String> = simple_cmd.args.iter()
-                                    .map(|arg| generator.word_to_perl(arg))
-                                    .collect();
-                                
-                                if !args.is_empty() {
-                                    format!("do {{ my $paste_result = qx{{paste {}}}; chomp $paste_result; $paste_result; }}", args.join(" "))
-                                } else {
-                                    format!("do {{ my $paste_result = qx{{paste}}; chomp $paste_result; $paste_result; }}")
-                                }
+                                // Regular paste command without process substitution - use dedicated implementation
+                                crate::generator::commands::paste::generate_paste_command(generator, simple_cmd, &[])
                             }
                         } else if name == "comm" {
                             // Special handling for comm command with process substitution
