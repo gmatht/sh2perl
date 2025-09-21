@@ -689,6 +689,8 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                             let mut linebyline_output = generate_linebyline_command(generator, cmd, "line", 1 + i);
                             // Replace the output variable reference with our correct output variable
                             linebyline_output = linebyline_output.replace(&format!("$output_{}", 1 + i), &output_var);
+                            // Also replace $output_0 with the correct output variable (for head command)
+                            linebyline_output = linebyline_output.replace("$output_0", &output_var);
                             output.push_str(&linebyline_output);
                         }
                         Command::While(while_loop) => {
