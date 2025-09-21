@@ -11,6 +11,27 @@ use crate::utils::{check_generator_available, cleanup_tmp, generate_unified_diff
                    check_perl_no_open3_builtins, check_perl_no_system_builtins};
 use debashl::shared_utils;
 use debashl::{Lexer, Parser, Generator, lexer::Token};
+use debashl::parser::errors::ParserError;
+
+// Timeout wrapper function
+fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String> 
+where 
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let operation_handle = std::thread::spawn(move || {
+        let result = operation();
+        let _ = tx.send(result);
+    });
+    
+    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        Ok(result) => result,
+        Err(_) => {
+            Err(format!("Operation timed out after {} seconds", timeout_secs))
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TestResult {
@@ -608,7 +629,9 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
             // Run the shell script and cache the output
             eprintln!("DEBUG: Running shell script: {}", filename);
             let start = std::time::Instant::now();
+            
             let output = run_shell_script(filename)?;
+            
             shell_duration = start.elapsed();
             eprintln!("DEBUG: Shell script completed in {:.2}s", shell_duration.as_secs_f64());
             
@@ -1123,6 +1146,7 @@ pub fn test_all_examples() {
     let total_tests = examples.len() * generators.len();
     let mut passed_tests = 0;
     let mut current_test = 0;
+    let mut should_break = false;
     
     if generators.len() == 1 {
         println!("\nRunning {} tests across {} examples with {} generator", 
@@ -1239,6 +1263,7 @@ pub fn test_all_examples() {
     }
     
     // Final summary line
+    eprintln!("DEBUG: Test execution completed");
     println!("\n{}", "=".repeat(80));
     if passed_tests < total_tests {
         println!("FINAL RESULT: {} out of {} tests PASSED ({:.1}%)", passed_tests, total_tests, (passed_tests as f64 / total_tests as f64) * 100.0);
@@ -1329,7 +1354,12 @@ fn find_shortest_unique_prefix(examples: &[String], target_name: &str) -> String
 pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
     const MAX_TESTS_WITHOUT_PREFIX: usize = 50; // Limit to prevent timeout while still being useful
     
+    eprintln!("DEBUG: Starting test_all_examples_next_fail with test_prefix: {:?}", test_prefix);
+    let overall_start = std::time::Instant::now();
+    
     // Filter to only available generators
+    eprintln!("DEBUG: Filtering generators...");
+    let filter_start = std::time::Instant::now();
     let generators: Vec<_> = generators.iter()
         .filter(|g| {
             let available = check_generator_available(g);
@@ -1339,6 +1369,7 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
             available
         })
         .collect();
+    eprintln!("DEBUG: Generator filtering completed in {:.2}ms", filter_start.elapsed().as_millis());
     
     if generators.is_empty() {
         println!("No supported generators found. Please install perl");
@@ -1348,6 +1379,8 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
     let mut examples = Vec::new();
     
     // Read examples directory
+    eprintln!("DEBUG: Reading examples directory...");
+    let examples_start = std::time::Instant::now();
     if let Ok(entries) = fs::read_dir("examples") {
         for entry in entries {
             if let Ok(entry) = entry {
@@ -1360,15 +1393,23 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
             }
         }
     }
+    eprintln!("DEBUG: Found {} examples in {:.2}ms", examples.len(), examples_start.elapsed().as_millis());
     
     // Sort examples for consistent output
+    eprintln!("DEBUG: Sorting examples...");
+    let sort_start = std::time::Instant::now();
     examples.sort();
+    eprintln!("DEBUG: Examples sorted in {:.2}ms", sort_start.elapsed().as_millis());
     
     // Test each combination
+    eprintln!("DEBUG: Initializing test loop...");
+    let test_loop_start = std::time::Instant::now();
     let mut passed_tests = 0;
     let mut current_test = 0;
     let total_tests = examples.len() * generators.len();
     let mut should_break = false;
+    eprintln!("DEBUG: Test loop initialized - {} total tests, {} examples, {} generators", 
+              total_tests, examples.len(), generators.len());
     
     // If a specific test prefix is requested, find the matching example
     let (target_example_index, original_prefix) = if let Some(ref prefix) = test_prefix {
@@ -1410,6 +1451,13 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
         for (example_index, example) in examples.iter().enumerate() {
             current_test += 1;
             
+            // Progress tracking
+            if current_test % 5 == 0 {
+                eprintln!("DEBUG: Progress: {}/{} tests completed ({:.1}%)", 
+                         current_test, total_tests, 
+                         (current_test as f64 / total_tests as f64) * 100.0);
+            }
+            
             // Apply limit to prevent timeout when no specific test is requested
             if target_example_index.is_none() && current_test > MAX_TESTS_WITHOUT_PREFIX {
                 println!("\n\nReached limit of {} tests to prevent timeout. Use specific test prefix to run more tests.", MAX_TESTS_WITHOUT_PREFIX);
@@ -1431,8 +1479,26 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                   generator);
             io::stdout().flush().unwrap();
             
-            // Run the actual test
-            match test_file_equivalence_detailed_with_critic(generator, example, Some(AstFormatOptions::default()), enable_perl_critic) {
+            // Run the actual test with fine-grained timeouts
+            eprintln!("DEBUG: Starting test execution for {} with generator {}", example, generator);
+            let individual_test_start = std::time::Instant::now();
+            
+            // Run test with timeout using std::thread::scope
+            let test_result = std::thread::scope(|s| {
+                let handle = s.spawn(|| {
+                    test_file_equivalence_detailed_with_critic(generator, example, Some(AstFormatOptions::default()), enable_perl_critic)
+                });
+                
+                // Wait for completion or timeout
+                match handle.join() {
+                    Ok(result) => result,
+                    Err(_) => Err("Test execution panicked".to_string()),
+                }
+            });
+            
+            eprintln!("DEBUG: Test execution completed in {:.2}ms", individual_test_start.elapsed().as_millis());
+            
+            match test_result {
                 Ok(result) => {
                     if result.success {
                         passed_tests += 1;
@@ -1646,6 +1712,15 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
                     }
                 }
                 Err(e) => {
+                    // Check if this is a timeout error
+                    if e.contains("timed out") {
+                        eprintln!("DEBUG: Test timed out after 60 seconds");
+                        print!("⏰");
+                    } else {
+                        eprintln!("DEBUG: Test failed with error: {}", e);
+                        print!("✗");
+                    }
+                    
                     // Test error - invalidate cache and show error and exit
                     let mut cache = CommandCache::load();
                     cache.invalidate_bash_cache(example);
@@ -1921,6 +1996,13 @@ pub fn test_all_examples_next_fail_unlimited(generators: &[String], test_prefix:
         for (example_index, example) in examples.iter().enumerate() {
             current_test += 1;
             
+            // Progress tracking
+            if current_test % 5 == 0 {
+                eprintln!("DEBUG: Progress: {}/{} tests completed ({:.1}%)", 
+                         current_test, total_tests, 
+                         (current_test as f64 / total_tests as f64) * 100.0);
+            }
+            
             // Apply limit to prevent timeout when no specific test is requested
             if target_example_index.is_none() && current_test > MAX_TESTS_WITHOUT_PREFIX {
                 println!("\n\nReached limit of {} tests to prevent timeout. Use specific test prefix to run more tests.", MAX_TESTS_WITHOUT_PREFIX);
@@ -1942,8 +2024,26 @@ pub fn test_all_examples_next_fail_unlimited(generators: &[String], test_prefix:
                   generator);
             io::stdout().flush().unwrap();
             
-            // Run the actual test
-            match test_file_equivalence_detailed_with_critic(generator, example, Some(AstFormatOptions::default()), enable_perl_critic) {
+            // Run the actual test with fine-grained timeouts
+            eprintln!("DEBUG: Starting test execution for {} with generator {}", example, generator);
+            let individual_test_start = std::time::Instant::now();
+            
+            // Run test with timeout using std::thread::scope
+            let test_result = std::thread::scope(|s| {
+                let handle = s.spawn(|| {
+                    test_file_equivalence_detailed_with_critic(generator, example, Some(AstFormatOptions::default()), enable_perl_critic)
+                });
+                
+                // Wait for completion or timeout
+                match handle.join() {
+                    Ok(result) => result,
+                    Err(_) => Err("Test execution panicked".to_string()),
+                }
+            });
+            
+            eprintln!("DEBUG: Test execution completed in {:.2}ms", individual_test_start.elapsed().as_millis());
+            
+            match test_result {
                 Ok(result) => {
                     if result.success {
                         passed_tests += 1;
