@@ -729,7 +729,7 @@ let pattern = &args[pattern_idx];
                             
                             time_output.push_str("my $end_time = [gettimeofday];\n");
                             time_output.push_str("my $elapsed = tv_interval($start_time, $end_time);\n");
-                            time_output.push_str("my $time_output = sprintf \"real %.3fs\\nuser 0.000s\\nsys 0.000s\\n\", $elapsed;\n");
+                            time_output.push_str("my $time_output = sprintf \"real\\t0m%.3fs\\nuser\\t0m0.000s\\nsys\\t0m0.000s\\n\", $elapsed;\n");
                             time_output.push_str("print STDERR $time_output;\n");
                             time_output.push_str("$time_output;\n");
                             
