@@ -120,12 +120,24 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str(&format!("my $set2_{} = {};\n", unique_id, set2));
         output.push_str(&format!("my $input_{} = ${};\n", unique_id, input_var));
         
+        // Expand character ranges for tr command
+        output.push_str(&format!("# Expand character ranges for tr command\n"));
+        output.push_str(&format!("my $expanded_set1_{} = $set1_{};\n", unique_id, unique_id));
+        output.push_str(&format!("my $expanded_set2_{} = $set2_{};\n", unique_id, unique_id));
+        output.push_str(&format!("# Handle A-Z range\n"));
+        output.push_str(&format!("if ($expanded_set1_{} =~ /A-Z/) {{\n", unique_id));
+        output.push_str(&format!("    $expanded_set1_{} =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/;\n", unique_id));
+        output.push_str(&format!("}}\n"));
+        output.push_str(&format!("if ($expanded_set2_{} =~ /a-z/) {{\n", unique_id));
+        output.push_str(&format!("    $expanded_set2_{} =~ s/a-z/abcdefghijklmnopqrstuvwxyz/;\n", unique_id));
+        output.push_str(&format!("}}\n"));
+        
         // Character-by-character translation
         output.push_str(&format!("my ${} = q{{}};\n", output_var));
         output.push_str(&format!("for my $char ( split //msx, $input_{} ) {{\n", unique_id));
-        output.push_str(&format!("    my $pos_{} = index $set1_{}, $char;\n", unique_id, unique_id));
-        output.push_str(&format!("    if ( $pos_{} >= 0 && $pos_{} < length $set2_{} ) {{\n", unique_id, unique_id, unique_id));
-        output.push_str(&format!("        ${} .= substr $set2_{}, $pos_{}, 1;\n", output_var, unique_id, unique_id));
+        output.push_str(&format!("    my $pos_{} = index $expanded_set1_{}, $char;\n", unique_id, unique_id));
+        output.push_str(&format!("    if ( $pos_{} >= 0 && $pos_{} < length $expanded_set2_{} ) {{\n", unique_id, unique_id, unique_id));
+        output.push_str(&format!("        ${} .= substr $expanded_set2_{}, $pos_{}, 1;\n", output_var, unique_id, unique_id));
         output.push_str("    } else {\n");
         output.push_str(&format!("        ${} .= $char;\n", output_var));
         output.push_str("    }\n");
