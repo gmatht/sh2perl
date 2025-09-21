@@ -436,6 +436,23 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                 }
             }
         }
+    } else if pipeline.commands.len() == 2 {
+        // Handle specific 2-command pipelines
+        if let (Command::Simple(cmd1), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline.commands[1]) {
+            let cmd1_name = match &cmd1.name {
+                Word::Literal(s, _) => s,
+                _ => "unknown_command"
+            };
+            let cmd2_name = match &cmd2.name {
+                Word::Literal(s, _) => s,
+                _ => "unknown_command"
+            };
+
+            if cmd1_name == "pwd" && cmd2_name == "basename" {
+                // Special case for pwd | basename
+                return "do { use Cwd; my $path = getcwd(); $path =~ s/.*\\///msx; $path; }".to_string();
+            }
+        }
     }
     
     // For complex pipelines, fall back to the original complex generation
