@@ -707,7 +707,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         output.push_str(&format!("print {};\n", args[0]));
                         output.push_str(&format!("if (!({} =~ /\\n$/msx)) {{ print \"\\n\"; }}\n", args[0]));
                     } else {
-                        output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
+                        // Check if the argument contains variables that might end with newlines
+                        if args[0].contains('$') {
+                            output.push_str(&format!("do {{ my $output = {}; print $output; print \"\\n\" unless $output =~ /\\n$/msx; }};\n", args[0]));
+                        } else {
+                            output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
+                        }
                     }
                 } else {
                     // Check if we have multiple brace expansions that need cartesian product
