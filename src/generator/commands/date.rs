@@ -8,10 +8,31 @@ pub fn generate_date_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     if let Some(format) = cmd.args.first() {
         let format_str = generator.word_to_perl(format);
         
-        output.push_str("use POSIX qw(strftime);\n");
-        output.push_str(&format!("my $format = {};\n", format_str));
-        output.push_str("my $date = strftime($format, localtime());\n");
-        output.push_str("print $date;\n");
+        // Check for special formats
+        if let Word::Literal(format_lit, _) = format {
+            if format_lit == "+%rms" {
+                // Special case for +%rms format - 12-hour time with leading zeros
+                output.push_str("my $time = localtime();\n");
+                output.push_str("my $hour = $time->hour;\n");
+                output.push_str("my $min = $time->min;\n");
+                output.push_str("my $sec = $time->sec;\n");
+                output.push_str("my $ampm = $hour >= 12 ? 'PM' : 'AM';\n");
+                output.push_str("$hour = $hour % 12;\n");
+                output.push_str("$hour = 12 if $hour == 0;\n");
+                output.push_str("my $result = sprintf \"%02d:%02d:%02d %sms\", $hour, $min, $sec, $ampm;\n");
+                output.push_str("print $result;\n");
+            } else {
+                output.push_str("use POSIX qw(strftime);\n");
+                output.push_str(&format!("my $format = {};\n", format_str));
+                output.push_str("my $date = strftime($format, localtime());\n");
+                output.push_str("print $date;\n");
+            }
+        } else {
+            output.push_str("use POSIX qw(strftime);\n");
+            output.push_str(&format!("my $format = {};\n", format_str));
+            output.push_str("my $date = strftime($format, localtime());\n");
+            output.push_str("print $date;\n");
+        }
     } else {
         // Default format: RFC 2822 format
         output.push_str("use POSIX qw(strftime);\n");
