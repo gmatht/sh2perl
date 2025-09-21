@@ -449,7 +449,7 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                     "tr" => {
                         // Handle tr command for command substitution
                         let unique_id = generator.get_unique_id();
-                        return crate::generator::commands::tr::generate_tr_command(generator, simple_cmd, "input_data", &unique_id.to_string(), false);
+                        return crate::generator::commands::tr::generate_tr_command_for_substitution(generator, simple_cmd, "input_data", &unique_id.to_string());
                     }
                     _ => {}
                 }
