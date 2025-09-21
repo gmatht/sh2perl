@@ -319,11 +319,13 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                             return format!("do {{ carp \"grep: {}: No such file or directory\"; \"\" }}", pattern);
                         } else {
                             let file = &files[0];
+                            // Adjust file path for Perl execution context (runs from examples directory)
+                            let adjusted_file = generator.adjust_file_path_for_perl_execution(file);
                             // Ensure the file is properly quoted
-                            let quoted_file = if file.starts_with('\'') || file.starts_with('"') {
-                                file.clone()
+                            let quoted_file = if adjusted_file.starts_with('\'') || adjusted_file.starts_with('"') {
+                                adjusted_file.clone()
                             } else {
-                                format!("'{}'", file)
+                                format!("'{}'", adjusted_file)
                             };
                             return format!("do {{ my @grep_lines_{}; if (-f {}) {{ open my $fh_{}, '<', {} or croak \"Cannot open file: $OS_ERROR\"; @grep_lines_{} = <$fh_{}>; close $fh_{} or croak \"Close failed: $OS_ERROR\"; chomp @grep_lines_{}; @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{}; }} join \"\\n\", @grep_lines_{}; }}", 
                                 unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id);
