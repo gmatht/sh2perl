@@ -1176,8 +1176,12 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                                 interpreted = interpreted[1..interpreted.len()-1].to_string();
                                             }
                                             
-                                            // Interpret backslash escapes - keep them as escape sequences for Perl
-                                            // Don't convert \n to actual newlines in the generated code
+                                            // Interpret backslash escapes
+                                            interpreted = interpreted
+                                                .replace("\\n", "\n")
+                                                .replace("\\t", "\t")
+                                                .replace("\\r", "\r")
+                                                .replace("\\\\", "\\");
                                             
                                             result.push_str(&interpreted);
                                         },
