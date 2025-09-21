@@ -1394,5 +1394,27 @@ impl Generator {
             _ => false
         }
     }
+    
+    /// Adjust file paths for Perl execution context
+    /// Since Perl code runs from the examples directory, we need to strip the examples/ prefix
+    pub fn adjust_file_path_for_perl_execution(&self, filename: &str) -> String {
+        // Remove quotes if present
+        let unquoted = filename.trim_matches('"').trim_matches('\'');
+        
+        // If the path starts with "examples/", remove that prefix since Perl runs from examples directory
+        if unquoted.starts_with("examples/") {
+            let adjusted = unquoted.strip_prefix("examples/").unwrap_or(unquoted);
+            // Re-add quotes if the original had them
+            if filename.starts_with('"') && filename.ends_with('"') {
+                format!("\"{}\"", adjusted)
+            } else if filename.starts_with('\'') && filename.ends_with('\'') {
+                format!("'{}'", adjusted)
+            } else {
+                adjusted.to_string()
+            }
+        } else {
+            filename.to_string()
+        }
+    }
 }
 
