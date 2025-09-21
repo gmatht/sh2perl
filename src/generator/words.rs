@@ -515,7 +515,7 @@ let pattern = &args[pattern_idx];
                                 if let Word::Literal(format_lit, _) = format {
                                     if format_lit == "+%rms" {
                                         // Special case for +%rms format - 12-hour time with leading zeros
-                                        return "do { my $time = localtime(); my $hour = $time->hour; my $min = $time->min; my $sec = $time->sec; my $ampm = $hour >= 12 ? 'PM' : 'AM'; $hour = $hour % 12; $hour = 12 if $hour == 0; sprintf \"%02d:%02d:%02d %sms\", $hour, $min, $sec, $ampm }".to_string();
+                                        return "do { my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime(); my $ampm = $hour >= 12 ? 'PM' : 'AM'; $hour = $hour % 12; $hour = 12 if $hour == 0; sprintf \"%02d:%02d:%02d %sms\", $hour, $min, $sec, $ampm }".to_string();
                                     }
                                 }
                                 
