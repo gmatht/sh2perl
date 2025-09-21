@@ -208,7 +208,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
     my @file2_lines;
     
     # Read first file
-    if (open my $fh1, '<', {}) {{
+    if (open my $fh1, '<', '{}') {{
         while (my $line = <$fh1>) {{
             chomp $line;
             push @file1_lines, $line;
@@ -217,7 +217,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
     }}
     
     # Read second file
-    if (open my $fh2, '<', {}) {{
+    if (open my $fh2, '<', '{}') {{
         while (my $line = <$fh2>) {{
             chomp $line;
             push @file2_lines, $line;
