@@ -711,6 +711,27 @@ let pattern = &args[pattern_idx];
                             format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if (!$eval_result) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
                                 indent1, indent1, indent2, formatted_code, indent2, indent2, 
                                 indent1, indent1, indent1, indent1, indent1)
+                        } else if name == "time" {
+                            // Special handling for time in command substitution
+                            // Use custom time implementation instead of open3
+                            let mut time_output = String::new();
+                            time_output.push_str("use Time::HiRes qw(gettimeofday tv_interval);\n");
+                            time_output.push_str("my $start_time = [gettimeofday];\n");
+                            
+                            // Execute the command (if any arguments provided)
+                            if !simple_cmd.args.is_empty() {
+                                let args: Vec<String> = simple_cmd.args.iter()
+                                    .map(|arg| generator.word_to_perl(arg))
+                                    .collect();
+                                let command_str = args.join(" ");
+                                time_output.push_str(&format!("system {};\n", command_str));
+                            }
+                            
+                            time_output.push_str("my $end_time = [gettimeofday];\n");
+                            time_output.push_str("my $elapsed = tv_interval($start_time, $end_time);\n");
+                            time_output.push_str("sprintf \"real\\t%.3fs\\nuser\\t0.000s\\nsys\\t0.000s\\n\", $elapsed;\n");
+                            
+                            format!("do {{ {} }}", time_output)
                         } else {
                             // Fall back to system command for non-builtin commands
                             let args: Vec<String> = simple_cmd.args.iter()

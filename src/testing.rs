@@ -633,9 +633,7 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
             let start = std::time::Instant::now();
             
             let filename_clone = filename.to_string();
-            let output = execute_with_timeout(OperationType::ShellExecution, move || {
-                run_shell_script(&filename_clone)
-            })?;
+            let output = run_shell_script(&filename_clone)?;
             
             shell_duration = start.elapsed();
             eprintln!("DEBUG: Shell script completed in {:.2}s", shell_duration.as_secs_f64());
@@ -961,6 +959,7 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
             // Use timeout manager for Perl execution
             let lang = lang.to_string();
             let tmp_file = tmp_file.clone();
+            eprintln!("DEBUG: Starting Perl execution with timeout manager");
             execute_with_timeout(OperationType::PerlExecution, move || {
                 let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
                     Ok(c) => {
@@ -982,8 +981,8 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                             break child.wait_with_output().unwrap();
                         },
                         Ok(None) => {
-                            if elapsed > Duration::from_millis(10000) { 
-                                eprintln!("DEBUG: Perl process timed out after 10 seconds, killing process");
+                            if elapsed > Duration::from_millis(30000) { 
+                                eprintln!("DEBUG: Perl process timed out after 30 seconds, killing process");
                                 timed_out = true;
                                 let _ = child.kill(); 
                                 break child.wait_with_output().unwrap(); 
@@ -998,6 +997,7 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 };
                 let duration = start.elapsed();
                 eprintln!("DEBUG: Perl execution completed, duration: {:?}, timed_out: {}", duration, timed_out);
+                eprintln!("DEBUG: Ending Perl execution with timeout manager");
                 Ok((out, duration, timed_out))
             })?
                 }

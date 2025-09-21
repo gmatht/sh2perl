@@ -875,6 +875,10 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$cmd_result_{} = $output_0;\n", unique_id));
                 
+                // Return the result for command substitution
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$cmd_result_{}\n", unique_id));
+                
                 return output; // Return early since we've handled everything
             } else if name == "cat" && !first_cmd.args.is_empty() {
                 // First command is 'cat filename', so read from the file instead of STDIN
@@ -1339,7 +1343,7 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             // Note: The caller will add base indentation, so we generate unindented output
             // The $head_line_count variable is already declared at the pipeline level
             output.push_str(&format!("if ($head_line_count < {}) {{\n", num_lines));
-            output.push_str(&format!("    $output_{} .= $line . \"\\n\";\n", cmd_index));
+            output.push_str(&format!("    $output_0 .= $line . \"\\n\";\n"));
             output.push_str("    ++$head_line_count;\n");
             output.push_str("} else {\n");
             output.push_str("    $line = q{}; # Clear line to prevent printing\n");

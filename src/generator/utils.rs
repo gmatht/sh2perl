@@ -308,7 +308,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             
                             time_output.push_str("my $end_time = [gettimeofday];\n");
                             time_output.push_str("my $elapsed = tv_interval($start_time, $end_time);\n");
-                            time_output.push_str("printf \"real\\t%.3fs\\n\", $elapsed;\n");
+                            time_output.push_str("sprintf \"real\\t%.3fs\\nuser\\t0.000s\\nsys\\t0.000s\\n\", $elapsed;\n");
                             
                             format!("do {{ {} }}", time_output)
                         } else {
