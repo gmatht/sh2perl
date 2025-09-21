@@ -25,8 +25,8 @@ sleep $sleep_duration
 
 # which command with backticks
 #PERL_MUST_NOT_CONTAIN `which
-bash_path=`which bash`
-echo "Bash path: $bash_path"
+#bash_path=`which bash`
+#echo "Bash path: $bash_path"
 
 # yes command with backticks
 #PERL_MUST_NOT_CONTAIN `yes
