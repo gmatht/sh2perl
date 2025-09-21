@@ -510,6 +510,15 @@ let pattern = &args[pattern_idx];
                             // Special handling for date in command substitution
                             if let Some(format) = simple_cmd.args.first() {
                                 let format_str = generator.word_to_perl(format);
+                                
+                                // Check for special formats that need custom handling
+                                if let Word::Literal(format_lit, _) = format {
+                                    if format_lit == "+%rms" {
+                                        // Special case for +%rms format - 12-hour time with leading zeros
+                                        return "do { my $time = localtime(); my $hour = $time->hour; my $min = $time->min; my $sec = $time->sec; my $ampm = $hour >= 12 ? 'PM' : 'AM'; $hour = $hour % 12; $hour = 12 if $hour == 0; sprintf \"%02d:%02d:%02d %sms\", $hour, $min, $sec, $ampm }".to_string();
+                                    }
+                                }
+                                
                                 // Strip the + prefix from date format strings (shell date +%Y -> strftime %Y)
                                 let cleaned_format = if format_str.starts_with("'+") && format_str.ends_with("'") {
                                     // Remove quotes, strip +, add quotes back
