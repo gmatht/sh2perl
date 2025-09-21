@@ -838,12 +838,8 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
             } else if name == "cat" && !first_cmd.args.is_empty() {
                 // First command is 'cat filename', so read from the file instead of STDIN
                 let filename = generator.perl_string_literal(&first_cmd.args[0]);
-                // For relative filenames, use current directory
-                let adjusted_filename = if !filename.contains('/') && !filename.starts_with('.') && filename != "\"\"" {
-                    format!("\"./{}\"", filename.trim_matches('"'))
-                } else {
-                    filename.clone()
-                };
+                // Use filename as-is without adding ./ prefix
+                let adjusted_filename = filename.clone();
                 output.push_str(&generator.indent());
                 output.push_str(&format!("if (open(my $fh, '<', {})) {{\n", adjusted_filename));
                 generator.indent_level += 1;

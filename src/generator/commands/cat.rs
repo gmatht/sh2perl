@@ -33,12 +33,8 @@ pub fn generate_cat_command(generator: &mut Generator, cmd: &SimpleCommand, redi
         };
         
         output.push_str(&format!("${} = q{{}};\n", input_var));
-        // For relative filenames, use current directory
-        let adjusted_filename = if !filename.starts_with('/') && !filename.starts_with('.') && filename != "" {
-            format!("./{}", filename)
-        } else {
-            filename.clone()
-        };
+        // Use filename as-is without adding ./ prefix
+        let adjusted_filename = filename.clone();
         output.push_str(&format!("if (open my $fh, '<', '{}') {{\n", adjusted_filename));
         output.push_str("while (my $line = <$fh>) {\n");
         output.push_str(&format!("${} .= $line;\n", input_var));
