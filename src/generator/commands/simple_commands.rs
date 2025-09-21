@@ -727,7 +727,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // For multiple arguments, join them with spaces
                         let args_str = args.join(" . q{ } . ");
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("print {} . \"\\n\";\n", args_str));
+                        // Check if any argument contains variables that might end with newlines
+                        if args.iter().any(|arg| arg.contains('$')) {
+                            output.push_str(&format!("do {{ my $output = {}; print $output; print \"\\n\" unless $output =~ /\\n$/msx; }};\n", args_str));
+                        } else {
+                            output.push_str(&format!("print {} . \"\\n\";\n", args_str));
+                        }
                     }
                 }
             }
