@@ -13,7 +13,7 @@ echo "$file_list"
 
 # find command with backticks
 #PERL_MUST_NOT_CONTAIN `find
-found_files=`find . -name "*.sh" -type f`
+found_files=`find . -maxdepth 1 -name "*.sh" -type f`
 echo "Found shell scripts:"
 echo "$found_files"
 
