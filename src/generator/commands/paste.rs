@@ -80,6 +80,7 @@ pub fn generate_paste_command(
         if args.len() >= 2 {
             // Read both files and paste them together
             let paste_id = generator.get_unique_file_handle();
+            result.push_str(&format!("do {{\n"));
             result.push_str(&generator.indent());
             result.push_str(&format!("my @paste_file1_lines_{};\n", paste_id));
             result.push_str(&generator.indent());
@@ -134,6 +135,7 @@ pub fn generate_paste_command(
             result.push_str("}\n");
             result.push_str(&generator.indent());
             result.push_str("$paste_output");
+            result.push_str(&format!("\n{}}}", generator.indent()));
         } else if !args.is_empty() {
             result.push_str(&generator.indent());
             result.push_str(&format!("system 'paste {}';\n", args.join(" ")));
