@@ -230,9 +230,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for tr command in command substitution
                             eprintln!("DEBUG: Processing tr command in command substitution with args: {:?}", simple_cmd.args);
                             
-                            // Use the dedicated tr command generator
+                            // Use the dedicated tr command generator for substitution (no newline)
                             let unique_id = generator.get_unique_id();
-                            let tr_output = crate::generator::commands::tr::generate_tr_command(generator, simple_cmd, "input_data", &unique_id.to_string(), false);
+                            let tr_output = crate::generator::commands::tr::generate_tr_command_for_substitution(generator, simple_cmd, "input_data", &unique_id.to_string());
                             
                             // For command substitution, we need to return the result, not print it
                             format!("do {{ my $input_data = q{{}}; {} }}", tr_output)
