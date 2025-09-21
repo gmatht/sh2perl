@@ -7,13 +7,13 @@ echo "=== Text Processing Commands ==="
 
 # cat command with backticks
 #PERL_MUST_NOT_CONTAIN `cat
-file_content=`cat examples/000__04c_text_processing_commands.sh | head -5`
+file_content=`cat 000__04c_text_processing_commands.sh | head -5`
 echo "First 5 lines of this file:"
 echo "$file_content"
 
 # grep command with backticks
 #PERL_MUST_NOT_CONTAIN `grep
-grep_result=`grep -n "echo" examples/000__04c_text_processing_commands.sh`
+grep_result=`grep -n "echo" 000__04c_text_processing_commands.sh`
 echo "Lines containing 'echo':"
 echo "$grep_result"
 
