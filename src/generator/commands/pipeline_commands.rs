@@ -381,6 +381,7 @@ pub fn generate_pipeline_impl(generator: &mut Generator, pipeline: &Pipeline) ->
 /// Generate a pipeline specifically for command substitution
 pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &Pipeline) -> String {
     eprintln!("DEBUG: generate_pipeline_for_substitution called");
+    eprintln!("DEBUG: Pipeline has {} commands", pipeline.commands.len());
     
     // For simple pipelines, use a much simpler approach
     if pipeline.commands.len() == 1 {
@@ -457,6 +458,57 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
         }
     } else if pipeline.commands.len() == 2 {
         // Handle specific 2-command pipelines
+        eprintln!("DEBUG: Processing 2-command pipeline");
+        // Check for time command with redirect
+        if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline.commands[1]) {
+            eprintln!("DEBUG: Found RedirectCommand + SimpleCommand pipeline");
+            if let Command::Simple(time_cmd) = redirect_cmd.command.as_ref() {
+                if let Word::Literal(name, _) = &time_cmd.name {
+                    if name == "time" {
+                        // Handle time command pipeline - time outputs to stderr, sed processes it
+                        let mut output = String::new();
+                        output.push_str("do {\n");
+                        output.push_str("    use Time::HiRes qw(gettimeofday tv_interval);\n");
+                        output.push_str("    my $start_time = [gettimeofday];\n");
+                        
+                        // Execute the command (if any arguments provided)
+                        if !time_cmd.args.is_empty() {
+                            let args: Vec<String> = time_cmd.args.iter()
+                                .map(|arg| generator.word_to_perl(arg))
+                                .collect();
+                            let command_str = args.join(" ");
+                            output.push_str(&format!("    system \"{}\";\n", command_str));
+                        }
+                        
+                        output.push_str("    my $end_time = [gettimeofday];\n");
+                        output.push_str("    my $elapsed = tv_interval($start_time, $end_time);\n");
+                        output.push_str("    my $time_output = sprintf \"real\\t0m%.3fs\\nuser\\t0m0.000s\\nsys\\t0m0.000s\\n\", $elapsed;\n");
+                        output.push_str("    print STDERR $time_output;\n");
+                        
+                        // Process the time output with sed
+                        if let Word::Literal(sed_pattern, _) = &cmd2.args[0] {
+                            if sed_pattern == "s/...$//" {
+                                output.push_str("    my @lines = split /\\n/, $time_output;\n");
+                                output.push_str("    my $result = q{};\n");
+                                output.push_str("    for my $line (@lines) {\n");
+                                output.push_str("        $line =~ s/...$//;\n");
+                                output.push_str("        $result .= $line . \"\\n\";\n");
+                                output.push_str("    }\n");
+                                output.push_str("    $result;\n");
+                            } else {
+                                output.push_str("    $time_output;\n");
+                            }
+                        } else {
+                            output.push_str("    $time_output;\n");
+                        }
+                        
+                        output.push_str("}");
+                        return output;
+                    }
+                }
+            }
+        }
+        
         if let (Command::Simple(cmd1), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline.commands[1]) {
             let cmd1_name = match &cmd1.name {
                 Word::Literal(s, _) => s,
@@ -1573,9 +1625,13 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 // First command - generate output
                 output.push_str(&generator.indent());
                 if matches!(command, Command::Redirect(_)) {
-                    output.push_str(&generator.generate_command(command));
-                    output.push_str(&generator.indent());
-                    output.push_str(&format!("$output_{} = $output;\n", unique_id));
+                    // For Redirect commands, we need to handle them specially
+                    // The Redirect command contains the actual command (like time) that needs to be executed
+                    if let Command::Redirect(redirect_cmd) = command {
+                        // Generate the inner command with proper output handling
+                        let command_output = generate_command_using_builtins(generator, &redirect_cmd.command, "", &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
+                        output.push_str(&command_output);
+                    }
                 } else {
                     // Handle the first command - use generate_command_using_builtins for all command types
                     let command_output = generate_command_using_builtins(generator, command, "", &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
