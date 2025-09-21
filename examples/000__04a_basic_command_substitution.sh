@@ -8,7 +8,7 @@ echo "=== Basic Command Substitution ==="
 # Simple command substitution
 echo "Current date: `date +%Y`"
 #echo "Current user: `whoami`"
-echo "Current directory: `pwd | sed 's|.*/||'`"
+echo "Current directory: `basename $(pwd)`"
 
 # Assigning backtick results to variables
 current_date=`date +%Y%m`
