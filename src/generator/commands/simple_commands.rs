@@ -716,10 +716,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             _ => false
                         } || args[0].contains('$');
                         
-                        // Debug output
-                        if args[0].contains("tr_result") {
-                            eprintln!("DEBUG: Echo with tr_result - args[0]: '{}', has_variables: {}", args[0], has_variables);
-                        }
                         
                         if has_variables {
                             output.push_str(&format!("do {{ my $output = {}; print $output; print \"\\n\" unless $output =~ /\\n$/msx; }};\n", args[0]));
