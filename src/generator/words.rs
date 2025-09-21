@@ -197,6 +197,16 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     format!("do {{ my $comm_result = qx{{comm}}; chomp $comm_result; $comm_result; }}")
                                 }
                             }
+                        } else if name == "tr" {
+                            // Special handling for tr command in command substitution
+                            eprintln!("DEBUG: Processing tr command in command substitution with args: {:?}", simple_cmd.args);
+                            
+                            // Use the dedicated tr command generator
+                            let unique_id = generator.get_unique_id();
+                            let tr_output = crate::generator::commands::tr::generate_tr_command(generator, simple_cmd, "input_data", &unique_id.to_string(), false);
+                            
+                            // For command substitution, we need to return the result, not print it
+                            format!("do {{ my $input_data = q{{}}; {} }}", tr_output)
                         } else if name == "perl" {
                             // Special handling for perl in command substitution - execute as external command
                             eprintln!("DEBUG: Processing perl command in command substitution with args: {:?}", simple_cmd.args);

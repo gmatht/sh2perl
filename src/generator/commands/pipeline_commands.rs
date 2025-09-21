@@ -446,6 +446,11 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                         // Handle xargs command for command substitution
                         return crate::generator::commands::xargs::generate_xargs_command(generator, simple_cmd, "", "0");
                     }
+                    "tr" => {
+                        // Handle tr command for command substitution
+                        let unique_id = generator.get_unique_id();
+                        return crate::generator::commands::tr::generate_tr_command(generator, simple_cmd, "input_data", &unique_id.to_string(), false);
+                    }
                     _ => {}
                 }
             }
@@ -478,6 +483,22 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                         }
                     }
                 }
+            }
+            
+            if cmd1_name == "echo" && cmd2_name == "tr" {
+                // Special case for echo | tr
+                let unique_id = generator.get_unique_id();
+                // Generate echo output directly as a string value
+                let echo_args: Vec<String> = cmd1.args.iter()
+                    .map(|arg| generator.word_to_perl(arg))
+                    .collect();
+                let echo_string = if echo_args.is_empty() {
+                    "\"\\n\"".to_string()
+                } else {
+                    format!("({}) . \"\\n\"", echo_args.join(" . q{ } . "))
+                };
+                let tr_output = crate::generator::commands::tr::generate_tr_command(generator, cmd2, "input_data", &unique_id.to_string(), false);
+                return format!("do {{ my $input_data = {}; {} $tr_result_{}; }}", echo_string, tr_output, unique_id);
             }
         }
     }
