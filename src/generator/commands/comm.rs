@@ -162,7 +162,7 @@ pub fn generate_comm_command(
             output.push_str("}\n");
             
             // Generate output based on suppression flags
-            output.push_str(&format!("${} = \"\";\n", input_var));
+            output.push_str(&format!("my ${} = \"\";\n", input_var));
             
             if !suppress_col1 {
                 output.push_str("foreach my $line (@file1_lines) {\n");
