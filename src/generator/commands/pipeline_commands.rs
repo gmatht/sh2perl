@@ -821,8 +821,6 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str("my $head_line_count = 0;\n");
                 output.push_str(&generator.indent());
-                output.push_str(&format!("my $cmd_result_{} = q{{}};\n", unique_id));
-                output.push_str(&generator.indent());
                 output.push_str("my $output_0 = q{};\n");
                 output.push_str(&generator.indent());
                 output.push_str(&format!("for (my $i = 0; $i < {}; $i++) {{\n", head_max));
@@ -874,10 +872,6 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 // Assign the output to the final result
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$cmd_result_{} = $output_0;\n", unique_id));
-                
-                // Return the result for command substitution
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$cmd_result_{}\n", unique_id));
                 
                 return output; // Return early since we've handled everything
             } else if name == "cat" && !first_cmd.args.is_empty() {
