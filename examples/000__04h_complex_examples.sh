@@ -71,3 +71,4 @@ echo "Perl result: $perl_result"
 rm -f file1.txt file2.txt
 
 echo "=== Complex Backtick Examples Complete ==="
+

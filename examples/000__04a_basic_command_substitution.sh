@@ -20,3 +20,4 @@ echo "Stored date: $current_date"
 echo "Stored directory: $current_dir"
 
 echo "=== Basic Command Substitution Complete ==="
+

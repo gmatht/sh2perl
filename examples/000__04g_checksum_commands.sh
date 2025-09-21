@@ -26,3 +26,4 @@ echo "$strings_result"
 rm -f test_checksum.txt
 
 echo "=== Checksum Commands Complete ==="
+
