@@ -485,22 +485,9 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                         output.push_str("    my $time_output = sprintf \"real\\t0m%.3fs\\nuser\\t0m0.000s\\nsys\\t0m0.000s\\n\", $elapsed;\n");
                         output.push_str("    print STDERR $time_output;\n");
                         
-                        // Process the time output with sed
-                        if let Word::Literal(sed_pattern, _) = &cmd2.args[0] {
-                            if sed_pattern == "s/...$//" {
-                                output.push_str("    my @lines = split /\\n/, $time_output;\n");
-                                output.push_str("    my $result = q{};\n");
-                                output.push_str("    for my $line (@lines) {\n");
-                                output.push_str("        $line =~ s/...$//;\n");
-                                output.push_str("        $result .= $line . \"\\n\";\n");
-                                output.push_str("    }\n");
-                                output.push_str("    $result;\n");
-                            } else {
-                                output.push_str("    $time_output;\n");
-                            }
-                        } else {
-                            output.push_str("    $time_output;\n");
-                        }
+                        // The shell script has a bug where time command output is not captured
+                        // by command substitution. To match shell behavior, return empty string.
+                        output.push_str("    q{};\n");
                         
                         output.push_str("}");
                         return output;
