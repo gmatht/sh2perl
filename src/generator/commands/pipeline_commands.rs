@@ -452,6 +452,19 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                 // Special case for pwd | basename
                 return "do { use Cwd; my $path = getcwd(); $path =~ s/.*\\///msx; $path; }".to_string();
             }
+            
+            if cmd1_name == "pwd" && cmd2_name == "sed" {
+                // Special case for pwd | sed 's|.*/||'
+                if let Command::Simple(sed_cmd) = &pipeline.commands[1] {
+                    if sed_cmd.args.len() == 1 {
+                        if let Word::Literal(pattern, _) = &sed_cmd.args[0] {
+                            if pattern == "s|.*/||" {
+                                return "do { use Cwd; my $path = getcwd(); $path =~ s/.*\\///msx; $path; }".to_string();
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     
