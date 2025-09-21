@@ -12,34 +12,53 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
     let mut args = Vec::new();
     let mut max_args = 1; // Default to 1 argument per command
     
-    // Parse xargs arguments
-    for arg in &cmd.args {
-        if let Word::Literal(arg_str, _) = arg {
-            if arg_str == "grep" {
-                command = "grep";
-            } else if arg_str == "-l" {
-                // This will be handled in the grep logic
-            } else if arg_str == "-n1" {
-                max_args = 1;
-            } else if arg_str == "function" {
-                args.push("function".to_string());
-            } else if !arg_str.starts_with('-') {
-                // This is likely the command to execute
-                command = arg_str;
+        // Parse xargs arguments
+        let mut i = 0;
+        while i < cmd.args.len() {
+            if let Word::Literal(arg_str, _) = &cmd.args[i] {
+                if arg_str == "grep" {
+                    command = "grep";
+                } else if arg_str == "-l" {
+                    // This will be handled in the grep logic
+                } else if arg_str == "-n1" {
+                    max_args = 1;
+                } else if arg_str == "function" {
+                    args.push("function".to_string());
+                } else if !arg_str.starts_with('-') {
+                    // This is likely the command to execute
+                    command = arg_str;
+                    
+                    // Check if the next argument is a string interpolation (like "Number:")
+                    if i + 1 < cmd.args.len() {
+                        if let Word::StringInterpolation(interp, _) = &cmd.args[i + 1] {
+                            let pattern = interp.parts.iter()
+                                .map(|part| match part {
+                                    StringPart::Literal(s) => s,
+                                    _ => ".*"
+                                })
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .map(|s| s)
+                                .collect::<String>();
+                            args.push(pattern);
+                            i += 1; // Skip the next argument since we processed it
+                        }
+                    }
+                }
+            } else if let Word::StringInterpolation(interp, _) = &cmd.args[i] {
+                let pattern = interp.parts.iter()
+                    .map(|part| match part {
+                        StringPart::Literal(s) => s,
+                        _ => ".*"
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|s| s)
+                    .collect::<String>();
+                args.push(pattern);
             }
-        } else if let Word::StringInterpolation(interp, _) = arg {
-            let pattern = interp.parts.iter()
-                .map(|part| match part {
-                    StringPart::Literal(s) => s,
-                    _ => ".*"
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|s| s)
-                .collect::<String>();
-            args.push(pattern);
+            i += 1;
         }
-    }
     
     if command == "grep" && args.contains(&"function".to_string()) {
         // Handle grep -l "function" on the input files
@@ -83,10 +102,17 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         if command == "echo" {
             // Handle echo command
             output.push_str(&format!("    my $xargs_line_{} = \"\";\n", command_index));
+            
+            // Add the echo prefix if we have args
+            if !args.is_empty() {
+                output.push_str(&format!("    $xargs_line_{} .= \"{}\";\n", command_index, args[0]));
+            }
+            
+            // Add the input arguments
             output.push_str(&format!("    foreach my $arg (@xargs_args_{}) {{\n", command_index));
-            output.push_str(&format!("        $xargs_line_{} .= $arg . \" \";\n", command_index));
+            output.push_str(&format!("        $xargs_line_{} .= \" \" . $arg;\n", command_index));
             output.push_str("    }\n");
-            output.push_str(&format!("    $xargs_line_{} =~ s/\\s+$//;\n", command_index));
+            
             output.push_str(&format!("    push @xargs_output_{}, $xargs_line_{};\n", command_index, command_index));
         } else {
             // Handle other commands

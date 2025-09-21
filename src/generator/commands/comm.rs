@@ -127,6 +127,10 @@ pub fn generate_comm_command(
             let file1 = &file_args[0];
             let file2 = &file_args[1];
             
+            // Declare variables
+            output.push_str("my @file1_lines;\n");
+            output.push_str("my @file2_lines;\n");
+            
             // Read first file
             output.push_str(&format!("if (open my $fh1, '<', '{}') {{\n", file1));
             output.push_str("    while (my $line = <$fh1>) {\n");
