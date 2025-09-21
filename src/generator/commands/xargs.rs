@@ -10,6 +10,7 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
     
     let mut command = "echo";
     let mut args = Vec::new();
+    let mut max_args = 1; // Default to 1 argument per command
     
     // Parse xargs arguments
     for arg in &cmd.args {
@@ -18,8 +19,13 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
                 command = "grep";
             } else if arg_str == "-l" {
                 // This will be handled in the grep logic
+            } else if arg_str == "-n1" {
+                max_args = 1;
             } else if arg_str == "function" {
                 args.push("function".to_string());
+            } else if !arg_str.starts_with('-') {
+                // This is likely the command to execute
+                command = arg_str;
             }
         } else if let Word::StringInterpolation(interp, _) = arg {
             let pattern = interp.parts.iter()
@@ -65,14 +71,37 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         output.push_str(&generator.indent());
         output.push_str("}\n");
     } else {
-        // Fallback to system command for other cases
-        let unique_id = generator.get_unique_id();
-        output.push_str(&format!("my ($in_{}, $out_{}, $err_{});
-my $pid_{} = open3($in_{}, $out_{}, $err_{}, 'bash', '-c', 'echo \"${}\" | {}');
-close $in_{} or croak 'Close failed: $!';
-my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out_{}> }};
-close $out_{} or croak 'Close failed: $!';
-waitpid $pid_{}, 0;\n", unique_id, unique_id, unique_id, unique_id, unique_id, unique_id, unique_id, input_var, command, unique_id, output_var, unique_id, unique_id, unique_id));
+        // Handle xargs with command execution
+        output.push_str(&format!("my @xargs_input_{} = split /\\s+/msx, ${};\n", command_index, input_var));
+        output.push_str(&format!("my @xargs_output_{};\n", command_index));
+        output.push_str(&format!("for (my $i = 0; $i < @xargs_input_{}; $i += {}) {{\n", command_index, max_args));
+        output.push_str(&format!("    my @xargs_args_{};\n", command_index));
+        output.push_str(&format!("    for (my $j = 0; $j < {} && $i + $j < @xargs_input_{}; $j++) {{\n", max_args, command_index));
+        output.push_str(&format!("        push @xargs_args_{}, $xargs_input_{}[$i + $j];\n", command_index, command_index));
+        output.push_str("    }\n");
+        
+        if command == "echo" {
+            // Handle echo command
+            output.push_str(&format!("    my $xargs_line_{} = \"\";\n", command_index));
+            output.push_str(&format!("    foreach my $arg (@xargs_args_{}) {{\n", command_index));
+            output.push_str(&format!("        $xargs_line_{} .= $arg . \" \";\n", command_index));
+            output.push_str("    }\n");
+            output.push_str(&format!("    $xargs_line_{} =~ s/\\s+$//;\n", command_index));
+            output.push_str(&format!("    push @xargs_output_{}, $xargs_line_{};\n", command_index, command_index));
+        } else {
+            // Handle other commands
+            output.push_str(&format!("    my ($in_{}, $out_{}, $err_{});\n", command_index, command_index, command_index));
+            output.push_str(&format!("    my $pid_{} = open3($in_{}, $out_{}, $err_{}, '{}', @xargs_args_{});\n", command_index, command_index, command_index, command_index, command, command_index));
+            output.push_str(&format!("    close $in_{} or croak 'Close failed: $!';\n", command_index));
+            output.push_str(&format!("    my $xargs_result_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out_{}> }};\n", command_index, command_index));
+            output.push_str(&format!("    close $out_{} or croak 'Close failed: $!';\n", command_index));
+            output.push_str(&format!("    waitpid $pid_{}, 0;\n", command_index));
+            output.push_str(&format!("    chomp $xargs_result_{};\n", command_index));
+            output.push_str(&format!("    push @xargs_output_{}, $xargs_result_{};\n", command_index, command_index));
+        }
+        
+        output.push_str("}\n");
+        output.push_str(&format!("my ${} = join \"\\n\", @xargs_output_{};\n", output_var, command_index));
     }
     output.push_str("\n");
     
