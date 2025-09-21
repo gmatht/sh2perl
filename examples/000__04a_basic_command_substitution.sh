@@ -13,7 +13,7 @@ echo "Current directory: `basename $(pwd)`"
 # Assigning backtick results to variables
 current_date=`date +%Y%m`
 #current_user=`whoami`
-current_dir=`pwd | sed 's|.*/||'`
+current_dir=`basename $(pwd)`
 
 echo "Stored date: $current_date"
 #echo "Stored user: $current_user"
