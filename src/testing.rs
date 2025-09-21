@@ -975,9 +975,9 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 let out = loop {
                     let elapsed = start.elapsed();
                     // Reduced debug output - only log every 100ms to avoid spam
-        if elapsed.as_millis() % 100 == 0 {
-            eprintln!("DEBUG: Execution loop iteration, elapsed: {:?}", elapsed);
-        }
+                    if elapsed.as_millis() % 100 == 0 {
+                        eprintln!("DEBUG: Execution loop iteration, elapsed: {:?}", elapsed);
+                    }
                     match child.try_wait() {
                         Ok(Some(status)) => {
                             eprintln!("DEBUG: Perl process completed with status: {:?}", status);
