@@ -397,6 +397,9 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                                     return "use POSIX qw(strftime); strftime('%Y', localtime())".to_string();
                                 } else if format == "+%Y%m" {
                                     return "use POSIX qw(strftime); strftime('%Y%m', localtime())".to_string();
+                                } else if format == "+%rms" {
+                                    // Special case for +%rms format - 12-hour time with leading zeros
+                                    return "my $time = localtime(); my $hour = $time->hour; my $min = $time->min; my $sec = $time->sec; my $ampm = $hour >= 12 ? 'PM' : 'AM'; $hour = $hour % 12; $hour = 12 if $hour == 0; sprintf \"%02d:%02d:%02d %sms\", $hour, $min, $sec, $ampm".to_string();
                                 }
                             }
                         }
