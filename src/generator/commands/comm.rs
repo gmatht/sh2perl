@@ -162,12 +162,12 @@ pub fn generate_comm_command(
             output.push_str("}\n");
             
             // Generate output based on suppression flags
-            output.push_str(&format!("my ${} = \"\";\n", input_var));
+            output.push_str("my $comm_result = \"\";\n");
             
             if !suppress_col1 {
                 output.push_str("foreach my $line (@file1_lines) {\n");
                 output.push_str("    if (!exists($file2_set{$line})) {\n");
-                output.push_str(&format!("        ${} .= $line . \"\\n\";\n", input_var));
+                output.push_str("        $comm_result .= $line . \"\\n\";\n");
                 output.push_str("    }\n");
                 output.push_str("}\n");
             }
@@ -175,22 +175,23 @@ pub fn generate_comm_command(
             if !suppress_col2 {
                 output.push_str("foreach my $line (@file2_lines) {\n");
                 output.push_str("    if (!exists($file1_set{$line})) {\n");
-                output.push_str(&format!("        ${} .= $line . \"\\n\";\n", input_var));
+                output.push_str("        $comm_result .= $line . \"\\n\";\n");
                 output.push_str("    }\n");
                 output.push_str("}\n");
             }
             
             if !suppress_col3 {
                 output.push_str("foreach my $line (@common_lines) {\n");
-                output.push_str(&format!("    ${} .= $line . \"\\n\";\n", input_var));
+                output.push_str("    $comm_result .= $line . \"\\n\";\n");
                 output.push_str("}\n");
             }
             
-            // Remove trailing newline
-            output.push_str(&format!("${} =~ s/\\n$//;\n", input_var));
+            // Remove trailing newline and return the result
+            output.push_str("$comm_result =~ s/\\n$//;\n");
+            output.push_str("$comm_result");
         } else {
             // Fallback if we don't have enough file arguments
-            output.push_str(&format!("${} = \"\";\n", input_var));
+            output.push_str("\"\"");
         }
     }
     
