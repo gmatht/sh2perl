@@ -1504,9 +1504,7 @@ pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<St
             // Run test with timeout using the new timeout manager
             let generator_clone = generator.to_string();
             let example_clone = example.to_string();
-            let test_result = execute_with_progress(OperationType::TestExecution, move || {
-                test_file_equivalence_detailed_with_critic(&generator_clone, &example_clone, Some(AstFormatOptions::default()), enable_perl_critic)
-            });
+            let test_result = test_file_equivalence_detailed_with_critic(&generator_clone, &example_clone, Some(AstFormatOptions::default()), enable_perl_critic);
             
             eprintln!("DEBUG: Test execution completed in {:.2}ms", individual_test_start.elapsed().as_millis());
             
@@ -2050,9 +2048,7 @@ pub fn test_all_examples_next_fail_unlimited(generators: &[String], test_prefix:
             // Run test with timeout using the new timeout manager
             let generator_clone = generator.to_string();
             let example_clone = example.to_string();
-            let test_result = execute_with_progress(OperationType::TestExecution, move || {
-                test_file_equivalence_detailed_with_critic(&generator_clone, &example_clone, Some(AstFormatOptions::default()), enable_perl_critic)
-            });
+            let test_result = test_file_equivalence_detailed_with_critic(&generator_clone, &example_clone, Some(AstFormatOptions::default()), enable_perl_critic);
             
             eprintln!("DEBUG: Test execution completed in {:.2}ms", individual_test_start.elapsed().as_millis());
             
