@@ -778,7 +778,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
 
 pub fn word_to_perl_for_test_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s, _) => s.clone(),
+        Word::Literal(s, _) => generator.perl_string_literal(word),
         Word::ParameterExpansion(pe, _) => generator.generate_parameter_expansion(pe),
         _ => format!("{:?}", word)
     }
