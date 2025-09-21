@@ -817,7 +817,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                     }
                 }
 
-                // Generate a for loop that processes the line through all commands
+                // Generate a for loop that processes the line through all commands  
                 output.push_str(&generator.indent());
                 output.push_str("my $head_line_count = 0;\n");
                 output.push_str(&generator.indent());

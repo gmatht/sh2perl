@@ -800,10 +800,16 @@ let pattern = &args[pattern_idx];
                 // Simple expressions don't need wrapping
                 result
             } else {
-                // Wrap complex results with chomp to strip trailing newlines (bash behavior)
-                let unique_id = generator.get_unique_id();
-                format!("do {{\n{}    my $cmd_result_{} = {};\n{}    chomp $cmd_result_{};\n{}    $cmd_result_{};\n{}}}", 
-                    generator.indent(), unique_id, result, generator.indent(), unique_id, generator.indent(), unique_id, generator.indent())
+                // Check if this is a pipeline result that already returns a value directly
+                if result.contains("$output_0") && result.contains("for (my $i = 0") {
+                    // This is a pipeline that returns its result directly, so just wrap it in do block
+                    format!("do {{\n{}\n{}}}", result, generator.indent())
+                } else {
+                    // Wrap complex results with chomp to strip trailing newlines (bash behavior)
+                    let unique_id = generator.get_unique_id();
+                    format!("do {{\n{}    my $cmd_result_{} = {};\n{}    chomp $cmd_result_{};\n{}    $cmd_result_{};\n{}}}", 
+                        generator.indent(), unique_id, result, generator.indent(), unique_id, generator.indent(), unique_id, generator.indent())
+                }
             }
         },
         Word::Variable(var, _, _) => {
