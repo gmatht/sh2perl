@@ -711,7 +711,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         let has_variables = match &cmd.args[0] {
                             Word::Variable(_, _, _) => true,
                             Word::StringInterpolation(interp, _) => {
-                                interp.parts.iter().any(|part| matches!(part, crate::ast::StringPart::Variable(_)))
+                                let has_vars = interp.parts.iter().any(|part| matches!(part, crate::ast::StringPart::Variable(_)));
+                                // Debug: print what we're checking
+                                eprintln!("DEBUG: StringInterpolation parts: {:?}", interp.parts);
+                                eprintln!("DEBUG: has_vars: {}", has_vars);
+                                has_vars
                             }
                             _ => false
                         } || args[0].contains('$');
