@@ -708,7 +708,14 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         output.push_str(&format!("if (!({} =~ /\\n$/msx)) {{ print \"\\n\"; }}\n", args[0]));
                     } else {
                         // Check if the argument contains variables that might end with newlines
-                        if args[0].contains('$') {
+                        let has_variables = match &cmd.args[0] {
+                            Word::Variable(_, _, _) => true,
+                            Word::StringInterpolation(interp, _) => {
+                                interp.parts.iter().any(|part| matches!(part, crate::ast::StringPart::Variable(_)))
+                            }
+                            _ => false
+                        };
+                        if has_variables {
                             output.push_str(&format!("do {{ my $output = {}; print $output; print \"\\n\" unless $output =~ /\\n$/msx; }};\n", args[0]));
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
@@ -728,7 +735,16 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         let args_str = args.join(" . q{ } . ");
                         output.push_str(&generator.indent());
                         // Check if any argument contains variables that might end with newlines
-                        if args.iter().any(|arg| arg.contains('$')) {
+                        let has_variables = cmd.args.iter().any(|arg| {
+                            match arg {
+                                Word::Variable(_, _, _) => true,
+                                Word::StringInterpolation(interp, _) => {
+                                    interp.parts.iter().any(|part| matches!(part, crate::ast::StringPart::Variable(_)))
+                                }
+                                _ => false
+                            }
+                        });
+                        if has_variables {
                             output.push_str(&format!("do {{ my $output = {}; print $output; print \"\\n\" unless $output =~ /\\n$/msx; }};\n", args_str));
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args_str));
