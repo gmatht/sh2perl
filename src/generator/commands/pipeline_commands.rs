@@ -869,9 +869,9 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
                 
-                // Assign the output to the final result
+                // Return the output directly for command substitution
                 output.push_str(&generator.indent());
-                output.push_str(&format!("$cmd_result_{} = $output_0;\n", unique_id));
+                output.push_str("$output_0\n");
                 
                 return output; // Return early since we've handled everything
             } else if name == "cat" && !first_cmd.args.is_empty() {
