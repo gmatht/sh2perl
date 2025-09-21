@@ -1579,7 +1579,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                         if let Word::Literal(cmd_name, _) = &cmd.name {
                             if cmd_name == "echo" {
                                 // For echo commands, just add the output directly without splitting
-                                output.push_str(&generator.indent());
+                                // Don't add extra indentation as echo commands already have proper indentation
                                 output.push_str(&command_output);
                                 if !command_output.ends_with('\n') {
                                     output.push_str("\n");
