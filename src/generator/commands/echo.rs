@@ -70,8 +70,8 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                         .replace("\\\\", "\\");
                                     
                                     // Return as a quoted string literal with proper escaping for Perl
-                                    // For -e flag, we want to preserve the interpreted newlines, so don't escape them
-                                    format!("\"{}\"", interpreted.replace("\\", "\\\\").replace("\"", "\\\""))
+                                    // For -e flag, escape newlines to prevent multiline string literals with indentation issues
+                                    format!("\"{}\"", interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
                                 } else {
                                     generator.perl_string_literal(arg)
                                 }
@@ -129,8 +129,8 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                     }
                                 }
                                 // Return as a quoted string literal with proper escaping for Perl
-                                // For -e flag, we want to preserve the interpreted newlines, so don't escape them
-                                format!("\"{}\"", result.replace("\\", "\\\\").replace("\"", "\\\""))
+                                // For -e flag, escape newlines to prevent multiline string literals with indentation issues
+                                format!("\"{}\"", result.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
                             } else {
                                 // For multi-part string interpolation without -e flag, use the general string interpolation handler
                                 eprintln!("DEBUG: echo.rs - Processing StringInterpolation with {} parts", interp.parts.len());
