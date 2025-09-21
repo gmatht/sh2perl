@@ -24,3 +24,4 @@ echo "Tee result: $tee_result"
 rm -f test_tee.txt
 
 echo "=== Output and Formatting Commands Complete ==="
+

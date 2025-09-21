@@ -26,3 +26,4 @@ echo "$found_files"
 #echo "Script directory: $script_dir"
 
 echo "=== File and Directory Operations Complete ==="
+
