@@ -703,8 +703,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                    .replace("\r", "\\r");
                         output.push_str(&format!("print \"{}\\n\";\n", escaped_content));
                     } else if args[0].starts_with('$') && !args[0].contains("\\n") {
-                        // For variables, use comma to avoid string interpolation
-                        output.push_str(&format!("print {}, \"\\n\";\n", args[0]));
+                        // For variables, check if they already end with newline to avoid extra blank lines
+                        output.push_str(&format!("print {};\n", args[0]));
+                        output.push_str(&format!("if (!({} =~ /\\n$/msx)) {{ print \"\\n\"; }}\n", args[0]));
                     } else {
                         output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
                     }
