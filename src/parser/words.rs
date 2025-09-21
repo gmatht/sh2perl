@@ -862,7 +862,8 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
 // Placeholder functions - these would need to be implemented based on the actual AST structures
 
 fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
-    use crate::ast::{StringInterpolation, StringPart};
+    use crate::ast::{StringInterpolation, StringPart, Command, SimpleCommand, Word};
+    use std::collections::HashMap;
     
     // Get the double-quoted string content (this includes the quotes)
     let string_content = lexer.get_string_text()?;
@@ -967,12 +968,32 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 let cmd_content = &content[cmd_start..i];
                 i += 1; // skip the closing `
                 
-                // Parse the command content using the simple command parser
-                match parse_simple_command_from_text(cmd_content) {
-                    Ok(command) => {
-                        parts.push(StringPart::CommandSubstitution(Box::new(command)));
+                // Parse the command content using the full parser to handle pipelines
+                let sub_lexer = Lexer::new(cmd_content);
+                let mut sub_parser = Parser::new_with_lexer(sub_lexer);
+                match sub_parser.parse() {
+                    Ok(commands) => {
+                        eprintln!("DEBUG: String interpolation parsed command '{}' as {} commands", cmd_content, commands.len());
+                        if commands.len() == 1 {
+                            parts.push(StringPart::CommandSubstitution(Box::new(commands[0].clone())));
+                        } else if commands.is_empty() {
+                            // If no commands parsed, treat as a simple command with the text as argument
+                            let placeholder_cmd = Command::Simple(SimpleCommand {
+                                name: Word::Literal("echo".to_string(), None),
+                                args: vec![Word::Literal(cmd_content.to_string(), None)],
+                                redirects: Vec::new(),
+                                env_vars: HashMap::new(),
+                                stdout_used: true,
+                                stderr_used: true,
+                            });
+                            parts.push(StringPart::CommandSubstitution(Box::new(placeholder_cmd)));
+                        } else {
+                            // If multiple commands, use the first one
+                            parts.push(StringPart::CommandSubstitution(Box::new(commands[0].clone())));
+                        }
                     }
-                    Err(_e) => {
+                    Err(e) => {
+                        eprintln!("DEBUG: String interpolation failed to parse command '{}': {:?}", cmd_content, e);
                         // Fall back to treating it as a literal
                         parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
                     }

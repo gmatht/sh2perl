@@ -133,6 +133,10 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                 format!("\"{}\"", result.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
                             } else {
                                 // For multi-part string interpolation without -e flag, use the general string interpolation handler
+                                eprintln!("DEBUG: echo.rs - Processing StringInterpolation with {} parts", interp.parts.len());
+                                for (i, part) in interp.parts.iter().enumerate() {
+                                    eprintln!("DEBUG: echo.rs - Part {}: {:?}", i, part);
+                                }
                                 generator.convert_string_interpolation_to_perl(interp)
                             }
                         }
@@ -142,6 +146,7 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                         handle_brace_expansion_for_echo(generator, expansion)
                     }
                     Word::Literal(literal, _) => {
+                        eprintln!("DEBUG: echo.rs - Processing literal word: '{}'", literal);
                         if has_e_flag {
                             // If -e flag is present, interpret backslash escapes
                             let mut interpreted = literal.clone();
@@ -162,9 +167,9 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                             // Escape quotes, backslashes, newlines, and tabs
                             format!("\"{}\"", interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
                         } else {
-                            // Check if the literal contains escaped backticks that should be processed as command substitutions
-                            if literal.contains("\\`") {
-                                // Parse the string as string interpolation to handle escaped backticks
+                            // Check if the literal contains backticks that should be processed as command substitutions
+                            if literal.contains("\\`") || literal.contains("`") {
+                                // Parse the string as string interpolation to handle backticks
                                 if let Ok(interp) = crate::parser::words::parse_string_interpolation_from_literal(literal) {
                                     generator.convert_string_interpolation_to_perl(&interp)
                                 } else {
