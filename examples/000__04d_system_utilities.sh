@@ -14,7 +14,7 @@ echo "Formatted date: $formatted_date"
 
 # time command with backticks
 #PERL_MUST_NOT_CONTAIN `time
-time_result=`time sleep 1 2>&1 | sed s/...$//`
+time_result=`time sleep 1 2>&1 | sed 's/...$//'`
 echo "Time result: $time_result"
 
 # sleep command with backticks (though it doesn't produce output)
