@@ -1,137 +1,48 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_diff_command(generator: &mut Generator, _cmd: &SimpleCommand, _input_var: &str, _command_index: usize, _is_final_command: bool) -> String {
+pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, _command_index: usize, _is_final_command: bool) -> String {
     let mut output = String::new();
     
-    // Check if we have environment variables for diff temp files
+    // Always use diff.exe instead of built-in implementation
     output.push_str(&generator.indent());
     output.push_str("my $diff_exit_code = 0;\n");
     output.push_str(&generator.indent());
-    output.push_str("if (exists($ENV{DIFF_TEMP_FILE1}) && exists($ENV{DIFF_TEMP_FILE2})) {\n");
+    output.push_str("my $diff_output = \"\";\n");
+    
+    // Build the diff command arguments
+    let mut args = Vec::new();
+    for arg in &cmd.args {
+        let arg_str = generator.word_to_perl(arg);
+        args.push(arg_str);
+    }
+    
+    if !args.is_empty() {
+        output.push_str(&generator.indent());
+        output.push_str("{\n");
+        generator.indent_level += 1;
+        output.push_str(&generator.indent());
+        output.push_str("local $/;  # Read entire input at once\n");
+        output.push_str(&generator.indent());
+        output.push_str(&format!("open my $pipe, '-|', 'diff.exe', {};\n", 
+            args.iter().map(|arg| format!("\"{}\"", arg)).collect::<Vec<_>>().join(", ")));
+        output.push_str(&generator.indent());
+        output.push_str("$diff_output = <$pipe>;\n");
+        output.push_str(&generator.indent());
+        output.push_str("close $pipe;\n");
+        output.push_str(&generator.indent());
+        output.push_str("$diff_exit_code = $? >> 8;\n");
+        generator.indent_level -= 1;
+        output.push_str(&generator.indent());
+        output.push_str("}\n");
+    } else {
+        output.push_str(&generator.indent());
+        output.push_str("$diff_output = \"\";\n");
+    }
+    
+    // For command substitution, we need to return the output
     output.push_str(&generator.indent());
-    output.push_str("    my $file1 = $ENV{DIFF_TEMP_FILE1};\n");
-    output.push_str(&generator.indent());
-    output.push_str("    my $file2 = $ENV{DIFF_TEMP_FILE2};\n");
-    output.push_str(&generator.indent());
-    output.push_str("    \n");
-    output.push_str(&generator.indent());
-    output.push_str("    # Read both files\n");
-    output.push_str(&generator.indent());
-    output.push_str("    my @file1_lines;\n");
-    output.push_str(&generator.indent());
-    output.push_str("    my @file2_lines;\n");
-    output.push_str(&generator.indent());
-    output.push_str("    \n");
-    output.push_str(&generator.indent());
-    output.push_str("    if (open my $fh1, '<', $file1) {\n");
-    output.push_str(&generator.indent());
-    output.push_str("        while (my $line = <$fh1>) {\n");
-    output.push_str(&generator.indent());
-    output.push_str("            chomp $line;\n");
-    output.push_str(&generator.indent());
-    output.push_str("            push @file1_lines, $line;\n");
-    output.push_str(&generator.indent());
-    output.push_str("        }\n");
-    output.push_str(&generator.indent());
-    output.push_str("        close($fh1);\n");
-    output.push_str(&generator.indent());
-    output.push_str("    }\n");
-    output.push_str(&generator.indent());
-    output.push_str("    \n");
-    output.push_str(&generator.indent());
-    output.push_str("    if (open my $fh2, '<', $file2) {\n");
-    output.push_str(&generator.indent());
-    output.push_str("        while (my $line = <$fh2>) {\n");
-    output.push_str(&generator.indent());
-    output.push_str("            chomp $line;\n");
-    output.push_str(&generator.indent());
-    output.push_str("            push @file2_lines, $line;\n");
-    output.push_str(&generator.indent());
-    output.push_str("        }\n");
-    output.push_str(&generator.indent());
-    output.push_str("        close($fh2);\n");
-    output.push_str(&generator.indent());
-    output.push_str("    }\n");
-    output.push_str(&generator.indent());
-    output.push_str("    \n");
-    output.push_str(&generator.indent());
-    output.push_str("    # Simple diff implementation\n");
-    output.push_str(&generator.indent());
-    output.push_str("    my $exit_code = 0;\n");
-    output.push_str(&generator.indent());
-    output.push_str("    my $max_lines = @file1_lines > @file2_lines ? @file1_lines : @file2_lines;\n");
-    output.push_str(&generator.indent());
-    output.push_str("    \n");
-    output.push_str(&generator.indent());
-    output.push_str("    for (my $i = 0; $i < $max_lines; $i++) {\n");
-    output.push_str(&generator.indent());
-    output.push_str("        my $line1 = $i < @file1_lines ? $file1_lines[$i] : undef;\n");
-    output.push_str(&generator.indent());
-    output.push_str("        my $line2 = $i < @file2_lines ? $file2_lines[$i] : undef;\n");
-    output.push_str(&generator.indent());
-    output.push_str("        \n");
-    output.push_str(&generator.indent());
-    output.push_str("        if (!defined $line1 || !defined $line2 || $line1 ne $line2) {\n");
-    output.push_str(&generator.indent());
-    output.push_str("            if (defined $line1 && defined $line2) {\n");
-    output.push_str(&generator.indent());
-    output.push_str("                # Lines differ\n");
-    output.push_str(&generator.indent());
-    output.push_str("                my $line_num = $i + 1;\n");
-    output.push_str(&generator.indent());
-                    output.push_str("                print \"${line_num}c${line_num}\\n\";\n");
-    output.push_str(&generator.indent());
-                    output.push_str("                print \"< $line1\\n\";\n");
-    output.push_str(&generator.indent());
-                    output.push_str("                print \"---\\n\";\n");
-    output.push_str(&generator.indent());
-                    output.push_str("                print \"> $line2\\n\";\n");
-    output.push_str(&generator.indent());
-    output.push_str("            } elsif (!defined($line1)) {\n");
-    output.push_str(&generator.indent());
-    output.push_str("                # File2 has more lines\n");
-    output.push_str(&generator.indent());
-    output.push_str("                my $line_num = @file1_lines + 1;\n");
-    output.push_str(&generator.indent());
-    output.push_str("                print \"${line_num}a${line_num}\\n\";\n");
-    output.push_str(&generator.indent());
-    output.push_str("                print \"> $line2\\n\";\n");
-    output.push_str(&generator.indent());
-    output.push_str("            } else {\n");
-    output.push_str(&generator.indent());
-    output.push_str("                # File1 has more lines\n");
-    output.push_str(&generator.indent());
-    output.push_str("                my $line_num = @file2_lines + 1;\n");
-    output.push_str(&generator.indent());
-    output.push_str("                print \"${line_num}d${line_num}\\n\";\n");
-    output.push_str(&generator.indent());
-    output.push_str("                print \"< $line1\\n\";\n");
-    output.push_str(&generator.indent());
-    output.push_str("            }\n");
-    output.push_str(&generator.indent());
-    output.push_str("            $exit_code = 1;\n");
-    output.push_str(&generator.indent());
-    output.push_str("        }\n");
-    output.push_str(&generator.indent());
-    output.push_str("    }\n");
-    output.push_str(&generator.indent());
-    output.push_str("    \n");
-    output.push_str(&generator.indent());
-    output.push_str("    # Set exit code for the || operator to work\n");
-    output.push_str(&generator.indent());
-    output.push_str("    $diff_exit_code = $exit_code;\n");
-    output.push_str(&generator.indent());
-    output.push_str("} else {\n");
-    output.push_str(&generator.indent());
-    output.push_str("    # Fallback: use system diff if available\n");
-    output.push_str(&generator.indent());
-    output.push_str("    my $exit_code = system 'diff', @ARGV;\n");
-    output.push_str(&generator.indent());
-    output.push_str("    $diff_exit_code = $exit_code >> 8;\n");
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
-
+    output.push_str("$diff_output");
     
     output
 }

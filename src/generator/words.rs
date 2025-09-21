@@ -194,7 +194,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for diff command in command substitution
                             eprintln!("DEBUG: Processing diff command in command substitution with args: {:?}", simple_cmd.args);
                             
-                            // Use a simple diff implementation for command substitution
+                            // Use diff.exe instead of built-in implementation
                             let args: Vec<String> = simple_cmd.args.iter()
                                 .map(|arg| generator.word_to_perl(arg))
                                 .collect();
@@ -204,57 +204,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 let file2 = &args[1];
                                 
                                 format!("do {{
-    my @file1_lines;
-    my @file2_lines;
-    
-    # Read first file
-    if (open my $fh1, '<', '{}') {{
-        while (my $line = <$fh1>) {{
-            chomp $line;
-            push @file1_lines, $line;
-        }}
-        close $fh1;
-    }}
-    
-    # Read second file
-    if (open my $fh2, '<', '{}') {{
-        while (my $line = <$fh2>) {{
-            chomp $line;
-            push @file2_lines, $line;
-        }}
-        close $fh2;
-    }}
-    
-    # Simple diff implementation
     my $diff_output = \"\";
-    my $max_lines = @file1_lines > @file2_lines ? @file1_lines : @file2_lines;
-    
-    for (my $i = 0; $i < $max_lines; $i++) {{
-        my $line1 = $i < @file1_lines ? $file1_lines[$i] : undef;
-        my $line2 = $i < @file2_lines ? $file2_lines[$i] : undef;
-        
-        if (!defined $line1 || !defined $line2 || $line1 ne $line2) {{
-            if (defined $line1 && defined $line2) {{
-                # Lines differ
-                my $line_num = $i + 1;
-                $diff_output .= \"${{line_num}}c${{line_num}}\\n\";
-                $diff_output .= \"< $line1\\n\";
-                $diff_output .= \"---\\n\";
-                $diff_output .= \"> $line2\\n\";
-            }} elsif (!defined $line1) {{
-                # File2 has more lines
-                my $line_num = @file1_lines + 1;
-                $diff_output .= \"${{line_num}}a${{line_num}}\\n\";
-                $diff_output .= \"> $line2\\n\";
-            }} else {{
-                # File1 has more lines
-                my $line_num = @file2_lines + 1;
-                $diff_output .= \"${{line_num}}d${{line_num}}\\n\";
-                $diff_output .= \"< $line1\\n\";
-            }}
-        }}
+    {{
+        local $/;  # Read entire input at once
+        open my $pipe, '-|', 'diff.exe', \"{}\", \"{}\";
+        $diff_output = <$pipe>;
+        close $pipe;
     }}
-    
     $diff_output;
 }}", file1, file2)
                             } else {
