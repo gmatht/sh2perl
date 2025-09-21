@@ -128,6 +128,16 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         
         output.push_str("}\n");
         output.push_str(&format!("my ${} = join \"\\n\", @xargs_output_{};\n", output_var, command_index));
+        
+        // For pipeline context, also assign to the expected pipeline output variable
+        if output_var.starts_with("xargs_result_") {
+            // Extract the unique_id from the command_index (format: unique_id_i)
+            let parts: Vec<&str> = command_index.split('_').collect();
+            if parts.len() >= 2 {
+                let unique_id = parts[0];
+                output.push_str(&format!("$output_{} = ${};\n", unique_id, output_var));
+            }
+        }
     }
     output.push_str("\n");
     
