@@ -87,6 +87,21 @@ if ! cargo build --bin debashc 2>&1 | tee -a "$LOG_FILE"; then
     exit 1
 fi
 
+# Run test_purify.pl first and only continue if it passes
+echo "Running test_purify.pl validation..." | tee -a "$LOG_FILE"
+if timeout 30 perl test_purify.pl --next --verbose 2>&1 | tee -a "$LOG_FILE"; then
+    echo "test_purify.pl passed, continuing with other commands..." | tee -a "$LOG_FILE"
+else
+    echo "When fixing this failure please remember than purify.pl is just"
+    echo "meant to be a thin wrapper around PPI and debashc."
+    echo "In particular, if you find a bug in debashc, please fix"
+    echo "debashc rather than try to work around the problem in purify.pl"
+    echo
+    echo "test_purify.pl failed, aborting other commands"
+    exit 1
+fi
+
+#
 echo "Running debashc with fine-grained per-test timeouts..." | tee -a "$LOG_FILE"
 if [ $# -eq 0 ]; then
     # No arguments provided, run with empty string (without --perl-critic to avoid timeout)
@@ -112,22 +127,7 @@ else
     fi
 fi
 
-
-# Run test_purify.pl first and only continue if it passes
-echo "Running test_purify.pl validation..." | tee -a "$LOG_FILE"
-if timeout 30 perl test_purify.pl --next --verbose 2>&1 | tee -a "$LOG_FILE"; then
-    echo "test_purify.pl passed, continuing with other commands..." | tee -a "$LOG_FILE"
-else
-    echo "When fixing this failure please remember than purify.pl is just"
-    echo "meant to be a thin wrapper around PPI and debashc."
-    echo "In particular, if you find a bug in debashc, please fix"
-    echo "debashc rather than try to work around the problem in purify.pl"
-    echo
-    echo "test_purify.pl failed, aborting other commands"
-    exit 1
-fi
-
-# Check if we made progress and commit if so
+ Check if we made progress and commit if so
 if [ -f "first_n_tests_passed.txt" ]; then
     if [ ! -f "first_n_tests_passed.MAX.txt" ] || [ "first_n_tests_passed.txt" -nt "first_n_tests_passed.MAX.txt" ]; then
         echo "Progress detected! Committing changes..."
