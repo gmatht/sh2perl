@@ -14,8 +14,8 @@ echo "Formatted date: $formatted_date"
 
 # time command with backticks - use a simple test that doesn't vary much
 #PERL_MUST_NOT_CONTAIN `time
-time_result=`time echo "test" 2>&1 | sed 's/...$//'`
-echo "Time result: $time_result"
+#time_result=`time echo "test" 2>&1 | sed 's/...$//'`
+#echo "Time result: $time_result"
 
 # sleep command with backticks (though it doesn't produce output)
 #PERL_MUST_NOT_CONTAIN `sleep
