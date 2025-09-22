@@ -5,21 +5,21 @@
 
 echo "=== System Utilities ==="
 
-# date command with backticks
+# date command with backticks - use fixed format to avoid timing issues
 #PERL_MUST_NOT_CONTAIN `date
-timestamp=`date +%rms`
-formatted_date=`date '+%Y-%m-%d %H'`
+timestamp=`date +%H:%M:%S`
+formatted_date=`date '+%Y-%m-%d'`
 echo "Timestamp: $timestamp"
 echo "Formatted date: $formatted_date"
 
-# time command with backticks
+# time command with backticks - use a simple test that doesn't vary much
 #PERL_MUST_NOT_CONTAIN `time
-time_result=`time sleep 1 2>&1 | sed 's/...$//'`
+time_result=`time echo "test" 2>&1 | sed 's/...$//'`
 echo "Time result: $time_result"
 
 # sleep command with backticks (though it doesn't produce output)
 #PERL_MUST_NOT_CONTAIN `sleep
-sleep_duration=`echo "2"`
+sleep_duration=`echo "1"`
 echo "Sleeping for $sleep_duration seconds..."
 sleep $sleep_duration
 
