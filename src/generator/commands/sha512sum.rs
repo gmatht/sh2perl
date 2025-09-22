@@ -59,7 +59,7 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
             for file in &files {
                 output.push_str(&format!("if (-f \"{}\") {{\n", file));
                 output.push_str(&format!("my $hash = sha512_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', \"{}\" or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
-                output.push_str(&format!("push @results, \"$hash  {}\";\n", file));
+                output.push_str(&format!("push @results, \"$hash *{}\";\n", file));
                 output.push_str("} else {\n");
                 output.push_str(&format!("push @results, \"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", file));
                 output.push_str("}\n");
@@ -71,7 +71,7 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
             for file in &files {
                 output.push_str(&format!("if (-f \"{}\") {{\n", file));
                 output.push_str(&format!("my $hash = sha512_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', \"{}\" or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
-                output.push_str(&format!("push @results, \"$hash  {}\";\n", file));
+                output.push_str(&format!("push @results, \"$hash *{}\";\n", file));
                 output.push_str("} else {\n");
                 output.push_str(&format!("push @results, \"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", file));
                 output.push_str("}\n");
