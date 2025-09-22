@@ -159,9 +159,13 @@ pub fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCom
     
     if let Some(ftype) = &file_type {
         if ftype == "f" {
-            result.push_str(&format!("        return unless -f $file_{};\n", unique_id));
+            result.push_str(&format!("        if (!(-f $file_{})) {{\n", unique_id));
+            result.push_str(&format!("            return;\n"));
+            result.push_str(&format!("        }}\n"));
         } else if ftype == "d" {
-            result.push_str(&format!("        return unless -d $file_{};\n", unique_id));
+            result.push_str(&format!("        if (!(-d $file_{})) {{\n", unique_id));
+            result.push_str(&format!("            return;\n"));
+            result.push_str(&format!("        }}\n"));
         }
     }
     
@@ -174,10 +178,13 @@ pub fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCom
             // If pattern doesn't contain path separators, match against basename
             format!("basename($file_{})", unique_id)
         };
-        result.push_str(&format!("        return unless {} =~ m/^{}$/xms;\n", filename, glob_pattern));
+        result.push_str(&format!("        if (!({} =~ m/^{}$/xms)) {{\n", filename, glob_pattern));
+        result.push_str(&format!("            return;\n"));
+        result.push_str(&format!("        }}\n"));
     }
     
     result.push_str(&format!("        push @files_{}, $file_{};\n", unique_id, unique_id));
+    result.push_str(&format!("        return;\n"));
     
     result.push_str("    }\n");
     result.push_str(&format!("    find(\\&find_files_{}, $start_{});\n", unique_id, unique_id));
