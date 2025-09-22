@@ -1,0 +1,25 @@
+# Cursor Rules for sh2perl Project
+
+## Test Execution Rules
+- Do not limit number of tests to run
+- Fix actual timeout issues instead of adding artificial limits
+- When timeouts occur, investigate the root cause in the execution framework
+- Individual tests should run without arbitrary restrictions
+
+## Code Quality Rules
+- Fix compilation errors immediately
+- Address type mismatches and syntax issues
+- Ensure proper error handling and cleanup
+- Maintain code readability and maintainability
+
+## Performance Rules
+- Optimize actual bottlenecks, don't work around them
+- Profile and measure before making performance changes
+- Fix infinite loops and blocking operations at their source
+- Use proper timeouts and process management
+
+## Debugging Rules
+- Use debug output sparingly to avoid performance impact
+- Remove or reduce verbose logging in production code
+- Focus on root causes rather than symptoms
+
