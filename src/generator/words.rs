@@ -240,37 +240,42 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for perl in command substitution - execute as external command
                             eprintln!("DEBUG: Processing perl command in command substitution with args: {:?}", simple_cmd.args);
                             
-                            // Check if this is a perl -e command (which has quote issues with qx{})
+                            // Use qx for perl commands but with unique variable names to minimize Perl Critic violations
+                            let args: Vec<String> = simple_cmd.args.iter()
+                                .map(|arg| generator.perl_string_literal(arg))
+                                .collect();
+                            let unique_id = generator.get_unique_id();
+                            
                             if simple_cmd.args.len() >= 2 {
                                 if let (Word::Literal(flag, _), Word::Literal(code, _)) = (&simple_cmd.args[0], &simple_cmd.args[1]) {
                                     if flag == "-e" {
                                         // Use temporary file approach for perl -e commands
                                         let temp_file = format!("temp_perl_{}.pl", std::process::id());
-                                        format!("do {{ open my $fh, '>', '{}' or croak 'Cannot create temp file: $!'; print $fh {}; close $fh; my $perl_result = qx{{perl {}}}; chomp $perl_result; unlink '{}' or carp 'Cannot remove temp file: $!'; $perl_result; }}", 
-                                            temp_file, generator.perl_string_literal(&Word::Literal(code.clone(), None)), temp_file, temp_file)
+                                        let code_literal = generator.perl_string_literal(&Word::Literal(code.clone(), None));
+                                        format!("do {{ 
+                                            open my $fh, '>', '{}' or croak 'Cannot create temp file: $!'; 
+                                            print {{$fh}} {}; 
+                                            close $fh or croak 'Close failed: $!'; 
+                                            my $perl_result_{} = qx{{perl {}}}; 
+                                            chomp $perl_result_{}; 
+                                            unlink '{}' or carp 'Cannot remove temp file: $!'; 
+                                            $perl_result_{};
+                                        }}", 
+                                            temp_file, code_literal, unique_id, temp_file, unique_id, temp_file, unique_id)
                                     } else {
                                         // Use qx for other perl commands
-                                        let args: Vec<String> = simple_cmd.args.iter()
-                                            .map(|arg| generator.perl_string_literal(arg))
-                                            .collect();
                                         let command = format!("perl {}", args.join(" "));
-                                        format!("do {{ my $perl_result = qx{{{}}}; chomp $perl_result; $perl_result; }}", command)
+                                        format!("do {{ my $perl_result_{} = qx{{{}}}; chomp $perl_result_{}; $perl_result_{}; }}", unique_id, command, unique_id, unique_id)
                                     }
                                 } else {
                                     // Use qx for other perl commands
-                                    let args: Vec<String> = simple_cmd.args.iter()
-                                        .map(|arg| generator.perl_string_literal(arg))
-                                        .collect();
                                     let command = format!("perl {}", args.join(" "));
-                                    format!("do {{ my $perl_result = qx{{{}}}; chomp $perl_result; $perl_result; }}", command)
+                                    format!("do {{ my $perl_result_{} = qx{{{}}}; chomp $perl_result_{}; $perl_result_{}; }}", unique_id, command, unique_id, unique_id)
                                 }
                             } else {
                                 // Use qx for other perl commands
-                                let args: Vec<String> = simple_cmd.args.iter()
-                                    .map(|arg| generator.perl_string_literal(arg))
-                                    .collect();
                                 let command = format!("perl {}", args.join(" "));
-                                format!("do {{ my $perl_result = qx{{{}}}; chomp $perl_result; $perl_result; }}", command)
+                                format!("do {{ my $perl_result_{} = qx{{{}}}; chomp $perl_result_{}; $perl_result_{}; }}", unique_id, command, unique_id, unique_id)
                             }
                         } else if name == "wc" {
                             // Special handling for wc in command substitution
