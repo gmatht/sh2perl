@@ -483,7 +483,9 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                                 .map(|arg| generator.word_to_perl(arg))
                                 .collect();
                             let command_str = args.join(" ");
-                            output.push_str(&format!("    system \"{}\";\n", command_str));
+                            // Properly escape quotes in the command string
+                            let escaped_command = command_str.replace("\"", "\\\"");
+                            output.push_str(&format!("    system \"{}\";\n", escaped_command));
                         }
                         
                         output.push_str("    my $end_time = [gettimeofday];\n");
