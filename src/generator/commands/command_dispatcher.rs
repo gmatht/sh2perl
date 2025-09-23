@@ -421,6 +421,23 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                         return result;
                     }
                     
+                    // For tr with here-string, pass the here-string content
+                    if cmd_name == "tr" && has_here_string {
+//                         eprintln!("DEBUG: Generating tr with here-string, content: {}", here_string_content);
+                        let tr_cmd = cmd.clone();
+                        // Create a temporary variable for the here-string content
+                        let temp_var = format!("here_string_content_{}", generator.get_unique_file_handle());
+                        result.push_str(&generator.indent());
+                        result.push_str(&format!("my ${} = {};\n", temp_var, here_string_content));
+                        
+                        // Call the tr generator with the here-string content (pass with $ prefix)
+                        let specific_output = crate::generator::commands::tr::generate_tr_command_for_substitution(generator, &tr_cmd, &format!("${}", temp_var), "0");
+                        result.push_str(&specific_output);
+                        
+//                         eprintln!("DEBUG: Final tr result: {}", result);
+                        return result;
+                    }
+                    
                     // Special handling for grep -f command with process substitution
                     if cmd_name == "grep" && !process_sub_files.is_empty() {
                         // Check if this is a grep -f command

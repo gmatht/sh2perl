@@ -38,7 +38,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         let glob_exprs: Vec<String> = patterns.iter()
                                             .map(|pattern| format!("glob '{}'", pattern))
                                             .collect();
-                                        format!("map {{ glob '{}' }} ('{}')", "{}", patterns.join("', '"))
+                                        format!("map {{ glob }} ('{}')", patterns.join("', '"))
                                     }
                                 } else {
                                     // Fallback for other ls commands - use native Perl
@@ -57,7 +57,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     };
                                     format!("do {{ use POSIX qw(strftime); strftime({}, localtime) }}", cleaned_format)
                                 } else {
-                                    "do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime) }".to_string()
+                                    "do { use POSIX qw(strftime); strftime('%a %b %d %H:%M:%S %Z %Y', localtime) }".to_string()
                                 }
                             } else {
                                 // For other commands, use open3 to capture output without backticks
