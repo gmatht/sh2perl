@@ -27,7 +27,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str(&format!("my @diff_args = ({});\n", 
             args.iter().map(|arg| format!("\"{}\"", arg)).collect::<Vec<_>>().join(", ")));
         output.push_str(&generator.indent());
-        output.push_str("my $diff_pid = open my $diff_fh, '-|', $diff_cmd, @diff_args;\n");
+        output.push_str("my $diff_pid = open my $diff_fh, q{-|}, $diff_cmd, @diff_args;\n");
         output.push_str(&generator.indent());
         output.push_str("if ($diff_pid) {\n");
         generator.indent_level += 1;
@@ -36,7 +36,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str(&generator.indent());
         output.push_str("$diff_output = <$diff_fh>;\n");
         output.push_str(&generator.indent());
-        output.push_str("close $diff_fh;\n");
+        output.push_str("close $diff_fh or croak \"Close failed: $OS_ERROR\";\n");
         output.push_str(&generator.indent());
         output.push_str("$diff_exit_code = $CHILD_ERROR >> 8;\n");
         generator.indent_level -= 1;
