@@ -240,42 +240,75 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for perl in command substitution - execute as external command
                             eprintln!("DEBUG: Processing perl command in command substitution with args: {:?}", simple_cmd.args);
                             
-                            // Use qx for perl commands but with unique variable names to minimize Perl Critic violations
-                            let args: Vec<String> = simple_cmd.args.iter()
-                                .map(|arg| generator.perl_string_literal(arg))
-                                .collect();
-                            let unique_id = generator.get_unique_id();
+                            // Use IPC::Open3 instead of qx to avoid Perl::Critic violations
+                            let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
                             
                             if simple_cmd.args.len() >= 2 {
                                 if let (Word::Literal(flag, _), Word::Literal(code, _)) = (&simple_cmd.args[0], &simple_cmd.args[1]) {
                                     if flag == "-e" {
-                                        // Use temporary file approach for perl -e commands
+                                        // Use temporary file approach for perl -e commands with IPC::Open3
                                         let temp_file = format!("temp_perl_{}.pl", std::process::id());
                                         let code_literal = generator.perl_string_literal(&Word::Literal(code.clone(), None));
                                         format!("do {{ 
                                             open my $fh, '>', '{}' or croak 'Cannot create temp file: $!'; 
                                             print {{$fh}} {}; 
                                             close $fh or croak 'Close failed: $!'; 
-                                            my $perl_result_{} = qx{{perl {}}}; 
-                                            chomp $perl_result_{}; 
+                                            my ({}, {}, {}); 
+                                            my {} = open3({}, {}, {}, 'perl', '{}'); 
+                                            close {} or croak 'Close failed: $!'; 
+                                            my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; 
+                                            close {} or croak 'Close failed: $!'; 
+                                            waitpid {}, 0; 
                                             unlink '{}' or carp 'Cannot remove temp file: $!'; 
-                                            $perl_result_{};
+                                            {};
                                         }}", 
-                                            temp_file, code_literal, unique_id, temp_file, unique_id, temp_file, unique_id)
+                                            temp_file, code_literal, in_var, out_var, err_var, pid_var, in_var, out_var, err_var, temp_file, in_var, result_var, out_var, out_var, pid_var, temp_file, result_var)
                                     } else {
-                                        // Use qx for other perl commands
-                                        let command = format!("perl {}", args.join(" "));
-                                        format!("do {{ my $perl_result_{} = qx{{{}}}; chomp $perl_result_{}; $perl_result_{}; }}", unique_id, command, unique_id, unique_id)
+                                        // Use IPC::Open3 for other perl commands
+                                        let args: Vec<String> = simple_cmd.args.iter()
+                                            .map(|arg| generator.perl_string_literal(arg))
+                                            .collect();
+                                        let formatted_args = args.join(", ");
+                                        format!("do {{ 
+                                            my ({}, {}, {}); 
+                                            my {} = open3({}, {}, {}, 'perl', {}); 
+                                            close {} or croak 'Close failed: $!'; 
+                                            my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; 
+                                            close {} or croak 'Close failed: $!'; 
+                                            waitpid {}, 0; 
+                                            {};
+                                        }}", 
+                                            in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
                                     }
                                 } else {
-                                    // Use qx for other perl commands
-                                    let command = format!("perl {}", args.join(" "));
-                                    format!("do {{ my $perl_result_{} = qx{{{}}}; chomp $perl_result_{}; $perl_result_{}; }}", unique_id, command, unique_id, unique_id)
+                                    // Use IPC::Open3 for other perl commands
+                                    let args: Vec<String> = simple_cmd.args.iter()
+                                        .map(|arg| generator.perl_string_literal(arg))
+                                        .collect();
+                                    let formatted_args = args.join(", ");
+                                    format!("do {{ 
+                                        my ({}, {}, {}); 
+                                        my {} = open3({}, {}, {}, 'perl', {}); 
+                                        close {} or croak 'Close failed: $!'; 
+                                        my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; 
+                                        close {} or croak 'Close failed: $!'; 
+                                        waitpid {}, 0; 
+                                        {};
+                                    }}", 
+                                        in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
                                 }
                             } else {
-                                // Use qx for other perl commands
-                                let command = format!("perl {}", args.join(" "));
-                                format!("do {{ my $perl_result_{} = qx{{{}}}; chomp $perl_result_{}; $perl_result_{}; }}", unique_id, command, unique_id, unique_id)
+                                // Use IPC::Open3 for perl commands with no arguments
+                                format!("do {{ 
+                                    my ({}, {}, {}); 
+                                    my {} = open3({}, {}, {}, 'perl'); 
+                                    close {} or croak 'Close failed: $!'; 
+                                    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; 
+                                    close {} or croak 'Close failed: $!'; 
+                                    waitpid {}, 0; 
+                                    {};
+                                }}", 
+                                    in_var, out_var, err_var, pid_var, in_var, out_var, err_var, in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         } else if name == "wc" {
                             // Special handling for wc in command substitution
