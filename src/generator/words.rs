@@ -1116,7 +1116,7 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, inte
                             if pe.variable.starts_with('#') {
                                 // ${#arr[@]} -> scalar(@arr)
                                 let array_name = &pe.variable[1..];
-                                    current_string.push_str(&format!("${{scalar(@{})}}", array_name));
+                                    current_string.push_str(&format!("scalar(@{})", array_name));
                             } else if pe.variable.starts_with('!') {
                                 // ${!map[@]} -> keys %map (map keys iteration)
                                 let map_name = &pe.variable[1..]; // Remove ! prefix
