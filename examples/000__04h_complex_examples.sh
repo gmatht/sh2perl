@@ -22,7 +22,7 @@ else
 fi
 
 # Backticks in case statement
-system_name=`uname -s`
+system_name='Darwin'
 case $system_name in
     Linux)
         echo "Running on Linux"

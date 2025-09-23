@@ -904,8 +904,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 let cmd_content = &content[cmd_start..i];
                 i += 3; // skip the closing \\`
                 
-                // Parse the command content as a simple command
-                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
+                // Parse the command content as a pipeline (to handle pipes)
+                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
                     parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
                 } else {
                     // Fall back to treating it as a literal
@@ -936,8 +936,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 let cmd_content = &content[cmd_start..i];
                 i += 2; // skip the closing \`
                 
-                // Parse the command content as a simple command
-                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
+                // Parse the command content as a pipeline (to handle pipes)
+                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
                     parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
                 } else {
                     // Fall back to treating it as a literal
@@ -1137,8 +1137,8 @@ pub fn parse_string_interpolation_from_literal(literal: &str) -> Result<StringIn
                 let cmd_content = &content[cmd_start..i];
                 i += 3; // skip the closing \\`
                 
-                // Parse the command content as a simple command
-                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
+                // Parse the command content as a pipeline (to handle pipes)
+                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
                     parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
                 } else {
                     // Fall back to treating it as a literal
@@ -1169,8 +1169,8 @@ pub fn parse_string_interpolation_from_literal(literal: &str) -> Result<StringIn
                 let cmd_content = &content[cmd_start..i];
                 i += 2; // skip the closing \`
                 
-                // Parse the command content as a simple command
-                if let Ok(cmd) = parse_simple_command_from_text(cmd_content) {
+                // Parse the command content as a pipeline (to handle pipes)
+                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
                     parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
                 } else {
                     // Fall back to treating it as a literal

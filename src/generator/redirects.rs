@@ -12,17 +12,20 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
     match &redirect.operator {
         RedirectOperator::Input => {
             // Input redirection: command < file
-            output.push_str(&format!("open STDIN, '<', '{}' or croak \"Cannot open file: $OS_ERROR\\n\";\n", redirect.target));
+            let target = generator.perl_string_literal(&redirect.target);
+            output.push_str(&format!("open STDIN, '<', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n", target));
         }
         RedirectOperator::Output => {
             // Output redirection: command > file
             // Note: This function doesn't have access to the command name, so it can't handle echo specially
             // The special handling is done in generate_simple_command
-            output.push_str(&format!("open STDOUT, '>', '{}' or croak \"Cannot open file: $OS_ERROR\\n\";\n", redirect.target));
+            let target = generator.perl_string_literal(&redirect.target);
+            output.push_str(&format!("open STDOUT, '>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n", target));
         }
         RedirectOperator::Append => {
             // Append redirection: command >> file
-            output.push_str(&format!("open STDOUT, '>>', '{}' or croak \"Cannot open file: $OS_ERROR\\n\";\n", redirect.target));
+            let target = generator.perl_string_literal(&redirect.target);
+            output.push_str(&format!("open STDOUT, '>>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n", target));
         }
         RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => {
             // Heredoc: command << delimiter
@@ -99,15 +102,18 @@ waitpid $pid, 0;\n", output_var, cmd_str));
         }
         RedirectOperator::StderrOutput => {
             // Stderr redirection: command 2> file
-            output.push_str(&format!("open STDERR, '>', '{}' or croak \"Cannot open file: $OS_ERROR\\n\";\n", redirect.target));
+            let target = generator.perl_string_literal(&redirect.target);
+            output.push_str(&format!("open STDERR, '>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n", target));
         }
         RedirectOperator::StderrAppend => {
             // Stderr append: command 2>> file
-            output.push_str(&format!("open STDERR, '>>', '{}' or croak \"Cannot open file: $OS_ERROR\\n\";\n", redirect.target));
+            let target = generator.perl_string_literal(&redirect.target);
+            output.push_str(&format!("open STDERR, '>>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n", target));
         }
         RedirectOperator::StderrInput => {
             // Stderr input: command 2< file
-            output.push_str(&format!("open STDERR, '<', '{}' or croak \"Cannot open file: $OS_ERROR\\n\";\n", redirect.target));
+            let target = generator.perl_string_literal(&redirect.target);
+            output.push_str(&format!("open STDERR, '<', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n", target));
         }
         _ => {
             // Other redirects not yet implemented

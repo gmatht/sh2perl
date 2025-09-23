@@ -539,10 +539,10 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                 });
                 
                 if let Some(redirect) = output_redirect {
-                    let target = generator.word_to_perl(&redirect.target);
+                    let target = generator.perl_string_literal(&redirect.target);
                     let mode = if matches!(redirect.operator, RedirectOperator::Append) { ">>" } else { ">" };
                     result.push_str(&generator.indent());
-                    result.push_str(&format!("open STDOUT, '{}', '{}'\n", mode, target));
+                    result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
                     result.push_str("    or croak \"Cannot open file: $ERRNO\";\n");
                 } else {
                     result.push_str(&generator.indent());
