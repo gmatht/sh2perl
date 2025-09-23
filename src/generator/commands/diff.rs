@@ -24,7 +24,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str(&generator.indent());
         output.push_str("local $INPUT_RECORD_SEPARATOR = undef;  # Read entire input at once\n");
         output.push_str(&generator.indent());
-        output.push_str("my $pipe_mode = '-|';\n");
+        output.push_str("my $pipe_mode = q{-|};\n");
         output.push_str(&generator.indent());
         output.push_str(&format!("open my $pipe, $pipe_mode, 'diff.exe', {} or croak \"Cannot open diff pipe: $OS_ERROR\";\n", 
             args.iter().map(|arg| format!("\"{}\"", arg)).collect::<Vec<_>>().join(", ")));
