@@ -55,7 +55,7 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                 output.push_str("} else {\n");
                 // When directory exists, mkdir should output error to stderr and fail
                 // This matches shell behavior
-                output.push_str(&format!("print {{STDERR}} \"mkdir: cannot create directory {}: File exists\\n\";\n", dir));
+                output.push_str(&format!("print {{\\*STDERR}} \"mkdir: cannot create directory {}: File exists\\n\";\n", dir));
                 output.push_str("local $CHILD_ERROR = 256;\n");
                 output.push_str("}\n");
             }
