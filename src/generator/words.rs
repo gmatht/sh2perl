@@ -833,7 +833,7 @@ let pattern = &args[pattern_idx];
                 result
             } else {
                 // Check if this is a pipeline result that already returns a value directly
-                if result.contains("$output_0") && result.contains("for (my $i = 0") {
+                if result.contains("$output_0") && (result.contains("for (my $i = 0") || result.contains("while (1)")) {
                     // This is a pipeline that returns its result directly, so just wrap it in do block
                     format!("do {{\n{}\n{}}}", result, generator.indent())
                 } else {
