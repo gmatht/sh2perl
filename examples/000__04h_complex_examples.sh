@@ -6,7 +6,7 @@
 echo "=== Complex Backtick Examples ==="
 
 # Nested backticks
-nested_result=`echo "Current time: \`date\`"`
+nested_result=`echo "Three wells: \`yes well | head -3\`"`
 echo "Nested backticks: $nested_result"
 
 # Backticks in arithmetic
