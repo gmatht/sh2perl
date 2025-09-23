@@ -93,15 +93,15 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
         // Handle xargs with command execution
         output.push_str(&format!("my @xargs_input_{} = split /\\s+/msx, ${};\n", command_index, input_var));
         output.push_str(&format!("my @xargs_output_{};\n", command_index));
-        output.push_str(&format!("for (my $i = 0; $i < @xargs_input_{}; $i += {}) {{\n", command_index, max_args));
+        output.push_str(&format!("for my $i (0..scalar @xargs_input_{}-1) {{\n", command_index));
         output.push_str(&format!("    my @xargs_args_{};\n", command_index));
-        output.push_str(&format!("    for (my $j = 0; $j < {} && $i + $j < @xargs_input_{}; $j++) {{\n", max_args, command_index));
+        output.push_str(&format!("    for my $j (0..{}-1) {{\n", max_args));
         output.push_str(&format!("        push @xargs_args_{}, $xargs_input_{}[$i + $j];\n", command_index, command_index));
         output.push_str("    }\n");
         
         if command == "echo" {
             // Handle echo command
-            output.push_str(&format!("    my $xargs_line_{} = \"\";\n", command_index));
+            output.push_str(&format!("    my $xargs_line_{} = q{{}};\n", command_index));
             
             // Add the echo prefix if we have args
             if !args.is_empty() {
@@ -110,7 +110,7 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
             
             // Add the input arguments
             output.push_str(&format!("    foreach my $arg (@xargs_args_{}) {{\n", command_index));
-            output.push_str(&format!("        $xargs_line_{} .= \" \" . $arg;\n", command_index));
+                output.push_str(&format!("        $xargs_line_{} .= q{{ }} . $arg;\n", command_index));
             output.push_str("    }\n");
             
             output.push_str(&format!("    push @xargs_output_{}, $xargs_line_{};\n", command_index, command_index));
