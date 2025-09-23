@@ -718,7 +718,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         
                         
                         if has_variables {
-                            output.push_str(&format!("do {{ my $output = {}; print $output; unless ($output =~ /\\n$/msx) {{ print \"\\n\"; }} }};\n", args[0]));
+                            output.push_str(&format!("do {{ my $output = {}; print $output; if (!($output =~ /\\n$/msx)) {{ print \"\\n\"; }} }};\n", args[0]));
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
                         }
@@ -747,7 +747,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             }
                         });
                         if has_variables {
-                            output.push_str(&format!("do {{ my $output = {}; print $output; unless ($output =~ /\\n$/msx) {{ print \"\\n\"; }} }};\n", args_str));
+                            output.push_str(&format!("do {{ my $output = {}; print $output; if (!($output =~ /\\n$/msx)) {{ print \"\\n\"; }} }};\n", args_str));
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args_str));
                         }
