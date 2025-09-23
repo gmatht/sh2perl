@@ -376,7 +376,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     Word::Literal(filename, _) => {
                         // Read from file - generate a proper variable assignment
                         let file_var = format!("file_content_{}", command_index);
-                        let reading_code = format!("my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', '{}' or croak \"Cannot open file: $OS_ERROR\"; <$fh> }};", file_var, filename);
+                        let reading_code = format!("my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', '{}' or croak \"Cannot open file: $OS_ERROR\"; my $content = <$fh>; close $fh or croak \"Close failed: $OS_ERROR\"; $content }};", file_var, filename);
                         (format!("${}", file_var), reading_code)
                     }
                     _ => {
