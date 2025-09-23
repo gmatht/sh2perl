@@ -24,14 +24,16 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str(&generator.indent());
         output.push_str("local $INPUT_RECORD_SEPARATOR = undef;  # Read entire input at once\n");
         output.push_str(&generator.indent());
-        output.push_str(&format!("open my $pipe, '-|', 'diff.exe', {} or croak \"Cannot open diff pipe: $OS_ERROR\";\n", 
+        output.push_str("my $pipe_mode = '-|';\n");
+        output.push_str(&generator.indent());
+        output.push_str(&format!("open my $pipe, $pipe_mode, 'diff.exe', {} or croak \"Cannot open diff pipe: $OS_ERROR\";\n", 
             args.iter().map(|arg| format!("\"{}\"", arg)).collect::<Vec<_>>().join(", ")));
         output.push_str(&generator.indent());
         output.push_str("$diff_output = <$pipe>;\n");
         output.push_str(&generator.indent());
         output.push_str("close $pipe or croak \"Close failed: $OS_ERROR\";\n");
         output.push_str(&generator.indent());
-        output.push_str("$diff_exit_code = $? >> 8;\n");
+        output.push_str("$diff_exit_code = $CHILD_ERROR >> 8;\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
