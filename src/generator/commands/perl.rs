@@ -128,9 +128,9 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     };
     output.push_str(&format!("my ($in, $out, $err);
 my $pid = open3($in, $out, $err, 'perl'{});
-close $in or croak 'Close failed: $!';
+close $in or croak 'Close failed: $OS_ERROR';
 my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
-close $out or croak 'Close failed: $!';
+close $out or croak 'Close failed: $OS_ERROR';
 waitpid $pid, 0;\n", args_str, output_var));
     output.push_str(&format!("print ${};\n", output_var));
     
@@ -273,9 +273,9 @@ pub fn generate_perl_pipeline_command(generator: &mut Generator, cmd: &SimpleCom
         };
         output.push_str(&format!("my ($in, $out, $err);
 my $pid = open3($in, $out, $err, 'perl'{});
-close $in or croak 'Close failed: $!';
+close $in or croak 'Close failed: $OS_ERROR';
 my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
-close $out or croak 'Close failed: $!';
+close $out or croak 'Close failed: $OS_ERROR';
 waitpid $pid, 0;\n", args_str, output_var));
         output.push_str(&format!("print ${};\n", output_var));
     }

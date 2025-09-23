@@ -118,9 +118,9 @@ pub fn generate_xargs_command_with_output(generator: &mut Generator, cmd: &Simpl
             // Handle other commands
             output.push_str(&format!("    my ($in_{}, $out_{}, $err_{});\n", command_index, command_index, command_index));
             output.push_str(&format!("    my $pid_{} = open3($in_{}, $out_{}, $err_{}, '{}', @xargs_args_{});\n", command_index, command_index, command_index, command_index, command, command_index));
-            output.push_str(&format!("    close $in_{} or croak 'Close failed: $!';\n", command_index));
+            output.push_str(&format!("    close $in_{} or croak 'Close failed: $OS_ERROR';\n", command_index));
             output.push_str(&format!("    my $xargs_result_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out_{}> }};\n", command_index, command_index));
-            output.push_str(&format!("    close $out_{} or croak 'Close failed: $!';\n", command_index));
+            output.push_str(&format!("    close $out_{} or croak 'Close failed: $OS_ERROR';\n", command_index));
             output.push_str(&format!("    waitpid $pid_{}, 0;\n", command_index));
             output.push_str(&format!("    chomp $xargs_result_{};\n", command_index));
             output.push_str(&format!("    push @xargs_output_{}, $xargs_result_{};\n", command_index, command_index));

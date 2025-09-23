@@ -31,7 +31,7 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
         output.push_str(&format!("if ($line =~ {}) {{\n", generator.format_regex_pattern(r"^([a-f0-9]{128})\\s+(.+)$")));
         output.push_str("my ($expected_hash, $filename) = ($1, $2);\n");
         output.push_str("if (-f \"$filename\") {\n");
-        output.push_str("my $actual_hash = sha512_hex(do { local $/; open my $fh, '<', $filename or die \"Cannot open $filename: $!\"; <$fh> });\n");
+        output.push_str("my $actual_hash = sha512_hex(do { local $/; open my $fh, '<', $filename or die \"Cannot open $filename: $OS_ERROR\"; <$fh> });\n");
         output.push_str("if ($expected_hash eq $actual_hash) {\n");
         output.push_str("push @results, \"$filename: OK\";\n");
         output.push_str("} else {\n");

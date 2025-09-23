@@ -191,9 +191,9 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                             result.push_str("\n");
             result.push_str("my ($in, $out, $err);\n");
             result.push_str(&format!("my $pid = open3($in, $out, $err, 'bash', '-c', '{}');\n", cmd_str));
-            result.push_str("close $in or croak 'Close failed: $!';\n");
+            result.push_str("close $in or croak 'Close failed: $OS_ERROR';\n");
             result.push_str(&format!("my $output_ps_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};\n", global_counter));
-            result.push_str("close $out or croak 'Close failed: $!';\n");
+            result.push_str("close $out or croak 'Close failed: $OS_ERROR';\n");
             result.push_str("waitpid $pid, 0;\n");
                         }
                         

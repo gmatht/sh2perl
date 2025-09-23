@@ -489,9 +489,9 @@ fn generate_system_call_fallback(generator: &mut Generator, command_name: &str, 
     let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
     if input_var.is_empty() {
         // First command in pipeline
-        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $!';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
+        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
     } else {
         // Subsequent command
-        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | {} {}');\nclose {} or croak 'Close failed: $!';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $!';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, input_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
+        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | {} {}');\nclose {} or croak 'Close failed: $OS_ERROR';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, input_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
     }
 }

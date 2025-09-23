@@ -62,7 +62,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             } else {
                                 // For other commands, use open3 to capture output without backticks
                                 let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                                format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', '{}'); close {} or croak 'Close failed: $!'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $!'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_text, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_text, in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         } else {
                             // Element contains backticks but not at start/end - treat as literal
@@ -376,7 +376,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     Word::Literal(filename, _) => {
                         // Read from file - generate a proper variable assignment
                         let file_var = format!("file_content_{}", command_index);
-                        let reading_code = format!("my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', '{}' or croak \"Cannot open file: $!\"; <$fh> }};", file_var, filename);
+                        let reading_code = format!("my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', '{}' or croak \"Cannot open file: $OS_ERROR\"; <$fh> }};", file_var, filename);
                         (format!("${}", file_var), reading_code)
                     }
                     _ => {
