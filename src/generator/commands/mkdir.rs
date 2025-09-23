@@ -53,7 +53,11 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                 output.push_str(&format!("croak \"mkdir: cannot create directory {}: $ERRNO\\n\";\n", dir));
                 output.push_str("}\n");
                 output.push_str("} else {\n");
-                output.push_str(&format!("croak \"mkdir: cannot create directory {}: File exists\\n\";\n", dir));
+                // When directory exists, mkdir should fail silently (no error output)
+                // This matches shell behavior where mkdir fails silently if dir exists
+                // Just set exit code but don't output error message
+                // Don't output error when directory exists - just fail silently
+                // output.push_str(&format!("croak \"mkdir: cannot create directory {}: File exists\\n\";\n", dir));
                 output.push_str("}\n");
             }
         }
