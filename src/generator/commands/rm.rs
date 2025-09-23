@@ -94,13 +94,13 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                         output.push_str("local $CHILD_ERROR = 1;\n");
                         output.push_str(&generator.indent());
                         output.push_str("carp \"rm: carping: could not remove \", $file_to_remove,\n");
-                        output.push_str("    \": $ERRNO\\n\";\n");
+                        output.push_str("    \": $OS_ERROR\\n\";\n");
                     } else {
                         output.push_str(&generator.indent());
                         output.push_str("local $CHILD_ERROR = 1;\n");
                         output.push_str(&generator.indent());
                         output.push_str("croak \"rm: cannot remove \", $file_to_remove,\n");
-                        output.push_str("    \": $ERRNO\\n\";\n");
+                        output.push_str("    \": $OS_ERROR\\n\";\n");
                     }
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
@@ -136,13 +136,13 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                         output.push_str("local $CHILD_ERROR = 1;\n");
                         output.push_str(&generator.indent());
                         output.push_str("carp \"rm: carping: could not remove \", $file_to_remove,\n");
-                        output.push_str("    \": $ERRNO\\n\";\n");
+                        output.push_str("    \": $OS_ERROR\\n\";\n");
                     } else {
                         output.push_str(&generator.indent());
                         output.push_str("local $CHILD_ERROR = 1;\n");
                         output.push_str(&generator.indent());
                         output.push_str("croak \"rm: cannot remove \", $file_to_remove,\n");
-                        output.push_str("    \": $ERRNO\\n\";\n");
+                        output.push_str("    \": $OS_ERROR\\n\";\n");
                     }
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
@@ -208,10 +208,10 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("} else {\n");
                     if force {
                         output.push_str(&format!("carp \"rm: carping: could not remove \", {},\n", file));
-                        output.push_str("    \": $ERRNO\\n\";\n");
+                        output.push_str("    \": $OS_ERROR\\n\";\n");
                     } else {
                         output.push_str(&format!("croak \"rm: cannot remove \", {},\n", file));
-                        output.push_str("    \": $ERRNO\\n\";\n");
+                        output.push_str("    \": $OS_ERROR\\n\";\n");
                     }
                     output.push_str("}\n");
                     output.push_str("}\n");
@@ -232,10 +232,10 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("} else {\n");
                     if force {
                         output.push_str(&format!("carp \"rm: carping: could not remove \", {},\n", file));
-                        output.push_str("    \": $ERRNO\\n\";\n");
+                        output.push_str("    \": $OS_ERROR\\n\";\n");
                     } else {
                         output.push_str(&format!("croak \"rm: cannot remove \", {},\n", file));
-                        output.push_str("    \": $ERRNO\\n\";\n");
+                        output.push_str("    \": $OS_ERROR\\n\";\n");
                     }
                     output.push_str("}\n");
                     output.push_str("}\n");
