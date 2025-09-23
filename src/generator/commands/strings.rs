@@ -34,6 +34,7 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
         output.push_str("$input_data = <$fh>;\n");
         output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
         output.push_str("} else {\n");
+        output.push_str(&format!("print {{*STDERR}} \"strings: '{}': No such file\\n\";\n", filename));
         output.push_str("$input_data = q{};\n");
         output.push_str("}\n");
     } else {
