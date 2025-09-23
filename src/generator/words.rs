@@ -194,28 +194,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for diff command in command substitution
                             eprintln!("DEBUG: Processing diff command in command substitution with args: {:?}", simple_cmd.args);
                             
-                            // Use diff.exe instead of built-in implementation
-                            let args: Vec<String> = simple_cmd.args.iter()
-                                .map(|arg| generator.word_to_perl(arg))
-                                .collect();
-                            
-                            if args.len() >= 2 {
-                                let file1 = &args[0];
-                                let file2 = &args[1];
-                                
-                                format!("do {{
-    my $diff_output = \"\";
-    {{
-        local $/;  # Read entire input at once
-        open my $pipe, '-|', 'diff.exe', \"{}\", \"{}\";
-        $diff_output = <$pipe>;
-        close $pipe;
-    }}
-    $diff_output;
-}}", file1, file2)
-                            } else {
-                                "\"\"".to_string()
-                            }
+                            // Use the dedicated diff command implementation
+                            let diff_output = crate::generator::commands::diff::generate_diff_command(generator, simple_cmd, "diff_result", 0, false);
+                            format!("do {{ {} }}", diff_output)
                         } else if name == "xargs" {
                             // Special handling for xargs command in command substitution
                             eprintln!("DEBUG: Processing xargs command in command substitution with args: {:?}", simple_cmd.args);
