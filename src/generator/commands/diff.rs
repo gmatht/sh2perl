@@ -8,7 +8,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
     output.push_str(&generator.indent());
     output.push_str("my $diff_exit_code = 0;\n");
     output.push_str(&generator.indent());
-    output.push_str("my $diff_output = \"\";\n");
+    output.push_str("my $diff_output = q{};\n");
     
     // Build the diff command arguments
     let mut args = Vec::new();
@@ -22,14 +22,14 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str("{\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str("local $/;  # Read entire input at once\n");
+        output.push_str("local $INPUT_RECORD_SEPARATOR = undef;  # Read entire input at once\n");
         output.push_str(&generator.indent());
-        output.push_str(&format!("open my $pipe, '-|', 'diff.exe', {};\n", 
+        output.push_str(&format!("open my $pipe, '-|', 'diff.exe', {} or croak \"Cannot open diff pipe: $OS_ERROR\";\n", 
             args.iter().map(|arg| format!("\"{}\"", arg)).collect::<Vec<_>>().join(", ")));
         output.push_str(&generator.indent());
         output.push_str("$diff_output = <$pipe>;\n");
         output.push_str(&generator.indent());
-        output.push_str("close $pipe;\n");
+        output.push_str("close $pipe or croak \"Close failed: $OS_ERROR\";\n");
         output.push_str(&generator.indent());
         output.push_str("$diff_exit_code = $? >> 8;\n");
         generator.indent_level -= 1;
@@ -37,7 +37,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str("}\n");
     } else {
         output.push_str(&generator.indent());
-        output.push_str("$diff_output = \"\";\n");
+        output.push_str("$diff_output = q{};\n");
     }
     
     // For command substitution, we need to return the output

@@ -55,7 +55,7 @@ pub fn generate_comm_command(
             output.push_str("        chomp $line;\n");
             output.push_str("        push @file1_lines, $line;\n");
             output.push_str("    }\n");
-            output.push_str("    close($fh1);\n");
+            output.push_str("    close $fh1 or croak \"Close failed: $OS_ERROR\";\n");
             output.push_str("}\n");
             
             // Read second file
@@ -64,7 +64,7 @@ pub fn generate_comm_command(
             output.push_str("        chomp $line;\n");
             output.push_str("        push @file2_lines, $line;\n");
             output.push_str("    }\n");
-            output.push_str("    close($fh2);\n");
+            output.push_str("    close $fh2 or croak \"Close failed: $OS_ERROR\";\n");
             output.push_str("}\n");
             
             // Create hashes for efficient lookup
@@ -74,7 +74,7 @@ pub fn generate_comm_command(
             // Find common lines
             output.push_str("my @common_lines;\n");
             output.push_str("foreach my $line (@file1_lines) {\n");
-            output.push_str("    if (exists($file2_set{$line})) {\n");
+            output.push_str("    if (exists $file2_set{$line}) {\n");
             output.push_str("        push @common_lines, $line;\n");
             output.push_str("    }\n");
             output.push_str("}\n");
@@ -137,7 +137,7 @@ pub fn generate_comm_command(
             output.push_str("        chomp $line;\n");
             output.push_str("        push @file1_lines, $line;\n");
             output.push_str("    }\n");
-            output.push_str("    close($fh1);\n");
+            output.push_str("    close $fh1 or croak \"Close failed: $OS_ERROR\";\n");
             output.push_str("}\n");
             
             // Read second file
@@ -146,7 +146,7 @@ pub fn generate_comm_command(
             output.push_str("        chomp $line;\n");
             output.push_str("        push @file2_lines, $line;\n");
             output.push_str("    }\n");
-            output.push_str("    close($fh2);\n");
+            output.push_str("    close $fh2 or croak \"Close failed: $OS_ERROR\";\n");
             output.push_str("}\n");
             
             // Create hashes for efficient lookup
@@ -156,18 +156,18 @@ pub fn generate_comm_command(
             // Find common lines
             output.push_str("my @common_lines;\n");
             output.push_str("foreach my $line (@file1_lines) {\n");
-            output.push_str("    if (exists($file2_set{$line})) {\n");
+            output.push_str("    if (exists $file2_set{$line}) {\n");
             output.push_str("        push @common_lines, $line;\n");
             output.push_str("    }\n");
             output.push_str("}\n");
             
             // Generate output based on suppression flags
-            output.push_str("my $comm_result = \"\";\n");
+            output.push_str("my $comm_output = q{};\n");
             
             if !suppress_col1 {
                 output.push_str("foreach my $line (@file1_lines) {\n");
                 output.push_str("    if (!exists($file2_set{$line})) {\n");
-                output.push_str("        $comm_result .= $line . \"\\n\";\n");
+                output.push_str("        $comm_output .= $line . \"\\n\";\n");
                 output.push_str("    }\n");
                 output.push_str("}\n");
             }
@@ -175,20 +175,20 @@ pub fn generate_comm_command(
             if !suppress_col2 {
                 output.push_str("foreach my $line (@file2_lines) {\n");
                 output.push_str("    if (!exists($file1_set{$line})) {\n");
-                output.push_str("        $comm_result .= $line . \"\\n\";\n");
+                output.push_str("        $comm_output .= $line . \"\\n\";\n");
                 output.push_str("    }\n");
                 output.push_str("}\n");
             }
             
             if !suppress_col3 {
                 output.push_str("foreach my $line (@common_lines) {\n");
-                output.push_str("    $comm_result .= $line . \"\\n\";\n");
+                output.push_str("    $comm_output .= $line . \"\\n\";\n");
                 output.push_str("}\n");
             }
             
             // Remove trailing newline and return the result
-            output.push_str("$comm_result =~ s/\\n$//;\n");
-            output.push_str("$comm_result");
+            output.push_str("$comm_output =~ s/\\n$//msx;\n");
+            output.push_str("$comm_output");
         } else {
             // Fallback if we don't have enough file arguments
             output.push_str("\"\"");

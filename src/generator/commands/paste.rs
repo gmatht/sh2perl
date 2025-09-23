@@ -33,7 +33,7 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str("    }\n");
             result.push_str(&generator.indent());
-            result.push_str("    close $fh1;\n");
+            result.push_str("    close $fh1 or croak \"Close failed: $OS_ERROR\";\n");
             result.push_str(&generator.indent());
             result.push_str("}\n");
             
@@ -49,21 +49,21 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str("    }\n");
             result.push_str(&generator.indent());
-            result.push_str("    close $fh2;\n");
+            result.push_str("    close $fh2 or croak \"Close failed: $OS_ERROR\";\n");
             result.push_str(&generator.indent());
             result.push_str("}\n");
             
             // Paste the lines together
             result.push_str(&generator.indent());
-            result.push_str(&format!("my $max_lines = scalar(@paste_file1_lines_{}) > scalar(@paste_file2_lines_{}) ? scalar(@paste_file1_lines_{}) : scalar(@paste_file2_lines_{});\n", paste_id, paste_id, paste_id, paste_id));
+            result.push_str(&format!("my $max_lines = scalar @paste_file1_lines_{} > scalar @paste_file2_lines_{} ? scalar @paste_file1_lines_{} : scalar @paste_file2_lines_{};\n", paste_id, paste_id, paste_id, paste_id));
             result.push_str(&generator.indent());
-            result.push_str("my $paste_output = \"\";\n");
+            result.push_str("my $paste_output = q{};\n");
             result.push_str(&generator.indent());
-            result.push_str("for (my $i = 0; $i < $max_lines; $i++) {\n");
+            result.push_str("for my $i (0..$max_lines-1) {\n");
             result.push_str(&generator.indent());
-            result.push_str(&format!("    my $line1 = $i < scalar(@paste_file1_lines_{}) ? $paste_file1_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
+            result.push_str(&format!("    my $line1 = $i < scalar @paste_file1_lines_{} ? $paste_file1_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
             result.push_str(&generator.indent());
-            result.push_str(&format!("    my $line2 = $i < scalar(@paste_file2_lines_{}) ? $paste_file2_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
+            result.push_str(&format!("    my $line2 = $i < scalar @paste_file2_lines_{} ? $paste_file2_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
             result.push_str(&generator.indent());
             result.push_str("    $paste_output .= \"$line1\\t$line2\\n\";\n");
             result.push_str(&generator.indent());
@@ -98,7 +98,7 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str("    }\n");
             result.push_str(&generator.indent());
-            result.push_str("    close $fh1;\n");
+            result.push_str("    close $fh1 or croak \"Close failed: $OS_ERROR\";\n");
             result.push_str(&generator.indent());
             result.push_str("}\n");
             
@@ -114,21 +114,21 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str("    }\n");
             result.push_str(&generator.indent());
-            result.push_str("    close $fh2;\n");
+            result.push_str("    close $fh2 or croak \"Close failed: $OS_ERROR\";\n");
             result.push_str(&generator.indent());
             result.push_str("}\n");
             
             // Paste the lines together
             result.push_str(&generator.indent());
-            result.push_str(&format!("my $max_lines = scalar(@paste_file1_lines_{}) > scalar(@paste_file2_lines_{}) ? scalar(@paste_file1_lines_{}) : scalar(@paste_file2_lines_{});\n", paste_id, paste_id, paste_id, paste_id));
+            result.push_str(&format!("my $max_lines = scalar @paste_file1_lines_{} > scalar @paste_file2_lines_{} ? scalar @paste_file1_lines_{} : scalar @paste_file2_lines_{};\n", paste_id, paste_id, paste_id, paste_id));
             result.push_str(&generator.indent());
-            result.push_str("my $paste_output = \"\";\n");
+            result.push_str("my $paste_output = q{};\n");
             result.push_str(&generator.indent());
-            result.push_str("for (my $i = 0; $i < $max_lines; $i++) {\n");
+            result.push_str("for my $i (0..$max_lines-1) {\n");
             result.push_str(&generator.indent());
-            result.push_str(&format!("    my $line1 = $i < scalar(@paste_file1_lines_{}) ? $paste_file1_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
+            result.push_str(&format!("    my $line1 = $i < scalar @paste_file1_lines_{} ? $paste_file1_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
             result.push_str(&generator.indent());
-            result.push_str(&format!("    my $line2 = $i < scalar(@paste_file2_lines_{}) ? $paste_file2_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
+            result.push_str(&format!("    my $line2 = $i < scalar @paste_file2_lines_{} ? $paste_file2_lines_{}[$i] : q{{}};\n", paste_id, paste_id));
             result.push_str(&generator.indent());
             result.push_str("    $paste_output .= \"$line1\\t$line2\\n\";\n");
             result.push_str(&generator.indent());
