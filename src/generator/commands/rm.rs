@@ -15,6 +15,14 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             match arg_str.as_str() {
                 "-r" | "-R" | "--recursive" => recursive = true,
                 "-f" | "--force" => force = true,
+                "f" => {
+                    // Handle case where -rf is parsed as -r and f separately
+                    if recursive {
+                        force = true;
+                    } else {
+                        files.push(format!("\"{}\"", arg_str));
+                    }
+                },
                 _ => {
                     if !arg_str.starts_with('-') {
                         files.push(format!("\"{}\"", arg_str));
