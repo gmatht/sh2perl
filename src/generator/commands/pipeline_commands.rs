@@ -414,7 +414,7 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                         if simple_cmd.args.len() == 1 {
                             if let Word::Literal(arg, _) = &simple_cmd.args[0] {
                                 if arg == "-a" {
-                                    return "opendir my $dh, '.' or die; my @files = readdir $dh; closedir $dh; join '\\n', sort @files".to_string();
+                                    return "opendir my $dh, '.' or die; my @files = readdir $dh; closedir $dh; @files = grep { !/^__tmp_.*[.]pl$/msx } @files; join '\\n', sort @files".to_string();
                                 }
                             }
                         }
