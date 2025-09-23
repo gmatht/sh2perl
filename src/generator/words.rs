@@ -718,7 +718,7 @@ let pattern = &args[pattern_idx];
                             eprintln!("DEBUG: words.rs - Using native mkdir implementation for command substitution");
                             let mkdir_code = crate::generator::commands::mkdir::generate_mkdir_command(generator, simple_cmd);
                             let formatted_code = mkdir_code.trim_end_matches('\n')
-                                .replace("print ", "# print ")
+                                .replace("print \"mkdir:", "# print \"mkdir:")  // Comment out success messages
                                 .replace("die ", "croak ");
                             let indent1 = generator.indent();
                             let indent2 = format!("{}{}", generator.indent(), "    ");
