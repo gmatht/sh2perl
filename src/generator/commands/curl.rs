@@ -131,7 +131,7 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
             output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
             output.push_str(&format!("print \"Content saved to {}\\n\";\n", output_file));
             output.push_str("} else {\n");
-            output.push_str(&format!("die \"curl: Cannot write to {}: $!\\n\";\n", output_file));
+            output.push_str(&format!("die \"curl: Cannot write to {}: $OS_ERROR\\n\";\n", output_file));
             output.push_str("}\n");
         } else {
             if !silent_mode {

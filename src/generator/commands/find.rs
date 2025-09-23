@@ -95,9 +95,9 @@ fn generate_system_find_fallback(generator: &mut Generator, cmd: &SimpleCommand,
         let formatted_args = find_args.join(", ");
         output.push_str(&format!("my ({}, {}, {});
 my {} = open3({}, {}, {}, 'find', {});
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 waitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, input_var, out_var, out_var, pid_var));
         output.push_str(&generator.indent());
         output.push_str(&format!("chomp ${};\n", input_var));

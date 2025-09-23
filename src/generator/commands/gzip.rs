@@ -38,9 +38,9 @@ pub fn generate_gzip_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
             output.push_str(&format!("my ({});
 my {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | gunzip 2>/dev/null');
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 my $decompressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, input_var, in_var, out_var, out_var, pid_var));
             output.push_str("if (defined $decompressed) {\n");
             output.push_str(&format!("{} = $decompressed;\n", input_var));
@@ -51,9 +51,9 @@ waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, input_var, in_var,
             let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
             output.push_str(&format!("my ({});
 my {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | gzip | base64');
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 my $compressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, input_var, in_var, out_var, out_var, pid_var));
             output.push_str("chomp $compressed;\n");
             output.push_str(&format!("{} = $compressed;\n", input_var));
@@ -69,9 +69,9 @@ waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, input_var, in_var,
                 let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
                 output.push_str(&format!("my ({});
 my {} = open3({}, {}, {}, 'gunzip', '-c', '{}.gz');
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 my $decompressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, file, in_var, out_var, out_var, pid_var));
                 output.push_str("if (defined $decompressed) {\n");
                 output.push_str(&format!("push @results, \"Decompressed: {}\";\n", file));
@@ -95,9 +95,9 @@ waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, file, in_var, out_
                 let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
                 output.push_str(&format!("my ({});
 my {} = open3({}, {}, {}, 'bash', '-c', '{}');
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
-close {} or croak 'Close failed: $!';
+close {} or croak 'Close failed: $OS_ERROR';
 waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, gzip_cmd, in_var, out_var, out_var, pid_var));
                 output.push_str("if ($CHILD_ERROR == 0) {\n");
                 output.push_str(&format!("push @results, \"Compressed: {}\";\n", file));

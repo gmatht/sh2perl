@@ -71,9 +71,9 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 let cmd_str = generate_bash_command_string(cmd);
                 output.push_str(&format!("my ($in, $out, $err);
 my $pid = open3($in, $out, $err, 'bash', '-c', '{}');
-close $in or croak 'Close failed: $!';
+close $in or croak 'Close failed: $OS_ERROR';
 my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
-close $out or croak 'Close failed: $!';
+close $out or croak 'Close failed: $OS_ERROR';
 waitpid $pid, 0;\n", output_var, cmd_str));
             }
             

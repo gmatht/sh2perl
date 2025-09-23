@@ -25,7 +25,12 @@ pub fn generate_sort_command_with_output(generator: &mut Generator, cmd: &Simple
         }
     }
     
-    output.push_str(&format!("my @sort_lines_{} = split /\\n/msx, ${};\n", command_index, input_var));
+    let var_ref = if input_var.starts_with('$') { 
+        input_var.to_string() 
+    } else { 
+        format!("${}", input_var) 
+    };
+    output.push_str(&format!("my @sort_lines_{} = split /\\n/msx, {};\n", command_index, var_ref));
     if numeric {
         // For numeric sort, use a separate function to avoid complex sort blocks
         output.push_str(&format!("sub sort_numeric_{} {{\n", command_index));
@@ -44,13 +49,18 @@ pub fn generate_sort_command_with_output(generator: &mut Generator, cmd: &Simple
     if reverse {
         output.push_str(&format!("@sort_sorted_{} = reverse @sort_sorted_{};\n", command_index, command_index));
     }
-    output.push_str(&format!("${} = join \"\\n\", @sort_sorted_{};\n", output_var, command_index));
+    let output_ref = if output_var.starts_with('$') { 
+        output_var.to_string() 
+    } else { 
+        format!("${}", output_var) 
+    };
+    output.push_str(&format!("{} = join \"\\n\", @sort_sorted_{};\n", output_ref, command_index));
     // Ensure output ends with newline to match shell behavior
     output.push_str(&generator.indent());
-    output.push_str(&format!("if (!(${} =~ {})) {{\n", output_var, generator.newline_end_regex()));
+    output.push_str(&format!("if (!({} =~ {})) {{\n", output_ref, generator.newline_end_regex()));
     generator.indent_level += 1;
     output.push_str(&generator.indent());
-    output.push_str(&format!("${} .= \"\\n\";\n", output_var));
+    output.push_str(&format!("{} .= \"\\n\";\n", output_ref));
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("}\n");
