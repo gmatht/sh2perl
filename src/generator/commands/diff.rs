@@ -35,7 +35,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str("close $pipe or croak \"Close failed: $OS_ERROR\";\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
-        output.push_str("}} else {{\n");
+        output.push_str("} else {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
         output.push_str("carp \"Cannot open diff pipe: $OS_ERROR\";\n");
@@ -43,7 +43,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str("$diff_output = q{};\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
-        output.push_str("}}\n");
+        output.push_str("}\n");
         output.push_str(&generator.indent());
         output.push_str("$diff_exit_code = $CHILD_ERROR >> 8;\n");
         generator.indent_level -= 1;
