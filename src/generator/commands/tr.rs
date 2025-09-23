@@ -136,6 +136,14 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str(&format!("if ($expanded_set1_{} =~ /a-z/msx) {{\n", unique_id));
         output.push_str(&format!("    $expanded_set1_{} =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;\n", unique_id));
         output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle A-Z range in set1\n"));
+        output.push_str(&format!("if ($expanded_set1_{} =~ /A-Z/msx) {{\n", unique_id));
+        output.push_str(&format!("    $expanded_set1_{} =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n", unique_id));
+        output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle a-z range in set2\n"));
+        output.push_str(&format!("if ($expanded_set2_{} =~ /a-z/msx) {{\n", unique_id));
+        output.push_str(&format!("    $expanded_set2_{} =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;\n", unique_id));
+        output.push_str(&format!("}}\n"));
         output.push_str(&format!("# Handle A-Z range in set2\n"));
         output.push_str(&format!("if ($expanded_set2_{} =~ /A-Z/msx) {{\n", unique_id));
         output.push_str(&format!("    $expanded_set2_{} =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n", unique_id));
@@ -222,6 +230,14 @@ fn generate_tr_buffered_impl_with_output_for_substitution(generator: &mut Genera
         output.push_str(&format!("if ($expanded_set1_{} =~ /a-z/msx) {{\n", unique_id));
         output.push_str(&format!("    $expanded_set1_{} =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;\n", unique_id));
         output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle A-Z range in set1\n"));
+        output.push_str(&format!("if ($expanded_set1_{} =~ /A-Z/msx) {{\n", unique_id));
+        output.push_str(&format!("    $expanded_set1_{} =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n", unique_id));
+        output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle a-z range in set2\n"));
+        output.push_str(&format!("if ($expanded_set2_{} =~ /a-z/msx) {{\n", unique_id));
+        output.push_str(&format!("    $expanded_set2_{} =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;\n", unique_id));
+        output.push_str(&format!("}}\n"));
         output.push_str(&format!("# Handle A-Z range in set2\n"));
         output.push_str(&format!("if ($expanded_set2_{} =~ /A-Z/msx) {{\n", unique_id));
         output.push_str(&format!("    $expanded_set2_{} =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n", unique_id));
@@ -244,7 +260,7 @@ fn generate_tr_buffered_impl_with_output_for_substitution(generator: &mut Genera
     }
     
     // Return the result for command substitution
-    output.push_str(&format!("${};\n", output_var));
+    output.push_str(&format!("${}", output_var));
     
     output
 }

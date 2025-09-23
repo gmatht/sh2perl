@@ -11,9 +11,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
             } else if s.contains(',') {
                 generator.handle_comma_expansion(s)
             } else {
-                // For literal strings, only replace constants in specific contexts
-                // Don't replace numbers that are part of arithmetic expressions
-                s.clone()
+                // For literal strings, quote them to avoid bareword errors
+                format!("\"{}\"", s.replace("\"", "\\\""))
             }
         },
         Word::ParameterExpansion(pe, _) => generator.generate_parameter_expansion(pe),
@@ -54,6 +53,16 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // For backtick commands, we need to return the value, not print it
                             // The generate_find_command already returns the joined string
                             perl_code
+                        } else if name == "yes" {
+                            // Special handling for yes command in command substitution
+                            let string_to_repeat = if let Some(arg) = simple_cmd.args.first() {
+                                generator.perl_string_literal(arg)
+                            } else {
+                                "\"y\"".to_string()
+                            };
+                            
+                            // Generate a limited number of lines for command substitution
+                            format!("do {{ my $string = {}; my $output = q{{}}; for my $i (0..999) {{ $output .= \"$string\\n\"; }} $output; }}", string_to_repeat)
                         } else if name == "paste" {
                             // Special handling for paste command
                             // Check if this command has process substitution redirects
@@ -394,17 +403,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                                 generator.convert_string_interpolation_to_perl(interp)
                                             },
                                             Word::Literal(literal, _) => {
-                                                // Check if the literal contains escaped backticks that should be processed as command substitutions
-                                                if literal.contains("\\`") {
-                                                    // Parse the string as string interpolation to handle escaped backticks
-                                                    if let Ok(interp) = crate::parser::words::parse_string_interpolation_from_literal(literal) {
-                                                        generator.convert_string_interpolation_to_perl(&interp)
-                                                    } else {
-                                                        generator.perl_string_literal(arg)
-                                                    }
-                                                } else {
-                                                    generator.perl_string_literal(arg)
-                                                }
+                                                // Escaped backticks should be treated as literal backticks, not command substitution
+                                                generator.perl_string_literal(arg)
                                             },
                                             _ => generator.word_to_perl(arg)
                                         }

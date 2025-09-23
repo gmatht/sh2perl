@@ -15,10 +15,10 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
             if arg_str == "-c" {
                 check_mode = true;
             } else if !arg_str.starts_with('-') {
-                files.push(generator.word_to_perl(arg));
+                files.push(generator.perl_string_literal(arg));
             }
         } else {
-            files.push(generator.word_to_perl(arg));
+            files.push(generator.perl_string_literal(arg));
         }
     }
     
@@ -57,8 +57,8 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
             output.push_str("do {\n");
             output.push_str("my @results;\n");
             for file in &files {
-                output.push_str(&format!("if (-f \"{}\") {{\n", file));
-                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', \"{}\" or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
+                output.push_str(&format!("if (-f {}) {{\n", file));
+                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', {} or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
                 output.push_str(&format!("push @results, \"$hash  {}\";\n", file));
                 output.push_str("} else {\n");
                 output.push_str(&format!("push @results, \"0000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", file));
@@ -69,8 +69,8 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
         } else {
             output.push_str("my @results;\n");
             for file in &files {
-                output.push_str(&format!("if (-f \"{}\") {{\n", file));
-                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', \"{}\" or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
+                output.push_str(&format!("if (-f {}) {{\n", file));
+                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', {} or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
                 output.push_str(&format!("push @results, \"$hash  {}\";\n", file));
                 output.push_str("} else {\n");
                 output.push_str(&format!("push @results, \"0000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", file));

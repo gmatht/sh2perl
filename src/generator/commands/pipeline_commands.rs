@@ -545,7 +545,7 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                     format!("({})", echo_args.join(" . q{ } . "))
                 };
                 let tr_output = crate::generator::commands::tr::generate_tr_command_for_substitution(generator, cmd2, "input_data", &unique_id.to_string());
-                return format!("do {{ my $input_data = {}; {} $tr_result_{}; }}", echo_string, tr_output, unique_id);
+                return format!("do {{ my $input_data = {}; {} }}", echo_string, tr_output);
             }
         }
     }

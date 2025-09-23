@@ -15,10 +15,10 @@ pub fn generate_sha512sum_command(generator: &mut Generator, cmd: &SimpleCommand
             if arg_str == "-c" {
                 check_mode = true;
             } else if !arg_str.starts_with('-') {
-                files.push(generator.word_to_perl(arg));
+                files.push(generator.perl_string_literal(arg));
             }
         } else {
-            files.push(generator.word_to_perl(arg));
+            files.push(generator.perl_string_literal(arg));
         }
     }
     

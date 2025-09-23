@@ -34,7 +34,7 @@ pub fn generate_date_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
             output.push_str("print $date;\n");
         }
     } else {
-        // Default format: RFC 2822 format
+        // Default format: match shell date format
         output.push_str("use POSIX qw(strftime);\n");
         output.push_str("my $date = strftime('%a %b %d %H:%M:%S %Z %Y', localtime());\n");
         output.push_str("print $date;\n");

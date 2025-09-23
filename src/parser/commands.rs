@@ -1346,6 +1346,20 @@ fn is_builtin_command(name: &str) -> bool {
     )
 }
 
+// Helper function to parse a pipeline from text
+pub fn parse_pipeline_from_text(text: &str) -> Result<Command, ParserError> {
+    use crate::lexer::{Lexer, Token};
+    
+    // Create a lexer for the command text
+    let mut lexer = Lexer::new(text);
+    
+    // Create a parser with the lexer
+    let mut parser = Parser::new_with_lexer(lexer);
+    
+    // Parse as a pipeline
+    parser.parse_pipeline()
+}
+
 // Re-export the main parsing function
 pub fn parse(input: &str) -> Result<Vec<Command>, ParserError> {
     let mut parser = Parser::new(input);
