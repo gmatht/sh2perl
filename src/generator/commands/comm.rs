@@ -80,11 +80,11 @@ pub fn generate_comm_command(
             output.push_str("}\n");
             
             // Generate output based on suppression flags
-            output.push_str("my $comm_output = \"\";\n");
+            output.push_str("my $comm_output = q{};\n");
             
             if !suppress_col1 {
                 output.push_str("foreach my $line (@file1_lines) {\n");
-                output.push_str("    if (!exists($file2_set{$line})) {\n");
+                output.push_str("    if (!exists $file2_set{$line}) {\n");
                 output.push_str("        $comm_output .= $line . \"\\n\";\n");
                 output.push_str("    }\n");
                 output.push_str("}\n");
@@ -92,7 +92,7 @@ pub fn generate_comm_command(
             
             if !suppress_col2 {
                 output.push_str("foreach my $line (@file2_lines) {\n");
-                output.push_str("    if (!exists($file1_set{$line})) {\n");
+                output.push_str("    if (!exists $file1_set{$line}) {\n");
                 output.push_str("        $comm_output .= $line . \"\\n\";\n");
                 output.push_str("    }\n");
                 output.push_str("}\n");
@@ -105,11 +105,11 @@ pub fn generate_comm_command(
             }
             
             // Remove trailing newline and return the result
-            output.push_str("$comm_output =~ s/\\n$//;\n");
+            output.push_str("$comm_output =~ s/\\n$//msx;\n");
             output.push_str("$comm_output");
         } else {
             // Fallback if we don't have enough process substitution files
-            output.push_str("\"\"");
+            output.push_str("q{}");
         }
     } else {
         // Regular comm command without process substitution
@@ -166,7 +166,7 @@ pub fn generate_comm_command(
             
             if !suppress_col1 {
                 output.push_str("foreach my $line (@file1_lines) {\n");
-                output.push_str("    if (!exists($file2_set{$line})) {\n");
+                output.push_str("    if (!exists $file2_set{$line}) {\n");
                 output.push_str("        $comm_output .= $line . \"\\n\";\n");
                 output.push_str("    }\n");
                 output.push_str("}\n");
@@ -174,7 +174,7 @@ pub fn generate_comm_command(
             
             if !suppress_col2 {
                 output.push_str("foreach my $line (@file2_lines) {\n");
-                output.push_str("    if (!exists($file1_set{$line})) {\n");
+                output.push_str("    if (!exists $file1_set{$line}) {\n");
                 output.push_str("        $comm_output .= $line . \"\\n\";\n");
                 output.push_str("    }\n");
                 output.push_str("}\n");
@@ -191,7 +191,7 @@ pub fn generate_comm_command(
             output.push_str("$comm_output");
         } else {
             // Fallback if we don't have enough file arguments
-            output.push_str("\"\"");
+            output.push_str("q{}");
         }
     }
     

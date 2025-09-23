@@ -120,11 +120,11 @@ fn generate_command_using_builtins(
                                 output.push_str(&format!("\n"));
                             output.push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
                             output.push_str(&format!("my {} = open3({}, {}, {}, '{}');\n", pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd)));
-                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", in_var));
+                            output.push_str(&format!("close {} or croak 'Close failed: $OS_ERROR';\n", in_var));
                             output.push_str(&format!("while (my $line = <{}>) {{\n", out_var));
                             output.push_str(&format!("    ${} .= $line;\n", output_var));
                             output.push_str(&format!("}}\n"));
-                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", out_var));
+                            output.push_str(&format!("close {} or croak 'Close failed: $OS_ERROR';\n", out_var));
                             output.push_str(&format!("waitpid {}, 0;\n", pid_var));
                             }
                         } else {
@@ -134,11 +134,11 @@ fn generate_command_using_builtins(
                             output.push_str(&format!("\n"));
                             output.push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
                             output.push_str(&format!("my {} = open3({}, {}, {}, '{}');\n", pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd)));
-                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", in_var));
+                            output.push_str(&format!("close {} or croak 'Close failed: $OS_ERROR';\n", in_var));
                             output.push_str(&format!("while (my $line = <{}>) {{\n", out_var));
                             output.push_str(&format!("    ${} .= $line;\n", output_var));
                             output.push_str(&format!("}}\n"));
-                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", out_var));
+                            output.push_str(&format!("close {} or croak 'Close failed: $OS_ERROR';\n", out_var));
                             output.push_str(&format!("waitpid {}, 0;\n", pid_var));
                         }
                     } else {
@@ -148,11 +148,11 @@ fn generate_command_using_builtins(
                         output.push_str(&format!("\n"));
                             output.push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
                             output.push_str(&format!("my {} = open3({}, {}, {}, '{}');\n", pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd)));
-                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", in_var));
+                            output.push_str(&format!("close {} or croak 'Close failed: $OS_ERROR';\n", in_var));
                             output.push_str(&format!("while (my $line = <{}>) {{\n", out_var));
                             output.push_str(&format!("    ${} .= $line;\n", output_var));
                             output.push_str(&format!("}}\n"));
-                            output.push_str(&format!("close {} or croak 'Close failed: $!';\n", out_var));
+                            output.push_str(&format!("close {} or croak 'Close failed: $OS_ERROR';\n", out_var));
                             output.push_str(&format!("waitpid {}, 0;\n", pid_var));
                     }
                 }
