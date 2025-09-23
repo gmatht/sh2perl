@@ -54,7 +54,7 @@ pub fn generate_sort_command_with_output(generator: &mut Generator, cmd: &Simple
     } else { 
         format!("${}", output_var) 
     };
-    output.push_str(&format!("{} = join \"\\n\", @sort_sorted_{};\n", output_ref, command_index));
+    output.push_str(&format!("my {} = join \"\\n\", @sort_sorted_{};\n", output_ref, command_index));
     // Ensure output ends with newline to match shell behavior
     output.push_str(&generator.indent());
     output.push_str(&format!("if (!({} =~ {})) {{\n", output_ref, generator.newline_end_regex()));
