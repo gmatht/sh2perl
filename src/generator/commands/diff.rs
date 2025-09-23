@@ -36,7 +36,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str(&generator.indent());
         output.push_str("$diff_output = <$diff_fh>;\n");
         output.push_str(&generator.indent());
-        output.push_str("close $diff_fh or carp \"Close failed (non-fatal): $OS_ERROR\";\n");
+        output.push_str("my $close_result = close $diff_fh; # Capture but ignore close result for diff\n");
         output.push_str(&generator.indent());
         output.push_str("$diff_exit_code = $CHILD_ERROR >> 8;\n");
         generator.indent_level -= 1;
