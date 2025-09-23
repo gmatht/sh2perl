@@ -237,7 +237,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 };
                                 format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", cleaned_format)
                             } else {
-                                "do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime); }".to_string()
+                                "do { use POSIX qw(strftime); strftime('%a %b %d %H:%M:%S %Z %Y', localtime); }".to_string()
                             }
                         } else if name == "pwd" {
                             // Special handling for pwd in command substitution

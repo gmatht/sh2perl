@@ -1751,7 +1751,23 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                         },
                         _ => {
                             // Use generate_command_using_builtins for regular commands
-                            let command_output = generate_command_using_builtins(generator, command, &format!("output_{}", unique_id), &format!("output_{}", unique_id), &format!("{}_{}", unique_id, i), false);
+                            // For commands that need buffered processing (like sort), use a unique output variable
+                            let cmd_output_var = if let Command::Simple(cmd) = command {
+                                if let Word::Literal(cmd_name, _) = &cmd.name {
+                                    if cmd_name == "sort" || cmd_name == "uniq" || cmd_name == "wc" {
+                                        // Use a unique output variable for buffered commands to avoid variable conflicts
+                                        format!("output_{}_{}", unique_id, i)
+                                    } else {
+                                        format!("output_{}", unique_id)
+                                    }
+                                } else {
+                                    format!("output_{}", unique_id)
+                                }
+                            } else {
+                                format!("output_{}", unique_id)
+                            };
+                            
+                            let command_output = generate_command_using_builtins(generator, command, &format!("output_{}", unique_id), &cmd_output_var, &format!("{}_{}", unique_id, i), false);
                             
                             // Split the output into lines and apply indentation
                             for line in command_output.lines() {
@@ -1762,6 +1778,12 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                                         output.push_str("\n");
                                     }
                                 }
+                            }
+                            
+                            // If we used a different output variable, assign it back to the main pipeline output
+                            if cmd_output_var != format!("output_{}", unique_id) {
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("$output_{} = ${};\n", unique_id, cmd_output_var));
                             }
                             
                             // For builtin commands, ensure output assignment for those with separate result vars

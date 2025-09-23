@@ -2,7 +2,8 @@ use crate::ast::*;
 use crate::generator::Generator;
 
 pub fn generate_sort_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
-    generate_sort_command_with_output(generator, cmd, input_var, command_index, input_var)
+    let output_var = format!("sort_output_{}", command_index);
+    generate_sort_command_with_output(generator, cmd, input_var, command_index, &output_var)
 }
 
 pub fn generate_sort_command_with_output(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str, output_var: &str) -> String {
@@ -54,7 +55,14 @@ pub fn generate_sort_command_with_output(generator: &mut Generator, cmd: &Simple
     } else { 
         format!("${}", output_var) 
     };
-    output.push_str(&format!("my {} = join \"\\n\", @sort_sorted_{};\n", output_ref, command_index));
+    
+    // Check if this is a pipeline context where the output variable might already be declared
+    // If input_var and output_var are the same, use assignment instead of declaration
+    if input_var == output_var {
+        output.push_str(&format!("{} = join \"\\n\", @sort_sorted_{};\n", output_ref, command_index));
+    } else {
+        output.push_str(&format!("my {} = join \"\\n\", @sort_sorted_{};\n", output_ref, command_index));
+    }
     // Ensure output ends with newline to match shell behavior
     output.push_str(&generator.indent());
     output.push_str(&format!("if (!({} =~ {})) {{\n", output_ref, generator.newline_end_regex()));
@@ -64,6 +72,12 @@ pub fn generate_sort_command_with_output(generator: &mut Generator, cmd: &Simple
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("}\n");
+    
+    // If this is being used in a pipeline context, assign the result back to the input variable
+    if input_var != output_var {
+        output.push_str(&generator.indent());
+        output.push_str(&format!("{} = {};\n", input_var, output_ref));
+    }
     
     output
 }

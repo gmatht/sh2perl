@@ -127,20 +127,28 @@ else
     fi
 fi
 
- Check if we made progress and commit if so
+# Check if we made progress and commit if so
 if [ -f "first_n_tests_passed.txt" ]; then
-    if [ ! -f "first_n_tests_passed.MAX.txt" ] || [ "first_n_tests_passed.txt" -nt "first_n_tests_passed.MAX.txt" ]; then
-        echo "Progress detected! Committing changes..."
-        git commit . -m "Reached $(cat first_n_tests_passed.txt)"
-        cp first_n_tests_passed.txt first_n_tests_passed.MAX.txt
-        echo "Committed and updated MAX file"
-    else
-        echo "No progress detected, skipping commit"
-    fi
-    # Always copy if MAX doesn't exist yet
     if [ ! -f "first_n_tests_passed.MAX.txt" ]; then
+        # First time running - create MAX file but don't commit
         cp first_n_tests_passed.txt first_n_tests_passed.MAX.txt
-        echo "Created MAX file from current result"
+        echo "Created MAX file from current result (first run)"
+    else
+        # Compare the actual test scores (file contents) to see if we made progress
+        # Extract numeric part from format like "EXAMPLE_NAME:y00000" or "EXAMPLE_NAME:n10"
+        current_score=$(cat first_n_tests_passed.txt | sed 's/.*:y\([0-9]*\)/\1/' | sed 's/.*:n\([0-9]*\)/\1/' | head -1)
+        max_score=$(cat first_n_tests_passed.MAX.txt | sed 's/.*:y\([0-9]*\)/\1/' | sed 's/.*:n\([0-9]*\)/\1/' | head -1)
+        
+        if [ "$current_score" -gt "$max_score" ]; then
+            # We reached a new high score - commit and update MAX file
+            echo "Progress detected! New high score: $current_score (was $max_score)"
+            echo "Committing changes..."
+            git commit . -m "Reached $(cat first_n_tests_passed.txt)"
+            cp first_n_tests_passed.txt first_n_tests_passed.MAX.txt
+            echo "Committed and updated MAX file"
+        else
+            echo "No progress detected (current: $current_score, max: $max_score), skipping commit"
+        fi
     fi
 else
     echo "No first_n_tests_passed.txt file found"

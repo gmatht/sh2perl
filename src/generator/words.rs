@@ -211,12 +211,29 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for tr command in command substitution
                             eprintln!("DEBUG: Processing tr command in command substitution with args: {:?}", simple_cmd.args);
                             
-                            // Use the dedicated tr command generator for substitution (no newline)
+                            // Check if this tr command has here string redirects
+                            let has_here_string = simple_cmd.redirects.iter().any(|r| {
+                                matches!(r.operator, RedirectOperator::HereString)
+                            });
+                            
                             let unique_id = generator.get_unique_id();
+                            let input_data = if has_here_string {
+                                // Extract here string content
+                                let here_string_content = simple_cmd.redirects.iter()
+                                    .find(|r| matches!(r.operator, RedirectOperator::HereString))
+                                    .and_then(|r| r.heredoc_body.as_ref())
+                                    .map(|content| format!("\"{}\"", content))
+                                    .unwrap_or_else(|| "q{}".to_string());
+                                format!("my $input_data = {};", here_string_content)
+                            } else {
+                                "my $input_data = q{};".to_string()
+                            };
+                            
+                            // Use the dedicated tr command generator for substitution (no newline)
                             let tr_output = crate::generator::commands::tr::generate_tr_command_for_substitution(generator, simple_cmd, "input_data", &unique_id.to_string());
                             
                             // For command substitution, we need to return the result, not print it
-                            format!("do {{ my $input_data = q{{}}; {} }}", tr_output)
+                            format!("do {{ {} {} }}", input_data, tr_output)
                         } else if name == "perl" {
                             // Special handling for perl in command substitution - execute as external command
                             eprintln!("DEBUG: Processing perl command in command substitution with args: {:?}", simple_cmd.args);
@@ -560,7 +577,7 @@ let pattern = &args[pattern_idx];
                                 };
                                 format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", cleaned_format)
                             } else {
-                                "do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime); }".to_string()
+                                "do { use POSIX qw(strftime); strftime('%a %b %d %H:%M:%S %Z %Y', localtime); }".to_string()
                             }
                         } else if name == "pwd" {
                             // Special handling for pwd in command substitution
@@ -1108,6 +1125,12 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, inte
                 // We need to convert the ParameterExpansion to Perl code
                 // For now, let's handle the common cases directly
                 
+                // First, add any accumulated string as a quoted part
+                if !current_string.is_empty() {
+                    parts.push(format!("\"{}\"", current_string.replace("\\", "\\\\").replace("\"", "\\\"")));
+                    current_string.clear();
+                }
+                
                 // Check for special array operations first
                 match &pe.operator {
                     ParameterExpansionOperator::ArraySlice(offset, length) => {
@@ -1116,22 +1139,22 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, inte
                             if pe.variable.starts_with('#') {
                                 // ${#arr[@]} -> scalar(@arr)
                                 let array_name = &pe.variable[1..];
-                                    current_string.push_str(&format!("scalar(@{})", array_name));
+                                parts.push(format!("scalar(@{})", array_name));
                             } else if pe.variable.starts_with('!') {
                                 // ${!map[@]} -> keys %map (map keys iteration)
                                 let map_name = &pe.variable[1..]; // Remove ! prefix
-                                current_string.push_str(&format!("keys %{}", map_name));
+                                parts.push(format!("keys %{}", map_name));
                             } else {
                                 // ${arr[@]} -> @arr (for array iteration)
                                 let array_name = &pe.variable;
-                                current_string.push_str(&format!("@{}", array_name));
+                                parts.push(format!("@{}", array_name));
                             }
                         } else {
                             // Regular array slice
                             if let Some(length_str) = length {
-                                current_string.push_str(&format!("@${{{}}}[{}..{}]", pe.variable, offset, length_str));
+                                parts.push(format!("@${{{}}}[{}..{}]", pe.variable, offset, length_str));
                             } else {
-                                current_string.push_str(&format!("@${{{}}}[{}..]", pe.variable, offset));
+                                parts.push(format!("@${{{}}}[{}..]", pe.variable, offset));
                             }
                         }
                     }
@@ -1146,20 +1169,20 @@ pub fn convert_string_interpolation_to_perl_impl(generator: &mut Generator, inte
                                     // Check if the key is numeric (indexed array) or string (associative array)
                                     if key.parse::<usize>().is_ok() {
                                         // Indexed array access: arr[1] -> $arr[1]
-                                        current_string.push_str(&format!("${}[{}]", var_name, key));
+                                        parts.push(format!("${}[{}]", var_name, key));
                                     } else {
                                         // Associative array access: map[foo] -> $map{foo}
-                                        current_string.push_str(&format!("${}{{{}}}", var_name, key));
+                                        parts.push(format!("${}{{{}}}", var_name, key));
                                     }
                                 } else {
-                                    current_string.push_str(&format!("${{{}}}", pe.variable));
+                                    parts.push(format!("${{{}}}", pe.variable));
                                 }
                             } else {
-                                current_string.push_str(&format!("${{{}}}", pe.variable));
+                                parts.push(format!("${{{}}}", pe.variable));
                             }
                         } else {
                             // Simple variable reference - use the proper parameter expansion generation
-                            current_string.push_str(&generator.generate_parameter_expansion(pe));
+                            parts.push(generator.generate_parameter_expansion(pe));
                         }
                     }
                 }
