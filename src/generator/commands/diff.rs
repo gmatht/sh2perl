@@ -30,6 +30,8 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
             args.iter().map(|arg| format!("\"{}\"", arg)).collect::<Vec<_>>().join(", ")));
         generator.indent_level += 1;
         output.push_str(&generator.indent());
+        output.push_str("local $INPUT_RECORD_SEPARATOR = undef;\n");
+        output.push_str(&generator.indent());
         output.push_str("$diff_output = <$pipe>;\n");
         output.push_str(&generator.indent());
         output.push_str("close $pipe or croak \"Close failed: $OS_ERROR\";\n");
