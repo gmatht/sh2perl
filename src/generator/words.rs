@@ -839,7 +839,7 @@ let pattern = &args[pattern_idx];
                 } else {
                     // Wrap complex results with chomp to strip trailing newlines (bash behavior)
                     let unique_id = generator.get_unique_id();
-                    format!("do {{\n{}    my $cmd_result_{} = {};\n{}    chomp $cmd_result_{};\n{}    $cmd_result_{};\n{}}}", 
+                    format!("do {{\n{}    my $cmd_result_{} = do {{ {} }};\n{}    chomp $cmd_result_{};\n{}    $cmd_result_{};\n{}}}", 
                         generator.indent(), unique_id, result, generator.indent(), unique_id, generator.indent(), unique_id, generator.indent())
                 }
             }
