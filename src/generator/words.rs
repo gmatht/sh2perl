@@ -422,61 +422,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             eprintln!("DEBUG: words.rs - Using native sha512sum implementation for command substitution");
                             crate::generator::commands::sha512sum::generate_sha512sum_command(generator, simple_cmd, "")
                         } else if name == "grep" {
-                            // Special handling for grep in command substitution
-                            // Use a simplified approach similar to ls substitution
-                            eprintln!("DEBUG: words.rs - Using native grep implementation for command substitution");
+                            // Use the proper grep command generator
                             let unique_id = generator.get_unique_id();
-                            let args: Vec<String> = simple_cmd.args.iter()
-                                .map(|arg| generator.word_to_perl(arg))
-                                .collect();
-                            
-                            if args.is_empty() {
-                                "\"\"".to_string()
-                            } else {
-                                // Parse grep arguments properly
-                                let mut pattern_idx = 0;
-                                let mut file_idx = 1;
-                                let mut show_line_numbers = false;
-                                
-                                // Skip flags like -n, -i, etc.
-                                while pattern_idx < args.len() && args[pattern_idx].starts_with('-') {
-                                    if args[pattern_idx] == "-n" {
-                                        show_line_numbers = true;
-                                    }
-                                    pattern_idx += 1;
-                                    file_idx += 1;
-                                }
-                                
-                                if pattern_idx >= args.len() {
-                                    return "\"\"".to_string();
-                                }
-                                
-let pattern = &args[pattern_idx];
-                                let files = if file_idx < args.len() { &args[file_idx..] } else { &[] };
-                                
-                                if files.is_empty() {
-                                    // No files specified, grep will fail (no input)
-                                    format!("do {{ carp \"grep: {}: No such file or directory\"; \"\" }}", pattern)
-                                } else {
-                                    let file = &files[0];
-                                    // Adjust file path for Perl execution context (runs from examples directory)
-                                    let adjusted_file = generator.adjust_file_path_for_perl_execution(file);
-                                    // Ensure the file is properly quoted
-                                    let quoted_file = if adjusted_file.starts_with('\'') || adjusted_file.starts_with('"') {
-                                        adjusted_file.clone()
-                                    } else {
-                                        format!("'{}'", adjusted_file)
-                                    };
-                                    
-                                    if show_line_numbers {
-                                        format!("do {{ my @grep_lines_{}; my $fh_{}; my $line_num_{} = 0; if (-f {}) {{ open $fh_{}, '<', {} or croak \"Cannot open file: $OS_ERROR\"; while (my $line = <$fh_{}>) {{ $line_num_{}++; chomp $line; if ($line =~ /{}/msx) {{ push @grep_lines_{}, \"$line_num_{}:$line\"; }} }} close $fh_{} or croak \"Close failed: $OS_ERROR\"; }} join \"\\n\", @grep_lines_{}; }}", 
-                                            unique_id, unique_id, unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id, unique_id, unique_id)
-                                    } else {
-                                        format!("do {{ my @grep_lines_{}; my $fh_{}; if (-f {}) {{ open $fh_{}, '<', {} or croak \"Cannot open file: $OS_ERROR\"; @grep_lines_{} = <$fh_{}>; close $fh_{} or croak \"Close failed: $OS_ERROR\"; chomp @grep_lines_{}; @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{}; }} join \"\\n\", @grep_lines_{}; }}", 
-                                            unique_id, unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id)
-                                    }
-                                }
-                            }
+                            let grep_output = crate::generator::commands::grep::generate_grep_command(generator, simple_cmd, "", &unique_id.to_string(), false);
+                            format!("do {{ {} $grep_result_{}; }}", grep_output, unique_id)
                         } else if name == "printf" {
                             // Special handling for printf in command substitution
                             let mut format_string = String::new();
@@ -556,7 +505,15 @@ let pattern = &args[pattern_idx];
                                 }
                                 
                                 // Strip the + prefix from date format strings (shell date +%Y -> strftime %Y)
-                                let cleaned_format = if format_str.starts_with("'+") && format_str.ends_with("'") {
+                                let cleaned_format = if format_str.starts_with("'\"+") && format_str.ends_with("\"'") {
+                                    // Remove quotes, strip +, add quotes back
+                                    let inner = &format_str[2..format_str.len()-2];
+                                    if inner.starts_with('+') {
+                                        format!("'\"{}\"'", &inner[1..])
+                                    } else {
+                                        format_str
+                                    }
+                                } else if format_str.starts_with("'+") && format_str.ends_with("'") {
                                     // Remove quotes, strip +, add quotes back
                                     let inner = &format_str[1..format_str.len()-1];
                                     if inner.starts_with('+') {
@@ -568,14 +525,22 @@ let pattern = &args[pattern_idx];
                                     // No quotes, just strip the +
                                     format!("'{}'", &format_str[1..])
                                 } else {
-                                    // Ensure the format string is properly quoted for strftime
-                                    if format_str.starts_with('"') || format_str.starts_with("'") || format_str.starts_with("q{") {
-                                        format_str
+                                    // Check if the string contains a + character and strip it
+                                    if format_str.contains('+') {
+                                        // This handles cases like '"+%Y"' -> '"\%Y"'
+                                        format_str.replace("+", "")
                                     } else {
-                                        format!("'{}'", format_str)
+                                        format_str
                                     }
                                 };
-                                format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", cleaned_format)
+                                
+                                // Ensure the format string is properly quoted for strftime
+                                let final_format = if cleaned_format.starts_with('"') || cleaned_format.starts_with("'") || cleaned_format.starts_with("q{") {
+                                    cleaned_format
+                                } else {
+                                    format!("'{}'", cleaned_format)
+                                };
+                                format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", final_format)
                             } else {
                                 "do { use POSIX qw(strftime); strftime('%a %b %d %H:%M:%S %Z %Y', localtime); }".to_string()
                             }

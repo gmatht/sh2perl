@@ -13,7 +13,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
     // Build the diff command arguments
     let mut args = Vec::new();
     for arg in &cmd.args {
-        let arg_str = generator.word_to_perl(arg);
+        let arg_str = generator.perl_string_literal(arg);
         args.push(arg_str);
     }
     
@@ -25,7 +25,7 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str("my $diff_cmd = 'diff.exe';\n");
         output.push_str(&generator.indent());
         output.push_str(&format!("my @diff_args = ({});\n", 
-            args.iter().map(|arg| format!("\"{}\"", arg)).collect::<Vec<_>>().join(", ")));
+            args.join(", ")));
         output.push_str(&generator.indent());
         output.push_str("my $diff_pid = open my $diff_fh, q{-|}, $diff_cmd, @diff_args;\n");
         output.push_str(&generator.indent());

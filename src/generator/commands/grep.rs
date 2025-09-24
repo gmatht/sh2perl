@@ -173,7 +173,13 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
     let mut i = 0;
     while i < cmd.args.len() {
             if let Word::Literal(s, _) = &cmd.args[i] {
-                if !s.starts_with('-') && s != &pattern {
+                if !s.starts_with('-') {
+                    // Skip the pattern argument (first non-option argument)
+                    if s == &pattern || s == &format!("\"{}\"", pattern) || s == &format!("'{}'", pattern) {
+                        i += 1;
+                        continue;
+                    }
+                    
                     // Check if this is a pattern file (skip it from file_args)
                     if let Some(ref pf) = pattern_file {
                         if s == pf {
@@ -320,12 +326,13 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                         output.push_str("    }\n");
                         output.push_str("}\n");
                     } else {
-                        output.push_str(&format!("if (-f {}) {{\n", adjusted_file));
-                        output.push_str(&format!("    open my $fh, '<', {} or die \"Cannot open {}: $ERRNO\";\n", adjusted_file, adjusted_file));
+                        let quoted_file = format!("\"{}\"", adjusted_file);
+                        output.push_str(&format!("if (-f {}) {{\n", quoted_file));
+                        output.push_str(&format!("    open my $fh, '<', {} or croak \"Cannot open file: $ERRNO\";\n", quoted_file));
                         output.push_str("    while (my $line = <$fh>) {\n");
                         output.push_str("        chomp $line;\n");
                         output.push_str(&format!("        push @grep_lines_{}, $line;\n", command_index));
-                        output.push_str(&format!("        push @grep_filenames_{}, {};\n", command_index, adjusted_file));
+                        output.push_str(&format!("        push @grep_filenames_{}, {};\n", command_index, quoted_file));
                         output.push_str("    }\n");
                         output.push_str("    close $fh or croak \"Close failed: $OS_ERROR\";\n");
                         output.push_str("}\n");
@@ -446,7 +453,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             // First, identify chunks (consecutive lines with output.push_str or result.push_str calls)
             output.push_str(&format!("my $in_chunk_{} = 0;\n", command_index));
             output.push_str(&format!("my $chunk_start_{} = -1;\n", command_index));
-            output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
+            output.push_str(&format!("for my $i (0..@grep_lines_{}-1) {{\n", command_index));
             output.push_str(&format!("    if ($grep_lines_{}[$i] =~ {}) {{\n", command_index, generator.format_regex_pattern(r"(output|result)\\.push_str\\(")));
             output.push_str(&format!("        if (!$in_chunk_{}) {{\n", command_index));
             output.push_str(&format!("            $chunk_start_{} = $i;\n", command_index));
@@ -464,7 +471,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             output.push_str("}\n");
             
             // Now find lines that match the missing regex but are not in chunks
-            output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
+            output.push_str(&format!("for my $i (0..@grep_lines_{}-1) {{\n", command_index));
             output.push_str(&format!("    my $in_chunk_{} = 0;\n", command_index));
             output.push_str(&format!("    for my $range (@chunk_ranges_{}) {{\n", command_index));
             output.push_str(&format!("        if ($i >= $range->[0] && $i <= $range->[1]) {{\n"));
@@ -486,8 +493,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             if has_file_args && recursive {
                 // For recursive grep with -c, generate per-file counts
                 output.push_str(&format!("my %file_counts_{};\n", command_index));
-                output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
-                output.push_str(&format!("    if (grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
+                output.push_str(&format!("for my $i (0..@grep_lines_{}-1) {{\n", command_index));
+                output.push_str(&format!("    if (scalar grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
                 output.push_str(&format!("        $file_counts_{}{{$grep_filenames_{}[$i]}}++;\n", command_index, command_index));
                 output.push_str("    }\n");
                 output.push_str("}\n");
@@ -509,11 +516,11 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             let before = if context_lines > 0 { context_lines } else { before_context };
             
             output.push_str(&format!("my @grep_with_context_{};\n", command_index));
-            output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
-            output.push_str(&format!("    if (grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
+            output.push_str(&format!("for my $i (0..@grep_lines_{}-1) {{\n", command_index));
+            output.push_str(&format!("    if (scalar grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
             // Add before context
             if before > 0 {
-                output.push_str(&format!("        for (my $j = $i - {}; $j < $i; $j++) {{\n", before));
+                output.push_str(&format!("        for my $j (($i - {})..($i-1)) {{\n", before));
                 output.push_str(&format!("            if ($j >= 0) {{\n"));
                 output.push_str(&format!("                push @grep_with_context_{}, $grep_lines_{}[$j];\n", command_index, command_index));
                 output.push_str("            }\n");
@@ -523,7 +530,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             output.push_str(&format!("        push @grep_with_context_{}, $grep_lines_{}[$i];\n", command_index, command_index));
             // Add after context
             if after > 0 {
-                output.push_str(&format!("        for (my $j = $i + 1; $j <= $i + {} && $j < @grep_lines_{}; $j++) {{\n", after, command_index));
+                output.push_str(&format!("        for my $j (($i + 1)..($i + {})) {{\n", after));
                 output.push_str(&format!("            push @grep_with_context_{}, $grep_lines_{}[$j];\n", command_index, command_index));
                 output.push_str("        }\n");
             }
@@ -536,8 +543,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             }
         } else if line_numbers {
             output.push_str(&format!("my @grep_numbered_{};\n", command_index));
-            output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
-            output.push_str(&format!("    if (grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
+            output.push_str(&format!("for my $i (0..@grep_lines_{}-1) {{\n", command_index));
+            output.push_str(&format!("    if (scalar grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
             output.push_str(&format!("        push @grep_numbered_{}, sprintf \"%d:%s\", $i + 1, $grep_lines_{}[$i];\n", command_index, command_index));
             output.push_str("    }\n");
             output.push_str("}\n");
@@ -566,8 +573,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     // For glob patterns, output the actual filenames that contain matches
                     output.push_str(&format!("my @matching_files_{};\n", command_index));
                     output.push_str(&format!("my %file_has_match_{};\n", command_index));
-                    output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
-                    output.push_str(&format!("    if (grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
+                    output.push_str(&format!("for my $i (0..@grep_lines_{}-1) {{\n", command_index));
+                    output.push_str(&format!("    if (scalar grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
                     output.push_str(&format!("        $file_has_match_{}{{$grep_filenames_{}[$i]}} = 1;\n", command_index, command_index));
                     output.push_str("    }\n");
                     output.push_str("}\n");
@@ -609,8 +616,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     output.push_str("}\n");
                     
                     // Then, mark which ones have matches
-                    output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
-                    output.push_str(&format!("    if (grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
+                    output.push_str(&format!("for my $i (0..@grep_lines_{}-1) {{\n", command_index));
+                    output.push_str(&format!("    if (scalar grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
                     output.push_str(&format!("        $file_has_match_{}{{$grep_filenames_{}[$i]}} = 1;\n", command_index, command_index));
                     output.push_str("    }\n");
                     output.push_str("}\n");
@@ -655,8 +662,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 // Handle -H flag: always show filename even with single file
                 output.push_str(&format!("my @grep_with_filename_{};\n", command_index));
                 if recursive {
-                    output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
-                    output.push_str(&format!("    if (grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
+                    output.push_str(&format!("for my $i (0..@grep_lines_{}-1) {{\n", command_index));
+                    output.push_str(&format!("    if (scalar grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
                     output.push_str(&format!("        push @grep_with_filename_{}, \"$grep_filenames_{}[$i]:$grep_lines_{}[$i]\";\n", command_index, command_index, command_index));
                     output.push_str("    }\n");
                     output.push_str("}\n");
@@ -671,8 +678,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
             if recursive && has_file_args {
                 // For recursive search, show filename:content format
                 output.push_str(&format!("my @grep_with_filename_{};\n", command_index));
-                output.push_str(&format!("for (my $i = 0; $i < @grep_lines_{}; $i++) {{\n", command_index));
-                output.push_str(&format!("    if (grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
+                output.push_str(&format!("for my $i (0..@grep_lines_{}-1) {{\n", command_index));
+                output.push_str(&format!("    if (scalar grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n", command_index, command_index));
                 output.push_str(&format!("        push @grep_with_filename_{}, \"$grep_filenames_{}[$i]:$grep_lines_{}[$i]\";\n", command_index, command_index, command_index));
                 output.push_str("    }\n");
                 output.push_str("}\n");

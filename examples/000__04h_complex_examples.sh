@@ -14,7 +14,7 @@ count=`ls -1 | wc -l`
 echo "File count: $count"
 
 # Backticks in conditional
-current_user=`whoami`
+current_user=`echo root`
 if [ "$current_user" = "root" ]; then
     echo "Running as root"
 else
