@@ -326,7 +326,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         for redirect in &simple_cmd.redirects {
                                             if let crate::ast::RedirectOperator::Input = redirect.operator {
                                                 let file_name = generator.word_to_perl(&redirect.target);
-                                                return format!("-s {}", file_name);
+                                                return format!("(-f {} ? -s {} : q{{}})", file_name, file_name);
                                             }
                                         }
                                         
@@ -336,12 +336,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                                 // Handle wc -c < file pattern
                                                 if file.starts_with('<') {
                                                     let file_name = file.strip_prefix('<').unwrap_or("").trim();
-                                                    format!("-s {}", file_name)
+                                                    format!("(-f {} ? -s {} : q{{}})", file_name, file_name)
                                                 } else {
-                                                    format!("-s {}", file)
+                                                    format!("(-f {} ? -s {} : q{{}})", file, file)
                                                 }
                                             } else {
-                                                format!("-s {}", generator.word_to_perl(&simple_cmd.args[1]))
+                                                let file_name = generator.word_to_perl(&simple_cmd.args[1]);
+                                                format!("(-f {} ? -s {} : q{{}})", file_name, file_name)
                                             }
                                         } else {
                                             // No file argument, use stdin

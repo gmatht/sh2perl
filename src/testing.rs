@@ -628,6 +628,22 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                 status: create_exit_status(0),
             });
         } else {
+            // Clean up any temporary files in examples directory before running shell script
+            let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
+            if let Ok(entries) = std::fs::read_dir(&examples_dir) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    let file_name_str = file_name.to_string_lossy();
+                    // Remove common temporary files that might affect file counts
+                    if file_name_str.starts_with("temp_") || 
+                       file_name_str.starts_with("file") && (file_name_str.ends_with(".txt") || file_name_str.ends_with(".tmp")) ||
+                       file_name_str.starts_with("debug_") ||
+                       file_name_str.ends_with("_out.txt") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+            
             // Run the shell script and cache the output
             eprintln!("DEBUG: Running shell script: {}", filename);
             let start = std::time::Instant::now();
@@ -952,6 +968,12 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                          } else { 
                              &translated_code 
                          });
+                // Save Perl code to a debug file for manual inspection
+                if let Err(e) = std::fs::write("debug_perl_code.pl", &translated_code) {
+                    eprintln!("DEBUG: Failed to write debug Perl code: {}", e);
+                } else {
+                    eprintln!("DEBUG: Saved Perl code to debug_perl_code.pl");
+                }
             } else {
                 for a in &run_cmd[1..] { cmd.arg(a); }
             }
@@ -1068,7 +1090,10 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
     eprintln!("DEBUG: Shell stdout length: {}, Translated stdout length: {}", shell_stdout.len(), trans_stdout.len());
     eprintln!("DEBUG: Shell stderr length: {}, Translated stderr length: {}", shell_stderr.len(), trans_stderr.len());
     eprintln!("DEBUG: Shell exit: {}, Translated exit: {}", shell_output_result.status.code().unwrap_or(-1), translated_output.status.code().unwrap_or(-1));
+    eprintln!("DEBUG: stdout_match: {}, stderr_match: {}, exit_code_match: {}", stdout_match, stderr_match, exit_code_match);
+    eprintln!("DEBUG: timed_out: {}", timed_out);
     eprintln!("DEBUG: Test success: {}", success);
+    eprintln!("DEBUG: failure_reason: '{}'", failure_reason);
     
     Ok(TestResult {
         success,

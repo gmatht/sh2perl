@@ -51,6 +51,9 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
         // Skip temporary files that might be created during test execution
         output.push_str(&generator.indent());
         output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
+        // Skip other common temporary files created during testing
+        output.push_str(&generator.indent());
+        output.push_str("next if $file =~ /^(debug_|temp_|test_|file\\d*[.]txt)$/msx;\n");
         if add_slash_to_dirs {
             output.push_str(&generator.indent());
             output.push_str(&format!("if (-d \"{}/$file\") {{\n", dir));
@@ -216,6 +219,9 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                 // Skip temporary files that might be created during test execution
                 output.push_str(&generator.indent());
                 output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
+                // Skip other common temporary files created during testing
+                output.push_str(&generator.indent());
+                output.push_str("next if $file =~ /^(debug_|temp_|test_|file\\d*[.]txt)$/msx;\n");
                 if add_slash_to_dirs {
                     output.push_str(&generator.indent());
                     output.push_str(&format!("if (-d \"{}/$file\") {{\n", file_arg));
@@ -301,6 +307,9 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                 // Skip temporary files that might be created during test execution
                 output.push_str(&generator.indent());
                 output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
+                // Skip other common temporary files created during testing
+                output.push_str(&generator.indent());
+                output.push_str("next if $file =~ /^(debug_|temp_|test_|file\\d*[.]txt)$/msx;\n");
                 if add_slash_to_dirs {
                     output.push_str(&generator.indent());
                     output.push_str(&format!("if (-d \"{}/$file\") {{\n", file_arg));
