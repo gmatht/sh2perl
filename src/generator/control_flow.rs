@@ -119,7 +119,9 @@ pub fn generate_case_statement_impl(generator: &mut Generator, case_stmt: &CaseS
                 };
                 
                 // Fix the regex pattern - use proper Perl regex syntax
-                let regex_pattern = format!("^{}$", perl_pattern);
+                // Remove quotes from the pattern since we're matching against a variable
+                let clean_pattern = perl_pattern.trim_matches('"').trim_matches('\'');
+                let regex_pattern = format!("^{}$", clean_pattern);
                 pattern_conditions.push(format!("{} =~ /{}/msx", processed_word, regex_pattern));
             }
         }

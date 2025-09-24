@@ -14,10 +14,10 @@ pub fn generate_tee_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
             if arg_str == "-a" {
                 append_mode = true;
             } else if !arg_str.starts_with('-') {
-                files.push(generator.word_to_perl(arg));
+                files.push(generator.perl_string_literal(arg));
             }
         } else {
-            files.push(generator.word_to_perl(arg));
+            files.push(generator.perl_string_literal(arg));
         }
     }
     
@@ -31,7 +31,7 @@ pub fn generate_tee_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
         
         for file in &files {
             let mode = if append_mode { ">>" } else { ">" };
-            output.push_str(&format!("if (open my $fh, '{}', \"{}\") {{\n", mode, file));
+            output.push_str(&format!("if (open my $fh, '{}', {}) {{\n", mode, file));
             output.push_str("foreach my $line (@lines) {\n");
             output.push_str("print {$fh} \"$line\\n\";\n");
             output.push_str("}\n");

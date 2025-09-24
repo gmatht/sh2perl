@@ -218,7 +218,15 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             if let Some(format) = simple_cmd.args.first() {
                                 let format_str = generator.word_to_perl(format);
                                 // Strip the + prefix from date format strings (shell date +%Y -> strftime %Y)
-                                let cleaned_format = if format_str.starts_with("'+") && format_str.ends_with("'") {
+                                let cleaned_format = if format_str.starts_with("'\"+") && format_str.ends_with("\"'") {
+                                    // Remove quotes, strip +, add quotes back
+                                    let inner = &format_str[2..format_str.len()-2];
+                                    if inner.starts_with('+') {
+                                        format!("'\"{}\"'", &inner[1..])
+                                    } else {
+                                        format_str
+                                    }
+                                } else if format_str.starts_with("'+") && format_str.ends_with("'") {
                                     // Remove quotes, strip +, add quotes back
                                     let inner = &format_str[1..format_str.len()-1];
                                     if inner.starts_with('+') {
@@ -230,14 +238,22 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                     // No quotes, just strip the +
                                     format!("'{}'", &format_str[1..])
                                 } else {
-                                    // Ensure the format string is properly quoted for strftime
-                                    if format_str.starts_with('"') || format_str.starts_with("'") || format_str.starts_with("q{") {
-                                        format_str
+                                    // Check if the string contains a + character and strip it
+                                    if format_str.contains('+') {
+                                        // This handles cases like '"+%Y"' -> '"\%Y"'
+                                        format_str.replace("+", "")
                                     } else {
-                                        format!("'{}'", format_str)
+                                        format_str
                                     }
                                 };
-                                format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", cleaned_format)
+                                
+                                // Ensure the format string is properly quoted for strftime
+                                let final_format = if cleaned_format.starts_with('"') || cleaned_format.starts_with("'") || cleaned_format.starts_with("q{") {
+                                    cleaned_format
+                                } else {
+                                    format!("'{}'", cleaned_format)
+                                };
+                                format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", final_format)
                             } else {
                                 "do { use POSIX qw(strftime); strftime('%a %b %d %H:%M:%S %Z %Y', localtime); }".to_string()
                             }

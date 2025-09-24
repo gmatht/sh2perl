@@ -35,7 +35,7 @@ pub fn generate_cat_command(generator: &mut Generator, cmd: &SimpleCommand, redi
         output.push_str(&format!("${} = q{{}};\n", input_var));
         // Adjust filename for Perl execution context (runs from examples directory)
         let adjusted_filename = generator.adjust_file_path_for_perl_execution(&filename);
-        output.push_str(&format!("if (open my $fh, '<', '{}') {{\n", adjusted_filename));
+        output.push_str(&format!("if (open my $fh, '<', {}) {{\n", adjusted_filename));
         output.push_str("while (my $line = <$fh>) {\n");
         output.push_str(&format!("${} .= $line;\n", input_var));
         output.push_str("}\n");
@@ -50,7 +50,7 @@ pub fn generate_cat_command(generator: &mut Generator, cmd: &SimpleCommand, redi
         output.push_str(&generator.indent());
         output.push_str("}\n");
         output.push_str("} else {\n");
-        output.push_str(&format!("carp \"cat: {}: No such file or directory\";\n", adjusted_filename));
+        output.push_str(&format!("carp \"cat: \", {}, \": No such file or directory\";\n", adjusted_filename));
         // Instead of calling exit(1), set the output to empty and let the pipeline handle the failure
         output.push_str(&format!("${} = q{{}};\n", input_var));
         output.push_str("}\n");

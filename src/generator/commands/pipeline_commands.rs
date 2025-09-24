@@ -1386,7 +1386,8 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             // Note: The caller will add base indentation, so we generate unindented output
             // The $head_line_count variable is already declared at the pipeline level
             output.push_str(&format!("if ($head_line_count < {}) {{\n", num_lines));
-            output.push_str(&format!("    $output_0 .= $line . \"\\n\";\n"));
+            output.push_str(&format!("    if ($head_line_count > 0) {{ $output_0 .= \"\\n\"; }}\n"));
+            output.push_str(&format!("    $output_0 .= $line;\n"));
             output.push_str("    ++$head_line_count;\n");
             output.push_str("} else {\n");
             output.push_str("    $line = q{}; # Clear line to prevent printing\n");
@@ -1454,7 +1455,11 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
                 if let Word::Literal(arg, _) = &cmd.args[i] {
                     if arg == "-d" && i + 1 < cmd.args.len() {
                         if let Some(next_arg) = cmd.args.get(i + 1) {
-                            delimiter = generator.word_to_perl(next_arg);
+                            if let Word::Literal(s, _) = next_arg {
+                                delimiter = s.clone();
+                            } else {
+                                delimiter = generator.word_to_perl(next_arg);
+                            }
                             i += 1; // Skip the delimiter argument
                         }
                     } else if arg == "-f" && i + 1 < cmd.args.len() {
@@ -1472,7 +1477,9 @@ fn generate_linebyline_command(generator: &mut Generator, cmd: &SimpleCommand, l
             }
             
             // Generate cut logic for the current line
-            output.push_str(&format!("my @fields = split /{}/msx, $line;\n", delimiter));
+            // Escape special regex characters in delimiter
+            let escaped_delimiter = delimiter.replace(":", "\\:").replace("|", "\\|").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}").replace("^", "\\^").replace("$", "\\$").replace("*", "\\*").replace("+", "\\+").replace("?", "\\?").replace(".", "\\.");
+            output.push_str(&format!("my @fields = split /{}/msx, $line;\n", escaped_delimiter));
             output.push_str(&format!("if (@fields > {}) {{\n", field_num - 1));
             output.push_str(&format!("    $line = $fields[{}];\n", field_num - 1));
             output.push_str("}\n");

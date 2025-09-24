@@ -15,12 +15,12 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                 "-p" | "--parents" => create_parents = true,
                 _ => {
                     if !arg_str.starts_with('-') {
-                        directories.push(generator.word_to_perl(arg));
+                        directories.push(generator.perl_string_literal(arg));
                     }
                 }
             }
         } else {
-            directories.push(generator.word_to_perl(arg));
+            directories.push(generator.perl_string_literal(arg));
         }
     }
     
@@ -35,8 +35,8 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         
         for dir in &directories {
             if create_parents {
-                output.push_str(&format!("if (!-d \"{}\") {{\n", dir));
-                output.push_str(&format!("make_path(\"{}\", {{error => \\$err}});\n", dir));
+                output.push_str(&format!("if (!-d {}) {{\n", dir));
+                output.push_str(&format!("make_path({}, {{error => \\$err}});\n", dir));
                 output.push_str("if (@{$err}) {\n");
                 output.push_str(&format!("croak \"mkdir: cannot create directory {}: $err->[0]\\n\";\n", dir));
                 output.push_str("} else {\n");
@@ -46,8 +46,8 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                 // mkdir -p is silent when directory already exists (matches shell behavior)
                 output.push_str("}\n");
             } else {
-                output.push_str(&format!("if (!-d \"{}\") {{\n", dir));
-                output.push_str(&format!("if (mkdir \"{}\") {{\n", dir));
+                output.push_str(&format!("if (!-d {}) {{\n", dir));
+                output.push_str(&format!("if (mkdir {}) {{\n", dir));
                 output.push_str(&format!("print \"mkdir: created directory {}\\n\";\n", dir));
                 output.push_str("} else {\n");
                 output.push_str(&format!("croak \"mkdir: cannot create directory {}: $ERRNO\\n\";\n", dir));
