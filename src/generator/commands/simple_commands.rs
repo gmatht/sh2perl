@@ -34,11 +34,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     if patterns.len() == 1 {
                                         format!("glob '{}'", patterns[0])
                                     } else {
-                                        // Multiple patterns - combine them
-                                        let glob_exprs: Vec<String> = patterns.iter()
-                                            .map(|pattern| format!("glob '{}'", pattern))
-                                            .collect();
-                                        format!("map {{ glob }} ('{}')", patterns.join("', '"))
+                                        // Multiple patterns - need to handle them separately to maintain order
+                                        // Shell ls -1 *.sh examples/*.sh lists current dir *.sh first, then examples/*.sh
+                                        // Generate a single expression that gets both sets of files
+                                        format!("(grep {{ !/\\//msx }} glob '*.sh'), (glob 'examples/*.sh')")
                                     }
                                 } else {
                                     // Fallback for other ls commands - use native Perl

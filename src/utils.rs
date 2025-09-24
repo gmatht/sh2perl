@@ -324,7 +324,7 @@ pub fn check_perl_no_open3_builtins(perl_code: &str) -> Result<(), String> {
         "export", "readonly", "declare", "local", "read", "printf", "echo",
         "test", "[", "[[", "let", "expr", "bc", "dc", "seq", "factor", "yes",
         "true", "false", "strings", ":", "exit", "return", "break",
-        "continue", "shift", "unshift", "pop", "push", "splice", "join", "split"
+        "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl"
     ];
     
     let mut violations = Vec::new();
@@ -332,7 +332,9 @@ pub fn check_perl_no_open3_builtins(perl_code: &str) -> Result<(), String> {
     // Create regex to match open3 calls with builtin commands
     for builtin in &builtin_commands {
         // Match patterns like: open3($in, $out, $err, 'BUILTIN', ...)
-        let pattern = format!("open3\\s*\\(\\s*[^,]+,\\s*[^,]+,\\s*[^,]+,\\s*['\"]{}['\"]", builtin);
+        // Escape special regex characters in the builtin command name
+        let escaped_builtin = regex::escape(builtin);
+        let pattern = format!("open3\\s*\\(\\s*[^,]+,\\s*[^,]+,\\s*[^,]+,\\s*['\"]{}['\"]", escaped_builtin);
         let regex = match Regex::new(&pattern) {
             Ok(re) => re,
             Err(e) => {
@@ -376,7 +378,7 @@ pub fn check_perl_no_system_builtins(perl_code: &str) -> Result<(), String> {
         "export", "readonly", "declare", "local", "read", "printf", "echo",
         "test", "[", "[[", "let", "expr", "bc", "dc", "seq", "factor", "yes",
         "true", "false", "strings", ":", "exit", "return", "break",
-        "continue", "shift", "unshift", "pop", "push", "splice", "join", "split"
+        "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl"
     ];
     
     let mut violations = Vec::new();
