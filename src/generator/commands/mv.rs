@@ -15,12 +15,12 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 "-f" | "--force" => _force = true,
                 _ => {
                     if !arg_str.starts_with('-') {
-                        sources.push(generator.word_to_perl(arg));
+                        sources.push(generator.perl_string_literal(arg));
                     }
                 }
             }
         } else {
-            sources.push(generator.word_to_perl(arg));
+            sources.push(generator.perl_string_literal(arg));
         }
     }
     
@@ -29,11 +29,6 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     } else {
         // Last argument is the destination
         let destination = sources.pop().unwrap();
-        let quoted_destination = if destination.starts_with('"') || destination.starts_with("'") {
-            destination.clone()
-        } else {
-            format!("\"{}\"", destination)
-        };
         
         if !generator.declared_locals.contains("err") {
             output.push_str(&generator.indent());
@@ -47,18 +42,18 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         }
         
         for source in &sources {
-            let quoted_source = if source.starts_with('"') || source.starts_with("'") {
+            let source = if source.starts_with('"') || source.starts_with("'") {
                 source.clone()
             } else {
                 format!("\"{}\"", source)
             };
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (-e {}) {{\n", quoted_source));
+            output.push_str(&format!("if (-e {}) {{\n", source));
             generator.indent_level += 1;
             
             // Check if destination exists and is a directory
             output.push_str(&generator.indent());
-            output.push_str(&format!("my $dest = {};\n", quoted_destination));
+            output.push_str(&format!("my $dest = {};\n", destination));
             output.push_str(&generator.indent());
             output.push_str("if (-e $dest && -d $dest) {\n");
             generator.indent_level += 1;
@@ -113,7 +108,7 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             
             // Perform the move
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (move({}, $dest)) {{\n", quoted_source));
+            output.push_str(&format!("if (move({}, $dest)) {{\n", source));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str(&format!("print \"mv: moved {} to $dest\\n\";\n", source));

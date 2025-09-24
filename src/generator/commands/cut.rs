@@ -14,12 +14,20 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
         if let Word::Literal(arg, _) = &cmd.args[i] {
             if arg == "-d" && i + 1 < cmd.args.len() {
                 if let Some(next_arg) = cmd.args.get(i + 1) {
-                    delimiter = generator.word_to_perl(next_arg);
+                    if let Word::Literal(s, _) = next_arg {
+                        delimiter = s.clone();
+                    } else {
+                        delimiter = generator.word_to_perl(next_arg);
+                    }
                     i += 1; // Skip the delimiter argument
                 }
             } else if arg == "-f" && i + 1 < cmd.args.len() {
                 if let Some(next_arg) = cmd.args.get(i + 1) {
-                    fields = generator.word_to_perl(next_arg);
+                    if let Word::Literal(s, _) = next_arg {
+                        fields = s.clone();
+                    } else {
+                        fields = generator.word_to_perl(next_arg);
+                    }
                     i += 1; // Skip the fields argument
                 }
             }
@@ -32,7 +40,9 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
     output.push_str(&format!("my @result_{};\n", unique_id));
     output.push_str(&format!("foreach my $line (@lines_{}) {{\n", unique_id));
     output.push_str("chomp $line;\n");
-    output.push_str(&format!("my @fields = split /{}/msx, $line;\n", delimiter));
+    // Escape special regex characters in delimiter
+    let escaped_delimiter = delimiter.replace(":", "\\:").replace("|", "\\|").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}").replace("^", "\\^").replace("$", "\\$").replace("*", "\\*").replace("+", "\\+").replace("?", "\\?").replace(".", "\\.");
+    output.push_str(&format!("my @fields = split /{}/msx, $line;\n", escaped_delimiter));
     
     // Handle field selection - convert field number from 1-based to 0-based indexing
     let field_index = if fields.trim_matches('"').trim_matches('\'').parse::<usize>().unwrap_or(1) > 0 {

@@ -17,12 +17,12 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 "-p" | "--preserve" => preserve = true,
                 _ => {
                     if !arg_str.starts_with('-') {
-                        sources.push(generator.word_to_perl(arg));
+                        sources.push(generator.perl_string_literal(arg));
                     }
                 }
             }
         } else {
-            sources.push(generator.word_to_perl(arg));
+            sources.push(generator.perl_string_literal(arg));
         }
     }
     
@@ -31,11 +31,6 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     } else {
         // Last argument is the destination
         let destination = sources.pop().unwrap();
-        let quoted_destination = if destination.starts_with('"') || destination.starts_with("'") {
-            destination.clone()
-        } else {
-            format!("\"{}\"", destination)
-        };
         
         if !generator.declared_locals.contains("err") {
             output.push_str(&generator.indent());
@@ -44,19 +39,14 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         }
         
         for source in &sources {
-            let quoted_source = if source.starts_with('"') || source.starts_with("'") {
-                source.clone()
-            } else {
-                format!("\"{}\"", source)
-            };
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (-e {}) {{\n", quoted_source));
+            output.push_str(&format!("if (-e {}) {{\n", source));
             generator.indent_level += 1;
             
-            if recursive && format!("-d {}", quoted_source).contains("-d") {
+            if recursive && format!("-d {}", source).contains("-d") {
                 // Recursive copy for directories
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (-d {}) {{\n", quoted_source));
+                output.push_str(&format!("if (-d {}) {{\n", source));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $dest_dir = {};\n", destination));
@@ -87,7 +77,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
                 output.push_str(&generator.indent());
-                output.push_str(&format!("my $cmd = \"cp -r {} $dest_dir\";\n", quoted_source));
+                output.push_str(&format!("my $cmd = \"cp -r {} $dest_dir\";\n", source));
                 output.push_str(&generator.indent());
                 output.push_str("my $result = system $cmd;\n");
                 output.push_str(&generator.indent());
@@ -110,7 +100,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 generator.indent_level += 1;
                 // Copy single file
                 output.push_str(&generator.indent());
-                output.push_str(&format!("my $dest = {};\n", quoted_destination));
+                output.push_str(&format!("my $dest = {};\n", destination));
                 output.push_str(&generator.indent());
                 output.push_str("if (-d $dest) {\n");
                 generator.indent_level += 1;
@@ -120,11 +110,11 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (copy({}, $dest)) {{\n", quoted_source));
+                output.push_str(&format!("if (copy({}, $dest)) {{\n", source));
                 generator.indent_level += 1;
                 if preserve {
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("my ($atime, $mtime) = (stat({}))[8,9];\n", quoted_source));
+                    output.push_str(&format!("my ($atime, $mtime) = (stat({}))[8,9];\n", source));
                     output.push_str(&generator.indent());
                     output.push_str("utime $atime, $mtime, $dest;\n");
                 }
@@ -145,7 +135,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             } else {
                 // Copy single file
                 output.push_str(&generator.indent());
-                output.push_str(&format!("my $dest = {};\n", quoted_destination));
+                output.push_str(&format!("my $dest = {};\n", destination));
                 output.push_str(&generator.indent());
                 output.push_str("if (-d $dest) {\n");
                 generator.indent_level += 1;
@@ -155,11 +145,11 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (copy({}, $dest)) {{\n", quoted_source));
+                output.push_str(&format!("if (copy({}, $dest)) {{\n", source));
                 generator.indent_level += 1;
                 if preserve {
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("my ($atime, $mtime) = (stat({}))[8,9];\n", quoted_source));
+                    output.push_str(&format!("my ($atime, $mtime) = (stat({}))[8,9];\n", source));
                     output.push_str(&generator.indent());
                     output.push_str("utime $atime, $mtime, $dest;\n");
                 }
