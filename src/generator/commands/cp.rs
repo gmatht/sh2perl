@@ -40,18 +40,18 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         
         for source in &sources {
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (-e {}) {{\n", source));
+            output.push_str(&format!("if ( -e {} ) {{\n", source));
             generator.indent_level += 1;
             
             if recursive && format!("-d {}", source).contains("-d") {
                 // Recursive copy for directories
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (-d {}) {{\n", source));
+                output.push_str(&format!("if ( -d {} ) {{\n", source));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $dest_dir = {};\n", destination));
                 output.push_str(&generator.indent());
-                output.push_str("if (-e $dest_dir && !-d $dest_dir) {\n");
+                output.push_str("if ( -e $dest_dir && !-d $dest_dir ) {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str("die \"cp: $dest_dir: not a directory\\n\";\n");
@@ -59,7 +59,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
                 output.push_str(&generator.indent());
-                output.push_str("if (!-d $dest_dir) {\n");
+                output.push_str("if ( !-d $dest_dir ) {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str("my $err;\n");
@@ -102,7 +102,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $dest = {};\n", destination));
                 output.push_str(&generator.indent());
-                output.push_str("if (-d $dest) {\n");
+                output.push_str("if ( -d $dest ) {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$dest = \"$dest/{}\";\n", source));
@@ -110,7 +110,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (copy({}, $dest)) {{\n", source));
+                output.push_str(&format!("if ( copy( {}, $dest ) ) {{\n", source));
                 generator.indent_level += 1;
                 if preserve {
                     output.push_str(&generator.indent());
@@ -137,7 +137,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $dest = {};\n", destination));
                 output.push_str(&generator.indent());
-                output.push_str("if (-d $dest) {\n");
+                output.push_str("if ( -d $dest ) {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$dest = \"$dest/{}\";\n", source));
@@ -145,7 +145,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (copy({}, $dest)) {{\n", source));
+                output.push_str(&format!("if ( copy( {}, $dest ) ) {{\n", source));
                 generator.indent_level += 1;
                 if preserve {
                     output.push_str(&generator.indent());

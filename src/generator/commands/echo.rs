@@ -327,7 +327,7 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                             } else {
                                 format!("'{}'", adjusted_file)
                             };
-                            return format!("do {{ my @grep_lines_{}; if (-f {}) {{ open my $fh_{}, '<', {} or croak \"Cannot open file: $OS_ERROR\"; @grep_lines_{} = <$fh_{}>; close $fh_{} or croak \"Close failed: $OS_ERROR\"; chomp @grep_lines_{}; @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{}; }} join \"\\n\", @grep_lines_{}; }}", 
+                            return format!("do {{\n    my @grep_lines_{};\n    if (-f {}) {{\n        open my $fh_{}, '<', {}\n            or croak \"Cannot open file: $OS_ERROR\";\n        @grep_lines_{} = <$fh_{}>;\n        close $fh_{}\n            or croak \"Close failed: $OS_ERROR\";\n        chomp @grep_lines_{};\n        @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{};\n    }}\n    join \"\\n\", @grep_lines_{};\n}}", 
                                 unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id);
                         }
                     }

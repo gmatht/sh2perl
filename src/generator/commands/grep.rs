@@ -302,7 +302,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                     output.push_str(&format!("            push @grep_lines_{}, $line;\n", command_index));
                     output.push_str(&format!("            push @grep_filenames_{}, $file;\n", command_index));
                     output.push_str(&format!("        }}\n"));
-                    output.push_str(&format!("        close $fh or croak \"Close failed: $OS_ERROR\";\n"));
+                    output.push_str(&format!("        close $fh\n"));
+                    output.push_str(&format!("            or croak \"Close failed: $OS_ERROR\";\n"));
                     output.push_str(&format!("    }}\n"));
                     output.push_str(&format!("}}\n"));
                 }
@@ -322,7 +323,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                         output.push_str(&format!("            push @grep_lines_{}, $line;\n", command_index));
                         output.push_str(&format!("            push @grep_filenames_{}, $glob_file;\n", command_index));
                         output.push_str("        }\n");
-                        output.push_str("        close $fh or croak \"Close failed: $OS_ERROR\";\n");
+                        output.push_str("        close $fh\n");
+                        output.push_str("            or croak \"Close failed: $OS_ERROR\";\n");
                         output.push_str("    }\n");
                         output.push_str("}\n");
                     } else {
@@ -334,7 +336,8 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                         output.push_str(&format!("        push @grep_lines_{}, $line;\n", command_index));
                         output.push_str(&format!("        push @grep_filenames_{}, {};\n", command_index, quoted_file));
                         output.push_str("    }\n");
-                        output.push_str("    close $fh or croak \"Close failed: $OS_ERROR\";\n");
+                        output.push_str("    close $fh\n");
+                        output.push_str("        or croak \"Close failed: $OS_ERROR\";\n");
                         output.push_str("}\n");
                     }
                 }

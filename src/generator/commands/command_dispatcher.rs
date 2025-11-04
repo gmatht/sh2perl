@@ -200,7 +200,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                         // Write the output to the temporary file
                         let fh_var = format!("fh_ps_{}", global_counter);
                         result.push_str(&generator.indent());
-                        result.push_str(&format!("use File::Path qw(make_path);\n"));
+                        result.push_str(&format!("use File::Path  qw(make_path);\n"));
                         result.push_str(&generator.indent());
                         result.push_str(&format!("my $temp_dir_{} = dirname(${});\n", global_counter, temp_var));
                         result.push_str(&generator.indent());
@@ -531,7 +531,7 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                 generator.indent_level += 1;
                 result.push_str(&generator.indent());
                 result.push_str("open my $original_stdout, '>&', STDOUT\n");
-                result.push_str("    or croak \"Cannot save STDOUT: $ERRNO\";\n");
+                result.push_str("      or croak \"Cannot save STDOUT: $ERRNO\";\n");
                 
                 // Find the output redirect target
                 let output_redirect = all_redirects.iter().find(|r| {
@@ -543,11 +543,11 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
                     let mode = if matches!(redirect.operator, RedirectOperator::Append) { ">>" } else { ">" };
                     result.push_str(&generator.indent());
                     result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                    result.push_str("    or croak \"Cannot open file: $ERRNO\";\n");
+                    result.push_str("      or croak \"Cannot open file: $ERRNO\";\n");
                 } else {
                     result.push_str(&generator.indent());
                     result.push_str("open STDOUT, '>', 'temp_file.txt'\n");
-                    result.push_str("    or croak \"Cannot open file: $ERRNO\";\n");
+                    result.push_str("      or croak \"Cannot open file: $ERRNO\";\n");
                 }
             }
             
@@ -669,9 +669,10 @@ pub fn generate_command_impl_with_input(generator: &mut Generator, command: &Com
             if has_output_redirect {
                 result.push_str(&generator.indent());
                 result.push_str("open STDOUT, '>&', $original_stdout\n");
-                result.push_str("    or croak \"Cannot restore STDOUT: $ERRNO\";\n");
+                result.push_str("      or croak \"Cannot restore STDOUT: $ERRNO\";\n");
                 result.push_str(&generator.indent());
-                result.push_str("close $original_stdout or croak \"Close failed: $ERRNO\";\n");
+                result.push_str("close $original_stdout\n");
+                result.push_str("      or croak \"Close failed: $ERRNO\";\n");
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());
                 result.push_str("}\n");

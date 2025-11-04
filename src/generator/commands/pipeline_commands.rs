@@ -196,7 +196,7 @@ fn generate_command_using_builtins(
                         for line in grep_output.lines() {
                             if !line.trim().is_empty() {
                                 output.push_str(&generator.indent());
-                                output.push_str(line);
+                                output.push_str(line.trim_start());
                                 if !line.ends_with('\n') {
                                     output.push_str("\n");
                                 }
@@ -545,7 +545,9 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
                     format!("({})", echo_args.join(" . q{ } . "))
                 };
                 let tr_output = crate::generator::commands::tr::generate_tr_command_for_substitution(generator, cmd2, "input_data", &unique_id.to_string());
-                return format!("do {{ my $input_data = {}; {} }}", echo_string, tr_output);
+                let result = format!("do {{\n    my $input_data = {};\n    {}\n}}", echo_string, tr_output);
+                // Bash strips trailing newlines from command substitution
+                return format!("do {{\n    my $_chomp_result = {};\n    chomp $_chomp_result;\n    $_chomp_result;\n}}", result);
             }
         }
     }
@@ -558,10 +560,20 @@ pub fn generate_pipeline_for_substitution(generator: &mut Generator, pipeline: &
     let simplified = if output.len() > 5000 {
         // If output is too long, use a simple system call instead
         let unique_id = generator.get_unique_id();
-        format!("do {{ my $result_{} = qx{{bash -c \"{}\"}}; chomp $result_{}; $result_{} }}", 
+        format!("do {{\n    my $result_{} = qx{{bash -c \"{}\"}};\n    chomp $result_{};\n    $result_{};\n}}", 
                 unique_id, pipeline.source_text.as_ref().unwrap_or(&"echo 'pipeline'".to_string()), unique_id, unique_id)
     } else {
-        output
+        // Bash strips trailing newlines from command substitution results
+        // Wrap the result in a chomp operation
+        // If output is already a do block, don't nest it - just return it (chomp is handled elsewhere)
+        let trimmed_output = output.trim();
+        if trimmed_output.starts_with("do {") && trimmed_output.ends_with("}") {
+            // Already a do block - return as-is (chomp should be handled at assignment level)
+            trimmed_output.to_string()
+        } else {
+            // Output is code that should be in a do block - wrap it properly
+            format!("do {{\n    my $_chomp_result = do {{ {} }};\n    chomp $_chomp_result;\n    $_chomp_result;\n}}", output.trim())
+        }
     };
     
     // Add basic chomp and newline handling - temporarily disabled to fix compilation errors
@@ -805,6 +817,7 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                 }
                 
                 // Set the final output variable for command substitution
+                // Note: Chomp is handled at the function level for all pipeline results
                 output.push_str(&generator.indent());
                 output.push_str(&format!("{};\n", output_var));
                 
@@ -886,9 +899,9 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                             // Generate line-by-line version of each command
                             let command_output = generate_linebyline_command(generator, cmd, "line", 0);
                             // Add indentation to all lines in the command output
-                            for line in command_output.lines() {
-                                output.push_str(&generator.indent());
-                                output.push_str(line);
+                                    for line in command_output.lines() {
+                                        output.push_str(&generator.indent());
+                                        output.push_str(line.trim_start());
                                 output.push_str("\n");
                             }
                         }
@@ -900,9 +913,9 @@ fn generate_streaming_pipeline(generator: &mut Generator, pipeline: &Pipeline, s
                                         // Generate line-by-line version of each command
                                         let command_output = generate_linebyline_command(generator, cmd, "line", 0);
                                         // Add indentation to all lines in the command output
-                                        for line in command_output.lines() {
-                                            output.push_str(&generator.indent());
-                                            output.push_str(line);
+                                    for line in command_output.lines() {
+                                        output.push_str(&generator.indent());
+                                        output.push_str(line.trim_start());
                                             output.push_str("\n");
                                         }
                                     }
@@ -1654,7 +1667,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                                 for line in command_output.lines() {
                                     if !line.trim().is_empty() {
                                         output.push_str(&generator.indent());
-                                        output.push_str(line);
+                                        output.push_str(line.trim_start());
                                         if !line.ends_with('\n') {
                                             output.push_str("\n");
                                         }
@@ -1666,7 +1679,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                             for line in command_output.lines() {
                                 if !line.trim().is_empty() {
                                     output.push_str(&generator.indent());
-                                    output.push_str(line);
+                                    output.push_str(line.trim_start());
                                     if !line.ends_with('\n') {
                                         output.push_str("\n");
                                     }
@@ -1678,7 +1691,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                         for line in command_output.lines() {
                             if !line.trim().is_empty() {
                                 output.push_str(&generator.indent());
-                                output.push_str(line);
+                                output.push_str(line.trim_start());
                                 if !line.ends_with('\n') {
                                     output.push_str("\n");
                                 }
@@ -1732,7 +1745,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     for line in command_output.lines() {
                         if !line.trim().is_empty() {
                             output.push_str(&generator.indent());
-                            output.push_str(line);
+                            output.push_str(line.trim_start());
                             if !line.ends_with('\n') {
                                 output.push_str("\n");
                             }
@@ -1749,7 +1762,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                             for line in command_output.lines() {
                                 if !line.trim().is_empty() {
                                     output.push_str(&generator.indent());
-                                    output.push_str(line);
+                                    output.push_str(line.trim_start());
                                     if !line.ends_with('\n') {
                                         output.push_str("\n");
                                     }
@@ -1780,7 +1793,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                             for line in command_output.lines() {
                                 if !line.trim().is_empty() {
                                     output.push_str(&generator.indent());
-                                    output.push_str(line);
+                                    output.push_str(line.trim_start());
                                     if !line.ends_with('\n') {
                                         output.push_str("\n");
                                     }
@@ -1840,7 +1853,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
         
         // Track pipeline success for overall script exit code
         output.push_str(&generator.indent());
-        output.push_str(&format!("if (!$pipeline_success_{}) {{ $main_exit_code = 1; }}\n", unique_id));
+        output.push_str(&format!("if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n", unique_id));
         output.push_str(&generator.indent());
         // output.push_str("exit(1) if $main_exit_code == 1;\n");
         
@@ -1877,7 +1890,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 for line in ls_output.lines() {
                     if !line.trim().is_empty() {
                         output.push_str(&generator.indent());
-                        output.push_str(line);
+                        output.push_str(line.trim_start());
                         if !line.ends_with('\n') {
                             output.push_str("\n");
                         }
@@ -1889,7 +1902,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 for line in grep_output.lines() {
                     if !line.trim().is_empty() {
                         output.push_str(&generator.indent());
-                        output.push_str(line);
+                        output.push_str(line.trim_start());
                         if !line.ends_with('\n') {
                             output.push_str("\n");
                         }
@@ -1906,7 +1919,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 
                 // Track pipeline success for overall script exit code
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (!$pipeline_success_{}) {{ $main_exit_code = 1; }}\n", unique_id));
+                output.push_str(&format!("if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n", unique_id));
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
                 
@@ -1924,8 +1937,8 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 output.push_str(&format!("my $pipeline_success_{} = 1;\n", unique_id));
                 
                 // Handle the first command
-                output.push_str(&generator.indent());
                 if matches!(&pipeline.commands[0], Command::Redirect(_)) {
+                    output.push_str(&generator.indent());
                     output.push_str(&generator.generate_command(&pipeline.commands[0]));
                     output.push_str(&generator.indent());
                     output.push_str(&format!("$output_{} = $output;\n", unique_id));
@@ -1933,9 +1946,22 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                     // Use centralized fallback logic for the first command
                     let fallback_output = generate_command_using_builtins(generator, &pipeline.commands[0], "", &format!("output_{}", unique_id), &format!("{}_0", unique_id), false);
                     for line in fallback_output.lines() {
-                        if !line.trim().is_empty() {
-                            output.push_str(&generator.indent());
-                            output.push_str(line);
+                        if line.trim().is_empty() {
+                            // Preserve blank lines - just output a newline
+                            output.push_str("\n");
+                        } else {
+                            // Preserve relative indentation: if line has leading spaces, keep them and add base indent
+                            // If line has no leading spaces, it's a top-level statement - add base indent only
+                            let leading_spaces = line.len() - line.trim_start().len();
+                            if leading_spaces > 0 {
+                                // Line has relative indentation - add base indent and preserve relative
+                                output.push_str(&generator.indent());
+                                output.push_str(line); // Keep original line with its indentation
+                            } else {
+                                // Line has no indentation - add base indent only
+                                output.push_str(&generator.indent());
+                                output.push_str(line.trim_start());
+                            }
                             if !line.ends_with('\n') {
                                 output.push_str("\n");
                             }
@@ -1956,9 +1982,22 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                         
                         // Split the output into lines and apply indentation
                         for line in command_output.lines() {
-                            if !line.trim().is_empty() {
-                                output.push_str(&generator.indent());
-                                output.push_str(line);
+                            if line.trim().is_empty() {
+                                // Preserve blank lines - just output a newline
+                                output.push_str("\n");
+                            } else {
+                                // Preserve relative indentation: if line has leading spaces, keep them and add base indent
+                                // If line has no leading spaces, it's a top-level statement - add base indent only
+                                let leading_spaces = line.len() - line.trim_start().len();
+                                if leading_spaces > 0 {
+                                    // Line has relative indentation - add base indent and preserve relative
+                                    output.push_str(&generator.indent());
+                                    output.push_str(line); // Keep original line with its indentation
+                                } else {
+                                    // Line has no indentation - add base indent only
+                                    output.push_str(&generator.indent());
+                                    output.push_str(line.trim_start());
+                                }
                                 if !line.ends_with('\n') {
                                     output.push_str("\n");
                                 }
@@ -1979,9 +2018,7 @@ fn generate_buffered_pipeline(generator: &mut Generator, pipeline: &Pipeline, sh
                 
                 // Track pipeline success for overall script exit code
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (!$pipeline_success_{}) {{ $main_exit_code = 1; }}\n", unique_id));
-                output.push_str(&generator.indent());
-                // output.push_str("exit(1) if $main_exit_code == 1;\n");
+                output.push_str(&format!("if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n", unique_id));
                 
                 // Return the output variable as the last statement
                 output.push_str(&generator.indent());
