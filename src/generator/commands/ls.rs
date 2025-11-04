@@ -29,20 +29,22 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
         // Check if the argument is a file (not a directory)
         output.push_str(&generator.indent());
         let dir_literal = if dir == "." { "q{.}" } else { &format!("'{}'", dir) };
-        output.push_str(&format!("if (-f {}) {{\n", dir_literal));
+        output.push_str(&format!("if ( -f {} ) {{\n", dir_literal));
         generator.indent_level += 1;
         output.push_str(&generator.indent());
         output.push_str(&format!("push @{}, {};\n", array_name, dir_literal));
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
-        output.push_str(&format!("}} elsif (-d {}) {{\n", dir_literal));
+        output.push_str("}\n");
+        output.push_str(&generator.indent());
+        output.push_str(&format!("elsif ( -d {} ) {{\n", dir_literal));
         generator.indent_level += 1;
         // For directories, use opendir/readdir
         output.push_str(&generator.indent());
-        output.push_str(&format!("if (opendir my $dh, {}) {{\n", dir_literal));
+        output.push_str(&format!("if ( opendir my $dh, {} ) {{\n", dir_literal));
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str("while (my $file = readdir $dh) {\n");
+        output.push_str("while ( my $file = readdir $dh ) {\n");
         generator.indent_level += 1;
         if !show_hidden {
             output.push_str(&generator.indent());
@@ -56,7 +58,7 @@ fn generate_ls_helper(generator: &mut Generator, dir: &str, array_name: &str, so
         output.push_str("next if $file =~ /^(debug_|temp_|test_|file\\d*[.]txt)$/msx;\n");
         if add_slash_to_dirs {
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (-d \"{}/$file\") {{\n", dir));
+            output.push_str(&format!("if ( -d \"{}/$file\" ) {{\n", dir));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str(&format!("push @{}, \"$file/\";\n", array_name));
@@ -197,20 +199,22 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             for file_arg in &file_args {
                 output.push_str(&generator.indent());
                 let file_literal = if *file_arg == "." { "q{.}" } else { &format!("'{}'", file_arg) };
-                output.push_str(&format!("if (-f {}) {{\n", file_literal));
+                output.push_str(&format!("if ( -f {} ) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str(&format!("push @{}, {};\n", array_name, file_literal));
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("}} elsif (-d {}) {{\n", file_literal));
+                output.push_str("}\n");
+                output.push_str(&generator.indent());
+                output.push_str(&format!("elsif ( -d {} ) {{\n", file_literal));
                 generator.indent_level += 1;
                 // For directories, list their contents
                 output.push_str(&generator.indent());
                 output.push_str(&format!("if (opendir my $dh, {}) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
-                output.push_str("while (my $file = readdir $dh) {\n");
+                output.push_str("while ( my $file = readdir $dh ) {\n");
                 generator.indent_level += 1;
                 if !show_hidden {
                     output.push_str(&generator.indent());
@@ -263,7 +267,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             output.push_str(&format!("${} = join \"\\n\", @{};\n", var, array_name));
             // Ensure output ends with newline to match shell behavior
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (!(${} =~ {})) {{\n", var, generator.newline_end_regex()));
+            output.push_str(&format!("if ( !( ${} =~ {} ) ) {{\n", var, generator.newline_end_regex()));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str(&format!("${} .= \"\\n\";\n", var));
@@ -285,20 +289,22 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             for file_arg in &file_args {
                 output.push_str(&generator.indent());
                 let file_literal = if *file_arg == "." { "q{.}" } else { &format!("'{}'", file_arg) };
-                output.push_str(&format!("if (-f {}) {{\n", file_literal));
+                output.push_str(&format!("if ( -f {} ) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str(&format!("push @{}, {};\n", array_name, file_literal));
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("}} elsif (-d {}) {{\n", file_literal));
+                output.push_str("}\n");
+                output.push_str(&generator.indent());
+                output.push_str(&format!("elsif ( -d {} ) {{\n", file_literal));
                 generator.indent_level += 1;
                 // For directories, list their contents
                 output.push_str(&generator.indent());
                 output.push_str(&format!("if (opendir my $dh, {}) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
-                output.push_str("while (my $file = readdir $dh) {\n");
+                output.push_str("while ( my $file = readdir $dh ) {\n");
                 generator.indent_level += 1;
                 if !show_hidden {
                     output.push_str(&generator.indent());
@@ -407,10 +413,10 @@ pub fn generate_ls_preamble(generator: &mut Generator) -> String {
     output.push_str(&generator.indent());
     output.push_str("my $ls_dir;\n");
     output.push_str(&generator.indent());
-    output.push_str("if (opendir my $dh, $ls_dir) {\n");
+    output.push_str("if ( opendir my $dh, $ls_dir ) {\n");
     generator.indent_level += 1;
     output.push_str(&generator.indent());
-    output.push_str("while (my $file = readdir $dh) {\n");
+    output.push_str("while ( my $file = readdir $dh ) {\n");
     generator.indent_level += 1;
     output.push_str(&generator.indent());
     output.push_str("next if $file eq q{.} || $file eq q{..};\n");
@@ -458,9 +464,13 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
         }
     }
     
+    // Save the current indent level
+    let saved_indent = generator.indent_level;
+    generator.indent_level = 0; // Start with no indentation since we'll format this ourselves
+    
     let mut output = String::new();
     output.push_str("do {\n");
-    generator.indent_level += 1;
+    generator.indent_level = 1; // Set to 1 for content inside do block
     
     let array_name = format!("ls_files_{}", generator.get_unique_id());
     
@@ -484,7 +494,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
             output.push_str(&format!("if (opendir my $dh, {}) {{\n", file_literal));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
-            output.push_str("while (my $file = readdir $dh) {\n");
+            output.push_str("while ( my $file = readdir $dh ) {\n");
             generator.indent_level += 1;
             if !show_hidden {
                 output.push_str(&generator.indent());
@@ -533,6 +543,9 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("}");
+    
+    // Restore the saved indent level
+    generator.indent_level = saved_indent;
     
     output
 }

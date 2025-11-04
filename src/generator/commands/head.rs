@@ -40,14 +40,21 @@ pub fn generate_head_command(_generator: &mut Generator, cmd: &SimpleCommand, in
     }
     
     // Use line-by-line processing instead of arrays
-    output.push_str(&format!("my $num_lines = {};\n", num_lines));
+    // Align variable declarations for perltidy compliance
+    let max_len = "head_line_count".len(); // Longest variable name
+    let num_lines_spaces = " ".repeat(max_len.saturating_sub("num_lines".len()));
+    let result_spaces = " ".repeat(max_len.saturating_sub("result".len()));
+    let input_spaces = " ".repeat(max_len.saturating_sub("input".len()));
+    let pos_spaces = " ".repeat(max_len.saturating_sub("pos".len()));
+    output.push_str(&format!("my $num_lines{} = {};\n", num_lines_spaces, num_lines));
     output.push_str(&format!("my $head_line_count = 0;\n"));
-    output.push_str(&format!("my $result = q{{}};\n"));
-    output.push_str(&format!("my $input = ${};\n", input_var));
-    output.push_str(&format!("my $pos = 0;\n"));
-    output.push_str(&format!("while ($pos < length $input && $head_line_count < $num_lines) {{\n"));
+    output.push_str(&format!("my $result{} = q{{}};\n", result_spaces));
+    output.push_str(&format!("my $input{} = ${};\n", input_spaces, input_var));
+    output.push_str(&format!("my $pos{} = 0;\n", pos_spaces));
+    output.push_str("\n");
+    output.push_str(&format!("while ( $pos < length $input && $head_line_count < $num_lines ) {{\n"));
     output.push_str(&format!("    my $line_end = index $input, \"\\n\", $pos;\n"));
-    output.push_str(&format!("    if ($line_end == -1) {{\n"));
+    output.push_str(&format!("    if ( $line_end == -1 ) {{\n"));
     output.push_str(&format!("        $line_end = length $input;\n"));
     output.push_str(&format!("    }}\n"));
     output.push_str(&format!("    my $head_line = substr $input, $pos, $line_end - $pos;\n"));

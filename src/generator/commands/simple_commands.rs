@@ -54,7 +54,14 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     } else {
                                         format!("'{}'", format)
                                     };
-                                    format!("do {{ use POSIX qw(strftime); strftime({}, localtime) }}", cleaned_format)
+                                    // Use UTC (gmtime) for date-only formats to avoid timezone/day boundary issues
+                                    let is_date_only = cleaned_format.contains("%Y") && 
+                                                       !cleaned_format.contains("%H") && 
+                                                       !cleaned_format.contains("%M") && 
+                                                       !cleaned_format.contains("%S") &&
+                                                       !cleaned_format.contains("%r");
+                                    let time_func = if is_date_only { "gmtime" } else { "localtime" };
+                                    format!("do {{ use POSIX qw(strftime); strftime({}, {}) }}", cleaned_format, time_func)
                                 } else {
                                     "do { use POSIX qw(strftime); strftime('%a %b %d %H:%M:%S %Z %Y', localtime) }".to_string()
                                 }
@@ -155,25 +162,51 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 }
             } else {
                 // Handle other Word types (including CommandSubstitution)
+                let is_command_substitution = matches!(value, crate::ast::Word::CommandSubstitution(_, _));
                 let val = generator.word_to_perl(value);
+                // Bash strips trailing newlines from command substitution results, so we need to chomp them
+                // For pipelines, chomp is handled in pipeline generation
+                // For simple command substitutions, wrap in chomp
+                let final_val = if is_command_substitution && (val.contains("my $head_line_count") || val.contains("my $output_") || val.contains("foreach") || (val.trim().starts_with("do {") && val.trim().ends_with("}"))) {
+                    // Pipeline command substitution or already a complete do block - chomp is handled in pipeline generation or already wrapped
+                    val
+                } else if is_command_substitution && !val.starts_with("do {") {
+                    // Simple value, not a block - chomp it directly
+                    format!("do {{\n    my $_chomp_temp = {};\n    chomp $_chomp_temp;\n    $_chomp_temp;\n}}", val)
+                } else {
+                    // Other cases - may already be handled or need different treatment
+                    val
+                };
                 // Always assign the value, but only declare if not already declared
                 if !generator.declared_locals.contains(var) {
                     output.push_str(&generator.indent());
                     // If the value is a block, wrap it in do {...}
-                    if val.starts_with('{') && val.ends_with('}') {
-                        output.push_str(&format!("my ${} = do {};\n", var, val));
+                    if final_val.starts_with('{') && final_val.ends_with('}') {
+                        output.push_str(&format!("my ${} = do {};\n", var, final_val));
+                    } else if final_val.trim().starts_with("do {") && final_val.trim().ends_with("}") {
+                        // Already a do block - assign directly without extra wrapping
+                        output.push_str(&format!("my ${} = {};\n", var, final_val.trim()));
+                    } else if final_val.trim_end().ends_with(';') {
+                        // Value already ends with semicolon (like do {...};)
+                        output.push_str(&format!("my ${} = {}\n", var, final_val.trim_end()));
                     } else {
-                        output.push_str(&format!("my ${} = {};\n", var, val));
+                        output.push_str(&format!("my ${} = {};\n", var, final_val));
                     }
                     generator.declared_locals.insert(var.clone());
                 } else {
                     // Variable already declared, just assign the value
                     output.push_str(&generator.indent());
                     // If the value is a block, wrap it in do {...}
-                    if val.starts_with('{') && val.ends_with('}') {
-                        output.push_str(&format!("${} = do {};\n", var, val));
+                    if final_val.starts_with('{') && final_val.ends_with('}') {
+                        output.push_str(&format!("${} = do {};\n", var, final_val));
+                    } else if final_val.trim().starts_with("do {") && final_val.trim().ends_with("}") {
+                        // Already a do block - assign directly without extra wrapping
+                        output.push_str(&format!("${} = {};\n", var, final_val.trim()));
+                    } else if final_val.trim_end().ends_with(';') {
+                        // Value already ends with semicolon (like do {...};)
+                        output.push_str(&format!("${} = {}\n", var, final_val.trim_end()));
                     } else {
-                        output.push_str(&format!("${} = {};\n", var, val));
+                        output.push_str(&format!("${} = {};\n", var, final_val));
                     }
                 }
                 // Don't set environment variable immediately - only set it when export command is encountered
@@ -221,7 +254,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 
                 // Write the output to the temporary file
                 output.push_str(&generator.indent());
-                output.push_str(&format!("use File::Path qw(make_path);\n"));
+                output.push_str(&format!("use File::Path  qw(make_path);\n"));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $temp_dir_{}_{} = dirname(${});\n", global_counter, temp_file_counter, temp_var));
                 output.push_str(&generator.indent());
@@ -375,7 +408,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     Word::Literal(filename, _) => {
                         // Read from file - generate a proper variable assignment
                         let file_var = format!("file_content_{}", command_index);
-                        let reading_code = format!("my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', '{}' or croak \"Cannot open file: $OS_ERROR\"; my $content = <$fh>; close $fh or croak \"Close failed: $OS_ERROR\"; $content }};", file_var, filename);
+                        let reading_code = format!("my ${} = do {{\n    local $INPUT_RECORD_SEPARATOR = undef;\n    open my $fh, '<', '{}'\n        or croak \"Cannot open file: $OS_ERROR\";\n    my $content = <$fh>;\n    close $fh\n        or croak \"Close failed: $OS_ERROR\";\n    $content\n}};", file_var, filename);
                         (format!("${}", file_var), reading_code)
                     }
                     _ => {
@@ -673,7 +706,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     if matches!(cmd.args[0], Word::CommandSubstitution(_, _)) {
                         // For command substitution, don't add extra newline as it already contains proper formatting
                         output.push_str(&format!("print {};\n", args[0]));
-                    } else if args[0].starts_with('"') && args[0].ends_with('"') && !args[0].contains("\\n") {
+                    } else if args[0].starts_with('"') && args[0].ends_with('"') && !args[0].contains("\\n") && !args[0].contains('$') {
                         // Extract the string content and add newline directly using double quotes for escape sequences
                         let content = &args[0][1..args[0].len()-1]; // Remove quotes
                         // Escape newlines, tabs, and carriage returns in the content
@@ -686,7 +719,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     } else if args[0].starts_with('$') && !args[0].contains("\\n") {
                         // For variables, check if they already end with newline to avoid extra blank lines
                         output.push_str(&format!("print {};\n", args[0]));
-                        output.push_str(&format!("if (!({} =~ /\\n$/msx)) {{ print \"\\n\"; }}\n", args[0]));
+                        output.push_str(&format!("if ( !( {} =~ {} ) ) {{ print \"\\n\"; }}\n", args[0], generator.newline_end_regex()));
                     } else {
                         // Check if the argument contains variables that might end with newlines
                         let has_variables = match &cmd.args[0] {
@@ -699,7 +732,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         
                         
                         if has_variables {
-                            output.push_str(&format!("do {{ my $output = {}; print $output; if (!($output =~ /\\n$/msx)) {{ print \"\\n\"; }} }};\n", args[0]));
+                            output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if ( !( $output =~ {} ) ) {{\n        print \"\\n\";\n    }}\n}};\n", args[0], generator.newline_end_regex()));
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
                         }
@@ -728,7 +761,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             }
                         });
                         if has_variables {
-                            output.push_str(&format!("do {{ my $output = {}; print $output; if (!($output =~ /\\n$/msx)) {{ print \"\\n\"; }} }};\n", args_str));
+                            output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if (!($output =~ /\\n$/msx)) {{\n        print \"\\n\";\n    }}\n}};\n", args_str));
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args_str));
                         }

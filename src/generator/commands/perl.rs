@@ -121,17 +121,32 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         .collect::<Vec<_>>();
     
     let output_var = format!("perl_output_{}", generator.get_unique_id());
-    let args_str = if args_list.is_empty() { 
-        "".to_string() 
-    } else { 
-        format!(", {}", args_list.join(", ")) 
-    };
-    output.push_str(&format!("my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'perl'{});
-close $in or croak 'Close failed: $OS_ERROR';
-my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
-close $out or croak 'Close failed: $OS_ERROR';
-waitpid $pid, 0;\n", args_str, output_var));
+    
+    // Use native Perl execution instead of open3 for builtin perl commands
+    if args_list.len() >= 2 && args_list[0] == "\"-e\"" {
+        // Handle perl -e commands by executing the code directly
+        let code = &args_list[1];
+        output.push_str(&format!("my ${} = do {{ 
+            use Capture::Tiny qw(capture_stdout);
+            my $result;
+            my $eval_success = eval {{
+                $result = capture_stdout( sub {{ {} }} );
+                1;
+            }};
+            if ( !$eval_success ) {{
+                $result = \"Error executing Perl code: $EVAL_ERROR\";
+            }}
+            $result;
+        }};\n", output_var, code));
+    } else {
+        // For other perl commands, use system call as fallback
+        let formatted_args = args_list.join(" ");
+        output.push_str(&format!("my ${} = do {{ 
+            my $result = qx{{perl {}}};
+            chomp $result;
+            $result;
+        }};\n", output_var, formatted_args));
+    }
     output.push_str(&format!("print ${};\n", output_var));
     
     output
@@ -266,17 +281,32 @@ pub fn generate_perl_pipeline_command(generator: &mut Generator, cmd: &SimpleCom
             .collect::<Vec<_>>();
         
         let output_var = format!("perl_output_{}", generator.get_unique_id());
-        let args_str = if args_list.is_empty() { 
-            "".to_string() 
-        } else { 
-            format!(", {}", args_list.join(", ")) 
-        };
-        output.push_str(&format!("my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'perl'{});
-close $in or croak 'Close failed: $OS_ERROR';
-my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
-close $out or croak 'Close failed: $OS_ERROR';
-waitpid $pid, 0;\n", args_str, output_var));
+        
+        // Use native Perl execution instead of open3 for builtin perl commands
+        if args_list.len() >= 2 && args_list[0] == "\"-e\"" {
+            // Handle perl -e commands by executing the code directly
+            let code = &args_list[1];
+            output.push_str(&format!("my ${} = do {{ 
+                use Capture::Tiny qw(capture_stdout);
+                my $result;
+                my $eval_success = eval {{
+                    $result = capture_stdout(sub {{ {} }});
+                    1;
+                }};
+                if (!$eval_success) {{
+                    $result = \"Error executing Perl code: $EVAL_ERROR\";
+                }}
+                $result;
+            }};\n", output_var, code));
+        } else {
+            // For other perl commands, use system call as fallback
+            let formatted_args = args_list.join(" ");
+            output.push_str(&format!("my ${} = do {{ 
+                my $result = qx{{perl {}}};
+                chomp $result;
+                $result;
+            }};\n", output_var, formatted_args));
+        }
         output.push_str(&format!("print ${};\n", output_var));
     }
     

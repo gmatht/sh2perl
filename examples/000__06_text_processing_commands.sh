@@ -7,13 +7,13 @@ echo "=== Text Processing Commands ==="
 
 # cat command with backticks
 #PERL_MUST_NOT_CONTAIN `cat
-file_content=`cat ../src/main.rs | head -5`
+file_content=`cat src/main.rs | head -5`
 echo "First 5 lines of main.rs:"
 echo "$file_content"
 
 # grep command with backticks
 #PERL_MUST_NOT_CONTAIN `grep
-grep_result=`grep -n "fn" ../src/main.rs`
+grep_result=`grep -n "fn" src/main.rs`
 echo "Lines containing 'fn':"
 echo "$grep_result"
 
@@ -63,9 +63,12 @@ echo "Second field: $cut_result"
 
 # paste command with backticks
 #PERL_MUST_NOT_CONTAIN `paste
-paste_result=`paste <(echo -e "1\n2\n3") <(echo -e "a\nb\nc")`
+echo -e "1\n2\n3" > temp1.txt
+echo -e "a\nb\nc" > temp2.txt
+paste_result=`paste temp1.txt temp2.txt | sed 's/\t/ /g'`
 echo "Pasted columns:"
 echo "$paste_result"
+rm -f temp1.txt temp2.txt
 
 # comm command with backticks
 #PERL_MUST_NOT_CONTAIN `comm

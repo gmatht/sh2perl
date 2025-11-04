@@ -2,6 +2,8 @@
 use strict;
 use warnings;
 use Getopt::Long;
+use IPC::Open3;
+use Symbol 'gensym';
 
 # Try to load PPI, die if not available
 eval {
@@ -132,7 +134,10 @@ EOF
 sub purify_perl_code {
     my ($content) = @_;
     
-    # Parse the Perl code with PPI
+    # Use simple string replacement instead of PPI for backtick commands
+    $content = process_backticks_string($content);
+    
+    # Parse the Perl code with PPI for system() calls
     my $document = PPI::Document->new(\$content);
     if (!$document) {
         die "Error: Failed to parse Perl code with PPI\n";
@@ -141,11 +146,39 @@ sub purify_perl_code {
     # Process system() calls using PPI
     process_system_calls_ppi($document);
     
-    # Process backtick command substitution using PPI
-    process_backticks_ppi($document);
+    # Debug: Print the final document content
+    if ($verbose) {
+        print "DEBUG: Final document content:\n" . $document->serialize . "\n";
+    }
     
     # Return the modified content
     return $document->serialize;
+}
+
+# String-based backtick processing
+sub process_backticks_string {
+    my ($content) = @_;
+    
+    # Find all backtick expressions and replace them
+    $content =~ s/my\s+(\$\w+)\s*=\s*`([^`]+)`;/process_single_backtick_string($1, $2)/ge;
+    
+    return $content;
+}
+
+sub process_single_backtick_string {
+    my ($var_name, $command) = @_;
+    
+    print "DEBUG: Processing backtick command: $command\n" if $verbose;
+    
+    # Convert using debashc
+    my $perl_result = convert_shell_to_perl($command, 1);
+    if ($perl_result) {
+        print "DEBUG: Got perl result for backtick: [$perl_result]\n" if $verbose;
+        return "my $var_name = $perl_result;";
+    } else {
+        print "DEBUG: No perl result for backtick command\n" if $verbose;
+        return "my $var_name = `$command`;";  # Keep original if conversion fails
+    }
 }
 
 # PPI-based system() call processing
@@ -296,8 +329,15 @@ sub replace_backtick_with_code {
     
     print "DEBUG: Parent statement: " . $parent->content . "\n" if $verbose;
     
+    # Extract the variable name from the original statement
+    my $var_name = "output";
+    if ($parent->content =~ /my\s+(\$\w+)\s*=/) {
+        $var_name = $1;
+        $var_name =~ s/^\$//;  # Remove the $ sign
+    }
+    
     # Create a new statement with the replacement code
-    my $new_statement = "my \$files = $replacement_code;";
+    my $new_statement = "my \$$var_name = $replacement_code;";
     print "DEBUG: New statement: $new_statement\n" if $verbose;
     
     # Create a new PPI document from the new statement
@@ -314,9 +354,29 @@ sub replace_backtick_with_code {
         return;
     }
     
+    print "DEBUG: New code type: " . ref($new_code) . "\n" if $verbose;
+    print "DEBUG: Parent type: " . ref($parent) . "\n" if $verbose;
+    
     print "DEBUG: Replacing entire statement with new code\n" if $verbose;
-    # Replace the entire statement with the new code
-    $parent->replace($new_code);
+    # Try to replace the parent with the new code
+    my $grandparent = $parent->parent;
+    if ($grandparent) {
+        # Find the position of the parent in the grandparent
+        my $position = 0;
+        for my $child ($grandparent->children) {
+            if ($child == $parent) {
+                last;
+            }
+            $position++;
+        }
+        # Remove the old parent and insert the new code
+        $parent->remove;
+        $grandparent->insert_before($new_code, $grandparent->child($position));
+    } else {
+        # Fallback to replace method
+        $parent->replace($new_code);
+    }
+    print "DEBUG: After replacement, parent content: " . $parent->content . "\n" if $verbose;
 }
 
 sub convert_shell_to_perl {
@@ -333,13 +393,27 @@ sub convert_shell_to_perl {
     print "Converting shell command: $shell_command\n" if $verbose;
     
     # Use debashc to convert the shell command to Perl
-    # Use --inline mode for backtick commands to get inline Perl code
-    my $mode = $is_backticks ? "--inline" : "--perl";
+    # Use --perl mode for both system calls and backtick commands
+    my $mode = "--perl";
     print "DEBUG: Running command: $debashc_path parse $mode \"$shell_command\"\n" if $verbose;
     
-    # Use backticks with proper escaping
-    my $stdout = `"$debashc_path" parse $mode "$shell_command" 2>&1`;
-    my $exit_code = $? >> 8;
+    # Use a simple approach without alarm conflicts
+    my $temp_file = "temp_debashc_output_$$.txt";
+    my $command = qq{"$debashc_path" parse $mode "$shell_command" > "$temp_file" 2>&1};
+    
+    my $exit_code = system($command);
+    $exit_code = $exit_code >> 8;
+    
+    my $stdout = '';
+    if (-f $temp_file) {
+        open my $fh, '<', $temp_file or warn "Cannot read temp file: $!\n";
+        if ($fh) {
+            local $/;
+            $stdout = <$fh>;
+            close $fh;
+        }
+        unlink $temp_file;
+    }
     
     print "DEBUG: Command output length: " . length($stdout) . "\n" if $verbose;
     
@@ -387,6 +461,19 @@ sub extract_perl_from_debashc_output {
         
         # For backtick commands, we need to return the value instead of printing it
         if ($is_backticks) {
+            print "DEBUG: Looking for print statement in: [$inline_code]\n" if $verbose;
+            # Look for any print statement in the code
+            if ($inline_code =~ /print\s+(.+?);/s) {
+                my $print_value = $1;
+                print "DEBUG: Found print statement: [$print_value]\n" if $verbose;
+                $print_value =~ s/;\s*$//;  # Remove trailing semicolon
+                $print_value =~ s/^\s+//;   # Remove leading whitespace
+                $print_value =~ s/\s+$//;   # Remove trailing whitespace
+                print "DEBUG: Cleaned print value: [$print_value]\n" if $verbose;
+                return $print_value;
+            } else {
+                print "DEBUG: No print statement found in backtick code\n" if $verbose;
+            }
             # Handle ls commands - replace print with return value
             if ($inline_code =~ /my \@ls_files = \(\)/ && $inline_code =~ /opendir my \$dh/) {
                 my $inline_ls = $inline_code;
@@ -419,6 +506,29 @@ sub extract_perl_from_debashc_output {
             print "DEBUG: Before removing DEBUG messages: [$inline_code]\n" if $verbose;
             $inline_code =~ s/DEBUG:.*?\n//g;
             print "DEBUG: After removing DEBUG messages: [$inline_code]\n" if $verbose;
+            
+            # Look for any print statement in the code
+            print "DEBUG: Looking for print statement in: [$inline_code]\n" if $verbose;
+            if ($inline_code =~ /print\s+(.+?);/s) {
+                my $print_value = $1;
+                print "DEBUG: Found print statement: [$print_value]\n" if $verbose;
+                $print_value =~ s/;\s*$//;  # Remove trailing semicolon
+                $print_value =~ s/^\s+//;   # Remove leading whitespace
+                $print_value =~ s/\s+$//;   # Remove trailing whitespace
+                print "DEBUG: Cleaned print value: [$print_value]\n" if $verbose;
+                return $print_value;
+            } else {
+                print "DEBUG: Regex did not match. Trying alternative patterns...\n" if $verbose;
+                # Try a more specific pattern for concatenated strings
+                if ($inline_code =~ /print\s+['\"](.+?)['\"]\s*\.\s*['\"](.+?)['\"]\s*;/s) {
+                    my $part1 = $1;
+                    my $part2 = $2;
+                    print "DEBUG: Found concatenated print: part1=[$part1] part2=[$part2]\n" if $verbose;
+                    my $result = "'$part1' . \"$part2\"";
+                    print "DEBUG: Returning concatenated result: [$result]\n" if $verbose;
+                    return $result;
+                }
+            }
             
             # Handle ls commands - replace print with return value
             print "DEBUG: Checking ls pattern match...\n" if $verbose;

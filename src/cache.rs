@@ -1,56 +1,37 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::time::SystemTime;
-use serde::{Serialize, Deserialize};
-use sha2::{Sha256, Digest};
+use std::path::Path;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub code_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommandCache {
-    pub bash_outputs: HashMap<String, CachedBashOutput>,
-    pub perl_outputs: HashMap<String, CachedPerlOutput>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CachedBashOutput {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-    pub last_modified: u64, // Unix timestamp
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CachedPerlOutput {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-    pub perl_code_hash: String, // SHA256 hash of the generated Perl code
-    pub last_modified: u64, // Unix timestamp
+    bash_cache: HashMap<String, CachedOutput>,
+    perl_cache: HashMap<String, CachedOutput>,
 }
 
 impl CommandCache {
-    pub fn new() -> Self {
-        Self {
-            bash_outputs: HashMap::new(),
-            perl_outputs: HashMap::new(),
-        }
-    }
-
-    fn compute_sha256(data: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(data.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-
     pub fn load() -> Self {
         let cache_file = "command_cache.json";
-        match fs::read_to_string(cache_file) {
-            Ok(content) => {
-                match serde_json::from_str(&content) {
-                    Ok(cache) => cache,
-                    Err(_) => Self::new(),
+        if Path::new(cache_file).exists() {
+            match fs::read_to_string(cache_file) {
+                Ok(content) => {
+                    match serde_json::from_str(&content) {
+                        Ok(cache) => cache,
+                        Err(_) => Self::default(),
+                    }
                 }
+                Err(_) => Self::default(),
             }
-            Err(_) => Self::new(),
+        } else {
+            Self::default()
         }
     }
 
@@ -61,91 +42,60 @@ impl CommandCache {
         }
     }
 
-    // Bash output caching methods
-    pub fn get_cached_bash_output(&self, filename: &str) -> Option<&CachedBashOutput> {
-        self.bash_outputs.get(filename)
+    pub fn is_bash_cache_valid(&self, filename: &str) -> bool {
+        self.bash_cache.contains_key(filename)
     }
 
-    pub fn is_bash_cache_valid(&self, filename: &str) -> bool {
-        if let Some(cached) = self.bash_outputs.get(filename) {
-            if let Ok(metadata) = fs::metadata(filename) {
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(modified_timestamp) = modified.duration_since(SystemTime::UNIX_EPOCH) {
-                        return modified_timestamp.as_secs() <= cached.last_modified;
-                    }
-                }
-            }
-        }
-        false
+    pub fn get_cached_bash_output(&self, filename: &str) -> Option<CachedOutput> {
+        self.bash_cache.get(filename).cloned()
     }
 
     pub fn update_bash_cache(&mut self, filename: &str, stdout: String, stderr: String, exit_code: i32) {
-        let last_modified = if let Ok(metadata) = fs::metadata(filename) {
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(modified_timestamp) = modified.duration_since(SystemTime::UNIX_EPOCH) {
-                    modified_timestamp.as_secs()
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
-        self.bash_outputs.insert(filename.to_string(), CachedBashOutput {
-            stdout,
-            stderr,
-            exit_code,
-            last_modified,
-        });
+        self.bash_cache.insert(
+            filename.to_string(),
+            CachedOutput {
+                stdout,
+                stderr,
+                exit_code,
+                code_hash: None,
+            },
+        );
     }
 
     pub fn invalidate_bash_cache(&mut self, filename: &str) {
-        self.bash_outputs.remove(filename);
-        self.save();
+        self.bash_cache.remove(filename);
     }
 
-    // Perl output caching methods
-    pub fn get_cached_perl_output(&self, filename: &str) -> Option<&CachedPerlOutput> {
-        self.perl_outputs.get(filename)
-    }
-
-    pub fn is_perl_cache_valid(&self, filename: &str, perl_code: &str) -> bool {
-        if let Some(cached) = self.perl_outputs.get(filename) {
-            // Check if the Perl code hash matches (indicating the generated code hasn't changed)
-            let current_hash = Self::compute_sha256(perl_code);
-            if current_hash == cached.perl_code_hash {
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn update_perl_cache(&mut self, filename: &str, stdout: String, stderr: String, exit_code: i32, perl_code: &str) {
-        let last_modified = if let Ok(metadata) = fs::metadata(filename) {
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(modified_timestamp) = modified.duration_since(SystemTime::UNIX_EPOCH) {
-                    modified_timestamp.as_secs()
-                } else {
-                    0
-                }
+    pub fn is_perl_cache_valid(&self, filename: &str, code: &str) -> bool {
+        if let Some(cached) = self.perl_cache.get(filename) {
+            // Check if the code hash matches
+            if let Some(ref code_hash) = cached.code_hash {
+                let current_hash = format!("{:x}", md5::compute(code));
+                code_hash == &current_hash
             } else {
-                0
+                // No hash stored, consider invalid
+                false
             }
         } else {
-            0
-        };
+            false
+        }
+    }
 
-        let perl_code_hash = Self::compute_sha256(perl_code);
+    pub fn get_cached_perl_output(&self, filename: &str) -> Option<CachedOutput> {
+        self.perl_cache.get(filename).cloned()
+    }
 
-        self.perl_outputs.insert(filename.to_string(), CachedPerlOutput {
-            stdout,
-            stderr,
-            exit_code,
-            perl_code_hash,
-            last_modified,
-        });
+    pub fn update_perl_cache(&mut self, filename: &str, stdout: String, stderr: String, exit_code: i32, code: &str) {
+        let code_hash = format!("{:x}", md5::compute(code));
+        self.perl_cache.insert(
+            filename.to_string(),
+            CachedOutput {
+                stdout,
+                stderr,
+                exit_code,
+                code_hash: Some(code_hash),
+            },
+        );
     }
 }
+

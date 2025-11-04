@@ -418,7 +418,7 @@ pub fn test_file_equivalence_with_critic(lang: &str, filename: &str, enable_perl
             let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
             let tmp_str = tmp.to_string_lossy().to_string();
             if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) { return Err(format!("Failed to write Perl temp file: {}", e)); }
-            (tmp_str.clone(), vec!["perl".to_string(), tmp_str])
+            (tmp_str.clone(), vec!["C:\\Strawberry\\perl\\bin\\perl.exe".to_string(), tmp_str])
         }
         _ => { return Err(format!("Unsupported language for --test-file: {}", lang)); }
     };
@@ -609,7 +609,7 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
             return Err(format!("Failed to write Perl temp file: {}", e)); 
         }
         tmp_file = tmp_str.clone();
-        run_cmd = vec!["perl".to_string(), tmp_str];
+        run_cmd = vec!["C:\\Strawberry\\perl\\bin\\perl.exe".to_string(), tmp_str];
     }
     
     // If no cached output, we need to run the shell script
@@ -757,7 +757,7 @@ pub fn test_file_equivalence_detailed_with_critic(lang: &str, filename: &str, as
                     return Err(format!("Failed to write Perl temp file: {}", e)); 
                 }
                 
-                (tmp_str.clone(), vec!["perl".to_string(), tmp_str], code)
+                (tmp_str.clone(), vec!["C:\\Strawberry\\perl\\bin\\perl.exe".to_string(), tmp_str], code)
             }
             _ => { return Err(format!("Unsupported language for --test-file: {}", lang)); }
         };

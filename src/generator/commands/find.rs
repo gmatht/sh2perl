@@ -154,16 +154,16 @@ pub fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCom
     result.push_str(&format!("    my $start_{} = q{{{}}};\n", unique_id, start_path));
     
     // Create a recursive find function
-    result.push_str(&format!("    sub find_files_{} {{\n", unique_id));
+    result.push_str(&format!("\n    sub find_files_{} {{\n", unique_id));
     result.push_str(&format!("        my $file_{} = $File::Find::name;\n", unique_id));
     
     if let Some(ftype) = &file_type {
         if ftype == "f" {
-            result.push_str(&format!("        if (!(-f $file_{})) {{\n", unique_id));
+            result.push_str(&format!("        if ( !( -f $file_{} ) ) {{\n", unique_id));
             result.push_str(&format!("            return;\n"));
             result.push_str(&format!("        }}\n"));
         } else if ftype == "d" {
-            result.push_str(&format!("        if (!(-d $file_{})) {{\n", unique_id));
+            result.push_str(&format!("        if ( !( -d $file_{} ) ) {{\n", unique_id));
             result.push_str(&format!("            return;\n"));
             result.push_str(&format!("        }}\n"));
         }
@@ -178,7 +178,7 @@ pub fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCom
             // If pattern doesn't contain path separators, match against basename
             format!("basename($file_{})", unique_id)
         };
-        result.push_str(&format!("        if (!({} =~ m/^{}$/xms)) {{\n", filename, glob_pattern));
+        result.push_str(&format!("        if ( !( {} =~ m/^{}$/xms ) ) {{\n", filename, glob_pattern));
         result.push_str(&format!("            return;\n"));
         result.push_str(&format!("        }}\n"));
     }
@@ -187,7 +187,7 @@ pub fn generate_find_for_substitution(generator: &mut Generator, cmd: &SimpleCom
     result.push_str(&format!("        return;\n"));
     
     result.push_str("    }\n");
-    result.push_str(&format!("    find(\\&find_files_{}, $start_{});\n", unique_id, unique_id));
+    result.push_str(&format!("    find( \\&find_files_{}, $start_{} );\n", unique_id, unique_id));
     result.push_str(&format!("    join \"\\n\", @files_{};\n}}", unique_id));
     result
 }

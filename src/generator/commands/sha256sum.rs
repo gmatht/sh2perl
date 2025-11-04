@@ -55,7 +55,7 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
         if input_var.is_empty() {
             // For command substitution, return the joined result directly
             output.push_str("do {\n");
-            output.push_str("my @results;\n");
+            output.push_str("    my @results;\n");
             for file in &files {
                 // Extract the unquoted filename for output
                 let unquoted_file = if file.starts_with("'") && file.ends_with("'") && file.len() > 2 {
@@ -63,15 +63,17 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
                 } else {
                     file
                 };
-                output.push_str(&format!("if (-f {}) {{\n", file));
-                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', {} or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
-                output.push_str(&format!("push @results, \"$hash  {}\";\n", unquoted_file));
-                output.push_str("} else {\n");
-                output.push_str(&format!("push @results, \"0000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", unquoted_file));
-                output.push_str("}\n");
+                output.push_str(&format!("    if ( -f {} ) {{\n", file));
+                output.push_str(&format!("        my $hash = sha256_hex(\n            do {{\n                local $INPUT_RECORD_SEPARATOR = undef;\n                open my $fh, '<', {}\n                  or croak \"Cannot open {}: $ERRNO\";\n                my $content = <$fh>;\n                close $fh\n                  or croak \"Close failed: $ERRNO\";\n                $content;\n            }}\n        );\n", file, file));
+                output.push_str(&format!("        push @results, \"$hash  {}\";\n", unquoted_file));
+                output.push_str("    }\n");
+                output.push_str("    else {\n");
+                output.push_str("        push @results,\n");
+                output.push_str(&format!("\"0000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", unquoted_file));
+                output.push_str("    }\n");
             }
-            output.push_str("join \"\\n\", @results;\n");
-            output.push_str("}");
+            output.push_str("    join \"\\n\", @results;\n");
+            output.push_str("};");
         } else {
             output.push_str("my @results;\n");
             for file in &files {
@@ -81,12 +83,14 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
                 } else {
                     file
                 };
-                output.push_str(&format!("if (-f {}) {{\n", file));
-                output.push_str(&format!("my $hash = sha256_hex(do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', {} or croak \"Cannot open {}: $ERRNO\"; my $content = <$fh>; close $fh or croak \"Close failed: $ERRNO\"; $content }});\n", file, file));
-                output.push_str(&format!("push @results, \"$hash  {}\";\n", unquoted_file));
-                output.push_str("} else {\n");
-                output.push_str(&format!("push @results, \"0000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", unquoted_file));
-                output.push_str("}\n");
+                output.push_str(&format!("    if ( -f {} ) {{\n", file));
+                output.push_str(&format!("        my $hash = sha256_hex(\n            do {{\n                local $INPUT_RECORD_SEPARATOR = undef;\n                open my $fh, '<', {}\n                  or croak \"Cannot open {}: $ERRNO\";\n                my $content = <$fh>;\n                close $fh\n                  or croak \"Close failed: $ERRNO\";\n                $content;\n            }}\n        );\n", file, file));
+                output.push_str(&format!("        push @results, \"$hash  {}\";\n", unquoted_file));
+                output.push_str("    }\n");
+                output.push_str("    else {\n");
+                output.push_str("        push @results,\n");
+                output.push_str(&format!("\"0000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", unquoted_file));
+                output.push_str("    }\n");
             }
             output.push_str(&format!("{} = join \"\\n\", @results;\n", input_var));
         }

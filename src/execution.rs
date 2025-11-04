@@ -41,6 +41,8 @@ pub fn run_shell_script(filename: &str) -> Result<std::process::Output, String> 
         let mut cmd = Command::new("bash");
         let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
         cmd.current_dir(&examples_dir);
+        // Set TZ=UTC to avoid date differences between shell and Perl
+        cmd.env("TZ", "UTC");
         cmd.arg(&script_name);
         
         let child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {

@@ -82,11 +82,11 @@ pub fn generate_parameter_expansion_impl(_generator: &mut Generator, pe: &Parame
         }
         ParameterExpansionOperator::Basename => {
             // ${var##*/} - get basename
-            format!("basename(${})", pe.variable)
+            format!("basename({})", pe.variable)
         }
         ParameterExpansionOperator::Dirname => {
             // ${var%/*} - get dirname
-            format!("dirname(${})", pe.variable)
+            format!("dirname({})", pe.variable)
         }
         ParameterExpansionOperator::ArraySlice(offset, length) => {
             // Special case: ${#arr[@]} should be array length, not array slice

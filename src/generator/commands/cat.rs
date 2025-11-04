@@ -39,7 +39,8 @@ pub fn generate_cat_command(generator: &mut Generator, cmd: &SimpleCommand, redi
         output.push_str("while (my $line = <$fh>) {\n");
         output.push_str(&format!("${} .= $line;\n", input_var));
         output.push_str("}\n");
-        output.push_str("close $fh or croak \"Close failed: $OS_ERROR\";\n");
+        output.push_str("close $fh\n");
+        output.push_str("    or croak \"Close failed: $OS_ERROR\";\n");
         output.push_str(&format!("# Ensure content ends with newline to prevent line concatenation\n"));
         output.push_str(&generator.indent());
         output.push_str(&format!("if (!(${} =~ {})) {{\n", input_var, generator.newline_end_regex()));

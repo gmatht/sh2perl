@@ -247,13 +247,22 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                     }
                                 };
                                 
+                                // Use UTC (gmtime) for date-only formats to avoid timezone/day boundary issues
+                                // Check if format is date-only (contains %Y but no time components)
+                                let cleaned_format_for_check = &cleaned_format;
+                                let is_date_only = cleaned_format_for_check.contains("%Y") && 
+                                                   !cleaned_format_for_check.contains("%H") && 
+                                                   !cleaned_format_for_check.contains("%M") && 
+                                                   !cleaned_format_for_check.contains("%S") &&
+                                                   !cleaned_format_for_check.contains("%r");
+                                let time_func = if is_date_only { "gmtime" } else { "localtime" };
                                 // Ensure the format string is properly quoted for strftime
                                 let final_format = if cleaned_format.starts_with('"') || cleaned_format.starts_with("'") || cleaned_format.starts_with("q{") {
                                     cleaned_format
                                 } else {
                                     format!("'{}'", cleaned_format)
                                 };
-                                format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", final_format)
+                                format!("do {{ use POSIX qw(strftime); strftime({}, {}); }}", final_format, time_func)
                             } else {
                                 "do { use POSIX qw(strftime); strftime('%a %b %d %H:%M:%S %Z %Y', localtime); }".to_string()
                             }
@@ -269,7 +278,8 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 } else {
                                     "q{}".to_string()
                                 };
-                                format!("do {{ my $basename_path = {}; my $basename_suffix = {}; if ($basename_suffix ne q{{}}) {{ $basename_path =~ s/\\Q$basename_suffix\\E$//msx; }} $basename_path =~ s/.*\\///msx; $basename_path; }}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
+                                // Generate with proper formatting
+                                format!("do {{\n    my $basename_path = {};\n    my $basename_suffix = {};\n    if ($basename_suffix ne q{{}}) {{\n        $basename_path =~ s/\\Q$basename_suffix\\E$//msx;\n    }}\n    $basename_path =~ s/.*\\///msx;\n    $basename_path;\n}}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
                             } else {
                                 "\".\"".to_string()
                             }
@@ -513,26 +523,31 @@ pub fn convert_escaped_metacharacters(pattern: &str) -> String {
            .replace("\\(", "[(]")
            .replace("\\)", "[)]")
            .replace("\\|", "[|]")
+           .replace("\\t", "\t")
+           .replace("\\r", "\r")
            .replace("{", "\\{")
            .replace("}", "\\}")
 }
 
 /// Generate a regex pattern for checking if string ends with newline
 pub fn newline_end_regex() -> String {
-    format_regex_pattern(r"\n$")
+    // Use a regex pattern that matches actual newline characters
+    // In Rust strings, \\n becomes \n in the string, which Perl interprets as a newline in regex
+    // Use {} delimiters to satisfy Perl::Critic policy for regex patterns with /m flag
+    "m{\\n$}msx".to_string()
 }
 
 /// Convert postfix unless statement to block form
 pub fn convert_postfix_unless_to_block(condition: &str, statement: &str) -> String {
-    format!("if (!({}) ) {{\n    {};\n}}", condition, statement)
+    format!("if (!({})) {{\n    {};\n}}", condition, statement)
 }
 
 /// Convert postfix unless statement to block form with proper indentation
 pub fn convert_postfix_unless_to_block_with_indent(condition: &str, statement: &str, indent: &str) -> String {
-    format!("{}if (!({}) ) {{\n{}    {};\n{}}}", indent, condition, indent, statement, indent)
+    format!("{}if (!({})) {{\n{}    {};\n{}}}", indent, condition, indent, statement, indent)
 }
 
 /// Convert postfix unless statement to block form without adding indentation (for use within already indented blocks)
 pub fn convert_postfix_unless_to_block_no_indent(condition: &str, statement: &str) -> String {
-    format!("if (!({}) ) {{\n    {};\n}}", condition, statement)
+    format!("if (!({})) {{\n    {};\n}}", condition, statement)
 }

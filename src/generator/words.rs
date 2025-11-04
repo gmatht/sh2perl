@@ -126,7 +126,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         } else {
                                             process_sub_code.push_str(&format!("    print $fh {};\n", process_sub_output));
                                         }
-                                        process_sub_code.push_str(&format!("    close $fh or croak \"Close failed: $OS_ERROR\\n\";\n"));
+                                        process_sub_code.push_str("    close $fh\n");
+                                        process_sub_code.push_str("        or croak \"Close failed: $OS_ERROR\\n\";\n");
                                         process_sub_code.push_str(&format!("}}\n"));
                                         
                                         process_sub_files.push((temp_file.clone(), process_sub_output));
@@ -183,7 +184,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         process_sub_code.push_str("    my $temp_output = q{};\n");
                                         process_sub_code.push_str(&format!("    $temp_output .= {};\n", process_sub_output));
                                         process_sub_code.push_str("    print {$fh} $temp_output;\n");
-                                        process_sub_code.push_str(&format!("    close $fh or croak \"Close failed: $OS_ERROR\\n\";\n"));
+                                        process_sub_code.push_str("    close $fh\n");
+                                        process_sub_code.push_str("        or croak \"Close failed: $OS_ERROR\\n\";\n");
                                         process_sub_code.push_str(&format!("}}\n"));
                                         
                                         process_sub_files.push((temp_file.clone(), process_sub_output));
@@ -244,78 +246,57 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // For command substitution, we need to return the result, not print it
                             format!("do {{ {} {} }}", input_data, tr_output)
                         } else if name == "perl" {
-                            // Special handling for perl in command substitution - execute as external command
+                            // Special handling for perl in command substitution - use native Perl instead of open3
                             eprintln!("DEBUG: Processing perl command in command substitution with args: {:?}", simple_cmd.args);
-                            
-                            // Use IPC::Open3 instead of qx to avoid Perl::Critic violations
-                            let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
                             
                             if simple_cmd.args.len() >= 2 {
                                 if let (Word::Literal(flag, _), Word::Literal(code, _)) = (&simple_cmd.args[0], &simple_cmd.args[1]) {
                                     if flag == "-e" {
-                                        // Use temporary file approach for perl -e commands with IPC::Open3
-                                        let temp_file = format!("temp_perl_{}.pl", std::process::id());
-                                        let code_literal = generator.perl_string_literal(&Word::Literal(code.clone(), None));
+                                        // Execute Perl code directly instead of using open3
+                                        // Use capture_stdout to capture the output of print statements
                                         format!("do {{ 
-                                            open my $fh, '>', '{}' or croak 'Cannot create temp file: $OS_ERROR'; 
-                                            print {{$fh}} {}; 
-                                            close $fh or croak 'Close failed: $OS_ERROR'; 
-                                            my ({}, {}, {}); 
-                                            my {} = open3({}, {}, {}, 'perl', '{}'); 
-                                            close {} or croak 'Close failed: $OS_ERROR'; 
-                                            my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; 
-                                            close {} or croak 'Close failed: $OS_ERROR'; 
-                                            waitpid {}, 0; 
-                                            unlink '{}' or carp 'Cannot remove temp file: $OS_ERROR'; 
-                                            {};
-                                        }}", 
-                                            temp_file, code_literal, in_var, out_var, err_var, pid_var, in_var, out_var, err_var, temp_file, in_var, result_var, out_var, out_var, pid_var, temp_file, result_var)
+    use Capture::Tiny qw(capture_stdout);
+    my $result;
+    my $eval_success = eval {{
+        $result = capture_stdout( sub {{ {} }} );
+        1;
+    }};
+    if ( !$eval_success ) {{
+        $result = \"Error executing Perl code: $EVAL_ERROR\";
+    }}
+    $result;
+}}", code)
                                     } else {
-                                        // Use IPC::Open3 for other perl commands
+                                        // For other perl commands, use system call as fallback
                                         let args: Vec<String> = simple_cmd.args.iter()
                                             .map(|arg| generator.perl_string_literal(arg))
                                             .collect();
                                         let formatted_args = args.join(", ");
                                         format!("do {{ 
-                                            my ({}, {}, {}); 
-                                            my {} = open3({}, {}, {}, 'perl', {}); 
-                                            close {} or croak 'Close failed: $OS_ERROR'; 
-                                            my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; 
-                                            close {} or croak 'Close failed: $OS_ERROR'; 
-                                            waitpid {}, 0; 
-                                            {};
-                                        }}", 
-                                            in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                            my $result = qx{{perl {}}};
+                                            chomp $result;
+                                            $result;
+                                        }}", formatted_args)
                                     }
                                 } else {
-                                    // Use IPC::Open3 for other perl commands
+                                    // For other perl commands, use system call as fallback
                                     let args: Vec<String> = simple_cmd.args.iter()
                                         .map(|arg| generator.perl_string_literal(arg))
                                         .collect();
                                     let formatted_args = args.join(", ");
                                     format!("do {{ 
-                                        my ({}, {}, {}); 
-                                        my {} = open3({}, {}, {}, 'perl', {}); 
-                                        close {} or croak 'Close failed: $OS_ERROR'; 
-                                        my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; 
-                                        close {} or croak 'Close failed: $OS_ERROR'; 
-                                        waitpid {}, 0; 
-                                        {};
-                                    }}", 
-                                        in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                        my $result = qx{{perl {}}};
+                                        chomp $result;
+                                        $result;
+                                    }}", formatted_args)
                                 }
                             } else {
-                                // Use IPC::Open3 for perl commands with no arguments
+                                // For perl commands with no arguments, use system call as fallback
                                 format!("do {{ 
-                                    my ({}, {}, {}); 
-                                    my {} = open3({}, {}, {}, 'perl'); 
-                                    close {} or croak 'Close failed: $OS_ERROR'; 
-                                    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; 
-                                    close {} or croak 'Close failed: $OS_ERROR'; 
-                                    waitpid {}, 0; 
-                                    {};
-                                }}", 
-                                    in_var, out_var, err_var, pid_var, in_var, out_var, err_var, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                    my $result = qx{{perl}};
+                                    chomp $result;
+                                    $result;
+                                }}")
                             }
                         } else if name == "wc" {
                             // Special handling for wc in command substitution
@@ -469,7 +450,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 "\"\"".to_string()
                             } else {
                                 if args.is_empty() {
-                                    format!("do {{ my $result = sprintf \"{}\"; chomp $result; $result; }}", 
+                                    format!("do {{\n    my $result = sprintf \"{}\";\n    chomp $result;\n    $result;\n}}", 
                                         format_string.replace("\"", "\\\"").replace("\\\\", "\\"))
                                 } else {
                                     // Properly quote string arguments for sprintf
@@ -487,7 +468,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         })
                                         .collect::<Vec<_>>()
                                         .join(", ");
-                                    format!("do {{ my $result = sprintf \"{}\", {}; chomp $result; $result; }}", 
+                                    format!("do {{\n    my $result = sprintf \"{}\", {};\n    chomp $result;\n    $result;\n}}", 
                                         format_string.replace("\"", "\\\"").replace("\\\\", "\\"),
                                         formatted_args)
                                 }
@@ -535,13 +516,22 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     }
                                 };
                                 
+                                // Use UTC (gmtime) for date-only formats to avoid timezone/day boundary issues
+                                // Check if format is date-only (contains %Y but no time components) before moving cleaned_format
+                                let cleaned_format_for_check = &cleaned_format;
+                                let is_date_only = cleaned_format_for_check.contains("%Y") && 
+                                                   !cleaned_format_for_check.contains("%H") && 
+                                                   !cleaned_format_for_check.contains("%M") && 
+                                                   !cleaned_format_for_check.contains("%S") &&
+                                                   !cleaned_format_for_check.contains("%r");
+                                let time_func = if is_date_only { "gmtime" } else { "localtime" };
                                 // Ensure the format string is properly quoted for strftime
                                 let final_format = if cleaned_format.starts_with('"') || cleaned_format.starts_with("'") || cleaned_format.starts_with("q{") {
                                     cleaned_format
                                 } else {
                                     format!("'{}'", cleaned_format)
                                 };
-                                format!("do {{ use POSIX qw(strftime); strftime({}, localtime); }}", final_format)
+                                format!("do {{ use POSIX qw(strftime); strftime({}, {}); }}", final_format, time_func)
                             } else {
                                 "do { use POSIX qw(strftime); strftime('%a %b %d %H:%M:%S %Z %Y', localtime); }".to_string()
                             }
@@ -557,7 +547,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 } else {
                                     "q{}".to_string()
                                 };
-                                format!("do {{ my $basename_path; my $basename_suffix; $basename_path = {}; $basename_suffix = {}; if ($basename_suffix ne q{{}}) {{ $basename_path =~ s/\\Q$basename_suffix\\E$//msx; }} $basename_path =~ s/.*\\///msx; $basename_path; }}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
+                                // Generate with proper formatting - perltidy will accept this multi-line format
+                                format!("do {{\n    my $basename_path;\n    my $basename_suffix;\n    $basename_path = {};\n    $basename_suffix = {};\n    if ($basename_suffix ne q{{}}) {{\n        $basename_path =~ s/\\Q$basename_suffix\\E$//msx;\n    }}\n    $basename_path =~ s/.*\\///msx;\n    $basename_path;\n}}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
                             } else {
                                 "\".\"".to_string()
                             }
@@ -597,7 +588,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 "\"\"".to_string()
                             }
                         } else if name == "perl" {
-                            // Special handling for perl in command substitution
+                            // Special handling for perl in command substitution - use native Perl instead of open3
                             // For perl -e 'print "..."' commands, capture the output instead of printing
                             if simple_cmd.args.len() >= 2 {
                                 if let (Word::Literal(flag, _), Word::Literal(code, _)) = (&simple_cmd.args[0], &simple_cmd.args[1]) {
@@ -611,41 +602,29 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         // Fix double-escaped quotes and newlines
                                         clean_code = clean_code.replace("\\\"", "\"").replace("\\\\n", "\\n");
                                         
-                                        // For command substitution, capture output instead of printing
-                                        // Build the code manually to avoid quote escaping issues
-                                        let mut result = String::new();
-                                        result.push_str("do { use Capture::Tiny qw(capture_stdout); capture_stdout(sub { ");
-                                        result.push_str(&clean_code);
-                                        result.push_str("; }); }");
-                                        result
+                                        // Execute Perl code directly instead of using open3
+                                        // Use capture_stdout to capture the output of print statements
+                                        // Format for command substitution - content should have 4-space indentation inside do { }
+                                        format!("do {{\n    use Capture::Tiny qw(capture_stdout);\n    my $result;\n    my $eval_success = eval {{\n        $result = capture_stdout(sub {{ {} }});\n        1;\n    }};\n    if (!$eval_success) {{\n        $result = \"Error executing Perl code: $EVAL_ERROR\";\n    }}\n    $result;\n}}", clean_code)
                                     } else {
-                                        // Fallback to system command for other perl flags
+                                        // For other perl commands, use system call as fallback
                                         let args: Vec<String> = simple_cmd.args.iter()
                                             .map(|arg| generator.word_to_perl(arg))
                                             .collect();
-                                        let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                                        let formatted_args = args.iter().map(|arg| {
-                                            let word = Word::Literal(arg.clone(), Default::default());
-                                            generator.perl_string_literal(&word)
-                                        }).collect::<Vec<_>>().join(", ");
-                                        format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'perl', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                        let formatted_args = args.join(" ");
+                                        format!("do {{\n    my $result = qx{{perl {}}};\n    chomp $result;\n    $result;\n}}", formatted_args)
                                     }
                                 } else {
-                                    // Fallback to system command for non-literal args
+                                    // For other perl commands, use system call as fallback
                                     let args: Vec<String> = simple_cmd.args.iter()
                                         .map(|arg| generator.word_to_perl(arg))
                                         .collect();
-                                    let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                                    let formatted_args = args.iter().map(|arg| {
-                                        let word = Word::Literal(arg.clone(), Default::default());
-                                        generator.perl_string_literal(&word)
-                                    }).collect::<Vec<_>>().join(", ");
-                                    format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'perl', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                    let formatted_args = args.join(" ");
+                                    format!("do {{\n    my $result = qx{{perl {}}};\n    chomp $result;\n    $result;\n}}", formatted_args)
                                 }
                             } else {
-                                // No arguments, fallback to system command
-                                let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                                format!(" my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'perl');\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                // For perl commands with no arguments, use system call as fallback
+                                "do {\n    my $result = qx{perl};\n    chomp $result;\n    $result;\n}".to_string()
                             }
                         } else if generator.inline_mode && name == "echo" {
                             // In inline mode for echo, generate the output value directly
@@ -660,15 +639,42 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "cp" {
                             // Use native Perl cp implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native cp implementation for command substitution");
+                            // Generate cp code - need to preserve relative indentation
                             let cp_code = crate::generator::commands::cp::generate_cp_command(generator, simple_cmd);
-                            let formatted_code = cp_code.trim_end_matches('\n')
+                            // Find the minimum indentation in cp_code to normalize it
+                            let lines: Vec<&str> = cp_code.trim_end_matches('\n').lines().collect();
+                            let min_indent = lines.iter()
+                                .filter(|line| !line.trim().is_empty())
+                                .map(|line| line.len() - line.trim_start().len())
+                                .min()
+                                .unwrap_or(0);
+                            
+                            // Remove base indentation and add eval block indentation
+                            let mut formatted_lines = Vec::new();
+                            let base_eval_indent = 12; // 12 spaces for eval block content (inside do{ } at 4 spaces, then eval { at 8 spaces, so content is at 12)
+                            for line in lines {
+                                let trimmed = line.trim_start();
+                                if !trimmed.is_empty() {
+                                    // Calculate relative indentation from original line
+                                    let orig_indent = line.len() - trimmed.len();
+                                    // Remove base indent and add eval block base indent
+                                    let relative_indent = orig_indent.saturating_sub(min_indent);
+                                    let new_indent = base_eval_indent + relative_indent;
+                                    formatted_lines.push(format!("{}{}", " ".repeat(new_indent), trimmed));
+                                }
+                            }
+                            let formatted_code = formatted_lines.join("\n")
                                 .replace("print ", "# print ")
                                 .replace("die ", "croak ");
-                            let indent1 = generator.indent();
-                            let indent2 = format!("{}{}", generator.indent(), "    ");
-                            let _indent3 = format!("{}{}", indent2, "    ");
-                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if (!$eval_result) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
-                                indent1, indent1, indent2, formatted_code, indent2, indent2, 
+                            // The do block is nested inside another do block (my $left_result_0 = do {)
+                            // So we need to account for that extra indentation level
+                            // generator.indent() is at the outer do block level (4 spaces)
+                            // We need indent1 for the inner do block level (8 spaces)
+                            let outer_indent = generator.indent();
+                            let indent1 = format!("{}{}", outer_indent, "    "); // 8 spaces for inner do block
+                            let indent2 = format!("{}{}", indent1, "    "); // 12 spaces for eval block
+                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}    }};\n{}    if ( !$eval_result ) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
+                                indent1, indent1, formatted_code, indent2, indent2, 
                                 indent1, indent1, indent1, indent1, indent1)
                         } else if name == "mv" {
                             // Use native Perl mv implementation for command substitution
@@ -815,15 +821,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 // Simple expressions don't need wrapping
                 result
             } else {
-                // Check if this is a pipeline result that already returns a value directly
-                if result.contains("$output_0") && (result.contains("for (my $i = 0") || result.contains("while (1)")) {
-                    // This is a pipeline that returns its result directly, so just wrap it in do block
-                    format!("do {{\n{}\n{}}}", result, generator.indent())
+                // Check if the result is already a do block - if so, return as-is
+                // (don't add extra indentation here as it will be inserted into assignments)
+                if result.trim_start().starts_with("do {") {
+                    // Result is already a complete do block, return as-is without additional indentation
+                    // The caller will handle any necessary indentation based on context
+                    result
                 } else {
-                    // Wrap complex results with chomp to strip trailing newlines (bash behavior)
-                    let unique_id = generator.get_unique_id();
-                    format!("do {{\n{}    my $cmd_result_{} = do {{ {} }};\n{}    chomp $cmd_result_{};\n{}    $cmd_result_{};\n{}}}", 
-                        generator.indent(), unique_id, result, generator.indent(), unique_id, generator.indent(), unique_id, generator.indent())
+                    // For other results, return as-is
+                    result
                 }
             }
         },

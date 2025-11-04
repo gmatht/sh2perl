@@ -111,7 +111,7 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str("}\n");
         // Ensure output ends with newline to match shell behavior
         output.push_str(&generator.indent());
-        output.push_str(&format!("if ( !( ${} =~ {} || ${} eq q{{}} ) ) {{\n", output_var, generator.newline_end_regex(), output_var));
+        output.push_str(&format!("if (!(${} =~ {} || ${} eq q{{}})) {{\n", output_var, generator.newline_end_regex(), output_var));
         generator.indent_level += 1;
         output.push_str(&generator.indent());
         output.push_str(&format!("${} .= \"\\n\";\n", output_var));
@@ -161,7 +161,7 @@ fn generate_tr_buffered_impl_with_output(generator: &mut Generator, cmd: &Simple
         output.push_str("}\n");
         // Ensure output ends with newline to match shell behavior (but not for empty input)
         output.push_str(&generator.indent());
-        output.push_str(&format!("if ( !( ${} =~ {} || ${} eq q{{}} ) ) {{\n", output_var, generator.newline_end_regex(), output_var));
+        output.push_str(&format!("if (!(${} =~ {} || ${} eq q{{}})) {{\n", output_var, generator.newline_end_regex(), output_var));
         generator.indent_level += 1;
         output.push_str(&generator.indent());
         output.push_str(&format!("${} .= \"\\n\";\n", output_var));
