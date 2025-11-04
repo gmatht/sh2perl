@@ -139,7 +139,7 @@ impl Generator {
         output.push_str("use strict;\n");
         output.push_str("use warnings;\n");
         output.push_str("use Carp;\n");
-        output.push_str("use English qw( -no_match_vars );\n");
+        output.push_str("use English qw(-no_match_vars);\n");
         output.push_str("use locale;\n");
         
         if needs_basename {
@@ -155,20 +155,20 @@ impl Generator {
             output.push_str("use Digest::SHA qw(sha256_hex sha512_hex);\n");
         }
         if needs_file_path {
-            output.push_str("use File::Path qw(make_path remove_tree);\n");
+            output.push_str("use File::Path  qw(make_path remove_tree);\n");
         }
         if needs_file_copy {
             output.push_str("use File::Copy qw(copy move);\n");
         }
         if needs_posix {
-            output.push_str("use POSIX qw(time);\n");
+            output.push_str("use POSIX      qw(time);\n");
         }
         output.push_str("\n");
         
         // Add main exit code variable for pipeline tracking
         // Always declare it since it's used in pipeline generation
         output.push_str("my $main_exit_code = 0;\n");
-        output.push_str("my $ls_success = 0;\n");
+        output.push_str("my $ls_success     = 0;\n");
         
         // Add global CHILD_ERROR variable for command substitution
         output.push_str("our $CHILD_ERROR;\n\n");
@@ -209,9 +209,8 @@ impl Generator {
         }
         
         // Add final exit statement
-        if needs_exit_code {
-            output.push_str("\nexit $main_exit_code;\n");
-        }
+        // Always exit with $main_exit_code since it's always declared
+        output.push_str("\nexit $main_exit_code;\n");
         
         // Ensure the output ends with a newline
         if !output.ends_with('\n') {
@@ -224,6 +223,11 @@ impl Generator {
             .map(|line| line.trim_end().to_string())
             .collect();
         output = cleaned_lines.join("\n");
+        
+        // Ensure the output ends with a newline (after cleanup)
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
         
         output
     }

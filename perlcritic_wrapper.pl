@@ -5,6 +5,7 @@ use Perl::Critic;
 use Perl::Tidy;
 use Digest::SHA qw(sha1_hex);
 use File::Spec;
+use File::Path qw(make_path);
 use File::stat;
 use Time::HiRes qw(gettimeofday tv_interval);
 
@@ -54,7 +55,7 @@ if ($file && -f $file) {
     
     # Check if cache directory exists, create if not
     unless (-d $cache_dir) {
-        mkdir -p $cache_dir or die "Cannot create cache directory $cache_dir: $!";
+        make_path($cache_dir) or die "Cannot create cache directory $cache_dir: $!";
     }
     
     # Check if cache file exists and is newer than perlcritic.conf
@@ -267,13 +268,15 @@ sub check_tidy {
     
     # Use the working minimal wrapper approach by calling it as a separate process
     my $perltidy_start = [gettimeofday];
-    my $tidy_output = `C:/Strawberry/perl/bin/perl.exe test_wrapper_minimal.pl $file`;
+    my $tidy_output = `C:/Strawberry/perl/bin/perl.exe test_wrapper_minimal.pl $file 2>&1`;
     my $perltidy_time = tv_interval($perltidy_start);
     print STDERR "perlcritic_wrapper: Perltidy subprocess took ${perltidy_time}s\n";
     
-    if ($? != 0) {
-        # If perltidy failed, fall back to the original violation
-        print "perltidy failed with exit code: $?\n";
+    my $wrapper_exit = $? >> 8;
+    if ($wrapper_exit != 0) {
+        # If wrapper script failed, that means perltidy had an actual error (exit code >= 2)
+        # Exit code 0 and 1 from perltidy are both acceptable (0 = perfect match, 1 = formatting differences)
+        print "perltidy wrapper failed with exit code: $wrapper_exit\n";
         return 1;
     }
     
@@ -294,10 +297,70 @@ sub check_tidy {
     
     # Compare original with tidied version
     if ($original ne $tidy_content) {
-        print "Code formatting differences detected:\n";
-        print "Original:\n$original\n";
-        print "Tidied:\n$tidy_content\n";
-        return 1;
+        # Normalize line endings for comparison
+        $original =~ s/\r\n/\n/g;
+        $tidy_content =~ s/\r\n/\n/g;
+        
+        if ($original ne $tidy_content) {
+            # Still different after normalizing - show differences
+            my @orig_lines = split /\n/, $original;
+            my @tidy_lines = split /\n/, $tidy_content;
+            my $max_diff = 30;  # Increased from 10 to show more differences
+            my $diff_count = 0;
+            
+            print STDERR "Code formatting differences detected:\n";
+            print STDERR "Original has " . scalar(@orig_lines) . " lines, Tidied has " . scalar(@tidy_lines) . " lines\n\n";
+            
+            for my $i (0..$#orig_lines) {
+                if ($i <= $#tidy_lines) {
+                    if ($orig_lines[$i] ne $tidy_lines[$i]) {
+                        if ($diff_count++ < $max_diff) {
+                            print STDERR "Line " . ($i+1) . " differs:\n";
+                            print STDERR "  Original: [" . $orig_lines[$i] . "]\n";
+                            print STDERR "  Tidied:   [" . ($tidy_lines[$i] // "(missing)") . "]\n";
+                            
+                            # Show character-by-character differences for short lines
+                            if (length($orig_lines[$i]) < 100 && length($tidy_lines[$i] // "") < 100) {
+                                my $orig_chars = $orig_lines[$i];
+                                my $tidy_chars = $tidy_lines[$i] // "";
+                                my @orig_chars = split //, $orig_chars;
+                                my @tidy_chars = split //, $tidy_chars;
+                                my $max_len = @orig_chars > @tidy_chars ? @orig_chars : @tidy_chars;
+                                my $diff_found = 0;
+                                for my $j (0..$max_len-1) {
+                                    my $o_char = $orig_chars[$j] // "[EOF]";
+                                    my $t_char = $tidy_chars[$j] // "[EOF]";
+                                    if ($o_char ne $t_char) {
+                                        if (!$diff_found) {
+                                            print STDERR "  First diff at position $j:\n";
+                                            $diff_found = 1;
+                                        }
+                                        print STDERR "    pos $j: orig='$o_char' vs tidied='$t_char'\n";
+                                        last if $j > $orig_chars[$j-1] && $j > $tidy_chars[$j-1];
+                                    }
+                                }
+                            }
+                            print STDERR "\n";
+                        }
+                    }
+                } else {
+                    if ($diff_count++ < $max_diff) {
+                        print STDERR "Line " . ($i+1) . " only in original: [$orig_lines[$i]]\n";
+                    }
+                }
+                last if $diff_count >= $max_diff;
+            }
+            if ($#orig_lines != $#tidy_lines) {
+                print STDERR "\nLine count differs: original has " . scalar(@orig_lines) . " lines, tidied has " . scalar(@tidy_lines) . " lines\n";
+                if ($#tidy_lines > $#orig_lines) {
+                    print STDERR "Additional lines in tidied version:\n";
+                    for my $i ($#orig_lines+1..$#tidy_lines) {
+                        print STDERR "  Line " . ($i+1) . ": [$tidy_lines[$i]]\n";
+                    }
+                }
+            }
+            return 1;
+        }
     }
     
     my $tidy_sub_time = tv_interval($tidy_sub_start);

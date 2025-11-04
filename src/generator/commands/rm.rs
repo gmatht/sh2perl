@@ -49,13 +49,13 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str("foreach my $file_to_remove (@files_to_remove) {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
-                output.push_str("if (-e $file_to_remove) {\n");
+                output.push_str("if ( -e $file_to_remove ) {\n");
                 generator.indent_level += 1;
                 
                 if recursive {
                     // Recursive removal
                     output.push_str(&generator.indent());
-                    output.push_str("if (-d $file_to_remove) {\n");
+                    output.push_str("if ( -d $file_to_remove ) {\n");
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
                     output.push_str("my $err;\n");
@@ -73,21 +73,27 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     }
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
-                    output.push_str("} else {\n");
+                    output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
                     // Silent operation - no output unless error
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
-                    output.push_str("} else {\n");
+                    output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
                     // File removal
                     output.push_str(&generator.indent());
-                    output.push_str("if (unlink $file_to_remove) {\n");
+                    output.push_str("if ( unlink $file_to_remove ) {\n");
                     output.push_str(&generator.indent());
                     output.push_str("local $CHILD_ERROR = 0;\n");
                     // Silent operation - no output unless error
                     output.push_str(&generator.indent());
-                    output.push_str("} else {\n");
+                    output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
                     generator.indent_level += 1;
                     if force {
                         output.push_str(&generator.indent());
@@ -110,7 +116,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 } else {
                     // Non-recursive removal
                     output.push_str(&generator.indent());
-                    output.push_str("if (-d $file_to_remove) {\n");
+                    output.push_str("if ( -d $file_to_remove ) {\n");
                     generator.indent_level += 1;
                     if force {
                         output.push_str(&generator.indent());
@@ -123,13 +129,17 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     }
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
-                    output.push_str("} else {\n");
+                    output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
-                    output.push_str("if (unlink $file_to_remove) {\n");
+                    output.push_str("if ( unlink $file_to_remove ) {\n");
                     // Silent operation - no output unless error
                     output.push_str(&generator.indent());
-                    output.push_str("} else {\n");
+                    output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
                     generator.indent_level += 1;
                     if force {
                         output.push_str(&generator.indent());
@@ -154,7 +164,9 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
-                output.push_str("} else {\n");
+                output.push_str("}\n");
+                output.push_str(&generator.indent());
+                output.push_str("else {\n");
                 generator.indent_level += 1;
                 if force {
                     output.push_str(&generator.indent());
@@ -183,74 +195,166 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 } else {
                     format!("\"{}\"", file)
                 };
-                output.push_str(&format!("if (-e {}) {{\n", quoted_file));
+                output.push_str(&format!("if ( -e {} ) {{\n", quoted_file));
+                generator.indent_level += 1;
                 
                 if recursive {
                     // Recursive removal
-                    output.push_str(&format!("if (-d {}) {{\n", quoted_file));
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("if ( -d {} ) {{\n", quoted_file));
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
                     output.push_str("my $err;\n");
+                    output.push_str(&generator.indent());
                     output.push_str(&format!("remove_tree({}, {{error => \\$err}});\n", quoted_file));
+                    output.push_str(&generator.indent());
                     output.push_str("if (@{$err}) {\n");
+                    generator.indent_level += 1;
                     if force {
+                        output.push_str(&generator.indent());
                         output.push_str(&format!("carp \"rm: carping: could not remove \", {}, \": $err->[0]\\n\";\n", file));
                     } else {
+                        output.push_str(&generator.indent());
                         output.push_str(&format!("croak \"rm: cannot remove \", {}, \": $err->[0]\\n\";\n", file));
                     }
-                    output.push_str("} else {\n");
-                    // Silent operation - no output unless error
-                    output.push_str("$main_exit_code = 0;\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
                     output.push_str("}\n");
-                    output.push_str("} else {\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
+                    // Silent operation - no output unless error
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("$main_exit_code = 0;\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
                     // File removal
-                    output.push_str(&format!("if (unlink {}) {{\n", quoted_file));
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("if ( unlink {} ) {{\n", quoted_file));
+                    generator.indent_level += 1;
                     // Silent operation - no output unless error
+                    output.push_str(&generator.indent());
                     output.push_str("$main_exit_code = 0;\n");
-                    output.push_str("} else {\n");
-                    if force {
-                        output.push_str(&format!("carp \"rm: carping: could not remove \", {},\n", file));
-                        output.push_str("    \": $OS_ERROR\\n\";\n");
-                    } else {
-                        output.push_str(&format!("croak \"rm: cannot remove \", {},\n", file));
-                        output.push_str("    \": $OS_ERROR\\n\";\n");
-                    }
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
                     output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
+                    generator.indent_level += 1;
+                    if force {
+                        output.push_str(&generator.indent());
+                        let carp_line = format!("carp \"rm: carping: could not remove \", {},", file);
+                        output.push_str(&format!("{}\n", carp_line));
+                        // Perltidy wants continuation lines aligned - deeper nesting needs more spaces
+                        // For nesting level 3 (12 base spaces), continuation should be 14 spaces
+                        output.push_str("              ");
+                        output.push_str("\": $OS_ERROR\\n\";\n");
+                    } else {
+                        output.push_str(&generator.indent());
+                        let croak_line = format!("croak \"rm: cannot remove \", {},", file);
+                        output.push_str(&format!("{}\n", croak_line));
+                        // Perltidy wants continuation lines aligned - deeper nesting needs more spaces
+                        // For nesting level 3 (12 base spaces), continuation should be 14 spaces
+                        output.push_str("              ");
+                        output.push_str("\": $OS_ERROR\\n\";\n");
+                    }
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
                     output.push_str("}\n");
                 } else {
                     // Non-recursive removal
-                    output.push_str(&format!("if (-d {}) {{\n", quoted_file));
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("if ( -d {} ) {{\n", quoted_file));
+                    generator.indent_level += 1;
                     if force {
-                        output.push_str(&format!("carp \"rm: carping: \", {},\n", file));
-                        output.push_str("    \" is a directory (use -r to remove recursively)\\n\";\n");
+                        output.push_str(&generator.indent());
+                        let carp_line = format!("carp \"rm: carping: \", {},", file);
+                        output.push_str(&format!("{}\n", carp_line));
+                        // Perltidy wants continuation lines aligned to column 10
+                        output.push_str("          ");
+                        output.push_str("\" is a directory (use -r to remove recursively)\\n\";\n");
                     } else {
-                        output.push_str(&format!("croak \"rm: \", {},\n", file));
-                        output.push_str("    \" is a directory (use -r to remove recursively)\\n\";\n");
+                        output.push_str(&generator.indent());
+                        let croak_line = format!("croak \"rm: \", {},", file);
+                        output.push_str(&format!("{}\n", croak_line));
+                        // Perltidy wants continuation lines aligned to column 10
+                        output.push_str("          ");
+                        output.push_str("\" is a directory (use -r to remove recursively)\\n\";\n");
                     }
-                    output.push_str("} else {\n");
-                    output.push_str(&format!("if (unlink {}) {{\n", quoted_file));
-                    // Silent operation - no output unless error
-                    output.push_str("$main_exit_code = 0;\n");
-                    output.push_str("} else {\n");
-                    if force {
-                        output.push_str(&format!("carp \"rm: carping: could not remove \", {},\n", file));
-                        output.push_str("    \": $OS_ERROR\\n\";\n");
-                    } else {
-                        output.push_str(&format!("croak \"rm: cannot remove \", {},\n", file));
-                        output.push_str("    \": $OS_ERROR\\n\";\n");
-                    }
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
                     output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
+                    generator.indent_level += 1;
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("if ( unlink {} ) {{\n", quoted_file));
+                    generator.indent_level += 1;
+                    // Silent operation - no output unless error
+                    output.push_str(&generator.indent());
+                    output.push_str("$main_exit_code = 0;\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("else {\n");
+                    generator.indent_level += 1;
+                    if force {
+                        output.push_str(&generator.indent());
+                        let carp_line = format!("carp \"rm: carping: could not remove \", {},", file);
+                        output.push_str(&format!("{}\n", carp_line));
+                        // Perltidy wants continuation lines aligned - deeper nesting needs more spaces
+                        // For nesting level 3 (12 base spaces), continuation should be 14 spaces
+                        output.push_str("              ");
+                        output.push_str("\": $OS_ERROR\\n\";\n");
+                    } else {
+                        output.push_str(&generator.indent());
+                        let croak_line = format!("croak \"rm: cannot remove \", {},", file);
+                        output.push_str(&format!("{}\n", croak_line));
+                        // Perltidy wants continuation lines aligned - deeper nesting needs more spaces
+                        // For nesting level 3 (12 base spaces), continuation should be 14 spaces
+                        output.push_str("              ");
+                        output.push_str("\": $OS_ERROR\\n\";\n");
+                    }
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("}\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
                     output.push_str("}\n");
                 }
                 
-                output.push_str("} else {\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                output.push_str(&generator.indent());
+                output.push_str("else {\n");
+                generator.indent_level += 1;
                 if force {
+                    output.push_str(&generator.indent());
                     output.push_str("local $CHILD_ERROR = 0;\n");
-                    output.push_str(&format!("carp \"rm: carping: \", {},\n", file));
-                    output.push_str("    \": No such file or directory\\n\";\n");
+                    output.push_str(&generator.indent());
+                    // Perltidy prefers single-line statements when possible
+                    output.push_str(&format!("carp \"rm: carping: \", {}, \": No such file or directory\\n\";\n", file));
                 } else {
+                    output.push_str(&generator.indent());
                     output.push_str("local $CHILD_ERROR = 1;\n");
-                    output.push_str(&format!("croak \"rm: \", {},\n", file));
-                    output.push_str("    \": No such file or directory\\n\";\n");
+                    output.push_str(&generator.indent());
+                    // Perltidy prefers single-line statements when possible
+                    output.push_str(&format!("croak \"rm: \", {}, \": No such file or directory\\n\";\n", file));
                 }
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
                 output.push_str("}\n");
             }
         }

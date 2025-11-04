@@ -29,13 +29,15 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
     // If we have a filename, always read from file (even in pipeline context)
     if !filename.is_empty() {
         output.push_str(&format!("my $input_data;\n"));
-        output.push_str(&format!("if (open my $fh, '<', '{}') {{\n", filename));
-        output.push_str("local $INPUT_RECORD_SEPARATOR = undef;  # Read entire file at once\n");
-        output.push_str("$input_data = <$fh>;\n");
-        output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
-        output.push_str("} else {\n");
-        output.push_str(&format!("print {{*STDERR}} \"strings: '{}': No such file\\n\";\n", filename));
-        output.push_str("$input_data = q{};\n");
+        output.push_str(&format!("if ( open my $fh, '<', '{}' ) {{\n", filename));
+        output.push_str("    local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once\n");
+        output.push_str("    $input_data = <$fh>;\n");
+        output.push_str("    close $fh\n");
+        output.push_str("      or croak \"Close failed: $ERRNO\";\n");
+        output.push_str("}\n");
+        output.push_str("else {\n");
+        output.push_str(&format!("    print {{*STDERR}} \"strings: '{}': No such file\\n\";\n", filename));
+        output.push_str("    $input_data = q{};\n");
         output.push_str("}\n");
     } else {
         // For pipeline context or no filename, use input_var
@@ -50,9 +52,9 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
     output.push_str("my @result;\n");
     output.push_str("my @lines = split /\\n/msx, $input_data;\n");
     output.push_str("for my $line (@lines) {\n");
-    output.push_str("if (length $line >= 4) {\n");
-    output.push_str("push @result, $line;\n");
-    output.push_str("}\n");
+    output.push_str("    if ( length $line >= 4 ) {\n");
+    output.push_str("        push @result, $line;\n");
+    output.push_str("    }\n");
     output.push_str("}\n");
     output.push_str("my $line = join \"\\n\", @result;\n");
     if !output_var.is_empty() {

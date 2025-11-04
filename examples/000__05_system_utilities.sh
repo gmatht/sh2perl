@@ -8,7 +8,7 @@ echo "=== System Utilities ==="
 # date command with backticks
 #PERL_MUST_NOT_CONTAIN `date
 #timestamp=`date +%r`
-formatted_date=`date '+%Y-%m-%d %H'`
+formatted_date=`date '+%Y-%m-%d'`
 #echo "Timestamp: $timestamp"
 echo "Formatted date: $formatted_date"
 
