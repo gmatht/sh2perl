@@ -236,7 +236,7 @@ pub fn generate_grep_command(generator: &mut Generator, cmd: &SimpleCommand, inp
                 output.push_str(&format!("sub find_files_recursive_{} {{\n", command_index));
                 output.push_str(&format!("    my ($dir, $pattern) = @_;\n"));
                 output.push_str(&format!("    my @files;\n"));
-                output.push_str(&format!("    if (opendir my $dh, $dir) {{\n"));
+                output.push_str(&format!("    if ( opendir my $dh, $dir ) {{\n"));
                 output.push_str(&format!("        while (my $file = readdir $dh) {{\n"));
                 output.push_str(&format!("            next if $file eq '.' || $file eq '..';\n"));
                 output.push_str(&format!("            my $path = \"$dir/$file\";\n"));

@@ -254,7 +254,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 
                 // Write the output to the temporary file
                 output.push_str(&generator.indent());
-                output.push_str(&format!("use File::Path  qw(make_path);\n"));
+                output.push_str(&format!("use File::Path qw(make_path);\n"));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $temp_dir_{}_{} = dirname(${});\n", global_counter, temp_file_counter, temp_var));
                 output.push_str(&generator.indent());

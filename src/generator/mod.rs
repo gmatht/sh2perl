@@ -133,6 +133,7 @@ impl Generator {
         let needs_file_path = self.needs_file_path_import(ast);
         let needs_file_copy = self.needs_file_copy_import(ast);
         let needs_posix = self.needs_posix_import(ast);
+        let needs_capture_tiny = self.needs_capture_tiny_import(ast);
         
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
@@ -152,16 +153,29 @@ impl Generator {
             // No additional imports needed for glob-based approach
         }
         if needs_digest_sha {
-            output.push_str("use Digest::SHA qw(sha256_hex sha512_hex);\n");
+            output.push_str("use Digest::SHA   qw(sha256_hex sha512_hex);\n");
         }
         if needs_file_path {
-            output.push_str("use File::Path  qw(make_path remove_tree);\n");
+            // Align with other use statements - 2 spaces when Digest::SHA is present, 1 space otherwise
+            if needs_digest_sha {
+                output.push_str("use File::Path    qw(make_path remove_tree);\n");
+            } else {
+                output.push_str("use File::Path qw(make_path remove_tree);\n");
+            }
         }
         if needs_file_copy {
-            output.push_str("use File::Copy qw(copy move);\n");
+            // Use 2 spaces when Digest::SHA is present for column alignment, 1 space otherwise
+            if needs_digest_sha {
+                output.push_str("use File::Copy  qw(copy move);\n");
+            } else {
+                output.push_str("use File::Copy qw(copy move);\n");
+            }
         }
         if needs_posix {
             output.push_str("use POSIX      qw(time);\n");
+        }
+        if needs_capture_tiny {
+            output.push_str("use Capture::Tiny qw(capture_stdout);\n");
         }
         output.push_str("\n");
         
@@ -1254,6 +1268,16 @@ impl Generator {
         false
     }
 
+    /// Check if the AST needs Capture::Tiny import
+    fn needs_capture_tiny_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_capture_tiny(command) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if a specific command needs File::Copy
     fn command_needs_file_copy(&self, command: &Command) -> bool {
         match command {
@@ -1325,6 +1349,85 @@ impl Generator {
         match word {
             Word::CommandSubstitution(cmd, _) => {
                 self.command_needs_file_copy(cmd)
+            },
+            _ => false
+        }
+    }
+
+    /// Check if a specific command needs Capture::Tiny
+    fn command_needs_capture_tiny(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                // Check if it's a perl command with -e flag
+                if let Word::Literal(name, _) = &cmd.name {
+                    if name == "perl" && cmd.args.len() >= 2 {
+                        if let Word::Literal(flag, _) = &cmd.args[0] {
+                            if flag == "-e" {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                
+                // Check command substitutions in environment variables
+                for (_, word) in &cmd.env_vars {
+                    if self.word_needs_capture_tiny(word) {
+                        return true;
+                    }
+                }
+                
+                false
+            },
+            Command::Pipeline(pipeline) => {
+                for cmd in &pipeline.commands {
+                    if self.command_needs_capture_tiny(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::And(left, right) | Command::Or(left, right) => {
+                self.command_needs_capture_tiny(left) || self.command_needs_capture_tiny(right)
+            },
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_capture_tiny(&redirect_cmd.command)
+            },
+            Command::For(for_loop) => {
+                for cmd in &for_loop.body.commands {
+                    if self.command_needs_capture_tiny(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::While(while_loop) => {
+                for cmd in &while_loop.body.commands {
+                    if self.command_needs_capture_tiny(cmd) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Command::If(if_stmt) => {
+                if self.command_needs_capture_tiny(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_capture_tiny(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false
+        }
+    }
+
+    /// Check if a word contains command substitutions that need Capture::Tiny
+    fn word_needs_capture_tiny(&self, word: &Word) -> bool {
+        match word {
+            Word::CommandSubstitution(cmd, _) => {
+                self.command_needs_capture_tiny(cmd)
             },
             _ => false
         }

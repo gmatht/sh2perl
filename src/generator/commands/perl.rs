@@ -127,7 +127,6 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         // Handle perl -e commands by executing the code directly
         let code = &args_list[1];
         output.push_str(&format!("my ${} = do {{ 
-            use Capture::Tiny qw(capture_stdout);
             my $result;
             my $eval_success = eval {{
                 $result = capture_stdout( sub {{ {} }} );
@@ -287,7 +286,6 @@ pub fn generate_perl_pipeline_command(generator: &mut Generator, cmd: &SimpleCom
             // Handle perl -e commands by executing the code directly
             let code = &args_list[1];
             output.push_str(&format!("my ${} = do {{ 
-                use Capture::Tiny qw(capture_stdout);
                 my $result;
                 my $eval_success = eval {{
                     $result = capture_stdout(sub {{ {} }});

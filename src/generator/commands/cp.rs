@@ -118,11 +118,13 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str(&generator.indent());
                     output.push_str("utime $atime, $mtime, $dest;\n");
                 }
-                output.push_str(&generator.indent());
-                output.push_str(&format!("print \"cp: copied {} to $dest\\n\";\n", source));
+                // Empty if block - perltidy wants blank line
+                output.push_str("\n");
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
-                output.push_str("} else {\n");
+                output.push_str("}\n");
+                output.push_str(&generator.indent());
+                output.push_str("else {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str(&format!("die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n", source));
@@ -153,11 +155,13 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str(&generator.indent());
                     output.push_str("utime $atime, $mtime, $dest;\n");
                 }
-                output.push_str(&generator.indent());
-                output.push_str(&format!("print \"cp: copied {} to $dest\\n\";\n", source));
+                // Empty if block - perltidy wants blank line
+                output.push_str("\n");
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
-                output.push_str("} else {\n");
+                output.push_str("}\n");
+                output.push_str(&generator.indent());
+                output.push_str("else {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str(&format!("die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n", source));
@@ -168,7 +172,9 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
-            output.push_str("} else {\n");
+            output.push_str("}\n");
+            output.push_str(&generator.indent());
+            output.push_str("else {\n");
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str(&format!("die \"cp: {}: No such file or directory\\n\";\n", source));

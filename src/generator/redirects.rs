@@ -35,7 +35,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 let escaped_body = body.replace("'", "\\'");
                 output.push_str(&format!("my $temp_content = '{}';\n", escaped_body));
                 let fh = generator.get_unique_file_handle();
-                output.push_str(&format!("use File::Path  qw(make_path);\n"));
+                output.push_str(&format!("use File::Path qw(make_path);\n"));
                 let temp_dir = get_temp_dir();
                 output.push_str(&format!("if (!-d {}) {{ make_path({}); }}\n", temp_dir, temp_dir));
                 output.push_str(&format!("open my ${}, '>', {} . '/heredoc_temp' or croak \"Cannot create temp file: $OS_ERROR\\n\";\n", fh, temp_dir));
