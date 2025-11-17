@@ -211,7 +211,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                 generator.indent_level += 1;
                 // For directories, list their contents
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (opendir my $dh, {}) {{\n", file_literal));
+                output.push_str(&format!("if ( opendir my $dh, {} ) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str("while ( my $file = readdir $dh ) {\n");
@@ -301,7 +301,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
                 generator.indent_level += 1;
                 // For directories, list their contents
                 output.push_str(&generator.indent());
-                output.push_str(&format!("if (opendir my $dh, {}) {{\n", file_literal));
+                output.push_str(&format!("if ( opendir my $dh, {} ) {{\n", file_literal));
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 output.push_str("while ( my $file = readdir $dh ) {\n");
@@ -365,7 +365,7 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
         if has_file_args {
             output.push_str(&format!("my $expected_count = {};\n", file_args.len()));
             output.push_str(&generator.indent());
-            output.push_str(&format!("if (@{} == $expected_count) {{\n", array_name));
+            output.push_str(&format!("if ( @{} == $expected_count ) {{\n", array_name));
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str("local $CHILD_ERROR = 0;\n");
@@ -373,7 +373,9 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
             output.push_str("$ls_success = 1;\n");
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
-            output.push_str("} else {\n");
+            output.push_str("}\n");
+            output.push_str(&generator.indent());
+            output.push_str("else {\n");
             generator.indent_level += 1;
             output.push_str(&generator.indent());
             output.push_str("local $CHILD_ERROR = 2;\n");
@@ -390,7 +392,9 @@ pub fn generate_ls_command(generator: &mut Generator, cmd: &SimpleCommand, pipel
         }
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
-        output.push_str("} else {\n");
+        output.push_str("}\n");
+        output.push_str(&generator.indent());
+        output.push_str("else {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
         output.push_str("local $CHILD_ERROR = 1;\n");

@@ -5,13 +5,6 @@ use Getopt::Long;
 use IPC::Open3;
 use Symbol 'gensym';
 
-# Try to load PPI, die if not available
-eval {
-    require PPI;
-    require PPI::Find;
-    1;
-} or die "Error: PPI is required but not available. Install with: cpan PPI\n";
-
 # Command line options
 my $help = 0;
 my $verbose = 0;
@@ -31,6 +24,13 @@ if ($help) {
     print_help();
     exit 0;
 }
+
+# Try to load PPI, die if not available (after help check so --help works without PPI)
+eval {
+    require PPI;
+    require PPI::Find;
+    1;
+} or die "Error: PPI is required but not available. Install with: cpan PPI\n";
 
 # Get input file from command line
 my $input_file = shift @ARGV;

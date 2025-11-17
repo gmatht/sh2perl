@@ -27,7 +27,7 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     if directories.is_empty() {
         output.push_str("croak \"mkdir: missing operand\\n\";\n");
     } else {
-        output.push_str("use File::Path  qw(make_path);\n");
+        output.push_str("use File::Path qw(make_path);\n");
         if !generator.declared_locals.contains("err") {
             output.push_str("my $err;\n");
             generator.declared_locals.insert("err".to_string());

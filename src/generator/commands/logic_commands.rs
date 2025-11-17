@@ -199,10 +199,32 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                     // For ls commands in logical OR, generate the command and check if files were found
                     output.push_str(&generator.generate_command(left));
                     output.push_str(&generator.indent());
-                    output.push_str("if (!defined $ls_success || $ls_success == 0) {\n");
+                    output.push_str("if ( !defined $ls_success || $ls_success == 0 ) {\n");
                     generator.indent_level += 1;
-                    output.push_str(&generator.indent());
-                    output.push_str(&generator.generate_command(right));
+                    // Right command should be indented inside the if block (4 spaces)
+                    // The echo command generates code with its own indentation based on indent_level
+                    // We need to ensure it generates with no indentation, then add exactly 4 spaces
+                    // Save the current indent_level (which is now 1 after the increment above)
+                    let saved_indent = generator.indent_level;
+                    // Set indent_level to 0 so echo generates with no indentation
+                    generator.indent_level = 0;
+                    let right_cmd_raw = generator.generate_command(right);
+                    // Restore indent level  
+                    generator.indent_level = saved_indent;
+                    // The echo command may generate code with indentation even when indent_level=0
+                    // We MUST strip ALL leading whitespace from every line and add exactly 4 spaces
+                    // Process each line: remove ALL leading whitespace, then add exactly 4 spaces
+                    for line in right_cmd_raw.lines() {
+                        // Remove ALL leading whitespace using trim_start
+                        let trimmed = line.trim_start();
+                        if !trimmed.is_empty() {
+                            // CRITICAL: Add exactly 4 spaces (literal string), not using generator.indent()
+                            // This ensures we always have exactly 4 spaces, regardless of what the echo command generated
+                            output.push_str("    ");
+                            output.push_str(trimmed);
+                            output.push_str("\n");
+                        }
+                    }
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
@@ -217,7 +239,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                         // For ls commands in logical OR, generate the command and check if files were found
                         output.push_str(&generator.generate_command(left));
                         output.push_str(&generator.indent());
-                        output.push_str("if (!defined $ls_success || $ls_success == 0) {\n");
+                        output.push_str("if ( !defined $ls_success || $ls_success == 0 ) {\n");
                         generator.indent_level += 1;
                         output.push_str(&generator.indent());
                         output.push_str(&generator.generate_command(right));

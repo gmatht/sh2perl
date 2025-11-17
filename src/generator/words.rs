@@ -255,7 +255,6 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         // Execute Perl code directly instead of using open3
                                         // Use capture_stdout to capture the output of print statements
                                         format!("do {{ 
-    use Capture::Tiny qw(capture_stdout);
     my $result;
     my $eval_success = eval {{
         $result = capture_stdout( sub {{ {} }} );
@@ -605,7 +604,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         // Execute Perl code directly instead of using open3
                                         // Use capture_stdout to capture the output of print statements
                                         // Format for command substitution - content should have 4-space indentation inside do { }
-                                        format!("do {{\n    use Capture::Tiny qw(capture_stdout);\n    my $result;\n    my $eval_success = eval {{\n        $result = capture_stdout(sub {{ {} }});\n        1;\n    }};\n    if (!$eval_success) {{\n        $result = \"Error executing Perl code: $EVAL_ERROR\";\n    }}\n    $result;\n}}", clean_code)
+                                        format!("do {{\n    my $result;\n    my $eval_success = eval {{\n        $result = capture_stdout(sub {{ {} }});\n        1;\n    }};\n    if (!$eval_success) {{\n        $result = \"Error executing Perl code: $EVAL_ERROR\";\n    }}\n    $result;\n}}", clean_code)
                                     } else {
                                         // For other perl commands, use system call as fallback
                                         let args: Vec<String> = simple_cmd.args.iter()
@@ -666,16 +665,22 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let formatted_code = formatted_lines.join("\n")
                                 .replace("print ", "# print ")
                                 .replace("die ", "croak ");
+                            // Ensure formatted_code ends with a newline for proper formatting
+                            let formatted_code = if formatted_code.ends_with('\n') {
+                                formatted_code
+                            } else {
+                                format!("{}\n", formatted_code)
+                            };
                             // The do block is nested inside another do block (my $left_result_0 = do {)
                             // So we need to account for that extra indentation level
-                            // generator.indent() is at the outer do block level (4 spaces)
-                            // We need indent1 for the inner do block level (8 spaces)
-                            let outer_indent = generator.indent();
-                            let indent1 = format!("{}{}", outer_indent, "    "); // 8 spaces for inner do block
-                            let indent2 = format!("{}{}", indent1, "    "); // 12 spaces for eval block
-                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}    }};\n{}    if ( !$eval_result ) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
-                                indent1, indent1, formatted_code, indent2, indent2, 
-                                indent1, indent1, indent1, indent1, indent1)
+                            // Fixed indentation: outer do block at 4 spaces, inner do block at 8 spaces, eval at 12 spaces
+                            // We use fixed indentation to ensure consistency regardless of generator.indent_level
+                            let indent1 = "    ".to_string(); // 4 spaces for outer do block
+                            let indent1_do = "        ".to_string(); // 8 spaces for inner do block
+                            let indent2 = "            ".to_string(); // 12 spaces for eval block
+                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                                indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
+                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "mv" {
                             // Use native Perl mv implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native mv implementation for command substitution");
@@ -686,7 +691,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let indent1 = generator.indent();
                             let indent2 = format!("{}{}", generator.indent(), "    ");
                             let _indent3 = format!("{}{}", indent2, "    ");
-                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if (!$eval_result) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
+                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if ( !$eval_result ) {{\n{}        local $CHILD_ERROR = 256;\n{}    }}\n{}    q{{}};\n}}", 
                                 indent1, indent1, indent2, formatted_code, indent2, indent2, 
                                 indent1, indent1, indent1, indent1, indent1)
                         } else if name == "rm" {
@@ -699,7 +704,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let indent1 = generator.indent();
                             let indent2 = format!("{}{}", generator.indent(), "    ");
                             let _indent3 = format!("{}{}", indent2, "    ");
-                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if (!$eval_result) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
+                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if ( !$eval_result ) {{\n{}        local $CHILD_ERROR = 256;\n{}    }}\n{}    q{{}};\n}}", 
                                 indent1, indent1, indent2, formatted_code, indent2, indent2, 
                                 indent1, indent1, indent1, indent1, indent1)
                         } else if name == "mkdir" {
@@ -725,7 +730,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let indent1 = generator.indent();
                             let indent2 = format!("{}{}", generator.indent(), "    ");
                             let _indent3 = format!("{}{}", indent2, "    ");
-                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if (!$eval_result) {{\n{}        local $CHILD_ERROR = 256;\n{}    }};\n{}    q{{}};\n}}", 
+                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if ( !$eval_result ) {{\n{}        local $CHILD_ERROR = 256;\n{}    }}\n{}    q{{}};\n}}", 
                                 indent1, indent1, indent2, formatted_code, indent2, indent2, 
                                 indent1, indent1, indent1, indent1, indent1)
                         } else if name == "time" {
@@ -803,8 +808,26 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     // Generate code that executes left command, checks exit code, then executes right if successful
                     // The result is the concatenation of outputs from both commands (if both succeed)
                     // If left command fails, return empty string (shell behavior)
-                    format!("do {{\n    my $left_result_{} = {};\n    if ($CHILD_ERROR == 0) {{\n        my $right_result_{} = {};\n        $left_result_{} . $right_result_{};\n    }} else {{\n        q{{}};\n    }}\n}}", 
-                        unique_id, left_result, unique_id, right_result, unique_id, unique_id)
+                    // left_result is a complete "do { ... };" block
+                    // We need to extract just the block content (without the closing "};")
+                    // The closing "};" will be added with proper indentation (4 spaces)
+                    let left_trimmed = left_result.trim_end();
+                    let left_content = if left_trimmed.ends_with("};") {
+                        // Remove the closing "};" - find the last "};" and remove it
+                        let mut chars: Vec<char> = left_trimmed.chars().collect();
+                        // Remove last 2 characters (};)
+                        chars.truncate(chars.len().saturating_sub(2));
+                        chars.iter().collect::<String>().trim_end().to_string()
+                    } else if left_trimmed.ends_with('}') {
+                        // Remove the closing "}"
+                        let mut chars: Vec<char> = left_trimmed.chars().collect();
+                        chars.truncate(chars.len().saturating_sub(1));
+                        chars.iter().collect::<String>().trim_end().to_string()
+                    } else {
+                        left_trimmed.to_string()
+                    };
+                    format!("do {{\n    my $left_result_{} = {}\n    }};\n    if ( $CHILD_ERROR == 0 ) {{\n        my $right_result_{} = {};\n        $left_result_{} . $right_result_{};\n    }}\n    else {{\n        q{{}};\n    }}\n}}", 
+                        unique_id, left_content, unique_id, right_result, unique_id, unique_id)
                 },
                 _ => {
                     // For other command types, use system command fallback

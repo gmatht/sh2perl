@@ -99,7 +99,7 @@ close {} or croak 'Close failed: $OS_ERROR';
 my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
 close {} or croak 'Close failed: $OS_ERROR';
 waitpid {}, 0;\n", in_var, pid_var, in_var, out_var, err_var, gzip_cmd, in_var, out_var, out_var, pid_var));
-                output.push_str("if ($CHILD_ERROR == 0) {\n");
+                output.push_str("if ( $CHILD_ERROR == 0 ) {\n");
                 output.push_str(&format!("push @results, \"Compressed: {}\";\n", file));
                 output.push_str("} else {\n");
                 output.push_str(&format!("push @results, \"Failed to compress: {}\";\n", file));

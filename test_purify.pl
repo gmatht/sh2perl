@@ -181,7 +181,8 @@ my $start_time = time();
 
 # Test that purify.pl can handle the --help option
 debug_print(1, "Testing purify.pl --help...");
-my ($help_output, $help_result) = run_backticks_with_timeout("/c/Strawberry/perl/bin/perl.exe purify.pl --help 2>&1", 'purify_help', "purify.pl help test");
+my $perl_cmd = $^O eq 'MSWin32' ? "C:\\Strawberry\\perl\\bin\\perl.exe" : "perl";
+my ($help_output, $help_result) = run_backticks_with_timeout("$perl_cmd purify.pl --help 2>&1", 'purify_help', "purify.pl help test");
 if ($help_result != 0) {
     debug_print(1, "Error: purify.pl --help failed (exit code: $help_result)");
     debug_print(1, "Error output: $help_output");
@@ -203,7 +204,7 @@ foreach my $perl_file (@test_files) {
         
         # Test purify.pl on the Perl file and capture output
         debug_print(2, "Running purify.pl on $perl_file");
-        my ($output, $purify_result) = run_backticks_with_timeout("/c/Strawberry/perl/bin/perl.exe purify.pl \"$perl_file\" > \"$pure_file\" 2>&1", 'purify_execution', "purify.pl execution");
+        my ($output, $purify_result) = run_backticks_with_timeout("$perl_cmd purify.pl \"$perl_file\" > \"$pure_file\" 2>&1", 'purify_execution', "purify.pl execution");
         debug_print(2, "purify.pl result: $purify_result");
         
         if ($purify_result == 0) {
@@ -211,15 +212,9 @@ foreach my $perl_file (@test_files) {
 
             # Check if purified file still contains system calls or backticks
             debug_print(2, "Checking if $pure_file still contains system calls or backticks");
-            my $grep_command;
-            if ($^O eq 'MSWin32') {
-                # Use findstr on Windows - escape the backtick and use simpler pattern
-                $grep_command = "findstr /R \"system\\|`\" \"$pure_file\"";
-            } else {
-                # Use grep on Unix systems
-                $grep_command = "grep -e '(system|`)' \"$pure_file\"";
-            }
-            my $grep_result = run_system_with_timeout($grep_command, 'grep_check', "grep check");
+            # Use Perl to check for system calls and backticks (works on all platforms)
+            my $check_script = qq{$perl_cmd -ne "if (/system|\\`/) { exit 1; }" "$pure_file"};
+            my $grep_result = run_system_with_timeout($check_script, 'grep_check', "grep check");
             if ( $grep_result == 0 ){
                 debug_print(1, "Failed to Purify $pure_file - still contains system calls or backticks");
                 exit;
@@ -228,12 +223,12 @@ foreach my $perl_file (@test_files) {
 
             # Run original file
             debug_print(2, "Running original file: $perl_file");
-            my ($out1, $perl1_result) = run_backticks_with_timeout("/c/Strawberry/perl/bin/perl.exe \"$perl_file\" > out1.txt 2>&1", 'perl_execution', "original file execution");
+            my ($out1, $perl1_result) = run_backticks_with_timeout("$perl_cmd \"$perl_file\" > out1.txt 2>&1", 'perl_execution', "original file execution");
             debug_print(2, "Original file execution result: $perl1_result");
             
             # Run purified file
             debug_print(2, "Running purified file: $pure_file");
-            my ($out2, $perl2_result) = run_backticks_with_timeout("/c/Strawberry/perl/bin/perl.exe \"$pure_file\" > out2.txt 2>&1", 'perl_execution', "purified file execution");
+            my ($out2, $perl2_result) = run_backticks_with_timeout("$perl_cmd \"$pure_file\" > out2.txt 2>&1", 'perl_execution', "purified file execution");
             debug_print(2, "Purified file execution result: $perl2_result");
 
             # Compare outputs by reading the actual files
