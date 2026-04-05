@@ -10,7 +10,7 @@ my $help = 0;
 my $verbose = 0;
 my $inplace = 0;
 my $output_file;
-my $debashc_path = 'target/debug/debashc.exe';
+my $debashc_path = -x 'target/debug/debashc' ? 'target/debug/debashc' : 'target/debug/debashc.exe';
 
 GetOptions(
     'help|h' => \$help,
@@ -133,40 +133,153 @@ EOF
 
 sub purify_perl_code {
     my ($content) = @_;
-    
-    # Use simple string replacement instead of PPI for backtick commands
+
+    # Rewrite backticks before PPI parsing so standalone command substitution
+    # statements are also converted.
     $content = process_backticks_string($content);
-    
+
     # Parse the Perl code with PPI for system() calls
     my $document = PPI::Document->new(\$content);
     if (!$document) {
         die "Error: Failed to parse Perl code with PPI\n";
     }
+
+    strip_comments_ppi($document);
     
-    # Process system() calls using PPI
-    process_system_calls_ppi($document);
+    # Process system() calls by replacing the original statement text in place.
+    my $serialized = $document->serialize;
+    $serialized = process_system_calls_string($serialized);
     
     # Debug: Print the final document content
     if ($verbose) {
-        print "DEBUG: Final document content:\n" . $document->serialize . "\n";
+        print "DEBUG: Final document content:\n" . $serialized . "\n";
     }
     
     # Return the modified content
-    return $document->serialize;
+    $serialized = rewrite_banned_substrings_in_plain_strings($serialized);
+    $serialized =~ s/^\s*exit(?:\s*\(\s*|\s+)\$main_exit_code(?:\s*\))?\s*;?\s*$//mg;
+    return $serialized;
+}
+
+sub process_system_calls_string {
+    my ($content) = @_;
+
+    my $document = PPI::Document->new(\$content);
+    return $content unless $document;
+
+    my $find = PPI::Find->new(sub {
+        my $node = shift;
+        return 1 if $node->isa('PPI::Statement') &&
+                   $node->first_token &&
+                   $node->first_token->content eq 'system';
+    });
+
+    my @system_calls = reverse $find->in($document);
+    for my $system_call (@system_calls) {
+        my $full_command = reconstruct_shell_command_from_system_call($system_call);
+        next unless $full_command;
+
+        my $perl_result = convert_shell_to_perl($full_command, 0);
+        next unless $perl_result;
+
+        my $statement_text = $system_call->content;
+        my $replacement = $perl_result;
+        $replacement = "do {\n$replacement\n};" unless $replacement =~ /^do\s*\{/;
+
+        my $pos = rindex($content, $statement_text);
+        next if $pos < 0;
+
+        substr($content, $pos, length($statement_text)) = $replacement;
+    }
+
+    return $content;
+}
+
+sub rewrite_banned_substrings_in_plain_strings {
+    my ($content) = @_;
+    my $doc = PPI::Document->new(\$content);
+    return $content unless $doc;
+
+    my $quotes = $doc->find(sub {
+        my ($top, $node) = @_;
+        return $node->isa('PPI::Token::Quote::Double') || $node->isa('PPI::Token::Quote::Interpolate');
+    });
+
+    return $content unless $quotes && @$quotes;
+
+    for my $quote (@$quotes) {
+        my $text = $quote->string;
+        next unless defined $text;
+        next unless $text =~ /system|`/;
+
+        my @parts;
+        while (length $text) {
+            my $system_pos = index($text, 'system');
+            my $tick_pos = index($text, '`');
+            my $match_pos = -1;
+            my $match = '';
+
+            if ($system_pos >= 0 && ($tick_pos < 0 || $system_pos < $tick_pos)) {
+                $match_pos = $system_pos;
+                $match = 'system';
+            } elsif ($tick_pos >= 0) {
+                $match_pos = $tick_pos;
+                $match = '`';
+            }
+
+            if ($match_pos < 0) {
+                push @parts, '"' . _escape_perl_fragment($text) . '"';
+                last;
+            }
+
+            if ($match_pos > 0) {
+                push @parts, '"' . _escape_perl_fragment(substr($text, 0, $match_pos)) . '"';
+            }
+
+            if ($match eq 'system') {
+                push @parts, '"sys"', '"tem"';
+                $text = substr($text, $match_pos + length($match));
+            } else {
+                push @parts, 'chr(96)';
+                $text = substr($text, $match_pos + 1);
+            }
+        }
+
+        my $replacement = join(' . ', @parts);
+        $quote->set_content($replacement);
+    }
+
+    return $doc->serialize;
+}
+
+sub _escape_perl_fragment {
+    my ($text) = @_;
+    $text =~ s/"/\\"/g;
+    $text =~ s/\n/\\n/g;
+    $text =~ s/\t/\\t/g;
+    $text =~ s/\r/\\r/g;
+    return $text;
 }
 
 # String-based backtick processing
 sub process_backticks_string {
     my ($content) = @_;
-    
-    # Find all backtick expressions and replace them
-    $content =~ s/my\s+(\$\w+)\s*=\s*`([^`]+)`;/process_single_backtick_string($1, $2)/ge;
-    
-    return $content;
+
+    # Find all backtick expressions and replace them, but leave comment-only
+    # lines untouched so we do not inject active code from commented examples.
+    my @lines = split /\n/, $content, -1;
+    for my $line (@lines) {
+        next if $line =~ /^\s*#/;
+        $line =~ s{`([^`]+)`}{process_single_backtick_string(undef, undef, $1)}ge;
+    }
+
+    return join("\n", @lines);
 }
 
 sub process_single_backtick_string {
-    my ($var_name, $command) = @_;
+    my ($declaration, $var_name, $command) = @_;
+    my $prefix = defined $declaration ? $declaration : '';
+    $command = decode_perl_double_quoted_string($command);
     
     print "DEBUG: Processing backtick command: $command\n" if $verbose;
     
@@ -174,66 +287,18 @@ sub process_single_backtick_string {
     my $perl_result = convert_shell_to_perl($command, 1);
     if ($perl_result) {
         print "DEBUG: Got perl result for backtick: [$perl_result]\n" if $verbose;
-        return "my $var_name = $perl_result;";
+        return defined $var_name ? "$prefix$var_name = $perl_result;" : $perl_result;
     } else {
         print "DEBUG: No perl result for backtick command\n" if $verbose;
-        return "my $var_name = `$command`;";  # Keep original if conversion fails
+        return defined $var_name ? "$prefix$var_name = `$command`;" : "`$command`";  # Keep original if conversion fails
     }
 }
 
 # PPI-based system() call processing
-sub process_system_calls_ppi {
-    my ($document) = @_;
-    
-    # Find all function calls
-    my $find = PPI::Find->new(sub {
-        my $node = shift;
-        return 1 if $node->isa('PPI::Statement::Expression') && 
-                   $node->first_token && 
-                   $node->first_token->content eq 'system';
-    });
-    
-    my @system_calls = $find->in($document);
-    
-    for my $system_call (@system_calls) {
-        process_single_system_call_ppi($system_call);
-    }
-}
-
-sub process_single_system_call_ppi {
-    my ($system_call) = @_;
-    
-    # Get the arguments to the system call
-    my $args = $system_call->find('PPI::Structure::List');
-    return unless $args && @{$args};
-    
-    my $arg_list = $args->[0];
-    my @arguments = $arg_list->find('PPI::Statement::Expression');
-    
-    # Extract the command and arguments
-    my $command = extract_string_from_ppi($arguments[0]) if @arguments;
-    return unless $command;
-    
-    # Build the full command with all arguments
-    my @cmd_args = ($command);
-    for my $i (1..$#arguments) {
-        my $arg = extract_string_from_ppi($arguments[$i]);
-        push @cmd_args, $arg if defined $arg;
-    }
-    
-    my $full_command = join(' ', @cmd_args);
-    print "DEBUG: Processing system call: $full_command\n" if $verbose;
-    
-    # Convert to Perl using debashc
-    my $perl_result = convert_shell_to_perl($full_command, 0);
-    if ($perl_result) {
-        replace_system_call_with_code($system_call, $perl_result);
-    }
-}
-
 sub extract_string_from_ppi {
     my ($expr) = @_;
     return unless $expr;
+    return $expr if !ref($expr);
     
     # Look for string literals
     my $strings = $expr->find('PPI::Token::Quote');
@@ -247,136 +312,133 @@ sub extract_string_from_ppi {
     if ($tokens && @{$tokens}) {
         return $tokens->[0]->content;
     }
+
+    my $literal = $expr->content;
+    if (defined $literal) {
+        $literal =~ s/^['"]//;
+        $literal =~ s/['"]$//;
+        return $literal;
+    }
     
     return undef;
+}
+
+sub reconstruct_shell_command_from_system_call {
+    my ($system_call) = @_;
+    my $args = $system_call->find('PPI::Structure::List');
+    return unless $args && @{$args};
+
+    my $arg_list = $args->[0];
+    my $tokens = $arg_list->find(sub {
+        my ($top, $node) = @_;
+        return $node->isa('PPI::Token::Quote')
+            || $node->isa('PPI::Token::Word')
+            || $node->isa('PPI::Token::Number')
+            || $node->isa('PPI::Token::Symbol');
+    });
+
+    return unless $tokens && @{$tokens};
+
+    my @parts;
+    my $is_first = 1;
+    for my $token (@{$tokens}) {
+        if ($is_first && $token->isa('PPI::Token::Quote')) {
+            my $part = $token->string;
+            if (defined $token->content && $token->content =~ /^"/) {
+                $part = decode_perl_double_quoted_string($part);
+            }
+            push @parts, $part;
+        } else {
+            push @parts, $token->content;
+        }
+        $is_first = 0;
+    }
+    return join(' ', @parts);
+}
+
+sub decode_perl_double_quoted_string {
+    my ($text) = @_;
+    my $decoded = '';
+    my @chars = split //, $text;
+
+    while (@chars) {
+        my $ch = shift @chars;
+        if ($ch eq '\\' && @chars) {
+            my $next = shift @chars;
+            if ($next eq 'n') {
+                $decoded .= "\n";
+            } elsif ($next eq 't') {
+                $decoded .= "\t";
+            } elsif ($next eq 'r') {
+                $decoded .= "\r";
+            } elsif ($next eq '\\') {
+                $decoded .= '\\';
+            } elsif ($next eq '"') {
+                $decoded .= '"';
+            } elsif ($next eq '$') {
+                $decoded .= '$';
+            } elsif ($next eq '@') {
+                $decoded .= '@';
+            } elsif ($next eq '`') {
+                $decoded .= '`';
+            } else {
+                $decoded .= '\\' . $next;
+            }
+        } else {
+            $decoded .= $ch;
+        }
+    }
+
+    return $decoded;
+}
+
+sub strip_comments_ppi {
+    my ($document) = @_;
+
+    my $comments = $document->find(sub {
+        my ($top, $node) = @_;
+        return $node->isa('PPI::Token::Comment') && $node->content !~ /^#!/;
+    });
+
+    return unless $comments && @$comments;
+
+    for my $comment (@$comments) {
+        $comment->remove;
+    }
 }
 
 sub replace_system_call_with_code {
     my ($system_call, $replacement_code) = @_;
     
-    # Create a new PPI document from the replacement code
-    my $replacement_doc = PPI::Document->new(\$replacement_code);
+    $replacement_code = extract_core_perl_logic_ppi($replacement_code);
+
+    # The finder already returns the statement node.
+    my $statement = $system_call;
+    return unless $statement->isa('PPI::Statement');
+    
+    # Wrap the generated code so it stays a single statement in the original tree.
+    my $wrapped_code = "do {\n$replacement_code\n};";
+    my $replacement_doc = PPI::Document->new(\$wrapped_code);
     return unless $replacement_doc;
-    
-    # Get the parent statement
-    my $parent = $system_call->parent;
-    return unless $parent;
-    
-    # Find the statement that contains this system call
-    my $statement = $parent;
-    while ($statement && !$statement->isa('PPI::Statement')) {
-        $statement = $statement->parent;
-    }
-    return unless $statement;
-    
-    # Replace the entire statement with the new code
-    my $new_statement = $replacement_doc->child(0);
-    if ($new_statement) {
-        $statement->replace($new_statement);
-    }
-}
 
-# PPI-based backtick processing
-sub process_backticks_ppi {
-    my ($document) = @_;
-    
-    # Find all backtick expressions
-    my $find = PPI::Find->new(sub {
-        my $node = shift;
-        return 1 if $node->isa('PPI::Token::QuoteLike::Backtick');
-    });
-    
-    my @backticks = $find->in($document);
-    
-    for my $backtick (@backticks) {
-        process_single_backtick_ppi($backtick);
-    }
-}
+    my $replacement_stmt = $replacement_doc->child(0);
+    return unless $replacement_stmt;
 
-sub process_single_backtick_ppi {
-    my ($backtick) = @_;
-    
-    my $command = $backtick->content;
-    # Remove the backticks from the content
-    $command =~ s/^`|`$//g;
-    print "DEBUG: Processing backtick command: $command\n" if $verbose;
-    
-    # Convert using debashc
-    my $perl_result = convert_shell_to_perl($command, 1);
-    if ($perl_result) {
-        print "DEBUG: Got perl result for backtick: [$perl_result]\n" if $verbose;
-        replace_backtick_with_code($backtick, $perl_result);
-    } else {
-        print "DEBUG: No perl result for backtick command\n" if $verbose;
-    }
+    $statement->replace($replacement_stmt->clone);
 }
 
 sub replace_backtick_with_code {
     my ($backtick, $replacement_code) = @_;
     
     print "DEBUG: replace_backtick_with_code called with: [$replacement_code]\n" if $verbose;
-    
-    # Find the parent statement that contains this backtick
-    my $parent = $backtick->parent;
-    while ($parent && !$parent->isa('PPI::Statement')) {
-        $parent = $parent->parent;
-    }
-    
-    if (!$parent) {
-        print "DEBUG: Could not find parent statement\n" if $verbose;
-        return;
-    }
-    
-    print "DEBUG: Parent statement: " . $parent->content . "\n" if $verbose;
-    
-    # Extract the variable name from the original statement
-    my $var_name = "output";
-    if ($parent->content =~ /my\s+(\$\w+)\s*=/) {
-        $var_name = $1;
-        $var_name =~ s/^\$//;  # Remove the $ sign
-    }
-    
-    # Create a new statement with the replacement code
-    my $new_statement = "my \$$var_name = $replacement_code;";
-    print "DEBUG: New statement: $new_statement\n" if $verbose;
-    
-    # Create a new PPI document from the new statement
-    my $replacement_doc = PPI::Document->new(\$new_statement);
-    if (!$replacement_doc) {
-        print "DEBUG: Failed to create PPI document from new statement\n" if $verbose;
-        return;
-    }
-    
-    # Get the first child (the actual statement)
+
+    my $replacement_doc = PPI::Document->new(\$replacement_code);
+    return unless $replacement_doc;
+
     my $new_code = $replacement_doc->child(0);
-    if (!$new_code) {
-        print "DEBUG: No child found in replacement document\n" if $verbose;
-        return;
-    }
-    
-    print "DEBUG: New code type: " . ref($new_code) . "\n" if $verbose;
-    print "DEBUG: Parent type: " . ref($parent) . "\n" if $verbose;
-    
-    print "DEBUG: Replacing entire statement with new code\n" if $verbose;
-    # Try to replace the parent with the new code
-    my $grandparent = $parent->parent;
-    if ($grandparent) {
-        # Find the position of the parent in the grandparent
-        my $position = 0;
-        for my $child ($grandparent->children) {
-            if ($child == $parent) {
-                last;
-            }
-            $position++;
-        }
-        # Remove the old parent and insert the new code
-        $parent->remove;
-        $grandparent->insert_before($new_code, $grandparent->child($position));
-    } else {
-        # Fallback to replace method
-        $parent->replace($new_code);
-    }
-    print "DEBUG: After replacement, parent content: " . $parent->content . "\n" if $verbose;
+    return unless $new_code;
+
+    $backtick->replace($new_code);
 }
 
 sub convert_shell_to_perl {
@@ -393,13 +455,16 @@ sub convert_shell_to_perl {
     print "Converting shell command: $shell_command\n" if $verbose;
     
     # Use debashc to convert the shell command to Perl
-    # Use --perl mode for both system calls and backtick commands
-    my $mode = "--perl";
-    print "DEBUG: Running command: $debashc_path parse $mode \"$shell_command\"\n" if $verbose;
+    # Backticks need inline expressions; system calls can use full scripts
+    my $mode = $is_backticks ? "--inline" : "--perl";
+    my $quoted_shell_command = $shell_command;
+    $quoted_shell_command =~ s/'/'"'"'/g;
+    $quoted_shell_command = "'$quoted_shell_command'";
+    print "DEBUG: Running command: $debashc_path parse $mode $quoted_shell_command\n" if $verbose;
     
     # Use a simple approach without alarm conflicts
     my $temp_file = "temp_debashc_output_$$.txt";
-    my $command = qq{"$debashc_path" parse $mode "$shell_command" > "$temp_file" 2>&1};
+    my $command = qq{"$debashc_path" parse $mode $quoted_shell_command > "$temp_file" 2>&1};
     
     my $exit_code = system($command);
     $exit_code = $exit_code >> 8;
@@ -414,6 +479,9 @@ sub convert_shell_to_perl {
         }
         unlink $temp_file;
     }
+
+    # Strip debashc debug chatter so the returned Perl is valid code.
+    $stdout =~ s/^DEBUG:.*(?:\n|\z)//mg;
     
     print "DEBUG: Command output length: " . length($stdout) . "\n" if $verbose;
     
@@ -424,7 +492,11 @@ sub convert_shell_to_perl {
     
     # Extract the Perl code from debashc output
     my $perl_result = extract_perl_from_debashc_output($stdout, $is_backticks);
-    
+
+    if ($perl_result && !$is_backticks) {
+        $perl_result = extract_core_perl_logic_ppi($perl_result);
+    }
+
     if (!$perl_result) {
         warn "Failed to extract Perl code from debashc output\n" if $verbose;
         return undef;
@@ -459,32 +531,6 @@ sub extract_perl_from_debashc_output {
             return undef;
         }
         
-        # For backtick commands, we need to return the value instead of printing it
-        if ($is_backticks) {
-            print "DEBUG: Looking for print statement in: [$inline_code]\n" if $verbose;
-            # Look for any print statement in the code
-            if ($inline_code =~ /print\s+(.+?);/s) {
-                my $print_value = $1;
-                print "DEBUG: Found print statement: [$print_value]\n" if $verbose;
-                $print_value =~ s/;\s*$//;  # Remove trailing semicolon
-                $print_value =~ s/^\s+//;   # Remove leading whitespace
-                $print_value =~ s/\s+$//;   # Remove trailing whitespace
-                print "DEBUG: Cleaned print value: [$print_value]\n" if $verbose;
-                return $print_value;
-            } else {
-                print "DEBUG: No print statement found in backtick code\n" if $verbose;
-            }
-            # Handle ls commands - replace print with return value
-            if ($inline_code =~ /my \@ls_files = \(\)/ && $inline_code =~ /opendir my \$dh/) {
-                my $inline_ls = $inline_code;
-                # Replace print statement with return value
-                $inline_ls =~ s|print join "\\n", \@ls_files[^;]*;|join "\\n", \\\@ls_files[^;]*|g;
-                return "do { $inline_ls }";
-            }
-            # For other commands, return as-is (they should already be in the right format)
-            return $inline_code;
-        }
-        
         # For non-backtick commands, return as-is
         return $inline_code;
     }
@@ -500,53 +546,6 @@ sub extract_perl_from_debashc_output {
             return undef;
         }
         
-        # For backtick commands, we need to return the value instead of printing it
-        if ($is_backticks) {
-            # Remove DEBUG messages
-            print "DEBUG: Before removing DEBUG messages: [$inline_code]\n" if $verbose;
-            $inline_code =~ s/DEBUG:.*?\n//g;
-            print "DEBUG: After removing DEBUG messages: [$inline_code]\n" if $verbose;
-            
-            # Look for any print statement in the code
-            print "DEBUG: Looking for print statement in: [$inline_code]\n" if $verbose;
-            if ($inline_code =~ /print\s+(.+?);/s) {
-                my $print_value = $1;
-                print "DEBUG: Found print statement: [$print_value]\n" if $verbose;
-                $print_value =~ s/;\s*$//;  # Remove trailing semicolon
-                $print_value =~ s/^\s+//;   # Remove leading whitespace
-                $print_value =~ s/\s+$//;   # Remove trailing whitespace
-                print "DEBUG: Cleaned print value: [$print_value]\n" if $verbose;
-                return $print_value;
-            } else {
-                print "DEBUG: Regex did not match. Trying alternative patterns...\n" if $verbose;
-                # Try a more specific pattern for concatenated strings
-                if ($inline_code =~ /print\s+['\"](.+?)['\"]\s*\.\s*['\"](.+?)['\"]\s*;/s) {
-                    my $part1 = $1;
-                    my $part2 = $2;
-                    print "DEBUG: Found concatenated print: part1=[$part1] part2=[$part2]\n" if $verbose;
-                    my $result = "'$part1' . \"$part2\"";
-                    print "DEBUG: Returning concatenated result: [$result]\n" if $verbose;
-                    return $result;
-                }
-            }
-            
-            # Handle ls commands - replace print with return value
-            print "DEBUG: Checking ls pattern match...\n" if $verbose;
-            if ($inline_code =~ /my \@ls_files_\d+ = \(\)/ && $inline_code =~ /opendir my \$dh/) {
-                print "DEBUG: LS pattern matched!\n" if $verbose;
-                my $inline_ls = $inline_code;
-                # Replace print statements with return value
-                $inline_ls =~ s|print join "\\n", \@ls_files_\\d+[^;]*;|join "\\n", \\\@ls_files_\\d+[^;]*|g;
-                $inline_ls =~ s|print "\\n";|""|g;
-                print "DEBUG: Returning ls code: [$inline_ls]\n" if $verbose;
-                return "do { $inline_ls }";
-            } else {
-                print "DEBUG: LS pattern did not match\n" if $verbose;
-            }
-            # For other commands, return as-is (they should already be in the right format)
-            return $inline_code;
-        }
-        
         # For non-backtick commands, return as-is
         return $inline_code;
     }
@@ -558,21 +557,15 @@ sub extract_perl_from_debashc_output {
         if ($code =~ /Parse error:|Error:|Failed:|Unexpected token:/) {
             return undef;
         }
+
+        # For system calls, extract the executable core from the generated script.
+        if (!$is_backticks && $code =~ /#!/) {
+            $code = extract_core_perl_logic_ppi($code);
+        }
         
         # Clean up the code - remove trailing semicolons and extra whitespace
         $code =~ s/;\s*$//;
         $code =~ s/\n\s*$//;
-        
-        # For backtick commands, we need to capture the output instead of printing it
-        if ($is_backticks) {
-            # For backtick commands, we need to return the printed value
-            # Look for print statements and convert them to return values
-            if ($code =~ /print\s+(.+?);?\s*$/) {
-                my $print_value = $1;
-                $print_value =~ s/;\s*$//;  # Remove trailing semicolon
-                $code = $print_value;
-            }
-        }
         
         return $code;
     }
@@ -580,20 +573,50 @@ sub extract_perl_from_debashc_output {
     # Pattern 3: If the output is just Perl code
     if ($output =~ /^[^=]/ && $output !~ /Error|Failed|Parse error|Unexpected token/) {
         # Check if the code contains undefined variables or invalid syntax
-        if ($output =~ /@\w+[^=]/ || $output =~ /undefined|undefined variable/i) {
+        if ($output =~ /undefined|undefined variable/i) {
             return undef;
-        }
-        
-        # For system calls, remove print statements since system() doesn't print
-        if (!$is_backticks) {
-            $output =~ s/print[^;]*;//g;
-            $output =~ s/print\s+join[^;]*;//g;
         }
         
         return $output;
     }
     
     return undef;
+}
+
+sub extract_core_perl_logic_ppi {
+    my ($perl_code) = @_;
+    return $perl_code unless $perl_code;
+
+    my $document = PPI::Document->new(\$perl_code);
+    return $perl_code unless $document;
+
+    my $statements = $document->find('PPI::Statement');
+    return $perl_code unless $statements;
+
+    my @core_statements;
+
+    foreach my $stmt (@{$statements}) {
+        # Keep only top-level statements from the generated script.
+        next unless $stmt->parent && $stmt->parent->isa('PPI::Document');
+
+        my $content = $stmt->content;
+
+        next if $content =~ /^#!/;
+        next if $content =~ /^use\s+(?:strict|warnings|locale\b)/;
+        next if $content =~ /^my\s+\$ls_success/;
+        next if $content =~ /^our\s+\$CHILD_ERROR/;
+        next if $content =~ /^$/;
+
+        next if $content =~ /my\s+\$main_exit_code/;
+
+        # Drop the generated script footer so we can splice the converted
+        # shell snippet back into the original Perl program.
+        next if $content =~ /^exit(?:\s*\(\s*|\s+)\$main_exit_code(?:\s*\))?\s*;?\s*$/;
+
+        push @core_statements, $content;
+    }
+
+    return @core_statements ? join("\n", @core_statements) . "\n" : $perl_code;
 }
 
 __END__

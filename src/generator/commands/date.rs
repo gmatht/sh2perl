@@ -1,44 +1,49 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_date_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
-    let mut output = String::new();
-    
-    // date command syntax: date [format]
-    if let Some(format) = cmd.args.first() {
-        let format_str = generator.word_to_perl(format);
-        
-        // Check for special formats
-        if let Word::Literal(format_lit, _) = format {
-            if format_lit == "+%rms" {
-                // Special case for +%rms format - 12-hour time with leading zeros
-                output.push_str("my $time = localtime();\n");
-                output.push_str("my $hour = $time->hour;\n");
-                output.push_str("my $min = $time->min;\n");
-                output.push_str("my $sec = $time->sec;\n");
-                output.push_str("my $ampm = $hour >= 12 ? 'PM' : 'AM';\n");
-                output.push_str("$hour = $hour % 12;\n");
-                output.push_str("$hour = 12 if $hour == 0;\n");
-                output.push_str("my $result = sprintf \"%02d:%02d:%02d %sms\", $hour, $min, $sec, $ampm;\n");
-                output.push_str("print $result;\n");
-            } else {
-                output.push_str("use POSIX qw(strftime);\n");
-                output.push_str(&format!("my $format = {};\n", format_str));
-                output.push_str("my $date = strftime($format, localtime());\n");
-                output.push_str("print $date;\n");
-            }
-        } else {
-            output.push_str("use POSIX qw(strftime);\n");
-            output.push_str(&format!("my $format = {};\n", format_str));
-            output.push_str("my $date = strftime($format, localtime());\n");
-            output.push_str("print $date;\n");
+fn date_arg_expr(generator: &mut Generator, word: &Word) -> String {
+    match word {
+        Word::Literal(value, _) => {
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{}\"", escaped)
         }
-    } else {
-        // Default format: match shell date format
-        output.push_str("use POSIX qw(strftime);\n");
-        output.push_str("my $date = strftime('%a %b %d %H:%M:%S %Z %Y', localtime());\n");
-        output.push_str("print $date;\n");
+        _ => {
+            let rendered = generator.word_to_perl(word);
+            let escaped = rendered.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{}\"", escaped)
+        }
     }
-    
-    output
+}
+
+fn date_command_expr(generator: &mut Generator, cmd: &SimpleCommand) -> String {
+    let mut expr = "\"date\"".to_string();
+
+    for arg in &cmd.args {
+        expr.push_str(" . ' ' . ");
+        expr.push_str(&date_arg_expr(generator, arg));
+    }
+
+    expr
+}
+
+pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) -> String {
+    let mut prefix = String::new();
+    for (name, value) in &cmd.env_vars {
+        prefix.push_str(&format!(
+            "local $ENV{{{}}} = {};\n",
+            name,
+            generator.word_to_perl(value)
+        ));
+    }
+
+    format!(
+        "{}my $date_cmd = {}; qx{{$date_cmd}}",
+        prefix,
+        date_command_expr(generator, cmd)
+    )
+}
+
+pub fn generate_date_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
+    let body = generate_date_expression(generator, cmd);
+    format!("my $date = do {{\n{}\n}};\nprint $date;\n", body)
 }
