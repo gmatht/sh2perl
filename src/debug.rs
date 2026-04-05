@@ -2,7 +2,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 // use crate::shared_utils::SharedUtils;
 
-static DEBUG_ENABLED: AtomicBool = AtomicBool::new(true);
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // Function to safely check if DEBUG output is enabled
 pub fn is_debug_enabled() -> bool {

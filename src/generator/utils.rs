@@ -1,5 +1,5 @@
-use crate::ast::*;
 use super::Generator;
+use crate::ast::*;
 
 /// Get the appropriate temporary directory for the current platform
 pub fn get_temp_dir() -> &'static str {
@@ -30,10 +30,7 @@ pub fn extract_array_elements_impl(value: &str) -> Option<Vec<String>> {
     if value.starts_with('(') && value.ends_with(')') {
         let content = &value[1..value.len() - 1];
         if !content.is_empty() {
-            let elements: Vec<String> = content
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect();
+            let elements: Vec<String> = content.split_whitespace().map(|s| s.to_string()).collect();
             return Some(elements);
         }
     }
@@ -43,33 +40,39 @@ pub fn extract_array_elements_impl(value: &str) -> Option<Vec<String>> {
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
+            if s.contains("system") || s.contains('`') {
+                return crate::generator::commands::utilities::source_safe_perl_string_expr(s);
+            }
+
             // Handle empty strings with q{}
             if s.is_empty() {
                 return "q{}".to_string();
             }
-            
-            
+
             // Check if string needs interpolation (contains variables or special chars)
-            let needs_interpolation = s.contains('$') || s.contains('@') || s.contains('\\') || s.contains('`');
-            
+            let needs_interpolation =
+                s.contains('$') || s.contains('@') || s.contains('\\') || s.contains('`');
+
             if needs_interpolation {
                 // Always escape quotes and backslashes for Perl string literals
-                let escaped = s.replace("\\", "\\\\")
-                              .replace("\"", "\\\"")
-                              .replace("\n", "\\n")
-                              .replace("\t", "\\t")
-                              .replace("\r", "\\r");
+                let escaped = s
+                    .replace("\\", "\\\\")
+                    .replace("\"", "\\\"")
+                    .replace("\n", "\\n")
+                    .replace("\t", "\\t")
+                    .replace("\r", "\\r");
                 format!("\"{}\"", escaped)
             } else {
                 // Check if string contains newlines, tabs, or carriage returns
                 // If it does, we need to use double quotes with escape sequences
                 if s.contains('\n') || s.contains('\t') || s.contains('\r') {
                     // Use double quotes and escape special characters
-                    let escaped = s.replace("\\", "\\\\")
-                                  .replace("\"", "\\\"")
-                                  .replace("\n", "\\n")
-                                  .replace("\t", "\\t")
-                                  .replace("\r", "\\r");
+                    let escaped = s
+                        .replace("\\", "\\\\")
+                        .replace("\"", "\\\"")
+                        .replace("\n", "\\n")
+                        .replace("\t", "\\t")
+                        .replace("\r", "\\r");
                     format!("\"{}\"", escaped)
                 } else {
                     // Use q{} for single characters to avoid "noisy quotes" violations
@@ -78,8 +81,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         // Always use q{} for single characters to avoid Perl::Critic violations
                         format!("q{{{}}}", s)
                     } else {
-                        let escaped = s.replace("\\", "\\\\")
-                                      .replace("'", "\\'");
+                        let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
                         format!("'{}'", escaped)
                     }
                 }
@@ -88,10 +90,10 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
         Word::Variable(var, _, _) => {
             // Handle special shell variables
             match var.as_str() {
-                "#" => "scalar(@ARGV)".to_string(),  // $# -> scalar(@ARGV) for argument count
-                "@" => "@ARGV".to_string(),          // $@ -> @ARGV for arguments array
-                "0" => "$PROGRAM_NAME".to_string(),  // $0 -> $PROGRAM_NAME (Perl::Critic compliant)
-                _ => format!("${}", var)             // Regular variables
+                "#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
+                "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
+                "0" => "$PROGRAM_NAME".to_string(), // $0 -> $PROGRAM_NAME (Perl::Critic compliant)
+                _ => format!("${}", var),           // Regular variables
             }
         }
         Word::Arithmetic(expr, _) => {
@@ -114,15 +116,23 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     if let Word::Literal(name, _) = &simple_cmd.name {
                         if name == "ls" {
                             // Use the ls substitution function for proper conversion
-                            let perl_code = crate::generator::commands::ls::generate_ls_for_substitution(generator, simple_cmd);
-                            
+                            let perl_code =
+                                crate::generator::commands::ls::generate_ls_for_substitution(
+                                    generator, simple_cmd,
+                                );
+
                             // For backtick commands, we need to return the value, not print it
                             // The generate_ls_for_substitution already returns the joined string
                             perl_code
                         } else if name == "find" {
                             // Use the find command handler for proper conversion
-                            let perl_code = crate::generator::commands::find::generate_find_command(generator, simple_cmd, true, "found_files");
-                            
+                            let perl_code = crate::generator::commands::find::generate_find_command(
+                                generator,
+                                simple_cmd,
+                                true,
+                                "found_files",
+                            );
+
                             // For backtick commands, we need to return the value, not print it
                             // The generate_find_command already returns the joined string
                             perl_code
@@ -133,7 +143,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             } else {
                                 "\"y\"".to_string()
                             };
-                            
+
                             // Generate a limited number of lines for command substitution
                             format!("do {{ my $string = {}; my $output = q{{}}; for my $i (0..999) {{ $output .= \"$string\\n\"; }} $output; }}", string_to_repeat)
                         } else if name == "echo" {
@@ -142,17 +152,18 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 "\"\\n\"".to_string()
                             } else {
                                 // Process arguments with proper string interpolation handling
-                                let args: Vec<String> = simple_cmd.args.iter()
+                                let args: Vec<String> = simple_cmd
+                                    .args
+                                    .iter()
                                     .map(|arg| {
                                         match arg {
-                                            Word::StringInterpolation(interp, _) => {
-                                                generator.convert_string_interpolation_to_perl(interp)
-                                            },
+                                            Word::StringInterpolation(interp, _) => generator
+                                                .convert_string_interpolation_to_perl(interp),
                                             Word::Literal(literal, _) => {
                                                 // Escaped backticks should be treated as literal backticks, not command substitution
                                                 generator.perl_string_literal(arg)
-                                            },
-                                            _ => generator.word_to_perl(arg)
+                                            }
+                                            _ => generator.word_to_perl(arg),
                                         }
                                     })
                                     .collect();
@@ -160,15 +171,19 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             }
                         } else if name == "sha256sum" {
                             // Use the sha256sum command handler for proper conversion
-                            crate::generator::commands::sha256sum::generate_sha256sum_command(generator, simple_cmd, "")
+                            crate::generator::commands::sha256sum::generate_sha256sum_command(
+                                generator, simple_cmd, "",
+                            )
                         } else if name == "sha512sum" {
                             // Use the sha512sum command handler for proper conversion
-                            crate::generator::commands::sha512sum::generate_sha512sum_command(generator, simple_cmd, "")
+                            crate::generator::commands::sha512sum::generate_sha512sum_command(
+                                generator, simple_cmd, "",
+                            )
                         } else if name == "printf" {
                             // Special handling for printf in command substitution
                             let mut format_string = String::new();
                             let mut args = Vec::new();
-                            
+
                             for (i, arg) in simple_cmd.args.iter().enumerate() {
                                 if i == 0 {
                                     // For printf format strings, handle string interpolation specially
@@ -176,96 +191,66 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                         Word::StringInterpolation(interp, _) => {
                                             // For printf format strings, we want the raw string without escape processing
                                             // Reconstruct the original string from the interpolation parts
-                                            format_string = interp.parts.iter()
+                                            format_string = interp
+                                                .parts
+                                                .iter()
                                                 .map(|part| match part {
                                                     StringPart::Literal(s) => s.clone(),
                                                     _ => "".to_string(), // Skip variables in format strings for now
                                                 })
                                                 .collect::<Vec<_>>()
                                                 .join("");
-                                        },
+                                        }
                                         Word::Literal(s, _) => {
                                             format_string = s.clone();
-                                        },
+                                        }
                                         _ => {
                                             format_string = generator.word_to_perl(arg);
                                         }
                                     }
                                     // Remove quotes if they exist around the format string
-                                    if format_string.starts_with('\'') && format_string.ends_with('\'') {
-                                        format_string = format_string[1..format_string.len()-1].to_string();
-                                    } else if format_string.starts_with('"') && format_string.ends_with('"') {
-                                        format_string = format_string[1..format_string.len()-1].to_string();
+                                    if format_string.starts_with('\'')
+                                        && format_string.ends_with('\'')
+                                    {
+                                        format_string =
+                                            format_string[1..format_string.len() - 1].to_string();
+                                    } else if format_string.starts_with('"')
+                                        && format_string.ends_with('"')
+                                    {
+                                        format_string =
+                                            format_string[1..format_string.len() - 1].to_string();
                                     }
                                 } else {
                                     args.push(generator.word_to_perl(arg));
                                 }
                             }
-                            
+
                             if format_string.is_empty() {
                                 "\"\"".to_string()
                             } else {
-                                let formatted_args = args.iter()
-                                    .map(|arg| generator.perl_string_literal(&Word::Literal(arg.clone(), Default::default())))
+                                let formatted_args = args
+                                    .iter()
+                                    .map(|arg| {
+                                        generator.perl_string_literal(&Word::Literal(
+                                            arg.clone(),
+                                            Default::default(),
+                                        ))
+                                    })
                                     .collect::<Vec<_>>()
                                     .join(", ");
-                                format!("sprintf \"{}\", {}", 
+                                format!(
+                                    "sprintf \"{}\", {}",
                                     format_string.replace("\"", "\\\"").replace("\\\\", "\\"),
-                                    formatted_args)
+                                    formatted_args
+                                )
                             }
                         } else if name == "date" {
-                            // Special handling for date in command substitution
-                            if let Some(format) = simple_cmd.args.first() {
-                                let format_str = generator.word_to_perl(format);
-                                // Strip the + prefix from date format strings (shell date +%Y -> strftime %Y)
-                                let cleaned_format = if format_str.starts_with("'\"+") && format_str.ends_with("\"'") {
-                                    // Remove quotes, strip +, add quotes back
-                                    let inner = &format_str[2..format_str.len()-2];
-                                    if inner.starts_with('+') {
-                                        format!("'\"{}\"'", &inner[1..])
-                                    } else {
-                                        format_str
-                                    }
-                                } else if format_str.starts_with("'+") && format_str.ends_with("'") {
-                                    // Remove quotes, strip +, add quotes back
-                                    let inner = &format_str[1..format_str.len()-1];
-                                    if inner.starts_with('+') {
-                                        format!("'{}'", &inner[1..])
-                                    } else {
-                                        format_str
-                                    }
-                                } else if format_str.starts_with('+') {
-                                    // No quotes, just strip the +
-                                    format!("'{}'", &format_str[1..])
-                                } else {
-                                    // Check if the string contains a + character and strip it
-                                    if format_str.contains('+') {
-                                        // This handles cases like '"+%Y"' -> '"\%Y"'
-                                        format_str.replace("+", "")
-                                    } else {
-                                        format_str
-                                    }
-                                };
-                                
-                                // Use UTC (gmtime) for date-only formats to avoid timezone/day boundary issues
-                                // Check if format is date-only (contains %Y but no time components)
-                                let cleaned_format_for_check = &cleaned_format;
-                                let is_date_only = cleaned_format_for_check.contains("%Y") && 
-                                                   !cleaned_format_for_check.contains("%H") && 
-                                                   !cleaned_format_for_check.contains("%M") && 
-                                                   !cleaned_format_for_check.contains("%S") &&
-                                                   !cleaned_format_for_check.contains("%r");
-                                let time_func = if is_date_only { "gmtime" } else { "localtime" };
-                                // Ensure the format string is properly quoted for strftime
-                                let final_format = if cleaned_format.starts_with('"') || cleaned_format.starts_with("'") || cleaned_format.starts_with("q{") {
-                                    cleaned_format
-                                } else {
-                                    format!("'{}'", cleaned_format)
-                                };
-                                format!("do {{ use POSIX qw(strftime); strftime({}, {}); }}", final_format, time_func)
-                            } else {
-                                "do { use POSIX qw(strftime); strftime('%a %b %d %H:%M:%S %Z %Y', localtime); }".to_string()
-                            }
+                            format!(
+                                "do {{\n{}\n}}",
+                                crate::generator::commands::date::generate_date_expression(
+                                    generator, simple_cmd,
+                                )
+                            )
                         } else if name == "pwd" {
                             // Special handling for pwd in command substitution
                             "do { use Cwd; getcwd(); }".to_string()
@@ -324,28 +309,36 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             let mut time_output = String::new();
                             time_output.push_str("use Time::HiRes qw(gettimeofday tv_interval);\n");
                             time_output.push_str("my $start_time = [gettimeofday];\n");
-                            
+
                             // Execute the command (if any arguments provided)
                             if !simple_cmd.args.is_empty() {
-                                let args: Vec<String> = simple_cmd.args.iter()
+                                let args: Vec<String> = simple_cmd
+                                    .args
+                                    .iter()
                                     .map(|arg| generator.word_to_perl(arg))
                                     .collect();
                                 let command_str = args.join(" ");
                                 time_output.push_str(&format!("system {};\n", command_str));
                             }
-                            
+
                             time_output.push_str("my $end_time = [gettimeofday];\n");
-                            time_output.push_str("my $elapsed = tv_interval($start_time, $end_time);\n");
-                            time_output.push_str("sprintf \"real %.3fs\\nuser 0.000s\\nsys 0.000s\\n\", $elapsed;\n");
-                            
+                            time_output
+                                .push_str("my $elapsed = tv_interval($start_time, $end_time);\n");
+                            time_output.push_str(
+                                "sprintf \"real %.3fs\\nuser 0.000s\\nsys 0.000s\\n\", $elapsed;\n",
+                            );
+
                             format!("do {{ {} }}", time_output)
                         } else {
                             // For non-builtin commands, use open3 to capture output without backticks
-                            let args: Vec<String> = simple_cmd.args.iter()
+                            let args: Vec<String> = simple_cmd
+                                .args
+                                .iter()
                                 .map(|arg| generator.word_to_perl(arg))
                                 .collect();
-                            
-                            let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+
+                            let (in_var, out_var, err_var, pid_var, result_var) =
+                                generator.get_unique_ipc_vars();
                             if args.is_empty() {
                                 format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, name, in_var, result_var, out_var, out_var, pid_var, result_var)
                             } else {
@@ -355,72 +348,86 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     } else {
                         // For non-literal command names, use open3 to capture output without backticks
                         let cmd_name = generator.word_to_perl(&simple_cmd.name);
-                        let args: Vec<String> = simple_cmd.args.iter()
+                        let args: Vec<String> = simple_cmd
+                            .args
+                            .iter()
                             .map(|arg| generator.word_to_perl(arg))
                             .collect();
-                        
-                        let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+
+                        let (in_var, out_var, err_var, pid_var, result_var) =
+                            generator.get_unique_ipc_vars();
                         if args.is_empty() {
                             format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                         } else {
                             format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, {}, {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
                         }
                     }
-                },
+                }
                 Command::Pipeline(pipeline) => {
                     // For command substitution pipelines, use the specialized function
                     // Wrap in do block for utils context
                     format!("do {{ {} }}", crate::generator::commands::pipeline_commands::generate_pipeline_for_substitution(generator, pipeline))
-                },
+                }
                 _ => {
                     // For other command types, use system command fallback
-                    let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+                    let (in_var, out_var, err_var, pid_var, result_var) =
+                        generator.get_unique_ipc_vars();
                     format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd), in_var, result_var, out_var, out_var, pid_var, result_var)
                 }
             }
         }
-        _ => format!("{:?}", word)
+        _ => format!("{:?}", word),
     }
 }
 
-pub fn strip_shell_quotes_and_convert_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
+pub fn strip_shell_quotes_and_convert_to_perl_impl(
+    generator: &mut Generator,
+    word: &Word,
+) -> String {
     match word {
         Word::Literal(s, _) => {
             // Strip shell quotes if present and convert to Perl string literal
-            let stripped = if (s.starts_with("'") && s.ends_with("'")) || (s.starts_with("\"") && s.ends_with("\"")) {
+            let stripped = if (s.starts_with("'") && s.ends_with("'"))
+                || (s.starts_with("\"") && s.ends_with("\""))
+            {
                 // Remove the outer quotes
-                &s[1..s.len()-1]
+                &s[1..s.len() - 1]
             } else {
                 s
             };
-            
+
             // Handle empty strings with q{}
             if stripped.is_empty() {
                 return "q{}".to_string();
             }
-            
+
             // Check if string needs interpolation (contains variables or special chars)
-            let needs_interpolation = stripped.contains('$') || stripped.contains('@') || stripped.contains('\\');
-            
+            let needs_interpolation =
+                stripped.contains('$') || stripped.contains('@') || stripped.contains('\\');
+
             if needs_interpolation {
                 // Escape quotes and backslashes for Perl string literals
-                let escaped = stripped.replace("\\", "\\\\")
-                                    .replace("\"", "\\\"")
-                                    .replace("\n", "\\n")
-                                    .replace("\t", "\\t")
-                                    .replace("\r", "\\r");
+                let escaped = stripped
+                    .replace("\\", "\\\\")
+                    .replace("\"", "\\\"")
+                    .replace("\n", "\\n")
+                    .replace("\t", "\\t")
+                    .replace("\r", "\\r");
                 format!("\"{}\"", escaped)
             } else {
                 // Use q{} for single characters to avoid "noisy quotes" violations
-                if stripped.len() == 1 && !stripped.contains('\'') && !stripped.contains('{') && !stripped.contains('}') {
+                if stripped.len() == 1
+                    && !stripped.contains('\'')
+                    && !stripped.contains('{')
+                    && !stripped.contains('}')
+                {
                     format!("q{{{}}}", stripped)
                 } else if stripped.len() == 1 && stripped.contains('\'') {
                     // Handle single quotes in single character strings
                     format!("q{{{}}}", stripped)
                 } else {
                     // Use single quotes for strings that don't need interpolation
-                    let escaped = stripped.replace("\\", "\\\\")
-                                        .replace("'", "\\'");
+                    let escaped = stripped.replace("\\", "\\\\").replace("'", "\\'");
                     format!("'{}'", escaped)
                 }
             }
@@ -437,7 +444,7 @@ pub fn strip_shell_quotes_and_convert_to_perl_impl(generator: &mut Generator, wo
             // Handle string interpolation
             generator.convert_string_interpolation_to_perl(interp)
         }
-        _ => format!("{:?}", word)
+        _ => format!("{:?}", word),
     }
 }
 
@@ -445,9 +452,11 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
     match word {
         Word::Literal(s, _) => {
             // Strip shell quotes if present and return the raw string for regex
-            if (s.starts_with("'") && s.ends_with("'")) || (s.starts_with("\"") && s.ends_with("\"")) {
+            if (s.starts_with("'") && s.ends_with("'"))
+                || (s.starts_with("\"") && s.ends_with("\""))
+            {
                 // Remove the outer quotes
-                s[1..s.len()-1].to_string()
+                s[1..s.len() - 1].to_string()
             } else {
                 s.clone()
             }
@@ -467,7 +476,7 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
                 if let StringPart::Literal(s) = &interp.parts[0] {
                     // Convert shell regex patterns to Perl regex patterns
                     let mut regex_pattern = s.clone();
-                    
+
                     // Convert shell extended regex patterns to Perl patterns
                     // Convert \+ to + (shell extended regex to Perl)
                     regex_pattern = regex_pattern.replace("\\+", "+");
@@ -481,7 +490,7 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
                     regex_pattern = regex_pattern.replace("\\}", "}");
                     // Convert \| to | (shell extended regex to Perl)
                     regex_pattern = regex_pattern.replace("\\|", "|");
-                    
+
                     // Return the converted regex pattern
                     regex_pattern
                 } else {
@@ -493,7 +502,7 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
                 generator.convert_string_interpolation_to_perl(interp)
             }
         }
-        _ => format!("{:?}", word)
+        _ => format!("{:?}", word),
     }
 }
 
@@ -512,21 +521,22 @@ pub fn format_regex_pattern(pattern: &str) -> String {
 
 /// Convert escaped metacharacters to character classes for better Perl::Critic compliance
 pub fn convert_escaped_metacharacters(pattern: &str) -> String {
-    pattern.replace("\\.", "[.]")
-           .replace("\\+", "[+]")
-           .replace("\\*", "[*]")
-           .replace("\\?", "[?]")
-           .replace("\\^", "[^]")
-           .replace("\\$", "[$]")
-           .replace("\\[", "[\\[]")
-           .replace("\\]", "[\\]]")
-           .replace("\\(", "[(]")
-           .replace("\\)", "[)]")
-           .replace("\\|", "[|]")
-           .replace("\\t", "\t")
-           .replace("\\r", "\r")
-           .replace("{", "\\{")
-           .replace("}", "\\}")
+    pattern
+        .replace("\\.", "[.]")
+        .replace("\\+", "[+]")
+        .replace("\\*", "[*]")
+        .replace("\\?", "[?]")
+        .replace("\\^", "[^]")
+        .replace("\\$", "[$]")
+        .replace("\\[", "[\\[]")
+        .replace("\\]", "[\\]]")
+        .replace("\\(", "[(]")
+        .replace("\\)", "[)]")
+        .replace("\\|", "[|]")
+        .replace("\\t", "\t")
+        .replace("\\r", "\r")
+        .replace("{", "\\{")
+        .replace("}", "\\}")
 }
 
 /// Generate a regex pattern for checking if string ends with newline
@@ -543,8 +553,15 @@ pub fn convert_postfix_unless_to_block(condition: &str, statement: &str) -> Stri
 }
 
 /// Convert postfix unless statement to block form with proper indentation
-pub fn convert_postfix_unless_to_block_with_indent(condition: &str, statement: &str, indent: &str) -> String {
-    format!("{}if (!({})) {{\n{}    {};\n{}}}", indent, condition, indent, statement, indent)
+pub fn convert_postfix_unless_to_block_with_indent(
+    condition: &str,
+    statement: &str,
+    indent: &str,
+) -> String {
+    format!(
+        "{}if (!({})) {{\n{}    {};\n{}}}",
+        indent, condition, indent, statement, indent
+    )
 }
 
 /// Convert postfix unless statement to block form without adding indentation (for use within already indented blocks)

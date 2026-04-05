@@ -4,6 +4,712 @@
 // Categorized based on test results from results/* files
 
 export const examples = {
+  '000__01_file_directory_operations.sh': `\#!/bin/bash
+
+\# File and directory operations with backticks
+\# This file demonstrates using backticks with file system commands
+
+echo "=== File and Directory Operations ==="
+
+\# ls command with backticks
+\#PERL_MUST_NOT_CONTAIN \`ls
+file_list=\`ls -a\`
+echo "File listing:"
+echo "\$file_list"
+
+\# find command with backticks
+\#PERL_MUST_NOT_CONTAIN \`find
+found_files=\`find . -maxdepth 1 -name "*.sh" -type f\`
+echo "Found shell scripts:"
+echo "\$found_files"
+
+\# basename and dirname with backticks
+\#PERL_MUST_NOT_CONTAIN \`basename
+\#PERL_MUST_NOT_CONTAIN \`dirname
+\#script_name=\`basename \$0\`
+\#script_dir=\`dirname \$0\`
+\#echo "Script name: \$script_name"
+\#echo "Script directory: \$script_dir"
+`,
+  '000__02_output_formatting_commands.sh': `\#!/bin/bash
+
+\# Output and formatting commands with backticks
+\# This file demonstrates using backticks with output and formatting commands
+
+echo "=== Output and Formatting Commands ==="
+
+\# echo command with backticks
+\#PERL_MUST_NOT_CONTAIN \`echo
+echo_result=\`echo "Hello from backticks"\`
+echo "Echo result: \$echo_result"
+
+\# printf command with backticks
+\#PERL_MUST_NOT_CONTAIN \`printf
+printf_result=\`printf "Number: %d, String: %s\\n" 42 "test"\`
+echo "Printf result: \$printf_result"
+
+echo "=== Compression Commands ==="
+
+\# gzip command with backticks
+\#PERL_MUST_NOT_CONTAIN \`gzip
+\#echo "test content for compression" > test_compress.txt
+\#gzip_result=\`gzip test_compress.txt && echo "Compression successful"\`
+\#echo "Gzip result: \$gzip_result"
+
+\# zcat command with backticks
+\#PERL_MUST_NOT_CONTAIN \`zcat
+\#zcat_result=\`zcat test_compress.txt.gz\`
+\#echo "Zcat result: \$zcat_result"
+
+echo "=== Network Commands ==="
+
+\# wget command with backticks
+\#PERL_MUST_NOT_CONTAIN \`wget
+\# wget_result=\`wget -qO- http://httpbin.org/get | head -1\`
+\# echo "Wget result: \$wget_result"
+
+\# curl command with backticks
+\#PERL_MUST_NOT_CONTAIN \`curl
+\# curl_result=\`curl -s http://httpbin.org/get | head -1\`
+\# echo "Curl result: \$curl_result"
+
+echo "=== Process Management Commands ==="
+
+\# kill command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`kill
+\# kill_result=\`kill -0 \$\$ && echo "Process exists"\`
+\# echo "Kill result: \$kill_result"
+
+\# nohup command with backticks
+\#PERL_MUST_NOT_CONTAIN \`nohup
+\# nohup_result=\`nohup echo "background process" 2>&1\`
+\# echo "Nohup result: \$nohup_result"
+
+\# nice command with backticks
+\#PERL_MUST_NOT_CONTAIN \`nice
+\#nice_result=\`nice echo "low priority process"\`
+\#echo "Nice result: \$nice_result"
+
+echo "=== Checksum Commands ==="
+
+\# sha256sum command with backticks
+\#PERL_MUST_NOT_CONTAIN \`sha256sum
+echo "test content" > test_checksum.txt
+sha256_result=\`sha256sum test_checksum.txt\`
+echo "SHA256 result: \$sha256_result"
+
+\# sha512sum command with backticks
+\#PERL_MUST_NOT_CONTAIN \`sha512sum
+sha512_result=\`sha512sum test_checksum.txt\`
+echo "SHA512 result: \$sha512_result"
+
+\# strings command with backticks
+\#PERL_MUST_NOT_CONTAIN \`strings
+strings_result=\`strings test_binary.txt | head -3\`
+echo "Strings result:"
+echo "\$strings_result"
+
+echo "=== I/O Redirection Commands ==="
+
+\# tee command with backticks
+\#PERL_MUST_NOT_CONTAIN \`tee
+tee_result=\`echo "test output" | tee test_tee.txt\`
+echo "Tee result: \$tee_result"
+
+echo "=== Perl Command ==="
+
+\# perl command with backticks
+\#PERL_MUST_NOT_CONTAIN \`perl
+perl_result=\`perl -e 'print "Hello from Perl\\n"'\`
+echo "Perl result: \$perl_result"
+
+\# Cleanup
+rm -f test_checksum.txt test_tee.txt
+
+`,
+  '000__03_file_manipulation_commands.sh': `\#!/bin/bash
+
+\# File manipulation commands with backticks
+\# This file demonstrates using backticks with file manipulation commands
+
+echo "=== File Manipulation Commands ==="
+
+echo "=== cp command ==="
+\# cp command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`cp
+echo
+echo "test content" > test_file.txt
+cp_result=\`cp test_file.txt test_file_copy.txt && echo "Copy successful"\`
+echo "Copy result: \$cp_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+echo
+echo "=== mv command ==="
+\# mv command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`mv
+mv_result=\`mv test_file_copy.txt test_file_moved.txt && echo "Move successful"\`
+echo "Move result: \$mv_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+echo
+echo "=== rm command ==="
+\# rm command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`rm
+rm_result=\`rm test_file.txt test_file_moved.txt && echo "Remove successful"\`
+echo "Remove result: \$rm_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+echo
+echo "=== mkdir command ==="
+\# mkdir command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`mkdir
+mkdir_result=\`mkdir test_dir && echo "Directory created"\`
+echo "Mkdir result: \$mkdir_result"
+touch test_dir/file
+ls test_dir 2>/dev/null || echo "Directory not found"
+rm test_dir/file
+rmdir test_dir
+
+echo
+echo "=== touch command ==="
+\# touch command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`touch
+touch_result=\`touch test_file.txt && echo "File touched"\`
+echo "Touch result: \$touch_result"
+
+echo
+\# Cleanup
+rm -f test_file.txt test_file_copy.txt test_file_moved.txt
+rm -rf test_dir 2>/dev/null || true
+
+`,
+  '000__04a_basic_command_substitution.sh': `\#!/bin/bash
+
+\# Basic command substitution examples using backticks
+\# This file demonstrates simple command substitution using backticks (\`)
+
+echo "=== Basic Command Substitution ==="
+
+\# Simple command substitution
+echo "Current date: \`date +%Y\`"
+\#echo "Current user: \`whoami\`"
+echo "Current directory: \`basename \$(pwd)\`"
+
+\# Assigning backtick results to variables
+current_date=\`date +%Y%m\`
+\#current_user=\`whoami\`
+current_dir=\`basename \$(pwd)\`
+
+echo "Stored date: \$current_date"
+\#echo "Stored user: \$current_user"
+echo "Stored directory: \$current_dir"
+
+echo "=== Basic Command Substitution Complete ==="
+
+`,
+  '000__04b_file_directory_operations.sh': `\#!/bin/bash
+
+\# File and directory operations using backticks
+\# This file demonstrates file and directory commands with backticks
+
+echo "=== File and Directory Operations ==="
+
+\# ls command with backticks
+\#PERL_MUST_NOT_CONTAIN \`ls
+file_list=\`ls -a\`
+echo "File listing:"
+echo "\$file_list"
+
+\# find command with backticks
+\#PERL_MUST_NOT_CONTAIN \`find
+found_files=\`find . -name "*.sh" -type f\`
+echo "Found shell scripts:"
+echo "\$found_files"
+
+\# basename and dirname with backticks
+\#PERL_MUST_NOT_CONTAIN \`basename
+\#PERL_MUST_NOT_CONTAIN \`dirname
+\#script_name=\`basename \$0\`
+\#script_dir=\`dirname \$0\`
+\#echo "Script name: \$script_name"
+\#echo "Script directory: \$script_dir"
+
+echo "=== File and Directory Operations Complete ==="
+
+`,
+  '000__04c_text_processing_commands.sh': `\#!/bin/bash
+
+\# Text processing commands using backticks
+\# This file demonstrates various text processing commands with backticks
+
+echo "=== Text Processing Commands ==="
+
+\# cat command with backticks
+\#PERL_MUST_NOT_CONTAIN \`cat
+file_content=\`cat 000__04c_text_processing_commands.sh | head -5\`
+echo "First 5 lines of this file:"
+echo "\$file_content"
+
+\# grep command with backticks
+\#PERL_MUST_NOT_CONTAIN \`grep
+grep_result=\`grep -n "echo" 000__04c_text_processing_commands.sh\`
+echo "Lines containing 'echo':"
+echo "\$grep_result"
+
+\# sed command with backticks
+\#PERL_MUST_NOT_CONTAIN \`sed
+sed_result=\`echo "Hello World" | sed 's/World/Universe/'\`
+echo "Sed result: \$sed_result"
+
+\# awk command with backticks
+\#PERL_MUST_NOT_CONTAIN \`awk
+awk_result=\`echo "1 2 3 4 5" | awk '{print \$1 + \$2}'\`
+echo "Awk sum result: \$awk_result"
+
+\# sort command with backticks
+\#PERL_MUST_NOT_CONTAIN \`sort
+sort_result=\`echo -e "zebra\\napple\\nbanana" | sort\`
+echo "Sorted words:"
+echo "\$sort_result"
+
+\# uniq command with backticks
+\#PERL_MUST_NOT_CONTAIN \`uniq
+uniq_result=\`echo -e "apple\\napple\\nbanana\\nbanana\\ncherry" | uniq\`
+echo "Unique words:"
+echo "\$uniq_result"
+
+\# wc command with backticks
+\#PERL_MUST_NOT_CONTAIN \`wc
+word_count=\`echo "Hello World" | wc -w\`
+line_count=\`echo -e "line1\\nline2\\nline3" | wc -l\`
+echo "Word count: \$word_count"
+echo "Line count: \$line_count"
+
+\# head command with backticks
+\#PERL_MUST_NOT_CONTAIN \`head
+head_result=\`seq 1 10 | head -3\`
+echo "First 3 numbers: \$head_result"
+
+\# tail command with backticks
+\#PERL_MUST_NOT_CONTAIN \`tail
+tail_result=\`seq 1 10 | tail -3\`
+echo "Last 3 numbers: \$tail_result"
+
+\# cut command with backticks
+\#PERL_MUST_NOT_CONTAIN \`cut
+cut_result=\`echo "apple:banana:cherry" | cut -d: -f2\`
+echo "Second field: \$cut_result"
+
+\# paste command with backticks
+\#PERL_MUST_NOT_CONTAIN \`paste
+echo -e "1\\n2\\n3" > temp1.txt
+echo -e "a\\nb\\nc" > temp2.txt
+paste_result=\`paste temp1.txt temp2.txt\`
+echo "Pasted columns:"
+echo "\$paste_result"
+rm -f temp1.txt temp2.txt
+
+\# comm command with backticks
+\#PERL_MUST_NOT_CONTAIN \`comm
+echo -e "apple\\nbanana\\ncherry" > file1.txt
+echo -e "banana\\ncherry\\ndate" > file2.txt
+comm_result=\`comm -12 file1.txt file2.txt\`
+echo "Common lines:"
+echo "\$comm_result"
+
+\# diff command with backticks
+\#PERL_MUST_NOT_CONTAIN \`diff
+diff_result=\`diff file1.txt file2.txt\`
+echo "File differences:"
+echo "\$diff_result"
+
+\# tr command with backticks
+\#PERL_MUST_NOT_CONTAIN \`tr
+tr_result=\`echo "HELLO WORLD" | tr 'A-Z' 'a-z'\`
+echo "Lowercase: \$tr_result"
+
+\# xargs command with backticks
+\#PERL_MUST_NOT_CONTAIN \`xargs
+xargs_result=\`echo "1 2 3" | xargs -n1 echo "Number:"\`
+echo "Xargs result:"
+echo "\$xargs_result"
+
+\# Cleanup
+rm -f file1.txt file2.txt
+
+echo "=== Text Processing Commands Complete ==="
+`,
+  '000__04d_system_utilities.sh': `\#!/bin/bash
+
+\# System utilities using backticks
+\# This file demonstrates system utility commands with backticks
+
+echo "=== System Utilities ==="
+
+\# date command with backticks - use fixed format to avoid timing issues
+\#PERL_MUST_NOT_CONTAIN \`date
+\#timestamp=\`date +%H:%M:%S\`
+formatted_date=\`date '+%Y-%m-%d'\`
+\#echo "Timestamp: \$timestamp"
+echo "Formatted date: \$formatted_date"
+
+\# time command with backticks - use a simple test that doesn't vary much
+\#PERL_MUST_NOT_CONTAIN \`time
+\#time_result=\`time echo "test" 2>&1 | sed 's/...\$//'\`
+\#echo "Time result: \$time_result"
+
+\# sleep command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`sleep
+sleep_duration=\`echo "1"\`
+echo "Sleeping for \$sleep_duration seconds..."
+sleep \$sleep_duration
+
+\# which command with backticks
+\#PERL_MUST_NOT_CONTAIN \`which
+\#bash_path=\`which bash\`
+\#echo "Bash path: \$bash_path"
+
+\# yes command with backticks
+\#PERL_MUST_NOT_CONTAIN \`yes
+yes_result=\`yes "Hello" | head -3\`
+echo "Yes command result:"
+echo "\$yes_result"
+
+echo "=== System Utilities Complete ==="
+
+`,
+  '000__04e_file_manipulation.sh': `\#!/bin/bash
+
+\# File manipulation commands using backticks
+\# This file demonstrates file manipulation commands with backticks
+
+echo "=== File Manipulation Commands ==="
+
+\# cp command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`cp
+echo "test content" > test_file.txt
+cp_result=\`cp test_file.txt test_file_copy.txt && echo "Copy successful"\`
+echo "Copy result: \$cp_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+\# mv command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`mv
+mv_result=\`mv test_file_copy.txt test_file_moved.txt && echo "Move successful"\`
+echo "Move result: \$mv_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+\# rm command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`rm
+rm_result=\`rm test_file.txt test_file_moved.txt && echo "Remove successful"\`
+echo "Remove result: \$rm_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+\# mkdir command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`mkdir
+mkdir_result=\`mkdir test_dir && echo "Directory created"\`
+echo "Mkdir result: \$mkdir_result"
+touch test_dir/file
+ls test_dir 2>/dev/null || echo "Directory not found"
+
+\# touch command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`touch
+touch_result=\`touch test_file.txt && echo "File touched"\`
+echo "Touch result: \$touch_result"
+
+\# Cleanup
+rm -f test_file.txt test_file_copy.txt test_file_moved.txt
+rm -rf test_dir 2>/dev/null || true
+
+echo "=== File Manipulation Commands Complete ==="
+
+`,
+  '000__04f_output_formatting.sh': `\#!/bin/bash
+
+\# Output and formatting commands using backticks
+\# This file demonstrates output and formatting commands with backticks
+
+echo "=== Output and Formatting Commands ==="
+
+\# echo command with backticks
+\#PERL_MUST_NOT_CONTAIN \`echo
+echo_result=\`echo "Hello from backticks"\`
+echo "Echo result: \$echo_result"
+
+\# printf command with backticks
+\#PERL_MUST_NOT_CONTAIN \`printf
+printf_result=\`printf "Number: %d, String: %s\\n" 42 "test"\`
+echo "Printf result: \$printf_result"
+
+\# tee command with backticks
+\#PERL_MUST_NOT_CONTAIN \`tee
+tee_result=\`echo "test output" | tee test_tee.txt\`
+echo "Tee result: \$tee_result"
+
+\# Cleanup
+rm -f test_tee.txt
+
+echo "=== Output and Formatting Commands Complete ==="
+
+`,
+  '000__04g_checksum_commands.sh': `\#!/bin/bash
+
+\# Checksum commands using backticks
+\# This file demonstrates checksum and related commands with backticks
+
+echo "=== Checksum Commands ==="
+
+\# sha256sum command with backticks
+\#PERL_MUST_NOT_CONTAIN \`sha256sum
+echo "test content" > test_checksum.txt
+sha256_result=\`sha256sum test_checksum.txt\`
+echo "SHA256 result: \$sha256_result"
+
+\# sha512sum command with backticks
+\#PERL_MUST_NOT_CONTAIN \`sha512sum
+sha512_result=\`sha512sum test_checksum.txt\`
+echo "SHA512 result: \$sha512_result"
+
+\# strings command with backticks
+\#PERL_MUST_NOT_CONTAIN \`strings
+strings_result=\`strings target/debug/debashc.exe | head -3\`
+echo "Strings result:"
+echo "\$strings_result"
+
+\# Cleanup
+rm -f test_checksum.txt
+
+echo "=== Checksum Commands Complete ==="
+
+`,
+  '000__04h_complex_examples.sh': `\#!/bin/bash
+
+\# Complex backtick examples
+\# This file demonstrates complex usage patterns with backticks
+
+echo "=== Complex Backtick Examples ==="
+
+\# Nested backticks
+nested_result=\`echo "Three wells: \\\`yes well | head -3\\\`"\`
+echo "Nested backticks: \$nested_result"
+
+\# Backticks in arithmetic
+count=\`ls -1 | wc -l\`
+echo "File count: \$count"
+
+\# Backticks in conditional
+current_user=\`echo root\`
+if [ "\$current_user" = "root" ]; then
+    echo "Running as root"
+else
+    echo "Not running as root"
+fi
+
+\# Backticks in case statement
+system_name='Darwin'
+case \$system_name in
+    Linux)
+        echo "Running on Linux"
+        ;;
+    Darwin)
+        echo "Running on macOS"
+        ;;
+    *)
+        echo "Running on other system"
+        ;;
+esac
+
+\# Backticks in function
+get_file_size() {
+    local file=\$1
+    local size=\`wc -c < "\$file"\`
+    echo "File \$file has \$size bytes"
+}
+
+get_file_size 000__01_file_directory_operations.sh
+
+\# Backticks in array
+files=(\`ls -1 *.sh examples/*.sh 2>/dev/null\`)
+echo "Shell scripts found: \${\#files[@]}"
+for file in "\${files[@]}"; do
+    echo "  - \$file"
+done
+
+\# Backticks with process substitution
+echo -e "apple\\nbanana\\ncherry" > file1.txt
+echo -e "banana\\ncherry\\ndate" > file2.txt
+process_result=\`comm -23 <(sort file1.txt) <(sort file2.txt)\`
+echo "Process substitution result:"
+echo "\$process_result"
+
+\# Backticks with here strings
+here_string_result=\`tr 'a-z' 'A-Z' <<< "hello world"\`
+echo "Here string result: \$here_string_result"
+
+\# perl command with backticks
+\#PERL_MUST_NOT_CONTAIN \`perl
+perl_result=\`perl -e 'print "Hello from Perl\\n"'\`
+echo "Perl result: \$perl_result"
+
+\# Cleanup
+rm -f file1.txt file2.txt
+
+echo "=== Complex Backtick Examples Complete ==="
+
+`,
+  '000__05_system_utilities.sh': `\#!/bin/bash
+
+\# System utilities with backticks
+\# This file demonstrates using backticks with system utility commands
+
+echo "=== System Utilities ==="
+
+\# date command with backticks
+\#PERL_MUST_NOT_CONTAIN \`date
+\#timestamp=\`date +%r\`
+formatted_date=\`date '+%Y-%m-%d'\`
+\#echo "Timestamp: \$timestamp"
+echo "Formatted date: \$formatted_date"
+
+\# time command with backticks
+\#PERL_MUST_NOT_CONTAIN \`time
+\#time_result=\`(time sleep 1) 2>&1 | sed s/...\$//\`
+\#echo "Time result: \$time_result"
+
+\# sleep command with backticks (though it doesn't produce output)
+\#PERL_MUST_NOT_CONTAIN \`sleep
+\#sleep_duration=\`echo "2"\`
+\#echo "Sleeping for \$sleep_duration seconds..."
+\#sleep \$sleep_duration
+
+\# which command with backticks
+\#PERL_MUST_NOT_CONTAIN \`which
+\#bash_path=\`which bash\`
+\#echo "Bash path: \$bash_path"
+
+\# yes command with backticks
+\#PERL_MUST_NOT_CONTAIN \`yes
+yes_result=\`yes "Hello" | head -3\`
+echo "Yes command result:"
+echo "\$yes_result"
+
+`,
+  '000__06_text_processing_commands.sh': `\#!/bin/bash
+
+\# Text processing commands with backticks
+\# This file demonstrates using backticks with text manipulation commands
+
+echo "=== Text Processing Commands ==="
+
+\# cat command with backticks
+\#PERL_MUST_NOT_CONTAIN \`cat
+file_content=\`cat src/main.rs | head -5\`
+echo "First 5 lines of main.rs:"
+echo "\$file_content"
+
+\# grep command with backticks
+\#PERL_MUST_NOT_CONTAIN \`grep
+grep_result=\`grep -n "fn" src/main.rs\`
+echo "Lines containing 'fn':"
+echo "\$grep_result"
+
+\# sed command with backticks
+\#PERL_MUST_NOT_CONTAIN \`sed
+sed_result=\`echo "Hello World" | sed 's/World/Universe/'\`
+echo "Sed result: \$sed_result"
+
+\# awk command with backticks
+\#PERL_MUST_NOT_CONTAIN \`awk
+awk_result=\`echo "1 2 3 4 5" | awk '{print \$1 + \$2}'\`
+echo "Awk sum result: \$awk_result"
+
+\# sort command with backticks
+\#PERL_MUST_NOT_CONTAIN \`sort
+sort_result=\`echo -e "zebra\\napple\\nbanana" | sort\`
+echo "Sorted words:"
+echo "\$sort_result"
+
+\# uniq command with backticks
+\#PERL_MUST_NOT_CONTAIN \`uniq
+uniq_result=\`echo -e "apple\\napple\\nbanana\\nbanana\\ncherry" | uniq\`
+echo "Unique words:"
+echo "\$uniq_result"
+
+\# wc command with backticks
+\#PERL_MUST_NOT_CONTAIN \`wc
+word_count=\`echo "Hello World" | wc -w\`
+line_count=\`echo -e "line1\\nline2\\nline3" | wc -l\`
+echo "Word count: \$word_count"
+echo "Line count: \$line_count"
+
+\# head command with backticks
+\#PERL_MUST_NOT_CONTAIN \`head
+head_result=\`seq 1 10 | head -3\`
+echo "First 3 numbers: \$head_result"
+
+\# tail command with backticks
+\#PERL_MUST_NOT_CONTAIN \`tail
+tail_result=\`seq 1 10 | tail -3\`
+echo "Last 3 numbers: \$tail_result"
+
+\# cut command with backticks
+\#PERL_MUST_NOT_CONTAIN \`cut
+cut_result=\`echo "apple:banana:cherry" | cut -d: -f2\`
+echo "Second field: \$cut_result"
+
+\# paste command with backticks
+\#PERL_MUST_NOT_CONTAIN \`paste
+echo -e "1\\n2\\n3" > temp1.txt
+echo -e "a\\nb\\nc" > temp2.txt
+paste_result=\`paste temp1.txt temp2.txt | sed 's/\\t/ /g'\`
+echo "Pasted columns:"
+echo "\$paste_result"
+rm -f temp1.txt temp2.txt
+
+\# comm command with backticks
+\#PERL_MUST_NOT_CONTAIN \`comm
+echo -e "apple\\nbanana\\ncherry" > file1.txt
+echo -e "banana\\ncherry\\ndate" > file2.txt
+comm_result=\`comm -12 file1.txt file2.txt\`
+echo "Common lines:"
+echo "\$comm_result"
+
+\# diff command with backticks
+\#PERL_MUST_NOT_CONTAIN \`diff
+diff_result=\`diff file1.txt file2.txt\`
+echo "File differences:"
+echo "\$diff_result"
+
+\# tr command with backticks
+\#PERL_MUST_NOT_CONTAIN \`tr
+tr_result=\`echo "HELLO WORLD" | tr 'A-Z' 'a-z'\`
+echo "Lowercase: \$tr_result"
+
+\# xargs command with backticks
+\#PERL_MUST_NOT_CONTAIN \`xargs
+xargs_result=\`echo "1 2 3" | xargs -n1 echo "Number:"\`
+echo "Xargs result:"
+echo "\$xargs_result"
+
+\# Cleanupcd
+rm -f file1.txt file2.txt
+
+`,
+  '000__07_find_path_commands.sh': `\#!/bin/bash
+
+\# find command with backticks
+\#PERL_MUST_NOT_CONTAIN \`find
+found_files=\`find . -name "*.sh" -type f\`
+echo "Found shell scripts:"
+echo "\$found_files"
+
+\# basename and dirname with backticks
+\#PERL_MUST_NOT_CONTAIN \`basename
+\#PERL_MUST_NOT_CONTAIN \`dirname
+\#script_name=\`basename \$0\`
+\#script_dir=\`dirname \$0\`
+\#echo "Script name: \$script_name"
+\#echo "Script directory: \$script_dir"
+`,
   '001_simple.sh': `\#!/bin/bash
 
 \# This script demonstrates basic shell functionality
@@ -22,8 +728,14 @@ done
 \#Bash leaves \$i as 5 after the loop. But it is messy to add this if i will not be used later.
 \#PERL_MUST_NOT_CONTAIN: \$i = 5;
 
+\#Only use basename if actually needed.
+\#PERL_MUST_NOT_CONTAIN: basename
+
 \# "Hello, World!\\n" is simpler
-\#PERL_MUST_NOT_CONTAIN: "Hello, World!", "\\n"`,
+\#PERL_MUST_NOT_CONTAIN: "Hello, World!", "\\n"
+\#PERL_MUST_CONTAIN: "Hello, World!\\n"
+
+`,
   '002_control_flow.sh': `\#!/bin/bash
 
 \# Control flow examples
@@ -103,6 +815,8 @@ oyster
 snapper
 salmon
 FISH
+
+echo "Fin. That is all folks."
 `,
   '008_simple_backup.sh': `\#!/bin/bash
 
@@ -361,8 +1075,8 @@ set -euo pipefail
 
 echo "== Basic grep parameters =="
 echo "text with pattern" | grep -i "PATTERN"
-echo "line1\\nline2\\nline3" | grep -v "line2"
-echo "match\\nno match\\nmatch again" | grep -c "match"
+echo -e "line1\\nline2\\nline3" | grep -v "line2"
+echo -e "match\\nno match\\nmatch again" | grep -c "match"
 
 echo "== Context parameters =="
 echo -e "line1\\nline2\\nTARGET\\nline4\\nline5" | grep -A 2 "TARGET"
@@ -374,7 +1088,7 @@ echo "content" > temp_file.txt
 grep -H "content" temp_file.txt
 grep -h "content" temp_file.txt
 grep -l "content" temp_file.txt
-grep -L "nonexistent" temp_file.txt
+grep -L "nonexistent" temp_file.txt || true
 
 echo "== Output formatting parameters =="
 echo "text with pattern in it" | grep -o "pattern"
@@ -388,6 +1102,8 @@ echo "no pattern" > test_dir/file2.txt
 grep -r "pattern" test_dir
 grep -r "pattern" test_dir --include="*.txt"
 grep -r "pattern" test_dir --exclude="*.bak"
+grep -r -c "pattern" test_dir --include="*.txt"
+grep -r "pattern" test_dir --include="*.txt" | wc -l
 
 echo "== Advanced parameters =="
 echo -e "match1\\nmatch2\\nmatch3\\nmatch4" | grep -m 2 "match"
@@ -673,22 +1389,34 @@ paste <(echo -e "name1\\nname2") <(echo -e "value1\\nvalue2")
   '044_find_example.sh': `\#!/bin/bash
 
 \# Find all .txt files in current directory and subdirectories
-find . -name "*.txt" -type f
+echo '\#find . -name "*.txt" -type f | sort'
+find . -name "*.txt" -type f | sort
 
 \# Find files modified in the last 7 days
-find . -mtime -7 -type f
+echo '
+find . -mtime -7 -type f  | sort'
+find . -mtime -7 -type f  | sort
 
 \# Find files modified in the last 1 day
-find . -mtime -1 -type f
+echo '
+find . -mtime -1 -type f  | sort'
+find . -mtime -1 -type f  | sort
 
 \# Find files modified in the last 1 hour
-find . -mmin -60 -type f
+\# dd
+echo '
+find . -mmin -60 -type f  | sort'
+find . -mmin -60 -type f  | sort
 
 \# Find files larger than 1MB
-find . -size +1M -type f
+echo '
+find . -size +1M -type f  | sort'
+find . -size +1M -type f  | sort
 
 \# Find empty files and directories
-find . -empty
+echo '
+find . -empty  | sort'
+find . -empty  | sort
 
 \# Don't use  yet, they are not portable
 \# Find files with specific permissions (executable)
@@ -701,15 +1429,30 @@ find . -empty
 \#find . -group \$(id -gn) -type f
 
 \# Find files and execute command on them
-find . -name "*.log" -exec rm {} \\;
+echo 'touch/ls/rm'
+touch a.logtmp a.logtmp.sav
+find . -name "*.logtmp" -exec rm {} \\;
+
+ls *.logtmp*
+
+rm a.logtmp.sav
 
 \# Find files and show detailed information
-find . -type f -ls
+\#echo 'find . -type f -ls  | sort'
+\#find . -type f -ls  | sort
 
 \# Find files excluding certain directories
-find . -type f -not -path "./.git/*" -not -path "./node_modules/*"
+echo 'find .. -type f -not -path "./.git/*" -not -path "./node_modules/*"  | sort'
+find .. -type f -not -path "./.git/*" -not -path "./node_modules/*"  | sort
 `,
   '045_shell_calling_perl.sh': `\#!/bin/bash
+
+echo Warmup 1
+echo "apple" | perl -ne 'print "Fruit: \$_\\n"'
+
+\#echo Warmup 2
+\#perl -e "print \\"Shell variable: \$ENV{SHELL_VAR}\\n\\""
+
 
 \# Example 1: Simple Perl one-liner to print text
 echo "=== Example 1: Simple Perl one-liner ==="
@@ -722,11 +1465,13 @@ perl -e 'foreach \$arg (@ARGV) { print "Argument: \$arg\\n" }' "first" "second" 
 \# Example 3: Perl script processing shell variables
 echo -e "\\n=== Example 3: Perl processing shell variables ==="
 SHELL_VAR="Hello World"
-perl -e "print \\"Shell variable: \$ENV{SHELL_VAR}\\n\\""
+perl -e 'print "Shell variable: \$ENV{SHELL_VAR}\\n"'
+export SHELL_VAR 
+perl -e 'print "Shell variable: \$ENV{SHELL_VAR}\\n"'
 
 \# Example 4: Perl script reading from shell pipeline
 echo -e "\\n=== Example 4: Perl reading from pipeline ==="
-echo "apple\\nbanana\\ncherry" | perl -ne 'chomp; print "Fruit: \$_\\n"'
+echo -e "apple\\nbanana\\ncherry" | perl -ne 'chomp; print "Fruit: \$_\\n"'
 
 \# Example 5: Complex Perl script with here document
 echo -e "\\n=== Example 5: Perl script with here document ==="
@@ -2642,35 +3387,25 @@ echo "Input: '\$input' -> Sanitized: '\$sanitized' -> Uppercase: '\$uppercase'"
 
 echo "Script completed successfully!"
 `,
-  '917_grep_context.sh': `\#!/bin/bash
+  '065_yes_head_while.sh': `yes Line:LINE | head -n100 | while read L; do i=\$((i+1)); echo \$L | sed s/LINE/\$i/ ; done
 
-\# Grep context and file operation examples
-\# Demonstrates grep's context and file handling capabilities
+\#Avoid arrays, use a line by line pipeline rather than buffered.
+\#PERL_MUST_NOT_CONTAIN: @
 
-\# Context lines: after, before, and both
-echo -e "line1\\nline2\\nTARGET\\nline4\\nline5" | grep -A 2 "TARGET"
-echo -e "line1\\nline2\\nTARGET\\nline4\\nline5" | grep -B 2 "TARGET"
-echo -e "line1\\nline2\\nTARGET\\nline4\\nline5" | grep -C 1 "TARGET"
+\#Only use basename and main_exit_code if actually needed.
+\#PERL_MUST_NOT_CONTAIN: Basename
+\#PERL_MUST_NOT_CONTAIN: main_exit_code
 
-\# Recursive search in current directory
-echo "Creating test files..."
-echo "pattern in file1" > temp_file1.txt
-echo "no pattern in file2" > temp_file2.txt
-echo "pattern in file3" > temp_file3.txt
+\#Not sure why this would appear, but it did
+\#PERL_MUST_NOT_CONTAIN: \$lines=\$L
+`,
+  '900_if2echo.sh': `  if [ \$\# -lt 2 ]; then
+    echo "One"
+    echo "Two"
+  fi
 
-echo "Recursive search results:"
-grep -r "pattern" . --include="*.txt"
-
-echo Result 2...
-\# Print file names with matches
-grep -l "pattern" *.txt
-
-echo Result 3...
-\# Print file names without matches
-grep -L "pattern" *.txt
-
-\# Cleanup
-rm temp_file*.txt
+\#Cleaner to have word and newline in same quotes
+\#PERL_MUST_CONTAIN "One\\n"
 `,
   '999_pwd.sh': `basename \`pwd\`
 `,
@@ -2679,205 +3414,41 @@ rm temp_file*.txt
 Host: \${HOSTNAME:-localhost}
 Path: \$PWD
 `,
-  'debug_output.txt': `=== Starting pipeline execution ===
-4
-=== Starting pipeline 2 ===
-DEBUG: output_2 after cat: length=75
-DEBUG: sort_lines_2_1 count=11
-DEBUG: sort_lines_2_1[0] = [apple]
-DEBUG: sort_lines_2_1[1] = [banana]
-DEBUG: sort_lines_2_1[2] = [apple]
-DEBUG: sort_lines_2_1[3] = [cherry]
-DEBUG: sort_lines_2_1[4] = [banana]
-DEBUG: sort_lines_2_1[5] = [apple]
-DEBUG: sort_lines_2_1[6] = [date]
-DEBUG: sort_lines_2_1[7] = [elderberry]
-DEBUG: sort_lines_2_1[8] = [apple]
-DEBUG: sort_lines_2_1[9] = [banana]
-DEBUG: sort_lines_2_1[10] = [cherry]
-DEBUG: output_2 after sort: length=74
-DEBUG: uniq_lines_2_2 count before filter=11
-DEBUG: uniq_lines_2_2[0] = [apple]
-DEBUG: uniq_lines_2_2[1] = [apple]
-DEBUG: uniq_lines_2_2[2] = [apple]
-DEBUG: uniq_lines_2_2[3] = [apple]
-DEBUG: uniq_lines_2_2[4] = [banana]
-DEBUG: uniq_lines_2_2[5] = [banana]
-DEBUG: uniq_lines_2_2[6] = [banana]
-DEBUG: uniq_lines_2_2[7] = [cherry]
-DEBUG: uniq_lines_2_2[8] = [cherry]
-DEBUG: uniq_lines_2_2[9] = [date]
-DEBUG: uniq_lines_2_2[10] = [elderberry]
-DEBUG: uniq_lines_2_2 count after filter=11
-DEBUG: uniq result:
-DEBUG: uniq result line: [      2 cherry]
-DEBUG: uniq result line: [      3 banana]
-DEBUG: uniq result line: [      1 elderberry]
-DEBUG: uniq result line: [      4 apple]
-DEBUG: uniq result line: [      1 date]
-      4 apple
-      3 banana
-      2 cherry
-      1 elderberry
-      1 date
-=== Starting pipeline 3 ===
-DEBUG: find results count=124
-DEBUG: find_files_4[0] = [./001_simple.sh]
-DEBUG: find_files_4[1] = [./002_control_flow.sh]
-DEBUG: find_files_4[2] = [./003_pipeline.sh]
-DEBUG: find_files_4[3] = [./004_test_quoted.sh]
-DEBUG: find_files_4[4] = [./005_args.sh]
-DEBUG: find_files_4[5] = [./006_misc.sh]
-DEBUG: find_files_4[6] = [./007_cat_EOF.sh]
-DEBUG: find_files_4[7] = [./008_simple_backup.sh]
-DEBUG: find_files_4[8] = [./009_arrays.sh]
-DEBUG: find_files_4[9] = [./010_pattern_matching.sh]
-DEBUG: find_files_4[10] = [./011_brace_expansion.sh]
-DEBUG: find_files_4[11] = [./012_process_substitution.sh]
-DEBUG: find_files_4[12] = [./013_parameter_expansion.sh]
-DEBUG: find_files_4[13] = [./014_ansi_quoting.sh]
-DEBUG: find_files_4[14] = [./015_grep_advanced.sh]
-DEBUG: find_files_4[15] = [./016_grep_basic.sh]
-DEBUG: find_files_4[16] = [./017_grep_context.sh]
-DEBUG: find_files_4[17] = [./018_grep_params.sh]
-DEBUG: find_files_4[18] = [./019_grep_regex.sh]
-DEBUG: find_files_4[19] = [./020_ansi_quoting_basic.sh]
-DEBUG: find_files_4[20] = [./021_ansi_quoting_escape.sh]
-DEBUG: find_files_4[21] = [./022_ansi_quoting_unicode.sh]
-DEBUG: find_files_4[22] = [./023_ansi_quoting_practical.sh]
-DEBUG: find_files_4[23] = [./024_parameter_expansion_case.sh]
-DEBUG: find_files_4[24] = [./025_parameter_expansion_advanced.sh]
-DEBUG: find_files_4[25] = [./026_parameter_expansion_more.sh]
-DEBUG: find_files_4[26] = [./027_parameter_expansion_defaults.sh]
-DEBUG: find_files_4[27] = [./028_arrays_indexed.sh]
-DEBUG: find_files_4[28] = [./029_arrays_associative.sh]
-DEBUG: find_files_4[29] = [./030_control_flow_if.sh]
-DEBUG: find_files_4[30] = [./031_control_flow_loops.sh]
-DEBUG: find_files_4[31] = [./032_control_flow_function.sh]
-DEBUG: find_files_4[32] = [./033_brace_expansion_basic.sh]
-DEBUG: find_files_4[33] = [./034_brace_expansion_advanced.sh]
-DEBUG: find_files_4[34] = [./035_brace_expansion_practical.sh]
-DEBUG: find_files_4[35] = [./036_pattern_matching_basic.sh]
-DEBUG: find_files_4[36] = [./037_pattern_matching_extglob.sh]
-DEBUG: find_files_4[37] = [./038_pattern_matching_nocase.sh]
-DEBUG: find_files_4[38] = [./039_process_substitution_here.sh]
-DEBUG: find_files_4[39] = [./040_process_substitution_comm.sh]
-DEBUG: find_files_4[40] = [./041_process_substitution_mapfile.sh]
-DEBUG: find_files_4[41] = [./042_process_substitution_advanced.sh]
-DEBUG: find_files_4[42] = [./043_home.sh]
-DEBUG: find_files_4[43] = [./044_find_example.sh]
-DEBUG: find_files_4[44] = [./045_shell_calling_perl.sh]
-DEBUG: find_files_4[45] = [./046_cd..sh]
-DEBUG: find_files_4[46] = [./047_for_arithematic.sh]
-DEBUG: find_files_4[47] = [./048_subprocess.sh]
-DEBUG: find_files_4[48] = [./049_local.sh]
-DEBUG: find_files_4[49] = [./050_test_ls_star_dot_sh.sh]
-DEBUG: find_files_4[50] = [./051_primes.sh]
-DEBUG: find_files_4[51] = [./052_numeric_computations.sh]
-DEBUG: find_files_4[52] = [./053_gcd.sh]
-DEBUG: find_files_4[53] = [./054_fibonacci.sh]
-DEBUG: find_files_4[54] = [./055_factorize.sh]
-DEBUG: find_files_4[55] = [./056_send_args.sh]
-DEBUG: find_files_4[56] = [./057_case.sh]
-DEBUG: find_files_4[57] = [./058_advanced_bash_idioms.sh]
-DEBUG: find_files_4[58] = [./059_issue3.sh]
-DEBUG: find_files_4[59] = [./060_issue5.sh]
-DEBUG: find_files_4[60] = [./061_test_local_names_preserved.sh]
-DEBUG: find_files_4[61] = [./062_01_ambiguous_operators.sh]
-DEBUG: find_files_4[62] = [./062_02_complex_parameter_expansions.sh]
-DEBUG: find_files_4[63] = [./062_03_complex_heredocs.sh]
-DEBUG: find_files_4[64] = [./062_04_nested_arithmetic.sh]
-DEBUG: find_files_4[65] = [./062_05_nested_command_substitution.sh]
-DEBUG: find_files_4[66] = [./062_06_process_substitution.sh]
-DEBUG: find_files_4[67] = [./062_07_complex_brace_expansion.sh]
-DEBUG: find_files_4[68] = [./062_08_simple_case.sh]
-DEBUG: find_files_4[69] = [./062_09_complex_function.sh]
-DEBUG: find_files_4[70] = [./062_10_simple_pipeline.sh]
-DEBUG: find_files_4[71] = [./062_11_mixed_arithmetic.sh]
-DEBUG: find_files_4[72] = [./062_12_complex_string_interpolation.sh]
-DEBUG: find_files_4[73] = [./062_13_simple_test_expressions.sh]
-DEBUG: find_files_4[74] = [./062_14_complex_array_operations.sh]
-DEBUG: find_files_4[75] = [./062_15_complex_local_variables.sh]
-DEBUG: find_files_4[76] = [./062_hard_to_lex.sh]
-DEBUG: find_files_4[77] = [./063_01_deeply_nested_arithmetic.sh]
-DEBUG: find_files_4[78] = [./063_02_complex_array_assignments.sh]
-DEBUG: find_files_4[79] = [./063_03_nested_command_substitutions.sh]
-DEBUG: find_files_4[80] = [./063_04_complex_parameter_expansion.sh]
-DEBUG: find_files_4[81] = [./063_05_heredoc_with_complex_content.sh]
-DEBUG: find_files_4[82] = [./063_06_complex_pipeline_background.sh]
-DEBUG: find_files_4[83] = [./063_07_nested_if_statements.sh]
-DEBUG: find_files_4[84] = [./063_08_complex_case_statement.sh]
-DEBUG: find_files_4[85] = [./063_09_complex_function_parameter_handling.sh]
-DEBUG: find_files_4[86] = [./063_10_complex_for_loop.sh]
-DEBUG: find_files_4[87] = [./063_11_complex_while_loop.sh]
-DEBUG: find_files_4[88] = [./063_12_complex_eval.sh]
-DEBUG: find_files_4[89] = [./063_13_nested_subshells.sh]
-DEBUG: find_files_4[90] = [./063_14_complex_redirects.sh]
-DEBUG: find_files_4[91] = [./063_15_complex_function_definition.sh]
-DEBUG: find_files_4[92] = [./063_16_complex_test_expressions.sh]
-DEBUG: find_files_4[93] = [./063_17_nested_brace_expansion.sh]
-DEBUG: find_files_4[94] = [./063_18_complex_here_string.sh]
-DEBUG: find_files_4[95] = [./063_19_complex_function_call.sh]
-DEBUG: find_files_4[96] = [./063_20_final_complex_construct.sh]
-DEBUG: find_files_4[97] = [./063_hard_to_parse.sh]
-DEBUG: find_files_4[98] = [./064_01_complex_nested_subshells.sh]
-DEBUG: find_files_4[99] = [./064_02_nested_brace_expansions.sh]
-DEBUG: find_files_4[100] = [./064_03_complex_parameter_expansion.sh]
-DEBUG: find_files_4[101] = [./064_04_extended_glob_patterns.sh]
-DEBUG: find_files_4[102] = [./064_05_complex_case_statement.sh]
-DEBUG: find_files_4[103] = [./064_06_nested_arithmetic_expressions.sh]
-DEBUG: find_files_4[104] = [./064_07_complex_array_operations.sh]
-DEBUG: find_files_4[105] = [./064_08_heredocs_with_variable_interpolation.sh]
-DEBUG: find_files_4[106] = [./064_09_process_substitution_pipeline.sh]
-DEBUG: find_files_4[107] = [./064_10_nested_function_definitions.sh]
-DEBUG: find_files_4[108] = [./064_11_complex_test_expressions.sh]
-DEBUG: find_files_4[109] = [./064_12_brace_expansion_nested_sequences.sh]
-DEBUG: find_files_4[110] = [./064_13_complex_string_manipulation.sh]
-DEBUG: find_files_4[111] = [./064_14_nested_command_substitution_arithmetic.sh]
-DEBUG: find_files_4[112] = [./064_15_complex_pipeline_multiple_redirects.sh]
-DEBUG: find_files_4[113] = [./064_16_function_complex_argument_handling.sh]
-DEBUG: find_files_4[114] = [./064_17_complex_while_loop_nested_conditionals.sh]
-DEBUG: find_files_4[115] = [./064_18_array_slicing_manipulation.sh]
-DEBUG: find_files_4[116] = [./064_19_complex_pattern_matching_extended_globs.sh]
-DEBUG: find_files_4[117] = [./064_20_nested_subshells_environment_variables.sh]
-DEBUG: find_files_4[118] = [./064_21_complex_string_interpolation_multiple_variables.sh]
-DEBUG: find_files_4[119] = [./064_22_function_returning_complex_data_structures.sh]
-DEBUG: find_files_4[120] = [./064_23_complex_error_handling_traps.sh]
-DEBUG: find_files_4[121] = [./064_24_advanced_parameter_expansion.sh]
-DEBUG: find_files_4[122] = [./064_25_complex_command_chaining.sh]
-DEBUG: find_files_4[123] = [./064_hard_to_generate.sh]
-.001_simple.sh
-.002_control_flow.sh
-.003_pipeline.sh
-.032_control_flow_function.sh
-.052_numeric_computations.sh
-.061_test_local_names_preserved.sh
-.062_09_complex_function.sh
-.062_15_complex_local_variables.sh
-.062_hard_to_lex.sh
-.063_09_complex_function_parameter_handling.sh
-.063_15_complex_function_definition.sh
-.063_19_complex_function_call.sh
-.063_hard_to_parse.sh
-.064_10_nested_function_definitions.sh
-.064_16_function_complex_argument_handling.sh
-.064_22_function_returning_complex_data_structures.sh
-.064_hard_to_generate.sh
-=== Done with all pipelines ===
+  'stderr.txt': ``,
+  'test_binary.txt': `Hello World
+This is a test
+Binary content here
 `,
-  'file.txt': `apple
-banana
-apple
-cherry
-banana
-apple
-date
-elderberry
-apple
-banana
-cherry
+  'test_find.sh': `\#!/bin/bash
+find . -name "*.sh" | head -3
 `,
-  'stderr.txt': ``
+  'test_grep.sh': `result=\`grep pattern file.txt\`
+`,
+  'test_perl_critic.sh': `echo "Testing Perl::Critic integration"
+`,
+  'test_simple_function.sh': `\#!/bin/bash
+
+get_file_size() {
+    local file=\$1
+    local size=\`wc -c < "\$file"\`
+    echo "File \$file has \$size bytes"
+}
+
+get_file_size test_simple_function.sh
+`,
+  'test_system_builtin.sh': `\#!/bin/bash
+
+\# This script should generate system calls with builtin commands
+echo "Testing system calls with builtin commands"
+
+\# These should generate system 'ls' and system 'find' calls
+result1=\`ls -la\`
+result2=\`find . -name "*.txt"\`
+
+echo "Results:"
+echo "\$result1"
+echo "\$result2"
+`
 };
 
 // Helper function to get all example names
@@ -2893,10 +3464,22 @@ export function getExample(name) {
 // Helper function to get examples grouped by category
 export function getExamplesByCategory() {
   const categories = {
-    'Data Files': ['comparison.txt', 'config.txt', 'debug_output.txt', 'file.txt', 'stderr.txt'],
-    '⚠️ Can Generate': ['018_grep_params.sh', '019_grep_regex.sh', '031_control_flow_loops.sh', '045_shell_calling_perl.sh', '046_cd..sh', '048_subprocess.sh', '049_local.sh', '050_test_ls_star_dot_sh.sh', '054_fibonacci.sh', '056_send_args.sh', '062_02_complex_parameter_expansions.sh', '062_03_complex_heredocs.sh', '062_05_nested_command_substitution.sh', '062_08_simple_case.sh', '062_10_simple_pipeline.sh', '062_11_mixed_arithmetic.sh', '062_12_complex_string_interpolation.sh', '063_01_deeply_nested_arithmetic.sh', '063_04_complex_parameter_expansion.sh', '063_05_heredoc_with_complex_content.sh', '063_06_complex_pipeline_background.sh', '063_12_complex_eval.sh', '063_14_complex_redirects.sh', '064_02_nested_brace_expansions.sh', '064_03_complex_parameter_expansion.sh', '064_06_nested_arithmetic_expressions.sh', '064_08_heredocs_with_variable_interpolation.sh', '064_09_process_substitution_pipeline.sh', '064_13_complex_string_manipulation.sh', '064_18_array_slicing_manipulation.sh', '064_21_complex_string_interpolation_multiple_variables.sh', '064_23_complex_error_handling_traps.sh', '064_24_advanced_parameter_expansion.sh', '999_pwd.sh'],
-    '✅ Equivalent': ['001_simple.sh', '002_control_flow.sh', '003_pipeline.sh', '004_test_quoted.sh', '005_args.sh', '006_misc.sh', '007_cat_EOF.sh', '008_simple_backup.sh', '009_arrays.sh', '010_pattern_matching.sh', '011_brace_expansion.sh', '012_process_substitution.sh', '013_parameter_expansion.sh', '014_ansi_quoting.sh', '015_grep_advanced.sh', '016_grep_basic.sh', '017_grep_context.sh', '020_ansi_quoting_basic.sh', '021_ansi_quoting_escape.sh', '022_ansi_quoting_unicode.sh', '023_ansi_quoting_practical.sh', '024_parameter_expansion_case.sh', '025_parameter_expansion_advanced.sh', '026_parameter_expansion_more.sh', '027_parameter_expansion_defaults.sh', '028_arrays_indexed.sh', '029_arrays_associative.sh', '030_control_flow_if.sh', '032_control_flow_function.sh', '033_brace_expansion_basic.sh', '034_brace_expansion_advanced.sh', '035_brace_expansion_practical.sh', '036_pattern_matching_basic.sh', '037_pattern_matching_extglob.sh', '038_pattern_matching_nocase.sh', '039_process_substitution_here.sh', '040_process_substitution_comm.sh', '041_process_substitution_mapfile.sh', '042_process_substitution_advanced.sh', '060_issue5.sh', '062_01_ambiguous_operators.sh', '062_04_nested_arithmetic.sh', '062_06_process_substitution.sh', '062_07_complex_brace_expansion.sh', '063_10_complex_for_loop.sh', '063_17_nested_brace_expansion.sh', '064_04_extended_glob_patterns.sh', '064_25_complex_command_chaining.sh', '917_grep_context.sh'],
-    '🔍 Can Parse': ['043_home.sh', '044_find_example.sh', '047_for_arithematic.sh', '051_primes.sh', '052_numeric_computations.sh', '053_gcd.sh', '055_factorize.sh', '057_case.sh', '058_advanced_bash_idioms.sh', '059_issue3.sh', '061_test_local_names_preserved.sh', '062_09_complex_function.sh', '062_13_simple_test_expressions.sh', '062_14_complex_array_operations.sh', '062_15_complex_local_variables.sh', '062_hard_to_lex.sh', '063_02_complex_array_assignments.sh', '063_03_nested_command_substitutions.sh', '063_07_nested_if_statements.sh', '063_08_complex_case_statement.sh', '063_09_complex_function_parameter_handling.sh', '063_11_complex_while_loop.sh', '063_13_nested_subshells.sh', '063_15_complex_function_definition.sh', '063_16_complex_test_expressions.sh', '063_18_complex_here_string.sh', '063_19_complex_function_call.sh', '063_20_final_complex_construct.sh', '063_hard_to_parse.sh', '064_01_complex_nested_subshells.sh', '064_05_complex_case_statement.sh', '064_07_complex_array_operations.sh', '064_10_nested_function_definitions.sh', '064_11_complex_test_expressions.sh', '064_12_brace_expansion_nested_sequences.sh', '064_14_nested_command_substitution_arithmetic.sh', '064_15_complex_pipeline_multiple_redirects.sh', '064_16_function_complex_argument_handling.sh', '064_17_complex_while_loop_nested_conditionals.sh', '064_19_complex_pattern_matching_extended_globs.sh', '064_20_nested_subshells_environment_variables.sh', '064_22_function_returning_complex_data_structures.sh', '064_hard_to_generate.sh']
+    'ANSI Quoting': ['014_ansi_quoting.sh', '020_ansi_quoting_basic.sh', '021_ansi_quoting_escape.sh', '022_ansi_quoting_unicode.sh', '023_ansi_quoting_practical.sh'],
+    'Advanced Examples': ['000__04h_complex_examples.sh', '062_03_complex_heredocs.sh', '062_05_nested_command_substitution.sh', '062_12_complex_string_interpolation.sh', '062_hard_to_lex.sh', '063_03_nested_command_substitutions.sh', '063_05_heredoc_with_complex_content.sh', '063_12_complex_eval.sh', '063_13_nested_subshells.sh', '063_14_complex_redirects.sh', '063_16_complex_test_expressions.sh', '063_18_complex_here_string.sh', '063_20_final_complex_construct.sh', '063_hard_to_parse.sh', '064_01_complex_nested_subshells.sh', '064_11_complex_test_expressions.sh', '064_13_complex_string_manipulation.sh', '064_20_nested_subshells_environment_variables.sh', '064_21_complex_string_interpolation_multiple_variables.sh', '064_23_complex_error_handling_traps.sh', '064_25_complex_command_chaining.sh', '064_hard_to_generate.sh'],
+    'Arithmetic & Math': ['051_primes.sh', '052_numeric_computations.sh', '053_gcd.sh', '054_fibonacci.sh', '055_factorize.sh', '062_04_nested_arithmetic.sh', '062_11_mixed_arithmetic.sh', '063_01_deeply_nested_arithmetic.sh', '064_06_nested_arithmetic_expressions.sh', '064_14_nested_command_substitution_arithmetic.sh'],
+    'Arrays': ['009_arrays.sh', '028_arrays_indexed.sh', '029_arrays_associative.sh', '062_14_complex_array_operations.sh', '063_02_complex_array_assignments.sh', '064_07_complex_array_operations.sh', '064_18_array_slicing_manipulation.sh'],
+    'Basic Examples': ['000__01_file_directory_operations.sh', '000__02_output_formatting_commands.sh', '000__03_file_manipulation_commands.sh', '000__04a_basic_command_substitution.sh', '000__04b_file_directory_operations.sh', '000__04c_text_processing_commands.sh', '000__04d_system_utilities.sh', '000__04e_file_manipulation.sh', '000__04f_output_formatting.sh', '000__04g_checksum_commands.sh', '000__05_system_utilities.sh', '000__06_text_processing_commands.sh', '001_simple.sh', '004_test_quoted.sh', '005_args.sh', '006_misc.sh', '007_cat_EOF.sh', '008_simple_backup.sh', '045_shell_calling_perl.sh', '047_for_arithematic.sh', '050_test_ls_star_dot_sh.sh', '056_send_args.sh', '058_advanced_bash_idioms.sh', '062_01_ambiguous_operators.sh', '062_13_simple_test_expressions.sh', '064_04_extended_glob_patterns.sh', '064_08_heredocs_with_variable_interpolation.sh', '065_yes_head_while.sh', '999_pwd.sh', 'test_perl_critic.sh', 'test_system_builtin.sh'],
+    'Brace Expansion': ['011_brace_expansion.sh', '033_brace_expansion_basic.sh', '034_brace_expansion_advanced.sh', '035_brace_expansion_practical.sh', '062_07_complex_brace_expansion.sh', '063_17_nested_brace_expansion.sh', '064_02_nested_brace_expansions.sh', '064_12_brace_expansion_nested_sequences.sh'],
+    'Control Flow': ['002_control_flow.sh', '024_parameter_expansion_case.sh', '030_control_flow_if.sh', '031_control_flow_loops.sh', '032_control_flow_function.sh', '038_pattern_matching_nocase.sh', '057_case.sh', '062_08_simple_case.sh', '062_09_complex_function.sh', '063_07_nested_if_statements.sh', '063_08_complex_case_statement.sh', '063_09_complex_function_parameter_handling.sh', '063_10_complex_for_loop.sh', '063_11_complex_while_loop.sh', '063_15_complex_function_definition.sh', '063_19_complex_function_call.sh', '064_05_complex_case_statement.sh', '064_10_nested_function_definitions.sh', '064_16_function_complex_argument_handling.sh', '064_17_complex_while_loop_nested_conditionals.sh', '064_22_function_returning_complex_data_structures.sh', '900_if2echo.sh', 'test_simple_function.sh'],
+    'Data Files': ['comparison.txt', 'config.txt', 'stderr.txt', 'test_binary.txt'],
+    'File Operations': ['000__07_find_path_commands.sh', '043_home.sh', '044_find_example.sh', 'test_find.sh'],
+    'Grep Examples': ['015_grep_advanced.sh', '016_grep_basic.sh', '017_grep_context.sh', '018_grep_params.sh', '019_grep_regex.sh', 'test_grep.sh'],
+    'Issue Examples': ['059_issue3.sh', '060_issue5.sh'],
+    'Parameter Expansion': ['013_parameter_expansion.sh', '025_parameter_expansion_advanced.sh', '026_parameter_expansion_more.sh', '027_parameter_expansion_defaults.sh', '062_02_complex_parameter_expansions.sh', '063_04_complex_parameter_expansion.sh', '064_03_complex_parameter_expansion.sh', '064_24_advanced_parameter_expansion.sh'],
+    'Pattern Matching': ['010_pattern_matching.sh', '036_pattern_matching_basic.sh', '037_pattern_matching_extglob.sh', '064_19_complex_pattern_matching_extended_globs.sh'],
+    'Pipelines': ['003_pipeline.sh', '062_10_simple_pipeline.sh', '063_06_complex_pipeline_background.sh', '064_09_process_substitution_pipeline.sh', '064_15_complex_pipeline_multiple_redirects.sh'],
+    'Process Substitution': ['012_process_substitution.sh', '039_process_substitution_here.sh', '040_process_substitution_comm.sh', '041_process_substitution_mapfile.sh', '042_process_substitution_advanced.sh', '062_06_process_substitution.sh'],
+    'Shell Operations': ['046_cd..sh', '048_subprocess.sh', '049_local.sh', '061_test_local_names_preserved.sh', '062_15_complex_local_variables.sh']
   };
   
   return categories;

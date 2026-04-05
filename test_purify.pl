@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use Getopt::Long;
 use File::Basename;
+use File::Temp qw(tempfile);
 use Time::HiRes qw(time);
 use POSIX qw(WIFEXITED WEXITSTATUS);
 
@@ -54,6 +55,31 @@ sub debug_progress {
     my $filled = int(($current / $total) * $bar_length);
     my $bar = "[" . "=" x $filled . " " x ($bar_length - $filled) . "]";
     debug_print(1, "Progress: $bar $percent% ($current/$total) - $operation");
+}
+
+sub print_output_excerpt {
+    my ($title, $output, $max_lines) = @_;
+    $max_lines ||= 8;
+    $output //= '';
+
+    $output =~ s/\r\n/\n/g;
+    $output =~ s/\r/\n/g;
+
+    my @lines = split /\n/, $output;
+    my $total_lines = scalar @lines;
+    my $shown_lines = $total_lines < $max_lines ? $total_lines : $max_lines;
+
+    print "$title (showing first $shown_lines of $total_lines lines)\n";
+    if ($shown_lines == 0) {
+        print "  <no output>\n";
+        return;
+    }
+
+    for my $i (0 .. $shown_lines - 1) {
+        print $lines[$i] . "\n";
+    }
+
+    print "... truncated after $shown_lines lines ...\n" if $total_lines > $shown_lines;
 }
 
 # Enhanced timeout functions with fine-grained control
@@ -169,7 +195,7 @@ sub run_backticks_with_timeout {
 # Test purify.pl on all files from examples.impurl
 my @test_files = glob("examples.impurl/*.pl");
 # Limit to first 10 files for faster testing
-@test_files = @test_files[0..9] if scalar(@test_files) > 10;
+#@test_files = @test_files[0..9] if scalar(@test_files) > 10;
 my $total_files = scalar(@test_files);
 
 debug_print(1, "Found $total_files .pl files in examples.impurl directory");
@@ -190,6 +216,53 @@ if ($help_result != 0) {
 }
 debug_print(1, "purify.pl --help test passed");
 
+sub assert_rewrites_backticks {
+    my ($name, $source, $expected_regex) = @_;
+
+    my ($in_fh, $input_path) = tempfile();
+    print $in_fh $source;
+    close $in_fh;
+
+    my ($out_fh, $output_path) = tempfile();
+    close $out_fh;
+
+    my $command = "$perl_cmd purify.pl --debashc-path target/debug/debashc \"$input_path\" > \"$output_path\" 2>&1";
+    my ($output, $result) = run_backticks_with_timeout($command, 'purify_execution', $name);
+    if ($result != 0) {
+        die "$name failed: $output\n";
+    }
+
+    my $purified = do {
+        local $/;
+        open my $fh, '<', $output_path or die "Cannot open $output_path: $!";
+        <$fh>;
+    };
+
+    if ($purified =~ /`/) {
+        die "$name still contains raw backticks:\n$purified\n";
+    }
+
+    if ($purified !~ $expected_regex) {
+        die "$name did not rewrite to expected Perl:\n$purified\n";
+    }
+
+    unlink $input_path, $output_path;
+}
+
+assert_rewrites_backticks(
+    'backtick command substitution',
+    "print `echo hi`\n",
+    qr/\('hi'\)\s*\.\s*"\\n"/,
+);
+
+assert_rewrites_backticks(
+    'bare mv backtick',
+    "`mv a b`\n",
+    qr/\bmove\(/,
+);
+
+# Remove old comparison artifacts so they don't affect ls-based examples.
+unlink 'out1.txt', 'out2.txt';
 
 
 foreach my $perl_file (@test_files) {
@@ -215,31 +288,35 @@ foreach my $perl_file (@test_files) {
             # Use Perl to check for system calls and backticks (works on all platforms)
             my $check_script = qq{$perl_cmd -ne "if (/system|\\`/) { exit 1; }" "$pure_file"};
             my $grep_result = run_system_with_timeout($check_script, 'grep_check', "grep check");
-            if ( $grep_result == 0 ){
+            if ( $grep_result != 0 ){
                 debug_print(1, "Failed to Purify $pure_file - still contains system calls or backticks");
-                exit;
+                die "Failed to Purify $pure_file - still contains system calls or backticks\n";
             }
             debug_print(2, "✓ Purification check passed - no system calls or backticks found");
 
             # Run original file
             debug_print(2, "Running original file: $perl_file");
-            my ($out1, $perl1_result) = run_backticks_with_timeout("$perl_cmd \"$perl_file\" > out1.txt 2>&1", 'perl_execution', "original file execution");
+            my ($out1_fh, $out1_path) = tempfile();
+            close $out1_fh;
+            my ($out1, $perl1_result) = run_backticks_with_timeout("$perl_cmd \"$perl_file\" > \"$out1_path\" 2>&1", 'perl_execution', "original file execution");
             debug_print(2, "Original file execution result: $perl1_result");
             
             # Run purified file
             debug_print(2, "Running purified file: $pure_file");
-            my ($out2, $perl2_result) = run_backticks_with_timeout("$perl_cmd \"$pure_file\" > out2.txt 2>&1", 'perl_execution', "purified file execution");
+            my ($out2_fh, $out2_path) = tempfile();
+            close $out2_fh;
+            my ($out2, $perl2_result) = run_backticks_with_timeout("$perl_cmd \"$pure_file\" > \"$out2_path\" 2>&1", 'perl_execution', "purified file execution");
             debug_print(2, "Purified file execution result: $perl2_result");
 
             # Compare outputs by reading the actual files
             my $file1_content = do {
                 local $/;
-                open my $fh, '<', 'out1.txt' or die "Cannot open out1.txt: $!";
+                open my $fh, '<', $out1_path or die "Cannot open $out1_path: $!";
                 <$fh>;
             };
             my $file2_content = do {
                 local $/;
-                open my $fh, '<', 'out2.txt' or die "Cannot open out2.txt: $!";
+                open my $fh, '<', $out2_path or die "Cannot open $out2_path: $!";
                 <$fh>;
             };
             
@@ -247,24 +324,25 @@ foreach my $perl_file (@test_files) {
                 debug_print(1, "Output mismatch detected between original and purified files");
                 debug_print(2, " === purified === \n$output\n === end purified ===");
 
-                debug_print(2, "Running diff to show differences");
                 my $diff_command;
                 if ($^O eq 'MSWin32') {
                     # Use fc on Windows
-                    $diff_command = "fc out1.txt out2.txt";
+                    $diff_command = "fc \"$out1_path\" \"$out2_path\" 2>&1";
                 } else {
                     # Use diff on Unix systems
-                    $diff_command = "diff -u out1.txt out2.txt";
+                    $diff_command = "diff -u \"$out1_path\" \"$out2_path\" 2>&1";
                 }
-                run_system_with_timeout($diff_command, 'diff_comparison', "diff comparison");
-                debug_print(1, "FAILED - Output mismatch");
-                exit;
+                my ($diff_output, $diff_result) = run_backticks_with_timeout($diff_command, 'diff_comparison', "diff comparison");
+                print_output_excerpt("Diff excerpt", $diff_output, 8);
+                die "FAILED - Output mismatch for $perl_file -> $pure_file (diff exit code: $diff_result)\n";
             }
             debug_print(1, "✓ Output comparison passed - files produce identical output");
+            unlink $out1_path, $out2_path;
             $purify_passed++;
         } else {
             debug_print(1, "✗ $perl_file: purify.pl failed (exit code: $purify_result)");
             debug_print(1, "Error output: $output");
+            print_output_excerpt("purify.pl error output", $output, 8);
             $purify_failed++;
             # Quit on first failure
             die "Stopping on first failure. Fix the issue and run again.\n";
