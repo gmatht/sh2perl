@@ -4,6 +4,9 @@ use warnings;
 use Getopt::Long;
 use File::Basename;
 use File::Temp qw(tempfile);
+use File::Path qw(make_path remove_tree);
+use File::Spec;
+use Cwd qw(abs_path getcwd);
 use Time::HiRes qw(time);
 use POSIX qw(WIFEXITED WEXITSTATUS);
 
@@ -40,12 +43,29 @@ if ($next) {
     print "Running test_purify.pl with next option\n";
 }
 
+$ENV{TZ} = 'UTC';
+$ENV{LANG} = 'C';
+$ENV{LC_ALL} = 'C';
+$ENV{PATH} = '/usr/bin:/bin';
+umask 022;
+
+my $repo_root = dirname(abs_path($0));
+my $workspace_root = File::Spec->catdir($repo_root, '.test-work', 'purify');
+make_path($workspace_root);
+my $purify_pl = File::Spec->catfile($repo_root, 'purify.pl');
+my $debashc_path = File::Spec->catfile($repo_root, 'target', 'debug', 'debashc');
+if ($^O eq 'MSWin32' && !-x $debashc_path) {
+    $debashc_path .= '.exe';
+}
+if (!-x $debashc_path) {
+    die "Error: debashc not found at '$debashc_path'. Please build the project first with 'cargo build'\n";
+}
+
 # Enhanced debugging functions
 sub debug_print {
     my ($level, $message) = @_;
     return if $level > $debug_level;
-    my $timestamp = sprintf("[%.3f]", time());
-    print "DEBUG$timestamp: $message\n";
+    print "DEBUG: $message\n";
 }
 
 sub debug_progress {
@@ -193,7 +213,7 @@ sub run_backticks_with_timeout {
 }
 
 # Test purify.pl on all files from examples.impurl
-my @test_files = glob("examples.impurl/*.pl");
+my @test_files = glob(File::Spec->catfile($repo_root, 'examples.impurl', '*.pl'));
 # Limit to first 10 files for faster testing
 #@test_files = @test_files[0..9] if scalar(@test_files) > 10;
 my $total_files = scalar(@test_files);
@@ -208,7 +228,7 @@ my $start_time = time();
 # Test that purify.pl can handle the --help option
 debug_print(1, "Testing purify.pl --help...");
 my $perl_cmd = $^O eq 'MSWin32' ? "C:\\Strawberry\\perl\\bin\\perl.exe" : "perl";
-my ($help_output, $help_result) = run_backticks_with_timeout("$perl_cmd purify.pl --help 2>&1", 'purify_help', "purify.pl help test");
+my ($help_output, $help_result) = run_backticks_with_timeout("$perl_cmd \"$purify_pl\" --help 2>&1", 'purify_help', "purify.pl help test");
 if ($help_result != 0) {
     debug_print(1, "Error: purify.pl --help failed (exit code: $help_result)");
     debug_print(1, "Error output: $help_output");
@@ -226,7 +246,7 @@ sub assert_rewrites_backticks {
     my ($out_fh, $output_path) = tempfile();
     close $out_fh;
 
-    my $command = "$perl_cmd purify.pl --debashc-path target/debug/debashc \"$input_path\" > \"$output_path\" 2>&1";
+    my $command = "$perl_cmd \"$purify_pl\" --debashc-path \"$debashc_path\" \"$input_path\" > \"$output_path\" 2>&1";
     my ($output, $result) = run_backticks_with_timeout($command, 'purify_execution', $name);
     if ($result != 0) {
         die "$name failed: $output\n";
@@ -268,85 +288,120 @@ unlink 'out1.txt', 'out2.txt';
 foreach my $perl_file (@test_files) {
     if (-f $perl_file) {
         $purify_tested++;
-        my $pure_file="pure/" . basename($perl_file);
-        
+        my $example_name = basename($perl_file, '.pl');
+        my $example_dir = File::Spec->catdir($workspace_root, $example_name);
+        remove_tree($example_dir);
+        make_path(File::Spec->catdir($example_dir, 'pure'));
+        my $pure_file = File::Spec->catfile($example_dir, 'pure', basename($perl_file));
+
         # Show progress
         debug_progress($purify_tested, $total_files, "Processing files");
         debug_print(1, "Testing purify.pl on $perl_file -> $pure_file");
         debug_print(2, "File $purify_tested of $total_files");
-        
-        # Test purify.pl on the Perl file and capture output
-        debug_print(2, "Running purify.pl on $perl_file");
-        my ($output, $purify_result) = run_backticks_with_timeout("$perl_cmd purify.pl \"$perl_file\" > \"$pure_file\" 2>&1", 'purify_execution', "purify.pl execution");
-        debug_print(2, "purify.pl result: $purify_result");
-        
-        if ($purify_result == 0) {
-            debug_print(1, "✓ $perl_file: purify.pl processed successfully");
 
-            # Check if purified file still contains system calls or backticks
-            debug_print(2, "Checking if $pure_file still contains system calls or backticks");
-            # Use Perl to check for system calls and backticks (works on all platforms)
-            my $check_script = qq{$perl_cmd -ne "if (/system|\\`/) { exit 1; }" "$pure_file"};
-            my $grep_result = run_system_with_timeout($check_script, 'grep_check', "grep check");
-            if ( $grep_result != 0 ){
-                debug_print(1, "Failed to Purify $pure_file - still contains system calls or backticks");
-                die "Failed to Purify $pure_file - still contains system calls or backticks\n";
-            }
-            debug_print(2, "✓ Purification check passed - no system calls or backticks found");
+        my $original_dir = getcwd();
+        chdir $example_dir or die "Cannot chdir to $example_dir: $!\n";
+        my $nondeterministic_skip = 0;
 
-            # Run original file
-            debug_print(2, "Running original file: $perl_file");
-            my ($out1_fh, $out1_path) = tempfile();
-            close $out1_fh;
-            my ($out1, $perl1_result) = run_backticks_with_timeout("$perl_cmd \"$perl_file\" > \"$out1_path\" 2>&1", 'perl_execution', "original file execution");
-            debug_print(2, "Original file execution result: $perl1_result");
-            
-            # Run purified file
-            debug_print(2, "Running purified file: $pure_file");
-            my ($out2_fh, $out2_path) = tempfile();
-            close $out2_fh;
-            my ($out2, $perl2_result) = run_backticks_with_timeout("$perl_cmd \"$pure_file\" > \"$out2_path\" 2>&1", 'perl_execution', "purified file execution");
-            debug_print(2, "Purified file execution result: $perl2_result");
+        eval {
+            # Test purify.pl on the Perl file and capture output
+            debug_print(2, "Running purify.pl on $perl_file");
+            my ($output, $purify_result) = run_backticks_with_timeout("$perl_cmd \"$purify_pl\" --debashc-path \"$debashc_path\" \"$perl_file\" > \"$pure_file\" 2>&1", 'purify_execution', "purify.pl execution");
+            debug_print(2, "purify.pl result: $purify_result");
 
-            # Compare outputs by reading the actual files
-            my $file1_content = do {
-                local $/;
-                open my $fh, '<', $out1_path or die "Cannot open $out1_path: $!";
-                <$fh>;
-            };
-            my $file2_content = do {
-                local $/;
-                open my $fh, '<', $out2_path or die "Cannot open $out2_path: $!";
-                <$fh>;
-            };
-            
-            if ( $file1_content ne $file2_content ) {
-                debug_print(1, "Output mismatch detected between original and purified files");
-                debug_print(2, " === purified === \n$output\n === end purified ===");
+            if ($purify_result == 0) {
+                debug_print(1, "✓ $perl_file: purify.pl processed successfully");
 
-                my $diff_command;
-                if ($^O eq 'MSWin32') {
-                    # Use fc on Windows
-                    $diff_command = "fc \"$out1_path\" \"$out2_path\" 2>&1";
-                } else {
-                    # Use diff on Unix systems
-                    $diff_command = "diff -u \"$out1_path\" \"$out2_path\" 2>&1";
+                # Check if purified file still contains system calls or backticks
+                debug_print(2, "Checking if $pure_file still contains system calls or backticks");
+                # Use Perl to check for system calls and backticks (works on all platforms)
+                my $check_script = qq{$perl_cmd -ne "if (/system|\\`/) { exit 1; }" "$pure_file"};
+                my $grep_result = run_system_with_timeout($check_script, 'grep_check', "grep check");
+                if ( $grep_result != 0 ){
+                    debug_print(1, "Failed to Purify $pure_file - still contains system calls or backticks");
+                    die "Failed to Purify $pure_file - still contains system calls or backticks\n";
                 }
-                my ($diff_output, $diff_result) = run_backticks_with_timeout($diff_command, 'diff_comparison', "diff comparison");
-                print_output_excerpt("Diff excerpt", $diff_output, 8);
-                die "FAILED - Output mismatch for $perl_file -> $pure_file (diff exit code: $diff_result)\n";
+                debug_print(2, "✓ Purification check passed - no system calls or backticks found");
+
+                # Run original file
+                debug_print(2, "Running original file: $perl_file");
+                my ($out1_fh, $out1_path) = tempfile(DIR => $workspace_root);
+                close $out1_fh;
+                my ($out1, $perl1_result) = run_backticks_with_timeout("$perl_cmd \"$perl_file\" > \"$out1_path\" 2>&1", 'perl_execution', "original file execution");
+                debug_print(2, "Original file execution result: $perl1_result");
+
+                # Run purified file
+                debug_print(2, "Running purified file: $pure_file");
+                my ($out2_fh, $out2_path) = tempfile(DIR => $workspace_root);
+                close $out2_fh;
+                my ($out2, $perl2_result) = run_backticks_with_timeout("$perl_cmd \"$pure_file\" > \"$out2_path\" 2>&1", 'perl_execution', "purified file execution");
+                debug_print(2, "Purified file execution result: $perl2_result");
+
+                # Compare outputs by reading the actual files
+                my $file1_content = do {
+                    local $/;
+                    open my $fh, '<', $out1_path or die "Cannot open $out1_path: $!";
+                    <$fh>;
+                };
+                my $file2_content = do {
+                    local $/;
+                    open my $fh, '<', $out2_path or die "Cannot open $out2_path: $!";
+                    <$fh>;
+                };
+
+                if ( $file1_content ne $file2_content ) {
+                    debug_print(1, "Output mismatch detected between original and purified files; re-running original to check for nondeterminism");
+                    debug_print(2, " === purified === \n$output\n === end purified ===");
+
+                    my ($out1b_fh, $out1b_path) = tempfile(DIR => $workspace_root);
+                    close $out1b_fh;
+                    my ($out1b, $perl1b_result) = run_backticks_with_timeout("$perl_cmd \"$perl_file\" > \"$out1b_path\" 2>&1", 'perl_execution', "original file re-run");
+                    my $file1b_content = do {
+                        local $/;
+                        open my $fh, '<', $out1b_path or die "Cannot open $out1b_path: $!";
+                        <$fh>;
+                    };
+
+                    if ($perl1_result != $perl1b_result || $file1_content ne $file1b_content) {
+                        debug_print(1, "Nondeterministic test detected for $perl_file; skipping");
+                        $skipped_count++;
+                        $nondeterministic_skip = 1;
+                        unlink $out1_path, $out2_path, $out1b_path;
+                    } else {
+                        my $diff_command;
+                        if ($^O eq 'MSWin32') {
+                            # Use fc on Windows
+                            $diff_command = "fc \"$out1_path\" \"$out2_path\" 2>&1";
+                        } else {
+                            # Use diff on Unix systems
+                            $diff_command = "diff -u \"$out1_path\" \"$out2_path\" 2>&1";
+                        }
+                        my ($diff_output, $diff_result) = run_backticks_with_timeout($diff_command, 'diff_comparison', "diff comparison");
+                        print_output_excerpt("Diff excerpt", $diff_output, 8);
+                        die "FAILED - Output mismatch for $perl_file -> $pure_file (diff exit code: $diff_result)\n";
+                    }
+                }
+                if ($nondeterministic_skip) {
+                    debug_print(1, "Skipping $perl_file after nondeterminism check");
+                } else {
+                    debug_print(1, "✓ Output comparison passed - files produce identical output");
+                    unlink $out1_path, $out2_path;
+                    $purify_passed++;
+                }
+            } else {
+                debug_print(1, "✗ $perl_file: purify.pl failed (exit code: $purify_result)");
+                debug_print(1, "Error output: $output");
+                print_output_excerpt("purify.pl error output", $output, 8);
+                $purify_failed++;
+                # Quit on first failure
+                die "Stopping on first failure. Fix the issue and run again.\n";
             }
-            debug_print(1, "✓ Output comparison passed - files produce identical output");
-            unlink $out1_path, $out2_path;
-            $purify_passed++;
-        } else {
-            debug_print(1, "✗ $perl_file: purify.pl failed (exit code: $purify_result)");
-            debug_print(1, "Error output: $output");
-            print_output_excerpt("purify.pl error output", $output, 8);
-            $purify_failed++;
-            # Quit on first failure
-            die "Stopping on first failure. Fix the issue and run again.\n";
-        }
+        };
+
+        my $example_error = $@;
+        chdir $original_dir or die "Cannot chdir back to $original_dir: $!\n";
+        next if $example_error eq '' && $nondeterministic_skip;
+        die $example_error if $example_error;
     }
 }
 
