@@ -4,10 +4,10 @@ use crate::generator::Generator;
 /// Generate logical AND operation (left && right)
 pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &Command) -> String {
     let mut output = String::new();
-    
+
     // Generate: left && right
     output.push_str(&generator.indent());
-    
+
     // For TestExpression, use the test expression directly as the condition
     if let Command::TestExpression(_) = left {
         output.push_str("if (");
@@ -30,10 +30,10 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         output.push_str("}\n");
         return output;
     }
-    
+
     // For other commands, use the original pattern with exit code checking
     output.push_str("if (");
-    
+
     // For RedirectCommand, we need to check exit code
     if let Command::Redirect(_) = left {
         // Generate the redirect command first, then check exit code
@@ -53,7 +53,7 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
                 let grep_result = generator.generate_command(left);
-                
+
                 // Extract the grep_result variable name from the generated code
                 let mut _grep_result_var = String::new();
                 for line in grep_result.lines() {
@@ -69,12 +69,12 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
                         output.push_str("\n");
                     }
                 }
-                
+
                 output.push_str(&generator.indent());
                 // For grep commands, check if matches were found by looking at the filtered array
                 // The grep command should have already set $CHILD_ERROR correctly
                 output.push_str("$CHILD_ERROR == 0\n");
-                
+
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("}");
@@ -132,7 +132,7 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         output.push_str(&generator.indent());
         output.push_str("}");
     }
-    
+
     output.push_str(") {\n");
     generator.indent_level += 1;
     output.push_str(&generator.indent());
@@ -140,18 +140,18 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("}\n");
-    
+
     output
 }
 
 /// Generate logical OR operation (left || right)
 pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Command) -> String {
     let mut output = String::new();
-    
+
     // Generate: left || right
     // OR operations should NEVER capture STDOUT - they're about conditional execution
     output.push_str(&generator.indent());
-    
+
     // Check if left is a test expression
     if let Command::TestExpression(_) = left {
         // For test expressions, generate: if (!left) { right }
@@ -209,7 +209,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                     // Set indent_level to 0 so echo generates with no indentation
                     generator.indent_level = 0;
                     let right_cmd_raw = generator.generate_command(right);
-                    // Restore indent level  
+                    // Restore indent level
                     generator.indent_level = saved_indent;
                     // The echo command may generate code with indentation even when indent_level=0
                     // We MUST strip ALL leading whitespace from every line and add exactly 4 spaces
@@ -251,10 +251,10 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                 }
             }
         }
-        
+
         // Execute left command and check exit code
         output.push_str(&generator.generate_command(left));
-        
+
         // Execute right command if left command fails
         // For diff commands, check $diff_exit_code; for others, check $CHILD_ERROR
         let exit_code_var = if contains_diff_command(left) {
@@ -262,7 +262,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         } else {
             "$CHILD_ERROR"
         };
-        
+
         output.push_str(&generator.indent());
         output.push_str(&format!("if ({} != 0) {{\n", exit_code_var));
         generator.indent_level += 1;
@@ -272,7 +272,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         output.push_str(&generator.indent());
         output.push_str("}\n");
     }
-    
+
     output
 }
 
@@ -286,9 +286,7 @@ fn contains_diff_command(cmd: &Command) -> bool {
                 false
             }
         }
-        Command::Redirect(redirect_cmd) => {
-            contains_diff_command(&redirect_cmd.command)
-        }
+        Command::Redirect(redirect_cmd) => contains_diff_command(&redirect_cmd.command),
         _ => false,
     }
 }

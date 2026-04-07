@@ -1090,6 +1090,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
         &string_content
     };
 
+    let content = content.replace("\\\"", "\"");
+
     // Debug output
 
     // Parse the string content to extract literal parts and variable references

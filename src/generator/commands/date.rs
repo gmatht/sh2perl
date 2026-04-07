@@ -1,29 +1,40 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-fn date_arg_expr(generator: &mut Generator, word: &Word) -> String {
+fn perl_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn simple_word_text(word: &Word) -> Option<String> {
     match word {
-        Word::Literal(value, _) => {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("\"{}\"", escaped)
+        Word::Literal(text, _) => Some(text.clone()),
+        Word::StringInterpolation(interp, _) => {
+            let mut text = String::new();
+            for part in &interp.parts {
+                match part {
+                    StringPart::Literal(s) => text.push_str(s),
+                    _ => return None,
+                }
+            }
+            Some(text)
         }
-        _ => {
-            let rendered = generator.word_to_perl(word);
-            let escaped = rendered.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("\"{}\"", escaped)
-        }
+        _ => None,
     }
 }
 
-fn date_command_expr(generator: &mut Generator, cmd: &SimpleCommand) -> String {
-    let mut expr = "\"date\"".to_string();
+fn default_date_expr() -> String {
+    "require POSIX; POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime($DATE_SNAPSHOT)) . \"\\n\""
+        .to_string()
+}
 
-    for arg in &cmd.args {
-        expr.push_str(" . ' ' . ");
-        expr.push_str(&date_arg_expr(generator, arg));
-    }
+fn format_date_expr(format: &str) -> String {
+    let cleaned = format.strip_prefix('+').unwrap_or(format);
+    let format_expr = perl_single_quoted(cleaned);
 
-    expr
+    format!(
+        "require POSIX; POSIX::strftime({}, localtime($DATE_SNAPSHOT)) . \"\\n\"",
+        format_expr
+    )
 }
 
 pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) -> String {
@@ -36,11 +47,36 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
         ));
     }
 
-    format!(
-        "{}my $date_cmd = {}; qx{{$date_cmd}}",
-        prefix,
-        date_command_expr(generator, cmd)
-    )
+    let body = match cmd.args.as_slice() {
+        [] => default_date_expr(),
+        [flag_word, arg, ..] if simple_word_text(flag_word).as_deref() == Some("-r") => {
+            let path_expr = generator.word_to_perl(arg);
+            format!(
+                "my $date_path = {};\nrequire POSIX; POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime((stat($date_path))[9])) . \"\\n\"",
+                path_expr
+            )
+        }
+        [flag_word, arg, ..] if simple_word_text(flag_word).as_deref() == Some("-d") => {
+            let source_expr = generator.word_to_perl(arg);
+            format!(
+                "my $date_source = {};\nrequire POSIX;\nif ($date_source =~ /^@([0-9]+)$/) {{\n    my $date_epoch = $1;\n    POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime($date_epoch)) . \"\\n\"\n}}\nelse {{\n    select((select(STDOUT), $| = 1)[0]);\n    print STDERR \"date: option requires an argument -- 'd'\\nTry 'date --help' for more information.\\n\";\n    q{{}};\n}}",
+                source_expr
+            )
+        }
+        [format_word, ..] => {
+            if let Some(format) = simple_word_text(format_word) {
+                format_date_expr(&format)
+            } else {
+                let format_expr = generator.word_to_perl(format_word);
+                format!(
+                    "my $date_now = $DATE_SNAPSHOT; my $date_format = {}; $date_format =~ s/^\\+//; require POSIX; POSIX::strftime($date_format, localtime($date_now)) . \"\\n\"",
+                    format_expr
+                )
+            }
+        }
+    };
+
+    format!("{}{}", prefix, body)
 }
 
 pub fn generate_date_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {

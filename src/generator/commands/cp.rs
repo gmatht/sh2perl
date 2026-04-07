@@ -3,12 +3,12 @@ use crate::generator::Generator;
 
 pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
-    
+
     // cp command syntax: cp [options] source... destination
     let mut recursive = false;
     let mut preserve = false;
     let mut sources = Vec::new();
-    
+
     // Parse cp options
     for arg in &cmd.args {
         if let Word::Literal(arg_str, _) = arg {
@@ -25,24 +25,24 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             sources.push(generator.perl_string_literal(arg));
         }
     }
-    
+
     if sources.len() < 2 {
         output.push_str("die \"cp: missing file operand\\n\";\n");
     } else {
         // Last argument is the destination
         let destination = sources.pop().unwrap();
-        
+
         if !generator.declared_locals.contains("err") {
             output.push_str(&generator.indent());
             output.push_str("my $err;\n");
             generator.declared_locals.insert("err".to_string());
         }
-        
+
         for source in &sources {
             output.push_str(&generator.indent());
             output.push_str(&format!("if ( -e {} ) {{\n", source));
             generator.indent_level += 1;
-            
+
             if recursive && format!("-d {}", source).contains("-d") {
                 // Recursive copy for directories
                 output.push_str(&generator.indent());
@@ -84,13 +84,19 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str("if ($result == 0) {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("print \"cp: copied directory {} to $dest_dir\\n\";\n", source));
+                output.push_str(&format!(
+                    "print \"cp: copied directory {} to $dest_dir\\n\";\n",
+                    source
+                ));
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("} else {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("die \"cp: failed to copy directory {}\\n\";\n", source));
+                output.push_str(&format!(
+                    "die \"cp: failed to copy directory {}\\n\";\n",
+                    source
+                ));
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
@@ -127,7 +133,10 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str("else {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n", source));
+                output.push_str(&format!(
+                    "die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n",
+                    source
+                ));
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
@@ -164,12 +173,15 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 output.push_str("else {\n");
                 generator.indent_level += 1;
                 output.push_str(&generator.indent());
-                output.push_str(&format!("die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n", source));
+                output.push_str(&format!(
+                    "die \"cp: cannot copy {} to $dest: $ERRNO\\n\";\n",
+                    source
+                ));
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
             }
-            
+
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");
@@ -177,12 +189,15 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             output.push_str("else {\n");
             generator.indent_level += 1;
             output.push_str(&generator.indent());
-            output.push_str(&format!("die \"cp: {}: No such file or directory\\n\";\n", source));
+            output.push_str(&format!(
+                "die \"cp: {}: No such file or directory\\n\";\n",
+                source
+            ));
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");
         }
     }
-    
+
     output
 }

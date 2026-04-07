@@ -3,12 +3,12 @@ use crate::generator::Generator;
 
 pub fn generate_wget_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
-    
+
     // wget command syntax: wget [options] URL
     if let Some(url) = cmd.args.last() {
         let url_str = generator.word_to_perl(url);
         let mut output_file = "".to_string();
-        
+
         // Parse wget options
         for arg in &cmd.args {
             if let Word::Literal(arg_str, _) = arg {
@@ -24,15 +24,17 @@ pub fn generate_wget_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                 }
             }
         }
-        
+
         output.push_str("use LWP::Simple;\n");
         output.push_str(&format!("my $url = {};\n", url_str));
-        
+
         if !output_file.is_empty() {
             output.push_str(&format!("my $output_file = {};\n", output_file));
             output.push_str("my $content = get($url);\n");
             output.push_str("if (defined $content) {\n");
-            output.push_str(&format!("open my $fh, '>', $output_file or die \"Cannot open $output_file: $ERRNO\";\n"));
+            output.push_str(&format!(
+                "open my $fh, '>', $output_file or die \"Cannot open $output_file: $ERRNO\";\n"
+            ));
             output.push_str("print $fh $content;\n");
             output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
             output.push_str("print \"Downloaded to $output_file\\n\";\n");
@@ -50,6 +52,6 @@ pub fn generate_wget_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     } else {
         output.push_str("die \"wget: missing URL\\n\";\n");
     }
-    
+
     output
 }

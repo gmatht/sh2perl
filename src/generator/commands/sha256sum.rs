@@ -1,14 +1,17 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str) -> String {
+pub fn generate_sha256sum_command(
+    generator: &mut Generator,
+    cmd: &SimpleCommand,
+    input_var: &str,
+) -> String {
     let mut output = String::new();
-    
-    
+
     // sha256sum command syntax: sha256sum [options] [file]
     let mut check_mode = false;
     let mut files = Vec::new();
-    
+
     // Parse sha256sum options
     for arg in &cmd.args {
         if let Word::Literal(arg_str, _) = arg {
@@ -21,14 +24,17 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
             files.push(generator.perl_string_literal(arg));
         }
     }
-    
+
     if check_mode {
         // Check mode: verify checksums from input
         output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
         output.push_str("my @results;\n");
         output.push_str("foreach my $line (@lines) {\n");
         output.push_str("chomp $line;\n");
-        output.push_str(&format!("if ($line =~ {}) {{\n", generator.format_regex_pattern(r"^([a-f0-9]{64})\\s+(.+)$")));
+        output.push_str(&format!(
+            "if ($line =~ {}) {{\n",
+            generator.format_regex_pattern(r"^([a-f0-9]{64})\\s+(.+)$")
+        ));
         output.push_str("my ($expected_hash, $filename) = ($1, $2);\n");
         output.push_str("if (-f \"$filename\") {\n");
         output.push_str("my $actual_hash = sha256_hex(do { local $/; open my $fh, '<', $filename or die \"Cannot open $filename: $OS_ERROR\"; my $content = <$fh>; close $fh or die \"Close failed: $OS_ERROR\"; $content });\n");
@@ -58,14 +64,18 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
             output.push_str("    my @results;\n");
             for file in &files {
                 // Extract the unquoted filename for output
-                let unquoted_file = if file.starts_with("'") && file.ends_with("'") && file.len() > 2 {
-                    &file[1..file.len()-1]
-                } else {
-                    file
-                };
+                let unquoted_file =
+                    if file.starts_with("'") && file.ends_with("'") && file.len() > 2 {
+                        &file[1..file.len() - 1]
+                    } else {
+                        file
+                    };
                 output.push_str(&format!("    if ( -f {} ) {{\n", file));
                 output.push_str(&format!("        my $hash = sha256_hex(\n            do {{\n                local $INPUT_RECORD_SEPARATOR = undef;\n                open my $fh, '<', {}\n                  or croak \"Cannot open {}: $ERRNO\";\n                my $content = <$fh>;\n                close $fh\n                  or croak \"Close failed: $ERRNO\";\n                $content;\n            }}\n        );\n", file, file));
-                output.push_str(&format!("        push @results, \"$hash  {}\";\n", unquoted_file));
+                output.push_str(&format!(
+                    "        push @results, \"$hash  {}\";\n",
+                    unquoted_file
+                ));
                 output.push_str("    }\n");
                 output.push_str("    else {\n");
                 output.push_str("        push @results,\n");
@@ -78,14 +88,18 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
             output.push_str("my @results;\n");
             for file in &files {
                 // Extract the unquoted filename for output
-                let unquoted_file = if file.starts_with("'") && file.ends_with("'") && file.len() > 2 {
-                    &file[1..file.len()-1]
-                } else {
-                    file
-                };
+                let unquoted_file =
+                    if file.starts_with("'") && file.ends_with("'") && file.len() > 2 {
+                        &file[1..file.len() - 1]
+                    } else {
+                        file
+                    };
                 output.push_str(&format!("    if ( -f {} ) {{\n", file));
                 output.push_str(&format!("        my $hash = sha256_hex(\n            do {{\n                local $INPUT_RECORD_SEPARATOR = undef;\n                open my $fh, '<', {}\n                  or croak \"Cannot open {}: $ERRNO\";\n                my $content = <$fh>;\n                close $fh\n                  or croak \"Close failed: $ERRNO\";\n                $content;\n            }}\n        );\n", file, file));
-                output.push_str(&format!("        push @results, \"$hash  {}\";\n", unquoted_file));
+                output.push_str(&format!(
+                    "        push @results, \"$hash  {}\";\n",
+                    unquoted_file
+                ));
                 output.push_str("    }\n");
                 output.push_str("    else {\n");
                 output.push_str("        push @results,\n");
@@ -96,6 +110,6 @@ pub fn generate_sha256sum_command(generator: &mut Generator, cmd: &SimpleCommand
         }
     }
     output.push_str("\n");
-    
+
     output
 }

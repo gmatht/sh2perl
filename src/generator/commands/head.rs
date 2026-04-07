@@ -1,12 +1,17 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_head_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: usize) -> String {
+pub fn generate_head_command(
+    _generator: &mut Generator,
+    cmd: &SimpleCommand,
+    input_var: &str,
+    _command_index: usize,
+) -> String {
     let mut output = String::new();
-    
+
     // head command syntax: head [options] [file...]
     let mut num_lines = 10; // Default to first 10 lines
-    
+
     // Parse head options
     let mut i = 0;
     while i < cmd.args.len() {
@@ -38,7 +43,7 @@ pub fn generate_head_command(_generator: &mut Generator, cmd: &SimpleCommand, in
         }
         i += 1;
     }
-    
+
     // Use line-by-line processing instead of arrays
     // Align variable declarations for perltidy compliance
     let max_len = "head_line_count".len(); // Longest variable name
@@ -46,24 +51,33 @@ pub fn generate_head_command(_generator: &mut Generator, cmd: &SimpleCommand, in
     let result_spaces = " ".repeat(max_len.saturating_sub("result".len()));
     let input_spaces = " ".repeat(max_len.saturating_sub("input".len()));
     let pos_spaces = " ".repeat(max_len.saturating_sub("pos".len()));
-    output.push_str(&format!("my $num_lines{} = {};\n", num_lines_spaces, num_lines));
+    output.push_str(&format!(
+        "my $num_lines{} = {};\n",
+        num_lines_spaces, num_lines
+    ));
     output.push_str(&format!("my $head_line_count = 0;\n"));
     output.push_str(&format!("my $result{} = q{{}};\n", result_spaces));
     output.push_str(&format!("my $input{} = ${};\n", input_spaces, input_var));
     output.push_str(&format!("my $pos{} = 0;\n", pos_spaces));
     output.push_str("\n");
-    output.push_str(&format!("while ( $pos < length $input && $head_line_count < $num_lines ) {{\n"));
-    output.push_str(&format!("    my $line_end = index $input, \"\\n\", $pos;\n"));
+    output.push_str(&format!(
+        "while ( $pos < length $input && $head_line_count < $num_lines ) {{\n"
+    ));
+    output.push_str(&format!(
+        "    my $line_end = index $input, \"\\n\", $pos;\n"
+    ));
     output.push_str(&format!("    if ( $line_end == -1 ) {{\n"));
     output.push_str(&format!("        $line_end = length $input;\n"));
     output.push_str(&format!("    }}\n"));
-    output.push_str(&format!("    my $head_line = substr $input, $pos, $line_end - $pos;\n"));
+    output.push_str(&format!(
+        "    my $head_line = substr $input, $pos, $line_end - $pos;\n"
+    ));
     output.push_str(&format!("    $result .= $head_line . \"\\n\";\n"));
     output.push_str(&format!("    $pos = $line_end + 1;\n"));
     output.push_str(&format!("    ++$head_line_count;\n"));
     output.push_str(&format!("}}\n"));
     output.push_str(&format!("${} = $result;\n", input_var));
     output.push_str("\n");
-    
+
     output
 }

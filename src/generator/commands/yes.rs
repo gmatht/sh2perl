@@ -3,32 +3,38 @@ use crate::generator::Generator;
 
 pub fn generate_yes_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
-    
+
     // yes command syntax: yes [string]
     let string_to_repeat = if let Some(arg) = cmd.args.first() {
         generator.perl_string_literal(arg)
     } else {
         "\"y\"".to_string()
     };
-    
+
     output.push_str(&format!("my $string = {};\n", string_to_repeat));
     output.push_str("while (1) {\n");
     output.push_str("print \"$string\\n\";\n");
     output.push_str("}\n");
-    
+
     output
 }
 
-pub fn generate_yes_command_with_context(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, output_var: &str, _command_index: &str) -> String {
+pub fn generate_yes_command_with_context(
+    generator: &mut Generator,
+    cmd: &SimpleCommand,
+    _input_var: &str,
+    output_var: &str,
+    _command_index: &str,
+) -> String {
     let mut output = String::new();
-    
+
     // yes command syntax: yes [string]
     let string_to_repeat = if let Some(arg) = cmd.args.first() {
         generator.perl_string_literal(arg)
     } else {
         "\"y\"".to_string()
     };
-    
+
     if !output_var.is_empty() {
         // In pipeline context - generate a limited number of lines and assign to output_var
         // For yes command in pipeline, we need to generate a reasonable number of lines
@@ -45,6 +51,6 @@ pub fn generate_yes_command_with_context(generator: &mut Generator, cmd: &Simple
         output.push_str("print \"$string\\n\";\n");
         output.push_str("}\n");
     }
-    
+
     output
 }

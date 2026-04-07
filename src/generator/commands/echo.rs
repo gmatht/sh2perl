@@ -3,13 +3,18 @@ use crate::generator::Generator;
 use regex::Regex;
 
 /// Generate Perl code for echo command
-pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, output_var: &str) -> String {
+pub fn generate_echo_command(
+    generator: &mut Generator,
+    cmd: &SimpleCommand,
+    _input_var: &str,
+    output_var: &str,
+) -> String {
     let mut output = String::new();
-    
+
     if cmd.args.is_empty() {
         output.push_str(&format!("${} .= \"\\n\";\n", output_var));
     } else {
-        // Check for -e flag
+        // Check for -e / -n flags
         let has_e_flag = cmd.args.iter().any(|arg| {
             if let Word::Literal(s, _) = arg {
                 s == "-e"
@@ -17,28 +22,38 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                 false
             }
         });
-        
-        // Filter out the -e flag from arguments
-        let filtered_args: Vec<&Word> = cmd.args.iter().filter(|&arg| {
+        let has_n_flag = cmd.args.iter().any(|arg| {
             if let Word::Literal(s, _) = arg {
-                s != "-e"
+                s == "-n"
             } else {
-                true
+                false
             }
-        }).collect();
-        
+        });
+
+        // Filter out the echo flags from arguments
+        let filtered_args: Vec<&Word> = cmd
+            .args
+            .iter()
+            .filter(|&arg| {
+                if let Word::Literal(s, _) = arg {
+                    s != "-e" && s != "-n"
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         // Convert arguments to Perl format
-        let args: Vec<String> = filtered_args.iter()
+        let args: Vec<String> = filtered_args
+            .iter()
             .map(|arg| {
                 // For echo commands, handle special variables differently
                 match arg {
-                    Word::Variable(var, _, _) => {
-                        match var.as_str() {
-                            "#" => "scalar(@ARGV)".to_string(),
-                            "@" => "@ARGV".to_string(),
-                            _ => format!("${}", var)
-                        }
-                    }
+                    Word::Variable(var, _, _) => match var.as_str() {
+                        "#" => "scalar(@ARGV)".to_string(),
+                        "@" => "@ARGV".to_string(),
+                        _ => format!("${}", var),
+                    },
                     Word::StringInterpolation(interp, _) => {
                         // Handle quoted variables like "$#" -> scalar(@ARGV)
                         if interp.parts.len() == 1 {
@@ -46,7 +61,7 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                 match var.as_str() {
                                     "#" => "scalar(@ARGV)".to_string(),
                                     "@" => "@ARGV".to_string(),
-                                    _ => format!("${}", var)
+                                    _ => format!("${}", var),
                                 }
                             } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
                                 // Handle parameter expansion like "${#arr[@]}" -> scalar(@arr)
@@ -57,21 +72,32 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                     // If -e flag is present, interpret backslash escapes
                                     let mut interpreted = literal.clone();
                                     // Remove outer quotes if present
-                                    if (interpreted.starts_with('"') && interpreted.ends_with('"')) ||
-                                       (interpreted.starts_with('\'') && interpreted.ends_with('\'')) {
-                                        interpreted = interpreted[1..interpreted.len()-1].to_string();
+                                    if (interpreted.starts_with('"') && interpreted.ends_with('"'))
+                                        || (interpreted.starts_with('\'')
+                                            && interpreted.ends_with('\''))
+                                    {
+                                        interpreted =
+                                            interpreted[1..interpreted.len() - 1].to_string();
                                     }
-                                    
+
                                     // Interpret backslash escapes
                                     interpreted = interpreted
                                         .replace("\\n", "\n")
                                         .replace("\\t", "\t")
                                         .replace("\\r", "\r")
                                         .replace("\\\\", "\\");
-                                    
+
                                     // Return as a quoted string literal with proper escaping for Perl
                                     // For -e flag, escape newlines to prevent multiline string literals with indentation issues
-                                    format!("\"{}\"", interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
+                                    format!(
+                                        "\"{}\"",
+                                        interpreted
+                                            .replace("\\", "\\\\")
+                                            .replace("\"", "\\\"")
+                                            .replace("\n", "\\n")
+                                            .replace("\t", "\\t")
+                                            .replace("\r", "\\r")
+                                    )
                                 } else {
                                     generator.perl_string_literal(arg)
                                 }
@@ -89,51 +115,74 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                                             // Interpret backslash escapes
                                             let mut interpreted = literal.clone();
                                             // Remove outer quotes if present
-                                            if (interpreted.starts_with('"') && interpreted.ends_with('"')) ||
-                                               (interpreted.starts_with('\'') && interpreted.ends_with('\'')) {
-                                                interpreted = interpreted[1..interpreted.len()-1].to_string();
+                                            if (interpreted.starts_with('"')
+                                                && interpreted.ends_with('"'))
+                                                || (interpreted.starts_with('\'')
+                                                    && interpreted.ends_with('\''))
+                                            {
+                                                interpreted = interpreted[1..interpreted.len() - 1]
+                                                    .to_string();
                                             }
-                                            
+
                                             // Interpret backslash escapes
                                             interpreted = interpreted
                                                 .replace("\\n", "\n")
                                                 .replace("\\t", "\t")
                                                 .replace("\\r", "\r")
                                                 .replace("\\\\", "\\");
-                                            
+
                                             result.push_str(&interpreted);
-                                        },
+                                        }
                                         crate::ast::StringPart::Variable(var) => {
                                             // Handle variables in string interpolation
                                             match var.as_str() {
                                                 "#" => result.push_str("scalar(@ARGV)"),
                                                 "@" => result.push_str("@ARGV"),
-                                                _ => result.push_str(&format!("${}", var))
+                                                _ => result.push_str(&format!("${}", var)),
                                             }
-                                        },
+                                        }
                                         crate::ast::StringPart::CommandSubstitution(cmd) => {
                                             // Handle command substitutions in string interpolation
-                                            let cmd_result = generator.word_to_perl(&Word::CommandSubstitution(cmd.clone(), None));
+                                            let cmd_result = generator.word_to_perl(
+                                                &Word::CommandSubstitution(cmd.clone(), None),
+                                            );
                                             result.push_str(&cmd_result);
-                                        },
+                                        }
                                         crate::ast::StringPart::ParameterExpansion(pe) => {
                                             // Handle parameter expansions
-                                            result.push_str(&generator.generate_parameter_expansion(pe));
-                                        },
+                                            result.push_str(
+                                                &generator.generate_parameter_expansion(pe),
+                                            );
+                                        }
                                         _ => {
                                             // For other parts, use default processing
-                                            result.push_str(&generator.convert_string_interpolation_to_perl(&crate::ast::StringInterpolation {
-                                                parts: vec![part.clone()]
-                                            }));
+                                            result.push_str(
+                                                &generator.convert_string_interpolation_to_perl(
+                                                    &crate::ast::StringInterpolation {
+                                                        parts: vec![part.clone()],
+                                                    },
+                                                ),
+                                            );
                                         }
                                     }
                                 }
                                 // Return as a quoted string literal with proper escaping for Perl
                                 // For -e flag, escape newlines to prevent multiline string literals with indentation issues
-                                format!("\"{}\"", result.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
+                                format!(
+                                    "\"{}\"",
+                                    result
+                                        .replace("\\", "\\\\")
+                                        .replace("\"", "\\\"")
+                                        .replace("\n", "\\n")
+                                        .replace("\t", "\\t")
+                                        .replace("\r", "\\r")
+                                )
                             } else {
                                 // For multi-part string interpolation without -e flag, use the general string interpolation handler
-                                eprintln!("DEBUG: echo.rs - Processing StringInterpolation with {} parts", interp.parts.len());
+                                eprintln!(
+                                    "DEBUG: echo.rs - Processing StringInterpolation with {} parts",
+                                    interp.parts.len()
+                                );
                                 for (i, part) in interp.parts.iter().enumerate() {
                                     eprintln!("DEBUG: echo.rs - Part {}: {:?}", i, part);
                                 }
@@ -151,26 +200,39 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                             // If -e flag is present, interpret backslash escapes
                             let mut interpreted = literal.clone();
                             // Remove outer quotes if present
-                            if (interpreted.starts_with('"') && interpreted.ends_with('"')) ||
-                               (interpreted.starts_with('\'') && interpreted.ends_with('\'')) {
-                                interpreted = interpreted[1..interpreted.len()-1].to_string();
+                            if (interpreted.starts_with('"') && interpreted.ends_with('"'))
+                                || (interpreted.starts_with('\'') && interpreted.ends_with('\''))
+                            {
+                                interpreted = interpreted[1..interpreted.len() - 1].to_string();
                             }
-                            
+
                             // Interpret backslash escapes
                             interpreted = interpreted
                                 .replace("\\n", "\n")
                                 .replace("\\t", "\t")
                                 .replace("\\r", "\r")
                                 .replace("\\\\", "\\");
-                            
+
                             // Return as a quoted string literal with proper escaping for Perl
                             // Escape quotes, backslashes, newlines, and tabs
-                            format!("\"{}\"", interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
+                            format!(
+                                "\"{}\"",
+                                interpreted
+                                    .replace("\\", "\\\\")
+                                    .replace("\"", "\\\"")
+                                    .replace("\n", "\\n")
+                                    .replace("\t", "\\t")
+                                    .replace("\r", "\\r")
+                            )
                         } else {
                             // Check if the literal contains backticks that should be processed as command substitutions
                             if literal.contains("\\`") || literal.contains("`") {
                                 // Parse the string as string interpolation to handle backticks
-                                if let Ok(interp) = crate::parser::words::parse_string_interpolation_from_literal(literal) {
+                                if let Ok(interp) =
+                                    crate::parser::words::parse_string_interpolation_from_literal(
+                                        literal,
+                                    )
+                                {
                                     generator.convert_string_interpolation_to_perl(&interp)
                                 } else {
                                     generator.perl_string_literal(arg)
@@ -184,18 +246,18 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
                         // For command substitution in echo, preserve newlines instead of converting to spaces
                         handle_command_substitution_for_echo(generator, cmd)
                     }
-                    _ => generator.perl_string_literal(arg)
+                    _ => generator.perl_string_literal(arg),
                 }
             })
             .collect();
-        
+
         if args.is_empty() {
             output.push_str(&format!("${} .= \"\\n\";\n", output_var));
         } else if args.len() == 1 {
             // Check if the argument is a simple string literal that we can combine with newline
             if args[0].starts_with('"') && args[0].ends_with('"') && !args[0].contains("\\n") {
                 // Extract the string content and add newline directly using double quotes for escape sequences
-                let content = &args[0][1..args[0].len()-1]; // Remove quotes
+                let content = &args[0][1..args[0].len() - 1]; // Remove quotes
                 output.push_str(&format!("${} .= \"{}\\n\";\n", output_var, content));
             } else if args[0].contains("\\n") {
                 output.push_str(&format!("${} .= {};\n", output_var, args[0]));
@@ -207,31 +269,52 @@ pub fn generate_echo_command(generator: &mut Generator, cmd: &SimpleCommand, _in
             let args_str = args.join(" . q{ } . ");
             output.push_str(&format!("${} .= {} . \"\\n\";\n", output_var, args_str));
         }
+
+        if !has_n_flag {
+            output.push_str(&format!(
+                "if ( !(${} =~ {}) ) {{ ${} .= \"\\n\"; }}\n",
+                output_var,
+                generator.newline_end_regex(),
+                output_var
+            ));
+        }
     }
-    
+
     output
 }
 
 /// Handle brace expansion for echo commands
-pub fn handle_brace_expansion_for_echo(_generator: &mut Generator, expansion: &BraceExpansion) -> String {
+pub fn handle_brace_expansion_for_echo(
+    _generator: &mut Generator,
+    expansion: &BraceExpansion,
+) -> String {
     let mut items = Vec::new();
-    
+
     for item in &expansion.items {
         match item {
             BraceItem::Range(range) => {
                 // Handle numeric ranges like {1..5} or {00..04..2}
-                if let (Ok(start), Ok(end)) = (range.start.parse::<i32>(), range.end.parse::<i32>()) {
-                    let step = range.step.as_ref().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                if let (Ok(start), Ok(end)) = (range.start.parse::<i32>(), range.end.parse::<i32>())
+                {
+                    let step = range
+                        .step
+                        .as_ref()
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(1);
                     let mut current = start;
-                    
+
                     // Check if we need to preserve leading zeros
                     let format_width = if range.start.starts_with('0') && range.start.len() > 1 {
                         Some(range.start.len())
                     } else {
                         None
                     };
-                    
-                    while if step > 0 { current <= end } else { current >= end } {
+
+                    while if step > 0 {
+                        current <= end
+                    } else {
+                        current >= end
+                    } {
                         let formatted = if let Some(width) = format_width {
                             format!("{:0width$}", current, width = width)
                         } else {
@@ -242,20 +325,30 @@ pub fn handle_brace_expansion_for_echo(_generator: &mut Generator, expansion: &B
                     }
                 } else {
                     // Handle character ranges like {a..c}
-                    if let (Some(start_char), Some(end_char)) = (range.start.chars().next(), range.end.chars().next()) {
+                    if let (Some(start_char), Some(end_char)) =
+                        (range.start.chars().next(), range.end.chars().next())
+                    {
                         let start_code = start_char as u32;
                         let end_code = end_char as u32;
-                        let step = range.step.as_ref().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
-                        
+                        let step = range
+                            .step
+                            .as_ref()
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(1);
+
                         let mut current_code = start_code;
-                        while if step > 0 { current_code <= end_code } else { current_code >= end_code } {
+                        while if step > 0 {
+                            current_code <= end_code
+                        } else {
+                            current_code >= end_code
+                        } {
                             if let Some(c) = char::from_u32(current_code) {
                                 items.push(c.to_string());
                             }
-                            current_code = if step > 0 { 
-                                current_code.saturating_add(step) 
-                            } else { 
-                                current_code.saturating_sub(step) 
+                            current_code = if step > 0 {
+                                current_code.saturating_add(step)
+                            } else {
+                                current_code.saturating_sub(step)
                             };
                         }
                     }
@@ -271,7 +364,7 @@ pub fn handle_brace_expansion_for_echo(_generator: &mut Generator, expansion: &B
             }
         }
     }
-    
+
     // Join all items with spaces and return as a quoted string
     let items_str = items.join(" ");
     format!("\"{}\"", items_str.replace("\"", "\\\""))
@@ -285,92 +378,124 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
             if let Word::Literal(name, _) = &simple_cmd.name {
                 if name == "ls" {
                     // Use the ls substitution function for proper conversion
-                    return crate::generator::commands::ls::generate_ls_for_substitution(generator, simple_cmd);
+                    return crate::generator::commands::ls::generate_ls_for_substitution(
+                        generator, simple_cmd,
+                    );
                 } else if name == "grep" {
                     // Special handling for grep in command substitution
                     eprintln!("DEBUG: echo.rs - Using native grep implementation for command substitution");
                     let unique_id = generator.get_unique_id();
-                    let args: Vec<String> = simple_cmd.args.iter()
+                    let args: Vec<String> = simple_cmd
+                        .args
+                        .iter()
                         .map(|arg| generator.word_to_perl(arg))
                         .collect();
-                    
+
                     if args.is_empty() {
                         return "\"\"".to_string();
                     } else {
                         // Parse grep arguments properly
                         let mut pattern_idx = 0;
                         let mut file_idx = 1;
-                        
+
                         // Skip flags like -n, -i, etc.
                         while pattern_idx < args.len() && args[pattern_idx].starts_with('-') {
                             pattern_idx += 1;
                             file_idx += 1;
                         }
-                        
+
                         if pattern_idx >= args.len() {
                             return "\"\"".to_string();
                         }
-                        
+
                         let pattern = &args[pattern_idx];
-                        let files = if file_idx < args.len() { &args[file_idx..] } else { &[] };
-                        
+                        let files = if file_idx < args.len() {
+                            &args[file_idx..]
+                        } else {
+                            &[]
+                        };
+
                         if files.is_empty() {
                             // No files specified, grep will fail (no input)
-                            return format!("do {{ carp \"grep: {}: No such file or directory\"; \"\" }}", pattern);
+                            return format!(
+                                "do {{ carp \"grep: {}: No such file or directory\"; \"\" }}",
+                                pattern
+                            );
                         } else {
                             let file = &files[0];
                             // Adjust file path for Perl execution context (runs from examples directory)
                             let adjusted_file = generator.adjust_file_path_for_perl_execution(file);
                             // Ensure the file is properly quoted
-                            let quoted_file = if adjusted_file.starts_with('\'') || adjusted_file.starts_with('"') {
+                            let quoted_file = if adjusted_file.starts_with('\'')
+                                || adjusted_file.starts_with('"')
+                            {
                                 adjusted_file.clone()
                             } else {
                                 format!("'{}'", adjusted_file)
                             };
-                            return format!("do {{\n    my @grep_lines_{};\n    if (-f {}) {{\n        open my $fh_{}, '<', {}\n            or croak \"Cannot open file: $OS_ERROR\";\n        @grep_lines_{} = <$fh_{}>;\n        close $fh_{}\n            or croak \"Close failed: $OS_ERROR\";\n        chomp @grep_lines_{};\n        @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{};\n    }}\n    join \"\\n\", @grep_lines_{};\n}}", 
+                            return format!("do {{\n    my @grep_lines_{};\n    if (-e {}) {{\n        open my $fh_{}, '<', {}\n            or croak \"Cannot open file: $OS_ERROR\";\n        @grep_lines_{} = <$fh_{}>;\n        close $fh_{}\n            or croak \"Close failed: $OS_ERROR\";\n        chomp @grep_lines_{};\n        @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{};\n    }}\n    join \"\\n\", @grep_lines_{};\n}}", 
                                 unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id);
                         }
                     }
                 } else if name == "paste" {
                     // Special handling for paste in command substitution
                     eprintln!("DEBUG: echo.rs - Using native paste implementation for command substitution");
-                    return crate::generator::commands::paste::generate_paste_command(generator, simple_cmd, &[]);
+                    return crate::generator::commands::paste::generate_paste_command(
+                        generator,
+                        simple_cmd,
+                        &[],
+                    );
                 } else if name == "comm" {
                     // Special handling for comm in command substitution
                     eprintln!("DEBUG: echo.rs - Using native comm implementation for command substitution");
-                    return crate::generator::commands::comm::generate_comm_command(generator, simple_cmd, "", &[]);
+                    return crate::generator::commands::comm::generate_comm_command(
+                        generator,
+                        simple_cmd,
+                        "",
+                        &[],
+                    );
                 } else if name == "diff" {
                     // Special handling for diff in command substitution
                     eprintln!("DEBUG: echo.rs - Using native diff implementation for command substitution");
-                    return crate::generator::commands::diff::generate_diff_command(generator, simple_cmd, "", 0, false);
+                    return crate::generator::commands::diff::generate_diff_command(
+                        generator, simple_cmd, "", 0, false,
+                    );
                 } else if name == "xargs" {
                     // Special handling for xargs in command substitution
                     eprintln!("DEBUG: echo.rs - Using native xargs implementation for command substitution");
-                    return crate::generator::commands::xargs::generate_xargs_command(generator, simple_cmd, "", "0");
+                    return crate::generator::commands::xargs::generate_xargs_command(
+                        generator, simple_cmd, "", "0",
+                    );
                 }
             }
-            
+
             let cmd_name = generator.word_to_perl(&simple_cmd.name);
-            let args: Vec<String> = simple_cmd.args.iter()
+            let args: Vec<String> = simple_cmd
+                .args
+                .iter()
                 .map(|arg| generator.word_to_perl(arg))
                 .collect();
-            
+
             // For simple commands, fall back to system command for now
             let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
             if args.is_empty() {
                 format!(" my ({}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
             } else {
-                let formatted_args = args.iter().map(|arg| {
-                    let word = Word::Literal(arg.clone(), Default::default());
-                    generator.perl_string_literal(&word)
-                }).collect::<Vec<_>>().join(", ");
+                let formatted_args = args
+                    .iter()
+                    .map(|arg| {
+                        let word = Word::Literal(arg.clone(), Default::default());
+                        generator.perl_string_literal(&word)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!(" my ({}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, err_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
             }
-        },
+        }
         Command::Pipeline(pipeline) => {
             // For command substitution pipelines in echo, preserve newlines instead of converting to spaces
             let pipeline_code = generator.generate_command(&Command::Pipeline(pipeline.clone()));
-            
+
             // Find the actual output variable name that was generated
             let re = Regex::new(r"\$output_(\d+)").unwrap();
             let output_var = if let Some(cap) = re.captures(&pipeline_code) {
@@ -380,7 +505,7 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                 let unique_id = generator.get_unique_id();
                 format!("$output_{}", unique_id)
             };
-            
+
             // Find the pipeline success variable
             let success_var = if pipeline_code.contains("$pipeline_success_") {
                 let re = Regex::new(r"\$pipeline_success_(\d+)").unwrap();
@@ -392,14 +517,24 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
             } else {
                 "$pipeline_success_0".to_string()
             };
-            
+
             // Remove the print statements and exit code assignment using the actual variable names
             let mut captured_pipeline = pipeline_code
                 .replace(&format!("print {};", output_var), "")
                 .replace("print \"\\n\";", "")
-                .replace(&format!("if (!({} =~ {})) {{ print \"\\n\"; }}", output_var, generator.newline_end_regex()), "")
-                .replace(&format!("if (!{}) {{ $main_exit_code = 1; }}", success_var), "");
-            
+                .replace(
+                    &format!(
+                        "if (!({} =~ {})) {{ print \"\\n\"; }}",
+                        output_var,
+                        generator.newline_end_regex()
+                    ),
+                    "",
+                )
+                .replace(
+                    &format!("if (!{}) {{ $main_exit_code = 1; }}", success_var),
+                    "",
+                );
+
             // Remove conditional print blocks that are common in pipelines
             // Use a simpler approach with string replacement for the specific pattern
             let output_var_num = output_var.trim_start_matches("$output_");
@@ -408,24 +543,29 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                 output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
             );
             captured_pipeline = captured_pipeline.replace(&print_block_to_remove, "");
-            
+
             // Also try without the extra newlines in case formatting is different
             let print_block_compact = format!(
                 "if ({} ne q{} && !defined($output_printed_{})) {{ print {}; if (!({} =~ {})) {{ print \"\\n\"; }} }}", 
                 output_var, "", output_var_num, output_var, output_var, generator.newline_end_regex()
             );
             captured_pipeline = captured_pipeline.replace(&print_block_compact, "");
-            
+
             // Remove the outer braces if they exist, as we'll wrap in our own do block
             captured_pipeline = captured_pipeline.trim().to_string();
             if captured_pipeline.starts_with('{') && captured_pipeline.ends_with('}') {
-                captured_pipeline = captured_pipeline[1..captured_pipeline.len()-1].to_string();
+                captured_pipeline = captured_pipeline[1..captured_pipeline.len() - 1].to_string();
             }
-            
+
             // Return the code that executes the pipeline and captures output
-            // For echo commands, preserve newlines instead of converting to spaces
-            format!("do {{ {} {} }}", captured_pipeline.trim(), output_var)
-        },
+            // Shell command substitution strips all trailing newlines
+            format!(
+                "do {{ {} {} =~ s/\\n+\\z//msx; {} }}",
+                captured_pipeline.trim(),
+                output_var,
+                output_var
+            )
+        }
         _ => {
             // For other command types, use system command fallback
             let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
