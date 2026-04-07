@@ -3,7 +3,7 @@ use crate::generator::Generator;
 
 pub fn generate_seq_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
-    
+
     // seq command syntax: seq [first] [increment] last
     if cmd.args.is_empty() {
         output.push_str("print \"1\\n\";\n");
@@ -38,6 +38,6 @@ pub fn generate_seq_command(generator: &mut Generator, cmd: &SimpleCommand) -> S
         output.push_str("carp \"seq: too many arguments\";\n");
         output.push_str("exit 1;\n");
     }
-    
+
     output
 }

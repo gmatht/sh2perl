@@ -3,7 +3,7 @@ use crate::generator::Generator;
 
 pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
-    
+
     // curl command syntax: curl [options] [URL...]
     let mut url = "".to_string();
     let mut method = "GET".to_string();
@@ -14,7 +14,7 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     let mut silent_mode = false;
     let mut verbose_mode = false;
     let mut timeout = 0;
-    
+
     // Parse curl options
     let mut i = 0;
     while i < cmd.args.len() {
@@ -80,27 +80,27 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         }
         i += 1;
     }
-    
+
     if url.is_empty() {
         output.push_str("die \"curl: missing URL\\n\";\n");
     } else {
         output.push_str("use LWP::UserAgent;\n");
         output.push_str("use HTTP::Request;\n");
         output.push_str("use HTTP::Headers;\n");
-        
+
         // Create UserAgent
         output.push_str("my $ua = LWP::UserAgent->new;\n");
-        
+
         // Set timeout if specified
         if timeout > 0 {
             output.push_str(&format!("$ua->timeout({});\n", timeout));
         }
-        
+
         // Set redirects if specified
         if follow_redirects {
             output.push_str("$ua->max_redirect(5);\n");
         }
-        
+
         // Create headers
         if !headers.is_empty() {
             output.push_str("my $headers = HTTP::Headers->new;\n");
@@ -108,21 +108,24 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                 output.push_str(&format!("$headers->header({});\n", header));
             }
         }
-        
+
         // Create request
-        output.push_str(&format!("my $request = HTTP::Request->new('{}', {});\n", method, url));
-        
+        output.push_str(&format!(
+            "my $request = HTTP::Request->new('{}', {});\n",
+            method, url
+        ));
+
         if !headers.is_empty() {
             output.push_str("$request->headers($headers);\n");
         }
-        
+
         if !data.is_empty() {
             output.push_str(&format!("$request->content({});\n", data));
         }
-        
+
         // Make request
         output.push_str("my $response = $ua->request($request);\n");
-        
+
         // Handle response
         output.push_str("if ($response->is_success) {\n");
         if !output_file.is_empty() {
@@ -131,7 +134,10 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
             output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
             output.push_str(&format!("print \"Content saved to {}\\n\";\n", output_file));
             output.push_str("} else {\n");
-            output.push_str(&format!("die \"curl: Cannot write to {}: $OS_ERROR\\n\";\n", output_file));
+            output.push_str(&format!(
+                "die \"curl: Cannot write to {}: $OS_ERROR\\n\";\n",
+                output_file
+            ));
             output.push_str("}\n");
         } else {
             if !silent_mode {
@@ -140,13 +146,17 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         }
         output.push_str("} else {\n");
         if verbose_mode {
-            output.push_str(&format!("print STDERR \"HTTP {}: {}\\n\";\n", 
-                "$response->code", "$response->message"));
+            output.push_str(&format!(
+                "print STDERR \"HTTP {}: {}\\n\";\n",
+                "$response->code", "$response->message"
+            ));
         }
-        output.push_str(&format!("die \"curl: HTTP error: {} {}\\n\";\n", 
-            "$response->code", "$response->message"));
+        output.push_str(&format!(
+            "die \"curl: HTTP error: {} {}\\n\";\n",
+            "$response->code", "$response->message"
+        ));
         output.push_str("}\n");
     }
-    
+
     output
 }

@@ -1,5 +1,5 @@
 use crate::ast::*;
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Static counter for generating truly unique IDs across all generator instances
@@ -7,11 +7,11 @@ static GLOBAL_UNIQUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub mod commands;
 pub mod control_flow;
-pub mod words;
 pub mod expansions;
 pub mod redirects;
 pub mod test_expressions;
 pub mod utils;
+pub mod words;
 
 pub struct Generator {
     pub indent_level: usize,
@@ -25,7 +25,7 @@ pub struct Generator {
     pub function_level_vars: HashSet<String>,
     pub constants: HashMap<String, i64>,
     pub translation_mode: bool, // New field for pure translation mode
-    pub inline_mode: bool, // New field for inline mode (for backticks)
+    pub inline_mode: bool,      // New field for inline mode (for backticks)
     pub original_script_name: Option<String>, // Original script name for $0 compatibility
     pub use_function_signatures: bool, // Control whether to use modern function signatures
 }
@@ -53,7 +53,7 @@ impl Generator {
     pub fn new_translation_mode() -> Self {
         Self {
             indent_level: 0,
-            declared_locals: HashSet::new(), 
+            declared_locals: HashSet::new(),
             declared_functions: HashSet::new(),
             file_handle_counter: 0,
             extglob_enabled: false,
@@ -92,16 +92,15 @@ impl Generator {
         self.original_script_name = Some(name);
     }
 
-
     pub fn generate(&mut self, ast: &[Command]) -> String {
         let mut output = String::new();
-        
+
         // Pre-analysis pass: identify variables that are used after for loops
         self.analyze_variable_usage(ast);
-        
+
         // Pre-analysis pass: identify constants needed for magic numbers
         self.analyze_constants_needed(ast);
-        
+
         // In inline mode, skip the script header and just generate the command code
         if self.inline_mode {
             for command in ast {
@@ -109,21 +108,21 @@ impl Generator {
                 self.indent_level = 0;
                 let command_output = self.generate_command(command);
                 output.push_str(&command_output);
-                
+
                 // Ensure proper newline separation between commands
                 if !command_output.ends_with('\n') {
                     output.push('\n');
                 }
             }
-            
+
             // Ensure the output ends with a newline
             if !output.ends_with('\n') {
                 output.push('\n');
             }
-            
+
             return output;
         }
-        
+
         // Analyze what imports and variables are needed
         let needs_basename = self.needs_basename_import(ast);
         let needs_exit_code = self.needs_exit_code_tracking(ast);
@@ -133,16 +132,18 @@ impl Generator {
         let needs_file_path = self.needs_file_path_import(ast);
         let needs_file_copy = self.needs_file_copy_import(ast);
         let needs_posix = self.needs_posix_import(ast);
+        let needs_date_snapshot = self.needs_date_snapshot(ast);
         let needs_capture_tiny = self.needs_capture_tiny_import(ast);
-        
+
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
         output.push_str("use strict;\n");
         output.push_str("use warnings;\n");
         output.push_str("use Carp;\n");
-        output.push_str("use English qw(-no_match_vars);\n");
+        output.push_str("use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);\n");
         output.push_str("use locale;\n");
-        
+        output.push_str("select((select(STDOUT), $| = 1)[0]);\n");
+
         if needs_basename {
             output.push_str("use File::Basename;\n");
         }
@@ -172,21 +173,38 @@ impl Generator {
             }
         }
         if needs_posix {
-            output.push_str("use POSIX      qw(time);\n");
+            output.push_str("use POSIX qw(time);\n");
+        }
+        if needs_date_snapshot {
+            output.push_str("my $DATE_SNAPSHOT = time;\n");
         }
         if needs_capture_tiny {
-            output.push_str("use Capture::Tiny qw(capture_stdout);\n");
+            output.push_str(
+                r#"sub capture_stdout {
+    my ($code) = @_;
+    my $captured = q{};
+    {
+        local *STDOUT;
+        open STDOUT, '>', \$captured
+          or die "Cannot capture stdout: $!\n";
+        $code->();
+    }
+    return $captured;
+}
+
+"#,
+            );
         }
         output.push_str("\n");
-        
+
         // Add main exit code variable for pipeline tracking
         // Always declare it since it's used in pipeline generation
         output.push_str("my $main_exit_code = 0;\n");
         output.push_str("my $ls_success     = 0;\n");
-        
+
         // Add global CHILD_ERROR variable for command substitution
         output.push_str("our $CHILD_ERROR;\n\n");
-        
+
         // Add declarations for variables that are used in arithmetic expressions
         for var in &self.function_level_vars {
             output.push_str(&format!("my ${} = 0;\n", var));
@@ -194,12 +212,17 @@ impl Generator {
         if !self.function_level_vars.is_empty() {
             output.push_str("\n");
         }
-        
+
         // Add constant declarations
         if !self.constants.is_empty() {
             // Calculate the maximum length for alignment
-            let max_name_len = self.constants.keys().map(|name| name.len()).max().unwrap_or(0);
-            
+            let max_name_len = self
+                .constants
+                .keys()
+                .map(|name| name.len())
+                .max()
+                .unwrap_or(0);
+
             for (name, value) in &self.constants {
                 let padding = max_name_len - name.len();
                 let spaces = " ".repeat(padding);
@@ -209,40 +232,41 @@ impl Generator {
         if !self.constants.is_empty() {
             output.push_str("\n");
         }
-        
+
         for command in ast {
             // Reset indentation level for each top-level command to prevent staircase effect
             self.indent_level = 0;
             let command_output = self.generate_command(command);
             output.push_str(&command_output);
-            
+
             // Ensure proper newline separation between commands
             if !command_output.ends_with('\n') {
                 output.push('\n');
             }
         }
-        
+
         // Add final exit statement
         // Always exit with $main_exit_code since it's always declared
         output.push_str("\nexit $main_exit_code;\n");
-        
+
         // Ensure the output ends with a newline
         if !output.ends_with('\n') {
             output.push('\n');
         }
-        
+
         // Remove trailing whitespace from all lines
         let lines: Vec<&str> = output.split('\n').collect();
-        let cleaned_lines: Vec<String> = lines.iter()
+        let cleaned_lines: Vec<String> = lines
+            .iter()
             .map(|line| line.trim_end().to_string())
             .collect();
         output = cleaned_lines.join("\n");
-        
+
         // Ensure the output ends with a newline (after cleanup)
         if !output.ends_with('\n') {
             output.push('\n');
         }
-        
+
         output
     }
 
@@ -313,16 +337,17 @@ impl Generator {
 
     pub fn generate_assignment(&mut self, assignment: &Assignment) -> String {
         let mut output = String::new();
-        
-        
+
         // Only declare the variable if not already declared
         // This prevents redeclaring variables inside loops that shadow outer scope variables
-        if !self.declared_locals.contains(&assignment.variable) && !self.function_level_vars.contains(&assignment.variable) {
+        if !self.declared_locals.contains(&assignment.variable)
+            && !self.function_level_vars.contains(&assignment.variable)
+        {
             output.push_str(&self.indent());
             output.push_str(&format!("my ${};\n", assignment.variable));
             self.declared_locals.insert(assignment.variable.clone());
         }
-        
+
         // Generate the assignment based on the operator
         output.push_str(&self.indent());
         match assignment.operator {
@@ -336,32 +361,42 @@ impl Generator {
                 }
             }
             AssignmentOperator::PlusAssign => {
-                output.push_str(&format!("${} += {};\n", 
-                    assignment.variable, 
-                    words::word_to_perl_impl(self, &assignment.value)));
+                output.push_str(&format!(
+                    "${} += {};\n",
+                    assignment.variable,
+                    words::word_to_perl_impl(self, &assignment.value)
+                ));
             }
             AssignmentOperator::MinusAssign => {
-                output.push_str(&format!("${} -= {};\n", 
-                    assignment.variable, 
-                    words::word_to_perl_impl(self, &assignment.value)));
+                output.push_str(&format!(
+                    "${} -= {};\n",
+                    assignment.variable,
+                    words::word_to_perl_impl(self, &assignment.value)
+                ));
             }
             AssignmentOperator::StarAssign => {
-                output.push_str(&format!("${} *= {};\n", 
-                    assignment.variable, 
-                    words::word_to_perl_impl(self, &assignment.value)));
+                output.push_str(&format!(
+                    "${} *= {};\n",
+                    assignment.variable,
+                    words::word_to_perl_impl(self, &assignment.value)
+                ));
             }
             AssignmentOperator::SlashAssign => {
-                output.push_str(&format!("${} /= {};\n", 
-                    assignment.variable, 
-                    words::word_to_perl_impl(self, &assignment.value)));
+                output.push_str(&format!(
+                    "${} /= {};\n",
+                    assignment.variable,
+                    words::word_to_perl_impl(self, &assignment.value)
+                ));
             }
             AssignmentOperator::PercentAssign => {
-                output.push_str(&format!("${} %= {};\n", 
-                    assignment.variable, 
-                    words::word_to_perl_impl(self, &assignment.value)));
+                output.push_str(&format!(
+                    "${} %= {};\n",
+                    assignment.variable,
+                    words::word_to_perl_impl(self, &assignment.value)
+                ));
             }
         }
-        
+
         output
     }
 
@@ -433,7 +468,7 @@ impl Generator {
             format!("$out_{}", id),
             format!("$err_{}", id),
             format!("$pid_{}", id),
-            format!("$result_{}", id)
+            format!("$result_{}", id),
         )
     }
 
@@ -496,20 +531,20 @@ impl Generator {
         let trimmed = arg.trim();
         if trimmed.starts_with("\"") && trimmed.ends_with("\"") {
             // Extract the content between quotes
-            let content = &trimmed[1..trimmed.len()-1];
+            let content = &trimmed[1..trimmed.len() - 1];
             // Check if it doesn't already end with \n
             if !content.ends_with("\\n") {
                 // Create optimized version with newline appended
                 return Some(format!("\"{}\\n\"", content));
             }
         }
-        
+
         // Check if this is a single variable (like $i) that we can optimize
         if trimmed.starts_with("$") && !trimmed.contains(",") && !trimmed.contains(" ") {
             // Single variable, optimize to "$var\n"
             return Some(format!("\"{}\\n\"", trimmed));
         }
-        
+
         None
     }
 
@@ -525,20 +560,20 @@ impl Generator {
                         break;
                     }
                 }
-                
+
                 // Also check for variables used in arithmetic expressions within the loop body
                 self.analyze_variables_in_block(&for_loop.body);
             }
         }
     }
-    
+
     /// Pre-analysis pass to identify constants needed for magic numbers
     fn analyze_constants_needed(&mut self, ast: &[Command]) {
         for command in ast {
             self.analyze_constants_in_command(command);
         }
     }
-    
+
     /// Analyze constants needed in a command
     fn analyze_constants_in_command(&mut self, command: &Command) {
         match command {
@@ -547,7 +582,9 @@ impl Generator {
                     if let Word::BraceExpansion(expansion, _) = word {
                         if expansion.items.len() == 1 {
                             if let BraceItem::Range(range) = &expansion.items[0] {
-                                if let (Ok(_start_num), Ok(end_num)) = (range.start.parse::<i64>(), range.end.parse::<i64>()) {
+                                if let (Ok(_start_num), Ok(end_num)) =
+                                    (range.start.parse::<i64>(), range.end.parse::<i64>())
+                                {
                                     if end_num > 2 {
                                         let const_name = format!("MAX_LOOP_{}", end_num);
                                         self.add_constant(&const_name, end_num);
@@ -599,14 +636,14 @@ impl Generator {
             _ => {} // Other commands don't need constant analysis
         }
     }
-    
+
     /// Analyze constants in test expressions
     fn analyze_constants_in_test_expression(&mut self, test_expr: &TestExpression) {
         // Extract numbers from test expressions like "($i < 10)"
         let expr = &test_expr.expression;
         self.extract_magic_numbers_from_string(expr);
     }
-    
+
     /// Analyze constants in words
     fn analyze_constants_in_word(&mut self, word: &Word) {
         match word {
@@ -626,7 +663,7 @@ impl Generator {
             _ => {}
         }
     }
-    
+
     /// Extract magic numbers from a string and add them as constants
     fn extract_magic_numbers_from_string(&mut self, s: &str) {
         // Simple regex-like extraction of numbers > 2
@@ -640,14 +677,14 @@ impl Generator {
             }
         }
     }
-    
+
     /// Analyze constants needed in a block
     fn analyze_constants_in_block(&mut self, block: &Block) {
         for command in &block.commands {
             self.analyze_constants_in_command(command);
         }
     }
-    
+
     /// Analyze variables used in a block (for arithmetic expressions, etc.)
     fn analyze_variables_in_block(&mut self, block: &Block) {
         for command in &block.commands {
@@ -661,7 +698,7 @@ impl Generator {
                         // Find all identifiers in the expression (simple regex-like approach)
                         let mut chars = expr.chars().peekable();
                         let mut current_var = String::new();
-                        
+
                         while let Some(c) = chars.next() {
                             if c.is_alphabetic() || c == '_' {
                                 current_var.push(c);
@@ -703,7 +740,7 @@ impl Generator {
                         }
                     }
                 }
-            },
+            }
             Command::Simple(cmd) => {
                 // Check if variable is used in simple command arguments
                 for arg in &cmd.args {
@@ -713,7 +750,7 @@ impl Generator {
                         }
                     }
                 }
-                
+
                 // Check if variable is used in environment variable assignments (arithmetic expressions)
                 for (env_var, value) in &cmd.env_vars {
                     if env_var == var_name {
@@ -726,7 +763,7 @@ impl Generator {
                         }
                     }
                 }
-            },
+            }
             _ => {
                 // For other command types, we could add more sophisticated analysis
                 // but for now, we'll be conservative
@@ -734,7 +771,7 @@ impl Generator {
         }
         false
     }
-    
+
     /// Check if the AST needs File::Basename import
     fn needs_basename_import(&self, ast: &[Command]) -> bool {
         for command in ast {
@@ -744,7 +781,7 @@ impl Generator {
         }
         false
     }
-    
+
     /// Check if a specific command needs File::Basename
     fn command_needs_basename(&self, command: &Command) -> bool {
         match command {
@@ -762,7 +799,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::Pipeline(pipeline) => {
                 for cmd in &pipeline.commands {
                     if self.command_needs_basename(cmd) {
@@ -770,13 +807,22 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_basename(left) || self.command_needs_basename(right)
-            },
+            }
             Command::Redirect(redirect_cmd) => {
+                if redirect_cmd.redirects.iter().any(|redirect| {
+                    matches!(
+                        redirect.operator,
+                        RedirectOperator::ProcessSubstitutionInput(_)
+                            | RedirectOperator::ProcessSubstitutionOutput(_)
+                    )
+                }) {
+                    return true;
+                }
                 self.command_needs_basename(&redirect_cmd.command)
-            },
+            }
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
                     if self.command_needs_basename(cmd) {
@@ -784,7 +830,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::While(while_loop) => {
                 for cmd in &while_loop.body.commands {
                     if self.command_needs_basename(cmd) {
@@ -792,7 +838,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::If(if_stmt) => {
                 if self.command_needs_basename(&if_stmt.then_branch) {
                     return true;
@@ -803,45 +849,45 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
-    
+
     /// Check if a word needs basename functionality
     fn word_needs_basename(&self, word: &Word) -> bool {
         match word {
             Word::ParameterExpansion(pe, _) => {
                 matches!(pe.operator, ParameterExpansionOperator::Basename)
-            },
+            }
             Word::Array(_, _elements, _) => {
                 // Array elements are strings, not words, so no basename needed
                 false
-            },
+            }
             Word::StringInterpolation(interp, _) => {
                 for part in &interp.parts {
                     match part {
-                        StringPart::Literal(_) => {},
-                        StringPart::Variable(_) => {}, // Variables are strings, not words
-                        StringPart::CommandSubstitution(_) => {}, // Command substitutions don't need basename
+                        StringPart::Literal(_) => {}
+                        StringPart::Variable(_) => {} // Variables are strings, not words
+                        StringPart::CommandSubstitution(_) => {} // Command substitutions don't need basename
                         StringPart::ParameterExpansion(pe) => {
                             if matches!(pe.operator, ParameterExpansionOperator::Basename) {
                                 return true;
                             }
-                        },
-                        StringPart::MapAccess(_, _) => {}, // Map access doesn't need basename
-                        StringPart::MapKeys(_) => {}, // Map keys don't need basename
-                        StringPart::MapLength(_) => {}, // Map length doesn't need basename
-                        StringPart::ArraySlice(_, _, _) => {}, // Array slice doesn't need basename
-                        StringPart::Arithmetic(_) => {}, // Arithmetic expressions don't need basename
+                        }
+                        StringPart::MapAccess(_, _) => {} // Map access doesn't need basename
+                        StringPart::MapKeys(_) => {}      // Map keys don't need basename
+                        StringPart::MapLength(_) => {}    // Map length doesn't need basename
+                        StringPart::ArraySlice(_, _, _) => {} // Array slice doesn't need basename
+                        StringPart::Arithmetic(_) => {} // Arithmetic expressions don't need basename
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
-    
+
     /// Check if the AST needs exit code tracking
     fn needs_exit_code_tracking(&self, ast: &[Command]) -> bool {
         for command in ast {
@@ -851,7 +897,7 @@ impl Generator {
         }
         false
     }
-    
+
     /// Check if a specific command needs exit code tracking
     fn command_needs_exit_code_tracking(&self, command: &Command) -> bool {
         match command {
@@ -859,14 +905,14 @@ impl Generator {
                 // Only complex pipelines need exit code tracking
                 // Simple pipelines like "cmd1 | cmd2" don't need it
                 pipeline.commands.len() > 2
-            },
+            }
             Command::And(_left, _right) | Command::Or(_left, _right) => {
                 // Logical operators need exit code tracking
                 true
-            },
+            }
             Command::Redirect(redirect_cmd) => {
                 self.command_needs_exit_code_tracking(&redirect_cmd.command)
-            },
+            }
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
                     if self.command_needs_exit_code_tracking(cmd) {
@@ -874,7 +920,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::While(while_loop) => {
                 for cmd in &while_loop.body.commands {
                     if self.command_needs_exit_code_tracking(cmd) {
@@ -882,7 +928,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::If(if_stmt) => {
                 if self.command_needs_exit_code_tracking(&if_stmt.then_branch) {
                     return true;
@@ -893,11 +939,11 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
-    
+
     /// Check if the AST needs IPC::Open3
     fn needs_ipc_open3(&self, ast: &[Command]) -> bool {
         for command in ast {
@@ -940,7 +986,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::Pipeline(pipeline) => {
                 for cmd in &pipeline.commands {
                     if self.command_needs_file_find(cmd) {
@@ -948,22 +994,20 @@ impl Generator {
                     }
                 }
                 false
-            },
-            Command::Redirect(redirect_cmd) => {
-                self.command_needs_file_find(&redirect_cmd.command)
-            },
+            }
+            Command::Redirect(redirect_cmd) => self.command_needs_file_find(&redirect_cmd.command),
             Command::Background(bg_cmd) => {
                 if self.command_needs_file_find(bg_cmd) {
                     return true;
                 }
                 false
-            },
+            }
             Command::Subshell(sub_cmd) => {
                 if self.command_needs_file_find(sub_cmd) {
                     return true;
                 }
                 false
-            },
+            }
             Command::If(if_stmt) => {
                 if self.command_needs_file_find(&if_stmt.then_branch) {
                     return true;
@@ -974,17 +1018,15 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
 
     /// Check if a word needs File::Find (e.g., command substitution with find)
     fn word_needs_file_find(&self, word: &Word) -> bool {
         match word {
-            Word::CommandSubstitution(cmd, _) => {
-                self.command_needs_file_find(cmd)
-            },
+            Word::CommandSubstitution(cmd, _) => self.command_needs_file_find(cmd),
             Word::StringInterpolation(interp, _) => {
                 for part in &interp.parts {
                     if self.string_part_needs_file_find(part) {
@@ -992,21 +1034,19 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
 
     /// Check if a string interpolation part needs File::Find
     fn string_part_needs_file_find(&self, part: &StringPart) -> bool {
         match part {
-            StringPart::CommandSubstitution(cmd) => {
-                self.command_needs_file_find(cmd)
-            },
-            _ => false
+            StringPart::CommandSubstitution(cmd) => self.command_needs_file_find(cmd),
+            _ => false,
         }
     }
-    
+
     /// Check if a specific command needs IPC::Open3
     fn command_needs_ipc_open3(&self, command: &Command) -> bool {
         match command {
@@ -1015,7 +1055,8 @@ impl Generator {
                 if let Word::Literal(name, _) = &cmd.name {
                     // Commands that typically use open3 for IPC
                     match name.as_str() {
-                        "pwd" | "whoami" | "date" | "id" | "uname" | "hostname" | "uptime" | "w" | "who" | "perl" => true,
+                        "pwd" | "whoami" | "date" | "id" | "uname" | "hostname" | "uptime"
+                        | "w" | "who" | "perl" => true,
                         _ => {
                             // Check if it's a pipeline command or has complex arguments
                             cmd.args.len() > 0 || self.is_pipeline_command(name)
@@ -1025,17 +1066,15 @@ impl Generator {
                     // Non-literal command names often need open3
                     true
                 }
-            },
+            }
             Command::Pipeline(_pipeline) => {
                 // Pipelines need IPC::Open3
                 true
-            },
+            }
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_ipc_open3(left) || self.command_needs_ipc_open3(right)
-            },
-            Command::Redirect(redirect_cmd) => {
-                self.command_needs_ipc_open3(&redirect_cmd.command)
-            },
+            }
+            Command::Redirect(redirect_cmd) => self.command_needs_ipc_open3(&redirect_cmd.command),
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
                     if self.command_needs_ipc_open3(cmd) {
@@ -1043,7 +1082,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::While(while_loop) => {
                 for cmd in &while_loop.body.commands {
                     if self.command_needs_ipc_open3(cmd) {
@@ -1051,7 +1090,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::If(if_stmt) => {
                 if self.command_needs_ipc_open3(&if_stmt.then_branch) {
                     return true;
@@ -1062,26 +1101,41 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
-    
+
     /// Check if a command name is typically used in pipelines
     fn is_pipeline_command(&self, name: &str) -> bool {
-        matches!(name, "grep" | "sed" | "awk" | "cut" | "sort" | "uniq" | "head" | "tail" | "wc" | "tr" | "cat" | "echo" | "printf")
+        matches!(
+            name,
+            "grep"
+                | "sed"
+                | "awk"
+                | "cut"
+                | "sort"
+                | "uniq"
+                | "head"
+                | "tail"
+                | "wc"
+                | "tr"
+                | "cat"
+                | "echo"
+                | "printf"
+        )
     }
-    
+
     /// Generate a properly formatted regex pattern with appropriate flags
     pub fn format_regex_pattern(&self, pattern: &str) -> String {
         utils::format_regex_pattern(pattern)
     }
-    
+
     /// Generate a regex pattern for checking if string ends with newline
     pub fn newline_end_regex(&self) -> String {
         utils::newline_end_regex()
     }
-    
+
     /// Convert postfix unless statement to block form
     pub fn convert_postfix_unless_to_block(&self, condition: &str, statement: &str) -> String {
         utils::convert_postfix_unless_to_block_no_indent(condition, statement)
@@ -1120,7 +1174,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::Pipeline(pipeline) => {
                 for cmd in &pipeline.commands {
                     if self.command_needs_digest_sha(cmd) {
@@ -1128,13 +1182,11 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_digest_sha(left) || self.command_needs_digest_sha(right)
-            },
-            Command::Redirect(redirect_cmd) => {
-                self.command_needs_digest_sha(&redirect_cmd.command)
-            },
+            }
+            Command::Redirect(redirect_cmd) => self.command_needs_digest_sha(&redirect_cmd.command),
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
                     if self.command_needs_digest_sha(cmd) {
@@ -1142,7 +1194,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::While(while_loop) => {
                 for cmd in &while_loop.body.commands {
                     if self.command_needs_digest_sha(cmd) {
@@ -1150,7 +1202,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::If(if_stmt) => {
                 if self.command_needs_digest_sha(&if_stmt.then_branch) {
                     return true;
@@ -1161,17 +1213,15 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
 
     /// Check if a word needs Digest::SHA functionality
     fn word_needs_digest_sha(&self, word: &Word) -> bool {
         match word {
-            Word::CommandSubstitution(cmd, _) => {
-                self.command_needs_digest_sha(cmd)
-            },
+            Word::CommandSubstitution(cmd, _) => self.command_needs_digest_sha(cmd),
             Word::StringInterpolation(interp, _) => {
                 for part in &interp.parts {
                     match part {
@@ -1179,13 +1229,13 @@ impl Generator {
                             if self.command_needs_digest_sha(cmd) {
                                 return true;
                             }
-                        },
+                        }
                         _ => {}
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
 
@@ -1207,12 +1257,12 @@ impl Generator {
                 if let Word::Literal(name, _) = &cmd.name {
                     match name.as_str() {
                         "cp" | "mv" | "rm" | "mkdir" => true,
-                        _ => false
+                        _ => false,
                     }
                 } else {
                     false
                 }
-            },
+            }
             Command::Pipeline(pipeline) => {
                 for cmd in &pipeline.commands {
                     if self.command_needs_file_path(cmd) {
@@ -1220,13 +1270,11 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_file_path(left) || self.command_needs_file_path(right)
-            },
-            Command::Redirect(redirect_cmd) => {
-                self.command_needs_file_path(&redirect_cmd.command)
-            },
+            }
+            Command::Redirect(redirect_cmd) => self.command_needs_file_path(&redirect_cmd.command),
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
                     if self.command_needs_file_path(cmd) {
@@ -1234,7 +1282,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::While(while_loop) => {
                 for cmd in &while_loop.body.commands {
                     if self.command_needs_file_path(cmd) {
@@ -1242,7 +1290,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::If(if_stmt) => {
                 if self.command_needs_file_path(&if_stmt.then_branch) {
                     return true;
@@ -1253,8 +1301,8 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
 
@@ -1289,16 +1337,16 @@ impl Generator {
                         _ => {}
                     }
                 }
-                
+
                 // Check command substitutions in environment variables
                 for (_, word) in &cmd.env_vars {
                     if self.word_needs_file_copy(word) {
                         return true;
                     }
                 }
-                
+
                 false
-            },
+            }
             Command::Pipeline(pipeline) => {
                 for cmd in &pipeline.commands {
                     if self.command_needs_file_copy(cmd) {
@@ -1306,13 +1354,11 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_file_copy(left) || self.command_needs_file_copy(right)
-            },
-            Command::Redirect(redirect_cmd) => {
-                self.command_needs_file_copy(&redirect_cmd.command)
-            },
+            }
+            Command::Redirect(redirect_cmd) => self.command_needs_file_copy(&redirect_cmd.command),
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
                     if self.command_needs_file_copy(cmd) {
@@ -1320,7 +1366,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::While(while_loop) => {
                 for cmd in &while_loop.body.commands {
                     if self.command_needs_file_copy(cmd) {
@@ -1328,7 +1374,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::If(if_stmt) => {
                 if self.command_needs_file_copy(&if_stmt.then_branch) {
                     return true;
@@ -1339,18 +1385,16 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
-    
+
     /// Check if a word contains command substitutions that need File::Copy
     fn word_needs_file_copy(&self, word: &Word) -> bool {
         match word {
-            Word::CommandSubstitution(cmd, _) => {
-                self.command_needs_file_copy(cmd)
-            },
-            _ => false
+            Word::CommandSubstitution(cmd, _) => self.command_needs_file_copy(cmd),
+            _ => false,
         }
     }
 
@@ -1368,16 +1412,16 @@ impl Generator {
                         }
                     }
                 }
-                
+
                 // Check command substitutions in environment variables
                 for (_, word) in &cmd.env_vars {
                     if self.word_needs_capture_tiny(word) {
                         return true;
                     }
                 }
-                
+
                 false
-            },
+            }
             Command::Pipeline(pipeline) => {
                 for cmd in &pipeline.commands {
                     if self.command_needs_capture_tiny(cmd) {
@@ -1385,13 +1429,13 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_capture_tiny(left) || self.command_needs_capture_tiny(right)
-            },
+            }
             Command::Redirect(redirect_cmd) => {
                 self.command_needs_capture_tiny(&redirect_cmd.command)
-            },
+            }
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
                     if self.command_needs_capture_tiny(cmd) {
@@ -1399,7 +1443,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::While(while_loop) => {
                 for cmd in &while_loop.body.commands {
                     if self.command_needs_capture_tiny(cmd) {
@@ -1407,7 +1451,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::If(if_stmt) => {
                 if self.command_needs_capture_tiny(&if_stmt.then_branch) {
                     return true;
@@ -1418,18 +1462,16 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
 
     /// Check if a word contains command substitutions that need Capture::Tiny
     fn word_needs_capture_tiny(&self, word: &Word) -> bool {
         match word {
-            Word::CommandSubstitution(cmd, _) => {
-                self.command_needs_capture_tiny(cmd)
-            },
-            _ => false
+            Word::CommandSubstitution(cmd, _) => self.command_needs_capture_tiny(cmd),
+            _ => false,
         }
     }
 
@@ -1437,6 +1479,16 @@ impl Generator {
     fn needs_posix_import(&self, ast: &[Command]) -> bool {
         for command in ast {
             if self.command_needs_posix(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if the AST needs a frozen date snapshot for date rewrites
+    fn needs_date_snapshot(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_needs_date_snapshot(command) {
                 return true;
             }
         }
@@ -1451,12 +1503,12 @@ impl Generator {
                 if let Word::Literal(name, _) = &cmd.name {
                     match name.as_str() {
                         "touch" => true,
-                        _ => false
+                        _ => false,
                     }
                 } else {
                     false
                 }
-            },
+            }
             Command::Pipeline(pipeline) => {
                 for cmd in &pipeline.commands {
                     if self.command_needs_posix(cmd) {
@@ -1464,13 +1516,11 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_posix(left) || self.command_needs_posix(right)
-            },
-            Command::Redirect(redirect_cmd) => {
-                self.command_needs_posix(&redirect_cmd.command)
-            },
+            }
+            Command::Redirect(redirect_cmd) => self.command_needs_posix(&redirect_cmd.command),
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
                     if self.command_needs_posix(cmd) {
@@ -1478,7 +1528,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::While(while_loop) => {
                 for cmd in &while_loop.body.commands {
                     if self.command_needs_posix(cmd) {
@@ -1486,7 +1536,7 @@ impl Generator {
                     }
                 }
                 false
-            },
+            }
             Command::If(if_stmt) => {
                 if self.command_needs_posix(&if_stmt.then_branch) {
                     return true;
@@ -1497,17 +1547,88 @@ impl Generator {
                     }
                 }
                 false
-            },
-            _ => false
+            }
+            _ => false,
         }
     }
-    
+
+    /// Check if a specific command contains a date rewrite that needs a snapshot
+    fn command_needs_date_snapshot(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                if let Word::Literal(name, _) = &cmd.name {
+                    if name == "date" {
+                        return true;
+                    }
+                }
+
+                for (_, word) in &cmd.env_vars {
+                    if self.word_needs_date_snapshot(word) {
+                        return true;
+                    }
+                }
+
+                false
+            }
+            Command::Pipeline(pipeline) => {
+                for cmd in &pipeline.commands {
+                    if self.command_needs_date_snapshot(cmd) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Command::And(left, right) | Command::Or(left, right) => {
+                self.command_needs_date_snapshot(left) || self.command_needs_date_snapshot(right)
+            }
+            Command::Redirect(redirect_cmd) => {
+                self.command_needs_date_snapshot(&redirect_cmd.command)
+            }
+            Command::For(for_loop) => {
+                for cmd in &for_loop.body.commands {
+                    if self.command_needs_date_snapshot(cmd) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Command::While(while_loop) => {
+                for cmd in &while_loop.body.commands {
+                    if self.command_needs_date_snapshot(cmd) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Command::If(if_stmt) => {
+                if self.command_needs_date_snapshot(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_date_snapshot(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if a word contains command substitutions that need a date snapshot
+    fn word_needs_date_snapshot(&self, word: &Word) -> bool {
+        match word {
+            Word::CommandSubstitution(cmd, _) => self.command_needs_date_snapshot(cmd),
+            _ => false,
+        }
+    }
+
     /// Adjust file paths for Perl execution context
     /// Since Perl code runs from the examples directory, we need to strip the examples/ prefix
     pub fn adjust_file_path_for_perl_execution(&self, filename: &str) -> String {
         // Remove quotes if present
         let unquoted = filename.trim_matches('"').trim_matches('\'');
-        
+
         // If the path starts with "examples/", remove that prefix since Perl runs from examples directory
         if unquoted.starts_with("examples/") {
             let adjusted = unquoted.strip_prefix("examples/").unwrap_or(unquoted);
@@ -1524,4 +1645,3 @@ impl Generator {
         }
     }
 }
-

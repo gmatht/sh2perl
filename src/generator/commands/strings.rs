@@ -1,14 +1,19 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, output_var: &str) -> String {
+pub fn generate_strings_command(
+    _generator: &mut Generator,
+    cmd: &SimpleCommand,
+    input_var: &str,
+    output_var: &str,
+) -> String {
     let mut output = String::new();
-    
+
     // strings command syntax: strings [options] file
     // Extracts printable strings from binary files
     let mut _min_length = 4; // Default minimum string length
     let mut filename = String::new();
-    
+
     // Parse strings options and find the filename
     for arg in &cmd.args {
         if let Word::Literal(arg_str, _) = arg {
@@ -25,18 +30,22 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
             }
         }
     }
-    
+
     // If we have a filename, always read from file (even in pipeline context)
     if !filename.is_empty() {
         output.push_str(&format!("my $input_data;\n"));
         output.push_str(&format!("if ( open my $fh, '<', '{}' ) {{\n", filename));
-        output.push_str("    local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once\n");
+        output
+            .push_str("    local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once\n");
         output.push_str("    $input_data = <$fh>;\n");
         output.push_str("    close $fh\n");
         output.push_str("      or croak \"Close failed: $ERRNO\";\n");
         output.push_str("}\n");
         output.push_str("else {\n");
-        output.push_str(&format!("    print {{*STDERR}} \"strings: '{}': No such file\\n\";\n", filename));
+        output.push_str(&format!(
+            "    print {{*STDERR}} \"strings: '{}': No such file\\n\";\n",
+            filename
+        ));
         output.push_str("    $input_data = q{};\n");
         output.push_str("}\n");
     } else {
@@ -48,7 +57,7 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
         };
         output.push_str(&format!("my $input_data = {};\n", var_name));
     }
-    
+
     output.push_str("my @result;\n");
     output.push_str("my @lines = split /\\n/msx, $input_data;\n");
     output.push_str("for my $line (@lines) {\n");
@@ -62,6 +71,6 @@ pub fn generate_strings_command(_generator: &mut Generator, cmd: &SimpleCommand,
     } else {
         output.push_str("$output_0 = $line;\n");
     }
-    
+
     output
 }

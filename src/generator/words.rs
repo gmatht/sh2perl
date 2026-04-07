@@ -51,18 +51,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         Word::CommandSubstitution(cmd, _) => {
             // Handle command substitution
             let result = match cmd.as_ref() {
-                Command::Redirect(redirect_cmd) => {
-                    if let Command::Simple(simple_cmd) = redirect_cmd.command.as_ref() {
-                        if let Word::Literal(name, _) = &simple_cmd.name {
-                            if name == "ls" {
-                                return crate::generator::commands::ls::generate_ls_for_substitution(
-                                    generator,
-                                    simple_cmd,
-                                );
-                            }
-                        }
-                    }
-                    generator.generate_command(cmd)
+                Command::Redirect(_) => {
+                    let command_str =
+                        crate::generator::redirects::generate_bash_command_string(cmd);
+                    let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+
+                    format!(
+                        "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
+                        command_lit
+                    )
                 }
                 Command::Simple(simple_cmd) => {
                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
@@ -165,8 +162,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             };
 
                                         // Generate code to execute the process substitution and save to temp file
-                                        process_sub_code.push_str(&format!("my ${} = ($ENV{{TEMP}} || $ENV{{TMP}} || \"C:\\\\temp\") . '/process_sub_{}.tmp';\n", 
-                                            temp_file, temp_file_id));
+                                        process_sub_code.push_str(&format!(
+                                            "my ${} = {} . '/process_sub_{}.tmp';\n",
+                                            temp_file,
+                                            crate::generator::utils::get_temp_dir(),
+                                            temp_file_id
+                                        ));
                                         process_sub_code.push_str(&format!("{{\n"));
                                         process_sub_code.push_str(&format!("    open my $fh, '>', ${} or croak \"Cannot create temp file: $OS_ERROR\\n\";\n", temp_file));
 
@@ -277,8 +278,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         };
 
                                         // Generate code to execute the process substitution and save to temp file
-                                        process_sub_code.push_str(&format!("my ${} = ($ENV{{TEMP}} || $ENV{{TMP}} || \"C:\\\\temp\") . '/process_sub_{}.tmp';\n", 
-                                            temp_file, temp_file_id));
+                                        process_sub_code.push_str(&format!(
+                                            "my ${} = {} . '/process_sub_{}.tmp';\n",
+                                            temp_file,
+                                            crate::generator::utils::get_temp_dir(),
+                                            temp_file_id
+                                        ));
                                         process_sub_code.push_str(&format!("{{\n"));
                                         process_sub_code.push_str(&format!("    open my $fh, '>', ${} or croak \"Cannot create temp file: $OS_ERROR\\n\";\n", temp_file));
                                         process_sub_code.push_str("    my $temp_output = q{};\n");
@@ -446,15 +451,40 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "wc" {
                             let unique_id = generator.get_unique_id();
                             let output_var = format!("wc_output_{}", unique_id);
+                            let input_var = format!("wc_input_{}", unique_id);
+                            let input_setup = simple_cmd
+                                .redirects
+                                .iter()
+                                .rev()
+                                .find(|redirect| {
+                                    matches!(redirect.operator, RedirectOperator::Input)
+                                })
+                                .map(|redirect| {
+                                    let file_name = generator.word_to_perl(&redirect.target);
+                                    format!(
+                                        "my ${} = do {{\n    local $INPUT_RECORD_SEPARATOR = undef;\n    open my $fh, '<', {}\n        or croak \"Cannot open file: $OS_ERROR\";\n    my $content = <$fh>;\n    close $fh\n        or croak \"Close failed: $OS_ERROR\";\n    $content\n}};\n",
+                                        input_var, file_name
+                                    )
+                                })
+                                .unwrap_or_default();
                             let wc_code =
                                 crate::generator::commands::wc::generate_wc_command_with_output(
                                     generator,
                                     simple_cmd,
-                                    "",
+                                    if input_setup.is_empty() {
+                                        ""
+                                    } else {
+                                        &input_var
+                                    },
                                     &unique_id,
                                     &output_var,
                                 );
-                            format!("do {{\n{}\n${};\n}}", wc_code.trim_end(), output_var)
+                            format!(
+                                "do {{\n{}{}\n    ${};\n}}",
+                                input_setup,
+                                wc_code.trim_end(),
+                                output_var,
+                            )
                         } else if name == "echo" {
                             // Special handling for echo in command substitution
                             if simple_cmd.args.is_empty() {
@@ -616,13 +646,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 "\".\"".to_string()
                             }
                         } else if name == "which" {
-                            // Special handling for which in command substitution
-                            if let Some(command) = simple_cmd.args.first() {
-                                let command_str = generator.word_to_perl(command);
-                                format!("do {{ my $command; my $found; my $result; my $dir; my $full_path; $command = {}; $found = 0; $result = q{{}}; foreach my $dir (split /:/msx, $ENV{{PATH}}) {{ $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", generator.perl_string_literal(command))
-                            } else {
-                                "q{}".to_string()
-                            }
+                            // Use the real which command so flags and exit codes match the host tool.
+                            let which_cmd = generator.generate_command_string_for_system(cmd);
+                            let which_lit =
+                                generator.perl_string_literal(&Word::literal(which_cmd));
+                            format!(
+                                "do {{ my $which_cmd = {}; my $which_output = qx{{$which_cmd}}; $CHILD_ERROR = $? >> 8; $which_output; }}",
+                                which_lit
+                            )
                         } else if name == "seq" {
                             // Special handling for seq in command substitution
                             if simple_cmd.args.is_empty() {
@@ -744,6 +775,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             }
                             let formatted_code = formatted_lines
                                 .join("\n")
+                                .replace("if(-e", "if ( -e")
+                                .replace("if (-e", "if ( -e")
+                                .replace("if(-d", "if ( -d")
+                                .replace("if (-d", "if ( -d")
                                 .replace("print ", "# print ")
                                 .replace("die ", "croak ");
                             // Ensure formatted_code ends with a newline for proper formatting
@@ -768,32 +803,82 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let mv_code = crate::generator::commands::mv::generate_mv_command(
                                 generator, simple_cmd,
                             );
-                            let formatted_code = mv_code
-                                .trim_end_matches('\n')
+                            let lines: Vec<&str> = mv_code.trim_end_matches('\n').lines().collect();
+                            let min_indent = lines
+                                .iter()
+                                .filter(|line| !line.trim().is_empty())
+                                .map(|line| line.len() - line.trim_start().len())
+                                .min()
+                                .unwrap_or(0);
+                            let mut formatted_lines = Vec::new();
+                            let base_eval_indent = 12;
+                            for line in lines {
+                                let trimmed = line.trim_start();
+                                if !trimmed.is_empty() {
+                                    let orig_indent = line.len() - trimmed.len();
+                                    let relative_indent = orig_indent.saturating_sub(min_indent);
+                                    formatted_lines.push(format!(
+                                        "{}{}",
+                                        " ".repeat(base_eval_indent + relative_indent),
+                                        trimmed
+                                    ));
+                                }
+                            }
+                            let formatted_code = formatted_lines
+                                .join("\n")
+                                .replace("if(-e", "if ( -e")
+                                .replace("if (-e", "if ( -e")
+                                .replace("if(-d", "if ( -d")
+                                .replace("if (-d", "if ( -d")
                                 .replace("print ", "# print ")
                                 .replace("die ", "croak ");
-                            let indent1 = generator.indent();
-                            let indent2 = format!("{}{}", generator.indent(), "    ");
-                            let _indent3 = format!("{}{}", indent2, "    ");
-                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if ( !$eval_result ) {{\n{}        local $CHILD_ERROR = 256;\n{}    }}\n{}    q{{}};\n}}", 
-                                indent1, indent1, indent2, formatted_code, indent2, indent2, 
-                                indent1, indent1, indent1, indent1, indent1)
+                            let indent1 = "    ".to_string();
+                            let indent1_do = "        ".to_string();
+                            let indent2 = "            ".to_string();
+                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                                indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
+                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "rm" {
                             // Use native Perl rm implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native rm implementation for command substitution");
                             let rm_code = crate::generator::commands::rm::generate_rm_command(
                                 generator, simple_cmd,
                             );
-                            let formatted_code = rm_code
-                                .trim_end_matches('\n')
+                            let lines: Vec<&str> = rm_code.trim_end_matches('\n').lines().collect();
+                            let min_indent = lines
+                                .iter()
+                                .filter(|line| !line.trim().is_empty())
+                                .map(|line| line.len() - line.trim_start().len())
+                                .min()
+                                .unwrap_or(0);
+                            let mut formatted_lines = Vec::new();
+                            let base_eval_indent = 12;
+                            for line in lines {
+                                let trimmed = line.trim_start();
+                                if !trimmed.is_empty() {
+                                    let orig_indent = line.len() - trimmed.len();
+                                    let relative_indent = orig_indent.saturating_sub(min_indent);
+                                    formatted_lines.push(format!(
+                                        "{}{}",
+                                        " ".repeat(base_eval_indent + relative_indent),
+                                        trimmed
+                                    ));
+                                }
+                            }
+                            let formatted_code = formatted_lines
+                                .join("\n")
+                                .replace("if(-e", "if ( -e")
+                                .replace("if (-e", "if ( -e")
+                                .replace("if(-d", "if ( -d")
+                                .replace("if (-d", "if ( -d")
                                 .replace("print ", "# print ")
                                 .replace("die ", "croak ");
-                            let indent1 = generator.indent();
-                            let indent2 = format!("{}{}", generator.indent(), "    ");
-                            let _indent3 = format!("{}{}", indent2, "    ");
-                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if ( !$eval_result ) {{\n{}        local $CHILD_ERROR = 256;\n{}    }}\n{}    q{{}};\n}}", 
-                                indent1, indent1, indent2, formatted_code, indent2, indent2, 
-                                indent1, indent1, indent1, indent1, indent1)
+                            let indent1 = "    ".to_string();
+                            let indent1_do = "        ".to_string();
+                            let indent2 = "            ".to_string();
+                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                                indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
+                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "mkdir" {
                             // Use native Perl mkdir implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native mkdir implementation for command substitution");
@@ -801,22 +886,36 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 crate::generator::commands::mkdir::generate_mkdir_command(
                                     generator, simple_cmd,
                                 );
-                            let formatted_code = mkdir_code
-                                .trim_end_matches('\n')
-                                .replace("print \"mkdir:", "# print \"mkdir:") // Comment out success messages
-                                .replace("die ", "croak ");
-                            let indent1 = generator.indent();
-                            let indent2 = format!("{}{}", generator.indent(), "    ");
-                            // Don't use eval wrapper for mkdir - let it set $CHILD_ERROR directly
-                            let indented_code = format!(
-                                "{}{}",
-                                indent2,
-                                formatted_code.replace("\n", &format!("\n{}", indent2))
-                            );
-                            format!(
-                                "do {{\n{}{};\n{}    q{{}};\n}}",
-                                indent1, indented_code, indent1
-                            )
+                            let lines: Vec<&str> =
+                                mkdir_code.trim_end_matches('\n').lines().collect();
+                            let min_indent = lines
+                                .iter()
+                                .filter(|line| !line.trim().is_empty())
+                                .map(|line| line.len() - line.trim_start().len())
+                                .min()
+                                .unwrap_or(0);
+                            let mut formatted_lines = Vec::new();
+                            let base_indent = 8;
+                            for line in lines {
+                                let trimmed = line.trim_start();
+                                if !trimmed.is_empty() {
+                                    let orig_indent = line.len() - trimmed.len();
+                                    let relative_indent = orig_indent.saturating_sub(min_indent);
+                                    formatted_lines.push(format!(
+                                        "{}{}",
+                                        " ".repeat(base_indent + relative_indent),
+                                        trimmed
+                                    ));
+                                }
+                            }
+                            let formatted_code =
+                                formatted_lines.join("\n").replace("die ", "croak ");
+                            let indent1 = "    ".to_string();
+                            let indent1_do = "        ".to_string();
+                            let indent2 = "            ".to_string();
+                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                                indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
+                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "touch" {
                             // Use native Perl touch implementation for command substitution
                             eprintln!("DEBUG: words.rs - Using native touch implementation for command substitution");
@@ -824,16 +923,38 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 crate::generator::commands::touch::generate_touch_command(
                                     generator, simple_cmd,
                                 );
-                            let formatted_code = touch_code
-                                .trim_end_matches('\n')
+                            let lines: Vec<&str> =
+                                touch_code.trim_end_matches('\n').lines().collect();
+                            let min_indent = lines
+                                .iter()
+                                .filter(|line| !line.trim().is_empty())
+                                .map(|line| line.len() - line.trim_start().len())
+                                .min()
+                                .unwrap_or(0);
+                            let mut formatted_lines = Vec::new();
+                            let base_eval_indent = 12;
+                            for line in lines {
+                                let trimmed = line.trim_start();
+                                if !trimmed.is_empty() {
+                                    let orig_indent = line.len() - trimmed.len();
+                                    let relative_indent = orig_indent.saturating_sub(min_indent);
+                                    formatted_lines.push(format!(
+                                        "{}{}",
+                                        " ".repeat(base_eval_indent + relative_indent),
+                                        trimmed
+                                    ));
+                                }
+                            }
+                            let formatted_code = formatted_lines
+                                .join("\n")
                                 .replace("print ", "# print ")
                                 .replace("die ", "croak ");
-                            let indent1 = generator.indent();
-                            let indent2 = format!("{}{}", generator.indent(), "    ");
-                            let _indent3 = format!("{}{}", indent2, "    ");
-                            format!("do {{\n{}    local $CHILD_ERROR = 0;\n{}    my $eval_result = eval {{\n{}{};\n{}        local $CHILD_ERROR = 0;\n{}        1;\n{}    }};\n{}    if ( !$eval_result ) {{\n{}        local $CHILD_ERROR = 256;\n{}    }}\n{}    q{{}};\n}}", 
-                                indent1, indent1, indent2, formatted_code, indent2, indent2, 
-                                indent1, indent1, indent1, indent1, indent1)
+                            let indent1 = "    ".to_string();
+                            let indent1_do = "        ".to_string();
+                            let indent2 = "            ".to_string();
+                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                                indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
+                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "time" {
                             // Special handling for time in command substitution
                             // Use custom time implementation instead of open3
@@ -862,6 +983,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             time_output.push_str("q{};\n");
 
                             format!("do {{ {} }}", time_output)
+                        } else if name == "sleep" {
+                            crate::generator::commands::sleep::generate_sleep_expression(
+                                generator, simple_cmd,
+                            )
                         } else {
                             // Fall back to system command for non-builtin commands
                             let cmd_name = generator.perl_string_literal(&simple_cmd.name);
@@ -938,6 +1063,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     } else {
                         left_trimmed.to_string()
                     };
+                    let left_content = left_content.replace('\n', "\n    ");
+                    let right_result = right_result.replace('\n', "\n    ");
                     format!("do {{\n    my $left_result_{} = {}\n    }};\n    if ( $CHILD_ERROR == 0 ) {{\n        my $right_result_{} = {};\n        $left_result_{} . $right_result_{};\n    }}\n    else {{\n        q{{}};\n    }}\n}}", 
                         unique_id, left_content, unique_id, right_result, unique_id, unique_id)
                 }
@@ -1246,7 +1373,10 @@ pub fn convert_string_interpolation_to_perl_impl(
                 // Add the command substitution as a separate part
                 let cmd_result =
                     generator.word_to_perl(&Word::CommandSubstitution(cmd.clone(), None));
-                parts.push(format!("({})", cmd_result));
+                parts.push(format!(
+                    "(do {{ my $_chomp_temp = {}; chomp $_chomp_temp; $_chomp_temp; }})",
+                    cmd_result
+                ));
             }
             StringPart::ParameterExpansion(pe) => {
                 // Handle parameter expansions like ${arr[1]}, ${#arr[@]}, etc.

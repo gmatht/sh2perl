@@ -1,31 +1,36 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _input_var: &str, _command_index: usize, _is_final_command: bool) -> String {
+pub fn generate_diff_command(
+    generator: &mut Generator,
+    cmd: &SimpleCommand,
+    _input_var: &str,
+    _command_index: usize,
+    _is_final_command: bool,
+) -> String {
     let mut output = String::new();
-    
+
     // Always use diff.exe instead of built-in implementation
     output.push_str(&generator.indent());
     output.push_str("my $diff_exit_code = 0;\n");
     output.push_str(&generator.indent());
     output.push_str("my $diff_output = q{};\n");
-    
+
     // Build the diff command arguments
     let mut args = Vec::new();
     for arg in &cmd.args {
         let arg_str = generator.perl_string_literal(arg);
         args.push(arg_str);
     }
-    
+
     if !args.is_empty() {
         output.push_str(&generator.indent());
         output.push_str("{\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str("my $diff_cmd = 'diff.exe';\n");
+        output.push_str("my $diff_cmd = 'diff';\n");
         output.push_str(&generator.indent());
-        output.push_str(&format!("my @diff_args = ({});\n", 
-            args.join(", ")));
+        output.push_str(&format!("my @diff_args = ({});\n", args.join(", ")));
         output.push_str(&generator.indent());
         output.push_str("my $diff_pid = open my $diff_fh, q{-|}, $diff_cmd, @diff_args;\n");
         output.push_str(&generator.indent());
@@ -36,7 +41,9 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str(&generator.indent());
         output.push_str("$diff_output = <$diff_fh>;\n");
         output.push_str(&generator.indent());
-        output.push_str("my $close_result = close $diff_fh; # Capture but ignore close result for diff\n");
+        output.push_str(
+            "my $close_result = close $diff_fh; # Capture but ignore close result for diff\n",
+        );
         output.push_str(&generator.indent());
         output.push_str("$diff_exit_code = $CHILD_ERROR >> 8;\n");
         generator.indent_level -= 1;
@@ -59,10 +66,14 @@ pub fn generate_diff_command(generator: &mut Generator, cmd: &SimpleCommand, _in
         output.push_str(&generator.indent());
         output.push_str("$diff_output = q{};\n");
     }
-    
+
     // For command substitution, we need to return the output
     output.push_str(&generator.indent());
-    output.push_str("$diff_output");
-    
+    if _is_final_command {
+        output.push_str("print $diff_output;\n");
+    } else {
+        output.push_str("$diff_output;\n");
+    }
+
     output
 }

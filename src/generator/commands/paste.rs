@@ -1,5 +1,5 @@
-use crate::generator::Generator;
 use crate::ast::*;
+use crate::generator::Generator;
 
 pub fn generate_paste_command(
     generator: &mut Generator,
@@ -7,52 +7,58 @@ pub fn generate_paste_command(
     process_sub_files: &[(String, String)],
 ) -> String {
     let mut result = String::new();
-    
+
     if !process_sub_files.is_empty() {
         // Handle process substitution case
         if process_sub_files.len() >= 2 {
             let file1 = &process_sub_files[0];
             let file2 = &process_sub_files[1];
-            
+
             // Read both files and paste them together
             let paste_id = generator.get_unique_file_handle();
             result.push_str(&generator.indent());
             result.push_str(&format!("my @paste_file1_lines_{};\n", paste_id));
             result.push_str(&generator.indent());
             result.push_str(&format!("my @paste_file2_lines_{};\n", paste_id));
-            
+
             // Read first file
             result.push_str(&generator.indent());
-            result.push_str(&format!("if (open my $fh1, '<', '{}') {{\n", file1.0));
+            result.push_str(&format!("if (open my $fh1, '<', ${}) {{\n", file1.0));
             result.push_str(&generator.indent());
             result.push_str("    while (my $line = <$fh1>) {\n");
             result.push_str(&generator.indent());
             result.push_str("        chomp $line;\n");
             result.push_str(&generator.indent());
-            result.push_str(&format!("        push @paste_file1_lines_{}, $line;\n", paste_id));
+            result.push_str(&format!(
+                "        push @paste_file1_lines_{}, $line;\n",
+                paste_id
+            ));
             result.push_str(&generator.indent());
             result.push_str("    }\n");
             result.push_str(&generator.indent());
             result.push_str("    close $fh1 or croak \"Close failed: $OS_ERROR\";\n");
             result.push_str(&generator.indent());
             result.push_str("}\n");
-            
+
             // Read second file
             result.push_str(&generator.indent());
-            result.push_str(&format!("if (open my $fh2, '<', '{}') {{\n", file2.0));
+            result.push_str(&format!("if (open my $fh2, '<', ${}) {{\n", file2.0));
             result.push_str(&generator.indent());
             result.push_str("    while (my $line = <$fh2>) {\n");
             result.push_str(&generator.indent());
             result.push_str("        chomp $line;\n");
             result.push_str(&generator.indent());
-            result.push_str(&format!("        push @paste_file2_lines_{}, $line;\n", paste_id));
+            result.push_str(&format!(
+                "        push @paste_file2_lines_{}, $line;\n",
+                paste_id
+            ));
             result.push_str(&generator.indent());
             result.push_str("    }\n");
             result.push_str(&generator.indent());
             result.push_str("    close $fh2 or croak \"Close failed: $OS_ERROR\";\n");
             result.push_str(&generator.indent());
             result.push_str("}\n");
-            
+
             // Paste the lines together
             result.push_str(&generator.indent());
             result.push_str(&format!("my $max_lines = scalar @paste_file1_lines_{} > scalar @paste_file2_lines_{} ? scalar @paste_file1_lines_{} : scalar @paste_file2_lines_{};\n", paste_id, paste_id, paste_id, paste_id));
@@ -69,14 +75,16 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str("}\n");
             result.push_str(&generator.indent());
-            result.push_str("$paste_output");
+            result.push_str("print $paste_output;\n");
         }
     } else {
         // Handle regular paste command with file arguments
-        let args: Vec<String> = cmd.args.iter()
+        let args: Vec<String> = cmd
+            .args
+            .iter()
             .map(|arg| generator.perl_string_literal(arg))
             .collect();
-        
+
         if args.len() >= 2 {
             // Read both files and paste them together
             let paste_id = generator.get_unique_file_handle();
@@ -85,7 +93,7 @@ pub fn generate_paste_command(
             result.push_str(&format!("my @paste_file1_lines_{};\n", paste_id));
             result.push_str(&generator.indent());
             result.push_str(&format!("my @paste_file2_lines_{};\n", paste_id));
-            
+
             // Read first file
             result.push_str(&generator.indent());
             result.push_str(&format!("if (open my $fh1, '<', {}) {{\n", args[0]));
@@ -94,14 +102,17 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str("        chomp $line;\n");
             result.push_str(&generator.indent());
-            result.push_str(&format!("        push @paste_file1_lines_{}, $line;\n", paste_id));
+            result.push_str(&format!(
+                "        push @paste_file1_lines_{}, $line;\n",
+                paste_id
+            ));
             result.push_str(&generator.indent());
             result.push_str("    }\n");
             result.push_str(&generator.indent());
             result.push_str("    close $fh1 or croak \"Close failed: $OS_ERROR\";\n");
             result.push_str(&generator.indent());
             result.push_str("}\n");
-            
+
             // Read second file
             result.push_str(&generator.indent());
             result.push_str(&format!("if (open my $fh2, '<', {}) {{\n", args[1]));
@@ -110,14 +121,17 @@ pub fn generate_paste_command(
             result.push_str(&generator.indent());
             result.push_str("        chomp $line;\n");
             result.push_str(&generator.indent());
-            result.push_str(&format!("        push @paste_file2_lines_{}, $line;\n", paste_id));
+            result.push_str(&format!(
+                "        push @paste_file2_lines_{}, $line;\n",
+                paste_id
+            ));
             result.push_str(&generator.indent());
             result.push_str("    }\n");
             result.push_str(&generator.indent());
             result.push_str("    close $fh2 or croak \"Close failed: $OS_ERROR\";\n");
             result.push_str(&generator.indent());
             result.push_str("}\n");
-            
+
             // Paste the lines together
             result.push_str(&generator.indent());
             result.push_str(&format!("my $max_lines = scalar @paste_file1_lines_{} > scalar @paste_file2_lines_{} ? scalar @paste_file1_lines_{} : scalar @paste_file2_lines_{};\n", paste_id, paste_id, paste_id, paste_id));
@@ -144,6 +158,6 @@ pub fn generate_paste_command(
             result.push_str("system 'paste';\n");
         }
     }
-    
+
     result
 }

@@ -558,7 +558,13 @@ pub fn generate_generic_builtin(
         }
         "paste" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::paste::generate_paste_command(generator, cmd, &[])
+            let paste_output =
+                crate::generator::commands::paste::generate_paste_command(generator, cmd, &[]);
+            if output_var.is_empty() {
+                paste_output
+            } else {
+                format!("${} = {};\n", output_var, paste_output)
+            }
         }
         "comm" => {
             // For now, use the existing signature but we should standardize this
@@ -609,7 +615,7 @@ pub fn generate_generic_builtin(
             crate::generator::commands::time::generate_time_command(generator, cmd)
         }
         "sleep" => {
-            // For now, use the existing signature but we should standardize this
+            // Keep the implementation centralized in sleep.rs.
             crate::generator::commands::sleep::generate_sleep_command(generator, cmd)
         }
         "pwd" => {

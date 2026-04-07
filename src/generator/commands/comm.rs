@@ -8,47 +8,56 @@ pub fn generate_comm_command(
     process_sub_files: &[(String, String)],
 ) -> String {
     let mut output = String::new();
-    
+
     // comm compares two sorted files and shows lines unique to each
     // Format: comm [-123] file1 file2
     // Output columns: lines unique to file1, lines unique to file2, lines common to both
-    
+
     let mut suppress_col1 = false;
     let mut suppress_col2 = false;
     let mut suppress_col3 = false;
-    
+
     // Parse options
     for arg in &cmd.args {
         if let Word::Literal(s, _) = arg {
             if s.starts_with('-') {
-                if s.contains('1') { suppress_col1 = true; }
-                if s.contains('2') { suppress_col2 = true; }
-                if s.contains('3') { suppress_col3 = true; }
+                if s.contains('1') {
+                    suppress_col1 = true;
+                }
+                if s.contains('2') {
+                    suppress_col2 = true;
+                }
+                if s.contains('3') {
+                    suppress_col3 = true;
+                }
             }
         }
     }
-    
+
     // Check if we have process substitution redirects
     let mut has_process_sub = false;
     for redir in &cmd.redirects {
-        if matches!(redir.operator, RedirectOperator::ProcessSubstitutionInput(_)) {
+        if matches!(
+            redir.operator,
+            RedirectOperator::ProcessSubstitutionInput(_)
+        ) {
             has_process_sub = true;
             break;
         }
     }
-    
+
     if has_process_sub {
         // For process substitution, we need to handle the files differently
         // The process substitution files will be created by the main generator
         // We'll read from them directly
-        
+
         output.push_str("my @file1_lines;\n");
         output.push_str("my @file2_lines;\n");
-        
+
         if !process_sub_files.is_empty() && process_sub_files.len() >= 2 {
             let file1 = &process_sub_files[0];
             let file2 = &process_sub_files[1];
-            
+
             // Read first file
             output.push_str(&format!("if (open my $fh1, '<', ${}) {{\n", file1.0));
             output.push_str("    while (my $line = <$fh1>) {\n");
@@ -57,7 +66,7 @@ pub fn generate_comm_command(
             output.push_str("    }\n");
             output.push_str("    close $fh1 or croak \"Close failed: $OS_ERROR\";\n");
             output.push_str("}\n");
-            
+
             // Read second file
             output.push_str(&format!("if (open my $fh2, '<', ${}) {{\n", file2.0));
             output.push_str("    while (my $line = <$fh2>) {\n");
@@ -66,11 +75,11 @@ pub fn generate_comm_command(
             output.push_str("    }\n");
             output.push_str("    close $fh2 or croak \"Close failed: $OS_ERROR\";\n");
             output.push_str("}\n");
-            
+
             // Create hashes for efficient lookup
             output.push_str("my %file1_set = map { $_ => 1 } @file1_lines;\n");
             output.push_str("my %file2_set = map { $_ => 1 } @file2_lines;\n");
-            
+
             // Find common lines
             output.push_str("my @common_lines;\n");
             output.push_str("foreach my $line (@file1_lines) {\n");
@@ -78,10 +87,10 @@ pub fn generate_comm_command(
             output.push_str("        push @common_lines, $line;\n");
             output.push_str("    }\n");
             output.push_str("}\n");
-            
+
             // Generate output based on suppression flags
             output.push_str("my $comm_output = q{};\n");
-            
+
             if !suppress_col1 {
                 output.push_str("foreach my $line (@file1_lines) {\n");
                 output.push_str("    if (!exists $file2_set{$line}) {\n");
@@ -89,7 +98,7 @@ pub fn generate_comm_command(
                 output.push_str("    }\n");
                 output.push_str("}\n");
             }
-            
+
             if !suppress_col2 {
                 output.push_str("foreach my $line (@file2_lines) {\n");
                 output.push_str("    if (!exists $file1_set{$line}) {\n");
@@ -97,13 +106,13 @@ pub fn generate_comm_command(
                 output.push_str("    }\n");
                 output.push_str("}\n");
             }
-            
+
             if !suppress_col3 {
                 output.push_str("foreach my $line (@common_lines) {\n");
                 output.push_str("    $comm_output .= $line . \"\\n\";\n");
                 output.push_str("}\n");
             }
-            
+
             // Remove trailing newline and return the result
             output.push_str("$comm_output =~ s/\\n$//msx;\n");
             output.push_str("$comm_output");
@@ -122,15 +131,15 @@ pub fn generate_comm_command(
                 }
             }
         }
-        
+
         if file_args.len() >= 2 {
             let file1 = &file_args[0];
             let file2 = &file_args[1];
-            
+
             // Declare variables
             output.push_str("my @file1_lines;\n");
             output.push_str("my @file2_lines;\n");
-            
+
             // Read first file
             output.push_str(&format!("if (open my $fh1, '<', '{}') {{\n", file1));
             output.push_str("    while (my $line = <$fh1>) {\n");
@@ -139,7 +148,7 @@ pub fn generate_comm_command(
             output.push_str("    }\n");
             output.push_str("    close $fh1 or croak \"Close failed: $OS_ERROR\";\n");
             output.push_str("}\n");
-            
+
             // Read second file
             output.push_str(&format!("if (open my $fh2, '<', '{}') {{\n", file2));
             output.push_str("    while (my $line = <$fh2>) {\n");
@@ -148,11 +157,11 @@ pub fn generate_comm_command(
             output.push_str("    }\n");
             output.push_str("    close $fh2 or croak \"Close failed: $OS_ERROR\";\n");
             output.push_str("}\n");
-            
+
             // Create hashes for efficient lookup
             output.push_str("my %file1_set = map { $_ => 1 } @file1_lines;\n");
             output.push_str("my %file2_set = map { $_ => 1 } @file2_lines;\n");
-            
+
             // Find common lines
             output.push_str("my @common_lines;\n");
             output.push_str("foreach my $line (@file1_lines) {\n");
@@ -160,10 +169,10 @@ pub fn generate_comm_command(
             output.push_str("        push @common_lines, $line;\n");
             output.push_str("    }\n");
             output.push_str("}\n");
-            
+
             // Generate output based on suppression flags
             output.push_str("my $comm_output = q{};\n");
-            
+
             if !suppress_col1 {
                 output.push_str("foreach my $line (@file1_lines) {\n");
                 output.push_str("    if (!exists $file2_set{$line}) {\n");
@@ -171,7 +180,7 @@ pub fn generate_comm_command(
                 output.push_str("    }\n");
                 output.push_str("}\n");
             }
-            
+
             if !suppress_col2 {
                 output.push_str("foreach my $line (@file2_lines) {\n");
                 output.push_str("    if (!exists $file1_set{$line}) {\n");
@@ -179,13 +188,13 @@ pub fn generate_comm_command(
                 output.push_str("    }\n");
                 output.push_str("}\n");
             }
-            
+
             if !suppress_col3 {
                 output.push_str("foreach my $line (@common_lines) {\n");
                 output.push_str("    $comm_output .= $line . \"\\n\";\n");
                 output.push_str("}\n");
             }
-            
+
             // Remove trailing newline and return the result
             output.push_str("$comm_output =~ s/\\n$//msx;\n");
             output.push_str("$comm_output");
@@ -194,6 +203,6 @@ pub fn generate_comm_command(
             output.push_str("q{}");
         }
     }
-    
+
     output
 }

@@ -1,13 +1,18 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: usize) -> String {
+pub fn generate_cut_command(
+    generator: &mut Generator,
+    cmd: &SimpleCommand,
+    input_var: &str,
+    _command_index: usize,
+) -> String {
     let mut output = String::new();
-    
+
     // cut command syntax: cut -d delimiter -f fields
     let mut delimiter = "\\t".to_string(); // Default tab delimiter
     let mut fields = "1".to_string(); // Default to first field
-    
+
     // Parse cut options
     let mut i = 0;
     while i < cmd.args.len() {
@@ -34,28 +39,65 @@ pub fn generate_cut_command(generator: &mut Generator, cmd: &SimpleCommand, inpu
         }
         i += 1;
     }
-    
+
     let unique_id = generator.get_unique_id();
-    output.push_str(&format!("my @lines_{} = split /\\n/msx, ${};\n", unique_id, input_var));
+    output.push_str(&format!(
+        "my @lines_{} = split /\\n/msx, ${};\n",
+        unique_id, input_var
+    ));
     output.push_str(&format!("my @result_{};\n", unique_id));
     output.push_str(&format!("foreach my $line (@lines_{}) {{\n", unique_id));
     output.push_str("chomp $line;\n");
     // Escape special regex characters in delimiter
-    let escaped_delimiter = delimiter.replace(":", "\\:").replace("|", "\\|").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}").replace("^", "\\^").replace("$", "\\$").replace("*", "\\*").replace("+", "\\+").replace("?", "\\?").replace(".", "\\.");
-    output.push_str(&format!("my @fields = split /{}/msx, $line;\n", escaped_delimiter));
-    
+    let escaped_delimiter = delimiter
+        .replace(":", "\\:")
+        .replace("|", "\\|")
+        .replace("(", "\\(")
+        .replace(")", "\\)")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("{", "\\{")
+        .replace("}", "\\}")
+        .replace("^", "\\^")
+        .replace("$", "\\$")
+        .replace("*", "\\*")
+        .replace("+", "\\+")
+        .replace("?", "\\?")
+        .replace(".", "\\.");
+    output.push_str(&format!(
+        "my @fields = split /{}/msx, $line;\n",
+        escaped_delimiter
+    ));
+
     // Handle field selection - convert field number from 1-based to 0-based indexing
-    let field_index = if fields.trim_matches('"').trim_matches('\'').parse::<usize>().unwrap_or(1) > 0 {
-        fields.trim_matches('"').trim_matches('\'').parse::<usize>().unwrap_or(1) - 1
+    let field_index = if fields
+        .trim_matches('"')
+        .trim_matches('\'')
+        .parse::<usize>()
+        .unwrap_or(1)
+        > 0
+    {
+        fields
+            .trim_matches('"')
+            .trim_matches('\'')
+            .parse::<usize>()
+            .unwrap_or(1)
+            - 1
     } else {
         0
     };
     output.push_str(&format!("if (@fields > {}) {{\n", field_index));
-    output.push_str(&format!("push @result_{}, $fields[{}];\n", unique_id, field_index));
+    output.push_str(&format!(
+        "push @result_{}, $fields[{}];\n",
+        unique_id, field_index
+    ));
     output.push_str("}\n");
     output.push_str("}\n");
-    output.push_str(&format!("${} = join \"\\n\", @result_{};\n", input_var, unique_id));
+    output.push_str(&format!(
+        "${} = join \"\\n\", @result_{};\n",
+        input_var, unique_id
+    ));
     output.push_str("\n");
-    
+
     output
 }

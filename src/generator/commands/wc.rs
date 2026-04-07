@@ -17,7 +17,7 @@ pub fn generate_wc_command(
 }
 
 pub fn generate_wc_command_with_output(
-    _generator: &mut Generator,
+    generator: &mut Generator,
     cmd: &SimpleCommand,
     input_var: &str,
     command_index: &str,
@@ -28,7 +28,7 @@ pub fn generate_wc_command_with_output(
     let wc_args = cmd
         .args
         .iter()
-        .map(|arg| _generator.word_to_perl(arg))
+        .map(|arg| generator.word_to_perl(arg))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -66,10 +66,25 @@ pub fn generate_wc_command_with_output(
         "close $wc_in_{} or die \"Close failed: $!\\n\";\n",
         command_index
     ));
-    output.push_str(&format!(
-        "my ${} = do {{ local $/ = undef; <$wc_out_{}> }};\n",
-        output_var, command_index
-    ));
+    let output_name = output_var.trim_start_matches('$');
+    let output_var_expr = if output_var.starts_with('$') {
+        output_var.to_string()
+    } else {
+        format!("${}", output_name)
+    };
+
+    if generator.declared_locals.contains(output_name) {
+        output.push_str(&format!(
+            "{} = do {{ local $/ = undef; <$wc_out_{}> }};\n",
+            output_var_expr, command_index
+        ));
+    } else {
+        output.push_str(&format!(
+            "my {} = do {{ local $/ = undef; <$wc_out_{}> }};\n",
+            output_var_expr, command_index
+        ));
+        generator.declared_locals.insert(output_name.to_string());
+    }
     output.push_str(&format!(
         "close $wc_out_{} or die \"Close failed: $!\\n\";\n",
         command_index

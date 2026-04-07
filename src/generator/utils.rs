@@ -7,7 +7,7 @@ pub fn get_temp_dir() -> &'static str {
     if cfg!(target_os = "windows") {
         "($ENV{TEMP} || $ENV{TMP} || \"C:\\\\temp\")"
     } else {
-        "/tmp"
+        "q{/tmp}"
     }
 }
 
@@ -277,13 +277,11 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 "\".\"".to_string()
                             }
                         } else if name == "which" {
-                            // Special handling for which in command substitution
-                            if let Some(command) = simple_cmd.args.first() {
-                                let command_str = generator.word_to_perl(command);
-                                format!("do {{ my $command = {}; my $found = 0; my $result = q{{}}; foreach my $dir (split /:/msx, $ENV{{PATH}}) {{ my $full_path = \"$dir/$command\"; if (-x $full_path) {{ $result = $full_path; $found = 1; last; }} }} $result; }}", command_str)
-                            } else {
-                                "q{}".to_string()
-                            }
+                            // Use the real which command so flags and exit codes match the host tool.
+                            let which_cmd = generator.generate_command_string_for_system(cmd);
+                            let which_lit =
+                                generator.perl_string_literal(&Word::literal(which_cmd));
+                            format!("do {{ my $which_cmd = {}; my $which_output = qx{{$which_cmd}}; $CHILD_ERROR = $? >> 8; $which_output; }}", which_lit)
                         } else if name == "seq" {
                             // Special handling for seq in command substitution
                             if simple_cmd.args.is_empty() {
@@ -542,9 +540,8 @@ pub fn convert_escaped_metacharacters(pattern: &str) -> String {
 /// Generate a regex pattern for checking if string ends with newline
 pub fn newline_end_regex() -> String {
     // Use a regex pattern that matches actual newline characters
-    // In Rust strings, \\n becomes \n in the string, which Perl interprets as a newline in regex
-    // Use {} delimiters to satisfy Perl::Critic policy for regex patterns with /m flag
-    "m{\\n$}msx".to_string()
+    // Use \z so we only match a true trailing newline, not any newline in a multiline string.
+    "m{\\n\\z}msx".to_string()
 }
 
 /// Convert postfix unless statement to block form
