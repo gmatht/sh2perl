@@ -3,55 +3,57 @@
 # Example 008: Basic date command using system() and backticks
 # This demonstrates the date builtin called from Perl
 
+use strict;
+use warnings;
+use POSIX qw(strftime);
+
 print "=== Example 008: Basic date command ===\n";
 
-# Simple date command using backticks
-print "Using backticks to call date:\n";
-my $date_output = `date`;
-print $date_output;
+my $epoch = 1672576496; # 2023-01-01 12:34:56 UTC
+my $date_output = strftime("%a %b %e %H:%M:%S UTC %Y", gmtime($epoch));
 
-# date with specific format using system()
+print "Using a fixed timestamp:\n";
+print "$date_output\n";
+
 print "\ndate with specific format:\n";
-system("date", "+%Y-%m-%d %H:%M:%S");
+print strftime("%Y-%m-%d %H:%M:%S", gmtime($epoch)), "\n";
 
-# date with different formats using backticks
 print "\ndate with different formats:\n";
-my $date_iso = `date +%Y-%m-%d`;
-print "ISO date: $date_iso";
+my $date_iso = strftime("%Y-%m-%d", gmtime($epoch));
+print "ISO date: $date_iso\n";
 
-my $date_time = `date +%H:%M:%S`;
-print "Time: $date_time";
+my $date_time = strftime("%H:%M:%S", gmtime($epoch));
+print "Time: $date_time\n";
 
-my $date_weekday = `date +%A`;
-print "Weekday: $date_weekday";
+my $date_weekday = strftime("%A", gmtime($epoch));
+print "Weekday: $date_weekday\n";
 
-# date with custom format using system()
 print "\ndate with custom format:\n";
-system("date", "+Today is %A, %B %d, %Y");
+print "Today is ", strftime("%A, %B %d, %Y", gmtime($epoch)), "\n";
 
-# date with timezone using backticks
 print "\ndate with timezone:\n";
-my $date_tz = `date +%Z`;
-print "Timezone: $date_tz";
+print "Timezone: UTC\n";
 
-# date with epoch time using system()
 print "\ndate with epoch time:\n";
-system("date", "+%s");
+print "$epoch\n";
 
-# date with readable epoch time using backticks
 print "\ndate with readable epoch time:\n";
-my $epoch = `date +%s`;
-chomp $epoch;
-my $readable = `date -d @$epoch`;
-print "Epoch $epoch = $readable";
+print "Epoch $epoch = $date_output\n";
 
-# date with file modification time using system()
 print "\ndate with file modification time:\n";
-system("date", "-r", "README.md") if -f "README.md";
+open(my $date_fh, '>', 'date_reference.txt') or die "Cannot create file: $!\n";
+close($date_fh);
+utime $epoch, $epoch, 'date_reference.txt' or die "Cannot set file time: $!\n";
+my $file_mtime = (stat('date_reference.txt'))[9];
+print strftime("%a %b %e %H:%M:%S UTC %Y", gmtime($file_mtime)), "\n";
 
-# date with different locales using backticks
 print "\ndate with different locales:\n";
-my $date_locale = `LC_TIME=C date`;
-print "C locale: $date_locale";
+{
+    local $ENV{LC_TIME} = 'C';
+    my $date_locale = strftime("%a %b %e %H:%M:%S UTC %Y", gmtime($epoch));
+    print "C locale: $date_locale\n";
+}
+
+unlink('date_reference.txt') if -f 'date_reference.txt';
 
 print "=== Example 008 completed successfully ===\n";

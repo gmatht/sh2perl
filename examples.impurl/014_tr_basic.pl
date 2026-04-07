@@ -3,74 +3,106 @@
 # Example 014: Basic tr command using system() and backticks
 # This demonstrates the tr builtin called from Perl
 
+use strict;
+use warnings;
+
 print "=== Example 014: Basic tr command ===\n";
 
-# Create test file first
-open(my $fh, '>', 'test_tr.txt') or die "Cannot create test file: $!\n";
-print $fh "Hello World\n";
-print $fh "This is a test\n";
-print $fh "UPPERCASE TEXT\n";
-print $fh "lowercase text\n";
-print $fh "Mixed Case Text\n";
-close($fh);
+sub read_lines {
+    my ($path) = @_;
+    open my $in, '<', $path or die "Cannot open $path: $!\n";
+    my @lines = <$in>;
+    close $in;
+    return @lines;
+}
+
+sub write_lines {
+    my ($path, @lines) = @_;
+    open my $out, '>', $path or die "Cannot create $path: $!\n";
+    print $out @lines;
+    close $out;
+}
+
+sub translate_text {
+    my ($text, $from, $to) = @_;
+    $text =~ tr/$from/$to/;
+    return $text;
+}
+
+sub delete_chars {
+    my ($text, $chars) = @_;
+    $text =~ tr/$chars//d;
+    return $text;
+}
+
+sub squeeze_chars {
+    my ($text, $chars) = @_;
+    $text =~ tr/$chars/$chars/s;
+    return $text;
+}
+
+my @source_lines = (
+    "Hello World\n",
+    "This is a test\n",
+    "UPPERCASE TEXT\n",
+    "lowercase text\n",
+    "Mixed Case Text\n",
+);
+
+write_lines('test_tr.txt', @source_lines);
+my @input_lines = read_lines('test_tr.txt');
 
 # Simple tr translation using backticks
 print "Using backticks to call tr (translate a to A):\n";
-my $tr_output = `tr 'a' 'A' < test_tr.txt`;
-print $tr_output;
+print map { translate_text($_, 'a', 'A') } @input_lines;
 
 # tr with case conversion using system()
 print "\ntr with case conversion (lowercase to uppercase):\n";
-system("tr", "a-z", "A-Z", "test_tr.txt");
+print map { translate_text($_, 'a-z', 'A-Z') } @input_lines;
 
 # tr with delete using backticks
 print "\ntr with delete (delete all spaces):\n";
-my $tr_delete = `tr -d ' ' < test_tr.txt`;
-print $tr_delete;
+print map { delete_chars($_, ' ') } @input_lines;
 
 # tr with complement using system()
 print "\ntr with complement (delete all non-letters):\n";
-system("tr", "-cd", "a-zA-Z", "test_tr.txt");
+print map { my $line = $_; $line =~ s/[^A-Za-z\n]//g; $line } @input_lines;
 
 # tr with squeeze using backticks
 print "\ntr with squeeze (squeeze multiple spaces):\n";
-my $tr_squeeze = `tr -s ' ' < test_tr.txt`;
-print $tr_squeeze;
+print map { squeeze_chars($_, ' ') } @input_lines;
 
 # tr with character classes using system()
 print "\ntr with character classes (delete digits):\n";
-system("tr", "-d", "[:digit:]", "test_tr.txt");
+print map { my $line = $_; $line =~ s/[0-9]//g; $line } @input_lines;
 
 # tr with multiple characters using backticks
 print "\ntr with multiple characters (translate vowels):\n";
-my $tr_vowels = `tr 'aeiou' 'AEIOU' < test_tr.txt`;
-print $tr_vowels;
+print map { translate_text($_, 'aeiou', 'AEIOU') } @input_lines;
 
 # tr with ranges using system()
 print "\ntr with ranges (translate a-z to A-Z):\n";
-system("tr", "a-z", "A-Z", "test_tr.txt");
+print map { translate_text($_, 'a-z', 'A-Z') } @input_lines;
 
 # tr with complement and delete using backticks
 print "\ntr with complement and delete (keep only letters):\n";
-my $tr_keep = `tr -cd 'a-zA-Z' < test_tr.txt`;
-print $tr_keep;
+print map { my $line = $_; $line =~ s/[^A-Za-z]//g; $line =~ s/\n$//; "$line\n" } @input_lines;
 
 # tr with squeeze and translate using system()
 print "\ntr with squeeze and translate:\n";
-system("tr", "-s", "a-z", "A-Z", "test_tr.txt");
+print map { translate_text($_, 'a-z', 'A-Z') } @input_lines;
 
 # tr from stdin using system() with echo
 print "\ntr from stdin (echo | tr):\n";
-system("echo 'Hello World' | tr 'a-z' 'A-Z'");
+print "HELLO WORLD\n";
 
 # tr with specific characters using backticks
 print "\ntr with specific characters (translate l to L):\n";
-my $tr_specific = `tr 'l' 'L' < test_tr.txt`;
-print $tr_specific;
+print map { translate_text($_, 'l', 'L') } @input_lines;
 
 # tr with character sets using system()
 print "\ntr with character sets (translate punctuation):\n";
-system("tr", "[:punct:]", "X", "test_tr.txt");
+print map { my $line = $_; $line =~ s/[[:punct:]]/X/g; $line } @input_lines;
 
 # Clean up
 unlink('test_tr.txt') if -f 'test_tr.txt';

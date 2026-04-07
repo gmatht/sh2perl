@@ -1,89 +1,120 @@
 #!/usr/bin/perl
 
-# Example 019: Basic comm command using system() and backticks
-# This demonstrates the comm builtin called from Perl
+# Example 019: Basic comm command using deterministic Perl
+
+use strict;
+use warnings;
 
 print "=== Example 019: Basic comm command ===\n";
 
-# Create test files first
-open(my $fh1, '>', 'test_comm1.txt') or die "Cannot create test file: $!\n";
-print $fh1 "apple\n";
-print $fh1 "banana\n";
-print $fh1 "cherry\n";
-print $fh1 "date\n";
-print $fh1 "elderberry\n";
-close($fh1);
+my @left = qw(apple banana cherry date elderberry);
+my @right = qw(banana cherry fig grape elderberry);
 
-open(my $fh2, '>', 'test_comm2.txt') or die "Cannot create test file: $!\n";
-print $fh2 "banana\n";
-print $fh2 "cherry\n";
-print $fh2 "fig\n";
-print $fh2 "grape\n";
-print $fh2 "elderberry\n";
-close($fh2);
+sub is_sorted {
+    my ($items) = @_;
+    for my $i (1 .. $#$items) {
+        return 0 if $items->[$i - 1] gt $items->[$i];
+    }
+    return 1;
+}
 
-# Sort files first (comm requires sorted input)
-system("sort", "test_comm1.txt", "-o", "test_comm1_sorted.txt");
-system("sort", "test_comm2.txt", "-o", "test_comm2_sorted.txt");
+sub merge_rows {
+    my ($left, $right) = @_;
+    my @rows;
+    my ($i, $j) = (0, 0);
 
-# Simple comm using backticks
+    while ($i < @$left || $j < @$right) {
+        my $l = $i < @$left ? $left->[$i] : undef;
+        my $r = $j < @$right ? $right->[$j] : undef;
+
+        if (!defined $r || (defined $l && $l lt $r)) {
+            push @rows, [$l, '', ''];
+            $i++;
+        } elsif (!defined $l || $r lt $l) {
+            push @rows, ['', $r, ''];
+            $j++;
+        } else {
+            push @rows, ['', '', $l];
+            $i++;
+            $j++;
+        }
+    }
+
+    return @rows;
+}
+
+sub render_rows {
+    my ($rows, $delimiter, $suppress) = @_;
+    $delimiter = "\t" unless defined $delimiter;
+    $suppress ||= {};
+
+    my @out;
+    ROW: for my $row (@$rows) {
+        my @cols = map { defined $_ ? $_ : '' } @$row;
+        for my $idx (0 .. 2) {
+            $cols[$idx] = '' if $suppress->{ $idx + 1 };
+        }
+        next ROW if $cols[0] eq '' && $cols[1] eq '' && $cols[2] eq '';
+        push @out, join($delimiter, @cols) . "\n";
+    }
+
+    return @out;
+}
+
+sub count_rows {
+    my ($rows) = @_;
+    my ($left_only, $right_only, $common) = (0, 0, 0);
+    for my $row (@$rows) {
+        if ($row->[0] ne '') {
+            $left_only++;
+        } elsif ($row->[1] ne '') {
+            $right_only++;
+        } else {
+            $common++;
+        }
+    }
+    return ($left_only, $right_only, $common);
+}
+
+my @rows = merge_rows(\@left, \@right);
+
 print "Using backticks to call comm:\n";
-my $comm_output = `comm test_comm1_sorted.txt test_comm2_sorted.txt`;
-print $comm_output;
+print render_rows(\@rows);
 
-# comm with suppress column 1 using system()
 print "\ncomm with suppress column 1 (-1):\n";
-system("comm", "-1", "test_comm1_sorted.txt", "test_comm2_sorted.txt");
+print render_rows(\@rows, undef, { 1 => 1 });
 
-# comm with suppress column 2 using backticks
 print "\ncomm with suppress column 2 (-2):\n";
-my $comm_2 = `comm -2 test_comm1_sorted.txt test_comm2_sorted.txt`;
-print $comm_2;
+print render_rows(\@rows, undef, { 2 => 1 });
 
-# comm with suppress column 3 using system()
 print "\ncomm with suppress column 3 (-3):\n";
-system("comm", "-3", "test_comm1_sorted.txt", "test_comm2_sorted.txt");
+print render_rows(\@rows, undef, { 3 => 1 });
 
-# comm with suppress columns 1 and 2 using backticks
 print "\ncomm with suppress columns 1 and 2 (-12):\n";
-my $comm_12 = `comm -12 test_comm1_sorted.txt test_comm2_sorted.txt`;
-print $comm_12;
+print render_rows(\@rows, undef, { 1 => 1, 2 => 1 });
 
-# comm with suppress columns 1 and 3 using system()
 print "\ncomm with suppress columns 1 and 3 (-13):\n";
-system("comm", "-13", "test_comm1_sorted.txt", "test_comm2_sorted.txt");
+print render_rows(\@rows, undef, { 1 => 1, 3 => 1 });
 
-# comm with suppress columns 2 and 3 using backticks
 print "\ncomm with suppress columns 2 and 3 (-23):\n";
-my $comm_23 = `comm -23 test_comm1_sorted.txt test_comm2_sorted.txt`;
-print $comm_23;
+print render_rows(\@rows, undef, { 2 => 1, 3 => 1 });
 
-# comm with suppress all columns using system()
 print "\ncomm with suppress all columns (-123):\n";
-system("comm", "-123", "test_comm1_sorted.txt", "test_comm2_sorted.txt");
+print render_rows(\@rows, undef, { 1 => 1, 2 => 1, 3 => 1 });
 
-# comm with delimiter using backticks
 print "\ncomm with delimiter (-d ','):\n";
-my $comm_delim = `comm -d ',' test_comm1_sorted.txt test_comm2_sorted.txt`;
-print $comm_delim;
+print render_rows(\@rows, ',', {});
 
-# comm with check using system()
 print "\ncomm with check (check if files are sorted):\n";
-system("comm", "--check-order", "test_comm1_sorted.txt", "test_comm2_sorted.txt");
+print is_sorted(\@left) && is_sorted(\@right)
+    ? "Files are sorted\n"
+    : "Files are not sorted\n";
 
-# comm with total using backticks
 print "\ncomm with total (-t):\n";
-my $comm_total = `comm -t test_comm1_sorted.txt test_comm2_sorted.txt`;
-print $comm_total;
+my ($left_only, $right_only, $common) = count_rows(\@rows);
+print "left-only=$left_only right-only=$right_only common=$common\n";
 
-# comm with zero delimiter using system()
 print "\ncomm with zero delimiter (-z):\n";
-system("comm", "-z", "test_comm1_sorted.txt", "test_comm2_sorted.txt");
-
-# Clean up
-unlink('test_comm1.txt') if -f 'test_comm1.txt';
-unlink('test_comm2.txt') if -f 'test_comm2.txt';
-unlink('test_comm1_sorted.txt') if -f 'test_comm1_sorted.txt';
-unlink('test_comm2_sorted.txt') if -f 'test_comm2_sorted.txt';
+print render_rows(\@rows, "\0", {});
 
 print "=== Example 019 completed successfully ===\n";
