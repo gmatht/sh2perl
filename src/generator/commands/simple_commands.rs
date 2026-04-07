@@ -45,6 +45,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 }
                             } else if cmd_text.starts_with("date") {
                                 // Handle date command
+                                let date_snapshot = generator.date_snapshot_epoch();
                                 if let Some(rest) = cmd_text.strip_prefix("date ") {
                                     let parts: Vec<&str> = rest.split_whitespace().collect();
 
@@ -94,20 +95,16 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         } else {
                                             format!("'{}'", format)
                                         };
-                                        // Use UTC (gmtime) for date-only formats to avoid timezone/day boundary issues
-                                        let is_date_only = cleaned_format.contains("%Y")
-                                            && !cleaned_format.contains("%H")
-                                            && !cleaned_format.contains("%M")
-                                            && !cleaned_format.contains("%S")
-                                            && !cleaned_format.contains("%r");
-                                        let time_func = if is_date_only { "gmtime" } else { "localtime" };
                                         format!(
-                                            "do {{ require POSIX; POSIX::strftime({}, {}) }}",
-                                            cleaned_format, time_func
+                                            "do {{ require POSIX; POSIX::strftime({}, localtime({})) }}",
+                                            cleaned_format, date_snapshot
                                         )
                                     }
                                 } else {
-                                    "do { require POSIX; POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime) }".to_string()
+                                    format!(
+                                        "do {{ require POSIX; POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime({})) }}",
+                                        date_snapshot
+                                    )
                                 }
                             } else {
                                 // For other commands, use open3 to capture output without backticks
@@ -219,10 +216,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 let final_val = if is_command_substitution
                     && (val.contains("my $head_line_count")
                         || val.contains("my $output_")
-                        || val.contains("foreach")
-                        || (val.trim().starts_with("do {") && val.trim().ends_with("}")))
+                        || val.contains("foreach"))
                 {
-                    // Pipeline command substitution or already a complete do block - chomp is handled in pipeline generation or already wrapped
+                    // Pipeline command substitution - chomp is handled in pipeline generation
                     val
                 } else if is_command_substitution && !val.starts_with("do {") {
                     // Simple value, not a block - chomp it directly
@@ -900,8 +896,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 )
                             }
                             Word::CommandSubstitution(_, _) => {
-                                // For command substitution, don't escape newlines - preserve them as-is
-                                generator.word_to_perl(arg)
+                                // Unquoted command substitution is field-split before echo sees it.
+                                let substitution = generator.word_to_perl(arg);
+                                format!(
+                                    "join(\" \", grep {{ length }} split /\\s+/msx, {})",
+                                    substitution
+                                )
                             }
                             Word::Literal(literal, _) => {
                                 if has_e_flag {
@@ -950,16 +950,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         && !args[0].contains("\\n")
                         && !args[0].contains('$')
                     {
-                        // Extract the string content and add newline directly using double quotes for escape sequences
+                        // The string is already a valid Perl literal, so reuse it directly.
                         let content = &args[0][1..args[0].len() - 1]; // Remove quotes
-                                                                      // Escape newlines, tabs, and carriage returns in the content
-                        let escaped_content = content
-                            .replace("\\", "\\\\")
-                            .replace("\"", "\\\"")
-                            .replace("\n", "\\n")
-                            .replace("\t", "\\t")
-                            .replace("\r", "\\r");
-                        output.push_str(&format!("print \"{}\\n\";\n", escaped_content));
+                        output.push_str(&format!("print \"{}\\n\";\n", content));
                     } else if args[0].starts_with('$') && !args[0].contains("\\n") {
                         // For variables, check if they already end with newline to avoid extra blank lines
                         output.push_str(&format!("print {};\n", args[0]));
@@ -1137,7 +1130,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         output.push_str(&generator.indent());
                         output.push_str(&format!("print ${};\n", output_var));
                     }
-
                     _ => {
                         // Route other builtins to the builtins system
                         // Use unique index for standalone commands to prevent variable masking

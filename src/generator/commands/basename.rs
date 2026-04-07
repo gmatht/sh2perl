@@ -1,9 +1,14 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_basename_command(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, output_var: &str) -> String {
+pub fn generate_basename_command(
+    generator: &mut Generator,
+    cmd: &SimpleCommand,
+    input_var: &str,
+    output_var: &str,
+) -> String {
     let mut output = String::new();
-    
+
     // basename command syntax: basename path [suffix]
     if let Some(path) = cmd.args.first() {
         let path_str = generator.word_to_perl(path);
@@ -12,7 +17,7 @@ pub fn generate_basename_command(generator: &mut Generator, cmd: &SimpleCommand,
         } else {
             "".to_string()
         };
-        
+
         output.push_str(&format!("my $path = {};\n", path_str));
         if !suffix.is_empty() {
             output.push_str(&format!("my $suffix = {};\n", suffix));
@@ -33,7 +38,7 @@ pub fn generate_basename_command(generator: &mut Generator, cmd: &SimpleCommand,
         } else {
             "".to_string()
         };
-        
+
         output.push_str(&format!("my $path = ${};\n", input_var));
         if !suffix.is_empty() {
             output.push_str(&format!("my $suffix = {};\n", suffix));
@@ -56,6 +61,6 @@ pub fn generate_basename_command(generator: &mut Generator, cmd: &SimpleCommand,
         }
     }
     output.push_str("\n");
-    
+
     output
 }

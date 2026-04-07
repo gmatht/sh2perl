@@ -68,12 +68,6 @@ fn generate_ls_helper(
             output.push_str(&generator.indent());
             output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
         }
-        // Skip temporary files that might be created during test execution
-        output.push_str(&generator.indent());
-        output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
-        // Skip other common temporary files created during testing
-        output.push_str(&generator.indent());
-        output.push_str("next if $file =~ /^(debug_|temp_|test_|file\\d*[.]txt)$/msx;\n");
         if add_slash_to_dirs {
             output.push_str(&generator.indent());
             output.push_str(&format!("if ( -d \"{}/$file\" ) {{\n", dir));
@@ -272,10 +266,6 @@ fn generate_ls_sections_helper(
         output.push_str(&generator.indent());
         output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
     }
-    output.push_str(&generator.indent());
-    output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
-    output.push_str(&generator.indent());
-    output.push_str("next if $file =~ /^(debug_|temp_|test_|file\\d*[.]txt)$/msx;\n");
     if add_slash_to_dirs {
         output.push_str(&generator.indent());
         output.push_str(&format!("if ( -d \"${}/$file\" ) {{\n", dir_var));
@@ -508,12 +498,6 @@ pub fn generate_ls_command(
                         "next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n",
                     );
                 }
-                // Skip temporary files that might be created during test execution
-                output.push_str(&generator.indent());
-                output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
-                // Skip other common temporary files created during testing
-                output.push_str(&generator.indent());
-                output.push_str("next if $file =~ /^(debug_|temp_|test_|file\\d*[.]txt)$/msx;\n");
                 if add_slash_to_dirs {
                     output.push_str(&generator.indent());
                     output.push_str(&format!("if (-d \"{}/$file\") {{\n", file_arg));
@@ -582,7 +566,7 @@ pub fn generate_ls_command(
         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
 
         if has_file_args {
-            if file_args.len() > 1 {
+            if !file_args.is_empty() {
                 output.push_str(&generate_ls_sections_helper(
                     generator,
                     &file_args,
@@ -627,13 +611,6 @@ pub fn generate_ls_command(
                             "next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n",
                         );
                     }
-                    // Skip temporary files that might be created during test execution
-                    output.push_str(&generator.indent());
-                    output.push_str("next if $file =~ /^__tmp_.*[.]pl$/msx;\n");
-                    // Skip other common temporary files created during testing
-                    output.push_str(&generator.indent());
-                    output
-                        .push_str("next if $file =~ /^(debug_|temp_|test_|file\\d*[.]txt)$/msx;\n");
                     if add_slash_to_dirs {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("if (-d \"{}/$file\") {{\n", file_arg));

@@ -22,12 +22,10 @@ impl CommandCache {
         let cache_file = "command_cache.json";
         if Path::new(cache_file).exists() {
             match fs::read_to_string(cache_file) {
-                Ok(content) => {
-                    match serde_json::from_str(&content) {
-                        Ok(cache) => cache,
-                        Err(_) => Self::default(),
-                    }
-                }
+                Ok(content) => match serde_json::from_str(&content) {
+                    Ok(cache) => cache,
+                    Err(_) => Self::default(),
+                },
                 Err(_) => Self::default(),
             }
         } else {
@@ -42,15 +40,21 @@ impl CommandCache {
         }
     }
 
-    pub fn is_bash_cache_valid(&self, filename: &str) -> bool {
-        self.bash_cache.contains_key(filename)
+    pub fn is_bash_cache_valid(&self, _filename: &str) -> bool {
+        false
     }
 
     pub fn get_cached_bash_output(&self, filename: &str) -> Option<CachedOutput> {
         self.bash_cache.get(filename).cloned()
     }
 
-    pub fn update_bash_cache(&mut self, filename: &str, stdout: String, stderr: String, exit_code: i32) {
+    pub fn update_bash_cache(
+        &mut self,
+        filename: &str,
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    ) {
         self.bash_cache.insert(
             filename.to_string(),
             CachedOutput {
@@ -85,7 +89,14 @@ impl CommandCache {
         self.perl_cache.get(filename).cloned()
     }
 
-    pub fn update_perl_cache(&mut self, filename: &str, stdout: String, stderr: String, exit_code: i32, code: &str) {
+    pub fn update_perl_cache(
+        &mut self,
+        filename: &str,
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+        code: &str,
+    ) {
         let code_hash = format!("{:x}", md5::compute(code));
         self.perl_cache.insert(
             filename.to_string(),
@@ -98,4 +109,3 @@ impl CommandCache {
         );
     }
 }
-

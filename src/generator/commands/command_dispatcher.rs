@@ -213,17 +213,29 @@ pub fn generate_command_impl_with_input(
                         } else {
                             // Use backticks when not in STDOUT context for simple commands
                             let cmd_str = generator.generate_command_string_for_system(cmd);
+                            let cmd_literal =
+                                generator.perl_string_literal(&Word::literal(cmd_str));
                             result.push_str(&generator.indent());
-                            result.push_str("\n");
+                            result.push_str(&format!("my $output_ps_{};\n", global_counter));
+                            result.push_str(&generator.indent());
+                            result.push_str("{\n");
+                            result.push_str(&generator.indent());
                             result.push_str("my ($in, $out, $err);\n");
+                            result.push_str(&generator.indent());
                             result.push_str(&format!(
-                                "my $pid = open3($in, $out, $err, 'bash', '-c', '{}');\n",
-                                cmd_str
+                                "my $pid = open3($in, $out, $err, 'bash', '-c', {});\n",
+                                cmd_literal
                             ));
+                            result.push_str(&generator.indent());
                             result.push_str("close $in or croak 'Close failed: $OS_ERROR';\n");
-                            result.push_str(&format!("my $output_ps_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};\n", global_counter));
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("$output_ps_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};\n", global_counter));
+                            result.push_str(&generator.indent());
                             result.push_str("close $out or croak 'Close failed: $OS_ERROR';\n");
+                            result.push_str(&generator.indent());
                             result.push_str("waitpid $pid, 0;\n");
+                            result.push_str(&generator.indent());
+                            result.push_str("}\n");
                         }
 
                         // Write the output to the temporary file
@@ -574,8 +586,19 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&format!("$ENV{{DIFF_TEMP_FILE2}} = {};\n", file2.1));
 
                             // Generate the actual diff command
+                            let mut modified_diff_cmd = cmd.clone();
+                            modified_diff_cmd
+                                .args
+                                .push(Word::literal(format!("${}", file1.0)));
+                            modified_diff_cmd
+                                .args
+                                .push(Word::literal(format!("${}", file2.0)));
                             let diff_output = super::diff::generate_diff_command(
-                                generator, cmd, "$output", 0, true,
+                                generator,
+                                &modified_diff_cmd,
+                                "$output",
+                                0,
+                                true,
                             );
                             result.push_str(&diff_output);
 
@@ -799,7 +822,7 @@ pub fn generate_command_impl_with_input(
                 result.push_str("      or die \"Close failed: $!\\n\";\n");
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());
-                result.push_str("}\n");
+                result.push_str("};\n");
             }
             //             eprintln!("DEBUG: Final redirect result: {}", result);
             result

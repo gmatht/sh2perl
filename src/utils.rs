@@ -7,7 +7,9 @@ pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
     let parts: Vec<&str> = msg.split_whitespace().collect();
     for window in parts.windows(2) {
         if window[0] == "at" {
-            if let Some((l, c)) = parse_line_col(window[1]) { return Some((l, c)); }
+            if let Some((l, c)) = parse_line_col(window[1]) {
+                return Some((l, c));
+            }
         }
     }
     None
@@ -24,7 +26,9 @@ pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
 /// Generate a caret snippet for error reporting
 pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
     let lines: Vec<&str> = input.lines().collect();
-    if line == 0 || line > lines.len() { return None; }
+    if line == 0 || line > lines.len() {
+        return None;
+    }
     let src_line = lines[line - 1];
     let mut caret = String::new();
     let prefix = format!("{:>4} | ", line);
@@ -40,7 +44,7 @@ pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
 pub fn check_generator_available(generator: &str) -> bool {
     match generator {
         "perl" => Command::new("perl").arg("--version").output().is_ok(),
-        _ => false
+        _ => false,
     }
 }
 
@@ -58,28 +62,35 @@ pub fn cleanup_tmp(lang: &str, tmp_file: &str) {
 
 /// Convert string to show non-printable characters in hex format
 fn escape_non_printable(s: &str) -> String {
-    s.chars().map(|c| {
-        if c.is_ascii() && !c.is_ascii_control() {
-            c.to_string()
-        } else {
-            format!("\\x{:02x}", c as u32)
-        }
-    }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c.to_string()
+            } else {
+                format!("\\x{:02x}", c as u32)
+            }
+        })
+        .collect()
 }
 
 /// Generate unified diff format for comparing two strings with non-printable character highlighting
-pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str, actual_label: &str) -> String {
+pub fn generate_unified_diff(
+    expected: &str,
+    actual: &str,
+    expected_label: &str,
+    actual_label: &str,
+) -> String {
     let expected_lines: Vec<&str> = expected.lines().collect();
     let actual_lines: Vec<&str> = actual.lines().collect();
-    
+
     let mut diff = String::new();
     diff.push_str(&format!("--- {}\n", expected_label));
     diff.push_str(&format!("+++ {}\n", actual_label));
-    
+
     // Find the longest common subsequence to identify unchanged lines
     let mut i = 0;
     let mut j = 0;
-    
+
     while i < expected_lines.len() && j < actual_lines.len() {
         if expected_lines[i] == actual_lines[j] {
             // Lines are identical - show with space prefix
@@ -89,11 +100,13 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
         } else {
             // Lines differ - need to find the next match
             let mut found_match = false;
-            
+
             // Look ahead in expected lines for a match
             for look_ahead in i + 1..expected_lines.len() {
-                if look_ahead < expected_lines.len() && j < actual_lines.len() && 
-                   expected_lines[look_ahead] == actual_lines[j] {
+                if look_ahead < expected_lines.len()
+                    && j < actual_lines.len()
+                    && expected_lines[look_ahead] == actual_lines[j]
+                {
                     // Found a match ahead - the lines from i to look_ahead-1 were deleted
                     for k in i..look_ahead {
                         diff.push_str(&format!("-{}\n", escape_non_printable(expected_lines[k])));
@@ -103,12 +116,14 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
                     break;
                 }
             }
-            
+
             // Look ahead in actual lines for a match
             if !found_match {
                 for look_ahead in j + 1..actual_lines.len() {
-                    if i < expected_lines.len() && look_ahead < actual_lines.len() && 
-                       expected_lines[i] == actual_lines[look_ahead] {
+                    if i < expected_lines.len()
+                        && look_ahead < actual_lines.len()
+                        && expected_lines[i] == actual_lines[look_ahead]
+                    {
                         // Found a match ahead - the lines from j to look_ahead-1 were inserted
                         for k in j..look_ahead {
                             diff.push_str(&format!("+{}\n", escape_non_printable(actual_lines[k])));
@@ -119,7 +134,7 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
                     }
                 }
             }
-            
+
             // If no match found ahead, treat as modification
             if !found_match {
                 diff.push_str(&format!("-{}\n", escape_non_printable(expected_lines[i])));
@@ -129,18 +144,18 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
             }
         }
     }
-    
+
     // Handle remaining lines
     while i < expected_lines.len() {
         diff.push_str(&format!("-{}\n", escape_non_printable(expected_lines[i])));
         i += 1;
     }
-    
+
     while j < actual_lines.len() {
         diff.push_str(&format!("+{}\n", escape_non_printable(actual_lines[j])));
         j += 1;
     }
-    
+
     diff
 }
 
@@ -148,7 +163,7 @@ pub fn generate_unified_diff(expected: &str, actual: &str, expected_label: &str,
 pub fn check_perl_must_contain(shell_content: &str, perl_code: &str) -> Result<(), String> {
     let lines: Vec<&str> = shell_content.lines().collect();
     let mut violations = Vec::new();
-    
+
     for (line_num, line) in lines.iter().enumerate() {
         if line.contains("#PERL_MUST_CONTAIN") {
             // Extract the required pattern after the comment
@@ -163,17 +178,24 @@ pub fn check_perl_must_contain(shell_content: &str, perl_code: &str) -> Result<(
                 if !pattern.is_empty() {
                     // Check if the required pattern exists in the generated Perl code
                     if !perl_code.contains(pattern) {
-                        violations.push(format!("Line {}: Missing required pattern '{}' in generated Perl code", line_num + 1, pattern));
+                        violations.push(format!(
+                            "Line {}: Missing required pattern '{}' in generated Perl code",
+                            line_num + 1,
+                            pattern
+                        ));
                     }
                 }
             }
         }
     }
-    
+
     if violations.is_empty() {
         Ok(())
     } else {
-        Err(format!("PERL_MUST_CONTAIN violations:\n{}", violations.join("\n")))
+        Err(format!(
+            "PERL_MUST_CONTAIN violations:\n{}",
+            violations.join("\n")
+        ))
     }
 }
 
@@ -181,7 +203,7 @@ pub fn check_perl_must_contain(shell_content: &str, perl_code: &str) -> Result<(
 pub fn check_perl_must_not_contain(shell_content: &str, perl_code: &str) -> Result<(), String> {
     let lines: Vec<&str> = shell_content.lines().collect();
     let mut violations = Vec::new();
-    
+
     for (line_num, line) in lines.iter().enumerate() {
         if line.contains("#PERL_MUST_NOT_CONTAIN") {
             // Extract the forbidden pattern after the comment
@@ -196,17 +218,24 @@ pub fn check_perl_must_not_contain(shell_content: &str, perl_code: &str) -> Resu
                 if !pattern.is_empty() {
                     // Check if the forbidden pattern exists in the generated Perl code
                     if perl_code.contains(pattern) {
-                        violations.push(format!("Line {}: Found forbidden pattern '{}' in generated Perl code", line_num + 1, pattern));
+                        violations.push(format!(
+                            "Line {}: Found forbidden pattern '{}' in generated Perl code",
+                            line_num + 1,
+                            pattern
+                        ));
                     }
                 }
             }
         }
     }
-    
+
     if violations.is_empty() {
         Ok(())
     } else {
-        Err(format!("PERL_MUST_NOT_CONTAIN violations:\n{}", violations.join("\n")))
+        Err(format!(
+            "PERL_MUST_NOT_CONTAIN violations:\n{}",
+            violations.join("\n")
+        ))
     }
 }
 
@@ -214,7 +243,7 @@ pub fn check_perl_must_not_contain(shell_content: &str, perl_code: &str) -> Resu
 pub fn check_ast_must_not_contain(shell_content: &str, ast_string: &str) -> Result<(), String> {
     let lines: Vec<&str> = shell_content.lines().collect();
     let mut violations = Vec::new();
-    
+
     for (line_num, line) in lines.iter().enumerate() {
         if line.contains("#AST_MUST_NOT_CONTAIN:") {
             // Extract the forbidden patterns after the comment
@@ -224,22 +253,34 @@ pub fn check_ast_must_not_contain(shell_content: &str, ast_string: &str) -> Resu
                     // Parse the pattern list like [Literal("-"), Literal("1")]
                     if let Some(patterns) = parse_ast_pattern_list(pattern_text) {
                         // Check if ALL forbidden patterns exist in the AST string
-                        let all_patterns_found = patterns.iter().all(|pattern| ast_string.contains(pattern));
+                        let all_patterns_found =
+                            patterns.iter().all(|pattern| ast_string.contains(pattern));
                         if all_patterns_found {
-                            violations.push(format!("Line {}: Found all forbidden AST patterns {:?} in AST string", line_num + 1, patterns));
+                            violations.push(format!(
+                                "Line {}: Found all forbidden AST patterns {:?} in AST string",
+                                line_num + 1,
+                                patterns
+                            ));
                         }
                     } else {
-                        violations.push(format!("Line {}: Invalid AST_MUST_NOT_CONTAIN pattern format: {}", line_num + 1, pattern_text));
+                        violations.push(format!(
+                            "Line {}: Invalid AST_MUST_NOT_CONTAIN pattern format: {}",
+                            line_num + 1,
+                            pattern_text
+                        ));
                     }
                 }
             }
         }
     }
-    
+
     if violations.is_empty() {
         Ok(())
     } else {
-        Err(format!("AST_MUST_NOT_CONTAIN violations:\n{}", violations.join("\n")))
+        Err(format!(
+            "AST_MUST_NOT_CONTAIN violations:\n{}",
+            violations.join("\n")
+        ))
     }
 }
 
@@ -247,7 +288,7 @@ pub fn check_ast_must_not_contain(shell_content: &str, ast_string: &str) -> Resu
 pub fn check_ast_must_contain(shell_content: &str, ast_string: &str) -> Result<(), String> {
     let lines: Vec<&str> = shell_content.lines().collect();
     let mut violations = Vec::new();
-    
+
     for (line_num, line) in lines.iter().enumerate() {
         if line.contains("#AST_MUST_CONTAIN:") {
             // Extract the required patterns after the comment
@@ -264,9 +305,10 @@ pub fn check_ast_must_contain(shell_content: &str, ast_string: &str) -> Result<(
                                 // Extract the content inside Literal() and check for flexible matching
                                 if let Some(start) = pattern.find('(') {
                                     if let Some(end) = pattern.rfind(')') {
-                                        let literal_content = &pattern[start+1..end];
+                                        let literal_content = &pattern[start + 1..end];
                                         // Look for Literal(content, with any additional fields
-                                        let flexible_pattern = format!("Literal({},", literal_content);
+                                        let flexible_pattern =
+                                            format!("Literal({},", literal_content);
                                         return ast_string.contains(&flexible_pattern);
                                     }
                                 }
@@ -275,14 +317,16 @@ pub fn check_ast_must_contain(shell_content: &str, ast_string: &str) -> Result<(
                             ast_string.contains(pattern)
                         });
                         if !all_patterns_found {
-                            let missing_patterns: Vec<_> = patterns.iter()
+                            let missing_patterns: Vec<_> = patterns
+                                .iter()
                                 .filter(|pattern| {
                                     // Apply the same flexible matching logic for filtering
                                     if pattern.starts_with("Literal(") {
                                         if let Some(start) = pattern.find('(') {
                                             if let Some(end) = pattern.rfind(')') {
-                                                let literal_content = &pattern[start+1..end];
-                                                let flexible_pattern = format!("Literal({},", literal_content);
+                                                let literal_content = &pattern[start + 1..end];
+                                                let flexible_pattern =
+                                                    format!("Literal({},", literal_content);
                                                 return !ast_string.contains(&flexible_pattern);
                                             }
                                         }
@@ -290,59 +334,77 @@ pub fn check_ast_must_contain(shell_content: &str, ast_string: &str) -> Result<(
                                     !ast_string.contains(pattern.as_str())
                                 })
                                 .collect();
-                            violations.push(format!("Line {}: Missing required AST patterns {:?} in AST string", line_num + 1, missing_patterns));
+                            violations.push(format!(
+                                "Line {}: Missing required AST patterns {:?} in AST string",
+                                line_num + 1,
+                                missing_patterns
+                            ));
                         }
                     } else {
-                        violations.push(format!("Line {}: Invalid AST_MUST_CONTAIN pattern format: {}", line_num + 1, pattern_text));
+                        violations.push(format!(
+                            "Line {}: Invalid AST_MUST_CONTAIN pattern format: {}",
+                            line_num + 1,
+                            pattern_text
+                        ));
                     }
                 }
             }
         }
     }
-    
+
     if violations.is_empty() {
         Ok(())
     } else {
-        Err(format!("AST_MUST_CONTAIN violations:\n{}", violations.join("\n")))
+        Err(format!(
+            "AST_MUST_CONTAIN violations:\n{}",
+            violations.join("\n")
+        ))
     }
 }
 
 /// Check if the generated Perl code uses open3 with builtin commands (which should use native Perl instead)
 pub fn check_perl_no_open3_builtins(perl_code: &str) -> Result<(), String> {
     use regex::Regex;
-    
-    eprintln!("DEBUG: check_perl_no_open3_builtins called with {} characters", perl_code.len());
-    
+
+    eprintln!(
+        "DEBUG: check_perl_no_open3_builtins called with {} characters",
+        perl_code.len()
+    );
+
     // List of builtin commands that should use native Perl implementations
     let builtin_commands = [
-        "find", "ls", "grep", "sed", "awk", "sort", "uniq", "wc", "head", "tail",
-        "cat", "echo", "printf", "touch", "mkdir", "rmdir", "rm", "cp", "mv",
-        "chmod", "chown", "ln", "readlink", "realpath", "basename", "dirname",
-        "date", "sleep", "kill", "ps", "jobs", "fg", "bg", "wait", "nohup",
-        "cd", "pwd", "pushd", "popd", "dirs", "hash", "type", "which", "whereis",
-        "man", "info", "help", "history", "alias", "unalias", "set", "unset",
-        "export", "readonly", "declare", "local", "read", "printf", "echo",
-        "test", "[", "[[", "let", "expr", "bc", "dc", "seq", "factor", "yes",
-        "true", "false", "strings", ":", "exit", "return", "break",
-        "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl"
+        "find", "ls", "grep", "sed", "awk", "sort", "uniq", "head", "tail", "cat", "echo",
+        "printf", "touch", "mkdir", "rmdir", "rm", "cp", "mv", "chmod", "chown", "ln", "readlink",
+        "realpath", "basename", "dirname", "date", "sleep", "kill", "ps", "jobs", "fg", "bg",
+        "wait", "nohup", "cd", "pwd", "pushd", "popd", "dirs", "hash", "type", "which", "whereis",
+        "man", "info", "help", "history", "alias", "unalias", "set", "unset", "export", "readonly",
+        "declare", "local", "read", "printf", "echo", "test", "[", "[[", "let", "expr", "bc", "dc",
+        "seq", "factor", "yes", "true", "false", "strings", ":", "exit", "return", "break",
+        "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl",
     ];
-    
+
     let mut violations = Vec::new();
-    
+
     // Create regex to match open3 calls with builtin commands
     for builtin in &builtin_commands {
         // Match patterns like: open3($in, $out, $err, 'BUILTIN', ...)
         // Escape special regex characters in the builtin command name
         let escaped_builtin = regex::escape(builtin);
-        let pattern = format!("open3\\s*\\(\\s*[^,]+,\\s*[^,]+,\\s*[^,]+,\\s*['\"]{}['\"]", escaped_builtin);
+        let pattern = format!(
+            "open3\\s*\\(\\s*[^,]+,\\s*[^,]+,\\s*[^,]+,\\s*['\"]{}['\"]",
+            escaped_builtin
+        );
         let regex = match Regex::new(&pattern) {
             Ok(re) => re,
             Err(e) => {
-                eprintln!("Warning: Failed to create regex for builtin '{}': {}", builtin, e);
+                eprintln!(
+                    "Warning: Failed to create regex for builtin '{}': {}",
+                    builtin, e
+                );
                 continue;
             }
         };
-        
+
         // Find all matches
         for mat in regex.find_iter(perl_code) {
             let line_num = perl_code[..mat.start()].matches('\n').count() + 1;
@@ -352,11 +414,14 @@ pub fn check_perl_no_open3_builtins(perl_code: &str) -> Result<(), String> {
             ));
         }
     }
-    
+
     if violations.is_empty() {
         Ok(())
     } else {
-        Err(format!("OPEN3_BUILTIN violations:\n{}", violations.join("\n")))
+        Err(format!(
+            "OPEN3_BUILTIN violations:\n{}",
+            violations.join("\n")
+        ))
     }
 }
 
@@ -364,25 +429,26 @@ pub fn check_perl_no_open3_builtins(perl_code: &str) -> Result<(), String> {
 /// Returns an error if any system 'builtin' or system "builtin" calls are found
 pub fn check_perl_no_system_builtins(perl_code: &str) -> Result<(), String> {
     use regex::Regex;
-    
-    eprintln!("DEBUG: check_perl_no_system_builtins called with {} characters", perl_code.len());
-    
+
+    eprintln!(
+        "DEBUG: check_perl_no_system_builtins called with {} characters",
+        perl_code.len()
+    );
+
     // List of builtin commands that should not use system() calls
     let builtin_commands = [
-        "find", "ls", "grep", "sed", "awk", "sort", "uniq", "wc", "head", "tail",
-        "cat", "echo", "printf", "touch", "mkdir", "rmdir", "rm", "cp", "mv",
-        "chmod", "chown", "ln", "readlink", "realpath", "basename", "dirname",
-        "date", "sleep", "kill", "ps", "jobs", "fg", "bg", "wait", "nohup",
-        "cd", "pwd", "pushd", "popd", "dirs", "hash", "type", "which", "whereis",
-        "man", "info", "help", "history", "alias", "unalias", "set", "unset",
-        "export", "readonly", "declare", "local", "read", "printf", "echo",
-        "test", "[", "[[", "let", "expr", "bc", "dc", "seq", "factor", "yes",
-        "true", "false", "strings", ":", "exit", "return", "break",
-        "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl"
+        "find", "ls", "grep", "sed", "awk", "sort", "uniq", "head", "tail", "cat", "echo",
+        "printf", "touch", "mkdir", "rmdir", "rm", "cp", "mv", "chmod", "chown", "ln", "readlink",
+        "realpath", "basename", "dirname", "date", "sleep", "kill", "ps", "jobs", "fg", "bg",
+        "wait", "nohup", "cd", "pwd", "pushd", "popd", "dirs", "hash", "type", "which", "whereis",
+        "man", "info", "help", "history", "alias", "unalias", "set", "unset", "export", "readonly",
+        "declare", "local", "read", "printf", "echo", "test", "[", "[[", "let", "expr", "bc", "dc",
+        "seq", "factor", "yes", "true", "false", "strings", ":", "exit", "return", "break",
+        "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl",
     ];
-    
+
     let mut violations = Vec::new();
-    
+
     // Create regex to match system calls with builtin commands
     for builtin in &builtin_commands {
         // Match patterns like: system 'BUILTIN' or system "BUILTIN"
@@ -390,11 +456,14 @@ pub fn check_perl_no_system_builtins(perl_code: &str) -> Result<(), String> {
         let regex = match Regex::new(&pattern) {
             Ok(re) => re,
             Err(e) => {
-                eprintln!("Warning: Failed to create regex for builtin '{}': {}", builtin, e);
+                eprintln!(
+                    "Warning: Failed to create regex for builtin '{}': {}",
+                    builtin, e
+                );
                 continue;
             }
         };
-        
+
         // Find all matches
         for mat in regex.find_iter(perl_code) {
             let line_num = perl_code[..mat.start()].matches('\n').count() + 1;
@@ -404,11 +473,14 @@ pub fn check_perl_no_system_builtins(perl_code: &str) -> Result<(), String> {
             ));
         }
     }
-    
+
     if violations.is_empty() {
         Ok(())
     } else {
-        Err(format!("SYSTEM_BUILTIN violations:\n{}", violations.join("\n")))
+        Err(format!(
+            "SYSTEM_BUILTIN violations:\n{}",
+            violations.join("\n")
+        ))
     }
 }
 
@@ -419,14 +491,14 @@ pub fn parse_ast_pattern_list(pattern_text: &str) -> Option<Vec<String>> {
     if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
         return None;
     }
-    
-    let content = &trimmed[1..trimmed.len()-1];
+
+    let content = &trimmed[1..trimmed.len() - 1];
     let patterns: Vec<String> = content
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    
+
     if patterns.is_empty() {
         None
     } else {

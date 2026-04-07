@@ -6,16 +6,28 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
             // If the literal is already properly quoted (starts and ends with same quote), use it as-is
-            if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
+            if (s.starts_with('\'') && s.ends_with('\''))
+                || (s.starts_with('"') && s.ends_with('"'))
+            {
                 s.clone()
             }
             // Always quote literals that contain spaces, quotes, or special characters to ensure proper shell parsing
-            else if s.contains(' ') || s.contains('"') || s.contains('\'') || s.contains(';') || s.contains('|') || s.contains('&') || s.contains('<') || s.contains('>') || s.contains('\\') || s.contains('$') {
+            else if s.contains(' ')
+                || s.contains('"')
+                || s.contains('\'')
+                || s.contains(';')
+                || s.contains('|')
+                || s.contains('&')
+                || s.contains('<')
+                || s.contains('>')
+                || s.contains('\\')
+                || s.contains('$')
+            {
                 format!("'{}'", s.replace("'", "'\"'\"'"))
             } else {
                 s.clone()
             }
-        },
+        }
         Word::StringInterpolation(interp, _) => {
             // For string interpolation, we need to convert to a bash-compatible format
             // This is a simplified version - for complex cases we might need more work
@@ -32,12 +44,12 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
             } else {
                 result
             }
-        },
+        }
         Word::CommandSubstitution(cmd, _) => {
             // For command substitutions in system commands, we need to generate the actual bash command
             // This is a complex case - for now, generate a placeholder that won't break bash
             format!("\"$(echo 'command substitution not supported in system command context')\"")
-        },
+        }
         _ => {
             // For other word types, convert to string and quote if needed
             let s = word.to_string();
@@ -53,7 +65,9 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
 pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &Command) -> String {
     match cmd {
         Command::Simple(simple_cmd) => {
-            let args: Vec<String> = simple_cmd.args.iter()
+            let args: Vec<String> = simple_cmd
+                .args
+                .iter()
                 .map(|arg| word_to_bash_string_for_system(arg))
                 .collect();
             if args.is_empty() {
@@ -63,10 +77,14 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
             }
         }
         Command::Pipeline(pipeline) => {
-            let commands: Vec<String> = pipeline.commands.iter()
+            let commands: Vec<String> = pipeline
+                .commands
+                .iter()
                 .filter_map(|cmd| {
                     if let Command::Simple(simple_cmd) = cmd {
-                        let args: Vec<String> = simple_cmd.args.iter()
+                        let args: Vec<String> = simple_cmd
+                            .args
+                            .iter()
                             .map(|arg| word_to_bash_string_for_system(arg))
                             .collect();
                         if args.is_empty() {
@@ -84,7 +102,9 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
         Command::Subshell(subshell_cmd) => {
             match &**subshell_cmd {
                 Command::Simple(simple_cmd) => {
-                    let args: Vec<String> = simple_cmd.args.iter()
+                    let args: Vec<String> = simple_cmd
+                        .args
+                        .iter()
                         .map(|arg| generator.word_to_perl(arg))
                         .collect();
                     if args.is_empty() {
@@ -94,10 +114,14 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                     }
                 }
                 Command::Pipeline(pipeline) => {
-                    let commands: Vec<String> = pipeline.commands.iter()
+                    let commands: Vec<String> = pipeline
+                        .commands
+                        .iter()
                         .filter_map(|cmd| {
                             if let Command::Simple(simple_cmd) = cmd {
-                                let args: Vec<String> = simple_cmd.args.iter()
+                                let args: Vec<String> = simple_cmd
+                                    .args
+                                    .iter()
                                     .map(|arg| generator.word_to_perl(arg))
                                     .collect();
                                 Some(format!("{} {}", simple_cmd.name, args.join(" ")))
@@ -131,7 +155,10 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
         _ => {
             // For complex commands that can't be converted to simple shell commands,
             // we should not be called. This indicates a design issue.
-            eprintln!("WARNING: generate_command_string_for_system called with complex command: {:?}", cmd);
+            eprintln!(
+                "WARNING: generate_command_string_for_system called with complex command: {:?}",
+                cmd
+            );
             "echo \"Complex command cannot be converted to shell command\"".to_string()
         }
     }
