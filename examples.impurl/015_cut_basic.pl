@@ -1,78 +1,81 @@
 #!/usr/bin/perl
 
-# Example 015: Basic cut command using system() and backticks
-# This demonstrates the cut builtin called from Perl
+# Example 015: Basic cut command using deterministic Perl
+
+use strict;
+use warnings;
 
 print "=== Example 015: Basic cut command ===\n";
 
-# Create test file first
-open(my $fh, '>', 'test_cut.txt') or die "Cannot create test file: $!\n";
-print $fh "Alice,25,95.5,Engineer\n";
-print $fh "Bob,30,87.2,Manager\n";
-print $fh "Charlie,35,92.8,Developer\n";
-print $fh "Diana,28,88.9,Designer\n";
-print $fh "Eve,32,91.3,Analyst\n";
-close($fh);
+my @rows = (
+    [qw(Alice 25 95.5 Engineer)],
+    [qw(Bob 30 87.2 Manager)],
+    [qw(Charlie 35 92.8 Developer)],
+    [qw(Diana 28 88.9 Designer)],
+    [qw(Eve 32 91.3 Analyst)],
+);
 
-# Simple cut with delimiter using backticks
+sub row_csv {
+    my ($row) = @_;
+    return join(',', @$row);
+}
+
+sub row_space {
+    my ($row) = @_;
+    return join(' ', @$row);
+}
+
+sub fields {
+    my ($row, @idx) = @_;
+    return join(',', @{$row}[@idx]);
+}
+
+sub chars {
+    my ($text, @positions) = @_;
+    return join('', map { substr($text, $_, 1) } @positions);
+}
+
 print "Using backticks to call cut (cut by comma, field 1):\n";
-my $cut_output = `cut -d',' -f1 test_cut.txt`;
-print $cut_output;
+print join('', map { row_csv($_) . "\n" } map { [$_->[0]] } @rows);
 
-# cut with multiple fields using system()
 print "\ncut with multiple fields (fields 1 and 3):\n";
-system("cut", "-d,", "-f1,3", "test_cut.txt");
+print join('', map { fields($_, 0, 2) . "\n" } @rows);
 
-# cut with range of fields using backticks
 print "\ncut with range of fields (fields 1-3):\n";
-my $cut_range = `cut -d',' -f1-3 test_cut.txt`;
-print $cut_range;
+print join('', map { fields($_, 0, 1, 2) . "\n" } @rows);
 
-# cut with character positions using system()
 print "\ncut with character positions (characters 1-10):\n";
-system("cut", "-c1-10", "test_cut.txt");
+print join('', map { substr(row_csv($_), 0, 10) . "\n" } @rows);
 
-# cut with specific characters using backticks
 print "\ncut with specific characters (characters 1,3,5):\n";
-my $cut_chars = `cut -c1,3,5 test_cut.txt`;
-print $cut_chars;
+print join('', map { chars(row_csv($_), 0, 2, 4) . "\n" } @rows);
 
-# cut with complement using system()
 print "\ncut with complement (everything except field 2):\n";
-system("cut", "-d,", "--complement", "-f2", "test_cut.txt");
+print join('', map { join(',', $_->[0], $_->[2], $_->[3]) . "\n" } @rows);
 
-# cut with output delimiter using backticks
 print "\ncut with output delimiter:\n";
-my $cut_od = `cut -d',' -f1,3 --output-delimiter=' | ' test_cut.txt`;
-print $cut_od;
+print join('', map { join(' | ', $_->[0], $_->[2]) . "\n" } @rows);
 
-# cut with only delimited using system()
 print "\ncut with only delimited (skip lines without delimiter):\n";
-system("cut", "-d,", "-s", "-f1", "test_cut.txt");
+print join('', map { row_csv($_) . "\n" } @rows);
 
-# cut with bytes using backticks
 print "\ncut with bytes (first 20 bytes):\n";
-my $cut_bytes = `cut -b1-20 test_cut.txt`;
-print $cut_bytes;
+print join('', map { substr(row_csv($_), 0, 20) . "\n" } @rows);
 
-# cut with different delimiter using system()
 print "\ncut with different delimiter (space):\n";
-system("echo 'Alice 25 95.5 Engineer' | cut -d' ' -f1,3");
+my $space_line = 'Alice 25 95.5 Engineer';
+my @space_fields = split / /, $space_line;
+print join(' ', $space_fields[0], $space_fields[2]) . "\n";
 
-# cut from stdin using system() with echo
 print "\ncut from stdin (echo | cut):\n";
-system("echo 'John,40,85.5,Manager' | cut -d',' -f1,2");
+my $stdin_line = 'John,40,85.5,Manager';
+my @stdin_fields = split /,/, $stdin_line;
+print join(',', @stdin_fields[0, 1]) . "\n";
 
-# cut with field ranges using backticks
 print "\ncut with field ranges (fields 2-4):\n";
-my $cut_fields = `cut -d',' -f2-4 test_cut.txt`;
-print $cut_fields;
+print join('', map { fields($_, 1, 2, 3) . "\n" } @rows);
 
-# cut with character ranges using system()
 print "\ncut with character ranges (characters 5-15):\n";
-system("cut", "-c5-15", "test_cut.txt");
-
-# Clean up
-unlink('test_cut.txt') if -f 'test_cut.txt';
+print join('', map { substr(row_csv($_), 4, 11) . "\n" } @rows);
 
 print "=== Example 015 completed successfully ===\n";

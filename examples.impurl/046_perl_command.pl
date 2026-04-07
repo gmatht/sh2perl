@@ -46,7 +46,7 @@ print $perl_array;
 
 # perl with hash operations using system()
 print "\nperl with hash operations:\n";
-system("perl", "-e", "%hash = (a=>1, b=>2, c=>3); print \"Hash: %hash\\n\"", "test_perl_data.txt");
+system("perl", "-e", "my %hash = (a=>1, b=>2, c=>3); print join(', ', map { \"$_=$hash{$_}\" } sort keys %hash), \"\\n\";");
 
 # perl with file operations using backticks
 print "\nperl with file operations:\n";

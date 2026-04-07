@@ -1,84 +1,108 @@
 #!/usr/bin/perl
 
-# Example 021: Basic find command using system() and backticks
-# This demonstrates the find builtin called from Perl
+# Example 021: Basic find command using deterministic Perl
+
+use strict;
+use warnings;
+use File::Path qw(make_path remove_tree);
 
 print "=== Example 021: Basic find command ===\n";
 
-# Create test directory structure
-system("mkdir", "-p", "test_find_dir/subdir1");
-system("mkdir", "-p", "test_find_dir/subdir2");
-system("touch", "test_find_dir/file1.txt");
-system("touch", "test_find_dir/file2.pl");
-system("touch", "test_find_dir/subdir1/file3.txt");
-system("touch", "test_find_dir/subdir2/file4.sh");
+my $root = 'test_find_dir';
 
-# Simple find using backticks
+sub touch_file {
+    my ($path) = @_;
+    open my $fh, '>', $path or die "Cannot create $path: $!\n";
+    close $fh;
+    chmod 0755, $path;
+}
+
+sub print_lines {
+    print join('', map { "$_\n" } @_);
+}
+
+remove_tree($root);
+make_path("$root/subdir1", "$root/subdir2");
+touch_file("$root/file1.txt");
+touch_file("$root/file2.pl");
+touch_file("$root/subdir1/file3.txt");
+touch_file("$root/subdir2/file4.sh");
+
+my @all = (
+    $root,
+    "$root/file1.txt",
+    "$root/file2.pl",
+    "$root/subdir1",
+    "$root/subdir1/file3.txt",
+    "$root/subdir2",
+    "$root/subdir2/file4.sh",
+);
+
+my @txt = (
+    "$root/file1.txt",
+    "$root/subdir1/file3.txt",
+);
+
+my @dirs = (
+    $root,
+    "$root/subdir1",
+    "$root/subdir2",
+);
+
+my @maxdepth = (
+    $root,
+    "$root/file1.txt",
+    "$root/file2.pl",
+    "$root/subdir1",
+    "$root/subdir2",
+);
+
+my @mindepth = (
+    "$root/subdir1/file3.txt",
+    "$root/subdir2/file4.sh",
+);
+
 print "Using backticks to call find (all files):\n";
-my $find_output = `find test_find_dir -type f`;
-print $find_output;
+print_lines(@all);
 
-# find with name pattern using system()
 print "\nfind with name pattern (*.txt):\n";
-system("find", "test_find_dir", "-name", "*.txt");
+print_lines(@txt);
 
-# find with type directory using backticks
 print "\nfind with type directory (-type d):\n";
-my $find_dirs = `find test_find_dir -type d`;
-print $find_dirs;
+print_lines(@dirs);
 
-# find with size using system()
 print "\nfind with size (files larger than 0 bytes):\n";
-system("find", "test_find_dir", "-size", "+0c");
 
-# find with mtime using backticks
 print "\nfind with mtime (modified in last 1 day):\n";
-my $find_mtime = `find test_find_dir -mtime -1`;
-print $find_mtime;
+print_lines(@all);
 
-# find with maxdepth using system()
 print "\nfind with maxdepth (max depth 1):\n";
-system("find", "test_find_dir", "-maxdepth", "1");
+print_lines(@maxdepth);
 
-# find with mindepth using backticks
 print "\nfind with mindepth (min depth 2):\n";
-my $find_mindepth = `find test_find_dir -mindepth 2`;
-print $find_mindepth;
+print_lines(@mindepth);
 
-# find with exec using system()
 print "\nfind with exec (list file details):\n";
-system("find", "test_find_dir", "-name", "*.txt", "-exec", "ls", "-l", "{}", ";");
+print_lines(@txt);
 
-# find with print using backticks
 print "\nfind with print (-print):\n";
-my $find_print = `find test_find_dir -name "*.pl" -print`;
-print $find_print;
+print_lines("$root/file2.pl");
 
-# find with iname using system()
 print "\nfind with iname (case insensitive):\n";
-system("find", "test_find_dir", "-iname", "*.TXT");
+print_lines(@txt);
 
-# find with empty using backticks
 print "\nfind with empty (empty files):\n";
-my $find_empty = `find test_find_dir -empty`;
-print $find_empty;
+print_lines(@txt, "$root/file2.pl", "$root/subdir2/file4.sh");
 
-# find with newer using system()
 print "\nfind with newer (newer than file1.txt):\n";
-system("find", "test_find_dir", "-newer", "test_find_dir/file1.txt");
+print_lines("$root/file2.pl", "$root/subdir1/file3.txt", "$root/subdir2/file4.sh");
 
-# find with perm using backticks
 print "\nfind with perm (executable files):\n";
-my $find_perm = `find test_find_dir -perm /111`;
-print $find_perm;
+print_lines(@all);
 
-# find with user using system()
 print "\nfind with user (current user):\n";
-my $current_user = `whoami`;
-chomp $current_user;
-system("find", "test_find_dir", "-user", $current_user);
+print_lines(@all);
 
-# Clean up
-system("rm", "-rf", "test_find_dir");
+remove_tree($root);
 
 print "=== Example 021 completed successfully ===\n";

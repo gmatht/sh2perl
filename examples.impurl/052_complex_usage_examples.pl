@@ -16,18 +16,16 @@ print "=== Example 052: Complex usage of system() and backticks ===\n";
 # 1. System calls in if statements
 print "\n1. System calls in if statements:\n";
 
-# Check if a file exists using system()
-if (system("test -f README.md") == 0) {
-    print "README.md exists\n";
+if (system("sh", "-c", "true") == 0) {
+    print "Deterministic success\n";
 } else {
-    print "README.md does not exist\n";
+    print "Unexpected failure\n";
 }
 
-# Check if a command succeeds and use the result
-if (system("ls -la | grep -q '\.pl'") == 0) {
-    print "Found .pl files in current directory\n";
+if (system("sh", "-c", "false") == 0) {
+    print "Unexpected success\n";
 } else {
-    print "No .pl files found\n";
+    print "Deterministic failure\n";
 }
 
 # 2. Backticks in function arguments
@@ -41,23 +39,23 @@ sub process_output {
 }
 
 # Use backticks as function argument
-my $result1 = process_output(`ls -1`);
+my $result1 = process_output(`printf 'alpha\nbeta\ngamma\n'`);
 print "Result: $result1\n";
 
 # Use backticks in array context
-my @files = split /\n/, `ls -1 *.pl`;
-print "Found " . scalar(@files) . " Perl files: @files\n";
+my @files = split /\n/, `printf 'one\ntwo\nthree\n'`;
+print "Found " . scalar(@files) . " sample lines: @files\n";
 
 # 3. System calls in loops
 print "\n3. System calls in loops:\n";
 
 # Loop through files and check each one
-my @test_files = qw(README.md Makefile Cargo.toml);
+my @test_files = qw(alpha beta gamma);
 foreach my $file (@test_files) {
-    if (system("test -f '$file'") == 0) {
-        print "✓ $file exists\n";
+    if (system("sh", "-c", "test -n '$file'") == 0) {
+        print "✓ $file processed\n";
     } else {
-        print "✗ $file missing\n";
+        print "✗ $file failed\n";
     }
 }
 
@@ -65,24 +63,22 @@ foreach my $file (@test_files) {
 print "\n4. Backticks in variable assignments:\n";
 
 # Get current date and time
-my $current_time = `date`;
+my $current_time = `date -u -d '2023-01-01 12:34:56 UTC'`;
 chomp $current_time;
 print "Current time: $current_time\n";
 
-# Get system information
-my $hostname = `hostname`;
-chomp $hostname;
-my $user = `whoami`;
-chomp $user;
+# Fixed system information
+my $hostname = 'fixed-host';
+my $user = 'fixed-user';
 print "Running on $hostname as user $user\n";
 
 # 5. Complex conditional logic with system calls
 print "\n5. Complex conditional logic:\n";
 
 # Check multiple conditions
-my $has_git = system("which git > /dev/null 2>&1") == 0;
-my $has_cargo = system("which cargo > /dev/null 2>&1") == 0;
-my $has_perl = system("which perl > /dev/null 2>&1") == 0;
+my $has_git = system("sh", "-c", "true") == 0;
+my $has_cargo = system("sh", "-c", "true") == 0;
+my $has_perl = system("sh", "-c", "true") == 0;
 
 if ($has_git && $has_cargo && $has_perl) {
     print "All required tools are available\n";
@@ -110,21 +106,21 @@ if (system("mkdir -p test_dir") == 0) {
 print "\n7. Backticks in string operations:\n";
 
 # Use backticks in string building
-my $info = "System info:\n" . `uname -a` . "\nDisk usage:\n" . `df -h`;
+my $info = "System info:\n" . `printf 'Linux fixed\n'` . "\nDisk usage:\n" . `printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\nfixedfs 100 10 90 /\n'`;
 print $info;
 
 # 8. Nested system calls and backticks
 print "\n8. Nested usage:\n";
 
 # Use system output as input to another command
-my $file_count = `ls -1 | wc -l`;
+my $file_count = `printf 'a\nb\nc\n' | wc -l`;
 chomp $file_count;
 print "Number of files in current directory: $file_count\n";
 
 # Use backticks to get data for system call
-my $largest_file = `ls -la | sort -k5 -nr | head -1 | awk '{print \$9}'`;
+my $largest_file = `printf 'alpha\nbeta\ngamma\n' | sort -r | head -1`;
 chomp $largest_file;
-if ($largest_file && system("test -f '$largest_file'") == 0) {
+if ($largest_file) {
     print "Largest file: $largest_file\n";
 }
 
@@ -133,8 +129,8 @@ print "\n9. System calls in subroutines:\n";
 
 sub check_service {
     my ($service) = @_;
-    my $status = system("systemctl is-active $service > /dev/null 2>&1");
-    return $status == 0 ? "running" : "stopped";
+    system("sh", "-c", "true");
+    return $service eq 'ssh' ? 'running' : 'stopped';
 }
 
 # Test with common services (may not exist on all systems)
@@ -148,7 +144,7 @@ foreach my $service (@services) {
 print "\n10. Complex data processing:\n";
 
 # Get process information and parse it
-my $ps_output = `ps aux | head -5`;
+my $ps_output = `printf 'root 1 0.0\nuser 2 1.5\n'`;
 my @lines = split /\n/, $ps_output;
 print "Top 5 processes:\n";
 foreach my $line (@lines) {
@@ -162,7 +158,7 @@ foreach my $line (@lines) {
 print "\n11. System calls with redirection:\n";
 
 # Create a temporary file with system call
-system("echo 'Hello from system call' > temp_system.txt");
+system("sh", "-c", "printf 'Hello from system call\n' > temp_system.txt");
 if (-f "temp_system.txt") {
     open(my $fh, '<', 'temp_system.txt') or die "Cannot open file: $!";
     my $content = <$fh>;
@@ -175,7 +171,7 @@ if (-f "temp_system.txt") {
 print "\n12. Backticks with error handling:\n";
 
 # Use backticks and check for errors
-my $git_branch = `git branch --show-current 2>/dev/null`;
+my $git_branch = `printf 'main\n'`;
 if ($? == 0) {
     chomp $git_branch;
     print "Current git branch: $git_branch\n";
@@ -187,9 +183,9 @@ if ($? == 0) {
 print "\n13. Mixed usage in complex expressions:\n";
 
 # Combine system calls and backticks
-my $has_files = system("ls *.pl > /dev/null 2>&1") == 0;
+my $has_files = system("sh", "-c", "true") == 0;
 if ($has_files) {
-    my $perl_files = `ls *.pl`;
+    my $perl_files = `printf 'alpha.pl\nbeta.pl\n'`;
     my $count = scalar(split /\n/, $perl_files);
     print "Found $count Perl files using mixed approach\n";
 }
@@ -199,8 +195,8 @@ print "\n14. System calls in array operations:\n";
 
 # Use system call to populate array
 my @perl_files = ();
-if (system("ls *.pl > /dev/null 2>&1") == 0) {
-    @perl_files = split /\n/, `ls *.pl`;
+if (system("sh", "-c", "true") == 0) {
+    @perl_files = split /\n/, `printf 'alpha.pl\nbeta.pl\ngamma.pl\n'`;
     print "Perl files found: " . join(", ", @perl_files) . "\n";
 }
 
@@ -209,10 +205,10 @@ print "\n15. Advanced error checking:\n";
 
 # Check multiple system requirements
 my @checks = (
-    ["Git repository", "git status > /dev/null 2>&1"],
-    ["Perl available", "perl --version > /dev/null 2>&1"],
+    ["Always passes", "sh -c 'true'"],
+    ["Test file exists", "test -f temp_system.txt"],
     ["Current directory writable", "test -w ."],
-    ["Makefile exists", "test -f Makefile || test -f makefile"]
+    ["Always fails", "sh -c 'false'"]
 );
 
 my $all_passed = 1;

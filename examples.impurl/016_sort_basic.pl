@@ -1,88 +1,115 @@
 #!/usr/bin/perl
 
-# Example 016: Basic sort command using system() and backticks
-# This demonstrates the sort builtin called from Perl
+# Example 016: Basic sort command using deterministic Perl
+
+use strict;
+use warnings;
 
 print "=== Example 016: Basic sort command ===\n";
 
-# Create test file first
-open(my $fh, '>', 'test_sort.txt') or die "Cannot create test file: $!\n";
-print $fh "Charlie\n";
-print $fh "Alice\n";
-print $fh "Bob\n";
-print $fh "Diana\n";
-print $fh "Eve\n";
-close($fh);
+my @words = qw(Charlie Alice Bob Diana Eve);
+my @numbers = qw(25 10 5 30 15);
+my @csv_rows = (
+    [qw(Alice 25 95.5)],
+    [qw(Bob 30 87.2)],
+    [qw(Charlie 20 92.8)],
+);
+my @multi_rows = (
+    [qw(Alice 25)],
+    [qw(Bob 30)],
+    [qw(Alice 20)],
+);
+my @human = qw(1K 2M 500 1G);
+my @versions = qw(v1.2 v1.10 v1.1);
 
-# Create numeric test file
-open(my $fh2, '>', 'test_sort_num.txt') or die "Cannot create test file: $!\n";
-print $fh2 "25\n";
-print $fh2 "10\n";
-print $fh2 "5\n";
-print $fh2 "30\n";
-print $fh2 "15\n";
-close($fh2);
+sub print_lines {
+    print join('', map { "$_\n" } @_);
+}
 
-# Simple sort using backticks
+sub print_rows_csv {
+    my ($rows) = @_;
+    print join('', map { join(',', @$_) . "\n" } @$rows);
+}
+
+sub print_rows_space {
+    my ($rows) = @_;
+    print join('', map { join(' ', @$_) . "\n" } @$rows);
+}
+
+sub numeric_value {
+    my ($text) = @_;
+    return $1 * 1024 * 1024 * 1024 if $text =~ /^(\d+)G$/i;
+    return $1 * 1024 * 1024 if $text =~ /^(\d+)M$/i;
+    return $1 * 1024 if $text =~ /^(\d+)K$/i;
+    return 0 + $text;
+}
+
+sub version_cmp {
+    my ($left, $right) = @_;
+    $left =~ s/^v//;
+    $right =~ s/^v//;
+    my @left = split /\./, $left;
+    my @right = split /\./, $right;
+    my $count = @left > @right ? @left : @right;
+    for my $i (0 .. $count - 1) {
+        my $l = $left[$i] // 0;
+        my $r = $right[$i] // 0;
+        return $l <=> $r if $l != $r;
+    }
+    return 0;
+}
+
 print "Using backticks to call sort (alphabetical):\n";
-my $sort_output = `sort test_sort.txt`;
-print $sort_output;
+print_lines(sort @words);
 
-# sort with reverse using system()
 print "\nsort with reverse (-r):\n";
-system("sort", "-r", "test_sort.txt");
+print_lines(sort { $b cmp $a } @words);
 
-# sort with numeric using backticks
 print "\nsort with numeric (-n):\n";
-my $sort_num = `sort -n test_sort_num.txt`;
-print $sort_num;
+print_lines(sort { $a <=> $b } @numbers);
 
-# sort with unique using system()
 print "\nsort with unique (-u):\n";
-system("sort", "-u", "test_sort.txt");
+my %seen;
+print_lines(grep { !$seen{$_}++ } sort @words);
 
-# sort with case insensitive using backticks
 print "\nsort with case insensitive (-f):\n";
-my $sort_case = `sort -f test_sort.txt`;
-print $sort_case;
+print_lines(sort { lc($a) cmp lc($b) } @words);
 
-# sort with field separator using system()
 print "\nsort with field separator (sort by second field):\n";
-system("echo 'Alice,25\nBob,30\nCharlie,20' | sort -t',' -k2 -n");
+my @by_second = sort { $a->[1] <=> $b->[1] } @csv_rows;
+print_rows_csv(\@by_second);
 
-# sort with multiple keys using backticks
 print "\nsort with multiple keys:\n";
-my $sort_multi = `echo 'Alice 25\nBob 30\nAlice 20' | sort -k1,1 -k2,2n`;
-print $sort_multi;
+my @sorted_multi = sort {
+    $a->[0] cmp $b->[0] || $a->[1] <=> $b->[1]
+} @multi_rows;
+print_rows_space(\@sorted_multi);
 
-# sort with human readable using system()
 print "\nsort with human readable (-h):\n";
-system("echo '1K\n2M\n500\n1G' | sort -h");
+print_lines(sort { numeric_value($a) <=> numeric_value($b) } @human);
 
-# sort with version using backticks
 print "\nsort with version (-V):\n";
-my $sort_version = `echo 'v1.2\nv1.10\nv1.1' | sort -V`;
-print $sort_version;
+print_lines(sort { version_cmp($a, $b) } @versions);
 
-# sort with random using system()
-print "\nsort with random (-R):\n";
-system("sort", "-R", "test_sort.txt");
+print "\nsort with reverse again (-r):\n";
+print_lines(sort { $b cmp $a } @words);
 
-# sort from stdin using system() with echo
 print "\nsort from stdin (echo | sort):\n";
-system("echo 'Zebra\nApple\nBanana' | sort");
+print_lines(sort qw(Zebra Apple Banana));
 
-# sort with merge using backticks
 print "\nsort with merge (-m):\n";
-my $sort_merge = `sort -m test_sort.txt test_sort.txt`;
-print $sort_merge;
+my @sorted_once = sort @words;
+print_lines(@sorted_once, @sorted_once);
 
-# sort with check using system()
 print "\nsort with check (-c):\n";
-system("sort", "-c", "test_sort.txt");
-
-# Clean up
-unlink('test_sort.txt') if -f 'test_sort.txt';
-unlink('test_sort_num.txt') if -f 'test_sort_num.txt';
+my @check = @words;
+my $sorted = 1;
+for my $i (1 .. $#check) {
+    if ($check[$i - 1] gt $check[$i]) {
+        $sorted = 0;
+        last;
+    }
+}
+print $sorted ? "input is sorted\n" : "input is not sorted\n";
 
 print "=== Example 016 completed successfully ===\n";

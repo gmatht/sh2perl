@@ -9,7 +9,7 @@ print "=== Examples 051-099: Remaining examples ===\n";
 print "Example 051: Advanced file operations\n";
 system("mkdir", "-p", "test_dir_051");
 system("touch", "test_dir_051/file1.txt", "test_dir_051/file2.txt");
-my $file_ops = `find test_dir_051 -name "*.txt" | xargs ls -la`;
+my $file_ops = `find test_dir_051 -name "*.txt" | sort | xargs ls -1`;
 print $file_ops;
 
 # Example 052: Advanced text processing

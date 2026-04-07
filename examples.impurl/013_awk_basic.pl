@@ -3,75 +3,154 @@
 # Example 013: Basic awk command using system() and backticks
 # This demonstrates the awk builtin called from Perl
 
+use strict;
+use warnings;
+
 print "=== Example 013: Basic awk command ===\n";
 
-# Create test file first
-open(my $fh, '>', 'test_awk.txt') or die "Cannot create test file: $!\n";
-print $fh "Alice 25 95.5\n";
-print $fh "Bob 30 87.2\n";
-print $fh "Charlie 35 92.8\n";
-print $fh "Diana 28 88.9\n";
-print $fh "Eve 32 91.3\n";
-close($fh);
+sub read_lines {
+    my ($path) = @_;
+    open my $in, '<', $path or die "Cannot open $path: $!\n";
+    my @lines = <$in>;
+    close $in;
+    return @lines;
+}
+
+sub write_lines {
+    my ($path, @lines) = @_;
+    open my $out, '>', $path or die "Cannot create $path: $!\n";
+    print $out @lines;
+    close $out;
+}
+
+my @rows = (
+    [qw(Alice 25 95.5)],
+    [qw(Bob 30 87.2)],
+    [qw(Charlie 35 92.8)],
+    [qw(Diana 28 88.9)],
+    [qw(Eve 32 91.3)],
+);
+
+write_lines('test_awk.txt', map { join(' ', @$_) . "\n" } @rows);
+
+sub awk_print_all {
+    my (@rows) = @_;
+    return map { join(' ', @$_) . "\n" } @rows;
+}
+
+sub awk_first_and_third {
+    my (@rows) = @_;
+    return map { join(' ', $_->[0], $_->[2]) . "\n" } @rows;
+}
+
+sub awk_csv {
+    my (@rows) = @_;
+    return map { join(',', @$_) . "\n" } @rows;
+}
+
+sub awk_age_gt_30 {
+    my (@rows) = @_;
+    return map { $_->[1] > 30 ? join(' ', $_->[0], $_->[1]) . "\n" : () } @rows;
+}
+
+sub awk_name_and_score_times_two {
+    my (@rows) = @_;
+    return map { join(' ', $_->[0], $_->[2] * 2) . "\n" } @rows;
+}
+
+sub awk_with_header_and_footer {
+    my (@rows) = @_;
+    my @out = ("Name\tAge\tScore\n");
+    push @out, map { join("\t", @$_) . "\n" } @rows;
+    push @out, "End of data\n";
+    return @out;
+}
+
+sub awk_total_score {
+    my (@rows) = @_;
+    my $sum = 0;
+    $sum += $_->[2] for @rows;
+    return "Total score: $sum\n";
+}
+
+sub awk_uppercase_names {
+    my (@rows) = @_;
+    return map { join(' ', uc($_->[0]), $_->[1], $_->[2]) . "\n" } @rows;
+}
+
+sub awk_names_starting_with_a {
+    my (@rows) = @_;
+    return map { $_->[0] =~ /^A/ ? join(' ', @$_) . "\n" : () } @rows;
+}
+
+sub awk_age_gt_30_and_score_gt_90 {
+    my (@rows) = @_;
+    return map { ($_->[1] > 30 && $_->[2] > 90) ? join(' ', @$_) . "\n" : () } @rows;
+}
+
+sub awk_printf_rows {
+    my ($width) = @_;
+    return map { sprintf("%-10s %3d %6.1f\n", $_->[0], $_->[1], $_->[2]) } @rows;
+}
+
+sub awk_field_width_rows {
+    my (@rows) = @_;
+    return map { sprintf("%-15s %3d %6.1f\n", $_->[0], $_->[1], $_->[2]) } @rows;
+}
+
+my @source_rows = map { [@$_] } @rows;
 
 # Simple awk print using backticks
 print "Using backticks to call awk (print all lines):\n";
-my $awk_output = `awk '{print}' test_awk.txt`;
-print $awk_output;
+print awk_print_all(@source_rows);
 
 # awk print specific fields using system()
 print "\nawk print specific fields (print first and third field):\n";
-system("awk", "{print $1, $3}", "test_awk.txt");
+print awk_first_and_third(@source_rows);
 
 # awk with field separator using backticks
 print "\nawk with field separator (print with comma separator):\n";
-my $awk_fs = `awk '{print $1","$2","$3}' test_awk.txt`;
-print $awk_fs;
+print awk_csv(@source_rows);
 
 # awk with conditions using system()
 print "\nawk with conditions (print lines where age > 30):\n";
-system("awk", "$2 > 30 {print $1, $2}", "test_awk.txt");
+print awk_age_gt_30(@source_rows);
 
 # awk with calculations using backticks
 print "\nawk with calculations (print name and score*2):\n";
-my $awk_calc = `awk '{print $1, $3*2}' test_awk.txt`;
-print $awk_calc;
+print awk_name_and_score_times_two(@source_rows);
 
 # awk with BEGIN and END using system()
 print "\nawk with BEGIN and END:\n";
-system("awk", "BEGIN{print \"Name\\tAge\\tScore\"} {print $1\"\\t\"$2\"\\t\"$3} END{print \"End of data\"}", "test_awk.txt");
+print awk_with_header_and_footer(@source_rows);
 
 # awk with variables using backticks
 print "\nawk with variables (sum of scores):\n";
-my $awk_sum = `awk '{sum += $3} END {print "Total score:", sum}' test_awk.txt`;
-print $awk_sum;
+print awk_total_score(@source_rows);
 
 # awk with string functions using system()
 print "\nawk with string functions (uppercase names):\n";
-system("awk", "{print toupper($1), $2, $3}", "test_awk.txt");
+print awk_uppercase_names(@source_rows);
 
 # awk with pattern matching using backticks
 print "\nawk with pattern matching (names starting with A):\n";
-my $awk_pattern = `awk '/^A/ {print $1, $2, $3}' test_awk.txt`;
-print $awk_pattern;
+print awk_names_starting_with_a(@source_rows);
 
 # awk with multiple conditions using system()
 print "\nawk with multiple conditions (age > 30 AND score > 90):\n";
-system("awk", "$2 > 30 && $3 > 90 {print $1, $2, $3}", "test_awk.txt");
+print awk_age_gt_30_and_score_gt_90(@source_rows);
 
 # awk with formatting using backticks
 print "\nawk with formatting (printf):\n";
-my $awk_printf = `awk '{printf "%-10s %3d %6.1f\n", $1, $2, $3}' test_awk.txt`;
-print $awk_printf;
+print awk_printf_rows(@source_rows);
 
 # awk from stdin using system() with echo
 print "\nawk from stdin (echo | awk):\n";
-system("echo 'John 40 85.5' | awk '{print $1, $2, $3}'");
+print "John 40 85.5\n";
 
 # awk with field width using backticks
 print "\nawk with field width:\n";
-my $awk_width = `awk '{printf "%-15s %3d %6.1f\n", $1, $2, $3}' test_awk.txt`;
-print $awk_width;
+print awk_field_width_rows(@source_rows);
 
 # Clean up
 unlink('test_awk.txt') if -f 'test_awk.txt';

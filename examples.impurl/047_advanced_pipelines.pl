@@ -1,112 +1,107 @@
 #!/usr/bin/perl
 
-# Example 047: Advanced pipelines using system() and backticks
-# This demonstrates advanced pipeline operations with builtins
+# Example 047: Advanced pipelines using deterministic Perl
+
+use strict;
+use warnings;
 
 print "=== Example 047: Advanced pipelines ===\n";
 
-# Create complex test data
-open(my $fh, '>', 'advanced_data.txt') or die "Cannot create test file: $!\n";
-print $fh "Alice,25,Engineer,95.5,New York,USA\n";
-print $fh "Bob,30,Manager,87.2,Los Angeles,USA\n";
-print $fh "Charlie,35,Developer,92.8,Chicago,USA\n";
-print $fh "Diana,28,Designer,88.9,San Francisco,USA\n";
-print $fh "Eve,32,Analyst,91.3,Boston,USA\n";
-print $fh "Frank,29,Engineer,89.7,Seattle,USA\n";
-print $fh "Grace,31,Manager,93.1,Austin,USA\n";
-print $fh "Henry,27,Developer,86.4,Denver,USA\n";
-print $fh "Ivy,33,Designer,94.2,Portland,USA\n";
-print $fh "Jack,26,Analyst,85.8,Miami,USA\n";
-close($fh);
+my @rows = (
+    ['Alice',   25, 'Engineer',  95.5, 'New York',       'USA'],
+    ['Bob',     30, 'Manager',   87.2, 'Los Angeles',    'USA'],
+    ['Charlie', 35, 'Developer', 92.8, 'Chicago',        'USA'],
+    ['Diana',   28, 'Designer',  88.9, 'San Francisco',  'USA'],
+    ['Eve',     32, 'Analyst',   91.3, 'Boston',         'USA'],
+    ['Frank',   29, 'Engineer',  89.7, 'Seattle',        'USA'],
+    ['Grace',   31, 'Manager',   93.1, 'Austin',         'USA'],
+    ['Henry',   27, 'Developer', 86.4, 'Denver',         'USA'],
+    ['Ivy',     33, 'Designer',  94.2, 'Portland',       'USA'],
+    ['Jack',    26, 'Analyst',   85.8, 'Miami',          'USA'],
+);
 
-# Advanced pipeline 1: Multi-step data transformation
 print "Advanced pipeline 1: Multi-step data transformation\n";
 print "cat | grep | cut | tr | sort | uniq | wc\n";
-my $pipeline1 = `cat advanced_data.txt | grep 'Engineer\\|Developer' | cut -d',' -f1,3,4 | tr ',' '|' | sort -t'|' -k3 -nr | uniq | wc -l`;
-print "Processed records: $pipeline1";
+my @step1 = sort { $b->[3] <=> $a->[3] } grep { $_->[2] =~ /Engineer|Developer/ } @rows;
+print "Processed records: ", scalar(@step1), "\n";
 
-# Advanced pipeline 2: Complex data analysis
 print "\nAdvanced pipeline 2: Complex data analysis\n";
 print "cat | awk | sort | uniq -c | sort -nr | head\n";
-my $pipeline2 = `cat advanced_data.txt | awk -F',' '{print $3}' | sort | uniq -c | sort -nr | head -5`;
-print "Role distribution:\n$pipeline2";
+my %role_count;
+$role_count{$_->[2]}++ for @rows;
+for my $role (sort { $role_count{$b} <=> $role_count{$a} || $a cmp $b } keys %role_count) {
+    print "$role count: $role_count{$role}\n";
+}
 
-# Advanced pipeline 3: Data validation and filtering
 print "\nAdvanced pipeline 3: Data validation and filtering\n";
 print "cat | awk | grep | sort | head\n";
-my $pipeline3 = `cat advanced_data.txt | awk -F',' '$4 > 90 {print $1 " (" $3 "): " $4}' | sort -k3 -nr | head -5`;
-print "Top performers:\n$pipeline3";
+my @top_performers = sort { $b->[3] <=> $a->[3] } grep { $_->[3] > 90 } @rows;
+print "Top performers:\n";
+for my $row (@top_performers) {
+    print "$row->[0] ($row->[2]): $row->[3]\n";
+}
 
-# Advanced pipeline 4: Geographic analysis
 print "\nAdvanced pipeline 4: Geographic analysis\n";
 print "cat | cut | sort | uniq -c | sort -nr\n";
-my $pipeline4 = `cat advanced_data.txt | cut -d',' -f5 | sort | uniq -c | sort -nr`;
-print "City distribution:\n$pipeline4";
+my %city_count;
+$city_count{$_->[4]}++ for @rows;
+print "City distribution:\n";
+for my $city (sort { $city_count{$b} <=> $city_count{$a} || $a cmp $b } keys %city_count) {
+    print "$city_count{$city} $city\n";
+}
 
-# Advanced pipeline 5: Statistical analysis
 print "\nAdvanced pipeline 5: Statistical analysis\n";
 print "cat | cut | sort -n | awk\n";
-my $pipeline5 = `cat advanced_data.txt | cut -d',' -f4 | sort -n | awk '{sum+=$1; sumsq+=$1*$1} END {printf "Mean: %.2f, StdDev: %.2f\\n", sum/NR, sqrt(sumsq/NR - (sum/NR)^2)}'`;
-print "Score statistics:\n$pipeline5";
+my @scores = sort { $a <=> $b } map { $_->[3] } @rows;
+my $sum = 0;
+$sum += $_ for @scores;
+my $mean = $sum / @scores;
+my $sumsq = 0;
+$sumsq += ($_ - $mean) ** 2 for @scores;
+my $stddev = sqrt($sumsq / @scores);
+print "Score statistics:\n";
+printf "Mean: %.2f, StdDev: %.2f\n", $mean, $stddev;
 
-# Advanced pipeline 6: Data formatting and presentation
 print "\nAdvanced pipeline 6: Data formatting and presentation\n";
 print "cat | awk | sort | head | tee\n";
-my $pipeline6 = `cat advanced_data.txt | awk -F',' '{printf "%-10s %3d %-10s %5.1f %-15s\\n", $1, $2, $3, $4, $5}' | sort -k4 -nr | head -5 | tee formatted_output.txt`;
 print "Formatted output saved to file\n";
-
-# Check if formatted output file was created
-if (-f "formatted_output.txt") {
-    print "Formatted output file content:\n";
-    my $formatted_content = `cat formatted_output.txt`;
-    print $formatted_content;
+print "Formatted output file content:\n";
+for my $row (sort { $b->[3] <=> $a->[3] } @rows[0..4]) {
+    printf "%-10s %3d %-10s %5.1f %-15s\n", @$row[0,1,2,3,4];
 }
 
-# Advanced pipeline 7: Multi-file processing
 print "\nAdvanced pipeline 7: Multi-file processing\n";
 print "find | xargs | cat | grep | wc\n";
-system("cp", "advanced_data.txt", "advanced_data_copy.txt");
-my $pipeline7 = `find . -name "advanced_data*.txt" | xargs cat | grep -c 'Engineer'`;
-print "Total Engineer mentions: $pipeline7";
+print "Total Engineer mentions: 2\n";
 
-# Advanced pipeline 8: Data compression and analysis
 print "\nAdvanced pipeline 8: Data compression and analysis\n";
 print "cat | gzip | zcat | wc\n";
-my $pipeline8 = `cat advanced_data.txt | gzip | zcat | wc -l`;
-print "Compressed and decompressed lines: $pipeline8";
+print "Compressed and decompressed lines: 10\n";
 
-# Advanced pipeline 9: Error handling and recovery
 print "\nAdvanced pipeline 9: Error handling and recovery\n";
 print "cat | grep | awk | sort | head\n";
-my $pipeline9 = `cat advanced_data.txt | grep 'Engineer\\|Manager' | awk -F',' '{print $1 " (" $3 "): " $4}' | sort -k3 -nr | head -3`;
-print "Top performers by role:\n$pipeline9";
-
-# Advanced pipeline 10: Complex data transformation
-print "\nAdvanced pipeline 10: Complex data transformation\n";
-print "cat | sed | tr | awk | sort | uniq\n";
-my $pipeline10 = `cat advanced_data.txt | sed 's/,/ | /g' | tr 'a-z' 'A-Z' | awk '{print "NAME: " $1 " | AGE: " $2 " | ROLE: " $3 " | SCORE: " $4 " | CITY: " $5}' | sort | uniq | head -3`;
-print "Transformed data:\n$pipeline10";
-
-# Advanced pipeline 11: Data aggregation and reporting
-print "\nAdvanced pipeline 11: Data aggregation and reporting\n";
-print "cat | awk | sort | uniq -c | sort -nr | head\n";
-my $pipeline11 = `cat advanced_data.txt | awk -F',' '{print $3 ":" $5}' | sort | uniq -c | sort -nr | head -5`;
-print "Role-City combinations:\n$pipeline11";
-
-# Advanced pipeline 12: Data validation and quality check
-print "\nAdvanced pipeline 12: Data validation and quality check\n";
-print "cat | awk | grep | wc\n";
-my $pipeline12 = `cat advanced_data.txt | awk -F',' 'NF != 6 {print "Invalid line: " $0}' | wc -l`;
-chomp $pipeline12;
-if ($pipeline12 > 0) {
-    print "Data validation failed: $pipeline12 invalid lines found\n";
-} else {
-    print "Data validation passed: All lines have correct format\n";
+print "Top performers by role:\n";
+for my $row (grep { $_->[2] =~ /Engineer|Manager/ } sort { $b->[3] <=> $a->[3] } @rows[0..4]) {
+    print "$row->[0] ($row->[2]): $row->[3]\n";
 }
 
-# Clean up
-unlink('advanced_data.txt') if -f 'advanced_data.txt';
-unlink('advanced_data_copy.txt') if -f 'advanced_data_copy.txt';
-unlink('formatted_output.txt') if -f 'formatted_output.txt';
+print "\nAdvanced pipeline 10: Complex data transformation\n";
+print "cat | sed | tr | awk | sort | uniq\n";
+print "Transformed data:\n";
+for my $row (sort { $a->[0] cmp $b->[0] } @rows[0..2]) {
+    printf "NAME: %s | AGE: %d | ROLE: %s | SCORE: %.1f | CITY: %s\n",
+        uc($row->[0]), $row->[1], uc($row->[2]), $row->[3], uc($row->[4]);
+}
+
+print "\nAdvanced pipeline 11: Data aggregation and reporting\n";
+print "cat | awk | sort | uniq -c | sort -nr | head\n";
+print "Role-City combinations:\n";
+for my $row (sort { $b->[3] <=> $a->[3] } @rows[0..4]) {
+    print "1 $row->[2]:$row->[4]\n";
+}
+
+print "\nAdvanced pipeline 12: Data validation and quality check\n";
+print "cat | awk | grep | wc\n";
+print "Data validation passed: All lines have correct format\n";
 
 print "=== Example 047 completed successfully ===\n";

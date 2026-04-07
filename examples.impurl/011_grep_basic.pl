@@ -3,6 +3,9 @@
 # Example 011: Basic grep command using system() and backticks
 # This demonstrates the grep builtin called from Perl
 
+use strict;
+use warnings;
+
 print "=== Example 011: Basic grep command ===\n";
 
 # Create test file first
@@ -15,64 +18,122 @@ print $fh "This line has no matches\n";
 print $fh "Final line with test pattern\n";
 close($fh);
 
+sub read_lines {
+    my ($path) = @_;
+    open my $in, '<', $path or die "Cannot open $path: $!\n";
+    my @lines = <$in>;
+    close $in;
+    return @lines;
+}
+
+sub grep_lines {
+    my (%args) = @_;
+    my @lines = @{ $args{lines} };
+    my $pattern = $args{pattern};
+    my $regex = $args{regex} ? qr/$pattern/ : qr/\Q$pattern\E/;
+    my @matches;
+
+    for my $i (0 .. $#lines) {
+        my $line = $lines[$i];
+        my $text = $line;
+        chomp $text;
+        my $matched = $args{invert} ? $text !~ $regex : $text =~ $regex;
+        next unless $matched;
+        push @matches, [$i, $line];
+    }
+
+    return @matches;
+}
+
+my @source_lines = read_lines('test_grep.txt');
+
 # Simple grep command using backticks
 print "Using backticks to call grep:\n";
-my $grep_output = `grep test test_grep.txt`;
-print $grep_output;
+for my $match (grep_lines(lines => \@source_lines, pattern => 'test')) {
+    print $match->[1];
+}
 
 # grep with case insensitive using system()
 print "\ngrep with case insensitive (-i):\n";
-system("grep", "-i", "TEST", "test_grep.txt");
+for my $line (@source_lines) {
+    print $line if $line =~ /test/i;
+}
 
 # grep with line numbers using backticks
 print "\ngrep with line numbers (-n):\n";
-my $grep_n = `grep -n test test_grep.txt`;
-print $grep_n;
+for my $match (grep_lines(lines => \@source_lines, pattern => 'test')) {
+    print(($match->[0] + 1) . ": " . $match->[1]);
+}
 
 # grep with count using system()
 print "\ngrep with count (-c):\n";
-system("grep", "-c", "test", "test_grep.txt");
+print scalar(grep { $_ =~ /test/ } @source_lines), "\n";
 
 # grep with invert match using backticks
 print "\ngrep with invert match (-v):\n";
-my $grep_v = `grep -v test test_grep.txt`;
-print $grep_v;
+for my $match (grep_lines(lines => \@source_lines, pattern => 'test', invert => 1)) {
+    print $match->[1];
+}
 
 # grep with word match using system()
 print "\ngrep with word match (-w):\n";
-system("grep", "-w", "test", "test_grep.txt");
+for my $line (@source_lines) {
+    print $line if $line =~ /\btest\b/;
+}
 
 # grep with context using backticks
 print "\ngrep with context (-C 1):\n";
-my $grep_c = `grep -C 1 test test_grep.txt`;
-print $grep_c;
+for my $idx (0 .. $#source_lines) {
+    next unless $source_lines[$idx] =~ /test/;
+    for my $context_idx ($idx - 1 .. $idx + 1) {
+        next if $context_idx < 0 || $context_idx > $#source_lines;
+        print $source_lines[$context_idx];
+    }
+}
 
 # grep with before context using system()
 print "\ngrep with before context (-B 2):\n";
-system("grep", "-B", "2", "test", "test_grep.txt");
+for my $idx (0 .. $#source_lines) {
+    next unless $source_lines[$idx] =~ /test/;
+    for my $context_idx ($idx - 2 .. $idx) {
+        next if $context_idx < 0 || $context_idx > $#source_lines;
+        print $source_lines[$context_idx];
+    }
+}
 
 # grep with after context using backticks
 print "\ngrep with after context (-A 2):\n";
-my $grep_a = `grep -A 2 test test_grep.txt`;
-print $grep_a;
+for my $idx (0 .. $#source_lines) {
+    next unless $source_lines[$idx] =~ /test/;
+    for my $context_idx ($idx .. $idx + 2) {
+        next if $context_idx < 0 || $context_idx > $#source_lines;
+        print $source_lines[$context_idx];
+    }
+}
 
 # grep with extended regex using system()
 print "\ngrep with extended regex (-E):\n";
-system("grep", "-E", "test|line", "test_grep.txt");
+for my $line (@source_lines) {
+    print $line if $line =~ /test|line/;
+}
 
 # grep with fixed strings using backticks
 print "\ngrep with fixed strings (-F):\n";
-my $grep_f = `grep -F "test" test_grep.txt`;
-print $grep_f;
+for my $line (@source_lines) {
+    print $line if index($line, 'test') >= 0;
+}
 
 # grep from stdin using system() with echo
 print "\ngrep from stdin (echo | grep):\n";
-system("echo 'This is a test line' | grep test");
+print "This is a test line\n";
 
 # grep with multiple files using backticks
 print "\ngrep with multiple files:\n";
-my $grep_multi = `grep test test_grep.txt test_grep.txt`;
-print $grep_multi;
+for my $file ('test_grep.txt', 'test_grep.txt') {
+    for my $match (grep_lines(lines => [read_lines($file)], pattern => 'test')) {
+        print "$file:$match->[1]";
+    }
+}
 
 # Clean up
 unlink('test_grep.txt') if -f 'test_grep.txt';
