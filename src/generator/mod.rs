@@ -88,6 +88,15 @@ impl Generator {
         }
     }
 
+    pub fn date_snapshot_epoch(&self) -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
     pub fn set_original_script_name(&mut self, name: String) {
         self.original_script_name = Some(name);
     }
@@ -142,14 +151,12 @@ impl Generator {
         output.push_str("use Carp;\n");
         output.push_str("use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);\n");
         output.push_str("use locale;\n");
-        output.push_str("select((select(STDOUT), $| = 1)[0]);\n");
 
         if needs_basename {
             output.push_str("use File::Basename;\n");
         }
-        if needs_ipc_open3 {
-            output.push_str("use IPC::Open3;\n");
-        }
+        // IPC::Open3 is used by command-substitution fallbacks and a few command generators.
+        output.push_str("use IPC::Open3;\n");
         if needs_file_find {
             // No additional imports needed for glob-based approach
         }
@@ -1052,7 +1059,7 @@ impl Generator {
         match command {
             Command::Simple(cmd) => {
                 // Check if it's a command that uses open3
-                if let Word::Literal(name, _) = &cmd.name {
+                let needs_open3 = if let Word::Literal(name, _) = &cmd.name {
                     // Commands that typically use open3 for IPC
                     match name.as_str() {
                         "pwd" | "whoami" | "date" | "id" | "uname" | "hostname" | "uptime"
@@ -1065,7 +1072,23 @@ impl Generator {
                 } else {
                     // Non-literal command names often need open3
                     true
+                };
+
+                if needs_open3 {
+                    return true;
                 }
+
+                // Also inspect nested command substitutions in arguments and env vars.
+                if cmd.args.iter().any(|word| self.word_needs_ipc_open3(word)) {
+                    return true;
+                }
+                for (_, word) in &cmd.env_vars {
+                    if self.word_needs_ipc_open3(word) {
+                        return true;
+                    }
+                }
+
+                false
             }
             Command::Pipeline(_pipeline) => {
                 // Pipelines need IPC::Open3
@@ -1075,6 +1098,7 @@ impl Generator {
                 self.command_needs_ipc_open3(left) || self.command_needs_ipc_open3(right)
             }
             Command::Redirect(redirect_cmd) => self.command_needs_ipc_open3(&redirect_cmd.command),
+            Command::Assignment(assign) => self.word_needs_ipc_open3(&assign.value),
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
                     if self.command_needs_ipc_open3(cmd) {
@@ -1102,6 +1126,18 @@ impl Generator {
                 }
                 false
             }
+            _ => false,
+        }
+    }
+
+    /// Check if a word contains nested command substitutions that need IPC::Open3
+    fn word_needs_ipc_open3(&self, word: &Word) -> bool {
+        match word {
+            Word::CommandSubstitution(cmd, _) => self.command_needs_ipc_open3(cmd),
+            Word::StringInterpolation(interp, _) => interp.parts.iter().any(|part| match part {
+                StringPart::CommandSubstitution(cmd) => self.command_needs_ipc_open3(cmd),
+                _ => false,
+            }),
             _ => false,
         }
     }

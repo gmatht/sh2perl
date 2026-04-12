@@ -1,0 +1,346 @@
+Running shell script: examples/000__01_file_directory_operations.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-maxdepth", None), Literal("1", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+Generated Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my $cmd_result_1 = do {     do {
+        my @ls_files_0 = ();
+        if (-f q{.}) {
+            push @ls_files_0, q{.};
+        } elsif (-d q{.}) {
+            if (opendir my $dh, q{.}) {
+                while (my $file = readdir $dh) {
+                    next if $file =~ /^__tmp_.*[.]pl$/msx;
+                    next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+                    push @ls_files_0, $file;
+                }
+                closedir $dh;
+                @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+            }
+        }
+        join "\n", @ls_files_0;
+    }
+ };
+    chomp $cmd_result_1;
+    $cmd_result_1;
+};
+print "File listing:\n";
+print $file_list;
+if (!($file_list =~ /\n$/msx)) { print "\n"; }
+my $found_files = do {
+    my $cmd_result_3 = do {     do {
+        use File::Find;
+        use File::Basename;
+        my @files_2 = ();
+        my $start_2 = q{.};
+        sub find_files_2 {
+            my $file_2 = $File::Find::name;
+            if (!(-f $file_2)) {
+                return;
+            }
+            if (!(basename($file_2) =~ m/^.*.sh$/xms)) {
+                return;
+            }
+            push @files_2, $file_2;
+            return;
+        }
+        find(\&find_files_2, $start_2);
+        join "\n", @files_2;
+    }
+ };
+    chomp $cmd_result_3;
+    $cmd_result_3;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if (!($found_files =~ /\n$/msx)) { print "\n"; }
+
+
+--- Running generated Perl code ---
+Can't open perl script "__tmp_run.pl": No such file or directory
+Exit code: exit code: 2
+
+==================================================
+TIMING COMPARISON
+==================================================
+Perl execution time:  0.0582 seconds
+Bash execution time:  0.1268 seconds
+Perl is 2.18x faster than Bash
+
+==================================================
+OUTPUT COMPARISON
+==================================================
+Γ£ù DIFFERENCES FOUND:
+
+STDOUT DIFFERENCES:
+--- bash_stdout
++++ perl_stdout
+-=== File and Directory Operations ===
+-File listing:
+-.
+-..
+-.cursorrules
+-.git
+-.test_purify.pl.swp
+-__tmp_run.pl
+-000__04_basic_backtick_usage.sh
+-000__04_basic_backtick_usage.sh.complex
+-000__04_basic_backtick_usage.sh.ORIGINAL
+-000__04_basic_backtick_usage_simple.sh
+-003
+-20
+-30
+-90
+-after_test.txt
+-bash_tests
+-benchmark.bat
+-benchmark.ps1
+-BENCHMARK_README.md
+-benchmark_system.pl
+-build-wasm.sh
+-cache
+-Cargo.lock
+-Cargo.toml
+-cat
+-cd
+-clean_dead_code.sh
+-clean_dead_code_safe.sh
+-clean_perl.pl.ERR
+-command_cache.json
+-comment_debug.sh
+-compare_perl_bash.pl
+-complete_perl.pl
+-complex_script.sh
+-complex_test.sh
+-create_test_data.pl
+-current_perl.pl
+-current_perl.pl.ERR
+-debug_comparison.pdb
+-debug_comparison_test.exe
+-debug_comparison_test.pdb
+-debug_file_check.pl
+-debug_find_comprehensive.pl
+-debug_find_simple.pl
+-debug_function.sh
+-debug_lines.txt
+-debug_output.txt
+-debug_path_issue.pl
+-debug_perl.pl
+-debug_perl_code.pl
+-debug_purify.pl
+-debug_wc_redirect.sh
+-dir'
+-docs
+-echo
+-echo_if_test.sh
+-examples
+-examples.impurl
+-examples.out
+-examples.pl
+-extracted_perl.pl
+-fail
+-fail.bat
+-fail-fast
+-'File
+-find_perl_chunks.py
+-find_perl_specific_code.py
+-first_n_tests_passed.MAX.txt
+-first_n_tests_passed.txt
+-fixed_perl.pl
+-full_output.txt
+-generated_code.pl
+-generated_perl.pl
+-generated_perl_debug.pl
+-generated_perl_fixed.pl
+-git_commit_sizes.pl
+-git_filter_repo_generator.pl
+-highest_tests_and_lines.txt
+-in
+-INSTALL.md
+-install-deps.bat
+-install-deps.ps1
+-LICENSE
+-logs
+-ls
+-ls_clean.pl
+-ls_test.pl
+-minimal_test.sh
+-nul
+-out1.txt
+-out2.txt
+--p
+-perl_functions.txt
+-perl_output.txt
+-perl_result.txt
+-perl_specific_results.txt
+-perlcritic_wrapper.pl
+-ps_timeout.ps1
+-pure
+-pure_perl.pl
+-pure_perl.pl.ERR
+-purify.pl
+-purify_bloated.pl
+-README.md
+-README-WASM.md
+-rename_files.sh
+-restore_debug.sh
+--rf
+-rm
+-run_benchmarks.bat
+-run_benchmarks.sh
+-run-next-test.bat
+-shell_output.txt
+-simple_benchmark.pl
+-simple_benchmark_no_color.pl
+-simple_if_test.sh
+-src
+-strip_debug.sh
+-target
+-temp
+-temp*.txt;
+-temp_debashc_output_17296.txt
+-temp_debashc_output_36952.txt
+-temp_dir
+-temp_file.txt
+-temp_output.txt
+-temp_stderr.txt
+-temp_test.sh
+-temp_test_output.pl
+-temp_words.rs
+-temp1.txt;
+-temp2.txt;
+-test_000_02_debug.err
+-test_000_02_debug.pl
+-test_002_debug.pl
+-test_002_final.pl
+-test_002_fixed.pl
+-test_002_output.pl
+-test_002_output2.pl
+-test_004_clean.pl
+-test_004_debug.pl
+-test_004_output.pl
+-test_004_output2.pl
+-test_025.pl
+-test_025_clean.pl
+-test_031_debug.pl
+-test_binary.txt
+-test_clean_perl.pl
+-test_connection.bat
+-test_cp.pl
+-test_cp_isolated.pl
+-test_debug.pl
+-test_debug_performance.pl
+-test_dir
+-test_direct_system_check.pl
+-test_echo.sh
+-test_eval_copy.pl
+-test_eval_debug.pl
+-test_file.txt
+-test_file_spec.pl
+-test_fixed_output.pl
+-test_fixed_output2.pl
+-test_fixed_output3.pl
+-test_fixed_output4.pl
+-test_fixed_output5.pl
+-test_fixed_output6.pl
+-test_for_loop.sh
+-test_format.pl
+-test_generated.pl
+-test_generated.pl.ERR
+-test_generated_fixed.pl
+-test_get_file_size.sh
+-test_head_debug.pl
+-test_minimal.pl
+-test_minimal_glob.sh
+-test_mv_debug.pl
+-test_mv_file1.txt
+-test_mv_file2.txt
+-test_mv_preserve.txt
+-test_mv_verbose.txt
+-test_original_path.pl
+-test_output.pl
+-test_output.pl.ERR
+-test_output.txt
+-test_output2.txt
+-test_output3.txt
+-test_paste.sh
+-test_paste_final.pl
+-test_paste_fixed.pl
+-test_paste_output.pl
+-test_paste_simple.sh
+-test_paste_with_print.sh
+-test_perl.pl
+-test_perl.pl.ERR
+-test_perl.sh
+-test_perl_code.pl
+-test_perl_debug.pl
+-test_perl_debug2.pl
+-test_perl_debug3.pl
+-test_perl_debug4.pl
+-test_perl_debug5.pl
+-test_perl_debug6.pl
+-test_perl_debug7.pl
+-test_perl_debug8.pl
+-test_perl_debug9.pl
+-test_perl_direct.pl
+-test_perl_env.sh
+-test_perl_final.pl
+-test_perl_output.txt
+-test_perltidy.pl
+-test_perltidy_formatted.pl
+-test_perltidy_formatted2.pl
+-test_ppi_replace.pl
+-test_pure_perl.pl
+-test_purify.pl
+-test_sequence.pl
+-test_simple_function.sh
+-test_system_builtin_check.rs
+-test_system_builtin_detection.pl
+-test_system_builtins.pl
+-test_system_check.rs
+-test_time_debug.pl
+-test_time_debug2.pl
+-test_time_debug3.pl
+-test_time_fixed.pl
+-test_time_fixed_final.pl
+-test_time_fixed2.pl
+-test_workdir.pl
+-test_wrapper_minimal.pl
+-test_yes.sh
+-test1.txt
+-test2.txt
+-TODO.txt
+-tooltip_monitor.ps1
+-touch
+---version
+-wasm.ps1
+-www
+-Found shell scripts:
+-
+
+
+STDERR DIFFERENCES:
+--- bash_stderr
++++ perl_stderr
+-FIND: Parameter format not correct
++Can't open perl script "__tmp_run.pl": No such file or directory
+
+
+EXIT CODE DIFFERENCES:
+Bash exit code: Some(0)
+Perl exit code: Some(2)

@@ -47,7 +47,6 @@ pub enum Token {
     Export,
     #[token("readonly")]
     Readonly,
-    #[token("local")]
     Local,
     #[token("declare")]
     Declare,
@@ -580,4 +579,3 @@ mod tests {
         assert_eq!(lexer.next(), Some(&Token::BraceClose));
     }
 } 
-

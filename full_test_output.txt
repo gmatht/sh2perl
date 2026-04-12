@@ -1,0 +1,1178 @@
+To run this test: ./fail FAILING_TEST_PREFIX
+To run a specific test: ./fail TEST_PREFIX
+Examples: ./fail 062_02, ./fail 044, ./fail find
+Running test_purify.pl --next --verbose...
+Running test_purify.pl with verbose output
+Running test_purify.pl with next option
+DEBUG[1762013229.412]: Found 10 .pl files in examples.impurl directory
+DEBUG[1762013229.412]: Files to process: examples.impurl/000benchmark.pl, examples.impurl/001_echo_basic.pl, examples.impurl/002_printf_basic.pl, examples.impurl/003__ls_basic.pl, examples.impurl/003_ls_basic.pl, examples.impurl/004_cat_basic.pl, examples.impurl/005_wc_basic.pl, examples.impurl/006_head_basic.pl, examples.impurl/007_tail_basic.pl, examples.impurl/008_date_basic.pl
+DEBUG[1762013229.412]: Testing purify.pl --help...
+DEBUG[1762013229.412]: Starting purify.pl help test (timeout: 5s, type: purify_help)
+DEBUG[1762013230.309]: purify.pl help test completed in 0.896713972091675s (exit code: 0)
+DEBUG[1762013230.309]: purify.pl --help test passed
+DEBUG[1762013230.310]: Progress: [==                  ] 10% (1/10) - Processing files
+DEBUG[1762013230.310]: Testing purify.pl on examples.impurl/000benchmark.pl -> pure/000benchmark.pl
+DEBUG[1762013230.310]: File 1 of 10
+DEBUG[1762013230.310]: Running purify.pl on examples.impurl/000benchmark.pl
+DEBUG[1762013230.310]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1762013231.554]: purify.pl execution completed in 1.24438810348511s (exit code: 0)
+DEBUG[1762013231.554]: purify.pl result: 0
+DEBUG[1762013231.554]: Γ£ô examples.impurl/000benchmark.pl: purify.pl processed successfully
+DEBUG[1762013231.554]: Checking if pure/000benchmark.pl still contains system calls or backticks
+DEBUG[1762013231.554]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1762013231.752]: grep check completed in 0.197914123535156s (exit code: 1)
+DEBUG[1762013231.752]: Γ£ô Purification check passed - no system calls or backticks found
+DEBUG[1762013231.752]: Running original file: examples.impurl/000benchmark.pl
+DEBUG[1762013231.752]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1762013232.099]: original file execution completed in 0.346632957458496s (exit code: 0)
+DEBUG[1762013232.099]: Original file execution result: 0
+DEBUG[1762013232.099]: Running purified file: pure/000benchmark.pl
+DEBUG[1762013232.099]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1762013232.486]: purified file execution completed in 0.386867046356201s (exit code: 0)
+DEBUG[1762013232.486]: Purified file execution result: 0
+DEBUG[1762013232.489]: Γ£ô Output comparison passed - files produce identical output
+DEBUG[1762013232.489]: Progress: [====                ] 20% (2/10) - Processing files
+DEBUG[1762013232.489]: Testing purify.pl on examples.impurl/001_echo_basic.pl -> pure/001_echo_basic.pl
+DEBUG[1762013232.489]: File 2 of 10
+DEBUG[1762013232.489]: Running purify.pl on examples.impurl/001_echo_basic.pl
+DEBUG[1762013232.489]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1762013233.820]: purify.pl execution completed in 1.33059787750244s (exit code: 0)
+DEBUG[1762013233.820]: purify.pl result: 0
+DEBUG[1762013233.820]: Γ£ô examples.impurl/001_echo_basic.pl: purify.pl processed successfully
+DEBUG[1762013233.820]: Checking if pure/001_echo_basic.pl still contains system calls or backticks
+DEBUG[1762013233.820]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1762013234.026]: grep check completed in 0.206217050552368s (exit code: 1)
+DEBUG[1762013234.026]: Γ£ô Purification check passed - no system calls or backticks found
+DEBUG[1762013234.026]: Running original file: examples.impurl/001_echo_basic.pl
+DEBUG[1762013234.026]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1762013234.863]: original file execution completed in 0.836825132369995s (exit code: 0)
+DEBUG[1762013234.863]: Original file execution result: 0
+DEBUG[1762013234.863]: Running purified file: pure/001_echo_basic.pl
+DEBUG[1762013234.863]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1762013235.533]: purified file execution completed in 0.670108079910278s (exit code: 0)
+DEBUG[1762013235.533]: Purified file execution result: 0
+DEBUG[1762013235.536]: Output mismatch detected between original and purified files
+DEBUG[1762013235.536]:  === purified === 
+
+ === end purified ===
+DEBUG[1762013235.536]: Running diff to show differences
+DEBUG[1762013235.536]: Starting diff comparison (timeout: 10s, type: diff_comparison)
+--- out1.txt	2025-11-02 00:07:14.842654800 +0800
++++ out2.txt	2025-11-02 00:07:15.511839000 +0800
+@@ -6,12 +6,10 @@
+ This is a test of the echo builtin
+ 
+ Echo with special characters using backticks:
+-Line 1
+-Line 2
+-Line 3
++Line
+ 
+ Echo with variables:
+-Welcome to Perl version 5.32
++Welcome
+ 
+ Echo with quotes:
+ This is a 'quoted' string
+DEBUG[1762013235.751]: diff comparison completed in 0.214903831481934s (exit code: 1)
+DEBUG[1762013235.751]: FAILED - Output mismatch
+test_purify.pl passed, continuing with other commands...
+warning: unused import: `Token`
+    --> src\parser\commands.rs:1351:31
+     |
+1351 |     use crate::lexer::{Lexer, Token};
+     |                               ^^^^^
+     |
+     = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src\timeout_manager.rs:282:1
+    |
+282 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\parser\commands.rs:1354:9
+     |
+1354 |     let mut lexer = Lexer::new(text);
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `cmd2`
+   --> src\generator\commands\pipeline_commands.rs:469:66
+    |
+469 |         if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline.commands[1]) {
+    |                                                                  ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: variable `head_max` is assigned to, but never used
+   --> src\generator\commands\pipeline_commands.rs:847:25
+    |
+847 |                 let mut head_max = 10; // Default value
+    |                         ^^^^^^^^
+    |
+    = note: consider using `_head_max` instead
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:858:53
+    |
+858 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:865:53
+    |
+865 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:870:49
+    |
+870 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:894:22
+    |
+894 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:908:34
+    |
+908 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+    |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `input_var`
+ --> src\generator\commands\comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:566:37
+    |
+566 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `literal`
+   --> src\generator\words.rs:387:59
+    |
+387 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `s`
+   --> src\generator\words.rs:851:23
+    |
+851 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+    |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `literal`
+   --> src\generator\utils.rs:151:59
+    |
+151 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:151:13
+    |
+151 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:194:13
+    |
+194 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+  20 | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1885:4
+     |
+1885 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:195:4
+    |
+195 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:24:4
+   |
+24 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:73:4
+   |
+73 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:230:4
+    |
+230 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for_loop_index: usize) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 32 warnings (run `cargo fix --lib -p debashl` to apply 5 suggestions)
+warning: unused import: `execute_with_progress`
+ --> src\testing.rs:9:67
+  |
+9 | use crate::timeout_manager::{OperationType, execute_with_timeout, execute_with_progress, 
+  |                                                                   ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src\testing.rs:16:5
+   |
+16 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src\testing.rs:25:9
+   |
+25 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1188:9
+     |
+1188 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src\testing.rs:1397:9
+     |
+1397 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src\testing.rs:1445:9
+     |
+1445 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1994:13
+     |
+1994 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1994:9
+     |
+1994 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src\execution.rs:64:8
+   |
+64 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String> {
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src\testing.rs:19:4
+   |
+19 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String> 
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:52:9
+   |
+39 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+52 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+53 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:552:8
+    |
+552 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>) -> Result<TestResult, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src\testing.rs:1393:8
+     |
+1393 | pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src\timeout_manager.rs:11:5
+   |
+ 8 | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src\timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src\timeout_manager.rs:117:12
+    |
+ 90 | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: Duration) {
+    |            ^^^^^^^^^^^
+...
+178 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src\timeout_manager.rs:302:8
+    |
+302 | pub fn execute_with_progress<F, T>(operation: OperationType, operation_fn: F) -> Result<T, String>
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.48s
+     Running `target\debug\debashc.exe fail --perl-critic 000__01`
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '000__01'
+
+Found example matching prefix '000__01': 000__01_file_directory_operations.sh
+
+Running only the specified example
+==================================================
+
+DEBUG: Starting test execution for examples\000__01_file_directory_operations.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__01_file_directory_operations.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-maxdepth", None), Literal("1", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1394 characters
+DEBUG: Test execution completed in 13938ms
+Test 1/146: 000__01_file_directory_operations.sh with perl     [2J[1;1H================================================================================
+                                    TEST FAILED
+================================================================================
+File: examples\000__01_file_directory_operations.sh
+Generator: perl
+Test: 1/146
+Tests passed before failure: 0
+Failure Reason: Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my @ls_files_0 = ();
+    if (-f q{.}) {
+        push @ls_files_0, q{.};
+    }
+    elsif (-d q{.}) {
+        if (opendir my $dh, q{.}) {
+            while (my $file = readdir $dh) {
+                next if $file =~ /^__tmp_.*[.]pl$/msx;
+                next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+        }
+    }
+    join "\n", @ls_files_0;
+};
+print "File listing:\n";
+print $file_list;
+if (!($file_list =~ m{\n$}msx)) { print "\n"; }
+my $found_files = do {
+    use File::Find;
+    use File::Basename;
+    my @files_1 = ();
+    my $start_1 = q{.};
+
+    sub find_files_1 {
+        my $file_1 = $File::Find::name;
+        if (!(-f $file_1)) {
+            return;
+        }
+        if (!(basename($file_1) =~ m/^.*.sh$/xms)) {
+            return;
+        }
+        push @files_1, $file_1;
+        return;
+    }
+    find( \&find_files_1, $start_1 );
+    join "\n", @files_1;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if (!($found_files =~ m{\n$}msx)) { print "\n"; }
+
+```
+
+perlcritic_wrapper: Started, parse args took 4.9e-05s
+perlcritic_wrapper: File read took 0.001196s
+perlcritic_wrapper: SHA1 hash took 0.000109s
+perlcritic_wrapper: No cache file found
+perlcritic_wrapper: Perl::Critic init took 0.955889s
+perlcritic_wrapper: Perl::Critic analysis took 0.727559s
+perlcritic_wrapper: Perltidy subprocess took 1.257173s
+perlcritic_wrapper: Perltidy check took 1.258777s
+perlcritic_wrapper: Output generation took 1.3e-05s
+perlcritic_wrapper: Cache write took 0.001419s
+perlcritic_wrapper: Total time 2.947406s
+
+perltidy wrapper failed with exit code: 1
+FAILED: Code is not tidy
+
+================================================================================
+
+Exit Code Comparison (IGNORED):
+Shell script exit code: 0
+Translated code exit code: -1
+
+================================================================================
+ORIGINAL SHELL SCRIPT:
+================================================================================
+#!/bin/bash
+
+# File and directory operations with backticks
+# This file demonstrates using backticks with file system commands
+
+echo "=== File and Directory Operations ==="
+
+# ls command with backticks
+#PERL_MUST_NOT_CONTAIN `ls
+file_list=`ls -a`
+echo "File listing:"
+echo "$file_list"
+
+# find command with backticks
+#PERL_MUST_NOT_CONTAIN `find
+found_files=`find . -maxdepth 1 -name "*.sh" -type f`
+echo "Found shell scripts:"
+echo "$found_files"
+
+# basename and dirname with backticks
+#PERL_MUST_NOT_CONTAIN `basename
+#PERL_MUST_NOT_CONTAIN `dirname
+#script_name=`basename $0`
+#script_dir=`dirname $0`
+#echo "Script name: $script_name"
+#echo "Script directory: $script_dir"
+
+
+================================================================================
+TRANSLATED PERL CODE:
+================================================================================
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my @ls_files_0 = ();
+    if (-f q{.}) {
+        push @ls_files_0, q{.};
+    }
+    elsif (-d q{.}) {
+        if (opendir my $dh, q{.}) {
+            while (my $file = readdir $dh) {
+                next if $file =~ /^__tmp_.*[.]pl$/msx;
+                next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+        }
+    }
+    join "\n", @ls_files_0;
+};
+print "File listing:\n";
+print $file_list;
+if (!($file_list =~ m{\n$}msx)) { print "\n"; }
+my $found_files = do {
+    use File::Find;
+    use File::Basename;
+    my @files_1 = ();
+    my $start_1 = q{.};
+
+    sub find_files_1 {
+        my $file_1 = $File::Find::name;
+        if (!(-f $file_1)) {
+            return;
+        }
+        if (!(basename($file_1) =~ m/^.*.sh$/xms)) {
+            return;
+        }
+        push @files_1, $file_1;
+        return;
+    }
+    find( \&find_files_1, $start_1 );
+    join "\n", @files_1;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if (!($found_files =~ m{\n$}msx)) { print "\n"; }
+
+
+================================================================================
+PERL::CRITIC RESULTS:
+================================================================================
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my @ls_files_0 = ();
+    if (-f q{.}) {
+        push @ls_files_0, q{.};
+    }
+    elsif (-d q{.}) {
+        if (opendir my $dh, q{.}) {
+            while (my $file = readdir $dh) {
+                next if $file =~ /^__tmp_.*[.]pl$/msx;
+                next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+        }
+    }
+    join "\n", @ls_files_0;
+};
+print "File listing:\n";
+print $file_list;
+if (!($file_list =~ m{\n$}msx)) { print "\n"; }
+my $found_files = do {
+    use File::Find;
+    use File::Basename;
+    my @files_1 = ();
+    my $start_1 = q{.};
+
+    sub find_files_1 {
+        my $file_1 = $File::Find::name;
+        if (!(-f $file_1)) {
+            return;
+        }
+        if (!(basename($file_1) =~ m/^.*.sh$/xms)) {
+            return;
+        }
+        push @files_1, $file_1;
+        return;
+    }
+    find( \&find_files_1, $start_1 );
+    join "\n", @files_1;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if (!($found_files =~ m{\n$}msx)) { print "\n"; }
+
+```
+
+perlcritic_wrapper: Started, parse args took 3.6e-05s
+perlcritic_wrapper: File read took 0.001959s
+perlcritic_wrapper: SHA1 hash took 0.000102s
+perlcritic_wrapper: Cache hit, read took 0.008997s
+
+FAILED: Code is not tidy
+
+
+================================================================================
+ABSTRACT SYNTAX TREE:
+================================================================================
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== File and Directory Operations ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File listing:")] }, None)], redirects: [], env_vars: {"file_list": CommandSubstitution(Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("file_list")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Found shell scripts:")] }, None)], redirects: [], env_vars: {"found_files": CommandSubstitution(Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-maxdepth", None), Literal("1", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("found_files")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+
+================================================================================
+STDOUT COMPARISON (DIFF):
+================================================================================
+--- shell_stdout
++++ perl_stdout
+-=== File and Directory Operations ===
+-File listing:
+-.
+-..
+-000__01_file_directory_operations.sh
+-000__02_output_formatting_commands.sh
+-000__03_file_manipulation_commands.sh
+-000__04a_basic_command_substitution.sh
+-000__04b_file_directory_operations.sh
+-000__04c_text_processing_commands.sh
+-000__04d_system_utilities.sh
+-000__04e_file_manipulation.sh
+-000__04f_output_formatting.sh
+-000__04g_checksum_commands.sh
+-000__04h_complex_examples.sh
+-000__05_system_utilities.sh
+-000__06_text_processing_commands.sh
+-000__07_find_path_commands.sh
+-001_simple.sh
+-002_control_flow.sh
+-003_pipeline.sh
+-004_test_quoted.sh
+-005_args.sh
+-006_misc.sh
+-007_cat_EOF.sh
+-008_simple_backup.sh
+-009_arrays.sh
+-010_pattern_matching.sh
+-011_brace_expansion.sh
+-012_process_substitution.sh
+-013_parameter_expansion.sh
+-014_ansi_quoting.sh
+-015_grep_advanced.sh
+-016_grep_basic.sh
+-017_grep_context.sh
+-018_grep_params.sh
+-019_grep_regex.sh
+-020_ansi_quoting_basic.sh
+-021_ansi_quoting_escape.sh
+-022_ansi_quoting_unicode.sh
+-023_ansi_quoting_practical.sh
+-024_parameter_expansion_case.sh
+-025_parameter_expansion_advanced.sh
+-026_parameter_expansion_more.sh
+-027_parameter_expansion_defaults.sh
+-028_arrays_indexed.sh
+-029_arrays_associative.sh
+-030_control_flow_if.sh
+-031_control_flow_loops.sh
+-032_control_flow_function.sh
+-033_brace_expansion_basic.sh
+-034_brace_expansion_advanced.sh
+-035_brace_expansion_practical.sh
+-036_pattern_matching_basic.sh
+-037_pattern_matching_extglob.sh
+-038_pattern_matching_nocase.sh
+-039_process_substitution_here.sh
+-040_process_substitution_comm.sh
+-041_process_substitution_mapfile.sh
+-042_process_substitution_advanced.sh
+-043_home.sh
+-044_find_example.sh
+-045_shell_calling_perl.sh
+-046_cd..sh
+-047_for_arithematic.sh
+-048_subprocess.sh
+-049_local.sh
+-050_test_ls_star_dot_sh.sh
+-051_primes.sh
+-052_numeric_computations.sh
+-053_gcd.sh
+-054_fibonacci.sh
+-055_factorize.sh
+-056_send_args.sh
+-057_case.sh
+-058_advanced_bash_idioms.sh
+-059_issue3.sh
+-060_issue5.sh
+-061_test_local_names_preserved.sh
+-062_01_ambiguous_operators.sh
+-062_02_complex_parameter_expansions.sh
+-062_03_complex_heredocs.sh
+-062_04_nested_arithmetic.sh
+-062_05_nested_command_substitution.sh
+-062_06_process_substitution.sh
+-062_07_complex_brace_expansion.sh
+-062_08_simple_case.sh
+-062_09_complex_function.sh
+-062_10_simple_pipeline.sh
+-062_11_mixed_arithmetic.sh
+-062_12_complex_string_interpolation.sh
+-062_13_simple_test_expressions.sh
+-062_14_complex_array_operations.sh
+-062_15_complex_local_variables.sh
+-062_hard_to_lex.sh
+-063_01_deeply_nested_arithmetic.sh
+-063_02_complex_array_assignments.sh
+-063_03_nested_command_substitutions.sh
+-063_04_complex_parameter_expansion.sh
+-063_05_heredoc_with_complex_content.sh
+-063_06_complex_pipeline_background.sh
+-063_07_nested_if_statements.sh
+-063_08_complex_case_statement.sh
+-063_09_complex_function_parameter_handling.sh
+-063_10_complex_for_loop.sh
+-063_11_complex_while_loop.sh
+-063_12_complex_eval.sh
+-063_13_nested_subshells.sh
+-063_14_complex_redirects.sh
+-063_15_complex_function_definition.sh
+-063_16_complex_test_expressions.sh
+-063_17_nested_brace_expansion.sh
+-063_18_complex_here_string.sh
+-063_19_complex_function_call.sh
+-063_20_final_complex_construct.sh
+-063_hard_to_parse.sh
+-064_01_complex_nested_subshells.sh
+-064_02_nested_brace_expansions.sh
+-064_03_complex_parameter_expansion.sh
+-064_04_extended_glob_patterns.sh
+-064_05_complex_case_statement.sh
+-064_06_nested_arithmetic_expressions.sh
+-064_07_complex_array_operations.sh
+-064_08_heredocs_with_variable_interpolation.sh
+-064_09_process_substitution_pipeline.sh
+-064_10_nested_function_definitions.sh
+-064_11_complex_test_expressions.sh
+-064_12_brace_expansion_nested_sequences.sh
+-064_13_complex_string_manipulation.sh
+-064_14_nested_command_substitution_arithmetic.sh
+-064_15_complex_pipeline_multiple_redirects.sh
+-064_16_function_complex_argument_handling.sh
+-064_17_complex_while_loop_nested_conditionals.sh
+-064_18_array_slicing_manipulation.sh
+-064_19_complex_pattern_matching_extended_globs.sh
+-064_20_nested_subshells_environment_variables.sh
+-064_21_complex_string_interpolation_multiple_variables.sh
+-064_22_function_returning_complex_data_structures.sh
+-064_23_complex_error_handling_traps.sh
+-064_24_advanced_parameter_expansion.sh
+-064_25_complex_command_chaining.sh
+-064_hard_to_generate.sh
+-065_yes_head_while.sh
+-065_yes_head_while.sh.perl
+-1
+-900_if2echo.sh
+-999_pwd.sh
+-a.logtmp
+-comparison.txt
+-config.txt
+-stderr.txt
+-test_025.pl
+-test_binary.txt
+-test_find.sh
+-test_grep.sh
+-test_perl_critic.sh
+-test_recursive_find.pl
+-test_simple_function.sh
+-test_system_builtin.sh
+-Found shell scripts:
+-./000__01_file_directory_operations.sh
+-./000__02_output_formatting_commands.sh
+-./000__03_file_manipulation_commands.sh
+-./000__04a_basic_command_substitution.sh
+-./000__04b_file_directory_operations.sh
+-./000__04c_text_processing_commands.sh
+-./000__04d_system_utilities.sh
+-./000__04e_file_manipulation.sh
+-./000__04f_output_formatting.sh
+-./000__04g_checksum_commands.sh
+-./000__04h_complex_examples.sh
+-./000__05_system_utilities.sh
+-./000__06_text_processing_commands.sh
+-./000__07_find_path_commands.sh
+-./001_simple.sh
+-./002_control_flow.sh
+-./003_pipeline.sh
+-./004_test_quoted.sh
+-./005_args.sh
+-./006_misc.sh
+-./007_cat_EOF.sh
+-./008_simple_backup.sh
+-./009_arrays.sh
+-./010_pattern_matching.sh
+-./011_brace_expansion.sh
+-./012_process_substitution.sh
+-./013_parameter_expansion.sh
+-./014_ansi_quoting.sh
+-./015_grep_advanced.sh
+-./016_grep_basic.sh
+-./017_grep_context.sh
+-./018_grep_params.sh
+-./019_grep_regex.sh
+-./020_ansi_quoting_basic.sh
+-./021_ansi_quoting_escape.sh
+-./022_ansi_quoting_unicode.sh
+-./023_ansi_quoting_practical.sh
+-./024_parameter_expansion_case.sh
+-./025_parameter_expansion_advanced.sh
+-./026_parameter_expansion_more.sh
+-./027_parameter_expansion_defaults.sh
+-./028_arrays_indexed.sh
+-./029_arrays_associative.sh
+-./030_control_flow_if.sh
+-./031_control_flow_loops.sh
+-./032_control_flow_function.sh
+-./033_brace_expansion_basic.sh
+-./034_brace_expansion_advanced.sh
+-./035_brace_expansion_practical.sh
+-./036_pattern_matching_basic.sh
+-./037_pattern_matching_extglob.sh
+-./038_pattern_matching_nocase.sh
+-./039_process_substitution_here.sh
+-./040_process_substitution_comm.sh
+-./041_process_substitution_mapfile.sh
+-./042_process_substitution_advanced.sh
+-./043_home.sh
+-./044_find_example.sh
+-./045_shell_calling_perl.sh
+-./046_cd..sh
+-./047_for_arithematic.sh
+-./048_subprocess.sh
+-./049_local.sh
+-./050_test_ls_star_dot_sh.sh
+-./051_primes.sh
+-./052_numeric_computations.sh
+-./053_gcd.sh
+-./054_fibonacci.sh
+-./055_factorize.sh
+-./056_send_args.sh
+-./057_case.sh
+-./058_advanced_bash_idioms.sh
+-./059_issue3.sh
+-./060_issue5.sh
+-./061_test_local_names_preserved.sh
+-./062_01_ambiguous_operators.sh
+-./062_02_complex_parameter_expansions.sh
+-./062_03_complex_heredocs.sh
+-./062_04_nested_arithmetic.sh
+-./062_05_nested_command_substitution.sh
+-./062_06_process_substitution.sh
+-./062_07_complex_brace_expansion.sh
+-./062_08_simple_case.sh
+-./062_09_complex_function.sh
+-./062_10_simple_pipeline.sh
+-./062_11_mixed_arithmetic.sh
+-./062_12_complex_string_interpolation.sh
+-./062_13_simple_test_expressions.sh
+-./062_14_complex_array_operations.sh
+-./062_15_complex_local_variables.sh
+-./062_hard_to_lex.sh
+-./063_01_deeply_nested_arithmetic.sh
+-./063_02_complex_array_assignments.sh
+-./063_03_nested_command_substitutions.sh
+-./063_04_complex_parameter_expansion.sh
+-./063_05_heredoc_with_complex_content.sh
+-./063_06_complex_pipeline_background.sh
+-./063_07_nested_if_statements.sh
+-./063_08_complex_case_statement.sh
+-./063_09_complex_function_parameter_handling.sh
+-./063_10_complex_for_loop.sh
+-./063_11_complex_while_loop.sh
+-./063_12_complex_eval.sh
+-./063_13_nested_subshells.sh
+-./063_14_complex_redirects.sh
+-./063_15_complex_function_definition.sh
+-./063_16_complex_test_expressions.sh
+-./063_17_nested_brace_expansion.sh
+-./063_18_complex_here_string.sh
+-./063_19_complex_function_call.sh
+-./063_20_final_complex_construct.sh
+-./063_hard_to_parse.sh
+-./064_01_complex_nested_subshells.sh
+-./064_02_nested_brace_expansions.sh
+-./064_03_complex_parameter_expansion.sh
+-./064_04_extended_glob_patterns.sh
+-./064_05_complex_case_statement.sh
+-./064_06_nested_arithmetic_expressions.sh
+-./064_07_complex_array_operations.sh
+-./064_08_heredocs_with_variable_interpolation.sh
+-./064_09_process_substitution_pipeline.sh
+-./064_10_nested_function_definitions.sh
+-./064_11_complex_test_expressions.sh
+-./064_12_brace_expansion_nested_sequences.sh
+-./064_13_complex_string_manipulation.sh
+-./064_14_nested_command_substitution_arithmetic.sh
+-./064_15_complex_pipeline_multiple_redirects.sh
+-./064_16_function_complex_argument_handling.sh
+-./064_17_complex_while_loop_nested_conditionals.sh
+-./064_18_array_slicing_manipulation.sh
+-./064_19_complex_pattern_matching_extended_globs.sh
+-./064_20_nested_subshells_environment_variables.sh
+-./064_21_complex_string_interpolation_multiple_variables.sh
+-./064_22_function_returning_complex_data_structures.sh
+-./064_23_complex_error_handling_traps.sh
+-./064_24_advanced_parameter_expansion.sh
+-./064_25_complex_command_chaining.sh
+-./064_hard_to_generate.sh
+-./065_yes_head_while.sh
+-./900_if2echo.sh
+-./999_pwd.sh
+-./test_find.sh
+-./test_grep.sh
+-./test_perl_critic.sh
+-./test_simple_function.sh
+-./test_system_builtin.sh
+
+
+================================================================================
+STDERR COMPARISON:
+================================================================================
+STDERR values are identical:
+Shell stderr: ''
+Perl stderr: ''
+
+================================================================================
+SUMMARY: 0 out of 146 tests passed before first failure
+================================================================================
+
+BRIEF FAILURE SUMMARY:
+Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my @ls_files_0 = ();
+    if (-f q{.}) {
+        push @ls_files_0, q{.};
+    }
+    elsif (-d q{.}) {
+        if (opendir my $dh, q{.}) {
+            while (my $file = readdir $dh) {
+                next if $file =~ /^__tmp_.*[.]pl$/msx;
+                next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+        }
+    }
+    join "\n", @ls_files_0;
+};
+print "File listing:\n";
+print $file_list;
+if (!($file_list =~ m{\n$}msx)) { print "\n"; }
+my $found_files = do {
+    use File::Find;
+    use File::Basename;
+    my @files_1 = ();
+    my $start_1 = q{.};
+
+    sub find_files_1 {
+        my $file_1 = $File::Find::name;
+        if (!(-f $file_1)) {
+            return;
+        }
+        if (!(basename($file_1) =~ m/^.*.sh$/xms)) {
+            return;
+        }
+        push @files_1, $file_1;
+        return;
+    }
+    find( \&find_files_1, $start_1 );
+    join "\n", @files_1;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if (!($found_files =~ m{\n$}msx)) { print "\n"; }
+
+```
+
+perlcritic_wrapper: Started, parse args took 4.9e-05s
+perlcritic_wrapper: File read took 0.001196s
+perlcritic_wrapper: SHA1 hash took 0.000109s
+perlcritic_wrapper: No cache file found
+perlcritic_wrapper: Perl::Critic init took 0.955889s
+perlcritic_wrapper: Perl::Critic analysis took 0.727559s
+perlcritic_wrapper: Perltidy subprocess took 1.257173s
+perlcritic_wrapper: Perltidy check took 1.258777s
+perlcritic_wrapper: Output generation took 1.3e-05s
+perlcritic_wrapper: Cache write took 0.001419s
+perlcritic_wrapper: Total time 2.947406s
+
+perltidy wrapper failed with exit code: 1
+FAILED: Code is not tidy
+
+Writing test count 0 to first_n_tests_passed.txt
+Current working directory: "D:\\GitHub\\sh2perl"
+Successfully wrote test count 0 and matching stdout lines 0 to first_n_tests_passed.txt
+
+To run test again: ./fail 000__01
+error: process didn't exit successfully: `target\debug\debashc.exe fail --perl-critic 000__01` (exit code: 1)

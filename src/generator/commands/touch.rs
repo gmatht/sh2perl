@@ -6,12 +6,22 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
 
     // touch command syntax: touch [options] file...
     let mut files = Vec::new();
+    let mut use_shell_fallback = false;
+    let mut no_create = false;
 
     // Parse touch options and expand brace expansions
     for arg in &cmd.args {
         match arg {
             Word::Literal(arg_str, _) => {
-                if !arg_str.starts_with('-') {
+                if arg_str == "-v" || arg_str == "--verbose" {
+                    use_shell_fallback = true;
+                } else if arg_str == "-c" || arg_str == "--no-create" {
+                    no_create = true;
+                } else if arg_str == "-h" || arg_str == "--no-dereference" {
+                    use_shell_fallback = true;
+                } else if arg_str.starts_with('-') {
+                    use_shell_fallback = true;
+                } else {
                     files.push(format!("\"{}\"", arg_str));
                 }
             }
@@ -145,6 +155,14 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         }
     }
 
+    if use_shell_fallback {
+        let command = Command::Simple(cmd.clone());
+        let command_str = crate::generator::redirects::generate_bash_command_string(&command);
+        let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+
+        return format!("do {{ my $touch_cmd = {}; qx{{$touch_cmd}}; }};\n", command_lit);
+    }
+
     if files.is_empty() {
         output.push_str("croak \"touch: missing file operand\\n\";\n");
     } else {
@@ -224,29 +242,31 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
             output.push_str(&generator.indent());
             output.push_str("else {\n");
             generator.indent_level += 1;
-            // File doesn't exist, create it
-            output.push_str(&generator.indent());
-            output.push_str(&format!("if ( open my $fh, '>', {} ) {{\n", quoted_file));
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
-            generator.indent_level -= 1;
-            // Silent operation - no output unless error
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
-            output.push_str(&generator.indent());
-            output.push_str("else {\n");
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str(&format!(
-                "croak \"touch: cannot create \", {},\n",
-                quoted_file
-            ));
-            output.push_str(&generator.indent());
-            output.push_str("  \": $ERRNO\\n\";\n");
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
+            if !no_create {
+                // File doesn't exist, create it
+                output.push_str(&generator.indent());
+                output.push_str(&format!("if ( open my $fh, '>', {} ) {{\n", quoted_file));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
+                generator.indent_level -= 1;
+                // Silent operation - no output unless error
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+                output.push_str(&generator.indent());
+                output.push_str("else {\n");
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!(
+                    "croak \"touch: cannot create \", {},\n",
+                    quoted_file
+                ));
+                output.push_str(&generator.indent());
+                output.push_str("  \": $ERRNO\\n\";\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
+            }
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");

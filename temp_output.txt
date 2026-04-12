@@ -1,0 +1,3 @@
+'Output 1' ; echo 'Output 2' ; cat temp_output.txt; rm temp_output.txt
+'Output 1' ; echo 'Output 2' ; cat temp_output.txt; rm temp_output.txt
+'Output 1' ; echo 'Output 2' ; cat temp_output.txt; rm temp_output.txt

@@ -1,0 +1,14 @@
+Perltidy version is 20250711
+
+clean_perl.pl: Begin Error Output Stream
+
+2: > #!/usr/bin/env perl
+   ^
+found > where term expected
+103: final indentation level: 1
+
+Final nesting depth of '{'s is 1
+The most recent un-matched '{' is on line 101 (its closing '}' was not found)
+101: my $awk_result = do {
+                         ^
+103: To save a full .LOG file rerun with -g

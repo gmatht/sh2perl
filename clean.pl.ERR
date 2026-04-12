@@ -1,0 +1,13 @@
+Perltidy version is 20250711
+
+clean.pl: Begin Error Output Stream
+
+66: Perl execution time:  0.0684 seconds
+                          ------ ^
+found bareword where operator expected (previous token underlined)
+
+67: Bash execution time:  0.1313 seconds
+                          ------ ^
+found bareword where operator expected (previous token underlined)
+73: unexpected character decimal 163 (£) in script
+73: Giving up after error

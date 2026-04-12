@@ -6,13 +6,19 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
 
     // mv command syntax: mv [options] source... destination
     let mut _force = false;
+    let mut verbose = false;
     let mut sources = Vec::new();
+    let mut use_shell_fallback = false;
 
     // Parse mv options
     for arg in &cmd.args {
         if let Word::Literal(arg_str, _) = arg {
             match arg_str.as_str() {
                 "-f" | "--force" => _force = true,
+                "-v" | "--verbose" => verbose = true,
+                _ if arg_str.starts_with('-') => {
+                    use_shell_fallback = true;
+                }
                 _ => {
                     if !arg_str.starts_with('-') {
                         sources.push(generator.perl_string_literal(arg));
@@ -22,6 +28,17 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         } else {
             sources.push(generator.perl_string_literal(arg));
         }
+    }
+
+    if use_shell_fallback {
+        let command = Command::Simple(cmd.clone());
+        let command_str = generator.generate_command_string_for_system(&command);
+        let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+
+        return format!(
+            "do {{\n    my $mv_cmd = {};\n    qx{{$mv_cmd}};\n}};\n",
+            command_lit
+        );
     }
 
     if sources.len() < 2 {
@@ -45,7 +62,7 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         }
 
         for source in &sources {
-            let source = if source.starts_with('"') || source.starts_with("'") {
+            let source = if source.starts_with('"') || source.starts_with('\'') {
                 source.clone()
             } else {
                 format!("\"{}\"", source)
@@ -60,9 +77,13 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             output.push_str(&generator.indent());
             output.push_str("if ( -e $dest && -d $dest ) {\n");
             generator.indent_level += 1;
-            // Destination is a directory, append source name
+            // Destination is a directory, append the source basename.
             output.push_str(&generator.indent());
-            output.push_str(&format!("$dest = \"$dest/{}\";\n", source));
+            output.push_str(&format!("my $source_name = {};\n", source));
+            output.push_str(&generator.indent());
+            output.push_str("$source_name =~ s{^.*[\\/]}{};\n");
+            output.push_str(&generator.indent());
+            output.push_str("$dest = \"$dest/$source_name\";\n");
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");
@@ -113,8 +134,10 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             output.push_str(&generator.indent());
             output.push_str(&format!("if ( move( {}, $dest ) ) {{\n", source));
             generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str(&format!("# print \"mv: moved {} to $dest\\n\";\n", source));
+            if verbose {
+                output.push_str(&generator.indent());
+                output.push_str(&format!("print \"renamed {} -> '$dest'\\n\";\n", source));
+            }
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("} else {\n");

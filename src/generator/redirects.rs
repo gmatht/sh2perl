@@ -210,6 +210,20 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
             }
             result
         }
+        Command::And(left, right) => {
+            format!(
+                "{} && {}",
+                generate_bash_command_string(left),
+                generate_bash_command_string(right)
+            )
+        }
+        Command::Or(left, right) => {
+            format!(
+                "{} || {}",
+                generate_bash_command_string(left),
+                generate_bash_command_string(right)
+            )
+        }
         Command::Subshell(subshell_cmd) => {
             format!("({})", generate_bash_command_string(&**subshell_cmd))
         }

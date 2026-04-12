@@ -32,6 +32,97 @@ fn parse_at_prefixed_word(lexer: &mut Lexer) -> Option<Word> {
     }
 }
 
+fn plain_text_of_word(word: &Word) -> Option<String> {
+    match word {
+        Word::Literal(text, _) => Some(text.clone()),
+        Word::StringInterpolation(interp, _) => {
+            let mut text = String::new();
+            for part in &interp.parts {
+                if let StringPart::Literal(s) = part {
+                    text.push_str(s);
+                } else {
+                    return None;
+                }
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
+    match word {
+        Word::Literal(text, _) => {
+            text.push_str(fragment);
+            true
+        }
+        Word::StringInterpolation(interp, _) => {
+            if let Some(StringPart::Literal(last)) = interp.parts.last_mut() {
+                last.push_str(fragment);
+            } else {
+                interp.parts.push(StringPart::Literal(fragment.to_string()));
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn merge_contiguous_quoted_fragments(
+    lexer: &mut Lexer,
+    word: &mut Word,
+) -> Result<(), ParserError> {
+    loop {
+        let prev_end = match lexer.tokens.get(lexer.current.saturating_sub(1)) {
+            Some((_, _, end)) => *end,
+            None => break,
+        };
+        let next_start = match lexer.tokens.get(lexer.current) {
+            Some((_, start, _)) => *start,
+            None => break,
+        };
+
+        if next_start != prev_end {
+            break;
+        }
+
+        let fragment = match lexer.peek() {
+            Some(Token::SingleQuotedString) => {
+                let text = lexer.get_string_text()?;
+                strip_outer_quotes(&text)
+            }
+            Some(Token::DoubleQuotedString) => {
+                let fragment_word = parse_string_interpolation(lexer)?;
+                match plain_text_of_word(&fragment_word) {
+                    Some(text) => text,
+                    None => break,
+                }
+            }
+            Some(Token::DollarSingleQuotedString) => match parse_ansic_quoted_string(lexer)? {
+                Word::Literal(text, _) => text,
+                _ => break,
+            },
+            _ => break,
+        };
+
+        if !append_plain_text(word, &fragment) {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn strip_outer_quotes(text: &str) -> String {
+    if (text.starts_with('"') && text.ends_with('"'))
+        || (text.starts_with('\'') && text.ends_with('\''))
+    {
+        text[1..text.len() - 1].to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Handle backtick command substitution first
     if matches!(lexer.peek(), Some(Token::BacktickChar)) {
@@ -54,7 +145,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         }
         eprintln!("DEBUG: Backtick content: '{}'", cmd_content);
         // Parse the command content
-        match parse_simple_command_from_text(&cmd_content) {
+        match crate::parser::commands::parse_pipeline_from_text(&cmd_content) {
             Ok(command) => {
                 eprintln!("DEBUG: Successfully parsed backtick command: {:?}", command);
                 return Ok(Word::CommandSubstitution(Box::new(command), None));
@@ -91,6 +182,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::Colon)
             | Some(Token::Star)
             | Some(Token::Percent)
+            | Some(Token::Comma)
     ) {
         let mut combined = String::new();
         loop {
@@ -105,9 +197,10 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
-                | Some(Token::Colon)
-                | Some(Token::Star)
-                | Some(Token::Percent) => {
+            | Some(Token::Colon)
+            | Some(Token::Star)
+            | Some(Token::Percent)
+            | Some(Token::Comma) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -381,10 +474,13 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         }
     };
 
+    let mut result = result?;
+    merge_contiguous_quoted_fragments(lexer, &mut result)?;
+
     // Skip inline whitespace after consuming the word
     lexer.skip_inline_whitespace_and_comments();
 
-    result
+    Ok(result)
 }
 
 /// Parse a word without skipping newlines at the end.
@@ -412,6 +508,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::Colon)
             | Some(Token::Star)
             | Some(Token::Percent)
+            | Some(Token::Comma)
     ) {
         let mut combined = String::new();
         loop {
@@ -426,9 +523,10 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
-                | Some(Token::Colon)
-                | Some(Token::Star)
-                | Some(Token::Percent) => {
+            | Some(Token::Colon)
+            | Some(Token::Star)
+            | Some(Token::Percent)
+            | Some(Token::Comma) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -702,10 +800,13 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         }
     };
 
+    let mut result = result?;
+    merge_contiguous_quoted_fragments(lexer, &mut result)?;
+
     // Don't skip inline whitespace after consuming the word - this preserves newlines
     // for argument parsing context
 
-    result
+    Ok(result)
 }
 
 pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
@@ -2245,7 +2346,7 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
             }
             Err(_) => {
                 // Fall back to using the simple command parser
-                match parse_simple_command_from_text(command_text) {
+                match crate::parser::commands::parse_pipeline_from_text(command_text) {
                     Ok(command) => Ok(Word::CommandSubstitution(Box::new(command), None)),
                     Err(_) => {
                         // Fall back to treating it as a literal
@@ -2256,7 +2357,7 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
         }
     } else {
         // Use the simple command parser for commands without command substitutions
-        match parse_simple_command_from_text(command_text) {
+        match crate::parser::commands::parse_pipeline_from_text(command_text) {
             Ok(command) => Ok(Word::CommandSubstitution(Box::new(command), None)),
             Err(_) => {
                 // Fall back to treating it as a literal

@@ -182,17 +182,10 @@ sub process_system_calls_string {
         my $perl_result = convert_shell_to_perl($full_command, 0);
         next unless $perl_result;
 
-        my $statement_text = $system_call->content;
-        my $replacement = $perl_result;
-        $replacement = "do {\n$replacement\n};" unless $replacement =~ /^do\s*\{/;
-
-        my $pos = rindex($content, $statement_text);
-        next if $pos < 0;
-
-        substr($content, $pos, length($statement_text)) = $replacement;
+        replace_system_call_with_code($system_call, $perl_result);
     }
 
-    return $content;
+    return $document->serialize;
 }
 
 sub rewrite_banned_substrings_in_plain_strings {
@@ -265,15 +258,22 @@ sub _escape_perl_fragment {
 sub process_backticks_string {
     my ($content) = @_;
 
-    # Find all backtick expressions and replace them, but leave comment-only
-    # lines untouched so we do not inject active code from commented examples.
+    # Protect comment-only lines, then rewrite backticks across the whole file
+    # so multiline command substitutions are handled correctly.
     my @lines = split /\n/, $content, -1;
-    for my $line (@lines) {
-        next if $line =~ /^\s*#/;
-        $line =~ s{`([^`]+)`}{process_single_backtick_string(undef, undef, $1)}ge;
+    my @comment_lines;
+
+    for my $i (0 .. $#lines) {
+        next unless $lines[$i] =~ /^\s*#/;
+        push @comment_lines, $lines[$i];
+        $lines[$i] = "__PURIFY_COMMENT_LINE_" . ($#comment_lines) . "__";
     }
 
-    return join("\n", @lines);
+    $content = join("\n", @lines);
+    $content =~ s{`((?:\\.|[^`])*)`}{process_single_backtick_string(undef, undef, $1)}ges;
+    $content =~ s{__PURIFY_COMMENT_LINE_(\d+)__}{$comment_lines[$1]}g;
+
+    return $content;
 }
 
 sub process_single_backtick_string {
@@ -340,20 +340,38 @@ sub reconstruct_shell_command_from_system_call {
     return unless $tokens && @{$tokens};
 
     my @parts;
-    my $is_first = 1;
     for my $token (@{$tokens}) {
-        if ($is_first && $token->isa('PPI::Token::Quote')) {
-            my $part = $token->string;
-            if (defined $token->content && $token->content =~ /^"/) {
-                $part = decode_perl_double_quoted_string($part);
-            }
-            push @parts, $part;
-        } else {
-            push @parts, $token->content;
+        next if $token->content eq ',';
+
+        my $part = $token->content;
+        if ($token->isa('PPI::Token::Quote')) {
+            # Keep the original escape text but drop the surrounding quotes.
+            $part =~ s/^['"]//;
+            $part =~ s/['"]$//;
         }
-        $is_first = 0;
+
+        push @parts, $part;
     }
-    return join(' ', @parts);
+
+    return unless @parts;
+
+    # A single-argument system() call is already a shell command string.
+    # Preserve it verbatim so debashc can see the original shell syntax.
+    return $parts[0] if @parts == 1;
+
+    # List-form system() should keep arguments literal, so quote every part.
+    # This preserves tokens like | as data instead of shell operators.
+    my @rendered_parts = map { _shell_quote_for_system($_) } @parts;
+
+    return join(' ', @rendered_parts);
+}
+
+sub _shell_quote_for_system {
+    my ($text) = @_;
+    return "''" unless defined $text && length $text;
+    return $text if $text =~ /^[A-Za-z0-9_\@%+=:,\.\/-]+$/;
+    $text =~ s/'/'"'"'/g;
+    return "'$text'";
 }
 
 sub decode_perl_double_quoted_string {
@@ -455,8 +473,8 @@ sub convert_shell_to_perl {
     print "Converting shell command: $shell_command\n" if $verbose;
     
     # Use debashc to convert the shell command to Perl
-    # Backticks need inline expressions; system calls can use full scripts
-    my $mode = $is_backticks ? "--inline" : "--perl";
+    # Backticks need inline expressions; system() calls should use the system path
+    my $mode = $is_backticks ? "--inline" : "--system";
     my $quoted_shell_command = $shell_command;
     $quoted_shell_command =~ s/'/'"'"'/g;
     $quoted_shell_command = "'$quoted_shell_command'";
@@ -563,10 +581,11 @@ sub extract_perl_from_debashc_output {
             $code = extract_core_perl_logic_ppi($code);
         }
         
-        # Clean up the code - remove trailing semicolons and extra whitespace
-        $code =~ s/;\s*$//;
+        # Clean up the code - remove trailing whitespace while preserving
+        # terminating semicolons for statement-valued do blocks.
         $code =~ s/\n\s*$//;
-        
+        $code .= ';' if $code =~ /^do\s*\{/ && $code !~ /;\s*$/;
+
         return $code;
     }
     
@@ -616,7 +635,24 @@ sub extract_core_perl_logic_ppi {
         push @core_statements, $content;
     }
 
-    return @core_statements ? join("\n", @core_statements) . "\n" : $perl_code;
+    return $perl_code unless @core_statements;
+
+    my $core_code = join("\n", @core_statements) . "\n";
+    my $needs_open3 = $core_code =~ /\bopen3\b/;
+    my $needs_carp = $core_code =~ /\b(?:croak|confess)\b/;
+    my $needs_english = $core_code =~ /\$(?:OS_ERROR|ERRNO|CHILD_ERROR|EVAL_ERROR)\b/;
+
+    my @filtered_statements;
+    for my $content (@core_statements) {
+        next if $content =~ /^use\s+locale;/;
+        next if $content =~ /^select\(\(select\(STDOUT\), \$\| = 1\)\[0\]\);$/;
+        next if $content =~ /^use\s+IPC::Open3;/ && !$needs_open3;
+        next if $content =~ /^use\s+Carp;/ && !$needs_carp;
+        next if $content =~ /^use\s+English\b/ && !$needs_english;
+        push @filtered_statements, $content;
+    }
+
+    return @filtered_statements ? join("\n", @filtered_statements) . "\n" : $core_code;
 }
 
 __END__
