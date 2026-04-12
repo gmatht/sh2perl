@@ -1,0 +1,59 @@
+{
+  "name": "sh2perl Development",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "test",
+  "workspaceFolder": "/workspace",
+  "shutdownAction": "stopCompose",
+  
+  // Features to add to the container
+  "features": {},
+  
+  // VS Code/Cursor extensions to install in container
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "serayuzgur.crates",
+        "tamasfe.even-better-toml",
+        "ms-vscode.vscode-json",
+        "perl.perl"
+      ],
+      "settings": {
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "rust-analyzer.cargo.buildScripts.enable": true,
+        "rust-analyzer.cargo.allFeatures": true,
+        "files.exclude": {
+          "**/target": false,
+          "**/.git": false
+        },
+        "files.watcherExclude": {
+          "**/target/**": true,
+          "**/logs/**": true
+        },
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer",
+          "editor.formatOnSave": true
+        },
+        "[perl]": {
+          "editor.tabSize": 4
+        }
+      }
+    }
+  },
+  
+  // Commands to run after container is created
+  // Build is optional - comment out if you want to build manually
+  "postCreateCommand": "echo 'Container ready. Run: cargo build --bin debashc'",
+  
+  // Port forwarding (if needed for web interface or other services)
+  "forwardPorts": [],
+  
+  // Mount the project directory (already handled by docker-compose.yml)
+  // Additional mounts can be added here if needed
+  
+  // Remote user (use root for simplicity, or create a non-root user)
+  "remoteUser": "root"
+}
+
+

@@ -235,10 +235,18 @@ pub fn generate_echo_command(
                                 {
                                     generator.convert_string_interpolation_to_perl(&interp)
                                 } else {
-                                    generator.perl_string_literal(arg)
+                                    let rendered = generator.perl_string_literal(arg);
+                                    rendered
+                                        .replace("\\\\n", "\n")
+                                        .replace("\\\\t", "\t")
+                                        .replace("\\\\r", "\r")
                                 }
                             } else {
-                                generator.perl_string_literal(arg)
+                                let rendered = generator.perl_string_literal(arg);
+                                rendered
+                                    .replace("\\\\n", "\n")
+                                    .replace("\\\\t", "\t")
+                                    .replace("\\\\r", "\r")
                             }
                         }
                     }

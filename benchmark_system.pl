@@ -3,10 +3,10 @@
 use strict;
 use warnings;
 use Time::HiRes qw(gettimeofday tv_interval);
-use File::Temp qw(tempfile tempdir);
+use File::Temp qw(tempfile);
 use File::Spec;
 use File::Basename;
-use Cwd qw(abs_path);
+use Cwd qw(abs_path getcwd);
 use Data::Dumper;
 
 # Benchmark configuration
@@ -70,7 +70,11 @@ sub log_message {
 }
 
 sub create_test_environment {
-    my $test_dir = tempdir("sh2perl_benchmark_XXXXXX", CLEANUP => 1);
+    my $repo_root = dirname(abs_path($0));
+    my $test_dir = File::Spec->catdir($repo_root, '.test-work', 'benchmark');
+    require File::Path;
+    File::Path::remove_tree($test_dir);
+    File::Path::make_path($test_dir);
     log_message("INFO", "Created test environment: $test_dir");
     return $test_dir;
 }
@@ -147,7 +151,7 @@ sub run_shell_script {
     my $original_dir = getcwd();
     chdir $test_dir;
     
-    my $result = measure_execution_time("bash $script_path");
+    my $result = measure_execution_time("bash \"$script_path\"");
     
     chdir $original_dir;
     return $result;
@@ -160,7 +164,7 @@ sub run_perl_script {
     my $original_dir = getcwd();
     chdir $test_dir;
     
-    my $result = measure_execution_time("perl $script_path");
+    my $result = measure_execution_time("perl \"$script_path\"");
     
     chdir $original_dir;
     return $result;
@@ -169,8 +173,9 @@ sub run_perl_script {
 sub benchmark_single_test {
     my ($test_name, $test_dir) = @_;
     
-    my $shell_script = "examples/$test_name.sh";
-    my $perl_script = "examples.pl/$test_name.pl";
+    my $repo_root = dirname(abs_path($0));
+    my $shell_script = File::Spec->catfile($repo_root, 'examples', "$test_name.sh");
+    my $perl_script = File::Spec->catfile($repo_root, 'examples.pl', "$test_name.pl");
     
     # Check if both files exist
     unless (-f $shell_script && -f $perl_script) {
@@ -216,8 +221,8 @@ sub benchmark_single_test {
         
         # Memory measurement (if enabled)
         if ($BENCHMARK_CONFIG->{memory_check}) {
-            my $shell_memory = measure_memory_usage("bash $shell_script");
-            my $perl_memory = measure_memory_usage("perl $perl_script");
+            my $shell_memory = measure_memory_usage("bash \"$shell_script\"");
+            my $perl_memory = measure_memory_usage("perl \"$perl_script\"");
             push @{$results->{shell_memory}}, $shell_memory;
             push @{$results->{perl_memory}}, $perl_memory;
         }
@@ -368,6 +373,7 @@ sub run_benchmark_suite {
     log_message("INFO", "Configuration: " . Dumper($BENCHMARK_CONFIG));
     
     my $test_dir = create_test_environment();
+    my $repo_root = dirname(abs_path($0));
     
     my %all_results = ();
     
@@ -385,7 +391,7 @@ sub run_benchmark_suite {
     generate_report(\%all_results);
     
     # Save results to file
-    my $results_file = "benchmark_results_" . time() . ".json";
+    my $results_file = File::Spec->catfile($repo_root, '.test-work', 'benchmark_results.json');
     open(my $fh, '>', $results_file) or die "Cannot write results file: $!";
     print $fh JSON::encode_json(\%all_results);
     close($fh);
@@ -409,4 +415,3 @@ if (@ARGV) {
 }
 
 1;
-

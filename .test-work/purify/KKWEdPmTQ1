@@ -1,0 +1,64 @@
+=== Example 013: Basic awk command ===
+Using backticks to call awk (print all lines):
+Alice 25 95.5
+Bob 30 87.2
+Charlie 35 92.8
+Diana 28 88.9
+Eve 32 91.3
+
+awk print specific fields (print first and third field):
+awk: cmd. line:1: {print , }
+awk: cmd. line:1:        ^ syntax error
+
+awk with field separator (print with comma separator):
+,,
+,,
+,,
+,,
+,,
+
+awk with conditions (print lines where age > 30):
+awk: cmd. line:1:  > 30 {print , }
+awk: cmd. line:1:  ^ syntax error
+
+awk with calculations (print name and score*2):
+awk: cmd. line:1: {print , *2}
+awk: cmd. line:1:        ^ syntax error
+
+awk with BEGIN and END:
+Name	Age	Score
+		
+		
+		
+		
+		
+End of data
+
+awk with variables (sum of scores):
+awk: cmd. line:1: {sum += } END {print "Total score:", sum}
+awk: cmd. line:1:         ^ syntax error
+
+awk with string functions (uppercase names):
+awk: cmd. line:1: {print toupper(), , }
+awk: cmd. line:1:                ^ 0 is invalid as number of arguments for toupper
+
+awk with pattern matching (names starting with A):
+awk: cmd. line:1: /^A/ {print , , }
+awk: cmd. line:1:             ^ syntax error
+
+awk with multiple conditions (age > 30 AND score > 90):
+awk: cmd. line:1:  > 30 &&  > 90 {print , , }
+awk: cmd. line:1:  ^ syntax error
+
+awk with formatting (printf):
+awk: cmd. line:1: {printf "%-10s %3d %6.1f
+awk: cmd. line:1:         ^ unterminated string
+
+awk from stdin (echo | awk):
+awk: cmd. line:1: {print , , }
+awk: cmd. line:1:        ^ syntax error
+
+awk with field width:
+awk: cmd. line:1: {printf "%-15s %3d %6.1f
+awk: cmd. line:1:         ^ unterminated string
+=== Example 013 completed successfully ===

@@ -1,0 +1,4 @@
+syntax error at /mnt/d/GitHub/sh2perl/.test-work/purify/014_tr_basic/pure/014_tr_basic.pl line 26, near "$;
+# Expand character ranges for tr command
+my "
+Execution of /mnt/d/GitHub/sh2perl/.test-work/purify/014_tr_basic/pure/014_tr_basic.pl aborted due to compilation errors.

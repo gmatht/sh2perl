@@ -1,0 +1,5 @@
+error: no bin target named `sh2perl` in default-run packages
+help: available bin targets:
+    convert_examples
+    debashc
+    test_linebyline

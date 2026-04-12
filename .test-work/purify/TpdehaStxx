@@ -1,0 +1,110 @@
+Possible attempt to separate words with commas at /mnt/d/GitHub/sh2perl/.test-work/purify/017_uniq_basic/pure/017_uniq_basic.pl line 190.
+=== Example 017: Basic uniq command ===
+Using backticks to call uniq:
+apple
+banana
+apple
+cherry
+banana
+apple
+date
+cherry
+
+uniq with count (-c):
+      1 apple
+      1 banana
+      1 apple
+      1 cherry
+      1 banana
+      1 apple
+      1 date
+      1 cherry
+
+uniq with unique only (-u):
+date
+
+uniq with duplicate only (-d):
+apple
+banana
+cherry
+
+uniq with ignore case (-i):
+apple
+banana
+apple
+cherry
+banana
+apple
+date
+cherry
+
+uniq with skip fields (-f 1):
+1
+
+uniq with skip characters (-s 2):
+aa1
+bb2
+aa3
+cc4
+
+uniq with check (-c):
+      1 apple
+      1 banana
+      1 apple
+      1 cherry
+      1 banana
+      1 apple
+      1 date
+      1 cherry
+
+uniq with all repeated (-D):
+apple
+banana
+apple
+cherry
+banana
+apple
+cherry
+
+uniq with group (-g):
+apple
+
+
+banana
+
+
+apple
+
+
+cherry
+
+
+banana
+
+
+apple
+
+
+date
+
+
+cherry
+
+uniq from stdin (echo | uniq):
+apple
+banana
+apple
+cherry
+
+uniq with field separator:
+1,apple
+2,banana
+1,apple
+3,cherry
+
+uniq with width (-w 3):
+abc
+abd
+abc
+def
+=== Example 017 completed successfully ===

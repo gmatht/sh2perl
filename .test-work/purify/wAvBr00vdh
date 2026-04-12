@@ -1,0 +1,45 @@
+=== Example 027: Basic basename command ===
+Using backticks to call basename:
+basename /path/to/file.txt: file.txt
+
+basename with suffix (remove .txt):
+file
+
+basename with multiple suffixes:
+basename: extra operand '.bak'
+Try 'basename --help' for more information.
+basename /path/to/file.txt .txt .bak: 
+basename with zero suffix (-s ''):
+file.txt
+
+basename with multiple paths:
+basename: extra operand '/path/to/file3.txt'
+Try 'basename --help' for more information.
+Multiple paths: 
+basename with directory:
+documents
+
+basename with current directory:
+Current directory: .
+
+basename with parent directory:
+..
+
+basename with root directory:
+Root directory: /
+
+basename with empty string:
+
+
+basename with relative path:
+Relative path: file.txt
+
+basename with hidden file:
+.hidden.txt
+
+basename with file without extension:
+File without extension: file
+
+basename with multiple extensions:
+file
+=== Example 027 completed successfully ===

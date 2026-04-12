@@ -1,0 +1,41 @@
+=== Example 026: Basic touch command ===
+Using system() to call touch (create file):
+File created successfully
+
+touch with multiple files:
+Multiple files created successfully
+
+touch with verbose (-v):
+touch: invalid option -- 'v'
+Try 'touch --help' for more information.
+
+touch with no create (-c):
+File not created
+
+touch with reference (-r):
+File created with reference timestamp
+
+touch with specific time (-t 202301011200):
+File created with specific timestamp
+
+touch with date (-d '2023-01-01 12:00:00'):
+File created with specific date
+
+touch with access time (-a):
+Access time updated
+
+touch with modification time (-m):
+Modification time updated
+
+touch with both times (-a -m):
+Both access and modification times updated
+
+touch with no dereference (-h):
+touch: setting times of 'test_touch_no_deref.txt': No such file or directory
+
+touch with error handling:
+File created successfully
+
+touch with specific mode (--mode=644):
+File created with specific mode
+=== Example 026 completed successfully ===

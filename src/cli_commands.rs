@@ -143,7 +143,7 @@ pub fn parse_to_perl_inline(input: &str) {
 pub fn parse_system_to_perl(input: &str) {
     let mut generator = Generator::new();
 
-    println!("Converting system command to Perl:");
+    println!("Converting to Perl:");
     println!("{}", "=".repeat(50));
 
     // For system commands, we need to be more lenient with parsing
@@ -166,16 +166,7 @@ pub fn parse_system_to_perl(input: &str) {
 
     let perl_code = generator.generate(&commands);
 
-    // Extract preamble and core logic separately
-    let (preamble, core_code) = extract_preamble_and_core(&perl_code);
-
-    // Output in a format that purify.pl can parse
-    if !preamble.is_empty() {
-        println!("PREAMBLE:");
-        println!("{}", preamble);
-        println!("CORE:");
-    }
-    println!("{}", core_code);
+    println!("{}", perl_code);
 
     println!("{}", "=".repeat(50));
 }

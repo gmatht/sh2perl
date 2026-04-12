@@ -1,0 +1,3 @@
+String found where operator expected (Do you need to predeclare "croak"?) at /home/llm/src/sh2perl/.test-work/purify/030_tee_basic/pure/030_tee_basic.pl line 18, near "croak "Close failed: $ERRNO""
+syntax error at /home/llm/src/sh2perl/.test-work/purify/030_tee_basic/pure/030_tee_basic.pl line 18, near "croak "Close failed: $ERRNO""
+Execution of /home/llm/src/sh2perl/.test-work/purify/030_tee_basic/pure/030_tee_basic.pl aborted due to compilation errors.

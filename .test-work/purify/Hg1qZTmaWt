@@ -1,0 +1,67 @@
+=== Example 014: Basic tr command ===
+Using backticks to call tr (translate a to A):
+Hello World
+This is A test
+UPPERCASE TEXT
+lowercAse text
+Mixed CAse Text
+
+tr with case conversion (lowercase to uppercase):
+tr: extra operand 'test_tr.txt'
+Try 'tr --help' for more information.
+
+tr with delete (delete all spaces):
+HelloWorld
+Thisisatest
+UPPERCASETEXT
+lowercasetext
+MixedCaseText
+
+tr with complement (delete all non-letters):
+tr: extra operand 'test_tr.txt'
+Only one string may be given when deleting without squeezing repeats.
+Try 'tr --help' for more information.
+
+tr with squeeze (squeeze multiple spaces):
+Hello World
+This is a test
+UPPERCASE TEXT
+lowercase text
+Mixed Case Text
+
+tr with character classes (delete digits):
+tr: extra operand 'test_tr.txt'
+Only one string may be given when deleting without squeezing repeats.
+Try 'tr --help' for more information.
+
+tr with multiple characters (translate vowels):
+HEllO WOrld
+ThIs Is A tEst
+UPPERCASE TEXT
+lOwErcAsE tExt
+MIxEd CAsE TExt
+
+tr with ranges (translate a-z to A-Z):
+tr: extra operand 'test_tr.txt'
+Try 'tr --help' for more information.
+
+tr with complement and delete (keep only letters):
+HelloWorldThisisatestUPPERCASETEXTlowercasetextMixedCaseText
+tr with squeeze and translate:
+tr: extra operand 'test_tr.txt'
+Try 'tr --help' for more information.
+
+tr from stdin (echo | tr):
+HELLO WORLD
+
+tr with specific characters (translate l to L):
+HeLLo WorLd
+This is a test
+UPPERCASE TEXT
+Lowercase text
+Mixed Case Text
+
+tr with character sets (translate punctuation):
+tr: extra operand 'test_tr.txt'
+Try 'tr --help' for more information.
+=== Example 014 completed successfully ===

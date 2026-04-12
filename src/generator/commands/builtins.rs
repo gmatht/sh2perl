@@ -700,7 +700,12 @@ pub fn generate_generic_builtin(
         }
         "tee" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::tee::generate_tee_command(generator, cmd, input_var)
+            crate::generator::commands::tee::generate_tee_command(
+                generator,
+                cmd,
+                input_var,
+                output_var,
+            )
         }
         "read" => {
             // Handle read command - read from input_var if available, otherwise from STDIN

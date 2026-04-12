@@ -1,0 +1,15 @@
+=== Example 010: Basic which command ===
+Using backticks to call which with a fixed PATH:
+which alpha: test_which_bin/alpha
+
+which with a fixed command set:
+alpha: test_which_bin/alpha
+beta: test_which_bin/beta
+gamma: test_which_bin/gamma
+
+which with all matches (-a):
+test_which_bin/alpha
+
+which with non-existent command:
+Command not found
+=== Example 010 completed successfully ===

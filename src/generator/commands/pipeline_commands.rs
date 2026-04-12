@@ -639,7 +639,7 @@ pub fn generate_pipeline_for_substitution(
                         output.push_str("    print STDERR $time_output;\n");
 
                         // The shell script has a bug where time command output is not captured
-                        // by command substitution. To match shell behavior, return empty string.
+                        // by command substitution. Keep the existing empty result.
                         output.push_str("    q{};\n");
 
                         output.push_str("}");
@@ -722,8 +722,7 @@ pub fn generate_pipeline_for_substitution(
         format!("do {{\n    my $result_{} = qx{{bash -c \"{}\"}};\n    chomp $result_{};\n    $result_{};\n}}", 
                 unique_id, pipeline.source_text.as_ref().unwrap_or(&"echo 'pipeline'".to_string()), unique_id, unique_id)
     } else {
-        // Bash strips trailing newlines from command substitution results
-        // Wrap the result in a chomp operation
+        // Preserve Perl backtick newline semantics.
         // If output is already a do block, don't nest it - just return it (chomp is handled elsewhere)
         let trimmed_output = output.trim();
         if trimmed_output.starts_with("do {") && trimmed_output.ends_with("}") {
@@ -731,7 +730,7 @@ pub fn generate_pipeline_for_substitution(
             trimmed_output.to_string()
         } else {
             // Output is code that should be in a do block - wrap it properly
-            format!("do {{\n    my $_chomp_result = do {{ {} }};\n    chomp $_chomp_result;\n    $_chomp_result;\n}}", output.trim())
+            format!("do {{\n    do {{ {} }};\n}}", output.trim())
         }
     };
 
@@ -2427,10 +2426,7 @@ fn generate_buffered_pipeline(
                     unique_id
                 ));
 
-                // Return the output variable as the last statement
-                // Shell command substitution strips all trailing newlines.
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
+                // Return the output variable as the last statement.
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
             }

@@ -1,0 +1,2 @@
+syntax error at /mnt/d/GitHub/sh2perl/.test-work/purify/021_find_basic/pure/021_find_basic.pl line 59, near ""mkdir: cannot create directory "-p"
+Execution of /mnt/d/GitHub/sh2perl/.test-work/purify/021_find_basic/pure/021_find_basic.pl aborted due to compilation errors.

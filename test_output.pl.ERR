@@ -1,0 +1,14 @@
+Perltidy version is 20250711
+
+test_output.pl: Begin Error Output Stream
+1: Possibly invalid number
+
+634: Perl execution time:  0.1495 seconds
+                           ------ ^
+found bareword where operator expected (previous token underlined)
+
+635: Bash execution time:  1.6097 seconds
+                           ------ ^
+found bareword where operator expected (previous token underlined)
+641: unexpected character decimal 10007 (✗) in script
+641: Giving up after error

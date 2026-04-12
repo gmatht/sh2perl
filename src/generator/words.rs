@@ -21,9 +21,39 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
             // Handle literal strings
-            if s.contains("..") {
+            if s.starts_with('`') && s.ends_with('`') {
+                let command_str = s[1..s.len() - 1].to_string();
+                if let Ok(command) = crate::parser::commands::parse_pipeline_from_text(&command_str)
+                {
+                    return match command {
+                        Command::Simple(simple_cmd) => {
+                            if let Word::Literal(name, _) = &simple_cmd.name {
+                                if name == "head" || name == "tail" {
+                                    return generator.word_to_perl(&Word::CommandSubstitution(
+                                        Box::new(Command::Simple(simple_cmd)),
+                                        None,
+                                    ));
+                                }
+                            }
+                            generator.word_to_perl(&Word::CommandSubstitution(
+                                Box::new(Command::Simple(simple_cmd)),
+                                None,
+                            ))
+                        }
+                        Command::Pipeline(pipeline) => generator.word_to_perl(
+                            &Word::CommandSubstitution(Box::new(Command::Pipeline(pipeline)), None),
+                        ),
+                        other => generator.word_to_perl(&Word::CommandSubstitution(Box::new(other), None)),
+                    };
+                }
+                let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+                format!(
+                    "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
+                    command_lit
+                )
+            } else if Regex::new(r"^\d+\.\.\d+$").unwrap().is_match(s) {
                 generator.handle_range_expansion(s)
-            } else if s.contains(',') {
+            } else if Regex::new(r"^\d+(?:\s*,\s*\d+)+$").unwrap().is_match(s) {
                 generator.handle_comma_expansion(s)
             } else {
                 // For literal strings, quote them to avoid bareword errors
@@ -624,27 +654,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for pwd in command substitution
                             "do { use Cwd; getcwd(); }".to_string()
                         } else if name == "basename" {
-                            // Special handling for basename in command substitution
-                            if let Some(path) = simple_cmd.args.first() {
-                                let path_str = generator.word_to_perl(path);
-                                let suffix = if simple_cmd.args.len() > 1 {
-                                    generator.word_to_perl(&simple_cmd.args[1])
-                                } else {
-                                    "q{}".to_string()
-                                };
-                                // Generate with proper formatting - perltidy will accept this multi-line format
-                                format!("do {{\n    my $basename_path;\n    my $basename_suffix;\n    $basename_path = {};\n    $basename_suffix = {};\n    if ($basename_suffix ne q{{}}) {{\n        $basename_path =~ s/\\Q$basename_suffix\\E$//msx;\n    }}\n    $basename_path =~ s/.*\\///msx;\n    $basename_path;\n}}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
-                            } else {
-                                "\".\"".to_string()
-                            }
+                            // Run basename via the host command so output and edge cases match.
+                            let basename_cmd = generator.generate_command_string_for_system(&Command::Simple(simple_cmd.clone()));
+                            let basename_lit = generator.perl_string_literal(&Word::literal(basename_cmd));
+                            format!("do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}", basename_lit)
                         } else if name == "dirname" {
-                            // Special handling for dirname in command substitution
-                            if let Some(path) = simple_cmd.args.first() {
-                                let path_str = generator.word_to_perl(path);
-                                format!("do {{ my $path; $path = {}; if ($path =~ /\\//msx) {{ $path =~ s/\\/[^\\/]*$//msx; if ($path eq q{{}}) {{ $path = q{{.}}; }} }} else {{ $path = q{{.}}; }} $path; }}", path_str.replace("$0", "$PROGRAM_NAME"))
-                            } else {
-                                "\".\"".to_string()
-                            }
+                            let dirname_cmd = generator.generate_command_string_for_system(&Command::Simple(simple_cmd.clone()));
+                            let dirname_lit = generator.perl_string_literal(&Word::literal(dirname_cmd));
+                            format!("do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}", dirname_lit)
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
                             let which_cmd = generator.generate_command_string_for_system(cmd);
@@ -1025,8 +1042,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     }
                 }
                 Command::Pipeline(pipeline) => {
-                    // For command substitution pipelines, use the specialized function
-                    crate::generator::commands::pipeline_commands::generate_pipeline_for_substitution(generator, pipeline)
+                    // For command substitution pipelines, keep the shell pipeline intact
+                    // but emit it through qx{} so the purified script does not contain backticks.
+                    let pipeline_cmd = generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
+                    let pipeline_lit = generator.perl_string_literal(&Word::literal(pipeline_cmd));
+                    format!(
+                        "do {{ my $pipeline_cmd = {}; my $result = qx{{$pipeline_cmd}}; $CHILD_ERROR = $? >> 8; $result; }}",
+                        pipeline_lit
+                    )
                 }
                 Command::And(left_cmd, right_cmd) => {
                     // Handle And commands in command substitution
@@ -1069,10 +1092,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         unique_id, left_content, unique_id, right_result, unique_id, unique_id)
                 }
                 _ => {
-                    // For other command types, use system command fallback
-                    let (in_var, out_var, err_var, pid_var, result_var) =
-                        generator.get_unique_ipc_vars();
-                    format!("do {{\n    my ({}, {}, {});\n    my {} = open3({}, {}, {}, 'bash', '-c', 'echo ERROR: Command substitution not implemented');\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {};\n}}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, in_var, result_var, out_var, out_var, pid_var, result_var)
+                    // For other command types, execute the real shell command so
+                    // control operators and redirections keep working.
+                    let command_str = crate::generator::redirects::generate_bash_command_string(cmd);
+                    let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+                    format!(
+                        "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
+                        command_lit
+                    )
                 }
             };
             // For simple expressions, avoid unnecessary wrapping

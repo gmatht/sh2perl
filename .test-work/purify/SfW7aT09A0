@@ -1,0 +1,3 @@
+String found where operator expected (Do you need to predeclare "croak"?) at /mnt/d/GitHub/sh2perl/.test-work/purify/019_comm_basic/pure/019_comm_basic.pl line 53, near "croak "Close failed: $OS_ERROR""
+syntax error at /mnt/d/GitHub/sh2perl/.test-work/purify/019_comm_basic/pure/019_comm_basic.pl line 53, near "croak "Close failed: $OS_ERROR""
+Execution of /mnt/d/GitHub/sh2perl/.test-work/purify/019_comm_basic/pure/019_comm_basic.pl aborted due to compilation errors.

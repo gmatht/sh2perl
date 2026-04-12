@@ -1,0 +1,23 @@
+Perltidy version is 20250711
+
+current_perl.pl: Begin Error Output Stream
+
+102: ```perl
+     --^
+found String where operator expected (previous token underlined)
+
+204: ```perl
+      ^
+found String where operator expected
+
+204: ```perl
+      --^
+found bareword where operator expected (previous token underlined)
+302: final indentation level: 2
+302: Formatting will be skipped because level error '2' exceeds -maxle=1; use -maxle=-1 to force formatting
+
+Final nesting depth of '{'s is 2
+The most recent un-matched '{' is on line 99
+99: my $mv_result = do { my $cmd_result_8 = do {
+                                               ^
+302: To save a full .LOG file rerun with -g

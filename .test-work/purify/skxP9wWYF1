@@ -1,0 +1,76 @@
+=== Example 006: Basic head command ===
+Using backticks to call head (default 10 lines):
+Line 1: This is line number 1
+Line 2: This is line number 2
+Line 3: This is line number 3
+Line 4: This is line number 4
+Line 5: This is line number 5
+Line 6: This is line number 6
+Line 7: This is line number 7
+Line 8: This is line number 8
+Line 9: This is line number 9
+Line 10: This is line number 10
+
+head -n 5 (first 5 lines):
+Line 1: This is line number 1
+Line 2: This is line number 2
+Line 3: This is line number 3
+Line 4: This is line number 4
+Line 5: This is line number 5
+
+head -n 3 (first 3 lines):
+Line 1: This is line number 1
+Line 2: This is line number 2
+Line 3: This is line number 3
+
+head -n 1 (first line only):
+Line 1: This is line number 1
+
+head -n 15 (more than available):
+Line 1: This is line number 1
+Line 2: This is line number 2
+Line 3: This is line number 3
+Line 4: This is line number 4
+Line 5: This is line number 5
+Line 6: This is line number 6
+Line 7: This is line number 7
+Line 8: This is line number 8
+Line 9: This is line number 9
+Line 10: This is line number 10
+
+head -c 50 (first 50 characters):
+Line 1: This is line number 1
+Line 2: This is line
+head -c 100 (first 100 characters):
+Line 1: This is line number 1
+Line 2: This is line number 2
+Line 3: This is line number 3
+Line 4: Th
+head from stdin (echo | head):
+Line 1\nLine 2\nLine 3\nLine 4\nLine 5
+
+head -q (quiet mode, no filename):
+Line 1: This is line number 1
+Line 2: This is line number 2
+Line 3: This is line number 3
+Line 4: This is line number 4
+Line 5: This is line number 5
+Line 6: This is line number 6
+Line 7: This is line number 7
+Line 8: This is line number 8
+Line 9: This is line number 9
+Line 10: This is line number 10
+
+head -v (verbose mode, with filename):
+==> test_head.txt <==
+Line 1: This is line number 1
+Line 2: This is line number 2
+Line 3: This is line number 3
+Line 4: This is line number 4
+Line 5: This is line number 5
+Line 6: This is line number 6
+Line 7: This is line number 7
+Line 8: This is line number 8
+Line 9: This is line number 9
+Line 10: This is line number 10
+=== Example 006 completed successfully ===

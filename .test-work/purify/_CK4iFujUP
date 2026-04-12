@@ -1,0 +1,3 @@
+Bareword found where operator expected (Missing operator before "test_file1"?) at /mnt/d/GitHub/sh2perl/.test-work/purify/004_cat_basic/pure/004_cat_basic.pl line 26, near ""cat: "test_file1"
+syntax error at /mnt/d/GitHub/sh2perl/.test-work/purify/004_cat_basic/pure/004_cat_basic.pl line 26, near ""cat: "test_file1"
+Execution of /mnt/d/GitHub/sh2perl/.test-work/purify/004_cat_basic/pure/004_cat_basic.pl aborted due to compilation errors.
