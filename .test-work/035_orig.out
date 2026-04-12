@@ -1,0 +1,83 @@
+=== Example 035: Basic pipeline ===
+Using backticks to call pipeline (cat | grep | sort):
+apple
+banana
+date
+grape
+
+Pipeline with multiple commands (cat | grep | wc):
+cat: invalid option -- 'l'
+Try 'cat --help' for more information.
+
+Pipeline with head and tail:
+cherry
+date
+elderberry
+
+Pipeline with sed and awk:
+apple
+banana
+cherry
+date
+elderberry
+fig
+grape
+cat: '|': No such file or directory
+cat: sed: No such file or directory
+cat: s/a/A/g: No such file or directory
+cat: '|': No such file or directory
+cat: awk: No such file or directory
+cat: '{print toupper(examples.impurl/035_pipeline_basic.pl)}': No such file or directory
+
+Pipeline with cut and paste:
+1,3	4,6
+7,9	
+
+Pipeline with tr and sort:
+apple
+banana
+cherry
+date
+elderberry
+fig
+grape
+cat: '|': No such file or directory
+cat: tr: No such file or directory
+cat: a-z: No such file or directory
+cat: A-Z: No such file or directory
+cat: '|': No such file or directory
+cat: sort: No such file or directory
+
+Pipeline with uniq and wc:
+Unique lines: 7
+
+Pipeline with grep and head:
+cat: invalid option -- '2'
+Try 'cat --help' for more information.
+
+Pipeline with tail and grep:
+date
+grape
+
+Pipeline with multiple filters:
+cat: invalid option -- '3'
+Try 'cat --help' for more information.
+
+Pipeline with error handling:
+Lines with 'x': 0
+
+Pipeline with tee:
+apple
+banana
+cherry
+date
+elderberry
+fig
+grape
+cat: '|': No such file or directory
+cat: grep: No such file or directory
+cat: a: No such file or directory
+cat: '|': No such file or directory
+cat: tee: No such file or directory
+cat: pipeline_output.txt: No such file or directory
+=== Example 035 completed successfully ===

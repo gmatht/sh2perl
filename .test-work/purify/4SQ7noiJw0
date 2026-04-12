@@ -1,0 +1,19 @@
+=== Example 024: Basic rm command ===
+Using system() to call rm (remove file):
+File removed successfully
+
+rm with verbose (-v):
+removed 'test_rm_file2.txt'
+
+rm with force (-f):
+Force removal attempted
+
+rm with interactive (-i):
+rm: remove regular empty file 'test_rm_interactive.txt'? Undefined subroutine &main::open3 called at /home/llm/src/sh2perl/.test-work/purify/024_rm_basic/pure/024_rm_basic.pl line 269.
+
+rm with recursive (-r):
+Directory removed recursively
+
+rm with recursive and force (-rf):
+
+rm with preserve root (--preserve-root):

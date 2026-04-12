@@ -1,0 +1,3151 @@
+Starting test run at Mon Apr  6 20:53:37 AWST 2026
+Logging to: logs/fail_run_20260406_205337.log
+Test arguments: 
+----------------------------------------
+Compiling debashc...
+warning: unused import: `Token`
+    --> src/parser/commands.rs:1545:31
+     |
+1545 |     use crate::lexer::{Lexer, Token};
+     |                               ^^^^^
+     |
+     = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `regex::Regex`
+ --> src/generator/commands/pipeline_commands.rs:6:5
+  |
+6 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/generator/redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src/timeout_manager.rs:282:1
+    |
+282 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: variable does not need to be mutable
+    --> src/parser/commands.rs:1548:9
+     |
+1548 |     let mut lexer = Lexer::new(text);
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `cmd2`
+   --> src/generator/commands/pipeline_commands.rs:605:66
+    |
+605 |         if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) =
+    |                                                                  ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: variable `head_max` is assigned to, but never used
+    --> src/generator/commands/pipeline_commands.rs:1028:25
+     |
+1028 |                 let mut head_max = 10; // Default value
+     |                         ^^^^^^^^
+     |
+     = note: consider using `_head_max` instead
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1040:53
+     |
+1040 | ...                   head_max = num;
+     |                       ^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1047:53
+     |
+1047 | ...                   head_max = num;
+     |                       ^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1052:49
+     |
+1052 | ...                   head_max = num;
+     |                       ^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+    --> src/generator/commands/pipeline_commands.rs:1077:22
+     |
+1077 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+     |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+    --> src/generator/commands/pipeline_commands.rs:1092:34
+     |
+1092 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+     |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src/generator/commands/system_commands.rs:48:35
+   |
+48 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `input_var`
+ --> src/generator/commands/comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `output`
+  --> src/generator/commands/find.rs:47:13
+   |
+47 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src/generator/commands/find.rs:47:9
+   |
+47 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:463:13
+    |
+463 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:464:13
+    |
+464 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:465:13
+    |
+465 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: variable `sort_by_time` is assigned to, but never used
+   --> src/generator/commands/ls.rs:740:13
+    |
+740 |     let mut sort_by_time = false; // -t flag: sort by modification time
+    |             ^^^^^^^^^^^^
+    |
+    = note: consider using `_sort_by_time` instead
+
+warning: value assigned to `sort_by_time` is never read
+   --> src/generator/commands/ls.rs:754:32
+    |
+754 |                         't' => sort_by_time = true,   // -t flag: sort by modification time
+    |                                ^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `literal`
+   --> src/generator/utils.rs:162:59
+    |
+162 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `cmd_name`
+  --> src/generator/words.rs:68:25
+   |
+68 |                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
+   |                         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cmd_name`
+
+warning: unused variable: `command_str`
+   --> src/generator/words.rs:655:37
+    |
+655 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:797:33
+    |
+797 | ...                   let indent1 = "    ".to_string(); // 4 spaces for outer do block
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:838:33
+    |
+838 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:879:33
+    |
+879 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:916:33
+    |
+916 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:955:33
+    |
+955 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `literal`
+   --> src/generator/words.rs:505:59
+    |
+505 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `s`
+    --> src/generator/words.rs:1145:23
+     |
+1145 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+     |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `needs_exit_code`
+   --> src/generator/mod.rs:128:13
+    |
+128 |         let needs_exit_code = self.needs_exit_code_tracking(ast);
+    |             ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_needs_exit_code`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:151:13
+    |
+151 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:194:13
+    |
+194 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src/parser/commands.rs:1356:8
+     |
+  20 | impl Parser {
+     | ----------- methods in this implementation
+...
+1356 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1431 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src/parser/control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src/parser/control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src/parser/words.rs:2191:4
+     |
+2191 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src/generator/commands/find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src/generator/commands/find.rs:248:4
+    |
+248 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src/generator/commands/tr.rs:73:4
+   |
+73 | fn generate_tr_linebyline_impl(
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+   --> src/generator/commands/tr.rs:133:4
+    |
+133 | fn generate_tr_buffered_impl(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src/generator/control_flow.rs:241:4
+    |
+241 | fn is_variable_used_after_for_loop(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src/variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 44 warnings (run `cargo fix --lib -p debashl` to apply 5 suggestions)
+warning: unused import: `execute_with_progress`
+  --> src/testing.rs:11:5
+   |
+11 |     execute_with_progress, execute_with_timeout, is_execution_frozen, OperationType,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src/testing.rs:18:5
+   |
+18 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src/testing.rs:29:9
+   |
+29 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src/testing.rs:1490:9
+     |
+1490 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src/testing.rs:1740:9
+     |
+1740 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src/testing.rs:1799:9
+     |
+1799 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src/testing.rs:2481:13
+     |
+2481 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src/testing.rs:2481:9
+     |
+2481 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src/execution.rs:64:8
+   |
+64 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String> {
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src/utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src/utils.rs:19:8
+   |
+19 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src/utils.rs:27:8
+   |
+27 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src/testing.rs:23:4
+   |
+23 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String>
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+   --> src/testing.rs:123:9
+    |
+110 | pub struct TestResult {
+    |            ---------- fields in this struct
+...
+123 |     pub shell_duration: std::time::Duration, // Shell execution time
+    |         ^^^^^^^^^^^^^^
+124 |     pub translated_duration: std::time::Duration, // Translated program execution time
+    |         ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src/testing.rs:707:8
+    |
+707 | pub fn test_file_equivalence_detailed(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src/testing.rs:1729:8
+     |
+1729 | pub fn test_all_examples_next_fail(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src/cli_commands.rs:215:4
+    |
+215 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src/cli_commands.rs:485:8
+    |
+485 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src/timeout_manager.rs:11:5
+   |
+ 8 | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src/timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src/timeout_manager.rs:117:12
+    |
+ 90 | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: Duration) {
+    |            ^^^^^^^^^^^
+...
+178 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src/timeout_manager.rs:302:8
+    |
+302 | pub fn execute_with_progress<F, T>(operation: OperationType, operation_fn: F) -> Result<T, String>
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.25s
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+Running 146 tests across 146 examples with perl generator
+==================================================
+Test 1/146: 000__01_file_directory_operations.sh with perl     DEBUG: Starting test execution for examples/000__01_file_directory_operations.sh with generator perl
+DEBUG: Running shell script: examples/000__01_file_directory_operations.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.09s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__01_file_directory_operations.sh
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1433 characters
+DEBUG: check_perl_no_open3_builtins called with 1433 characters
+DEBUG: check_perl_no_system_builtins called with 1433 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1433 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.263µs
+DEBUG: Execution loop iteration, elapsed: 100.987899ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 696.149217ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 9035, Translated stdout length: 9035
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 6842ms
+✓Test 2/146: 000__02_output_formatting_commands.sh with perl     DEBUG: Starting test execution for examples/000__02_output_formatting_commands.sh with generator perl
+DEBUG: Running shell script: examples/000__02_output_formatting_commands.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.10s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__02_output_formatting_commands.sh
+DEBUG: words.rs - Using native sha256sum implementation for command substitution
+DEBUG: words.rs - Using native sha512sum implementation for command substitution
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 7055 characters
+DEBUG: check_perl_no_open3_builtins called with 7055 characters
+DEBUG: check_perl_no_system_builtins called with 7055 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 7055 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use Digest::SHA   qw(sha256_hex sha512_hex);
+us
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.983µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 80.782522ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 660, Translated stdout length: 660
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 5327ms
+✓Test 3/146: 000__03_file_manipulation_commands.sh with perl     DEBUG: Starting test execution for examples/000__03_file_manipulation_commands.sh with generator perl
+DEBUG: Running shell script: examples/000__03_file_manipulation_commands.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.16s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__03_file_manipulation_commands.sh
+DEBUG: words.rs - Using native cp implementation for command substitution
+DEBUG: words.rs - Using native mv implementation for command substitution
+DEBUG: words.rs - Using native rm implementation for command substitution
+DEBUG: words.rs - Using native mkdir implementation for command substitution
+DEBUG: words.rs - Using native touch implementation for command substitution
+DEBUG: Perl code generated, length: 19318 characters
+DEBUG: check_perl_no_open3_builtins called with 19318 characters
+DEBUG: check_perl_no_system_builtins called with 19318 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 19318 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use F
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.077µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 192.111116ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 422, Translated stdout length: 422
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 4755ms
+✓Test 4/146: 000__04a_basic_command_substitution.sh with perl     DEBUG: Starting test execution for examples/000__04a_basic_command_substitution.sh with generator perl
+DEBUG: Running shell script: examples/000__04a_basic_command_substitution.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.08s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: String interpolation parsed command 'date +%Y' as 1 commands
+DEBUG: String interpolation parsed command 'basename $(pwd)' as 1 commands
+DEBUG: Setting original script name to: 000__04a_basic_command_substitution.sh
+DEBUG: Perl code generated, length: 1761 characters
+DEBUG: check_perl_no_open3_builtins called with 1761 characters
+DEBUG: check_perl_no_system_builtins called with 1761 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1761 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.983µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 60.475148ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 172, Translated stdout length: 172
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 4560ms
+✓DEBUG: Progress: 5/146 tests completed (3.4%)
+Test 5/146: 000__04b_file_directory_operations.sh with perl     DEBUG: Starting test execution for examples/000__04b_file_directory_operations.sh with generator perl
+DEBUG: Running shell script: examples/000__04b_file_directory_operations.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.05s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04b_file_directory_operations.sh
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1509 characters
+DEBUG: check_perl_no_open3_builtins called with 1509 characters
+DEBUG: check_perl_no_system_builtins called with 1509 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1509 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.981µs
+DEBUG: Execution loop iteration, elapsed: 100.933871ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 333.183968ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 9082, Translated stdout length: 9082
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3754ms
+✓Test 6/146: 000__04c_text_processing_commands.sh with perl     DEBUG: Starting test execution for examples/000__04c_text_processing_commands.sh with generator perl
+DEBUG: Running shell script: examples/000__04c_text_processing_commands.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.23s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04c_text_processing_commands.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has no process substitution, using dedicated implementation
+DEBUG: Processing diff command in command substitution with args: [Literal("file1.txt", None), Literal("file2.txt", None)]
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 17534 characters
+DEBUG: check_perl_no_open3_builtins called with 17534 characters
+DEBUG: check_perl_no_system_builtins called with 17534 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 17534 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.792µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 141.599337ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 2154, Translated stdout length: 2154
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 4266ms
+✓Test 7/146: 000__04d_system_utilities.sh with perl     DEBUG: Starting test execution for examples/000__04d_system_utilities.sh with generator perl
+DEBUG: Running shell script: examples/000__04d_system_utilities.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 1.04s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04d_system_utilities.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 1643 characters
+DEBUG: check_perl_no_open3_builtins called with 1643 characters
+DEBUG: check_perl_no_system_builtins called with 1643 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1643 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.17µs
+DEBUG: Execution loop iteration, elapsed: 100.592544ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 1.039933219s, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 149, Translated stdout length: 149
+DEBUG: Shell stderr length: 0, Translated stderr length: 84
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: false, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 6120ms
+✓Test 8/146: 000__04e_file_manipulation.sh with perl     DEBUG: Starting test execution for examples/000__04e_file_manipulation.sh with generator perl
+DEBUG: Running shell script: examples/000__04e_file_manipulation.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.14s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04e_file_manipulation.sh
+DEBUG: words.rs - Using native cp implementation for command substitution
+DEBUG: words.rs - Using native mv implementation for command substitution
+DEBUG: words.rs - Using native rm implementation for command substitution
+DEBUG: words.rs - Using native mkdir implementation for command substitution
+DEBUG: words.rs - Using native touch implementation for command substitution
+DEBUG: Perl code generated, length: 18522 characters
+DEBUG: check_perl_no_open3_builtins called with 18522 characters
+DEBUG: check_perl_no_system_builtins called with 18522 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 18522 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use F
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.891µs
+DEBUG: Execution loop iteration, elapsed: 100.926009ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 101.04134ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 360, Translated stdout length: 360
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3826ms
+✓Test 9/146: 000__04f_output_formatting.sh with perl     DEBUG: Starting test execution for examples/000__04f_output_formatting.sh with generator perl
+DEBUG: Running shell script: examples/000__04f_output_formatting.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.04s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04f_output_formatting.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 2146 characters
+DEBUG: check_perl_no_open3_builtins called with 2146 characters
+DEBUG: check_perl_no_system_builtins called with 2146 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 2146 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.513µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 40.512525ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 184, Translated stdout length: 184
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3299ms
+✓DEBUG: Progress: 10/146 tests completed (6.8%)
+Test 10/146: 000__04g_checksum_commands.sh with perl     DEBUG: Starting test execution for examples/000__04g_checksum_commands.sh with generator perl
+DEBUG: Running shell script: examples/000__04g_checksum_commands.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.06s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04g_checksum_commands.sh
+DEBUG: words.rs - Using native sha256sum implementation for command substitution
+DEBUG: words.rs - Using native sha512sum implementation for command substitution
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 4516 characters
+DEBUG: check_perl_no_open3_builtins called with 4516 characters
+DEBUG: check_perl_no_system_builtins called with 4516 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 4516 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use Digest::SHA   qw(sha256_hex sha512_hex);
+us
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.08µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 50.663982ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 339, Translated stdout length: 339
+DEBUG: Shell stderr length: 49, Translated stderr length: 49
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 4228ms
+✓Test 11/146: 000__04h_complex_examples.sh with perl     DEBUG: Starting test execution for examples/000__04h_complex_examples.sh with generator perl
+DEBUG: Running shell script: examples/000__04h_complex_examples.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.42s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Starting parse_array_elements
+DEBUG: Skipping opening parenthesis
+DEBUG: Loop 1: token = Some(BacktickString), current_element = ''
+DEBUG: Found other token: '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Loop 2: token = Some(ParenClose), current_element = '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Found closing parenthesis, adding current_element: '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Final elements: ["`ls -1 *.sh examples/*.sh 2>/dev/null`"]
+DEBUG: Setting original script name to: 000__04h_complex_examples.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Processing Assignment command: current_user = CommandSubstitution(Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("root", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)
+DEBUG: Processing Assignment command: system_name = Literal("Darwin", None)
+DEBUG: Generating function body for get_file_size
+DEBUG: Function body commands: [BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("file=$1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("size=", None), CommandSubstitution(Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-c", None)], redirects: [Redirect { fd: None, operator: Input, target: StringInterpolation(StringInterpolation { parts: [Variable("file")] }, None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File "), Variable("file"), Literal(" has "), Variable("size"), Literal(" bytes")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has process substitution redirects
+DEBUG: Using builtin comm command generator for process substitution
+DEBUG: Processing tr command in command substitution with args: [Literal("a-z", None), Literal("A-Z", None)]
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 10382 characters
+DEBUG: check_perl_no_open3_builtins called with 10382 characters
+DEBUG: check_perl_no_system_builtins called with 10382 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 10382 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+sub c
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.173µs
+DEBUG: Execution loop iteration, elapsed: 100.925973ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 232.233846ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 5202, Translated stdout length: 5202
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 4584ms
+✓Test 12/146: 000__05_system_utilities.sh with perl     DEBUG: Starting test execution for examples/000__05_system_utilities.sh with generator perl
+DEBUG: Running shell script: examples/000__05_system_utilities.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.04s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__05_system_utilities.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 1138 characters
+DEBUG: check_perl_no_open3_builtins called with 1138 characters
+DEBUG: check_perl_no_system_builtins called with 1138 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1138 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.077µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 30.388808ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 89, Translated stdout length: 89
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3534ms
+✓Test 13/146: 000__06_text_processing_commands.sh with perl     DEBUG: Starting test execution for examples/000__06_text_processing_commands.sh with generator perl
+DEBUG: Running shell script: examples/000__06_text_processing_commands.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.21s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__06_text_processing_commands.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has no process substitution, using dedicated implementation
+DEBUG: Processing diff command in command substitution with args: [Literal("file1.txt", None), Literal("file2.txt", None)]
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 18207 characters
+DEBUG: check_perl_no_open3_builtins called with 18207 characters
+DEBUG: check_perl_no_system_builtins called with 18207 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 18207 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.983µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 90.772546ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 454, Translated stdout length: 454
+DEBUG: Shell stderr length: 88, Translated stderr length: 88
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3517ms
+✓Test 14/146: 000__07_find_path_commands.sh with perl     DEBUG: Starting test execution for examples/000__07_find_path_commands.sh with generator perl
+DEBUG: Running shell script: examples/000__07_find_path_commands.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.03s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__07_find_path_commands.sh
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 820 characters
+DEBUG: check_perl_no_open3_builtins called with 820 characters
+DEBUG: check_perl_no_system_builtins called with 820 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 820 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.511µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 323.279343ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 4582, Translated stdout length: 4582
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3592ms
+✓DEBUG: Progress: 15/146 tests completed (10.3%)
+Test 15/146: 001_simple.sh with perl     DEBUG: Starting test execution for examples/001_simple.sh with generator perl
+DEBUG: Running shell script: examples/001_simple.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.02s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 001_simple.sh
+DEBUG: Perl code generated, length: 442 characters
+DEBUG: check_perl_no_open3_builtins called with 442 characters
+DEBUG: check_perl_no_system_builtins called with 442 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 442 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.983µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 40.516747ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 23, Translated stdout length: 23
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 4127ms
+✓Test 16/146: 002_control_flow.sh with perl     DEBUG: Starting test execution for examples/002_control_flow.sh with generator perl
+DEBUG: Running shell script: examples/002_control_flow.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.03s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 002_control_flow.sh
+DEBUG: Processing Assignment command: i = Arithmetic(ArithmeticExpression { expression: "i + 1", tokens: [] }, None)
+DEBUG: Generating function body for greet
+DEBUG: Function body commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello, "), Variable("1"), Literal("!")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+DEBUG: Perl code generated, length: 934 characters
+DEBUG: check_perl_no_open3_builtins called with 934 characters
+DEBUG: check_perl_no_system_builtins called with 934 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 934 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.983µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 31.539515ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 138, Translated stdout length: 138
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 4814ms
+✓Test 17/146: 003_pipeline.sh with perl     DEBUG: Starting test execution for examples/003_pipeline.sh with generator perl
+DEBUG: Running shell script: examples/003_pipeline.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.67s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 003_pipeline.sh
+DEBUG: Perl code generated, length: 9890 characters
+DEBUG: check_perl_no_open3_builtins called with 9890 characters
+DEBUG: check_perl_no_system_builtins called with 9890 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 9890 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.178µs
+DEBUG: Execution loop iteration, elapsed: 100.968965ms
+DEBUG: Execution loop iteration, elapsed: 1.300163714s
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(256))
+DEBUG: Perl execution completed, duration: 1.786926151s, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 593, Translated stdout length: 593
+DEBUG: Shell stderr length: 122, Translated stderr length: 122
+DEBUG: Shell exit: 1, Translated exit: 1
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 7665ms
+✓Test 18/146: 004_test_quoted.sh with perl     DEBUG: Starting test execution for examples/004_test_quoted.sh with generator perl
+DEBUG: Running shell script: examples/004_test_quoted.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.03s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 004_test_quoted.sh
+DEBUG: Perl code generated, length: 380 characters
+DEBUG: check_perl_no_open3_builtins called with 380 characters
+DEBUG: check_perl_no_system_builtins called with 380 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 380 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.453µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 30.407442ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 84, Translated stdout length: 84
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 6105ms
+✓Test 19/146: 005_args.sh with perl     DEBUG: Starting test execution for examples/005_args.sh with generator perl
+DEBUG: Running shell script: examples/005_args.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.02s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 005_args.sh
+DEBUG: Perl code generated, length: 582 characters
+DEBUG: check_perl_no_open3_builtins called with 582 characters
+DEBUG: check_perl_no_system_builtins called with 582 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 582 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.788µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 30.435648ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 38, Translated stdout length: 38
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 5247ms
+✓DEBUG: Progress: 20/146 tests completed (13.7%)
+Test 20/146: 006_misc.sh with perl     DEBUG: Starting test execution for examples/006_misc.sh with generator perl
+DEBUG: Running shell script: examples/006_misc.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.03s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 006_misc.sh
+DEBUG: Perl code generated, length: 1315 characters
+DEBUG: check_perl_no_open3_builtins called with 1315 characters
+DEBUG: check_perl_no_system_builtins called with 1315 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1315 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.883µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 20.309538ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 63, Translated stdout length: 63
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3513ms
+✓Test 21/146: 007_cat_EOF.sh with perl     DEBUG: Starting test execution for examples/007_cat_EOF.sh with generator perl
+DEBUG: Running shell script: examples/007_cat_EOF.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.03s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 007_cat_EOF.sh
+DEBUG: Perl code generated, length: 348 characters
+DEBUG: check_perl_no_open3_builtins called with 348 characters
+DEBUG: check_perl_no_system_builtins called with 348 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 348 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.983µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 20.248924ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 66, Translated stdout length: 66
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3596ms
+✓Test 22/146: 008_simple_backup.sh with perl     DEBUG: Starting test execution for examples/008_simple_backup.sh with generator perl
+DEBUG: Running shell script: examples/008_simple_backup.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.04s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 008_simple_backup.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 2973 characters
+DEBUG: check_perl_no_open3_builtins called with 2973 characters
+DEBUG: check_perl_no_system_builtins called with 2973 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 2973 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.794µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 30.391091ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 8805, Translated stdout length: 8805
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3544ms
+✓Test 23/146: 009_arrays.sh with perl     DEBUG: Starting test execution for examples/009_arrays.sh with generator perl
+DEBUG: Running shell script: examples/009_arrays.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.04s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Starting parse_array_elements
+DEBUG: Skipping opening parenthesis
+DEBUG: Loop 1: token = Some(Identifier), current_element = ''
+DEBUG: Found identifier/number: 'one'
+DEBUG: Loop 2: token = Some(Space), current_element = 'one'
+DEBUG: Found whitespace/newline, adding current_element: 'one'
+DEBUG: Loop 3: token = Some(Identifier), current_element = ''
+DEBUG: Found identifier/number: 'two'
+DEBUG: Loop 4: token = Some(Space), current_element = 'two'
+DEBUG: Found whitespace/newline, adding current_element: 'two'
+DEBUG: Loop 5: token = Some(Identifier), current_element = ''
+DEBUG: Found identifier/number: 'three'
+DEBUG: Loop 6: token = Some(ParenClose), current_element = 'three'
+DEBUG: Found closing parenthesis, adding current_element: 'three'
+DEBUG: Final elements: ["one", "two", "three"]
+DEBUG: Setting original script name to: 009_arrays.sh
+DEBUG: Perl code generated, length: 1651 characters
+DEBUG: check_perl_no_open3_builtins called with 1651 characters
+DEBUG: check_perl_no_system_builtins called with 1651 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1651 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.795µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 30.3491ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 110, Translated stdout length: 110
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 5107ms
+✓Test 24/146: 010_pattern_matching.sh with perl     DEBUG: Starting test execution for examples/010_pattern_matching.sh with generator perl
+DEBUG: Running shell script: examples/010_pattern_matching.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.05s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 010_pattern_matching.sh
+DEBUG: Processing Assignment command: s = StringInterpolation(StringInterpolation { parts: [Literal("file.txt")] }, None)
+DEBUG: Processing Assignment command: f1 = StringInterpolation(StringInterpolation { parts: [Literal("file.js")] }, None)
+DEBUG: Processing Assignment command: f2 = StringInterpolation(StringInterpolation { parts: [Literal("thing.min.js")] }, None)
+DEBUG: Processing Assignment command: word = StringInterpolation(StringInterpolation { parts: [Literal("Foo")] }, None)
+DEBUG: Perl code generated, length: 1151 characters
+DEBUG: check_perl_no_open3_builtins called with 1151 characters
+DEBUG: check_perl_no_system_builtins called with 1151 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1151 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.792µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 30.382801ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 111, Translated stdout length: 111
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 5901ms
+✓DEBUG: Progress: 25/146 tests completed (17.1%)
+Test 25/146: 011_brace_expansion.sh with perl     DEBUG: Starting test execution for examples/011_brace_expansion.sh with generator perl
+DEBUG: Running shell script: examples/011_brace_expansion.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.09s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 011_brace_expansion.sh
+DEBUG: Perl code generated, length: 5066 characters
+DEBUG: check_perl_no_open3_builtins called with 5066 characters
+DEBUG: check_perl_no_system_builtins called with 5066 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 5066 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use P
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.886µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 161.924734ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 228, Translated stdout length: 228
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 5282ms
+✓Test 26/146: 012_process_substitution.sh with perl     DEBUG: Starting test execution for examples/012_process_substitution.sh with generator perl
+DEBUG: Running shell script: examples/012_process_substitution.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.09s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 012_process_substitution.sh
+DEBUG: echo.rs - Processing literal word: '"a\nc\nb"'
+DEBUG: echo.rs - Processing literal word: '"a\nb\nd"'
+DEBUG: Perl code generated, length: 9439 characters
+DEBUG: check_perl_no_open3_builtins called with 9439 characters
+DEBUG: check_perl_no_system_builtins called with 9439 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 9439 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use File::Basename;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.45µs
+DEBUG: Execution loop iteration, elapsed: 100.503358ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 171.410306ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 202, Translated stdout length: 202
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 5501ms
+✓Test 27/146: 013_parameter_expansion.sh with perl     DEBUG: Starting test execution for examples/013_parameter_expansion.sh with generator perl
+DEBUG: Running shell script: examples/013_parameter_expansion.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.03s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 013_parameter_expansion.sh
+DEBUG: Processing Assignment command: s2 = StringInterpolation(StringInterpolation { parts: [Literal("abba")] }, None)
+DEBUG: Perl code generated, length: 2196 characters
+DEBUG: check_perl_no_open3_builtins called with 2196 characters
+DEBUG: check_perl_no_system_builtins called with 2196 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 2196 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use File::Basename;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.073µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 30.362106ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 220, Translated stdout length: 220
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 4729ms
+✓Test 28/146: 014_ansi_quoting.sh with perl     DEBUG: Starting test execution for examples/014_ansi_quoting.sh with generator perl
+DEBUG: Running shell script: examples/014_ansi_quoting.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.02s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 014_ansi_quoting.sh
+DEBUG: Perl code generated, length: 916 characters
+DEBUG: check_perl_no_open3_builtins called with 916 characters
+DEBUG: check_perl_no_system_builtins called with 916 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 916 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.7µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 20.235939ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 278, Translated stdout length: 278
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3732ms
+✓Test 29/146: 015_grep_advanced.sh with perl     DEBUG: Starting test execution for examples/015_grep_advanced.sh with generator perl
+DEBUG: Running shell script: examples/015_grep_advanced.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.08s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 015_grep_advanced.sh
+DEBUG: Perl code generated, length: 10038 characters
+DEBUG: check_perl_no_open3_builtins called with 10038 characters
+DEBUG: check_perl_no_system_builtins called with 10038 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 10038 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.511µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 50.560855ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 120, Translated stdout length: 120
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3377ms
+✓DEBUG: Progress: 30/146 tests completed (20.5%)
+Test 30/146: 016_grep_basic.sh with perl     DEBUG: Starting test execution for examples/016_grep_basic.sh with generator perl
+DEBUG: Running shell script: examples/016_grep_basic.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.04s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 016_grep_basic.sh
+DEBUG: Perl code generated, length: 6253 characters
+DEBUG: check_perl_no_open3_builtins called with 6253 characters
+DEBUG: check_perl_no_system_builtins called with 6253 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 6253 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.55µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 30.366452ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 62, Translated stdout length: 62
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3600ms
+✓Test 31/146: 017_grep_context.sh with perl     DEBUG: Starting test execution for examples/017_grep_context.sh with generator perl
+DEBUG: Running shell script: examples/017_grep_context.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.12s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 017_grep_context.sh
+DEBUG: Perl code generated, length: 10786 characters
+DEBUG: check_perl_no_open3_builtins called with 10786 characters
+DEBUG: check_perl_no_system_builtins called with 10786 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 10786 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.511µs
+DEBUG: Execution loop iteration, elapsed: 100.987969ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 423.923448ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 332, Translated stdout length: 332
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 3834ms
+✓Test 32/146: 018_grep_params.sh with perl     DEBUG: Starting test execution for examples/018_grep_params.sh with generator perl
+DEBUG: Running shell script: examples/018_grep_params.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.19s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 018_grep_params.sh
+DEBUG: Perl code generated, length: 30299 characters
+DEBUG: check_perl_no_open3_builtins called with 30299 characters
+DEBUG: check_perl_no_system_builtins called with 30299 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 30299 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.641µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(65280))
+DEBUG: Perl execution completed, duration: 40.421449ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 648, Translated stdout length: 0
+DEBUG: Shell stderr length: 0, Translated stderr length: 1827
+DEBUG: Shell exit: 1, Translated exit: 255
+DEBUG: stdout_match: false, stderr_match: false, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: false
+DEBUG: failure_reason: 'Failed due to: stdout mismatch'
+DEBUG: Test execution completed in 3556ms
+[2J[1;1H================================================================================
+                                    TEST FAILED
+================================================================================
+File: examples/018_grep_params.sh
+Generator: perl
+Test: 32/146
+Tests passed before failure: 31
+Failure Reason: Failed due to: stdout mismatch
+================================================================================
+
+Exit Code Comparison (IGNORED):
+Shell script exit code: 1
+Translated code exit code: 255
+
+================================================================================
+ORIGINAL SHELL SCRIPT:
+================================================================================
+#!/bin/bash
+
+# Grep parameters and options examples
+# Demonstrates various grep command line parameters
+
+set -euo pipefail
+
+echo "== Basic grep parameters =="
+echo "text with pattern" | grep -i "PATTERN"
+echo -e "line1\nline2\nline3" | grep -v "line2"
+echo -e "match\nno match\nmatch again" | grep -c "match"
+
+echo "== Context parameters =="
+echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -A 2 "TARGET"
+echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -B 2 "TARGET"
+echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -C 1 "TARGET"
+
+echo "== File handling parameters =="
+echo "content" > temp_file.txt
+grep -H "content" temp_file.txt
+grep -h "content" temp_file.txt
+grep -l "content" temp_file.txt
+grep -L "nonexistent" temp_file.txt || true
+
+echo "== Output formatting parameters =="
+echo "text with pattern in it" | grep -o "pattern"
+echo "text with pattern in it" | grep -b "pattern"
+echo "text with pattern in it" | grep -n "pattern"
+
+echo "== Recursive and include/exclude parameters =="
+mkdir -p test_dir
+echo "pattern here" > test_dir/file1.txt
+echo "no pattern" > test_dir/file2.txt
+grep -r "pattern" test_dir
+grep -r "pattern" test_dir --include="*.txt"
+grep -r "pattern" test_dir --exclude="*.bak"
+grep -r -c "pattern" test_dir --include="*.txt"
+grep -r "pattern" test_dir --include="*.txt" | wc -l
+
+echo "== Advanced parameters =="
+echo -e "match1\nmatch2\nmatch3\nmatch4" | grep -m 2 "match"
+echo "text with pattern in it" | grep -q "pattern" && echo "found" || echo "not found"
+grep -Z -l "pattern" temp_file.txt | tr '\0' '\n'
+
+# Cleanup
+rm -f temp_file.txt
+rm -rf test_dir
+
+
+================================================================================
+TRANSLATED PERL CODE:
+================================================================================
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+$SIG{__DIE__} = sub { exit 1 };
+# set uo not implemented
+# set pipefail not implemented
+print "== Basic grep parameters ==\n";
+# Original bash: echo "text with pattern" | grep -i "PATTERN"
+{
+    my $output_202;
+    my $output_printed_202;
+    my $pipeline_success_202 = 1;
+    $output_202 .= "text with pattern\n";
+if ( !($output_202 =~ m{\n\z}msx) ) { $output_202 .= "\n"; }
+
+        my $grep_result_202_1;
+    my @grep_lines_202_1 = split /\n/msx, $output_202;
+    my @grep_filtered_202_1 = grep { /PATTERN/msxi } @grep_lines_202_1;
+    $grep_result_202_1 = join "\n", @grep_filtered_202_1;
+    if (!($grep_result_202_1 =~ m{\n\z}msx || $grep_result_202_1 eq q{})) {
+    $grep_result_202_1 .= "\n";
+    }
+    $CHILD_ERROR = scalar @grep_filtered_202_1 > 0 ? 0 : 1;
+    $output_202 = $grep_result_202_1;
+    $output_202 = $grep_result_202_1;
+    if ((scalar @grep_filtered_202_1) == 0) {
+        $pipeline_success_202 = 0;
+    }
+    if ($output_202 ne q{} && !defined $output_printed_202) {
+        print $output_202;
+        if (!($output_202 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_202 ) { $main_exit_code = 1; }
+    }
+# Original bash: echo -e "line1\nline2\nline3" | grep -v "line2"
+{
+    my $output_203;
+    my $output_printed_203;
+    my $pipeline_success_203 = 1;
+    $output_203 .= "line1\nline2\nline3";
+if ( !($output_203 =~ m{\n\z}msx) ) { $output_203 .= "\n"; }
+
+        my $grep_result_203_1;
+    my @grep_lines_203_1 = split /\n/msx, $output_203;
+    my @grep_filtered_203_1 = grep { !/line2/msx } @grep_lines_203_1;
+    $grep_result_203_1 = join "\n", @grep_filtered_203_1;
+    if (!($grep_result_203_1 =~ m{\n\z}msx || $grep_result_203_1 eq q{})) {
+    $grep_result_203_1 .= "\n";
+    }
+    $CHILD_ERROR = scalar @grep_filtered_203_1 > 0 ? 0 : 1;
+    $output_203 = $grep_result_203_1;
+    $output_203 = $grep_result_203_1;
+    if ((scalar @grep_filtered_203_1) == 0) {
+        $pipeline_success_203 = 0;
+    }
+    if ($output_203 ne q{} && !defined $output_printed_203) {
+        print $output_203;
+        if (!($output_203 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_203 ) { $main_exit_code = 1; }
+    }
+# Original bash: echo -e "match\nno match\nmatch again" | grep -c "match"
+{
+    my $output_204;
+    my $output_printed_204;
+    my $pipeline_success_204 = 1;
+    $output_204 .= "match\nno match\nmatch again";
+if ( !($output_204 =~ m{\n\z}msx) ) { $output_204 .= "\n"; }
+
+        my $grep_result_204_1;
+    my @grep_lines_204_1 = split /\n/msx, $output_204;
+    my @grep_filtered_204_1 = grep { /match/msx } @grep_lines_204_1;
+    $grep_result_204_1 = scalar @grep_filtered_204_1;
+    $CHILD_ERROR = scalar @grep_filtered_204_1 > 0 ? 0 : 1;
+    $output_204 = $grep_result_204_1;
+    $output_204 = $grep_result_204_1;
+    if ((scalar @grep_filtered_204_1) == 0) {
+        $pipeline_success_204 = 0;
+    }
+    if ($output_204 ne q{} && !defined $output_printed_204) {
+        print $output_204;
+        if (!($output_204 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_204 ) { $main_exit_code = 1; }
+    }
+print "== Context parameters ==\n";
+# Original bash: echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -A 2 "TARGET"
+{
+    my $output_205;
+    my $output_printed_205;
+    my $pipeline_success_205 = 1;
+    $output_205 .= "line1\nline2\nTARGET\nline4\nline5";
+if ( !($output_205 =~ m{\n\z}msx) ) { $output_205 .= "\n"; }
+
+        my $grep_result_205_1;
+    my @grep_lines_205_1 = split /\n/msx, $output_205;
+    my @grep_filtered_205_1 = grep { /TARGET/msx } @grep_lines_205_1;
+    my @grep_with_context_205_1;
+    for my $i (0..@grep_lines_205_1-1) {
+    if (scalar grep { $_ eq $grep_lines_205_1[$i] } @grep_filtered_205_1) {
+    push @grep_with_context_205_1, $grep_lines_205_1[$i];
+    for my $j (($i + 1)..($i + 2)) {
+    push @grep_with_context_205_1, $grep_lines_205_1[$j];
+    }
+    }
+    }
+    $grep_result_205_1 = join "\n", @grep_with_context_205_1;
+    $CHILD_ERROR = scalar @grep_filtered_205_1 > 0 ? 0 : 1;
+    $output_205 = $grep_result_205_1;
+    $output_205 = $grep_result_205_1;
+    if ((scalar @grep_filtered_205_1) == 0) {
+        $pipeline_success_205 = 0;
+    }
+    if ($output_205 ne q{} && !defined $output_printed_205) {
+        print $output_205;
+        if (!($output_205 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_205 ) { $main_exit_code = 1; }
+    }
+# Original bash: echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -B 2 "TARGET"
+{
+    my $output_206;
+    my $output_printed_206;
+    my $pipeline_success_206 = 1;
+    $output_206 .= "line1\nline2\nTARGET\nline4\nline5";
+if ( !($output_206 =~ m{\n\z}msx) ) { $output_206 .= "\n"; }
+
+        my $grep_result_206_1;
+    my @grep_lines_206_1 = split /\n/msx, $output_206;
+    my @grep_filtered_206_1 = grep { /TARGET/msx } @grep_lines_206_1;
+    my @grep_with_context_206_1;
+    for my $i (0..@grep_lines_206_1-1) {
+    if (scalar grep { $_ eq $grep_lines_206_1[$i] } @grep_filtered_206_1) {
+    for my $j (($i - 2)..($i-1)) {
+    if ($j >= 0) {
+    push @grep_with_context_206_1, $grep_lines_206_1[$j];
+    }
+    }
+    push @grep_with_context_206_1, $grep_lines_206_1[$i];
+    }
+    }
+    $grep_result_206_1 = join "\n", @grep_with_context_206_1;
+    $CHILD_ERROR = scalar @grep_filtered_206_1 > 0 ? 0 : 1;
+    $output_206 = $grep_result_206_1;
+    $output_206 = $grep_result_206_1;
+    if ((scalar @grep_filtered_206_1) == 0) {
+        $pipeline_success_206 = 0;
+    }
+    if ($output_206 ne q{} && !defined $output_printed_206) {
+        print $output_206;
+        if (!($output_206 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_206 ) { $main_exit_code = 1; }
+    }
+# Original bash: echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -C 1 "TARGET"
+{
+    my $output_207;
+    my $output_printed_207;
+    my $pipeline_success_207 = 1;
+    $output_207 .= "line1\nline2\nTARGET\nline4\nline5";
+if ( !($output_207 =~ m{\n\z}msx) ) { $output_207 .= "\n"; }
+
+        my $grep_result_207_1;
+    my @grep_lines_207_1 = split /\n/msx, $output_207;
+    my @grep_filtered_207_1 = grep { /TARGET/msx } @grep_lines_207_1;
+    my @grep_with_context_207_1;
+    for my $i (0..@grep_lines_207_1-1) {
+    if (scalar grep { $_ eq $grep_lines_207_1[$i] } @grep_filtered_207_1) {
+    for my $j (($i - 1)..($i-1)) {
+    if ($j >= 0) {
+    push @grep_with_context_207_1, $grep_lines_207_1[$j];
+    }
+    }
+    push @grep_with_context_207_1, $grep_lines_207_1[$i];
+    for my $j (($i + 1)..($i + 1)) {
+    push @grep_with_context_207_1, $grep_lines_207_1[$j];
+    }
+    }
+    }
+    $grep_result_207_1 = join "\n", @grep_with_context_207_1;
+    $CHILD_ERROR = scalar @grep_filtered_207_1 > 0 ? 0 : 1;
+    $output_207 = $grep_result_207_1;
+    $output_207 = $grep_result_207_1;
+    if ((scalar @grep_filtered_207_1) == 0) {
+        $pipeline_success_207 = 0;
+    }
+    if ($output_207 ne q{} && !defined $output_printed_207) {
+        print $output_207;
+        if (!($output_207 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_207 ) { $main_exit_code = 1; }
+    }
+print "== File handling parameters ==\n";
+do {
+    open my $original_stdout, '>&', STDOUT
+      or die "Cannot save STDOUT: $!\n";
+    open STDOUT, '>', 'temp_file.txt'
+      or die "Cannot open file: $!\n";
+    print "content\n";
+    open STDOUT, '>&', $original_stdout
+      or die "Cannot restore STDOUT: $!\n";
+    close $original_stdout
+      or die "Close failed: $!\n";
+};
+my $grep_result_208;
+my @grep_lines_208 = ();
+my @grep_filenames_208 = ();
+if (-e "temp_file.txt") {
+    open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
+    while (my $line = <$fh>) {
+        chomp $line;
+        push @grep_lines_208, $line;
+        push @grep_filenames_208, "temp_file.txt";
+    }
+    close $fh
+        or croak "Close failed: $OS_ERROR";
+}
+else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
+my @grep_filtered_208 = grep { /content/msx } @grep_lines_208;
+my @grep_with_filename_208;
+for my $line (@grep_filtered_208) {
+    push @grep_with_filename_208, "temp_file.txt:$line";
+}
+$grep_result_208 = join "\n", @grep_with_filename_208;
+if (!($grep_result_208 =~ m{\n\z}msx || $grep_result_208 eq q{})) {
+    $grep_result_208 .= "\n";
+}
+print $grep_result_208;
+$CHILD_ERROR = scalar @grep_filtered_208 > 0 ? 0 : 1;
+my $grep_result_209;
+my @grep_lines_209 = ();
+my @grep_filenames_209 = ();
+if (-e "temp_file.txt") {
+    open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
+    while (my $line = <$fh>) {
+        chomp $line;
+        push @grep_lines_209, $line;
+        push @grep_filenames_209, "temp_file.txt";
+    }
+    close $fh
+        or croak "Close failed: $OS_ERROR";
+}
+else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
+my @grep_filtered_209 = grep { /content/msx } @grep_lines_209;
+$grep_result_209 = join "\n", @grep_filtered_209;
+if (!($grep_result_209 =~ m{\n\z}msx || $grep_result_209 eq q{})) {
+    $grep_result_209 .= "\n";
+}
+print $grep_result_209;
+$CHILD_ERROR = scalar @grep_filtered_209 > 0 ? 0 : 1;
+my $grep_result_210;
+my @grep_lines_210 = ();
+my @grep_filenames_210 = ();
+if (-e "temp_file.txt") {
+    open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
+    while (my $line = <$fh>) {
+        chomp $line;
+        push @grep_lines_210, $line;
+        push @grep_filenames_210, "temp_file.txt";
+    }
+    close $fh
+        or croak "Close failed: $OS_ERROR";
+}
+else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
+my @grep_filtered_210 = grep { /content/msx } @grep_lines_210;
+$grep_result_210 = @grep_filtered_210 > 0 ? "temp_file.txt" : "";
+print $grep_result_210;
+print "\n";
+$CHILD_ERROR = scalar @grep_filtered_210 > 0 ? 0 : 1;
+my $grep_result_211;
+my @grep_lines_211 = ();
+my @grep_filenames_211 = ();
+if (-e "temp_file.txt") {
+    open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
+    while (my $line = <$fh>) {
+        chomp $line;
+        push @grep_lines_211, $line;
+        push @grep_filenames_211, "temp_file.txt";
+    }
+    close $fh
+        or croak "Close failed: $OS_ERROR";
+}
+else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
+my @grep_filtered_211 = grep { /nonexistent/msx } @grep_lines_211;
+$grep_result_211 = @grep_filtered_211 == 0 ? "temp_file.txt" : "";
+print $grep_result_211;
+print "\n";
+$CHILD_ERROR = scalar @grep_filtered_211 > 0 ? 0 : 1;
+if ($CHILD_ERROR != 0) {
+    1;
+}
+print "== Output formatting parameters ==\n";
+# Original bash: echo "text with pattern in it" | grep -o "pattern"
+{
+    my $output_213;
+    my $output_printed_213;
+    my $pipeline_success_213 = 1;
+    $output_213 .= "text with pattern in it\n";
+if ( !($output_213 =~ m{\n\z}msx) ) { $output_213 .= "\n"; }
+
+        my $grep_result_213_1;
+    my @grep_lines_213_1 = split /\n/msx, $output_213;
+    my @grep_filtered_213_1 = grep { /pattern/msx } @grep_lines_213_1;
+    my @grep_matches_213_1;
+    foreach my $line (@grep_filtered_213_1) {
+    if ($line =~ /(pattern)/msx) {
+    push @grep_matches_213_1, $1;
+    }
+    }
+    $grep_result_213_1 = join "\n", @grep_matches_213_1;
+    $CHILD_ERROR = scalar @grep_filtered_213_1 > 0 ? 0 : 1;
+    $output_213 = $grep_result_213_1;
+    $output_213 = $grep_result_213_1;
+    if ((scalar @grep_filtered_213_1) == 0) {
+        $pipeline_success_213 = 0;
+    }
+    if ($output_213 ne q{} && !defined $output_printed_213) {
+        print $output_213;
+        if (!($output_213 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_213 ) { $main_exit_code = 1; }
+    }
+# Original bash: echo "text with pattern in it" | grep -b "pattern"
+{
+    my $output_214;
+    my $output_printed_214;
+    my $pipeline_success_214 = 1;
+    $output_214 .= "text with pattern in it\n";
+if ( !($output_214 =~ m{\n\z}msx) ) { $output_214 .= "\n"; }
+
+        my $grep_result_214_1;
+    my @grep_lines_214_1 = split /\n/msx, $output_214;
+    my @grep_filtered_214_1 = grep { /pattern/msx } @grep_lines_214_1;
+    my @grep_with_offset_214_1;
+    my $offset_214_1 = 0;
+    for my $line (@grep_lines_214_1) {
+    if (grep { $_ eq $line } @grep_filtered_214_1) {
+    push @grep_with_offset_214_1, sprintf "%d:%s", $offset_214_1, $line;
+    }
+    $offset_214_1 += length($line) + 1; # +1 for newline
+    }
+    $grep_result_214_1 = join "\n", @grep_with_offset_214_1;
+    if (!($grep_result_214_1 =~ m{\n\z}msx || $grep_result_214_1 eq q{})) {
+    $grep_result_214_1 .= "\n";
+    }
+    $CHILD_ERROR = scalar @grep_filtered_214_1 > 0 ? 0 : 1;
+    $output_214 = $grep_result_214_1;
+    $output_214 = $grep_result_214_1;
+    if ((scalar @grep_filtered_214_1) == 0) {
+        $pipeline_success_214 = 0;
+    }
+    if ($output_214 ne q{} && !defined $output_printed_214) {
+        print $output_214;
+        if (!($output_214 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_214 ) { $main_exit_code = 1; }
+    }
+# Original bash: echo "text with pattern in it" | grep -n "pattern"
+{
+    my $output_215;
+    my $output_printed_215;
+    my $pipeline_success_215 = 1;
+    $output_215 .= "text with pattern in it\n";
+if ( !($output_215 =~ m{\n\z}msx) ) { $output_215 .= "\n"; }
+
+        my $grep_result_215_1;
+    my @grep_lines_215_1 = split /\n/msx, $output_215;
+    my @grep_filtered_215_1 = grep { /pattern/msx } @grep_lines_215_1;
+    my @grep_numbered_215_1;
+    for my $i (0..@grep_lines_215_1-1) {
+    if (scalar grep { $_ eq $grep_lines_215_1[$i] } @grep_filtered_215_1) {
+    push @grep_numbered_215_1, sprintf "%d:%s", $i + 1, $grep_lines_215_1[$i];
+    }
+    }
+    $grep_result_215_1 = join "\n", @grep_numbered_215_1;
+    $CHILD_ERROR = scalar @grep_filtered_215_1 > 0 ? 0 : 1;
+    $output_215 = $grep_result_215_1;
+    $output_215 = $grep_result_215_1;
+    if ((scalar @grep_filtered_215_1) == 0) {
+        $pipeline_success_215 = 0;
+    }
+    if ($output_215 ne q{} && !defined $output_printed_215) {
+        print $output_215;
+        if (!($output_215 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_215 ) { $main_exit_code = 1; }
+    }
+print "== Recursive and include/exclude parameters ==\n";
+use File::Path qw(make_path);
+my $err;
+if ( !-d 'test_dir' ) {
+    make_path( 'test_dir', { error => \$err } );
+    if ( @{$err} ) {
+        croak "mkdir: cannot create directory 'test_dir': $err->[0]\n";
+    }
+}
+do {
+    open my $original_stdout, '>&', STDOUT
+      or die "Cannot save STDOUT: $!\n";
+    open STDOUT, '>', 'test_dir/file1.txt'
+      or die "Cannot open file: $!\n";
+    print "pattern here\n";
+    open STDOUT, '>&', $original_stdout
+      or die "Cannot restore STDOUT: $!\n";
+    close $original_stdout
+      or die "Close failed: $!\n";
+};
+do {
+    open my $original_stdout, '>&', STDOUT
+      or die "Cannot save STDOUT: $!\n";
+    open STDOUT, '>', 'test_dir/file2.txt'
+      or die "Cannot open file: $!\n";
+    print "no pattern\n";
+    open STDOUT, '>&', $original_stdout
+      or die "Cannot restore STDOUT: $!\n";
+    close $original_stdout
+      or die "Close failed: $!\n";
+};
+my $grep_result_217;
+my @grep_lines_217 = ();
+my @grep_filenames_217 = ();
+sub find_files_recursive_217 {
+    my ($dir, $pattern) = @_;
+    my @files;
+    if ( opendir my $dh, $dir ) {
+        while (my $file = readdir $dh) {
+            next if $file eq '.' || $file eq '..';
+            my $path = "$dir/$file";
+            if (-d $path) {
+                @files = (@files, find_files_recursive_217($path, $pattern));
+            } elsif (-f $path) {
+                if ($file =~ /[.]txt$/msx) {
+                    push @files, $path;
+                }
+            }
+        }
+        closedir $dh;
+    }
+    return @files;
+}
+my @files_217 = find_files_recursive_217('test_dir', '*');
+for my $file (@files_217) {
+    if (-f $file) {
+        open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
+        while (my $line = <$fh>) {
+            chomp $line;
+            push @grep_lines_217, $line;
+            push @grep_filenames_217, $file;
+        }
+        close $fh
+            or croak "Close failed: $OS_ERROR";
+    }
+}
+my @grep_filtered_217 = grep { /pattern/msx } @grep_lines_217;
+my @grep_with_filename_217;
+for my $i (0..@grep_lines_217-1) {
+    if (scalar grep { $_ eq $grep_lines_217[$i] } @grep_filtered_217) {
+        push @grep_with_filename_217, "$grep_filenames_217[$i]:$grep_lines_217[$i]";
+    }
+}
+$grep_result_217 = join "\n", @grep_with_filename_217;
+if (!($grep_result_217 =~ m{\n\z}msx || $grep_result_217 eq q{})) {
+    $grep_result_217 .= "\n";
+}
+print $grep_result_217;
+$CHILD_ERROR = scalar @grep_filtered_217 > 0 ? 0 : 1;
+my $grep_result_218;
+my @grep_lines_218 = ();
+my @grep_filenames_218 = ();
+sub find_files_recursive_218 {
+    my ($dir, $pattern) = @_;
+    my @files;
+    if ( opendir my $dh, $dir ) {
+        while (my $file = readdir $dh) {
+            next if $file eq '.' || $file eq '..';
+            my $path = "$dir/$file";
+            if (-d $path) {
+                @files = (@files, find_files_recursive_218($path, $pattern));
+            } elsif (-f $path) {
+                if ($file =~ /.*[.]txt$/msx) {
+                    push @files, $path;
+                }
+            }
+        }
+        closedir $dh;
+    }
+    return @files;
+}
+my @files_218 = find_files_recursive_218('test_dir', '*.txt');
+for my $file (@files_218) {
+    if (-f $file) {
+        open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
+        while (my $line = <$fh>) {
+            chomp $line;
+            push @grep_lines_218, $line;
+            push @grep_filenames_218, $file;
+        }
+        close $fh
+            or croak "Close failed: $OS_ERROR";
+    }
+}
+my @grep_filtered_218 = grep { /pattern/msx } @grep_lines_218;
+my @grep_with_filename_218;
+for my $i (0..@grep_lines_218-1) {
+    if (scalar grep { $_ eq $grep_lines_218[$i] } @grep_filtered_218) {
+        push @grep_with_filename_218, "$grep_filenames_218[$i]:$grep_lines_218[$i]";
+    }
+}
+$grep_result_218 = join "\n", @grep_with_filename_218;
+if (!($grep_result_218 =~ m{\n\z}msx || $grep_result_218 eq q{})) {
+    $grep_result_218 .= "\n";
+}
+print $grep_result_218;
+$CHILD_ERROR = scalar @grep_filtered_218 > 0 ? 0 : 1;
+my $grep_result_219;
+my @grep_lines_219 = ();
+my @grep_filenames_219 = ();
+sub find_files_recursive_219 {
+    my ($dir, $pattern) = @_;
+    my @files;
+    if ( opendir my $dh, $dir ) {
+        while (my $file = readdir $dh) {
+            next if $file eq '.' || $file eq '..';
+            my $path = "$dir/$file";
+            if (-d $path) {
+                @files = (@files, find_files_recursive_219($path, $pattern));
+            } elsif (-f $path) {
+                if ($file =~ /[.]txt$/msx && $file !~ /.*[.]bak$/msx) {
+                    push @files, $path;
+                }
+            }
+        }
+        closedir $dh;
+    }
+    return @files;
+}
+my @files_219 = find_files_recursive_219('test_dir', '*');
+for my $file (@files_219) {
+    if (-f $file) {
+        open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
+        while (my $line = <$fh>) {
+            chomp $line;
+            push @grep_lines_219, $line;
+            push @grep_filenames_219, $file;
+        }
+        close $fh
+            or croak "Close failed: $OS_ERROR";
+    }
+}
+my @grep_filtered_219 = grep { /pattern/msx } @grep_lines_219;
+my @grep_with_filename_219;
+for my $i (0..@grep_lines_219-1) {
+    if (scalar grep { $_ eq $grep_lines_219[$i] } @grep_filtered_219) {
+        push @grep_with_filename_219, "$grep_filenames_219[$i]:$grep_lines_219[$i]";
+    }
+}
+$grep_result_219 = join "\n", @grep_with_filename_219;
+if (!($grep_result_219 =~ m{\n\z}msx || $grep_result_219 eq q{})) {
+    $grep_result_219 .= "\n";
+}
+print $grep_result_219;
+$CHILD_ERROR = scalar @grep_filtered_219 > 0 ? 0 : 1;
+my $grep_result_220;
+my @grep_lines_220 = ();
+my @grep_filenames_220 = ();
+sub find_files_recursive_220 {
+    my ($dir, $pattern) = @_;
+    my @files;
+    if ( opendir my $dh, $dir ) {
+        while (my $file = readdir $dh) {
+            next if $file eq '.' || $file eq '..';
+            my $path = "$dir/$file";
+            if (-d $path) {
+                @files = (@files, find_files_recursive_220($path, $pattern));
+            } elsif (-f $path) {
+                if ($file =~ /.*[.]txt$/msx) {
+                    push @files, $path;
+                }
+            }
+        }
+        closedir $dh;
+    }
+    return @files;
+}
+my @files_220 = find_files_recursive_220('test_dir', '*.txt');
+for my $file (@files_220) {
+    if (-f $file) {
+        open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
+        while (my $line = <$fh>) {
+            chomp $line;
+            push @grep_lines_220, $line;
+            push @grep_filenames_220, $file;
+        }
+        close $fh
+            or croak "Close failed: $OS_ERROR";
+    }
+}
+my @grep_filtered_220 = grep { /pattern/msx } @grep_lines_220;
+my %file_counts_220;
+for my $i (0..@grep_lines_220-1) {
+    if (scalar grep { $_ eq $grep_lines_220[$i] } @grep_filtered_220) {
+        $file_counts_220{$grep_filenames_220[$i]}++;
+    }
+}
+$grep_result_220 = q{};
+for my $file (sort keys %file_counts_220) {
+    $grep_result_220 .= "$file:$file_counts_220{$file}\n";
+}
+$grep_result_220 =~ s/\\n$/msx; # Remove trailing newline
+print $grep_result_220;
+print "\n";
+$CHILD_ERROR = scalar @grep_filtered_220 > 0 ? 0 : 1;
+# Original bash: grep -r "pattern" test_dir --include="*.txt" | wc -l
+{
+    my $output_221;
+    my $output_printed_221;
+    my $pipeline_success_221 = 1;
+        my $grep_result_221_0;
+    my @grep_lines_221_0 = ();
+    my @grep_filenames_221_0 = ();
+    sub find_files_recursive_221_0 {
+    my ($dir, $pattern) = @_;
+    my @files;
+    if ( opendir my $dh, $dir ) {
+    while (my $file = readdir $dh) {
+    next if $file eq '.' || $file eq '..';
+    my $path = "$dir/$file";
+    if (-d $path) {
+    @files = (@files, find_files_recursive_221_0($path, $pattern));
+    } elsif (-f $path) {
+    if ($file =~ /.*[.]txt$/msx) {
+    push @files, $path;
+    }
+    }
+    }
+    closedir $dh;
+    }
+    return @files;
+    }
+    my @files_221_0 = find_files_recursive_221_0('test_dir', '*.txt');
+    for my $file (@files_221_0) {
+    if (-f $file) {
+    open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
+    while (my $line = <$fh>) {
+    chomp $line;
+    push @grep_lines_221_0, $line;
+    push @grep_filenames_221_0, $file;
+    }
+    close $fh
+    or croak "Close failed: $OS_ERROR";
+    }
+    }
+    my @grep_filtered_221_0 = grep { /pattern/msx } @grep_lines_221_0;
+    my @grep_with_filename_221_0;
+    for my $i (0..@grep_lines_221_0-1) {
+    if (scalar grep { $_ eq $grep_lines_221_0[$i] } @grep_filtered_221_0) {
+    push @grep_with_filename_221_0, "$grep_filenames_221_0[$i]:$grep_lines_221_0[$i]";
+    }
+    }
+    $grep_result_221_0 = join "\n", @grep_with_filename_221_0;
+    if (!($grep_result_221_0 =~ m{\n\z}msx || $grep_result_221_0 eq q{})) {
+    $grep_result_221_0 .= "\n";
+    }
+    $CHILD_ERROR = scalar @grep_filtered_221_0 > 0 ? 0 : 1;
+    $output_221 = $grep_result_221_0;
+    $output_221 = $grep_result_221_0;
+    if ((scalar @grep_filtered_221_0) == 0) {
+        $pipeline_success_221 = 0;
+    }
+
+        use IPC::Open3;
+    my @wc_args_221_1 = ("-l");
+    my ($wc_in_221_1, $wc_out_221_1, $wc_err_221_1);
+    my $wc_pid_221_1 = open3($wc_in_221_1, $wc_out_221_1, $wc_err_221_1, 'wc', @wc_args_221_1);
+    print {$wc_in_221_1} $output_221;
+    close $wc_in_221_1 or die "Close failed: $!\n";
+    my $output_221_1 = do { local $/ = undef; <$wc_out_221_1> };
+    close $wc_out_221_1 or die "Close failed: $!\n";
+    waitpid $wc_pid_221_1, 0;
+    $output_221 = $output_221_1;
+    if ($output_221 ne q{} && !defined $output_printed_221) {
+        print $output_221;
+        if (!($output_221 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_221 ) { $main_exit_code = 1; }
+    }
+print "== Advanced parameters ==\n";
+# Original bash: echo -e "match1\nmatch2\nmatch3\nmatch4" | grep -m 2 "match"
+{
+    my $output_222;
+    my $output_printed_222;
+    my $pipeline_success_222 = 1;
+    $output_222 .= "match1\nmatch2\nmatch3\nmatch4";
+if ( !($output_222 =~ m{\n\z}msx) ) { $output_222 .= "\n"; }
+
+        my $grep_result_222_1;
+    my @grep_lines_222_1 = split /\n/msx, $output_222;
+    my @grep_filtered_222_1 = grep { /match/msx } @grep_lines_222_1;
+    @grep_filtered_222_1 = @grep_filtered_222_1[0..1];
+    $grep_result_222_1 = join "\n", @grep_filtered_222_1;
+    if (!($grep_result_222_1 =~ m{\n\z}msx || $grep_result_222_1 eq q{})) {
+    $grep_result_222_1 .= "\n";
+    }
+    $CHILD_ERROR = scalar @grep_filtered_222_1 > 0 ? 0 : 1;
+    $output_222 = $grep_result_222_1;
+    $output_222 = $grep_result_222_1;
+    if ((scalar @grep_filtered_222_1) == 0) {
+        $pipeline_success_222 = 0;
+    }
+    if ($output_222 ne q{} && !defined $output_printed_222) {
+        print $output_222;
+        if (!($output_222 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_222 ) { $main_exit_code = 1; }
+    }
+# Original bash: echo "text with pattern in it" | grep -q "pattern" && echo "found" || echo "not found"
+{
+    my $output_223;
+    my $output_printed_223;
+    my $pipeline_success_223 = 1;
+    $output_223 .= "text with pattern in it\n";
+if ( !($output_223 =~ m{\n\z}msx) ) { $output_223 .= "\n"; }
+
+        my $grep_exit_code_224;
+    {
+    my $grep_result_223_1;
+    my @grep_lines_223_1 = split /\n/msx, $output_223;
+    my @grep_filtered_223_1 = grep { /pattern/msx } @grep_lines_223_1;
+    $grep_result_223_1 = join "\n", @grep_filtered_223_1;
+    if (!($grep_result_223_1 =~ m{\n\z}msx || $grep_result_223_1 eq q{})) {
+    $grep_result_223_1 .= "\n";
+    }
+    $CHILD_ERROR = scalar @grep_filtered_223_1 > 0 ? 0 : 1;
+    $output_223 = $grep_result_223_1;
+    $grep_exit_code_224 = scalar @grep_filtered_223_1 > 0 ? 0 : 1;
+    if ($grep_exit_code_224 == 0) {
+    print "found\n";
+    } else {
+    print "not found\n";
+    }
+    }
+    $pipeline_success_223 = 1;
+    $output_223 = q{};
+    if ($output_223 ne q{} && !defined $output_printed_223) {
+        print $output_223;
+        if (!($output_223 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_223 ) { $main_exit_code = 1; }
+    }
+# Original bash: grep -Z -l "pattern" temp_file.txt | tr '\0' '\n'
+{
+    my $output_225;
+    my $output_printed_225;
+    my $pipeline_success_225 = 1;
+        my $grep_result_225_0;
+    my @grep_lines_225_0 = ();
+    my @grep_filenames_225_0 = ();
+    if (-e "temp_file.txt") {
+    open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
+    while (my $line = <$fh>) {
+    chomp $line;
+    push @grep_lines_225_0, $line;
+    push @grep_filenames_225_0, "temp_file.txt";
+    }
+    close $fh
+    or croak "Close failed: $OS_ERROR";
+    }
+    else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
+    my @grep_filtered_225_0 = grep { /pattern/msx } @grep_lines_225_0;
+    $grep_result_225_0 = @grep_filtered_225_0 > 0 ? "temp_file.txt" : "";
+    $CHILD_ERROR = scalar @grep_filtered_225_0 > 0 ? 0 : 1;
+    $output_225 = $grep_result_225_0;
+    $output_225 = $grep_result_225_0;
+    if ((scalar @grep_filtered_225_0) == 0) {
+        $pipeline_success_225 = 0;
+    }
+
+        my $set1_226 = "\\0";
+    my $set2_226 = "\\n";
+    my $input_226 = $output_225;
+    # Expand character ranges for tr command
+    my $expanded_set1_226 = $set1_226;
+    my $expanded_set2_226 = $set2_226;
+    # Handle a-z range in set1
+    if ($expanded_set1_226 =~ /a-z/msx) {
+    $expanded_set1_226 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+    }
+    # Handle A-Z range in set1
+    if ($expanded_set1_226 =~ /A-Z/msx) {
+    $expanded_set1_226 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    # Handle a-z range in set2
+    if ($expanded_set2_226 =~ /a-z/msx) {
+    $expanded_set2_226 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+    }
+    # Handle A-Z range in set2
+    if ($expanded_set2_226 =~ /A-Z/msx) {
+    $expanded_set2_226 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    my $tr_result_225_1 = q{};
+    for my $char ( split //msx, $input_226 ) {
+    my $pos_226 = index $expanded_set1_226, $char;
+    if ( $pos_226 >= 0 && $pos_226 < length $expanded_set2_226 ) {
+    $tr_result_225_1 .= substr $expanded_set2_226, $pos_226, 1;
+    } else {
+    $tr_result_225_1 .= $char;
+    }
+    }
+    if (!($tr_result_225_1 =~ m{\n\z}msx || $tr_result_225_1 eq q{})) {
+    $tr_result_225_1 .= "\n";
+    }
+    $output_225 = $tr_result_225_1;
+    if ($output_225 ne q{} && !defined $output_printed_225) {
+        print $output_225;
+        if (!($output_225 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_225 ) { $main_exit_code = 1; }
+    }
+if ( -e "temp_file.txt" ) {
+    if ( -d "temp_file.txt" ) {
+        carp "rm: carping: ", "temp_file.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "temp_file.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "temp_file.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "temp_file.txt", ": No such file or directory\n";
+}
+if ( -e "test_dir" ) {
+    if ( -d "test_dir" ) {
+        my $err;
+        remove_tree("test_dir", {error => \$err});
+        if (@{$err}) {
+            carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";
+        }
+        else {
+            $main_exit_code = 0;
+        }
+    }
+    else {
+        if ( unlink "test_dir" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_dir",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_dir", ": No such file or directory\n";
+}
+
+exit $main_exit_code;
+
+
+================================================================================
+PERL::CRITIC RESULTS:
+================================================================================
+Perl::Critic not found in PATH. Skipping Perl::Critic checks.
+
+================================================================================
+ABSTRACT SYNTAX TREE:
+================================================================================
+[BuiltinCommand(BuiltinCommand { name: "set", args: [Literal("-e", None), Literal("uo", None), Literal("pipefail", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("== Basic grep parameters ==")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("text with pattern")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-i", None), StringInterpolation(StringInterpolation { parts: [Literal("PATTERN")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo \"text with pattern\" | grep -i \"PATTERN\"\necho"), stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("line1\\nline2\\nline3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-v", None), StringInterpolation(StringInterpolation { parts: [Literal("line2")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo -e \"line1\\nline2\\nline3\" | grep -v \"line2\"\necho"), stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("match\\nno match\\nmatch again")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-c", None), StringInterpolation(StringInterpolation { parts: [Literal("match")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo -e \"match\\nno match\\nmatch again\" | grep -c \"match\"\n\necho"), stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("== Context parameters ==")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("line1\\nline2\\nTARGET\\nline4\\nline5")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-A", None), Literal("2", None), StringInterpolation(StringInterpolation { parts: [Literal("TARGET")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo -e \"line1\\nline2\\nTARGET\\nline4\\nline5\" | grep -A 2 \"TARGET\"\necho"), stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("line1\\nline2\\nTARGET\\nline4\\nline5")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-B", None), Literal("2", None), StringInterpolation(StringInterpolation { parts: [Literal("TARGET")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo -e \"line1\\nline2\\nTARGET\\nline4\\nline5\" | grep -B 2 \"TARGET\"\necho"), stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("line1\\nline2\\nTARGET\\nline4\\nline5")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-C", None), Literal("1", None), StringInterpolation(StringInterpolation { parts: [Literal("TARGET")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo -e \"line1\\nline2\\nTARGET\\nline4\\nline5\" | grep -C 1 \"TARGET\"\n\necho"), stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("== File handling parameters ==")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("content")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("temp_file.txt", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-H", None), StringInterpolation(StringInterpolation { parts: [Literal("content")] }, None), Literal("temp_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-h", None), StringInterpolation(StringInterpolation { parts: [Literal("content")] }, None), Literal("temp_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-l", None), StringInterpolation(StringInterpolation { parts: [Literal("content")] }, None), Literal("temp_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Or(Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-L", None), StringInterpolation(StringInterpolation { parts: [Literal("nonexistent")] }, None), Literal("temp_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("true", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("== Output formatting parameters ==")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("text with pattern in it")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-o", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo \"text with pattern in it\" | grep -o \"pattern\"\necho"), stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("text with pattern in it")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-b", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo \"text with pattern in it\" | grep -b \"pattern\"\necho"), stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("text with pattern in it")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-n", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo \"text with pattern in it\" | grep -n \"pattern\"\n\necho"), stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("== Recursive and include/exclude parameters ==")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("-p", None), Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("pattern here")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("test_dir/file1.txt", None), heredoc_body: None }] }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("no pattern")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("test_dir/file2.txt", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-r", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None), Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-r", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None), Literal("test_dir", None), Literal("--include=\"*.txt\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-r", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None), Literal("test_dir", None), Literal("--exclude=\"*.bak\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-r", None), Literal("-c", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None), Literal("test_dir", None), Literal("--include=\"*.txt\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-r", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None), Literal("test_dir", None), Literal("--include=\"*.txt\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("grep -r \"pattern\" test_dir --include=\"*.txt\" | wc -l\n\necho"), stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("== Advanced parameters ==")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("match1\\nmatch2\\nmatch3\\nmatch4")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-m", None), Literal("2", None), StringInterpolation(StringInterpolation { parts: [Literal("match")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("echo -e \"match1\\nmatch2\\nmatch3\\nmatch4\" | grep -m 2 \"match\"\necho"), stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("text with pattern in it")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Or(And(Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-q", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("found")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("not found")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))], source_text: Some("echo \"text with pattern in it\" | grep -q \"pattern\" && echo \"found\" || echo \"not found\"\ngrep"), stdout_used: true, stderr_used: true }), Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-Z", None), Literal("-l", None), StringInterpolation(StringInterpolation { parts: [Literal("pattern")] }, None), Literal("temp_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tr", None), args: [Literal("\\0", None), Literal("\\n", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: Some("grep -Z -l \"pattern\" temp_file.txt | tr '\\0' '\\n'\n\n# Cleanup\nrm"), stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-f", None), Literal("temp_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-r", None), Literal("f", None), Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+
+================================================================================
+STDOUT COMPARISON (DIFF):
+================================================================================
+--- shell_stdout
++++ perl_stdout
+-== Basic grep parameters ==
+-text with pattern
+-line1
+-line3
+-3
+-== Context parameters ==
+-TARGET
+-line4
+-line5
+-line1
+-line2
+-TARGET
+-line2
+-TARGET
+-line4
+-== File handling parameters ==
+-temp_file.txt:content
+-content
+-temp_file.txt
+-temp_file.txt
+-== Output formatting parameters ==
+-pattern
+-0:text with pattern in it
+-1:text with pattern in it
+-== Recursive and include/exclude parameters ==
+-test_dir/file1.txt:pattern here
+-test_dir/file2.txt:no pattern
+-test_dir/file1.txt:pattern here
+-test_dir/file2.txt:no pattern
+-test_dir/file1.txt:pattern here
+-test_dir/file2.txt:no pattern
+-test_dir/file1.txt:1
+-test_dir/file2.txt:1
+-2
+-== Advanced parameters ==
+-match1
+-match2
+-found
+
+
+================================================================================
+STDERR COMPARISON:
+================================================================================
+STDERR DIFFERENCES FOUND:
+--- shell_stderr
++++ perl_stderr
++Possible unintended interpolation of @grep_lines_221_0 in string at /tmp/__tmp_test_output.pl line 648.
++Possible unintended interpolation of @grep_filenames_221_0 in string at /tmp/__tmp_test_output.pl line 649.
++Possible unintended interpolation of @files in string at /tmp/__tmp_test_output.pl line 652.
++Global symbol "$output_221" requires explicit package name (did you forget to declare "my $output_221"?) at /tmp/__tmp_test_output.pl line 644.
++Global symbol "$output_printed_221" requires explicit package name (did you forget to declare "my $output_printed_221"?) at /tmp/__tmp_test_output.pl line 645.
++Global symbol "$pipeline_success_221" requires explicit package name (did you forget to declare "my $pipeline_success_221"?) at /tmp/__tmp_test_output.pl line 646.
++Global symbol "$grep_result_221_0" requires explicit package name (did you forget to declare "my $grep_result_221_0"?) at /tmp/__tmp_test_output.pl line 647.
++Global symbol "@grep_lines_221_0" requires explicit package name (did you forget to declare "my @grep_lines_221_0"?) at /tmp/__tmp_test_output.pl line 648.
++Global symbol "@grep_filenames_221_0" requires explicit package name (did you forget to declare "my @grep_filenames_221_0"?) at /tmp/__tmp_test_output.pl line 649.
++Global symbol "$dir" requires explicit package name (did you forget to declare "my $dir"?) at /tmp/__tmp_test_output.pl line 651.
++Global symbol "$pattern" requires explicit package name (did you forget to declare "my $pattern"?) at /tmp/__tmp_test_output.pl line 651.
++Global symbol "@files" requires explicit package name (did you forget to declare "my @files"?) at /tmp/__tmp_test_output.pl line 652.
++Global symbol "$dh" requires explicit package name (did you forget to declare "my $dh"?) at /tmp/__tmp_test_output.pl line 653.
++/tmp/__tmp_test_output.pl has too many errors.
+
+
+================================================================================
+SUMMARY: 31 out of 146 tests passed before first failure
+================================================================================
+
+BRIEF FAILURE SUMMARY:
+Failed due to: stdout mismatch
+Writing test count 31 to first_n_tests_passed.txt
+Current working directory: "/mnt/d/GitHub/sh2perl"
+Successfully wrote test count 31 and matching stdout lines 0 to first_n_tests_passed.txt
+
+To run test again: ./fail 018
+Test run completed at Mon Apr  6 20:56:15 AWST 2026

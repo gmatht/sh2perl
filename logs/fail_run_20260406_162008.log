@@ -1,0 +1,990 @@
+Starting test run at Mon Apr  6 16:20:08 AWST 2026
+Logging to: logs/fail_run_20260406_162008.log
+Test arguments: 
+----------------------------------------
+Compiling debashc...
+   Compiling debashl v0.1.0 (/mnt/d/GitHub/sh2perl)
+warning: unused import: `Token`
+    --> src/parser/commands.rs:1545:31
+     |
+1545 |     use crate::lexer::{Lexer, Token};
+     |                               ^^^^^
+     |
+     = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `regex::Regex`
+ --> src/generator/commands/pipeline_commands.rs:6:5
+  |
+6 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/generator/redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src/timeout_manager.rs:282:1
+    |
+282 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: variable does not need to be mutable
+    --> src/parser/commands.rs:1548:9
+     |
+1548 |     let mut lexer = Lexer::new(text);
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `cmd2`
+   --> src/generator/commands/pipeline_commands.rs:605:66
+    |
+605 |         if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) =
+    |                                                                  ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: variable `head_max` is assigned to, but never used
+    --> src/generator/commands/pipeline_commands.rs:1028:25
+     |
+1028 |                 let mut head_max = 10; // Default value
+     |                         ^^^^^^^^
+     |
+     = note: consider using `_head_max` instead
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1040:53
+     |
+1040 | ...                   head_max = num;
+     |                       ^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1047:53
+     |
+1047 | ...                   head_max = num;
+     |                       ^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1052:49
+     |
+1052 | ...                   head_max = num;
+     |                       ^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+    --> src/generator/commands/pipeline_commands.rs:1077:22
+     |
+1077 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+     |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+    --> src/generator/commands/pipeline_commands.rs:1092:34
+     |
+1092 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+     |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src/generator/commands/system_commands.rs:48:35
+   |
+48 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `input_var`
+ --> src/generator/commands/comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `output`
+  --> src/generator/commands/find.rs:47:13
+   |
+47 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src/generator/commands/find.rs:47:9
+   |
+47 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:473:13
+    |
+473 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:474:13
+    |
+474 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:475:13
+    |
+475 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: variable `sort_by_time` is assigned to, but never used
+   --> src/generator/commands/ls.rs:763:13
+    |
+763 |     let mut sort_by_time = false; // -t flag: sort by modification time
+    |             ^^^^^^^^^^^^
+    |
+    = note: consider using `_sort_by_time` instead
+
+warning: value assigned to `sort_by_time` is never read
+   --> src/generator/commands/ls.rs:777:32
+    |
+777 |                         't' => sort_by_time = true,   // -t flag: sort by modification time
+    |                                ^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `literal`
+   --> src/generator/utils.rs:162:59
+    |
+162 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `cmd_name`
+  --> src/generator/words.rs:68:25
+   |
+68 |                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
+   |                         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cmd_name`
+
+warning: unused variable: `command_str`
+   --> src/generator/words.rs:654:37
+    |
+654 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:796:33
+    |
+796 | ...                   let indent1 = "    ".to_string(); // 4 spaces for outer do block
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:837:33
+    |
+837 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:878:33
+    |
+878 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:915:33
+    |
+915 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:954:33
+    |
+954 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `literal`
+   --> src/generator/words.rs:504:59
+    |
+504 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `s`
+    --> src/generator/words.rs:1149:23
+     |
+1149 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+     |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `needs_exit_code`
+   --> src/generator/mod.rs:128:13
+    |
+128 |         let needs_exit_code = self.needs_exit_code_tracking(ast);
+    |             ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_needs_exit_code`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:151:13
+    |
+151 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:194:13
+    |
+194 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src/parser/commands.rs:1356:8
+     |
+  20 | impl Parser {
+     | ----------- methods in this implementation
+...
+1356 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1431 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src/parser/control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src/parser/control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src/parser/words.rs:2191:4
+     |
+2191 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src/generator/commands/find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src/generator/commands/find.rs:248:4
+    |
+248 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src/generator/commands/tr.rs:73:4
+   |
+73 | fn generate_tr_linebyline_impl(
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+   --> src/generator/commands/tr.rs:133:4
+    |
+133 | fn generate_tr_buffered_impl(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src/generator/control_flow.rs:241:4
+    |
+241 | fn is_variable_used_after_for_loop(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src/variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 44 warnings (run `cargo fix --lib -p debashl` to apply 5 suggestions)
+warning: unused import: `execute_with_progress`
+  --> src/testing.rs:10:5
+   |
+10 |     execute_with_progress, execute_with_timeout, is_execution_frozen, OperationType,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src/testing.rs:17:5
+   |
+17 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src/testing.rs:28:9
+   |
+28 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src/testing.rs:1428:9
+     |
+1428 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src/testing.rs:1678:9
+     |
+1678 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src/testing.rs:1737:9
+     |
+1737 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src/testing.rs:2419:13
+     |
+2419 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src/testing.rs:2419:9
+     |
+2419 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src/execution.rs:64:8
+   |
+64 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String> {
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src/utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src/utils.rs:19:8
+   |
+19 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src/utils.rs:27:8
+   |
+27 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src/testing.rs:22:4
+   |
+22 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String>
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src/testing.rs:64:9
+   |
+51 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+64 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+65 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src/testing.rs:645:8
+    |
+645 | pub fn test_file_equivalence_detailed(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src/testing.rs:1667:8
+     |
+1667 | pub fn test_all_examples_next_fail(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src/cli_commands.rs:215:4
+    |
+215 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src/cli_commands.rs:485:8
+    |
+485 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src/timeout_manager.rs:11:5
+   |
+ 8 | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src/timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src/timeout_manager.rs:117:12
+    |
+ 90 | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: Duration) {
+    |            ^^^^^^^^^^^
+...
+178 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src/timeout_manager.rs:302:8
+    |
+302 | pub fn execute_with_progress<F, T>(operation: OperationType, operation_fn: F) -> Result<T, String>
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 25.20s
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+Running 146 tests across 146 examples with perl generator
+==================================================
+Test 1/146: 000__01_file_directory_operations.sh with perl     DEBUG: Starting test execution for examples/000__01_file_directory_operations.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__01_file_directory_operations.sh
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1564 characters
+DEBUG: check_perl_no_open3_builtins called with 1564 characters
+DEBUG: check_perl_no_system_builtins called with 1564 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1564 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.616µs
+DEBUG: Execution loop iteration, elapsed: 100.751982ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 282.322796ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 9035, Translated stdout length: 9035
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 783ms
+✓Test 2/146: 000__02_output_formatting_commands.sh with perl     DEBUG: Starting test execution for examples/000__02_output_formatting_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__02_output_formatting_commands.sh
+DEBUG: words.rs - Using native sha256sum implementation for command substitution
+DEBUG: words.rs - Using native sha512sum implementation for command substitution
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 7055 characters
+DEBUG: check_perl_no_open3_builtins called with 7055 characters
+DEBUG: check_perl_no_system_builtins called with 7055 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 7055 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use Digest::SHA   qw(sha256_hex sha512_hex);
+us
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.33µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 40.436926ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 660, Translated stdout length: 660
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 500ms
+✓Test 3/146: 000__03_file_manipulation_commands.sh with perl     DEBUG: Starting test execution for examples/000__03_file_manipulation_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__03_file_manipulation_commands.sh
+DEBUG: words.rs - Using native cp implementation for command substitution
+DEBUG: words.rs - Using native mv implementation for command substitution
+DEBUG: words.rs - Using native rm implementation for command substitution
+DEBUG: words.rs - Using native mkdir implementation for command substitution
+DEBUG: words.rs - Using native touch implementation for command substitution
+DEBUG: Perl code generated, length: 19932 characters
+DEBUG: check_perl_no_open3_builtins called with 19932 characters
+DEBUG: check_perl_no_system_builtins called with 19932 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 19932 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use F
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.615µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 90.84207ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 422, Translated stdout length: 422
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 655ms
+✓Test 4/146: 000__04a_basic_command_substitution.sh with perl     DEBUG: Starting test execution for examples/000__04a_basic_command_substitution.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: String interpolation parsed command 'date +%Y' as 1 commands
+DEBUG: String interpolation parsed command 'basename $(pwd)' as 1 commands
+DEBUG: Setting original script name to: 000__04a_basic_command_substitution.sh
+DEBUG: Perl code generated, length: 1761 characters
+DEBUG: check_perl_no_open3_builtins called with 1761 characters
+DEBUG: check_perl_no_system_builtins called with 1761 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1761 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.235µs
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 20.251187ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 172, Translated stdout length: 172
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 591ms
+✓DEBUG: Progress: 5/146 tests completed (3.4%)
+Test 5/146: 000__04b_file_directory_operations.sh with perl     DEBUG: Starting test execution for examples/000__04b_file_directory_operations.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04b_file_directory_operations.sh
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1640 characters
+DEBUG: check_perl_no_open3_builtins called with 1640 characters
+DEBUG: check_perl_no_system_builtins called with 1640 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 1640 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.185µs
+DEBUG: Execution loop iteration, elapsed: 100.764305ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 342.807257ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 9082, Translated stdout length: 9082
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 855ms
+✓Test 6/146: 000__04c_text_processing_commands.sh with perl     DEBUG: Starting test execution for examples/000__04c_text_processing_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04c_text_processing_commands.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has no process substitution, using dedicated implementation
+DEBUG: Processing diff command in command substitution with args: [Literal("file1.txt", None), Literal("file2.txt", None)]
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 17534 characters
+DEBUG: check_perl_no_open3_builtins called with 17534 characters
+DEBUG: check_perl_no_system_builtins called with 17534 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 17534 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.33µs
+DEBUG: Execution loop iteration, elapsed: 100.96054ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 101.051154ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 2154, Translated stdout length: 2154
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 635ms
+✓Test 7/146: 000__04d_system_utilities.sh with perl     DEBUG: Starting test execution for examples/000__04d_system_utilities.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04d_system_utilities.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 1739 characters
+DEBUG: check_perl_no_open3_builtins called with 1739 characters
+DEBUG: Test execution completed in 367ms
+[2J[1;1H================================================================================
+                                    TEST FAILED
+================================================================================
+File: examples/000__04d_system_utilities.sh
+Generator: perl
+Test: 7/146
+Tests passed before failure: 6
+Failure Reason: OPEN3_BUILTIN violations:
+OPEN3_BUILTIN violations:
+Line 39: Builtin command 'sleep' is using open3() instead of native Perl implementation
+================================================================================
+
+Exit Code Comparison (IGNORED):
+Shell script exit code: 0
+Translated code exit code: -1
+
+================================================================================
+ORIGINAL SHELL SCRIPT:
+================================================================================
+#!/bin/bash
+
+# System utilities using backticks
+# This file demonstrates system utility commands with backticks
+
+echo "=== System Utilities ==="
+
+# date command with backticks - use fixed format to avoid timing issues
+#PERL_MUST_NOT_CONTAIN `date
+#timestamp=`date +%H:%M:%S`
+formatted_date=`date '+%Y-%m-%d'`
+#echo "Timestamp: $timestamp"
+echo "Formatted date: $formatted_date"
+
+# time command with backticks - use a simple test that doesn't vary much
+#PERL_MUST_NOT_CONTAIN `time
+#time_result=`time echo "test" 2>&1 | sed 's/...$//'`
+#echo "Time result: $time_result"
+
+# sleep command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `sleep
+sleep_duration=`echo "1"`
+echo "Sleeping for $sleep_duration seconds..."
+sleep $sleep_duration
+
+# which command with backticks
+#PERL_MUST_NOT_CONTAIN `which
+#bash_path=`which bash`
+#echo "Bash path: $bash_path"
+
+# yes command with backticks
+#PERL_MUST_NOT_CONTAIN `yes
+yes_result=`yes "Hello" | head -3`
+echo "Yes command result:"
+echo "$yes_result"
+
+echo "=== System Utilities Complete ==="
+
+
+
+================================================================================
+TRANSLATED PERL CODE:
+================================================================================
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== System Utilities ===\n";
+my $formatted_date = do {
+require POSIX; POSIX::strftime('%Y-%m-%d', localtime(time)) . "\n"
+};
+do {
+    my $output = "Formatted date: $formatted_date";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+my $sleep_duration = do {
+    my $_chomp_temp = (q{1});
+    chomp $_chomp_temp;
+    $_chomp_temp;
+};
+do {
+    my $output = "Sleeping for $sleep_duration seconds...";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+do {
+    my ($in, $out, $err);
+    my $pid = open3($in, $out, $err, 'sleep', $sleep_duration);
+    close $in or croak 'Close failed: $OS_ERROR';
+    my $result = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
+    close $out or croak 'Close failed: $OS_ERROR';
+    waitpid $pid, 0;
+    $result
+}
+my $yes_result = do {
+    my $_chomp_result = do { my $head_line_count = 0;
+my $output_0 = q{};
+while (1) {
+    my $line = "Hello";
+    # yes doesn't support line-by-line processing
+    if ($head_line_count < 3) {
+    if ($head_line_count > 0) { $output_0 .= "\n"; }
+    $output_0 .= $line;
+    ++$head_line_count;
+    } else {
+    $line = q{}; # Clear line to prevent printing
+    last; # Break out of the yes loop when head limit is reached
+    }
+}
+$output_0 };
+    chomp $_chomp_result;
+    $_chomp_result;
+};
+print "Yes command result:\n";
+print $yes_result;
+if ( !( $yes_result =~ m{\n\z}msx ) ) { print "\n"; }
+print "=== System Utilities Complete ===\n";
+
+exit $main_exit_code;
+
+
+================================================================================
+PERL::CRITIC RESULTS:
+================================================================================
+Perl::Critic not found in PATH. Skipping Perl::Critic checks.
+
+================================================================================
+ABSTRACT SYNTAX TREE:
+================================================================================
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== System Utilities ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Formatted date: "), Variable("formatted_date")] }, None)], redirects: [], env_vars: {"formatted_date": CommandSubstitution(Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y-%m-%d", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Sleeping for "), Variable("sleep_duration"), Literal(" seconds...")] }, None)], redirects: [], env_vars: {"sleep_duration": CommandSubstitution(Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sleep", None), args: [Variable("sleep_duration", false, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Yes command result:")] }, None)], redirects: [], env_vars: {"yes_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("yes", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("yes_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== System Utilities Complete ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+
+================================================================================
+STDOUT COMPARISON (DIFF):
+================================================================================
+--- shell_stdout
++++ perl_stdout
+-=== System Utilities ===
+-Formatted date: 2026-04-06
+-Sleeping for 1 seconds...
+-Yes command result:
+-Hello
+-Hello
+-Hello
+-=== System Utilities Complete ===
+
+
+================================================================================
+STDERR COMPARISON:
+================================================================================
+STDERR values are identical:
+Shell stderr: ''
+Perl stderr: ''
+
+================================================================================
+SUMMARY: 6 out of 146 tests passed before first failure
+================================================================================
+
+BRIEF FAILURE SUMMARY:
+OPEN3_BUILTIN violations:
+OPEN3_BUILTIN violations:
+Line 39: Builtin command 'sleep' is using open3() instead of native Perl implementation
+Writing test count 6 to first_n_tests_passed.txt
+Current working directory: "/mnt/d/GitHub/sh2perl"
+Successfully wrote test count 6 and matching stdout lines 0 to first_n_tests_passed.txt
+
+To run test again: ./fail 000__04d
+Test run completed at Mon Apr  6 16:20:40 AWST 2026

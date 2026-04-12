@@ -1,0 +1,51 @@
+Executing shell command: perl
+==================================================
+Generated Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+my ($in, $out, $err);
+my $pid = open3($in, $out, $err, 'perl_output_0', perl);
+close $in or croak 'Close failed: $!';
+ = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
+close $out or croak 'Close failed: $!';
+waitpid $pid, 0;
+print $perl_output_0;
+
+
+--- Running generated Perl code ---
+syntax error at __tmp_direct_exec.pl line 15, near "="
+Execution of __tmp_direct_exec.pl aborted due to compilation errors.
+Exit code: exit code: 255
+
+==================================================
+TIMING COMPARISON
+==================================================
+Perl execution time:  0.0902 seconds
+Bash execution time:  0.1086 seconds
+Perl is 1.20x faster than Bash
+
+==================================================
+OUTPUT COMPARISON
+==================================================
+✗ DIFFERENCES FOUND:
+
+STDERR DIFFERENCES:
+--- bash_stderr
++++ perl_stderr
++syntax error at __tmp_direct_exec.pl line 15, near "="
++Execution of __tmp_direct_exec.pl aborted due to compilation errors.
+
+
+EXIT CODE DIFFERENCES:
+Bash exit code: Some(0)
+Perl exit code: Some(255)
+==================================================

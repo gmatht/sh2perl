@@ -1,0 +1,573 @@
+Starting test run at Tue, Sep 23, 2025 11:27:54 AM
+Logging to: logs/fail_run_20250923_112754.log
+Test arguments: 000__01
+----------------------------------------
+Compiling debashc...
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src\timeout_manager.rs:282:1
+    |
+282 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: unused variable: `glob_exprs`
+  --> src\generator\commands\simple_commands.rs:38:45
+   |
+38 | ...                   let glob_exprs: Vec<String> = patterns.iter()
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_glob_exprs`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `cmd2`
+   --> src\generator\commands\pipeline_commands.rs:469:66
+    |
+469 | ...ct_cmd), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline...
+    |                             ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+
+warning: variable `head_max` is assigned to, but never used
+   --> src\generator\commands\pipeline_commands.rs:836:25
+    |
+836 |                 let mut head_max = 10; // Default value
+    |                         ^^^^^^^^
+    |
+    = note: consider using `_head_max` instead
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:847:53
+    |
+847 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:854:53
+    |
+854 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:859:49
+    |
+859 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:883:22
+    |
+883 |                 for (i, command) in pipeline.commands[start_index..].i...
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:897:34
+    |
+897 | ...                      for (j, nested_command) in nested_pipeline.co...
+    |                               ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `input_var`
+ --> src\generator\commands\comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:611:37
+    |
+611 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `s`
+   --> src\generator\words.rs:908:23
+    |
+908 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+    |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:151:13
+    |
+151 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:194:13
+    |
+194 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+  20 | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserErro...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserE...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserErr...
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1885:4
+     |
+1885 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, Pars...
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:195:4
+    |
+195 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:24:4
+   |
+24 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleC...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:73:4
+   |
+73 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCom...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:228:4
+    |
+228 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var:...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 29 warnings (run `cargo fix --lib -p debashl` to apply 3 suggestions)
+warning: unused import: `execute_with_progress`
+ --> src\testing.rs:9:67
+  |
+9 | ..., execute_with_timeout, execute_with_progress, 
+  |                            ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src\testing.rs:16:5
+   |
+16 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src\testing.rs:25:9
+   |
+25 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1163:9
+     |
+1163 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src\testing.rs:1372:9
+     |
+1372 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src\testing.rs:1420:9
+     |
+1420 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1969:13
+     |
+1969 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1969:9
+     |
+1969 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src\execution.rs:62:8
+   |
+62 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Outpu...
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usi...
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<St...
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src\testing.rs:19:4
+   |
+19 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, Str...
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:52:9
+   |
+39 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+52 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+53 |     pub translated_duration: std::time::Duration, // Translated program...
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:552:8
+    |
+552 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_...
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src\testing.rs:1368:8
+     |
+1368 | pub fn test_all_examples_next_fail(generators: &[String], test_prefix...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src\timeout_manager.rs:11:5
+   |
+ 8 | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src\timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src\timeout_manager.rs:117:12
+    |
+ 90 | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: ...
+    |            ^^^^^^^^^^^
+...
+178 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType...
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src\timeout_manager.rs:302:8
+    |
+302 | pub fn execute_with_progress<F, T>(operation: OperationType, operation...
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+Running test_purify.pl validation...
+Unknown option: verbose
+Error in command line arguments
+test_purify.pl passed, continuing with other commands...
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic "000__01"
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '000__01'
+
+Found example matching prefix '000__01': 000__01_file_directory_operations.sh
+
+Running only the specified example
+==================================================
+Test 1/146: 000__01_file_directory_operations.sh with perl     DEBUG: Starting test execution for examples\000__01_file_directory_operations.sh with generator perl
+DEBUG: Running shell script: examples\000__01_file_directory_operations.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.24s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__01_file_directory_operations.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-maxdepth", None), Literal("1", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1457 characters
+DEBUG: check_perl_no_open3_builtins called with 1457 characters
+Warning: Failed to create regex for builtin '[': regex parse error:
+    open3\s*\(\s*[^,]+,\s*[^,]+,\s*[^,]+,\s*['"][['"]
+                                                ^
+error: unclosed character class
+Warning: Failed to create regex for builtin '[[': regex parse error:
+    open3\s*\(\s*[^,]+,\s*[^,]+,\s*[^,]+,\s*['"][[['"]
+                                                 ^
+error: unclosed character class
+DEBUG: check_perl_no_system_builtins called with 1457 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1457 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== File an
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 5.4µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 334.8509ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 9058, Translated stdout length: 9058
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: Test success: true
+DEBUG: Test execution completed in 8391ms
+✓
+
+
+================================================================================
+                                    TEST PASSED
+================================================================================
+File: examples\000__01_file_directory_operations.sh
+Generator: perl
+Test: 1/146
+================================================================================
+
+ORIGINAL SHELL SCRIPT:
+#!/bin/bash
+
+# File and directory operations with backticks
+# This file demonstrates using backticks with file system commands
+
+echo "=== File and Directory Operations ==="
+
+# ls command with backticks
+#PERL_MUST_NOT_CONTAIN `ls
+file_list=`ls -a`
+echo "File listing:"
+echo "$file_list"
+
+# find command with backticks
+#PERL_MUST_NOT_CONTAIN `find
+found_files=`find . -maxdepth 1 -name "*.sh" -type f`
+echo "Found shell scripts:"
+echo "$found_files"
+
+# basename and dirname with backticks
+#PERL_MUST_NOT_CONTAIN `basename
+#PERL_MUST_NOT_CONTAIN `dirname
+#script_name=`basename $0`
+#script_dir=`dirname $0`
+#echo "Script name: $script_name"
+#echo "Script directory: $script_dir"
+
+
+TRANSLATED PERL CODE:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my $cmd_result_1 = do {
+    my @ls_files_0 = ();
+    if (-f q{.}) {
+        push @ls_files_0, q{.};
+    } elsif (-d q{.}) {
+        if (opendir my $dh, q{.}) {
+            while (my $file = readdir $dh) {
+                next if $file =~ /^__tmp_.*[.]pl$/msx;
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+        }
+    }
+    join "\n", @ls_files_0;
+};
+    chomp $cmd_result_1;
+    $cmd_result_1;
+};
+print "File listing:\n";
+print $file_list;
+if (!($file_list =~ /\n$/msx)) { print "\n"; }
+my $found_files = do {
+    my $cmd_result_3 = do {
+    use File::Find;
+    use File::Basename;
+    my @files_2 = ();
+    my $start_2 = q{.};
+    sub find_files_2 {
+        my $file_2 = $File::Find::name;
+        if (!(-f $file_2)) {
+            return;
+        }
+        if (!(basename($file_2) =~ m/^.*.sh$/xms)) {
+            return;
+        }
+        push @files_2, $file_2;
+        return;
+    }
+    find(\&find_files_2, $start_2);
+    join "\n", @files_2;
+};
+    chomp $cmd_result_3;
+    $cmd_result_3;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if (!($found_files =~ /\n$/msx)) { print "\n"; }
+
+
+ABSTRACT SYNTAX TREE:
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== File and Directory Operations ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File listing:")] }, None)], redirects: [], env_vars: {"file_list": CommandSubstitution(Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("file_list")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Found shell scripts:")] }, None)], redirects: [], env_vars: {"found_files": CommandSubstitution(Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-maxdepth", None), Literal("1", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("found_files")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+Test run completed at Tue, Sep 23, 2025 11:28:05 AM

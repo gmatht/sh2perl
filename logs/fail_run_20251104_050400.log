@@ -1,0 +1,3271 @@
+Starting test run at Tue Nov  4 05:04:00 AWST 2025
+Logging to: logs/fail_run_20251104_050400.log
+Test arguments: 000__03
+----------------------------------------
+Compiling debashc...
+./fail: line 85: cargo: command not found
+Running test_purify.pl validation...
+./fail: line 92: C:\Strawberry\perl\bin\perl.exe: command not found
+test_purify.pl passed, continuing with other commands...
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic "000__03"
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '
+000__03'
+Found example matching prefix '000__03': 000__03_file_manipulation_commands.sh
+
+Running only the specified example
+==================================================
+DEBUG: Starting test execution for Test 3/146: 000__03_file_manipulation_commands.sh with perl     examples\000__03_file_manipulation_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__03_file_manipulation_commands.sh
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("cp", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("cp", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native cp implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("mv", None), args: [Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("mv", None), args: [Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native mv implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_file.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_file.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native rm implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory created")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native mkdir implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory created")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_dir'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File touched")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native touch implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File touched")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Perl code generated, length: 16656 characters
+DEBUG: Test execution completed in 14685ms
+[2J[1;1H================================================================================
+                                    TEST FAILED
+================================================================================
+File: examples\000__03_file_manipulation_commands.sh
+Generator: perl
+Test: 3/146
+Tests passed before failure: 0
+Failure Reason: Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+use POSIX      qw(time);
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File Manipulation Commands ===\n";
+print "=== cp command ===\n";
+print "\n";
+{
+    open my $original_stdout, '>&', STDOUT
+      or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'test_file.txt'
+      or croak "Cannot open file: $ERRNO";
+    print "test content\n";
+    open STDOUT, '>&', $original_stdout
+      or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout
+      or croak "Close failed: $ERRNO";
+}
+my $cp_result = do {
+    my $left_result_0 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            if ( -e 'test_file.txt' ) {
+                my $dest = 'test_file_copy.txt';
+                if ( -d $dest ) {
+                    $dest = "$dest/'test_file.txt'";
+                }
+                if ( copy( 'test_file.txt', $dest ) ) {
+                    # print "cp: copied 'test_file.txt' to $dest\n";
+                } else {
+                    croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";
+                }
+            } else {
+                croak "cp: 'test_file.txt': No such file or directory\n";
+            }
+                local $CHILD_ERROR = 0;
+                1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        };
+        q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_0 = ("Copy successful");
+        $left_result_0 . $right_result_0;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Copy result: $cp_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_1 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_1, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_1, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_1, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_1) {
+    print join "\n", @ls_files_1;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_1 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== mv command ===\n";
+my $mv_result = do {
+    my $left_result_2 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    my $force = 0;
+if (-e 'test_file_copy.txt') {
+    my $dest = 'test_file_moved.txt';
+    if (-e $dest && -d $dest) {
+        $dest = "$dest/'test_file_copy.txt'";
+    }
+    if (-e $dest && !$force) {
+        croak "mv: $dest: File exists (use -f to force overwrite)\n";
+    }
+    my $dest_dir = $dest;
+    $dest_dir =~ s/\/[^\/]*$//msx;
+    if ($dest_dir eq $dest) {
+        $dest_dir = q{};
+    }
+    if ($dest_dir ne q{} && !-d $dest_dir) {
+        my $err;
+        make_path($dest_dir, {error => \$err});
+        if (@{$err}) {
+            croak "mv: cannot create directory $dest_dir: $err->[0]\n";
+        }
+    }
+    if (move('test_file_copy.txt', $dest)) {
+        # print "mv: moved 'test_file_copy.txt' to $dest\n";
+    } else {
+        croak "mv: cannot move 'test_file_copy.txt' to $dest: $ERRNO\n";
+    }
+} else {
+    croak "mv: 'test_file_copy.txt': No such file or directory\n";
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_2 = ("Move successful");
+        $left_result_2 . $right_result_2;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Move result: $mv_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_3 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_3, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_3, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_3, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_3) {
+    print join "\n", @ls_files_3;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_3 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== rm command ===\n";
+my $rm_result = do {
+    my $left_result_4 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    if ( -e "test_file.txt" ) {
+    if ( -d "test_file.txt" ) {
+        croak "rm: ", "test_file.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_file.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_file.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_moved.txt" ) {
+    if ( -d "test_file_moved.txt" ) {
+        croak "rm: ", "test_file_moved.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_moved.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_file_moved.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_file_moved.txt", ": No such file or directory\n";
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_4 = ("Remove successful");
+        $left_result_4 . $right_result_4;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Remove result: $rm_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_5 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_5, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_5, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_5, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_5) {
+    print join "\n", @ls_files_5;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_5 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== mkdir command ===\n";
+my $mkdir_result = do {
+    my $left_result_6 = do {
+    use File::Path  qw(make_path);
+    if (!-d 'test_dir') {
+    if (mkdir 'test_dir') {
+    # print "mkdir: created directory 'test_dir'\n";
+    } else {
+    croak "mkdir: cannot create directory 'test_dir': $ERRNO\n";
+    }
+    } else {
+    print {\*STDERR} "mkdir: cannot create directory 'test_dir': File exists\n";
+    local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_6 = ("Directory created");
+        $left_result_6 . $right_result_6;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Mkdir result: $mkdir_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+if (-e "test_dir/file") {
+my $current_time = time;
+utime $current_time, $current_time, "test_dir/file";
+} else {
+if (open my $fh, '>', "test_dir/file") {
+close $fh or croak "Close failed: $ERRNO";
+} else {
+croak "touch: cannot create ", "test_dir/file", ": $ERRNO\n";
+}
+}
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_8 = ();
+if ( -f 'test_dir' ) {
+    push @ls_files_8, 'test_dir';
+}
+elsif ( -d 'test_dir' ) {
+    if (opendir my $dh, 'test_dir') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_8, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_8) {
+    print join "\n", @ls_files_8;
+    print "\n";
+    my $expected_count = 1;
+    if (@ls_files_8 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "Directory not found\n";
+}
+if ( -e "test_dir/file" ) {
+    if ( -d "test_dir/file" ) {
+        croak "rm: ", "test_dir/file",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_dir/file" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_dir/file",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_dir/file", ": No such file or directory\n";
+}
+if (-d 'test_dir') {
+if (rmdir 'test_dir') {
+} else {
+croak "rmdir: cannot remove directory 'test_dir': $ERRNO\n";
+}
+} else {
+croak "rmdir: 'test_dir': No such file or directory\n";
+}
+print "\n";
+print "=== touch command ===\n";
+my $touch_result = do {
+    my $left_result_9 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    if (-e "test_file.txt") {
+my $current_time = time;
+utime $current_time, $current_time, "test_file.txt";
+} else {
+if (open my $fh, '>', "test_file.txt") {
+close $fh or croak "Close failed: $ERRNO";
+} else {
+croak "touch: cannot create ", "test_file.txt", ": $ERRNO\n";
+}
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_9 = ("File touched");
+        $left_result_9 . $right_result_9;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Touch result: $touch_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "\n";
+if ( -e "test_file.txt" ) {
+    if ( -d "test_file.txt" ) {
+        carp "rm: carping: ", "test_file.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_copy.txt" ) {
+    if ( -d "test_file_copy.txt" ) {
+        carp "rm: carping: ", "test_file_copy.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_copy.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file_copy.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file_copy.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_moved.txt" ) {
+    if ( -d "test_file_moved.txt" ) {
+        carp "rm: carping: ", "test_file_moved.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_moved.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file_moved.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file_moved.txt", ": No such file or directory\n";
+}
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+if ( -e "test_dir" ) {
+    if ( -d "test_dir" ) {
+        my $err;
+        remove_tree("test_dir", {error => \$err});
+        if (@{$err}) {
+            carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";
+        }
+        else {
+            $main_exit_code = 0;
+        }
+    }
+    else {
+        if ( unlink "test_dir" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_dir",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_dir", ": No such file or directory\n";
+}
+if ($CHILD_ERROR != 0) {
+    1;
+}
+
+exit $main_exit_code;
+
+```
+
+perlcritic_wrapper: Started, parse args took 1.5e-05s
+perlcritic_wrapper: File read took 0.000418s
+perlcritic_wrapper: SHA1 hash took 9.4e-05s
+perlcritic_wrapper: No cache file found
+perlcritic_wrapper: Perl::Critic init took 0.272531s
+perlcritic_wrapper: Perl::Critic analysis took 1.988777s
+perlcritic_wrapper: Perltidy subprocess took 4.539331s
+Code formatting differences detected:
+Original has 607 lines, Tidied has 640 lines
+
+Line 41 differs:
+  Original: [                    # print "cp: copied 'test_file.txt' to $dest\n";]
+  Tidied:   []
+  First diff at position 0:
+    pos 0: orig=' ' vs tidied='[EOF]'
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=' ' vs tidied='[EOF]'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Use of uninitialized value in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 42 differs:
+  Original: [                } else {]
+  Tidied:   [                    # print "cp: copied 'test_file.txt' to $dest\n";]
+  First diff at position 16:
+    pos 16: orig='}' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 43 differs:
+  Original: [                    croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";]
+  Tidied:   [                }]
+  First diff at position 16:
+    pos 16: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 44 differs:
+  Original: [                }]
+  Tidied:   [                else {]
+  First diff at position 16:
+    pos 16: orig='}' vs tidied='e'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 45 differs:
+  Original: [            } else {]
+  Tidied:   [                    croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";]
+  First diff at position 12:
+    pos 12: orig='}' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 46 differs:
+  Original: [                croak "cp: 'test_file.txt': No such file or directory\n";]
+  Tidied:   [                }]
+  First diff at position 16:
+    pos 16: orig='c' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 48 differs:
+  Original: [                local $CHILD_ERROR = 0;]
+  Tidied:   [            else {]
+  First diff at position 12:
+    pos 12: orig=' ' vs tidied='e'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 49 differs:
+  Original: [                1;]
+  Tidied:   [                croak "cp: 'test_file.txt': No such file or directory\n";]
+  First diff at position 16:
+    pos 16: orig='1' vs tidied='c'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 50 differs:
+  Original: [        };]
+  Tidied:   [            }]
+  First diff at position 8:
+    pos 8: orig='}' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 51 differs:
+  Original: [        if ( !$eval_result ) {]
+  Tidied:   [            local $CHILD_ERROR = 0;]
+  First diff at position 8:
+    pos 8: orig='i' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 52 differs:
+  Original: [            local $CHILD_ERROR = 256;]
+  Tidied:   [            1;]
+  First diff at position 12:
+    pos 12: orig='l' vs tidied='1'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 54 differs:
+  Original: [        q{};]
+  Tidied:   [        if ( !$eval_result ) {]
+  First diff at position 8:
+    pos 8: orig='q' vs tidied='i'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 55 differs:
+  Original: [};]
+  Tidied:   [            local $CHILD_ERROR = 256;]
+  First diff at position 0:
+    pos 0: orig='}' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=';' vs tidied=' '
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 56 differs:
+  Original: [    if ($CHILD_ERROR == 0) {]
+  Tidied:   [        }]
+  First diff at position 4:
+    pos 4: orig='i' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 57 differs:
+  Original: [        my $right_result_0 = ("Copy successful");]
+  Tidied:   [        q{};]
+  First diff at position 8:
+    pos 8: orig='m' vs tidied='q'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 58 differs:
+  Original: [        $left_result_0 . $right_result_0;]
+  Tidied:   [    };]
+  First diff at position 4:
+    pos 4: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 59 differs:
+  Original: [    } else {]
+  Tidied:   [    if ( $CHILD_ERROR == 0 ) {]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied='i'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 60 differs:
+  Original: [        q{};]
+  Tidied:   [        my $right_result_0 = ("Copy successful");]
+  First diff at position 8:
+    pos 8: orig='q' vs tidied='m'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 61 differs:
+  Original: [    }]
+  Tidied:   [        $left_result_0 . $right_result_0;]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 62 differs:
+  Original: [};]
+  Tidied:   [    }]
+  First diff at position 0:
+    pos 0: orig='}' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=';' vs tidied=' '
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 63 differs:
+  Original: [do {]
+  Tidied:   [    else {]
+  First diff at position 0:
+    pos 0: orig='d' vs tidied=' '
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='o' vs tidied=' '
+Argument "d" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 64 differs:
+  Original: [    my $output = "Copy result: $cp_result";]
+  Tidied:   [        q{};]
+  First diff at position 4:
+    pos 4: orig='m' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 65 differs:
+  Original: [    print $output;]
+  Tidied:   [    }]
+  First diff at position 4:
+    pos 4: orig='p' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 66 differs:
+  Original: [    if ( !( $output =~ m{\n$}msx ) ) {]
+  Tidied:   [};]
+  First diff at position 0:
+    pos 0: orig=' ' vs tidied='}'
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=' ' vs tidied=';'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 67 differs:
+  Original: [        print "\n";]
+  Tidied:   [do {]
+  First diff at position 0:
+    pos 0: orig=' ' vs tidied='d'
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=' ' vs tidied='o'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "d" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 68 differs:
+  Original: [    }]
+  Tidied:   [    my $output = "Copy result: $cp_result";]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied='m'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 69 differs:
+  Original: [};]
+  Tidied:   [    print $output;]
+  First diff at position 0:
+    pos 0: orig='}' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=';' vs tidied=' '
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 70 differs:
+  Original: [open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";]
+  Tidied:   [    if ( !( $output =~ m{\n$}msx ) ) {]
+  First diff at position 0:
+    pos 0: orig='o' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='p' vs tidied=' '
+Argument "o" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 71 differs:
+  Original: [my @ls_files_1 = ();]
+  Tidied:   [        print "\n";]
+  First diff at position 0:
+    pos 0: orig='m' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='y' vs tidied=' '
+Argument "m" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 72 differs:
+  Original: [if ( -f 'test_file.txt' ) {]
+  Tidied:   [    }]
+  First diff at position 0:
+    pos 0: orig='i' vs tidied=' '
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='f' vs tidied=' '
+Argument "i" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+
+Line count differs: original has 607 lines, tidied has 640 lines
+Additional lines in tidied version:
+  Line 608: [    carp "rm: carping: ", "test_file_moved.txt",]
+  Line 609: [      ": No such file or directory\n";]
+  Line 610: [}]
+  Line 611: [open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";]
+  Line 612: [if ( -e "test_dir" ) {]
+  Line 613: [    if ( -d "test_dir" ) {]
+  Line 614: [        my $err;]
+  Line 615: [        remove_tree( "test_dir", { error => \$err } );]
+  Line 616: [        if ( @{$err} ) {]
+  Line 617: [            carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";]
+  Line 618: [        }]
+  Line 619: [        else {]
+  Line 620: [            $main_exit_code = 0;]
+  Line 621: [        }]
+  Line 622: [    }]
+  Line 623: [    else {]
+  Line 624: [        if ( unlink "test_dir" ) {]
+  Line 625: [            $main_exit_code = 0;]
+  Line 626: [        }]
+  Line 627: [        else {]
+  Line 628: [            carp "rm: carping: could not remove ", "test_dir", ": $OS_ERROR\n";]
+  Line 629: [        }]
+  Line 630: [    }]
+  Line 631: [}]
+  Line 632: [else {]
+  Line 633: [    local $CHILD_ERROR = 0;]
+  Line 634: [    carp "rm: carping: ", "test_dir", ": No such file or directory\n";]
+  Line 635: [}]
+  Line 636: [if ( $CHILD_ERROR != 0 ) {]
+  Line 637: [    1;]
+  Line 638: [}]
+  Line 639: []
+  Line 640: [exit $main_exit_code;]
+perlcritic_wrapper: Perltidy check took 4.542149s
+perlcritic_wrapper: Output generation took 4e-06s
+perlcritic_wrapper: Cache write took 0.000709s
+perlcritic_wrapper: Total time 6.805136s
+
+FAILED: Code is not tidy
+
+================================================================================
+
+Exit Code Comparison (IGNORED):
+Shell script exit code: 0
+Translated code exit code: -1
+
+================================================================================
+ORIGINAL SHELL SCRIPT:
+================================================================================
+#!/bin/bash
+
+# File manipulation commands with backticks
+# This file demonstrates using backticks with file manipulation commands
+
+echo "=== File Manipulation Commands ==="
+
+echo "=== cp command ==="
+# cp command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `cp
+echo
+echo "test content" > test_file.txt
+cp_result=`cp test_file.txt test_file_copy.txt && echo "Copy successful"`
+echo "Copy result: $cp_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+echo
+echo "=== mv command ==="
+# mv command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `mv
+mv_result=`mv test_file_copy.txt test_file_moved.txt && echo "Move successful"`
+echo "Move result: $mv_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+echo
+echo "=== rm command ==="
+# rm command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `rm
+rm_result=`rm test_file.txt test_file_moved.txt && echo "Remove successful"`
+echo "Remove result: $rm_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+echo
+echo "=== mkdir command ==="
+# mkdir command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `mkdir
+mkdir_result=`mkdir test_dir && echo "Directory created"`
+echo "Mkdir result: $mkdir_result"
+touch test_dir/file
+ls test_dir 2>/dev/null || echo "Directory not found"
+rm test_dir/file
+rmdir test_dir
+
+echo
+echo "=== touch command ==="
+# touch command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `touch
+touch_result=`touch test_file.txt && echo "File touched"`
+echo "Touch result: $touch_result"
+
+echo
+# Cleanup
+rm -f test_file.txt test_file_copy.txt test_file_moved.txt
+rm -rf test_dir 2>/dev/null || true
+
+
+
+================================================================================
+TRANSLATED PERL CODE:
+================================================================================
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+use POSIX      qw(time);
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File Manipulation Commands ===\n";
+print "=== cp command ===\n";
+print "\n";
+{
+    open my $original_stdout, '>&', STDOUT
+      or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'test_file.txt'
+      or croak "Cannot open file: $ERRNO";
+    print "test content\n";
+    open STDOUT, '>&', $original_stdout
+      or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout
+      or croak "Close failed: $ERRNO";
+}
+my $cp_result = do {
+    my $left_result_0 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            if ( -e 'test_file.txt' ) {
+                my $dest = 'test_file_copy.txt';
+                if ( -d $dest ) {
+                    $dest = "$dest/'test_file.txt'";
+                }
+                if ( copy( 'test_file.txt', $dest ) ) {
+                    # print "cp: copied 'test_file.txt' to $dest\n";
+                } else {
+                    croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";
+                }
+            } else {
+                croak "cp: 'test_file.txt': No such file or directory\n";
+            }
+                local $CHILD_ERROR = 0;
+                1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        };
+        q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_0 = ("Copy successful");
+        $left_result_0 . $right_result_0;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Copy result: $cp_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_1 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_1, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_1, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_1, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_1) {
+    print join "\n", @ls_files_1;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_1 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== mv command ===\n";
+my $mv_result = do {
+    my $left_result_2 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    my $force = 0;
+if (-e 'test_file_copy.txt') {
+    my $dest = 'test_file_moved.txt';
+    if (-e $dest && -d $dest) {
+        $dest = "$dest/'test_file_copy.txt'";
+    }
+    if (-e $dest && !$force) {
+        croak "mv: $dest: File exists (use -f to force overwrite)\n";
+    }
+    my $dest_dir = $dest;
+    $dest_dir =~ s/\/[^\/]*$//msx;
+    if ($dest_dir eq $dest) {
+        $dest_dir = q{};
+    }
+    if ($dest_dir ne q{} && !-d $dest_dir) {
+        my $err;
+        make_path($dest_dir, {error => \$err});
+        if (@{$err}) {
+            croak "mv: cannot create directory $dest_dir: $err->[0]\n";
+        }
+    }
+    if (move('test_file_copy.txt', $dest)) {
+        # print "mv: moved 'test_file_copy.txt' to $dest\n";
+    } else {
+        croak "mv: cannot move 'test_file_copy.txt' to $dest: $ERRNO\n";
+    }
+} else {
+    croak "mv: 'test_file_copy.txt': No such file or directory\n";
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_2 = ("Move successful");
+        $left_result_2 . $right_result_2;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Move result: $mv_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_3 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_3, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_3, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_3, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_3) {
+    print join "\n", @ls_files_3;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_3 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== rm command ===\n";
+my $rm_result = do {
+    my $left_result_4 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    if ( -e "test_file.txt" ) {
+    if ( -d "test_file.txt" ) {
+        croak "rm: ", "test_file.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_file.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_file.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_moved.txt" ) {
+    if ( -d "test_file_moved.txt" ) {
+        croak "rm: ", "test_file_moved.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_moved.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_file_moved.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_file_moved.txt", ": No such file or directory\n";
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_4 = ("Remove successful");
+        $left_result_4 . $right_result_4;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Remove result: $rm_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_5 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_5, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_5, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_5, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_5) {
+    print join "\n", @ls_files_5;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_5 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== mkdir command ===\n";
+my $mkdir_result = do {
+    my $left_result_6 = do {
+    use File::Path  qw(make_path);
+    if (!-d 'test_dir') {
+    if (mkdir 'test_dir') {
+    # print "mkdir: created directory 'test_dir'\n";
+    } else {
+    croak "mkdir: cannot create directory 'test_dir': $ERRNO\n";
+    }
+    } else {
+    print {\*STDERR} "mkdir: cannot create directory 'test_dir': File exists\n";
+    local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_6 = ("Directory created");
+        $left_result_6 . $right_result_6;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Mkdir result: $mkdir_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+if (-e "test_dir/file") {
+my $current_time = time;
+utime $current_time, $current_time, "test_dir/file";
+} else {
+if (open my $fh, '>', "test_dir/file") {
+close $fh or croak "Close failed: $ERRNO";
+} else {
+croak "touch: cannot create ", "test_dir/file", ": $ERRNO\n";
+}
+}
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_8 = ();
+if ( -f 'test_dir' ) {
+    push @ls_files_8, 'test_dir';
+}
+elsif ( -d 'test_dir' ) {
+    if (opendir my $dh, 'test_dir') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_8, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_8) {
+    print join "\n", @ls_files_8;
+    print "\n";
+    my $expected_count = 1;
+    if (@ls_files_8 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "Directory not found\n";
+}
+if ( -e "test_dir/file" ) {
+    if ( -d "test_dir/file" ) {
+        croak "rm: ", "test_dir/file",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_dir/file" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_dir/file",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_dir/file", ": No such file or directory\n";
+}
+if (-d 'test_dir') {
+if (rmdir 'test_dir') {
+} else {
+croak "rmdir: cannot remove directory 'test_dir': $ERRNO\n";
+}
+} else {
+croak "rmdir: 'test_dir': No such file or directory\n";
+}
+print "\n";
+print "=== touch command ===\n";
+my $touch_result = do {
+    my $left_result_9 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    if (-e "test_file.txt") {
+my $current_time = time;
+utime $current_time, $current_time, "test_file.txt";
+} else {
+if (open my $fh, '>', "test_file.txt") {
+close $fh or croak "Close failed: $ERRNO";
+} else {
+croak "touch: cannot create ", "test_file.txt", ": $ERRNO\n";
+}
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_9 = ("File touched");
+        $left_result_9 . $right_result_9;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Touch result: $touch_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "\n";
+if ( -e "test_file.txt" ) {
+    if ( -d "test_file.txt" ) {
+        carp "rm: carping: ", "test_file.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_copy.txt" ) {
+    if ( -d "test_file_copy.txt" ) {
+        carp "rm: carping: ", "test_file_copy.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_copy.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file_copy.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file_copy.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_moved.txt" ) {
+    if ( -d "test_file_moved.txt" ) {
+        carp "rm: carping: ", "test_file_moved.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_moved.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file_moved.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file_moved.txt", ": No such file or directory\n";
+}
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+if ( -e "test_dir" ) {
+    if ( -d "test_dir" ) {
+        my $err;
+        remove_tree("test_dir", {error => \$err});
+        if (@{$err}) {
+            carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";
+        }
+        else {
+            $main_exit_code = 0;
+        }
+    }
+    else {
+        if ( unlink "test_dir" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_dir",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_dir", ": No such file or directory\n";
+}
+if ($CHILD_ERROR != 0) {
+    1;
+}
+
+exit $main_exit_code;
+
+
+================================================================================
+PERL::CRITIC RESULTS:
+================================================================================
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+use POSIX      qw(time);
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File Manipulation Commands ===\n";
+print "=== cp command ===\n";
+print "\n";
+{
+    open my $original_stdout, '>&', STDOUT
+      or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'test_file.txt'
+      or croak "Cannot open file: $ERRNO";
+    print "test content\n";
+    open STDOUT, '>&', $original_stdout
+      or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout
+      or croak "Close failed: $ERRNO";
+}
+my $cp_result = do {
+    my $left_result_0 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            if ( -e 'test_file.txt' ) {
+                my $dest = 'test_file_copy.txt';
+                if ( -d $dest ) {
+                    $dest = "$dest/'test_file.txt'";
+                }
+                if ( copy( 'test_file.txt', $dest ) ) {
+                    # print "cp: copied 'test_file.txt' to $dest\n";
+                } else {
+                    croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";
+                }
+            } else {
+                croak "cp: 'test_file.txt': No such file or directory\n";
+            }
+                local $CHILD_ERROR = 0;
+                1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        };
+        q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_0 = ("Copy successful");
+        $left_result_0 . $right_result_0;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Copy result: $cp_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_1 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_1, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_1, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_1, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_1) {
+    print join "\n", @ls_files_1;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_1 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== mv command ===\n";
+my $mv_result = do {
+    my $left_result_2 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    my $force = 0;
+if (-e 'test_file_copy.txt') {
+    my $dest = 'test_file_moved.txt';
+    if (-e $dest && -d $dest) {
+        $dest = "$dest/'test_file_copy.txt'";
+    }
+    if (-e $dest && !$force) {
+        croak "mv: $dest: File exists (use -f to force overwrite)\n";
+    }
+    my $dest_dir = $dest;
+    $dest_dir =~ s/\/[^\/]*$//msx;
+    if ($dest_dir eq $dest) {
+        $dest_dir = q{};
+    }
+    if ($dest_dir ne q{} && !-d $dest_dir) {
+        my $err;
+        make_path($dest_dir, {error => \$err});
+        if (@{$err}) {
+            croak "mv: cannot create directory $dest_dir: $err->[0]\n";
+        }
+    }
+    if (move('test_file_copy.txt', $dest)) {
+        # print "mv: moved 'test_file_copy.txt' to $dest\n";
+    } else {
+        croak "mv: cannot move 'test_file_copy.txt' to $dest: $ERRNO\n";
+    }
+} else {
+    croak "mv: 'test_file_copy.txt': No such file or directory\n";
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_2 = ("Move successful");
+        $left_result_2 . $right_result_2;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Move result: $mv_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_3 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_3, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_3, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_3, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_3) {
+    print join "\n", @ls_files_3;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_3 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== rm command ===\n";
+my $rm_result = do {
+    my $left_result_4 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    if ( -e "test_file.txt" ) {
+    if ( -d "test_file.txt" ) {
+        croak "rm: ", "test_file.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_file.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_file.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_moved.txt" ) {
+    if ( -d "test_file_moved.txt" ) {
+        croak "rm: ", "test_file_moved.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_moved.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_file_moved.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_file_moved.txt", ": No such file or directory\n";
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_4 = ("Remove successful");
+        $left_result_4 . $right_result_4;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Remove result: $rm_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_5 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_5, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_5, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_5, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_5) {
+    print join "\n", @ls_files_5;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_5 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== mkdir command ===\n";
+my $mkdir_result = do {
+    my $left_result_6 = do {
+    use File::Path  qw(make_path);
+    if (!-d 'test_dir') {
+    if (mkdir 'test_dir') {
+    # print "mkdir: created directory 'test_dir'\n";
+    } else {
+    croak "mkdir: cannot create directory 'test_dir': $ERRNO\n";
+    }
+    } else {
+    print {\*STDERR} "mkdir: cannot create directory 'test_dir': File exists\n";
+    local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_6 = ("Directory created");
+        $left_result_6 . $right_result_6;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Mkdir result: $mkdir_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+if (-e "test_dir/file") {
+my $current_time = time;
+utime $current_time, $current_time, "test_dir/file";
+} else {
+if (open my $fh, '>', "test_dir/file") {
+close $fh or croak "Close failed: $ERRNO";
+} else {
+croak "touch: cannot create ", "test_dir/file", ": $ERRNO\n";
+}
+}
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_8 = ();
+if ( -f 'test_dir' ) {
+    push @ls_files_8, 'test_dir';
+}
+elsif ( -d 'test_dir' ) {
+    if (opendir my $dh, 'test_dir') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_8, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_8) {
+    print join "\n", @ls_files_8;
+    print "\n";
+    my $expected_count = 1;
+    if (@ls_files_8 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "Directory not found\n";
+}
+if ( -e "test_dir/file" ) {
+    if ( -d "test_dir/file" ) {
+        croak "rm: ", "test_dir/file",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_dir/file" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_dir/file",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_dir/file", ": No such file or directory\n";
+}
+if (-d 'test_dir') {
+if (rmdir 'test_dir') {
+} else {
+croak "rmdir: cannot remove directory 'test_dir': $ERRNO\n";
+}
+} else {
+croak "rmdir: 'test_dir': No such file or directory\n";
+}
+print "\n";
+print "=== touch command ===\n";
+my $touch_result = do {
+    my $left_result_9 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    if (-e "test_file.txt") {
+my $current_time = time;
+utime $current_time, $current_time, "test_file.txt";
+} else {
+if (open my $fh, '>', "test_file.txt") {
+close $fh or croak "Close failed: $ERRNO";
+} else {
+croak "touch: cannot create ", "test_file.txt", ": $ERRNO\n";
+}
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_9 = ("File touched");
+        $left_result_9 . $right_result_9;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Touch result: $touch_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "\n";
+if ( -e "test_file.txt" ) {
+    if ( -d "test_file.txt" ) {
+        carp "rm: carping: ", "test_file.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_copy.txt" ) {
+    if ( -d "test_file_copy.txt" ) {
+        carp "rm: carping: ", "test_file_copy.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_copy.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file_copy.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file_copy.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_moved.txt" ) {
+    if ( -d "test_file_moved.txt" ) {
+        carp "rm: carping: ", "test_file_moved.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_moved.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file_moved.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file_moved.txt", ": No such file or directory\n";
+}
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+if ( -e "test_dir" ) {
+    if ( -d "test_dir" ) {
+        my $err;
+        remove_tree("test_dir", {error => \$err});
+        if (@{$err}) {
+            carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";
+        }
+        else {
+            $main_exit_code = 0;
+        }
+    }
+    else {
+        if ( unlink "test_dir" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_dir",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_dir", ": No such file or directory\n";
+}
+if ($CHILD_ERROR != 0) {
+    1;
+}
+
+exit $main_exit_code;
+
+```
+
+perlcritic_wrapper: Started, parse args took 1.7e-05s
+perlcritic_wrapper: File read took 0.000586s
+perlcritic_wrapper: SHA1 hash took 0.0001s
+perlcritic_wrapper: Cache hit, read took 0.001797s
+
+FAILED: Code is not tidy
+
+
+================================================================================
+ABSTRACT SYNTAX TREE:
+================================================================================
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== File Manipulation Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== cp command ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test content")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("test_file.txt", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy result: "), Variable("cp_result")] }, None)], redirects: [], env_vars: {"cp_result": CommandSubstitution(And(Simple(SimpleCommand { name: Literal("cp", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), None)}, stdout_used: true, stderr_used: true }), Or(Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: Some(2), operator: StderrOutput, target: Literal("/dev/null", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("No test files found")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), Simple(SimpleCommand { name: Literal("echo", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== mv command ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move result: "), Variable("mv_result")] }, None)], redirects: [], env_vars: {"mv_result": CommandSubstitution(And(Simple(SimpleCommand { name: Literal("mv", None), args: [Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), None)}, stdout_used: true, stderr_used: true }), Or(Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: Some(2), operator: StderrOutput, target: Literal("/dev/null", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("No test files found")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), Simple(SimpleCommand { name: Literal("echo", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== rm command ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove result: "), Variable("rm_result")] }, None)], redirects: [], env_vars: {"rm_result": CommandSubstitution(And(Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_file.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), None)}, stdout_used: true, stderr_used: true }), Or(Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: Some(2), operator: StderrOutput, target: Literal("/dev/null", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("No test files found")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), Simple(SimpleCommand { name: Literal("echo", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== mkdir command ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Mkdir result: "), Variable("mkdir_result")] }, None)], redirects: [], env_vars: {"mkdir_result": CommandSubstitution(And(Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory created")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_dir/file", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Or(Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: Some(2), operator: StderrOutput, target: Literal("/dev/null", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory not found")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_dir/file", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rmdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== touch command ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Touch result: "), Variable("touch_result")] }, None)], redirects: [], env_vars: {"touch_result": CommandSubstitution(And(Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File touched")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-f", None), Literal("test_file.txt", None), Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Or(Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-r", None), Literal("f", None), Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: Some(2), operator: StderrOutput, target: Literal("/dev/null", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("true", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))]
+
+================================================================================
+STDOUT COMPARISON (DIFF):
+================================================================================
+--- shell_stdout
++++ perl_stdout
+-=== File Manipulation Commands ===
+-=== cp command ===
+-
+-Copy result: Copy successful
+-test_file.txt
+-test_file_copy.txt
+-No test files found
+-
+-=== mv command ===
+-Move result: Move successful
+-test_file.txt
+-test_file_moved.txt
+-No test files found
+-
+-=== rm command ===
+-Remove result: Remove successful
+-No test files found
+-
+-=== mkdir command ===
+-Mkdir result: Directory created
+-file
+-
+-=== touch command ===
+-Touch result: File touched
+
+
+================================================================================
+STDERR COMPARISON:
+================================================================================
+STDERR values are identical:
+Shell stderr: ''
+Perl stderr: ''
+
+================================================================================
+SUMMARY: 0 out of 146 tests passed before first failure
+================================================================================
+
+BRIEF FAILURE SUMMARY:
+Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+use POSIX      qw(time);
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File Manipulation Commands ===\n";
+print "=== cp command ===\n";
+print "\n";
+{
+    open my $original_stdout, '>&', STDOUT
+      or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'test_file.txt'
+      or croak "Cannot open file: $ERRNO";
+    print "test content\n";
+    open STDOUT, '>&', $original_stdout
+      or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout
+      or croak "Close failed: $ERRNO";
+}
+my $cp_result = do {
+    my $left_result_0 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            if ( -e 'test_file.txt' ) {
+                my $dest = 'test_file_copy.txt';
+                if ( -d $dest ) {
+                    $dest = "$dest/'test_file.txt'";
+                }
+                if ( copy( 'test_file.txt', $dest ) ) {
+                    # print "cp: copied 'test_file.txt' to $dest\n";
+                } else {
+                    croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";
+                }
+            } else {
+                croak "cp: 'test_file.txt': No such file or directory\n";
+            }
+                local $CHILD_ERROR = 0;
+                1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        };
+        q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_0 = ("Copy successful");
+        $left_result_0 . $right_result_0;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Copy result: $cp_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_1 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_1, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_1, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_1, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_1, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_1) {
+    print join "\n", @ls_files_1;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_1 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== mv command ===\n";
+my $mv_result = do {
+    my $left_result_2 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    my $force = 0;
+if (-e 'test_file_copy.txt') {
+    my $dest = 'test_file_moved.txt';
+    if (-e $dest && -d $dest) {
+        $dest = "$dest/'test_file_copy.txt'";
+    }
+    if (-e $dest && !$force) {
+        croak "mv: $dest: File exists (use -f to force overwrite)\n";
+    }
+    my $dest_dir = $dest;
+    $dest_dir =~ s/\/[^\/]*$//msx;
+    if ($dest_dir eq $dest) {
+        $dest_dir = q{};
+    }
+    if ($dest_dir ne q{} && !-d $dest_dir) {
+        my $err;
+        make_path($dest_dir, {error => \$err});
+        if (@{$err}) {
+            croak "mv: cannot create directory $dest_dir: $err->[0]\n";
+        }
+    }
+    if (move('test_file_copy.txt', $dest)) {
+        # print "mv: moved 'test_file_copy.txt' to $dest\n";
+    } else {
+        croak "mv: cannot move 'test_file_copy.txt' to $dest: $ERRNO\n";
+    }
+} else {
+    croak "mv: 'test_file_copy.txt': No such file or directory\n";
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_2 = ("Move successful");
+        $left_result_2 . $right_result_2;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Move result: $mv_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_3 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_3, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_3, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_3, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_3, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_3) {
+    print join "\n", @ls_files_3;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_3 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== rm command ===\n";
+my $rm_result = do {
+    my $left_result_4 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    if ( -e "test_file.txt" ) {
+    if ( -d "test_file.txt" ) {
+        croak "rm: ", "test_file.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_file.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_file.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_moved.txt" ) {
+    if ( -d "test_file_moved.txt" ) {
+        croak "rm: ", "test_file_moved.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_moved.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_file_moved.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_file_moved.txt", ": No such file or directory\n";
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_4 = ("Remove successful");
+        $left_result_4 . $right_result_4;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Remove result: $rm_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_5 = ();
+if ( -f 'test_file.txt' ) {
+    push @ls_files_5, 'test_file.txt';
+}
+elsif ( -d 'test_file.txt' ) {
+    if (opendir my $dh, 'test_file.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_copy.txt' ) {
+    push @ls_files_5, 'test_file_copy.txt';
+}
+elsif ( -d 'test_file_copy.txt' ) {
+    if (opendir my $dh, 'test_file_copy.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if ( -f 'test_file_moved.txt' ) {
+    push @ls_files_5, 'test_file_moved.txt';
+}
+elsif ( -d 'test_file_moved.txt' ) {
+    if (opendir my $dh, 'test_file_moved.txt') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_5, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_5) {
+    print join "\n", @ls_files_5;
+    print "\n";
+    my $expected_count = 3;
+    if (@ls_files_5 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "No test files found\n";
+}
+print "\n";
+print "=== mkdir command ===\n";
+my $mkdir_result = do {
+    my $left_result_6 = do {
+    use File::Path  qw(make_path);
+    if (!-d 'test_dir') {
+    if (mkdir 'test_dir') {
+    # print "mkdir: created directory 'test_dir'\n";
+    } else {
+    croak "mkdir: cannot create directory 'test_dir': $ERRNO\n";
+    }
+    } else {
+    print {\*STDERR} "mkdir: cannot create directory 'test_dir': File exists\n";
+    local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_6 = ("Directory created");
+        $left_result_6 . $right_result_6;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Mkdir result: $mkdir_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+if (-e "test_dir/file") {
+my $current_time = time;
+utime $current_time, $current_time, "test_dir/file";
+} else {
+if (open my $fh, '>', "test_dir/file") {
+close $fh or croak "Close failed: $ERRNO";
+} else {
+croak "touch: cannot create ", "test_dir/file", ": $ERRNO\n";
+}
+}
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_8 = ();
+if ( -f 'test_dir' ) {
+    push @ls_files_8, 'test_dir';
+}
+elsif ( -d 'test_dir' ) {
+    if (opendir my $dh, 'test_dir') {
+        while ( my $file = readdir $dh ) {
+            next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+            next if $file =~ /^__tmp_.*[.]pl$/msx;
+            next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+            push @ls_files_8, $file;
+        }
+        closedir $dh;
+    }
+}
+if (@ls_files_8) {
+    print join "\n", @ls_files_8;
+    print "\n";
+    my $expected_count = 1;
+    if (@ls_files_8 == $expected_count) {
+        local $CHILD_ERROR = 0;
+        $ls_success = 1;
+    } else {
+        local $CHILD_ERROR = 2;
+        $ls_success = 0;
+    }
+} else {
+    local $CHILD_ERROR = 1;
+    $ls_success = 0;
+}
+if (!defined $ls_success || $ls_success == 0) {
+        print "Directory not found\n";
+}
+if ( -e "test_dir/file" ) {
+    if ( -d "test_dir/file" ) {
+        croak "rm: ", "test_dir/file",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_dir/file" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_dir/file",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_dir/file", ": No such file or directory\n";
+}
+if (-d 'test_dir') {
+if (rmdir 'test_dir') {
+} else {
+croak "rmdir: cannot remove directory 'test_dir': $ERRNO\n";
+}
+} else {
+croak "rmdir: 'test_dir': No such file or directory\n";
+}
+print "\n";
+print "=== touch command ===\n";
+my $touch_result = do {
+    my $left_result_9 = do {
+    local $CHILD_ERROR = 0;
+    my $eval_result = eval {
+    if (-e "test_file.txt") {
+my $current_time = time;
+utime $current_time, $current_time, "test_file.txt";
+} else {
+if (open my $fh, '>', "test_file.txt") {
+close $fh or croak "Close failed: $ERRNO";
+} else {
+croak "touch: cannot create ", "test_file.txt", ": $ERRNO\n";
+}
+};
+            local $CHILD_ERROR = 0;
+            1;
+    };
+    if (!$eval_result) {
+        local $CHILD_ERROR = 256;
+    };
+    q{};
+};
+    if ($CHILD_ERROR == 0) {
+        my $right_result_9 = ("File touched");
+        $left_result_9 . $right_result_9;
+    } else {
+        q{};
+    }
+};
+do {
+    my $output = "Touch result: $touch_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "\n";
+if ( -e "test_file.txt" ) {
+    if ( -d "test_file.txt" ) {
+        carp "rm: carping: ", "test_file.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_copy.txt" ) {
+    if ( -d "test_file_copy.txt" ) {
+        carp "rm: carping: ", "test_file_copy.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_copy.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file_copy.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file_copy.txt", ": No such file or directory\n";
+}
+if ( -e "test_file_moved.txt" ) {
+    if ( -d "test_file_moved.txt" ) {
+        carp "rm: carping: ", "test_file_moved.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_file_moved.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_file_moved.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_file_moved.txt", ": No such file or directory\n";
+}
+open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+if ( -e "test_dir" ) {
+    if ( -d "test_dir" ) {
+        my $err;
+        remove_tree("test_dir", {error => \$err});
+        if (@{$err}) {
+            carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";
+        }
+        else {
+            $main_exit_code = 0;
+        }
+    }
+    else {
+        if ( unlink "test_dir" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "test_dir",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "test_dir", ": No such file or directory\n";
+}
+if ($CHILD_ERROR != 0) {
+    1;
+}
+
+exit $main_exit_code;
+
+```
+
+perlcritic_wrapper: Started, parse args took 1.5e-05s
+perlcritic_wrapper: File read took 0.000418s
+perlcritic_wrapper: SHA1 hash took 9.4e-05s
+perlcritic_wrapper: No cache file found
+perlcritic_wrapper: Perl::Critic init took 0.272531s
+perlcritic_wrapper: Perl::Critic analysis took 1.988777s
+perlcritic_wrapper: Perltidy subprocess took 4.539331s
+Code formatting differences detected:
+Original has 607 lines, Tidied has 640 lines
+
+Line 41 differs:
+  Original: [                    # print "cp: copied 'test_file.txt' to $dest\n";]
+  Tidied:   []
+  First diff at position 0:
+    pos 0: orig=' ' vs tidied='[EOF]'
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=' ' vs tidied='[EOF]'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Use of uninitialized value in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 42 differs:
+  Original: [                } else {]
+  Tidied:   [                    # print "cp: copied 'test_file.txt' to $dest\n";]
+  First diff at position 16:
+    pos 16: orig='}' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 43 differs:
+  Original: [                    croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";]
+  Tidied:   [                }]
+  First diff at position 16:
+    pos 16: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 44 differs:
+  Original: [                }]
+  Tidied:   [                else {]
+  First diff at position 16:
+    pos 16: orig='}' vs tidied='e'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 45 differs:
+  Original: [            } else {]
+  Tidied:   [                    croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";]
+  First diff at position 12:
+    pos 12: orig='}' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 46 differs:
+  Original: [                croak "cp: 'test_file.txt': No such file or directory\n";]
+  Tidied:   [                }]
+  First diff at position 16:
+    pos 16: orig='c' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 48 differs:
+  Original: [                local $CHILD_ERROR = 0;]
+  Tidied:   [            else {]
+  First diff at position 12:
+    pos 12: orig=' ' vs tidied='e'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 49 differs:
+  Original: [                1;]
+  Tidied:   [                croak "cp: 'test_file.txt': No such file or directory\n";]
+  First diff at position 16:
+    pos 16: orig='1' vs tidied='c'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 50 differs:
+  Original: [        };]
+  Tidied:   [            }]
+  First diff at position 8:
+    pos 8: orig='}' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 51 differs:
+  Original: [        if ( !$eval_result ) {]
+  Tidied:   [            local $CHILD_ERROR = 0;]
+  First diff at position 8:
+    pos 8: orig='i' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 52 differs:
+  Original: [            local $CHILD_ERROR = 256;]
+  Tidied:   [            1;]
+  First diff at position 12:
+    pos 12: orig='l' vs tidied='1'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 54 differs:
+  Original: [        q{};]
+  Tidied:   [        if ( !$eval_result ) {]
+  First diff at position 8:
+    pos 8: orig='q' vs tidied='i'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 55 differs:
+  Original: [};]
+  Tidied:   [            local $CHILD_ERROR = 256;]
+  First diff at position 0:
+    pos 0: orig='}' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=';' vs tidied=' '
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 56 differs:
+  Original: [    if ($CHILD_ERROR == 0) {]
+  Tidied:   [        }]
+  First diff at position 4:
+    pos 4: orig='i' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 57 differs:
+  Original: [        my $right_result_0 = ("Copy successful");]
+  Tidied:   [        q{};]
+  First diff at position 8:
+    pos 8: orig='m' vs tidied='q'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 58 differs:
+  Original: [        $left_result_0 . $right_result_0;]
+  Tidied:   [    };]
+  First diff at position 4:
+    pos 4: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 59 differs:
+  Original: [    } else {]
+  Tidied:   [    if ( $CHILD_ERROR == 0 ) {]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied='i'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 60 differs:
+  Original: [        q{};]
+  Tidied:   [        my $right_result_0 = ("Copy successful");]
+  First diff at position 8:
+    pos 8: orig='q' vs tidied='m'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 61 differs:
+  Original: [    }]
+  Tidied:   [        $left_result_0 . $right_result_0;]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 62 differs:
+  Original: [};]
+  Tidied:   [    }]
+  First diff at position 0:
+    pos 0: orig='}' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=';' vs tidied=' '
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 63 differs:
+  Original: [do {]
+  Tidied:   [    else {]
+  First diff at position 0:
+    pos 0: orig='d' vs tidied=' '
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='o' vs tidied=' '
+Argument "d" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 64 differs:
+  Original: [    my $output = "Copy result: $cp_result";]
+  Tidied:   [        q{};]
+  First diff at position 4:
+    pos 4: orig='m' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 65 differs:
+  Original: [    print $output;]
+  Tidied:   [    }]
+  First diff at position 4:
+    pos 4: orig='p' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 66 differs:
+  Original: [    if ( !( $output =~ m{\n$}msx ) ) {]
+  Tidied:   [};]
+  First diff at position 0:
+    pos 0: orig=' ' vs tidied='}'
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=' ' vs tidied=';'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 67 differs:
+  Original: [        print "\n";]
+  Tidied:   [do {]
+  First diff at position 0:
+    pos 0: orig=' ' vs tidied='d'
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=' ' vs tidied='o'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "d" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 68 differs:
+  Original: [    }]
+  Tidied:   [    my $output = "Copy result: $cp_result";]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied='m'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 69 differs:
+  Original: [};]
+  Tidied:   [    print $output;]
+  First diff at position 0:
+    pos 0: orig='}' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=';' vs tidied=' '
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 70 differs:
+  Original: [open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";]
+  Tidied:   [    if ( !( $output =~ m{\n$}msx ) ) {]
+  First diff at position 0:
+    pos 0: orig='o' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='p' vs tidied=' '
+Argument "o" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 71 differs:
+  Original: [my @ls_files_1 = ();]
+  Tidied:   [        print "\n";]
+  First diff at position 0:
+    pos 0: orig='m' vs tidied=' '
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='y' vs tidied=' '
+Argument "m" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 72 differs:
+  Original: [if ( -f 'test_file.txt' ) {]
+  Tidied:   [    }]
+  First diff at position 0:
+    pos 0: orig='i' vs tidied=' '
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='f' vs tidied=' '
+Argument "i" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+
+Line count differs: original has 607 lines, tidied has 640 lines
+Additional lines in tidied version:
+  Line 608: [    carp "rm: carping: ", "test_file_moved.txt",]
+  Line 609: [      ": No such file or directory\n";]
+  Line 610: [}]
+  Line 611: [open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";]
+  Line 612: [if ( -e "test_dir" ) {]
+  Line 613: [    if ( -d "test_dir" ) {]
+  Line 614: [        my $err;]
+  Line 615: [        remove_tree( "test_dir", { error => \$err } );]
+  Line 616: [        if ( @{$err} ) {]
+  Line 617: [            carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";]
+  Line 618: [        }]
+  Line 619: [        else {]
+  Line 620: [            $main_exit_code = 0;]
+  Line 621: [        }]
+  Line 622: [    }]
+  Line 623: [    else {]
+  Line 624: [        if ( unlink "test_dir" ) {]
+  Line 625: [            $main_exit_code = 0;]
+  Line 626: [        }]
+  Line 627: [        else {]
+  Line 628: [            carp "rm: carping: could not remove ", "test_dir", ": $OS_ERROR\n";]
+  Line 629: [        }]
+  Line 630: [    }]
+  Line 631: [}]
+  Line 632: [else {]
+  Line 633: [    local $CHILD_ERROR = 0;]
+  Line 634: [    carp "rm: carping: ", "test_dir", ": No such file or directory\n";]
+  Line 635: [}]
+  Line 636: [if ( $CHILD_ERROR != 0 ) {]
+  Line 637: [    1;]
+  Line 638: [}]
+  Line 639: []
+  Line 640: [exit $main_exit_code;]
+perlcritic_wrapper: Perltidy check took 4.542149s
+perlcritic_wrapper: Output generation took 4e-06s
+perlcritic_wrapper: Cache write took 0.000709s
+perlcritic_wrapper: Total time 6.805136s
+
+FAILED: Code is not tidy
+
+Writing test count 0 to first_n_tests_passed.txt
+Current working directory: "D:\\GitHub\\sh2perl"
+Successfully wrote test count 0 and matching stdout lines 0 to first_n_tests_passed.txt
+
+To run test again: ./fail 000__03
+Test run completed at Tue Nov  4 05:04:27 AWST 2025

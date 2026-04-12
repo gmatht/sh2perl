@@ -1,0 +1,682 @@
+Starting test run at Sun Nov  2 11:03:10 AWST 2025
+Logging to: logs/fail_run_20251102_110310.log
+Test arguments: 000__01
+----------------------------------------
+Compiling debashc...
+./fail: line 85: cargo: command not found
+Running test_purify.pl validation...
+./fail: line 92: C:\Strawberry\perl\bin\perl.exe: command not found
+test_purify.pl passed, continuing with other commands...
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic "000__01"
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '
+000__01'
+Found example matching prefix '000__01': 000__01_file_directory_operations.sh
+
+Running only the specified example
+DEBUG: Starting test execution for ==================================================
+examples\000__01_file_directory_operations.sh with generator perl
+Test 1/146: 000__01_file_directory_operations.sh with perl     DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__01_file_directory_operations.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-maxdepth", None), Literal("1", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1406 characters
+DEBUG: Test execution completed in 7451ms
+[2J[1;1H================================================================================
+                                    TEST FAILED
+================================================================================
+File: examples\000__01_file_directory_operations.sh
+Generator: perl
+Test: 1/146
+Tests passed before failure: 0
+Failure Reason: Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my @ls_files_0 = ();
+    if (-f q{.}) {
+        push @ls_files_0, q{.};
+    } elsif (-d q{.}) {
+        if (opendir my $dh, q{.}) {
+            while (my $file = readdir $dh) {
+                next if $file =~ /^__tmp_.*[.]pl$/msx;
+                next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+        }
+    }
+    join "\n", @ls_files_0;
+};
+print "File listing:\n";
+print $file_list;
+if ( !( $file_list =~ m{\n$}msx ) ) { print "\n"; }
+my $found_files = do {
+    use File::Find;
+    use File::Basename;
+    my @files_1 = ();
+    my $start_1 = q{.};
+
+    sub find_files_1 {
+        my $file_1 = $File::Find::name;
+        if ( !( -f $file_1 ) ) {
+            return;
+        }
+        if ( !( basename($file_1) =~ m/^.*.sh$/xms ) ) {
+            return;
+        }
+        push @files_1, $file_1;
+        return;
+    }
+    find( \&find_files_1, $start_1 );
+    join "\n", @files_1;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if ( !( $found_files =~ m{\n$}msx ) ) { print "\n"; }
+
+```
+
+perlcritic_wrapper: Started, parse args took 1.4e-05s
+perlcritic_wrapper: File read took 0.000454s
+perlcritic_wrapper: SHA1 hash took 5.4e-05s
+perlcritic_wrapper: Cache hit, read took 0.000626s
+
+FAILED: Code is not tidy
+
+================================================================================
+
+Exit Code Comparison (IGNORED):
+Shell script exit code: 0
+Translated code exit code: -1
+
+================================================================================
+ORIGINAL SHELL SCRIPT:
+================================================================================
+#!/bin/bash
+
+# File and directory operations with backticks
+# This file demonstrates using backticks with file system commands
+
+echo "=== File and Directory Operations ==="
+
+# ls command with backticks
+#PERL_MUST_NOT_CONTAIN `ls
+file_list=`ls -a`
+echo "File listing:"
+echo "$file_list"
+
+# find command with backticks
+#PERL_MUST_NOT_CONTAIN `find
+found_files=`find . -maxdepth 1 -name "*.sh" -type f`
+echo "Found shell scripts:"
+echo "$found_files"
+
+# basename and dirname with backticks
+#PERL_MUST_NOT_CONTAIN `basename
+#PERL_MUST_NOT_CONTAIN `dirname
+#script_name=`basename $0`
+#script_dir=`dirname $0`
+#echo "Script name: $script_name"
+#echo "Script directory: $script_dir"
+
+
+================================================================================
+TRANSLATED PERL CODE:
+================================================================================
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my @ls_files_0 = ();
+    if (-f q{.}) {
+        push @ls_files_0, q{.};
+    } elsif (-d q{.}) {
+        if (opendir my $dh, q{.}) {
+            while (my $file = readdir $dh) {
+                next if $file =~ /^__tmp_.*[.]pl$/msx;
+                next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+        }
+    }
+    join "\n", @ls_files_0;
+};
+print "File listing:\n";
+print $file_list;
+if ( !( $file_list =~ m{\n$}msx ) ) { print "\n"; }
+my $found_files = do {
+    use File::Find;
+    use File::Basename;
+    my @files_1 = ();
+    my $start_1 = q{.};
+
+    sub find_files_1 {
+        my $file_1 = $File::Find::name;
+        if ( !( -f $file_1 ) ) {
+            return;
+        }
+        if ( !( basename($file_1) =~ m/^.*.sh$/xms ) ) {
+            return;
+        }
+        push @files_1, $file_1;
+        return;
+    }
+    find( \&find_files_1, $start_1 );
+    join "\n", @files_1;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if ( !( $found_files =~ m{\n$}msx ) ) { print "\n"; }
+
+
+================================================================================
+PERL::CRITIC RESULTS:
+================================================================================
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my @ls_files_0 = ();
+    if (-f q{.}) {
+        push @ls_files_0, q{.};
+    } elsif (-d q{.}) {
+        if (opendir my $dh, q{.}) {
+            while (my $file = readdir $dh) {
+                next if $file =~ /^__tmp_.*[.]pl$/msx;
+                next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+        }
+    }
+    join "\n", @ls_files_0;
+};
+print "File listing:\n";
+print $file_list;
+if ( !( $file_list =~ m{\n$}msx ) ) { print "\n"; }
+my $found_files = do {
+    use File::Find;
+    use File::Basename;
+    my @files_1 = ();
+    my $start_1 = q{.};
+
+    sub find_files_1 {
+        my $file_1 = $File::Find::name;
+        if ( !( -f $file_1 ) ) {
+            return;
+        }
+        if ( !( basename($file_1) =~ m/^.*.sh$/xms ) ) {
+            return;
+        }
+        push @files_1, $file_1;
+        return;
+    }
+    find( \&find_files_1, $start_1 );
+    join "\n", @files_1;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if ( !( $found_files =~ m{\n$}msx ) ) { print "\n"; }
+
+```
+
+perlcritic_wrapper: Started, parse args took 1.2e-05s
+perlcritic_wrapper: File read took 0.000359s
+perlcritic_wrapper: SHA1 hash took 4.6e-05s
+perlcritic_wrapper: Cache hit, read took 0.000611s
+
+FAILED: Code is not tidy
+
+
+================================================================================
+ABSTRACT SYNTAX TREE:
+================================================================================
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== File and Directory Operations ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File listing:")] }, None)], redirects: [], env_vars: {"file_list": CommandSubstitution(Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("file_list")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Found shell scripts:")] }, None)], redirects: [], env_vars: {"found_files": CommandSubstitution(Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-maxdepth", None), Literal("1", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("found_files")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+
+================================================================================
+STDOUT COMPARISON (DIFF):
+================================================================================
+--- shell_stdout
++++ perl_stdout
+-=== File and Directory Operations ===
+-File listing:
+-.
+-..
+-000__01_file_directory_operations.sh
+-000__02_output_formatting_commands.sh
+-000__03_file_manipulation_commands.sh
+-000__04a_basic_command_substitution.sh
+-000__04b_file_directory_operations.sh
+-000__04c_text_processing_commands.sh
+-000__04d_system_utilities.sh
+-000__04e_file_manipulation.sh
+-000__04f_output_formatting.sh
+-000__04g_checksum_commands.sh
+-000__04h_complex_examples.sh
+-000__05_system_utilities.sh
+-000__06_text_processing_commands.sh
+-000__07_find_path_commands.sh
+-001_simple.sh
+-002_control_flow.sh
+-003_pipeline.sh
+-004_test_quoted.sh
+-005_args.sh
+-006_misc.sh
+-007_cat_EOF.sh
+-008_simple_backup.sh
+-009_arrays.sh
+-010_pattern_matching.sh
+-011_brace_expansion.sh
+-012_process_substitution.sh
+-013_parameter_expansion.sh
+-014_ansi_quoting.sh
+-015_grep_advanced.sh
+-016_grep_basic.sh
+-017_grep_context.sh
+-018_grep_params.sh
+-019_grep_regex.sh
+-020_ansi_quoting_basic.sh
+-021_ansi_quoting_escape.sh
+-022_ansi_quoting_unicode.sh
+-023_ansi_quoting_practical.sh
+-024_parameter_expansion_case.sh
+-025_parameter_expansion_advanced.sh
+-026_parameter_expansion_more.sh
+-027_parameter_expansion_defaults.sh
+-028_arrays_indexed.sh
+-029_arrays_associative.sh
+-030_control_flow_if.sh
+-031_control_flow_loops.sh
+-032_control_flow_function.sh
+-033_brace_expansion_basic.sh
+-034_brace_expansion_advanced.sh
+-035_brace_expansion_practical.sh
+-036_pattern_matching_basic.sh
+-037_pattern_matching_extglob.sh
+-038_pattern_matching_nocase.sh
+-039_process_substitution_here.sh
+-040_process_substitution_comm.sh
+-041_process_substitution_mapfile.sh
+-042_process_substitution_advanced.sh
+-043_home.sh
+-044_find_example.sh
+-045_shell_calling_perl.sh
+-046_cd..sh
+-047_for_arithematic.sh
+-048_subprocess.sh
+-049_local.sh
+-050_test_ls_star_dot_sh.sh
+-051_primes.sh
+-052_numeric_computations.sh
+-053_gcd.sh
+-054_fibonacci.sh
+-055_factorize.sh
+-056_send_args.sh
+-057_case.sh
+-058_advanced_bash_idioms.sh
+-059_issue3.sh
+-060_issue5.sh
+-061_test_local_names_preserved.sh
+-062_01_ambiguous_operators.sh
+-062_02_complex_parameter_expansions.sh
+-062_03_complex_heredocs.sh
+-062_04_nested_arithmetic.sh
+-062_05_nested_command_substitution.sh
+-062_06_process_substitution.sh
+-062_07_complex_brace_expansion.sh
+-062_08_simple_case.sh
+-062_09_complex_function.sh
+-062_10_simple_pipeline.sh
+-062_11_mixed_arithmetic.sh
+-062_12_complex_string_interpolation.sh
+-062_13_simple_test_expressions.sh
+-062_14_complex_array_operations.sh
+-062_15_complex_local_variables.sh
+-062_hard_to_lex.sh
+-063_01_deeply_nested_arithmetic.sh
+-063_02_complex_array_assignments.sh
+-063_03_nested_command_substitutions.sh
+-063_04_complex_parameter_expansion.sh
+-063_05_heredoc_with_complex_content.sh
+-063_06_complex_pipeline_background.sh
+-063_07_nested_if_statements.sh
+-063_08_complex_case_statement.sh
+-063_09_complex_function_parameter_handling.sh
+-063_10_complex_for_loop.sh
+-063_11_complex_while_loop.sh
+-063_12_complex_eval.sh
+-063_13_nested_subshells.sh
+-063_14_complex_redirects.sh
+-063_15_complex_function_definition.sh
+-063_16_complex_test_expressions.sh
+-063_17_nested_brace_expansion.sh
+-063_18_complex_here_string.sh
+-063_19_complex_function_call.sh
+-063_20_final_complex_construct.sh
+-063_hard_to_parse.sh
+-064_01_complex_nested_subshells.sh
+-064_02_nested_brace_expansions.sh
+-064_03_complex_parameter_expansion.sh
+-064_04_extended_glob_patterns.sh
+-064_05_complex_case_statement.sh
+-064_06_nested_arithmetic_expressions.sh
+-064_07_complex_array_operations.sh
+-064_08_heredocs_with_variable_interpolation.sh
+-064_09_process_substitution_pipeline.sh
+-064_10_nested_function_definitions.sh
+-064_11_complex_test_expressions.sh
+-064_12_brace_expansion_nested_sequences.sh
+-064_13_complex_string_manipulation.sh
+-064_14_nested_command_substitution_arithmetic.sh
+-064_15_complex_pipeline_multiple_redirects.sh
+-064_16_function_complex_argument_handling.sh
+-064_17_complex_while_loop_nested_conditionals.sh
+-064_18_array_slicing_manipulation.sh
+-064_19_complex_pattern_matching_extended_globs.sh
+-064_20_nested_subshells_environment_variables.sh
+-064_21_complex_string_interpolation_multiple_variables.sh
+-064_22_function_returning_complex_data_structures.sh
+-064_23_complex_error_handling_traps.sh
+-064_24_advanced_parameter_expansion.sh
+-064_25_complex_command_chaining.sh
+-064_hard_to_generate.sh
+-065_yes_head_while.sh
+-065_yes_head_while.sh.perl
+-1
+-900_if2echo.sh
+-999_pwd.sh
+-a.logtmp
+-comparison.txt
+-config.txt
+-stderr.txt
+-test_025.pl
+-test_binary.txt
+-test_find.sh
+-test_grep.sh
+-test_perl_critic.sh
+-test_recursive_find.pl
+-test_simple_function.sh
+-test_system_builtin.sh
+-Found shell scripts:
+-./000__01_file_directory_operations.sh
+-./000__02_output_formatting_commands.sh
+-./000__03_file_manipulation_commands.sh
+-./000__04a_basic_command_substitution.sh
+-./000__04b_file_directory_operations.sh
+-./000__04c_text_processing_commands.sh
+-./000__04d_system_utilities.sh
+-./000__04e_file_manipulation.sh
+-./000__04f_output_formatting.sh
+-./000__04g_checksum_commands.sh
+-./000__04h_complex_examples.sh
+-./000__05_system_utilities.sh
+-./000__06_text_processing_commands.sh
+-./000__07_find_path_commands.sh
+-./001_simple.sh
+-./002_control_flow.sh
+-./003_pipeline.sh
+-./004_test_quoted.sh
+-./005_args.sh
+-./006_misc.sh
+-./007_cat_EOF.sh
+-./008_simple_backup.sh
+-./009_arrays.sh
+-./010_pattern_matching.sh
+-./011_brace_expansion.sh
+-./012_process_substitution.sh
+-./013_parameter_expansion.sh
+-./014_ansi_quoting.sh
+-./015_grep_advanced.sh
+-./016_grep_basic.sh
+-./017_grep_context.sh
+-./018_grep_params.sh
+-./019_grep_regex.sh
+-./020_ansi_quoting_basic.sh
+-./021_ansi_quoting_escape.sh
+-./022_ansi_quoting_unicode.sh
+-./023_ansi_quoting_practical.sh
+-./024_parameter_expansion_case.sh
+-./025_parameter_expansion_advanced.sh
+-./026_parameter_expansion_more.sh
+-./027_parameter_expansion_defaults.sh
+-./028_arrays_indexed.sh
+-./029_arrays_associative.sh
+-./030_control_flow_if.sh
+-./031_control_flow_loops.sh
+-./032_control_flow_function.sh
+-./033_brace_expansion_basic.sh
+-./034_brace_expansion_advanced.sh
+-./035_brace_expansion_practical.sh
+-./036_pattern_matching_basic.sh
+-./037_pattern_matching_extglob.sh
+-./038_pattern_matching_nocase.sh
+-./039_process_substitution_here.sh
+-./040_process_substitution_comm.sh
+-./041_process_substitution_mapfile.sh
+-./042_process_substitution_advanced.sh
+-./043_home.sh
+-./044_find_example.sh
+-./045_shell_calling_perl.sh
+-./046_cd..sh
+-./047_for_arithematic.sh
+-./048_subprocess.sh
+-./049_local.sh
+-./050_test_ls_star_dot_sh.sh
+-./051_primes.sh
+-./052_numeric_computations.sh
+-./053_gcd.sh
+-./054_fibonacci.sh
+-./055_factorize.sh
+-./056_send_args.sh
+-./057_case.sh
+-./058_advanced_bash_idioms.sh
+-./059_issue3.sh
+-./060_issue5.sh
+-./061_test_local_names_preserved.sh
+-./062_01_ambiguous_operators.sh
+-./062_02_complex_parameter_expansions.sh
+-./062_03_complex_heredocs.sh
+-./062_04_nested_arithmetic.sh
+-./062_05_nested_command_substitution.sh
+-./062_06_process_substitution.sh
+-./062_07_complex_brace_expansion.sh
+-./062_08_simple_case.sh
+-./062_09_complex_function.sh
+-./062_10_simple_pipeline.sh
+-./062_11_mixed_arithmetic.sh
+-./062_12_complex_string_interpolation.sh
+-./062_13_simple_test_expressions.sh
+-./062_14_complex_array_operations.sh
+-./062_15_complex_local_variables.sh
+-./062_hard_to_lex.sh
+-./063_01_deeply_nested_arithmetic.sh
+-./063_02_complex_array_assignments.sh
+-./063_03_nested_command_substitutions.sh
+-./063_04_complex_parameter_expansion.sh
+-./063_05_heredoc_with_complex_content.sh
+-./063_06_complex_pipeline_background.sh
+-./063_07_nested_if_statements.sh
+-./063_08_complex_case_statement.sh
+-./063_09_complex_function_parameter_handling.sh
+-./063_10_complex_for_loop.sh
+-./063_11_complex_while_loop.sh
+-./063_12_complex_eval.sh
+-./063_13_nested_subshells.sh
+-./063_14_complex_redirects.sh
+-./063_15_complex_function_definition.sh
+-./063_16_complex_test_expressions.sh
+-./063_17_nested_brace_expansion.sh
+-./063_18_complex_here_string.sh
+-./063_19_complex_function_call.sh
+-./063_20_final_complex_construct.sh
+-./063_hard_to_parse.sh
+-./064_01_complex_nested_subshells.sh
+-./064_02_nested_brace_expansions.sh
+-./064_03_complex_parameter_expansion.sh
+-./064_04_extended_glob_patterns.sh
+-./064_05_complex_case_statement.sh
+-./064_06_nested_arithmetic_expressions.sh
+-./064_07_complex_array_operations.sh
+-./064_08_heredocs_with_variable_interpolation.sh
+-./064_09_process_substitution_pipeline.sh
+-./064_10_nested_function_definitions.sh
+-./064_11_complex_test_expressions.sh
+-./064_12_brace_expansion_nested_sequences.sh
+-./064_13_complex_string_manipulation.sh
+-./064_14_nested_command_substitution_arithmetic.sh
+-./064_15_complex_pipeline_multiple_redirects.sh
+-./064_16_function_complex_argument_handling.sh
+-./064_17_complex_while_loop_nested_conditionals.sh
+-./064_18_array_slicing_manipulation.sh
+-./064_19_complex_pattern_matching_extended_globs.sh
+-./064_20_nested_subshells_environment_variables.sh
+-./064_21_complex_string_interpolation_multiple_variables.sh
+-./064_22_function_returning_complex_data_structures.sh
+-./064_23_complex_error_handling_traps.sh
+-./064_24_advanced_parameter_expansion.sh
+-./064_25_complex_command_chaining.sh
+-./064_hard_to_generate.sh
+-./065_yes_head_while.sh
+-./900_if2echo.sh
+-./999_pwd.sh
+-./test_find.sh
+-./test_grep.sh
+-./test_perl_critic.sh
+-./test_simple_function.sh
+-./test_system_builtin.sh
+
+
+================================================================================
+STDERR COMPARISON:
+================================================================================
+STDERR values are identical:
+Shell stderr: ''
+Perl stderr: ''
+
+================================================================================
+SUMMARY: 0 out of 146 tests passed before first failure
+================================================================================
+
+BRIEF FAILURE SUMMARY:
+Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== File and Directory Operations ===\n";
+my $file_list = do {
+    my @ls_files_0 = ();
+    if (-f q{.}) {
+        push @ls_files_0, q{.};
+    } elsif (-d q{.}) {
+        if (opendir my $dh, q{.}) {
+            while (my $file = readdir $dh) {
+                next if $file =~ /^__tmp_.*[.]pl$/msx;
+                next if $file =~ /^(debug_|temp_|test_|file\d*[.]txt)$/msx;
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = sort { lc $a cmp lc $b } @ls_files_0;
+        }
+    }
+    join "\n", @ls_files_0;
+};
+print "File listing:\n";
+print $file_list;
+if ( !( $file_list =~ m{\n$}msx ) ) { print "\n"; }
+my $found_files = do {
+    use File::Find;
+    use File::Basename;
+    my @files_1 = ();
+    my $start_1 = q{.};
+
+    sub find_files_1 {
+        my $file_1 = $File::Find::name;
+        if ( !( -f $file_1 ) ) {
+            return;
+        }
+        if ( !( basename($file_1) =~ m/^.*.sh$/xms ) ) {
+            return;
+        }
+        push @files_1, $file_1;
+        return;
+    }
+    find( \&find_files_1, $start_1 );
+    join "\n", @files_1;
+};
+print "Found shell scripts:\n";
+print $found_files;
+if ( !( $found_files =~ m{\n$}msx ) ) { print "\n"; }
+
+```
+
+perlcritic_wrapper: Started, parse args took 1.4e-05s
+perlcritic_wrapper: File read took 0.000454s
+perlcritic_wrapper: SHA1 hash took 5.4e-05s
+perlcritic_wrapper: Cache hit, read took 0.000626s
+
+FAILED: Code is not tidy
+
+Writing test count 0 to first_n_tests_passed.txt
+Current working directory: "D:\\GitHub\\sh2perl"
+Successfully wrote test count 0 and matching stdout lines 0 to first_n_tests_passed.txt
+
+To run test again: ./fail 000__01
+Test run completed at Sun Nov  2 11:03:27 AWST 2025

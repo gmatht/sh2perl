@@ -1,0 +1,21 @@
+Converting to inline Perl:
+==================================================
+my $num_lines = 15;
+my $head_line_count = 0;
+my $result = q{};
+my $input = $;
+my $pos = 0;
+while ($pos < length $input && $head_line_count < $num_lines) {
+    my $line_end = index $input, "\n", $pos;
+    if ($line_end == -1) {
+        $line_end = length $input;
+    }
+    my $head_line = substr $input, $pos, $line_end - $pos;
+    $result .= $head_line . "\n";
+    $pos = $line_end + 1;
+    ++$head_line_count;
+}
+$ = $result;
+
+
+==================================================

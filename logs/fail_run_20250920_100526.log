@@ -1,0 +1,207 @@
+Starting test run at Sat, Sep 20, 2025 10:05:26 AM
+Logging to: logs/fail_run_20250920_100526.log
+Test arguments: 
+----------------------------------------
+Compiling debashc...
+   Compiling debashl v0.1.0 (D:\GitHub\sh2perl)
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:419:37
+    |
+419 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+20   | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1862:4
+     |
+1862 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:190:4
+    |
+190 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:16:4
+   |
+16 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:65:4
+   |
+65 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:228:4
+    |
+228 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for_loop_index: usize) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+6  | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+7  |     /// Maps variable names to their usage information
+8  |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+9  |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 16 warnings (run `cargo fix --lib -p debashl` to apply 3 suggestions)
+warning: unused variable: `status`
+  --> src\execution.rs:58:21
+   |
+58 |             Ok(Some(status)) => {
+   |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_status`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:29:9
+   |
+16 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+29 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+30 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:529:8
+    |
+529 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>) -> Result<TestResult, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 8 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.32s
+Running debashc with 300 second timeout...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail
+Timeout: 300s
+----------------------------------------
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail
+Timeout: 300s
+----------------------------------------
+True
+Command timed out after 300s, killing process...
+True
+----------------------------------------
+Command timed out with exit code: 124
+----------------------------------------
+Command timed out after 300s
+----------------------------------------
+Command completed with exit code: 124
+----------------------------------------

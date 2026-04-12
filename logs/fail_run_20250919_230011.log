@@ -1,0 +1,36 @@
+Starting test run at Fri, Sep 19, 2025 11:00:11 PM
+Logging to: logs/fail_run_20250919_230011.log
+Test arguments: 
+----------------------------------------
+Compiling debashc...
+   Compiling debashl v0.1.0 (D:\GitHub\sh2perl)
+error: mismatched closing delimiter: `}`
+   --> src\generator\redirects.rs:215:24
+    |
+214 | ...   if s.contains(' ') || s.contains('"') || s.contains('\'') || s.contains(';') || s.contains('|') || s.contains('&') || s.contains('<') || s.contains('>') {
+    |                                                                                                                                                                - closing delimiter possibly meant for this
+215 | ...       format!("'{}'", s.replace("'", "'\''")
+    |                  ^ unclosed delimiter
+216 | ...   } else {
+    |       ^ mismatched closing delimiter
+
+error: could not compile `debashl` (lib) due to 1 previous error
+Running debashc with 300 second timeout...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail
+Timeout: 300s
+----------------------------------------
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail
+Timeout: 300s
+----------------------------------------
+True
+Command timed out after 300s, killing process...
+True
+----------------------------------------
+Command timed out with exit code: 124
+----------------------------------------
+Command timed out after 300s
+----------------------------------------
+Command completed with exit code: 124
+----------------------------------------

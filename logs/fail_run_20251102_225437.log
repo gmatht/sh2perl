@@ -1,0 +1,1766 @@
+Starting test run at Sun Nov  2 22:54:37 AWST 2025
+Logging to: logs/fail_run_20251102_225437.log
+Test arguments: 000__02
+----------------------------------------
+Compiling debashc...
+./fail: line 85: cargo: command not found
+Running test_purify.pl validation...
+./fail: line 92: C:\Strawberry\perl\bin\perl.exe: command not found
+test_purify.pl passed, continuing with other commands...
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic "000__02"
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '
+000__02'
+Found example matching prefix '000__02': 000__02_output_formatting_commands.sh
+
+Running only the specified example
+DEBUG: Starting test execution for ==================================================
+examples\000__02_output_formatting_commands.sh with generator perl
+Test 2/146: 000__02_output_formatting_commands.sh with perl     DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__02_output_formatting_commands.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("Hello from backticks", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("printf", None), args: [Literal("Number: %d, String: %s\\n", None), Literal("42", None), Literal("test", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha256sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha256sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha512sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha512sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("strings", None), args: [Literal("test_binary.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test output")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tee", None), args: [Literal("test_tee.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 7031 characters
+DEBUG: Test execution completed in 10613ms
+[2J[1;1H================================================================================
+                                    TEST FAILED
+================================================================================
+File: examples\000__02_output_formatting_commands.sh
+Generator: perl
+Test: 2/146
+Tests passed before failure: 0
+Failure Reason: Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+use Digest::SHA qw(sha256_hex sha512_hex);
+use File::Path  qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== Output and Formatting Commands ===\n";
+my $echo_result = do {
+    my $_chomp_temp = ('Hello from backticks');
+    chomp $_chomp_temp;
+    $_chomp_temp;
+};
+do {
+    my $output = "Echo result: $echo_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $printf_result = do {
+    my $result = sprintf "Number: %d, String: %s\n", "42", "test";
+    chomp $result;
+    $result;
+};
+do {
+    my $output = "Printf result: $printf_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "=== Compression Commands ===\n";
+print "=== Network Commands ===\n";
+print "=== Process Management Commands ===\n";
+print "=== Checksum Commands ===\n";
+{
+    open my $original_stdout, '>&', STDOUT
+      or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'test_checksum.txt'
+      or croak "Cannot open file: $ERRNO";
+    print "test content\n";
+    open STDOUT, '>&', $original_stdout
+      or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout
+      or croak "Close failed: $ERRNO";
+}
+my $sha256_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha256_hex(
+            do {
+                local $INPUT_RECORD_SEPARATOR = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $ERRNO";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
+    }
+    else {
+        push @results,
+            "0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+    }
+    join "\n", @results;
+}
+;
+do {
+    my $output = "SHA256 result: $sha256_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $sha512_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha512_hex(
+            do {
+                local $INPUT_RECORD_SEPARATOR = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $ERRNO";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
+    }
+    else {
+        push @results,
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+    }
+    join "\n", @results;
+}
+;
+do {
+    my $output = "SHA512 result: $sha512_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $strings_result = do {
+    my $_chomp_result = do { do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        my $input_data;
+    if (open my $fh, '<', 'test_binary.txt') {
+    local $INPUT_RECORD_SEPARATOR = undef;  # Read entire file at once
+    $input_data = <$fh>;
+    close $fh
+          or croak "Close failed: $ERRNO";
+    } else {
+    print {*STDERR} "strings: 'test_binary.txt': No such file\n";
+    $input_data = q{};
+    }
+    my @result;
+    my @lines = split /\n/msx, $input_data;
+    for my $line (@lines) {
+    if (length $line >= 4) {
+    push @result, $line;
+    }
+    }
+    my $line = join "\n", @result;
+    $output_0 = $line;
+    my $num_lines = 3;
+    my $head_line_count = 0;
+    my $result = q{};
+    my $input = $output_0;
+    my $pos = 0;
+    while ($pos < length $input && $head_line_count < $num_lines) {
+        my $line_end = index $input, "\n", $pos;
+        if ($line_end == -1) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_0 = $result;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+ };
+    chomp $_chomp_result;
+    $_chomp_result;
+};
+print "Strings result:\n";
+print $strings_result;
+if ( !( $strings_result =~ m{\n$}msx ) ) { print "\n"; }
+print "=== I/O Redirection Commands ===\n";
+my $tee_result = do {
+    my $_chomp_result = do { do {
+    my $output_1;
+    my $pipeline_success_1 = 1;
+        $output_1 .= "test output\n";
+    my @lines = split /\n/msx, $output_1;
+    if (open my $fh, '>', 'test_tee.txt') {
+    foreach my $line (@lines) {
+    print {$fh} "$line\n";
+    }
+    close $fh
+          or croak "Close failed: $ERRNO";
+    } else {
+    carp "tee: Cannot open 'test_tee.txt': $ERRNO";
+    }
+    if (!$pipeline_success_1) { $main_exit_code = 1; }
+        $output_1;
+}
+ };
+    chomp $_chomp_result;
+    $_chomp_result;
+};
+do {
+    my $output = "Tee result: $tee_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "=== Perl Command ===\n";
+my $perl_result = do {
+                                            use Capture::Tiny qw(capture_stdout);
+                                            my $result;
+                                            my $eval_success = eval {
+                                                $result = capture_stdout(sub { print "Hello from Perl\n" });
+                                                1;
+                                            };
+                                            if (!$eval_success) {
+                                                $result = "Error executing Perl code: $EVAL_ERROR";
+                                            }
+                                            $result;
+                                        };
+do {
+    my $output = "Perl result: $perl_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+if ( -e "test_checksum.txt" ) {
+if ( -d "test_checksum.txt" ) {
+carp "rm: carping: ", "test_checksum.txt",
+    " is a directory (use -r to remove recursively)\n";
+}
+else {
+if ( unlink "test_checksum.txt" ) {
+$main_exit_code = 0;
+}
+else {
+carp "rm: carping: could not remove ", "test_checksum.txt",
+    ": $OS_ERROR\n";
+}
+}
+}
+else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_checksum.txt",
+    ": No such file or directory\n";
+}
+if ( -e "test_tee.txt" ) {
+if ( -d "test_tee.txt" ) {
+carp "rm: carping: ", "test_tee.txt",
+    " is a directory (use -r to remove recursively)\n";
+}
+else {
+if ( unlink "test_tee.txt" ) {
+$main_exit_code = 0;
+}
+else {
+carp "rm: carping: could not remove ", "test_tee.txt",
+    ": $OS_ERROR\n";
+}
+}
+}
+else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_tee.txt",
+    ": No such file or directory\n";
+}
+
+```
+
+perlcritic_wrapper: Started, parse args took 2.1e-05s
+perlcritic_wrapper: File read took 0.000537s
+perlcritic_wrapper: SHA1 hash took 7.2e-05s
+perlcritic_wrapper: No cache file found
+perlcritic_wrapper: Perl::Critic init took 0.268079s
+perlcritic_wrapper: Perl::Critic analysis took 0.616009s
+perlcritic_wrapper: Perltidy subprocess took 3.307804s
+Code formatting differences detected:
+Original has 253 lines, Tidied has 255 lines
+
+Line 73 differs:
+  Original: [            "0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";]
+  Tidied:   ["0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";]
+
+Line 76 differs:
+  Original: [}]
+  Tidied:   [};]
+  First diff at position 1:
+    pos 1: orig='[EOF]' vs tidied=';'
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 77 differs:
+  Original: [;]
+  Tidied:   [do {]
+  First diff at position 0:
+    pos 0: orig=';' vs tidied='d'
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='[EOF]' vs tidied='o'
+Argument "d" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 78 differs:
+  Original: [do {]
+  Tidied:   [    my $output = "SHA256 result: $sha256_result";]
+  First diff at position 0:
+    pos 0: orig='d' vs tidied=' '
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='o' vs tidied=' '
+Argument "d" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 79 differs:
+  Original: [    my $output = "SHA256 result: $sha256_result";]
+  Tidied:   [    print $output;]
+  First diff at position 4:
+    pos 4: orig='m' vs tidied='p'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 80 differs:
+  Original: [    print $output;]
+  Tidied:   [    if ( !( $output =~ m{\n$}msx ) ) {]
+  First diff at position 4:
+    pos 4: orig='p' vs tidied='i'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 81 differs:
+  Original: [    if ( !( $output =~ m{\n$}msx ) ) {]
+  Tidied:   [        print "\n";]
+  First diff at position 4:
+    pos 4: orig='i' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 82 differs:
+  Original: [        print "\n";]
+  Tidied:   [    }]
+  First diff at position 4:
+    pos 4: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 83 differs:
+  Original: [    }]
+  Tidied:   [};]
+  First diff at position 0:
+    pos 0: orig=' ' vs tidied='}'
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=' ' vs tidied=';'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 84 differs:
+  Original: [};]
+  Tidied:   [my $sha512_result = do {]
+  First diff at position 0:
+    pos 0: orig='}' vs tidied='m'
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=';' vs tidied='y'
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "m" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 85 differs:
+  Original: [my $sha512_result = do {]
+  Tidied:   [    my @results;]
+  First diff at position 0:
+    pos 0: orig='m' vs tidied=' '
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='y' vs tidied=' '
+Argument "m" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 86 differs:
+  Original: [    my @results;]
+  Tidied:   [    if ( -f 'test_checksum.txt' ) {]
+  First diff at position 4:
+    pos 4: orig='m' vs tidied='i'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 87 differs:
+  Original: [    if ( -f 'test_checksum.txt' ) {]
+  Tidied:   [        my $hash = sha512_hex(]
+  First diff at position 4:
+    pos 4: orig='i' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 88 differs:
+  Original: [        my $hash = sha512_hex(]
+  Tidied:   [            do {]
+  First diff at position 8:
+    pos 8: orig='m' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 89 differs:
+  Original: [            do {]
+  Tidied:   [                local $INPUT_RECORD_SEPARATOR = undef;]
+  First diff at position 12:
+    pos 12: orig='d' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 90 differs:
+  Original: [                local $INPUT_RECORD_SEPARATOR = undef;]
+  Tidied:   [                open my $fh, '<', 'test_checksum.txt']
+  First diff at position 16:
+    pos 16: orig='l' vs tidied='o'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 91 differs:
+  Original: [                open my $fh, '<', 'test_checksum.txt']
+  Tidied:   [                  or croak "Cannot open 'test_checksum.txt': $ERRNO";]
+  First diff at position 16:
+    pos 16: orig='o' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 92 differs:
+  Original: [                  or croak "Cannot open 'test_checksum.txt': $ERRNO";]
+  Tidied:   [                my $content = <$fh>;]
+  First diff at position 16:
+    pos 16: orig=' ' vs tidied='m'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 93 differs:
+  Original: [                my $content = <$fh>;]
+  Tidied:   [                close $fh]
+  First diff at position 16:
+    pos 16: orig='m' vs tidied='c'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 94 differs:
+  Original: [                close $fh]
+  Tidied:   [                  or croak "Close failed: $ERRNO";]
+  First diff at position 16:
+    pos 16: orig='c' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 95 differs:
+  Original: [                  or croak "Close failed: $ERRNO";]
+  Tidied:   [                $content;]
+  First diff at position 16:
+    pos 16: orig=' ' vs tidied='$'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 96 differs:
+  Original: [                $content;]
+  Tidied:   [            }]
+  First diff at position 12:
+    pos 12: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 97 differs:
+  Original: [            }]
+  Tidied:   [        );]
+  First diff at position 8:
+    pos 8: orig=' ' vs tidied=')'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 98 differs:
+  Original: [        );]
+  Tidied:   [        push @results, "$hash  test_checksum.txt";]
+  First diff at position 8:
+    pos 8: orig=')' vs tidied='p'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 99 differs:
+  Original: [        push @results, "$hash  test_checksum.txt";]
+  Tidied:   [    }]
+  First diff at position 4:
+    pos 4: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 100 differs:
+  Original: [    }]
+  Tidied:   [    else {]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied='e'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 101 differs:
+  Original: [    else {]
+  Tidied:   [        push @results,]
+  First diff at position 4:
+    pos 4: orig='e' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 102 differs:
+  Original: [        push @results,]
+  Tidied:   ["00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";]
+
+Line 103 differs:
+  Original: [            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";]
+  Tidied:   [    }]
+
+Line 104 differs:
+  Original: [    }]
+  Tidied:   [    join "\n", @results;]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied='j'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+
+Line count differs: original has 253 lines, tidied has 255 lines
+Additional lines in tidied version:
+  Line 254: [    carp "rm: carping: ", "test_tee.txt", ": No such file or directory\n";]
+  Line 255: [}]
+perlcritic_wrapper: Perltidy check took 3.30994s
+perlcritic_wrapper: Output generation took 3e-06s
+perlcritic_wrapper: Cache write took 0.007704s
+perlcritic_wrapper: Total time 4.202856s
+
+FAILED: Code is not tidy
+
+================================================================================
+
+Exit Code Comparison (IGNORED):
+Shell script exit code: 0
+Translated code exit code: -1
+
+================================================================================
+ORIGINAL SHELL SCRIPT:
+================================================================================
+#!/bin/bash
+
+# Output and formatting commands with backticks
+# This file demonstrates using backticks with output and formatting commands
+
+echo "=== Output and Formatting Commands ==="
+
+# echo command with backticks
+#PERL_MUST_NOT_CONTAIN `echo
+echo_result=`echo "Hello from backticks"`
+echo "Echo result: $echo_result"
+
+# printf command with backticks
+#PERL_MUST_NOT_CONTAIN `printf
+printf_result=`printf "Number: %d, String: %s\n" 42 "test"`
+echo "Printf result: $printf_result"
+
+echo "=== Compression Commands ==="
+
+# gzip command with backticks
+#PERL_MUST_NOT_CONTAIN `gzip
+#echo "test content for compression" > test_compress.txt
+#gzip_result=`gzip test_compress.txt && echo "Compression successful"`
+#echo "Gzip result: $gzip_result"
+
+# zcat command with backticks
+#PERL_MUST_NOT_CONTAIN `zcat
+#zcat_result=`zcat test_compress.txt.gz`
+#echo "Zcat result: $zcat_result"
+
+echo "=== Network Commands ==="
+
+# wget command with backticks
+#PERL_MUST_NOT_CONTAIN `wget
+# wget_result=`wget -qO- http://httpbin.org/get | head -1`
+# echo "Wget result: $wget_result"
+
+# curl command with backticks
+#PERL_MUST_NOT_CONTAIN `curl
+# curl_result=`curl -s http://httpbin.org/get | head -1`
+# echo "Curl result: $curl_result"
+
+echo "=== Process Management Commands ==="
+
+# kill command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `kill
+# kill_result=`kill -0 $$ && echo "Process exists"`
+# echo "Kill result: $kill_result"
+
+# nohup command with backticks
+#PERL_MUST_NOT_CONTAIN `nohup
+# nohup_result=`nohup echo "background process" 2>&1`
+# echo "Nohup result: $nohup_result"
+
+# nice command with backticks
+#PERL_MUST_NOT_CONTAIN `nice
+#nice_result=`nice echo "low priority process"`
+#echo "Nice result: $nice_result"
+
+echo "=== Checksum Commands ==="
+
+# sha256sum command with backticks
+#PERL_MUST_NOT_CONTAIN `sha256sum
+echo "test content" > test_checksum.txt
+sha256_result=`sha256sum test_checksum.txt`
+echo "SHA256 result: $sha256_result"
+
+# sha512sum command with backticks
+#PERL_MUST_NOT_CONTAIN `sha512sum
+sha512_result=`sha512sum test_checksum.txt`
+echo "SHA512 result: $sha512_result"
+
+# strings command with backticks
+#PERL_MUST_NOT_CONTAIN `strings
+strings_result=`strings test_binary.txt | head -3`
+echo "Strings result:"
+echo "$strings_result"
+
+echo "=== I/O Redirection Commands ==="
+
+# tee command with backticks
+#PERL_MUST_NOT_CONTAIN `tee
+tee_result=`echo "test output" | tee test_tee.txt`
+echo "Tee result: $tee_result"
+
+echo "=== Perl Command ==="
+
+# perl command with backticks
+#PERL_MUST_NOT_CONTAIN `perl
+perl_result=`perl -e 'print "Hello from Perl\n"'`
+echo "Perl result: $perl_result"
+
+# Cleanup
+rm -f test_checksum.txt test_tee.txt
+
+
+
+================================================================================
+TRANSLATED PERL CODE:
+================================================================================
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+use Digest::SHA qw(sha256_hex sha512_hex);
+use File::Path  qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== Output and Formatting Commands ===\n";
+my $echo_result = do {
+    my $_chomp_temp = ('Hello from backticks');
+    chomp $_chomp_temp;
+    $_chomp_temp;
+};
+do {
+    my $output = "Echo result: $echo_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $printf_result = do {
+    my $result = sprintf "Number: %d, String: %s\n", "42", "test";
+    chomp $result;
+    $result;
+};
+do {
+    my $output = "Printf result: $printf_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "=== Compression Commands ===\n";
+print "=== Network Commands ===\n";
+print "=== Process Management Commands ===\n";
+print "=== Checksum Commands ===\n";
+{
+    open my $original_stdout, '>&', STDOUT
+      or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'test_checksum.txt'
+      or croak "Cannot open file: $ERRNO";
+    print "test content\n";
+    open STDOUT, '>&', $original_stdout
+      or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout
+      or croak "Close failed: $ERRNO";
+}
+my $sha256_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha256_hex(
+            do {
+                local $INPUT_RECORD_SEPARATOR = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $ERRNO";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
+    }
+    else {
+        push @results,
+            "0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+    }
+    join "\n", @results;
+}
+;
+do {
+    my $output = "SHA256 result: $sha256_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $sha512_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha512_hex(
+            do {
+                local $INPUT_RECORD_SEPARATOR = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $ERRNO";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
+    }
+    else {
+        push @results,
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+    }
+    join "\n", @results;
+}
+;
+do {
+    my $output = "SHA512 result: $sha512_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $strings_result = do {
+    my $_chomp_result = do { do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        my $input_data;
+    if (open my $fh, '<', 'test_binary.txt') {
+    local $INPUT_RECORD_SEPARATOR = undef;  # Read entire file at once
+    $input_data = <$fh>;
+    close $fh
+          or croak "Close failed: $ERRNO";
+    } else {
+    print {*STDERR} "strings: 'test_binary.txt': No such file\n";
+    $input_data = q{};
+    }
+    my @result;
+    my @lines = split /\n/msx, $input_data;
+    for my $line (@lines) {
+    if (length $line >= 4) {
+    push @result, $line;
+    }
+    }
+    my $line = join "\n", @result;
+    $output_0 = $line;
+    my $num_lines = 3;
+    my $head_line_count = 0;
+    my $result = q{};
+    my $input = $output_0;
+    my $pos = 0;
+    while ($pos < length $input && $head_line_count < $num_lines) {
+        my $line_end = index $input, "\n", $pos;
+        if ($line_end == -1) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_0 = $result;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+ };
+    chomp $_chomp_result;
+    $_chomp_result;
+};
+print "Strings result:\n";
+print $strings_result;
+if ( !( $strings_result =~ m{\n$}msx ) ) { print "\n"; }
+print "=== I/O Redirection Commands ===\n";
+my $tee_result = do {
+    my $_chomp_result = do { do {
+    my $output_1;
+    my $pipeline_success_1 = 1;
+        $output_1 .= "test output\n";
+    my @lines = split /\n/msx, $output_1;
+    if (open my $fh, '>', 'test_tee.txt') {
+    foreach my $line (@lines) {
+    print {$fh} "$line\n";
+    }
+    close $fh
+          or croak "Close failed: $ERRNO";
+    } else {
+    carp "tee: Cannot open 'test_tee.txt': $ERRNO";
+    }
+    if (!$pipeline_success_1) { $main_exit_code = 1; }
+        $output_1;
+}
+ };
+    chomp $_chomp_result;
+    $_chomp_result;
+};
+do {
+    my $output = "Tee result: $tee_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "=== Perl Command ===\n";
+my $perl_result = do {
+                                            use Capture::Tiny qw(capture_stdout);
+                                            my $result;
+                                            my $eval_success = eval {
+                                                $result = capture_stdout(sub { print "Hello from Perl\n" });
+                                                1;
+                                            };
+                                            if (!$eval_success) {
+                                                $result = "Error executing Perl code: $EVAL_ERROR";
+                                            }
+                                            $result;
+                                        };
+do {
+    my $output = "Perl result: $perl_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+if ( -e "test_checksum.txt" ) {
+if ( -d "test_checksum.txt" ) {
+carp "rm: carping: ", "test_checksum.txt",
+    " is a directory (use -r to remove recursively)\n";
+}
+else {
+if ( unlink "test_checksum.txt" ) {
+$main_exit_code = 0;
+}
+else {
+carp "rm: carping: could not remove ", "test_checksum.txt",
+    ": $OS_ERROR\n";
+}
+}
+}
+else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_checksum.txt",
+    ": No such file or directory\n";
+}
+if ( -e "test_tee.txt" ) {
+if ( -d "test_tee.txt" ) {
+carp "rm: carping: ", "test_tee.txt",
+    " is a directory (use -r to remove recursively)\n";
+}
+else {
+if ( unlink "test_tee.txt" ) {
+$main_exit_code = 0;
+}
+else {
+carp "rm: carping: could not remove ", "test_tee.txt",
+    ": $OS_ERROR\n";
+}
+}
+}
+else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_tee.txt",
+    ": No such file or directory\n";
+}
+
+
+================================================================================
+PERL::CRITIC RESULTS:
+================================================================================
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+use Digest::SHA qw(sha256_hex sha512_hex);
+use File::Path  qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== Output and Formatting Commands ===\n";
+my $echo_result = do {
+    my $_chomp_temp = ('Hello from backticks');
+    chomp $_chomp_temp;
+    $_chomp_temp;
+};
+do {
+    my $output = "Echo result: $echo_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $printf_result = do {
+    my $result = sprintf "Number: %d, String: %s\n", "42", "test";
+    chomp $result;
+    $result;
+};
+do {
+    my $output = "Printf result: $printf_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "=== Compression Commands ===\n";
+print "=== Network Commands ===\n";
+print "=== Process Management Commands ===\n";
+print "=== Checksum Commands ===\n";
+{
+    open my $original_stdout, '>&', STDOUT
+      or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'test_checksum.txt'
+      or croak "Cannot open file: $ERRNO";
+    print "test content\n";
+    open STDOUT, '>&', $original_stdout
+      or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout
+      or croak "Close failed: $ERRNO";
+}
+my $sha256_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha256_hex(
+            do {
+                local $INPUT_RECORD_SEPARATOR = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $ERRNO";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
+    }
+    else {
+        push @results,
+            "0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+    }
+    join "\n", @results;
+}
+;
+do {
+    my $output = "SHA256 result: $sha256_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $sha512_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha512_hex(
+            do {
+                local $INPUT_RECORD_SEPARATOR = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $ERRNO";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
+    }
+    else {
+        push @results,
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+    }
+    join "\n", @results;
+}
+;
+do {
+    my $output = "SHA512 result: $sha512_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $strings_result = do {
+    my $_chomp_result = do { do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        my $input_data;
+    if (open my $fh, '<', 'test_binary.txt') {
+    local $INPUT_RECORD_SEPARATOR = undef;  # Read entire file at once
+    $input_data = <$fh>;
+    close $fh
+          or croak "Close failed: $ERRNO";
+    } else {
+    print {*STDERR} "strings: 'test_binary.txt': No such file\n";
+    $input_data = q{};
+    }
+    my @result;
+    my @lines = split /\n/msx, $input_data;
+    for my $line (@lines) {
+    if (length $line >= 4) {
+    push @result, $line;
+    }
+    }
+    my $line = join "\n", @result;
+    $output_0 = $line;
+    my $num_lines = 3;
+    my $head_line_count = 0;
+    my $result = q{};
+    my $input = $output_0;
+    my $pos = 0;
+    while ($pos < length $input && $head_line_count < $num_lines) {
+        my $line_end = index $input, "\n", $pos;
+        if ($line_end == -1) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_0 = $result;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+ };
+    chomp $_chomp_result;
+    $_chomp_result;
+};
+print "Strings result:\n";
+print $strings_result;
+if ( !( $strings_result =~ m{\n$}msx ) ) { print "\n"; }
+print "=== I/O Redirection Commands ===\n";
+my $tee_result = do {
+    my $_chomp_result = do { do {
+    my $output_1;
+    my $pipeline_success_1 = 1;
+        $output_1 .= "test output\n";
+    my @lines = split /\n/msx, $output_1;
+    if (open my $fh, '>', 'test_tee.txt') {
+    foreach my $line (@lines) {
+    print {$fh} "$line\n";
+    }
+    close $fh
+          or croak "Close failed: $ERRNO";
+    } else {
+    carp "tee: Cannot open 'test_tee.txt': $ERRNO";
+    }
+    if (!$pipeline_success_1) { $main_exit_code = 1; }
+        $output_1;
+}
+ };
+    chomp $_chomp_result;
+    $_chomp_result;
+};
+do {
+    my $output = "Tee result: $tee_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "=== Perl Command ===\n";
+my $perl_result = do {
+                                            use Capture::Tiny qw(capture_stdout);
+                                            my $result;
+                                            my $eval_success = eval {
+                                                $result = capture_stdout(sub { print "Hello from Perl\n" });
+                                                1;
+                                            };
+                                            if (!$eval_success) {
+                                                $result = "Error executing Perl code: $EVAL_ERROR";
+                                            }
+                                            $result;
+                                        };
+do {
+    my $output = "Perl result: $perl_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+if ( -e "test_checksum.txt" ) {
+if ( -d "test_checksum.txt" ) {
+carp "rm: carping: ", "test_checksum.txt",
+    " is a directory (use -r to remove recursively)\n";
+}
+else {
+if ( unlink "test_checksum.txt" ) {
+$main_exit_code = 0;
+}
+else {
+carp "rm: carping: could not remove ", "test_checksum.txt",
+    ": $OS_ERROR\n";
+}
+}
+}
+else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_checksum.txt",
+    ": No such file or directory\n";
+}
+if ( -e "test_tee.txt" ) {
+if ( -d "test_tee.txt" ) {
+carp "rm: carping: ", "test_tee.txt",
+    " is a directory (use -r to remove recursively)\n";
+}
+else {
+if ( unlink "test_tee.txt" ) {
+$main_exit_code = 0;
+}
+else {
+carp "rm: carping: could not remove ", "test_tee.txt",
+    ": $OS_ERROR\n";
+}
+}
+}
+else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_tee.txt",
+    ": No such file or directory\n";
+}
+
+```
+
+perlcritic_wrapper: Started, parse args took 1.5e-05s
+perlcritic_wrapper: File read took 0.000344s
+perlcritic_wrapper: SHA1 hash took 4.6e-05s
+perlcritic_wrapper: Cache hit, read took 0.002612s
+
+FAILED: Code is not tidy
+
+
+================================================================================
+ABSTRACT SYNTAX TREE:
+================================================================================
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Output and Formatting Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Echo result: "), Variable("echo_result")] }, None)], redirects: [], env_vars: {"echo_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("Hello from backticks", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Printf result: "), Variable("printf_result")] }, None)], redirects: [], env_vars: {"printf_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("printf", None), args: [Literal("Number: %d, String: %s\\n", None), Literal("42", None), Literal("test", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Compression Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Network Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Process Management Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Checksum Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test content")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("test_checksum.txt", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("SHA256 result: "), Variable("sha256_result")] }, None)], redirects: [], env_vars: {"sha256_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("sha256sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("SHA512 result: "), Variable("sha512_result")] }, None)], redirects: [], env_vars: {"sha512_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("sha512sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Strings result:")] }, None)], redirects: [], env_vars: {"strings_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("strings", None), args: [Literal("test_binary.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("strings_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== I/O Redirection Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Tee result: "), Variable("tee_result")] }, None)], redirects: [], env_vars: {"tee_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test output")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tee", None), args: [Literal("test_tee.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Perl Command ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Perl result: "), Variable("perl_result")] }, None)], redirects: [], env_vars: {"perl_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-f", None), Literal("test_checksum.txt", None), Literal("test_tee.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+
+================================================================================
+STDOUT COMPARISON (DIFF):
+================================================================================
+--- shell_stdout
++++ perl_stdout
+-=== Output and Formatting Commands ===
+-Echo result: Hello from backticks
+-Printf result: Number: 42, String: test
+-=== Compression Commands ===
+-=== Network Commands ===
+-=== Process Management Commands ===
+-=== Checksum Commands ===
+-SHA256 result: a1fff0ffefb9eace7230c24e50731f0a91c62f9cefdfe77121c2f607125dffae  test_checksum.txt
+-SHA512 result: b22137a0e8969282b85e3f9375448307d14c5aabf41be66c4f6a0323bd03a3935972021e4c34aa30914e37b03c22594fe180eea9790e9ff147016c9dfae39d5a  test_checksum.txt
+-Strings result:
+-Hello World
+-This is a test
+-Binary content here
+-=== I/O Redirection Commands ===
+-Tee result: test output
+-=== Perl Command ===
+-Perl result: Hello from Perl
+
+
+================================================================================
+STDERR COMPARISON:
+================================================================================
+STDERR values are identical:
+Shell stderr: ''
+Perl stderr: ''
+
+================================================================================
+SUMMARY: 0 out of 146 tests passed before first failure
+================================================================================
+
+BRIEF FAILURE SUMMARY:
+Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+use IPC::Open3;
+use Digest::SHA qw(sha256_hex sha512_hex);
+use File::Path  qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== Output and Formatting Commands ===\n";
+my $echo_result = do {
+    my $_chomp_temp = ('Hello from backticks');
+    chomp $_chomp_temp;
+    $_chomp_temp;
+};
+do {
+    my $output = "Echo result: $echo_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $printf_result = do {
+    my $result = sprintf "Number: %d, String: %s\n", "42", "test";
+    chomp $result;
+    $result;
+};
+do {
+    my $output = "Printf result: $printf_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "=== Compression Commands ===\n";
+print "=== Network Commands ===\n";
+print "=== Process Management Commands ===\n";
+print "=== Checksum Commands ===\n";
+{
+    open my $original_stdout, '>&', STDOUT
+      or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'test_checksum.txt'
+      or croak "Cannot open file: $ERRNO";
+    print "test content\n";
+    open STDOUT, '>&', $original_stdout
+      or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout
+      or croak "Close failed: $ERRNO";
+}
+my $sha256_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha256_hex(
+            do {
+                local $INPUT_RECORD_SEPARATOR = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $ERRNO";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
+    }
+    else {
+        push @results,
+            "0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+    }
+    join "\n", @results;
+}
+;
+do {
+    my $output = "SHA256 result: $sha256_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $sha512_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha512_hex(
+            do {
+                local $INPUT_RECORD_SEPARATOR = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $ERRNO";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
+    }
+    else {
+        push @results,
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+    }
+    join "\n", @results;
+}
+;
+do {
+    my $output = "SHA512 result: $sha512_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+my $strings_result = do {
+    my $_chomp_result = do { do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        my $input_data;
+    if (open my $fh, '<', 'test_binary.txt') {
+    local $INPUT_RECORD_SEPARATOR = undef;  # Read entire file at once
+    $input_data = <$fh>;
+    close $fh
+          or croak "Close failed: $ERRNO";
+    } else {
+    print {*STDERR} "strings: 'test_binary.txt': No such file\n";
+    $input_data = q{};
+    }
+    my @result;
+    my @lines = split /\n/msx, $input_data;
+    for my $line (@lines) {
+    if (length $line >= 4) {
+    push @result, $line;
+    }
+    }
+    my $line = join "\n", @result;
+    $output_0 = $line;
+    my $num_lines = 3;
+    my $head_line_count = 0;
+    my $result = q{};
+    my $input = $output_0;
+    my $pos = 0;
+    while ($pos < length $input && $head_line_count < $num_lines) {
+        my $line_end = index $input, "\n", $pos;
+        if ($line_end == -1) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_0 = $result;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+ };
+    chomp $_chomp_result;
+    $_chomp_result;
+};
+print "Strings result:\n";
+print $strings_result;
+if ( !( $strings_result =~ m{\n$}msx ) ) { print "\n"; }
+print "=== I/O Redirection Commands ===\n";
+my $tee_result = do {
+    my $_chomp_result = do { do {
+    my $output_1;
+    my $pipeline_success_1 = 1;
+        $output_1 .= "test output\n";
+    my @lines = split /\n/msx, $output_1;
+    if (open my $fh, '>', 'test_tee.txt') {
+    foreach my $line (@lines) {
+    print {$fh} "$line\n";
+    }
+    close $fh
+          or croak "Close failed: $ERRNO";
+    } else {
+    carp "tee: Cannot open 'test_tee.txt': $ERRNO";
+    }
+    if (!$pipeline_success_1) { $main_exit_code = 1; }
+        $output_1;
+}
+ };
+    chomp $_chomp_result;
+    $_chomp_result;
+};
+do {
+    my $output = "Tee result: $tee_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+print "=== Perl Command ===\n";
+my $perl_result = do {
+                                            use Capture::Tiny qw(capture_stdout);
+                                            my $result;
+                                            my $eval_success = eval {
+                                                $result = capture_stdout(sub { print "Hello from Perl\n" });
+                                                1;
+                                            };
+                                            if (!$eval_success) {
+                                                $result = "Error executing Perl code: $EVAL_ERROR";
+                                            }
+                                            $result;
+                                        };
+do {
+    my $output = "Perl result: $perl_result";
+    print $output;
+    if ( !( $output =~ m{\n$}msx ) ) {
+        print "\n";
+    }
+};
+if ( -e "test_checksum.txt" ) {
+if ( -d "test_checksum.txt" ) {
+carp "rm: carping: ", "test_checksum.txt",
+    " is a directory (use -r to remove recursively)\n";
+}
+else {
+if ( unlink "test_checksum.txt" ) {
+$main_exit_code = 0;
+}
+else {
+carp "rm: carping: could not remove ", "test_checksum.txt",
+    ": $OS_ERROR\n";
+}
+}
+}
+else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_checksum.txt",
+    ": No such file or directory\n";
+}
+if ( -e "test_tee.txt" ) {
+if ( -d "test_tee.txt" ) {
+carp "rm: carping: ", "test_tee.txt",
+    " is a directory (use -r to remove recursively)\n";
+}
+else {
+if ( unlink "test_tee.txt" ) {
+$main_exit_code = 0;
+}
+else {
+carp "rm: carping: could not remove ", "test_tee.txt",
+    ": $OS_ERROR\n";
+}
+}
+}
+else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_tee.txt",
+    ": No such file or directory\n";
+}
+
+```
+
+perlcritic_wrapper: Started, parse args took 2.1e-05s
+perlcritic_wrapper: File read took 0.000537s
+perlcritic_wrapper: SHA1 hash took 7.2e-05s
+perlcritic_wrapper: No cache file found
+perlcritic_wrapper: Perl::Critic init took 0.268079s
+perlcritic_wrapper: Perl::Critic analysis took 0.616009s
+perlcritic_wrapper: Perltidy subprocess took 3.307804s
+Code formatting differences detected:
+Original has 253 lines, Tidied has 255 lines
+
+Line 73 differs:
+  Original: [            "0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";]
+  Tidied:   ["0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";]
+
+Line 76 differs:
+  Original: [}]
+  Tidied:   [};]
+  First diff at position 1:
+    pos 1: orig='[EOF]' vs tidied=';'
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 77 differs:
+  Original: [;]
+  Tidied:   [do {]
+  First diff at position 0:
+    pos 0: orig=';' vs tidied='d'
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='[EOF]' vs tidied='o'
+Argument "d" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 78 differs:
+  Original: [do {]
+  Tidied:   [    my $output = "SHA256 result: $sha256_result";]
+  First diff at position 0:
+    pos 0: orig='d' vs tidied=' '
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='o' vs tidied=' '
+Argument "d" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 79 differs:
+  Original: [    my $output = "SHA256 result: $sha256_result";]
+  Tidied:   [    print $output;]
+  First diff at position 4:
+    pos 4: orig='m' vs tidied='p'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 80 differs:
+  Original: [    print $output;]
+  Tidied:   [    if ( !( $output =~ m{\n$}msx ) ) {]
+  First diff at position 4:
+    pos 4: orig='p' vs tidied='i'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 81 differs:
+  Original: [    if ( !( $output =~ m{\n$}msx ) ) {]
+  Tidied:   [        print "\n";]
+  First diff at position 4:
+    pos 4: orig='i' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 82 differs:
+  Original: [        print "\n";]
+  Tidied:   [    }]
+  First diff at position 4:
+    pos 4: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 83 differs:
+  Original: [    }]
+  Tidied:   [};]
+  First diff at position 0:
+    pos 0: orig=' ' vs tidied='}'
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=' ' vs tidied=';'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 84 differs:
+  Original: [};]
+  Tidied:   [my $sha512_result = do {]
+  First diff at position 0:
+    pos 0: orig='}' vs tidied='m'
+Argument ";" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig=';' vs tidied='y'
+Argument "}" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument "m" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 85 differs:
+  Original: [my $sha512_result = do {]
+  Tidied:   [    my @results;]
+  First diff at position 0:
+    pos 0: orig='m' vs tidied=' '
+Argument "{" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+    pos 1: orig='y' vs tidied=' '
+Argument "m" isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 86 differs:
+  Original: [    my @results;]
+  Tidied:   [    if ( -f 'test_checksum.txt' ) {]
+  First diff at position 4:
+    pos 4: orig='m' vs tidied='i'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 87 differs:
+  Original: [    if ( -f 'test_checksum.txt' ) {]
+  Tidied:   [        my $hash = sha512_hex(]
+  First diff at position 4:
+    pos 4: orig='i' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 88 differs:
+  Original: [        my $hash = sha512_hex(]
+  Tidied:   [            do {]
+  First diff at position 8:
+    pos 8: orig='m' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 89 differs:
+  Original: [            do {]
+  Tidied:   [                local $INPUT_RECORD_SEPARATOR = undef;]
+  First diff at position 12:
+    pos 12: orig='d' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 90 differs:
+  Original: [                local $INPUT_RECORD_SEPARATOR = undef;]
+  Tidied:   [                open my $fh, '<', 'test_checksum.txt']
+  First diff at position 16:
+    pos 16: orig='l' vs tidied='o'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 91 differs:
+  Original: [                open my $fh, '<', 'test_checksum.txt']
+  Tidied:   [                  or croak "Cannot open 'test_checksum.txt': $ERRNO";]
+  First diff at position 16:
+    pos 16: orig='o' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 92 differs:
+  Original: [                  or croak "Cannot open 'test_checksum.txt': $ERRNO";]
+  Tidied:   [                my $content = <$fh>;]
+  First diff at position 16:
+    pos 16: orig=' ' vs tidied='m'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 93 differs:
+  Original: [                my $content = <$fh>;]
+  Tidied:   [                close $fh]
+  First diff at position 16:
+    pos 16: orig='m' vs tidied='c'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 94 differs:
+  Original: [                close $fh]
+  Tidied:   [                  or croak "Close failed: $ERRNO";]
+  First diff at position 16:
+    pos 16: orig='c' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 95 differs:
+  Original: [                  or croak "Close failed: $ERRNO";]
+  Tidied:   [                $content;]
+  First diff at position 16:
+    pos 16: orig=' ' vs tidied='$'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 96 differs:
+  Original: [                $content;]
+  Tidied:   [            }]
+  First diff at position 12:
+    pos 12: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 97 differs:
+  Original: [            }]
+  Tidied:   [        );]
+  First diff at position 8:
+    pos 8: orig=' ' vs tidied=')'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 98 differs:
+  Original: [        );]
+  Tidied:   [        push @results, "$hash  test_checksum.txt";]
+  First diff at position 8:
+    pos 8: orig=')' vs tidied='p'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 99 differs:
+  Original: [        push @results, "$hash  test_checksum.txt";]
+  Tidied:   [    }]
+  First diff at position 4:
+    pos 4: orig=' ' vs tidied='}'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 100 differs:
+  Original: [    }]
+  Tidied:   [    else {]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied='e'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 101 differs:
+  Original: [    else {]
+  Tidied:   [        push @results,]
+  First diff at position 4:
+    pos 4: orig='e' vs tidied=' '
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+Line 102 differs:
+  Original: [        push @results,]
+  Tidied:   ["00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";]
+
+Line 103 differs:
+  Original: [            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";]
+  Tidied:   [    }]
+
+Line 104 differs:
+  Original: [    }]
+  Tidied:   [    join "\n", @results;]
+  First diff at position 4:
+    pos 4: orig='}' vs tidied='j'
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+Argument " " isn't numeric in numeric gt (>) at perlcritic_wrapper.pl line 339.
+
+
+Line count differs: original has 253 lines, tidied has 255 lines
+Additional lines in tidied version:
+  Line 254: [    carp "rm: carping: ", "test_tee.txt", ": No such file or directory\n";]
+  Line 255: [}]
+perlcritic_wrapper: Perltidy check took 3.30994s
+perlcritic_wrapper: Output generation took 3e-06s
+perlcritic_wrapper: Cache write took 0.007704s
+perlcritic_wrapper: Total time 4.202856s
+
+FAILED: Code is not tidy
+
+Writing test count 0 to first_n_tests_passed.txt
+Current working directory: "D:\\GitHub\\sh2perl"
+Successfully wrote test count 0 and matching stdout lines 0 to first_n_tests_passed.txt
+
+To run test again: ./fail 000__02
+Test run completed at Sun Nov  2 22:54:56 AWST 2025

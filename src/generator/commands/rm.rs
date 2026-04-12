@@ -7,7 +7,9 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     // rm command syntax: rm [options] file...
     let mut recursive = false;
     let mut force = false;
+    let mut verbose = false;
     let mut files = Vec::new();
+    let mut use_shell_fallback = false;
 
     // Parse rm options
     for arg in &cmd.args {
@@ -15,11 +17,19 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             match arg_str.as_str() {
                 "-r" | "-R" | "--recursive" => recursive = true,
                 "-f" | "--force" => force = true,
+                "-v" | "--verbose" => verbose = true,
+                "-rf" | "-fr" => {
+                    recursive = true;
+                    force = true;
+                }
+                _ if arg_str.starts_with('-') => {
+                    use_shell_fallback = true;
+                }
                 "f" => {
                     // Handle case where -rf is parsed as -r and f separately
                     if recursive {
                         force = true;
-                    } else {
+                    } else if !arg_str.starts_with('-') {
                         files.push(format!("\"{}\"", arg_str));
                     }
                 }
@@ -32,6 +42,14 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         } else {
             files.push(generator.word_to_perl(arg));
         }
+    }
+
+    if use_shell_fallback {
+        let command = Command::Simple(cmd.clone());
+        let command_str = generator.generate_command_string_for_system(&command);
+        let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+
+        return format!("do {{ my $rm_cmd = {}; qx{{$rm_cmd}}; }};\n", command_lit);
     }
 
     if files.is_empty() {
@@ -90,7 +108,10 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str("if ( unlink $file_to_remove ) {\n");
                     output.push_str(&generator.indent());
                     output.push_str("local $CHILD_ERROR = 0;\n");
-                    // Silent operation - no output unless error
+                    if verbose {
+                        output.push_str(&generator.indent());
+                        output.push_str("print \"removed '\" . $file_to_remove . \"'\\n\";\n");
+                    }
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
                     output.push_str(&generator.indent());
@@ -143,6 +164,10 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str(&generator.indent());
                     output.push_str("if ( unlink $file_to_remove ) {\n");
                     // Silent operation - no output unless error
+                    if verbose {
+                        output.push_str(&generator.indent());
+                        output.push_str("print \"removed '\" . $file_to_remove . \"'\\n\";\n");
+                    }
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
                     output.push_str(&generator.indent());
@@ -180,9 +205,6 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 if force {
                     output.push_str(&generator.indent());
                     output.push_str("local $CHILD_ERROR = 0;\n");
-                    output.push_str(&generator.indent());
-                    output.push_str("carp \"rm: carping: \", $file_to_remove,\n");
-                    output.push_str("    \": No such file or directory\\n\";\n");
                 } else {
                     output.push_str(&generator.indent());
                     output.push_str("local $CHILD_ERROR = 1;\n");
@@ -244,6 +266,10 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
                     output.push_str("$main_exit_code = 0;\n");
+                    if verbose {
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("print \"removed '\" . {} . \"'\\n\";\n", file));
+                    }
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
@@ -257,9 +283,12 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str(&generator.indent());
                     output.push_str(&format!("if ( unlink {} ) {{\n", quoted_file));
                     generator.indent_level += 1;
-                    // Silent operation - no output unless error
                     output.push_str(&generator.indent());
                     output.push_str("$main_exit_code = 0;\n");
+                    if verbose {
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("print \"removed '\" . {} . \"'\\n\";\n", file));
+                    }
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
@@ -322,6 +351,10 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     // Silent operation - no output unless error
                     output.push_str(&generator.indent());
                     output.push_str("$main_exit_code = 0;\n");
+                    if verbose {
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("print \"removed '\" . {} . \"'\\n\";\n", file));
+                    }
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
@@ -363,12 +396,6 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                 if force {
                     output.push_str(&generator.indent());
                     output.push_str("local $CHILD_ERROR = 0;\n");
-                    output.push_str(&generator.indent());
-                    // Perltidy prefers single-line statements when possible
-                    output.push_str(&format!(
-                        "carp \"rm: carping: \", {}, \": No such file or directory\\n\";\n",
-                        file
-                    ));
                 } else {
                     output.push_str(&generator.indent());
                     output.push_str("local $CHILD_ERROR = 1;\n");

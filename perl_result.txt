@@ -1,0 +1,17 @@
+=== Output and Formatting Commands ===
+Echo result: Hello from backticks
+Printf result: Number: 42, String: test
+=== Compression Commands ===
+=== Network Commands ===
+=== Process Management Commands ===
+=== Checksum Commands ===
+SHA256 result: a1fff0ffefb9eace7230c24e50731f0a91c62f9cefdfe77121c2f607125dffae *test_checksum.txt
+SHA512 result: b22137a0e8969282b85e3f9375448307d14c5aabf41be66c4f6a0323bd03a3935972021e4c34aa30914e37b03c22594fe180eea9790e9ff147016c9dfae39d5a *test_checksum.txt
+Strings result:
+Hello World
+This is a test
+Binary content here
+=== I/O Redirection Commands ===
+Tee result: test output
+=== Perl Command ===
+Perl result: Hello from Perl

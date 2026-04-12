@@ -1,0 +1,503 @@
+#!/usr/bin/perl
+
+
+print "=== Example 022: Basic cp command ===\n";
+
+open(my $fh, '>', 'test_cp_source.txt') or die "Cannot create test file: $!\n";
+print $fh "This is a test file for copying\n";
+print $fh "It has multiple lines\n";
+print $fh "To demonstrate cp functionality\n";
+close($fh);
+
+do {
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+use File::Path qw(make_path);
+my $err;
+if ( !-d "test_cp_dir" ) {
+    make_path( "test_cp_dir", { error => \$err } );
+    if ( @{$err} ) {
+        croak "mkdir: cannot create directory " . "test_cp_dir" . ": $err->[0]\n";
+    }
+}
+
+};
+
+print "Using " . "sys" . "tem" . "() to call cp (copy file):\n";
+do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+my $err;
+if ( -e "test_cp_source.txt" ) {
+    my $dest = "test_cp_dest.txt";
+    if ( -d $dest ) {
+        $dest = $dest . q{/} . "test_cp_source.txt";
+    }
+    if ( copy( "test_cp_source.txt", $dest ) ) {
+
+    }
+    else {
+        die "cp: cannot copy " . "test_cp_source.txt" . " to $dest: $ERRNO\n";
+    }
+}
+else {
+    die "cp: " . "test_cp_source.txt" . ": No such file or directory\n";
+}
+
+};
+if (-f "test_cp_dest.txt") {
+    print "File copied successfully\n";
+    my $content = do { my @files = ('test_cp_dest.txt'); local $INPUT_RECORD_SEPARATOR = undef; join('', map { open my $fh, '<', $_ or die 'cat: ' . $_ . ': ' . $OS_ERROR . "\n"; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } @files) }
+;
+    print "Content: $content";
+}
+
+print "\ncp with recursive (-r):\n";
+do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+my $err;
+if ( -e "test_cp_dir" ) {
+    if ( -d "test_cp_dir" ) {
+        my $dest_dir = "test_cp_dir_copy";
+        if ( -e $dest_dir && !-d $dest_dir ) {
+            die "cp: $dest_dir: not a directory\n";
+        }
+        if ( !-d $dest_dir ) {
+            my $err;
+            make_path($dest_dir, {error => \$err});
+            if (@{$err}) {
+                die "cp: cannot create directory $dest_dir: $err->[0]\n";
+            }
+        }
+        my $cmd = "cp -r "test_cp_dir" $dest_dir";
+        my $result = system $cmd;
+        if ($result == 0) {
+            print "cp: copied directory "test_cp_dir" to $dest_dir\n";
+        } else {
+            die "cp: failed to copy directory "test_cp_dir"\n";
+        }
+    } else {
+        my $dest = "test_cp_dir_copy";
+        if ( -d $dest ) {
+            $dest = $dest . q{/} . "test_cp_dir";
+        }
+        if ( copy( "test_cp_dir", $dest ) ) {
+
+        }
+        else {
+            die "cp: cannot copy " . "test_cp_dir" . " to $dest: $ERRNO\n";
+        }
+    }
+}
+else {
+    die "cp: " . "test_cp_dir" . ": No such file or directory\n";
+}
+
+};
+if (-d "test_cp_dir_copy") {
+    print "Directory copied successfully\n";
+}
+
+print "\ncp with preserve (-p):\n";
+my $cp_preserve = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            if ( -e 'test_cp_source.txt' ) {
+                my $dest = 'test_cp_preserve.txt';
+                if ( -d $dest ) {
+                    $dest = $dest . q{/} . 'test_cp_source.txt';
+                }
+                if ( copy( 'test_cp_source.txt', $dest ) ) {
+                    my ($atime, $mtime) = (stat('test_cp_source.txt'))[8,9];
+                    utime $atime, $mtime, $dest;
+                }
+                else {
+                    croak "cp: cannot copy " . 'test_cp_source.txt' . " to $dest: $ERRNO\n";
+                }
+            }
+            else {
+                croak "cp: " . 'test_cp_source.txt' . ": No such file or directory\n";
+            }
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+}
+;
+if (-f "test_cp_preserve.txt") {
+    print "File copied with preserve attributes\n";
+}
+
+print "\ncp with verbose (-v):\n";
+do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+my $err;
+if ( -e "test_cp_source.txt" ) {
+    my $dest = "test_cp_verbose.txt";
+    if ( -d $dest ) {
+        $dest = $dest . q{/} . "test_cp_source.txt";
+    }
+    if ( copy( "test_cp_source.txt", $dest ) ) {
+
+    }
+    else {
+        die "cp: cannot copy " . "test_cp_source.txt" . " to $dest: $ERRNO\n";
+    }
+}
+else {
+    die "cp: " . "test_cp_source.txt" . ": No such file or directory\n";
+}
+
+};
+
+print "\ncp with force (-f):\n";
+my $cp_force = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            if ( -e 'test_cp_source.txt' ) {
+                my $dest = 'test_cp_force.txt';
+                if ( -d $dest ) {
+                    $dest = $dest . q{/} . 'test_cp_source.txt';
+                }
+                if ( copy( 'test_cp_source.txt', $dest ) ) {
+                }
+                else {
+                    croak "cp: cannot copy " . 'test_cp_source.txt' . " to $dest: $ERRNO\n";
+                }
+            }
+            else {
+                croak "cp: " . 'test_cp_source.txt' . ": No such file or directory\n";
+            }
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+}
+;
+if (-f "test_cp_force.txt") {
+    print "File copied with force\n";
+}
+
+print "\ncp with interactive (-i):\n";
+do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+my $err;
+if ( -e "test_cp_source.txt" ) {
+    my $dest = "test_cp_interactive.txt";
+    if ( -d $dest ) {
+        $dest = $dest . q{/} . "test_cp_source.txt";
+    }
+    if ( copy( "test_cp_source.txt", $dest ) ) {
+
+    }
+    else {
+        die "cp: cannot copy " . "test_cp_source.txt" . " to $dest: $ERRNO\n";
+    }
+}
+else {
+    die "cp: " . "test_cp_source.txt" . ": No such file or directory\n";
+}
+
+};
+
+print "\ncp with update (-u):\n";
+my $cp_update = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            if ( -e 'test_cp_source.txt' ) {
+                my $dest = 'test_cp_update.txt';
+                if ( -d $dest ) {
+                    $dest = $dest . q{/} . 'test_cp_source.txt';
+                }
+                if ( copy( 'test_cp_source.txt', $dest ) ) {
+                }
+                else {
+                    croak "cp: cannot copy " . 'test_cp_source.txt' . " to $dest: $ERRNO\n";
+                }
+            }
+            else {
+                croak "cp: " . 'test_cp_source.txt' . ": No such file or directory\n";
+            }
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+}
+;
+if (-f "test_cp_update.txt") {
+    print "File copied with update\n";
+}
+
+print "\ncp with backup (-b):\n";
+do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+my $err;
+if ( -e "test_cp_source.txt" ) {
+    my $dest = "test_cp_backup.txt";
+    if ( -d $dest ) {
+        $dest = $dest . q{/} . "test_cp_source.txt";
+    }
+    if ( copy( "test_cp_source.txt", $dest ) ) {
+
+    }
+    else {
+        die "cp: cannot copy " . "test_cp_source.txt" . " to $dest: $ERRNO\n";
+    }
+}
+else {
+    die "cp: " . "test_cp_source.txt" . ": No such file or directory\n";
+}
+
+};
+
+print "\ncp with suffix (--suffix=.bak):\n";
+my $cp_suffix = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            if ( -e 'test_cp_source.txt' ) {
+                my $dest = 'test_cp_suffix.txt';
+                if ( -d $dest ) {
+                    $dest = $dest . q{/} . 'test_cp_source.txt';
+                }
+                if ( copy( 'test_cp_source.txt', $dest ) ) {
+                }
+                else {
+                    croak "cp: cannot copy " . 'test_cp_source.txt' . " to $dest: $ERRNO\n";
+                }
+            }
+            else {
+                croak "cp: " . 'test_cp_source.txt' . ": No such file or directory\n";
+            }
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+}
+;
+if (-f "test_cp_suffix.txt") {
+    print "File copied with suffix\n";
+}
+
+print "\ncp with multiple files:\n";
+do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+my $err;
+if ( -e "test_cp_source.txt" ) {
+    my $dest = "test_cp_dir/";
+    if ( -d $dest ) {
+        $dest = $dest . q{/} . "test_cp_source.txt";
+    }
+    if ( copy( "test_cp_source.txt", $dest ) ) {
+
+    }
+    else {
+        die "cp: cannot copy " . "test_cp_source.txt" . " to $dest: $ERRNO\n";
+    }
+}
+else {
+    die "cp: " . "test_cp_source.txt" . ": No such file or directory\n";
+}
+if ( -e "test_cp_source2.txt" ) {
+    my $dest = "test_cp_dir/";
+    if ( -d $dest ) {
+        $dest = $dest . q{/} . "test_cp_source2.txt";
+    }
+    if ( copy( "test_cp_source2.txt", $dest ) ) {
+
+    }
+    else {
+        die "cp: cannot copy " . "test_cp_source2.txt" . " to $dest: $ERRNO\n";
+    }
+}
+else {
+    die "cp: " . "test_cp_source2.txt" . ": No such file or directory\n";
+}
+
+};
+
+print "\ncp with preserve all (-a):\n";
+my $cp_all = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            if ( -e 'test_cp_source.txt' ) {
+                my $dest = 'test_cp_all.txt';
+                if ( -d $dest ) {
+                    $dest = $dest . q{/} . 'test_cp_source.txt';
+                }
+                if ( copy( 'test_cp_source.txt', $dest ) ) {
+                }
+                else {
+                    croak "cp: cannot copy " . 'test_cp_source.txt' . " to $dest: $ERRNO\n";
+                }
+            }
+            else {
+                croak "cp: " . 'test_cp_source.txt' . ": No such file or directory\n";
+            }
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+}
+;
+if (-f "test_cp_all.txt") {
+    print "File copied with preserve all\n";
+}
+
+print "\ncp with no dereference (-P):\n";
+do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+my $err;
+if ( -e "test_cp_source.txt" ) {
+    my $dest = "test_cp_no_deref.txt";
+    if ( -d $dest ) {
+        $dest = $dest . q{/} . "test_cp_source.txt";
+    }
+    if ( copy( "test_cp_source.txt", $dest ) ) {
+
+    }
+    else {
+        die "cp: cannot copy " . "test_cp_source.txt" . " to $dest: $ERRNO\n";
+    }
+}
+else {
+    die "cp: " . "test_cp_source.txt" . ": No such file or directory\n";
+}
+
+};
+
+unlink('test_cp_source.txt') if -f 'test_cp_source.txt';
+unlink('test_cp_dest.txt') if -f 'test_cp_dest.txt';
+unlink('test_cp_preserve.txt') if -f 'test_cp_preserve.txt';
+unlink('test_cp_verbose.txt') if -f 'test_cp_verbose.txt';
+unlink('test_cp_force.txt') if -f 'test_cp_force.txt';
+unlink('test_cp_interactive.txt') if -f 'test_cp_interactive.txt';
+unlink('test_cp_update.txt') if -f 'test_cp_update.txt';
+unlink('test_cp_backup.txt') if -f 'test_cp_backup.txt';
+unlink('test_cp_suffix.txt') if -f 'test_cp_suffix.txt';
+unlink('test_cp_source2.txt') if -f 'test_cp_source2.txt';
+unlink('test_cp_all.txt') if -f 'test_cp_all.txt';
+unlink('test_cp_no_deref.txt') if -f 'test_cp_no_deref.txt';
+do {
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+if ( -e "-rf" ) {
+    if ( -d "-rf" ) {
+        croak "rm: ", "-rf",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "-rf" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "-rf",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "-rf", ": No such file or directory\n";
+}
+if ( -e "test_cp_dir" ) {
+    if ( -d "test_cp_dir" ) {
+        croak "rm: ", "test_cp_dir",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_cp_dir" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_cp_dir",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_cp_dir", ": No such file or directory\n";
+}
+
+};
+do {
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use File::Path qw(make_path remove_tree);
+if ( -e "-rf" ) {
+    if ( -d "-rf" ) {
+        croak "rm: ", "-rf",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "-rf" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "-rf",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "-rf", ": No such file or directory\n";
+}
+if ( -e "test_cp_dir_copy" ) {
+    if ( -d "test_cp_dir_copy" ) {
+        croak "rm: ", "test_cp_dir_copy",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "test_cp_dir_copy" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            croak "rm: cannot remove ", "test_cp_dir_copy",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 1;
+    croak "rm: ", "test_cp_dir_copy", ": No such file or directory\n";
+}
+
+};
+
+print "=== Example 022 completed successfully ===\n";

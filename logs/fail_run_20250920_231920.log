@@ -1,0 +1,338 @@
+Starting test run at Sat, Sep 20, 2025 11:19:20 PM
+Logging to: logs/fail_run_20250920_231920.log
+Test arguments: 001
+----------------------------------------
+Compiling debashc...
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `glob_exprs`
+  --> src\generator\commands\simple_commands.rs:38:45
+   |
+38 | ...                   let glob_exprs: Vec<String> = patterns.iter()
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_glob_exprs`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:769:22
+    |
+769 |                 for (i, command) in pipeline.commands[start_index..].i...
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:783:34
+    |
+783 | ...                      for (j, nested_command) in nested_pipeline.co...
+    |                               ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:521:37
+    |
+521 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+20   | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserErro...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserE...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserErr...
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1862:4
+     |
+1862 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, Pars...
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:188:4
+    |
+188 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:16:4
+   |
+16 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleC...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:65:4
+   |
+65 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCom...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:228:4
+    |
+228 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var:...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+6  | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+7  |     /// Maps variable names to their usage information
+8  |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+9  |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 19 warnings (run `cargo fix --lib -p debashl` to apply 3 suggestions)
+   Compiling debashl v0.1.0 (D:\GitHub\sh2perl)
+error[E0425]: cannot find value `should_break` in this scope
+    --> src\testing.rs:1175:12
+     |
+1175 |         if should_break {
+     |            ^^^^^^^^^^^^ not found in this scope
+
+warning: unused variable: `status`
+  --> src\execution.rs:58:21
+   |
+58 |             Ok(Some(status)) => {
+   |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_status`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1881:13
+     |
+1881 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1881:9
+     |
+1881 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `debashl` (bin "debashc") generated 3 warnings
+error: could not compile `debashl` (bin "debashc") due to 1 previous error; 3 warnings emitted
+Running debashc with 300 second timeout...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail "001"
+Timeout: 300s
+----------------------------------------
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail "001"
+Timeout: 300s
+----------------------------------------
+True
+Running ALL 146 examples (no limit applied)
+
+Found example matching prefix '001': 001_simple.sh
+
+Running only the specified example
+==================================================
+Test 15/146: 001_simple.sh with perl     ✓
+
+
+================================================================================
+                                    TEST PASSED
+================================================================================
+File: examples\001_simple.sh
+Generator: perl
+Test: 15/146
+================================================================================
+
+ORIGINAL SHELL SCRIPT:
+#!/bin/bash
+
+# This script demonstrates basic shell functionality
+echo "Hello, World!"
+
+# Valid if statement
+if [ -f "test.txt" ]; then
+    echo "File exists"
+fi
+
+# Valid for loop
+for i in {1..5}; do
+    echo $i
+done 
+
+#Bash leaves $i as 5 after the loop. But it is messy to add this if i will not be used later.
+#PERL_MUST_NOT_CONTAIN: $i = 5;
+
+#Only use basename if actually needed.
+#PERL_MUST_NOT_CONTAIN: basename
+
+# "Hello, World!\n" is simpler
+#PERL_MUST_NOT_CONTAIN: "Hello, World!", "\n"
+#PERL_MUST_CONTAIN: "Hello, World!\n"
+
+
+
+TRANSLATED PERL CODE:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+my $MAX_LOOP_5 = 5;
+
+print "Hello, World!\n";
+if ((-f"test.txt")) {
+    print "File exists\n";
+}
+my $i;
+for my $i ( 1 .. $MAX_LOOP_5 ) {
+    print $i, "\n";
+}
+
+
+ABSTRACT SYNTAX TREE:
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello, World!")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), If(IfStatement { condition: TestExpression(TestExpression { expression: "-f\"test.txt\"", modifiers: TestModifiers { extglob: false, nocasematch: false, globstar: false, nullglob: false, failglob: false, dotglob: false } }), then_branch: Block(Block { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File exists")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] }), else_branch: None }), For(ForLoop { variable: "i", items: [BraceExpansion(BraceExpansion { prefix: None, items: [Range(BraceRange { start: "1", end: "5", step: None, format: None })], suffix: None }, None)], body: Block { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Variable("i", false, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] } })]
+
+
+DEBUG: Looking for prefix '001'
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 001_simple.sh
+DEBUG: Perl code generated, length: 341 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 341 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+my $MAX_LOOP_5 = 5
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 4.4µs
+DEBUG: Execution loop iteration, elapsed: 10.5815ms
+DEBUG: Execution loop iteration, elapsed: 21.1168ms
+DEBUG: Execution loop iteration, elapsed: 31.6897ms
+DEBUG: Execution loop iteration, elapsed: 42.2441ms
+DEBUG: Execution loop iteration, elapsed: 52.8105ms
+DEBUG: Execution loop iteration, elapsed: 63.3537ms
+DEBUG: Execution loop iteration, elapsed: 73.9049ms
+DEBUG: Execution loop iteration, elapsed: 84.4481ms
+DEBUG: Execution loop iteration, elapsed: 95.0097ms
+DEBUG: Execution loop iteration, elapsed: 105.588ms
+DEBUG: Execution loop iteration, elapsed: 116.1317ms
+DEBUG: Execution loop iteration, elapsed: 126.6951ms
+DEBUG: Execution loop iteration, elapsed: 137.2435ms
+DEBUG: Execution loop iteration, elapsed: 147.8276ms
+DEBUG: Execution loop iteration, elapsed: 158.392ms
+DEBUG: Execution loop iteration, elapsed: 168.9679ms
+DEBUG: Execution loop iteration, elapsed: 179.5975ms
+DEBUG: Execution loop iteration, elapsed: 190.0765ms
+DEBUG: Execution loop iteration, elapsed: 200.6525ms
+DEBUG: Execution loop iteration, elapsed: 211.2646ms
+DEBUG: Execution loop iteration, elapsed: 221.8259ms
+DEBUG: Execution loop iteration, elapsed: 232.3256ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 232.459ms, timed_out: false
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 23, Translated stdout length: 23
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: Test success: true
+
+----------------------------------------
+Command completed with exit code: 0
+----------------------------------------
+----------------------------------------
+Command completed with exit code: 0
+----------------------------------------
+Running test_purify.pl validation...
+Running test_purify.pl with verbose output
+Running test_purify.pl with next option
+Testing purify.pl exists...
+Testing debashc exists...
+Testing examples.impurl directory exists...
+Testing purify.pl on examples.impurl/001_echo_basic.pl...
+  ✓ examples.impurl/001_echo_basic.pl processed successfully
+Testing purify.pl on examples.impurl/002_printf_basic.pl...
+  ✓ examples.impurl/002_printf_basic.pl processed successfully
+Testing purify.pl on examples.impurl/003_ls_basic.pl...
+  ✓ examples.impurl/003_ls_basic.pl processed successfully
+Testing purify.pl --help...
+test_purify.pl completed successfully
+test_purify.pl passed, continuing with other commands...
+Test run completed at Sat, Sep 20, 2025 11:20:00 PM

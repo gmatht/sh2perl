@@ -1,0 +1,1032 @@
+Starting test run at Mon Apr  6 17:27:39 AWST 2026
+Logging to: logs/fail_run_20260406_172739.log
+Test arguments: 000__04h
+----------------------------------------
+Compiling debashc...
+   Compiling debashl v0.1.0 (/mnt/d/GitHub/sh2perl)
+warning: unused import: `Token`
+    --> src/parser/commands.rs:1545:31
+     |
+1545 |     use crate::lexer::{Lexer, Token};
+     |                               ^^^^^
+     |
+     = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `regex::Regex`
+ --> src/generator/commands/pipeline_commands.rs:6:5
+  |
+6 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/generator/redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src/timeout_manager.rs:282:1
+    |
+282 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: variable does not need to be mutable
+    --> src/parser/commands.rs:1548:9
+     |
+1548 |     let mut lexer = Lexer::new(text);
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `cmd2`
+   --> src/generator/commands/pipeline_commands.rs:605:66
+    |
+605 |         if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) =
+    |                                                                  ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: variable `head_max` is assigned to, but never used
+    --> src/generator/commands/pipeline_commands.rs:1028:25
+     |
+1028 |                 let mut head_max = 10; // Default value
+     |                         ^^^^^^^^
+     |
+     = note: consider using `_head_max` instead
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1040:53
+     |
+1040 | ...                   head_max = num;
+     |                       ^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1047:53
+     |
+1047 | ...                   head_max = num;
+     |                       ^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1052:49
+     |
+1052 | ...                   head_max = num;
+     |                       ^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+    --> src/generator/commands/pipeline_commands.rs:1077:22
+     |
+1077 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+     |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+    --> src/generator/commands/pipeline_commands.rs:1092:34
+     |
+1092 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+     |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src/generator/commands/system_commands.rs:48:35
+   |
+48 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `input_var`
+ --> src/generator/commands/comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `output`
+  --> src/generator/commands/find.rs:47:13
+   |
+47 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src/generator/commands/find.rs:47:9
+   |
+47 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:463:13
+    |
+463 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:464:13
+    |
+464 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:465:13
+    |
+465 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: variable `sort_by_time` is assigned to, but never used
+   --> src/generator/commands/ls.rs:740:13
+    |
+740 |     let mut sort_by_time = false; // -t flag: sort by modification time
+    |             ^^^^^^^^^^^^
+    |
+    = note: consider using `_sort_by_time` instead
+
+warning: value assigned to `sort_by_time` is never read
+   --> src/generator/commands/ls.rs:754:32
+    |
+754 |                         't' => sort_by_time = true,   // -t flag: sort by modification time
+    |                                ^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `literal`
+   --> src/generator/utils.rs:162:59
+    |
+162 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `cmd_name`
+  --> src/generator/words.rs:68:25
+   |
+68 |                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
+   |                         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cmd_name`
+
+warning: unused variable: `command_str`
+   --> src/generator/words.rs:655:37
+    |
+655 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:797:33
+    |
+797 | ...                   let indent1 = "    ".to_string(); // 4 spaces for outer do block
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:838:33
+    |
+838 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:879:33
+    |
+879 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:916:33
+    |
+916 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+   --> src/generator/words.rs:955:33
+    |
+955 | ...                   let indent1 = "    ".to_string();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `literal`
+   --> src/generator/words.rs:505:59
+    |
+505 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `s`
+    --> src/generator/words.rs:1150:23
+     |
+1150 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+     |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `needs_exit_code`
+   --> src/generator/mod.rs:128:13
+    |
+128 |         let needs_exit_code = self.needs_exit_code_tracking(ast);
+    |             ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_needs_exit_code`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:151:13
+    |
+151 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:194:13
+    |
+194 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src/parser/commands.rs:1356:8
+     |
+  20 | impl Parser {
+     | ----------- methods in this implementation
+...
+1356 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1431 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src/parser/control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src/parser/control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src/parser/words.rs:2191:4
+     |
+2191 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src/generator/commands/find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src/generator/commands/find.rs:248:4
+    |
+248 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src/generator/commands/tr.rs:73:4
+   |
+73 | fn generate_tr_linebyline_impl(
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+   --> src/generator/commands/tr.rs:133:4
+    |
+133 | fn generate_tr_buffered_impl(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src/generator/control_flow.rs:241:4
+    |
+241 | fn is_variable_used_after_for_loop(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src/variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 44 warnings (run `cargo fix --lib -p debashl` to apply 5 suggestions)
+warning: unused import: `execute_with_progress`
+  --> src/testing.rs:10:5
+   |
+10 |     execute_with_progress, execute_with_timeout, is_execution_frozen, OperationType,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src/testing.rs:17:5
+   |
+17 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src/testing.rs:28:9
+   |
+28 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src/testing.rs:1428:9
+     |
+1428 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src/testing.rs:1678:9
+     |
+1678 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src/testing.rs:1737:9
+     |
+1737 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src/testing.rs:2419:13
+     |
+2419 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src/testing.rs:2419:9
+     |
+2419 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src/execution.rs:64:8
+   |
+64 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String> {
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src/utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src/utils.rs:19:8
+   |
+19 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src/utils.rs:27:8
+   |
+27 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src/testing.rs:22:4
+   |
+22 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String>
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src/testing.rs:64:9
+   |
+51 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+64 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+65 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src/testing.rs:645:8
+    |
+645 | pub fn test_file_equivalence_detailed(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src/testing.rs:1667:8
+     |
+1667 | pub fn test_all_examples_next_fail(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src/cli_commands.rs:215:4
+    |
+215 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src/cli_commands.rs:485:8
+    |
+485 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src/timeout_manager.rs:11:5
+   |
+ 8 | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src/timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src/timeout_manager.rs:117:12
+    |
+ 90 | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: Duration) {
+    |            ^^^^^^^^^^^
+...
+178 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src/timeout_manager.rs:302:8
+    |
+302 | pub fn execute_with_progress<F, T>(operation: OperationType, operation_fn: F) -> Result<T, String>
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.77s
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic "000__04h"
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '000__04h'
+
+Found example matching prefix '000__04h': 000__04h_complex_examples.sh
+
+Running only the specified example
+==================================================
+DEBUG: Progress: 5/146 tests completed (3.4%)
+DEBUG: Progress: 10/146 tests completed (6.8%)
+Test 11/146: 000__04h_complex_examples.sh with perl     DEBUG: Starting test execution for examples/000__04h_complex_examples.sh with generator perl
+DEBUG: Running shell script: examples/000__04h_complex_examples.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.48s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Starting parse_array_elements
+DEBUG: Skipping opening parenthesis
+DEBUG: Loop 1: token = Some(BacktickString), current_element = ''
+DEBUG: Found other token: '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Loop 2: token = Some(ParenClose), current_element = '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Found closing parenthesis, adding current_element: '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Final elements: ["`ls -1 *.sh examples/*.sh 2>/dev/null`"]
+DEBUG: Setting original script name to: 000__04h_complex_examples.sh
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Processing Assignment command: current_user = CommandSubstitution(Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("root", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)
+DEBUG: Processing Assignment command: system_name = Literal("Darwin", None)
+DEBUG: Generating function body for get_file_size
+DEBUG: Function body commands: [BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("file=$1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("size=", None), CommandSubstitution(Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-c", None)], redirects: [Redirect { fd: None, operator: Input, target: StringInterpolation(StringInterpolation { parts: [Variable("file")] }, None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File "), Variable("file"), Literal(" has "), Variable("size"), Literal(" bytes")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has process substitution redirects
+DEBUG: Using builtin comm command generator for process substitution
+DEBUG: Processing tr command in command substitution with args: [Literal("a-z", None), Literal("A-Z", None)]
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 10193 characters
+DEBUG: check_perl_no_open3_builtins called with 10193 characters
+DEBUG: check_perl_no_system_builtins called with 10193 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "/tmp/__tmp_test_output.pl"]
+DEBUG: Perl code length: 10193 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+sub c
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 1.993µs
+DEBUG: Execution loop iteration, elapsed: 100.759782ms
+DEBUG: Perl process completed with status: ExitStatus(unix_wait_status(0))
+DEBUG: Perl execution completed, duration: 211.83597ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 5202, Translated stdout length: 5202
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 1506ms
+✓
+
+
+================================================================================
+                                    TEST PASSED
+================================================================================
+File: examples/000__04h_complex_examples.sh
+Generator: perl
+Test: 11/146
+================================================================================
+
+ORIGINAL SHELL SCRIPT:
+#!/bin/bash
+
+# Complex backtick examples
+# This file demonstrates complex usage patterns with backticks
+
+echo "=== Complex Backtick Examples ==="
+
+# Nested backticks
+nested_result=`echo "Three wells: \`yes well | head -3\`"`
+echo "Nested backticks: $nested_result"
+
+# Backticks in arithmetic
+count=`ls -1 | wc -l`
+echo "File count: $count"
+
+# Backticks in conditional
+current_user=`echo root`
+if [ "$current_user" = "root" ]; then
+    echo "Running as root"
+else
+    echo "Not running as root"
+fi
+
+# Backticks in case statement
+system_name='Darwin'
+case $system_name in
+    Linux)
+        echo "Running on Linux"
+        ;;
+    Darwin)
+        echo "Running on macOS"
+        ;;
+    *)
+        echo "Running on other system"
+        ;;
+esac
+
+# Backticks in function
+get_file_size() {
+    local file=$1
+    local size=`wc -c < "$file"`
+    echo "File $file has $size bytes"
+}
+
+get_file_size 000__01_file_directory_operations.sh
+
+# Backticks in array
+files=(`ls -1 *.sh examples/*.sh 2>/dev/null`)
+echo "Shell scripts found: ${#files[@]}"
+for file in "${files[@]}"; do
+    echo "  - $file"
+done
+
+# Backticks with process substitution
+echo -e "apple\nbanana\ncherry" > file1.txt
+echo -e "banana\ncherry\ndate" > file2.txt
+process_result=`comm -23 <(sort file1.txt) <(sort file2.txt)`
+echo "Process substitution result:"
+echo "$process_result"
+
+# Backticks with here strings
+here_string_result=`tr 'a-z' 'A-Z' <<< "hello world"`
+echo "Here string result: $here_string_result"
+
+# perl command with backticks
+#PERL_MUST_NOT_CONTAIN `perl
+perl_result=`perl -e 'print "Hello from Perl\n"'`
+echo "Perl result: $perl_result"
+
+# Cleanup
+rm -f file1.txt file2.txt
+
+echo "=== Complex Backtick Examples Complete ==="
+
+
+
+TRANSLATED PERL CODE:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars);
+use locale;
+select((select(STDOUT), $| = 1)[0]);
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+sub capture_stdout {
+    my ($code) = @_;
+    my $captured = q{};
+    {
+        local *STDOUT;
+        open STDOUT, '>', \$captured
+          or die "Cannot capture stdout: $!\n";
+        $code->();
+    }
+    return $captured;
+}
+
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print "=== Complex Backtick Examples ===\n";
+my $nested_result = ("Three wells: " . (do { my $_chomp_temp = do {
+    my $_chomp_result = do { my $head_line_count = 0;
+my $output_0 = q{};
+while (1) {
+    my $line = 'well';
+    # yes doesn't support line-by-line processing
+    if ($head_line_count < 3) {
+    if ($head_line_count > 0) { $output_0 .= "\n"; }
+    $output_0 .= $line;
+    ++$head_line_count;
+    } else {
+    $line = q{}; # Clear line to prevent printing
+    last; # Break out of the yes loop when head limit is reached
+    }
+}
+$output_0 };
+    chomp $_chomp_result;
+    $_chomp_result;
+}; chomp $_chomp_temp; $_chomp_temp; }));
+do {
+    my $output = "Nested backticks: $nested_result";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+my $count = do {
+    my $output_1;
+    my $pipeline_success_1 = 1;
+    $output_1 = do {
+        my @ls_files_2 = ();
+        if ( -f q{.} ) {
+            push @ls_files_2, q{.};
+        }
+        elsif ( -d q{.} ) {
+            if ( opendir my $dh, q{.} ) {
+                while ( my $file = readdir $dh ) {
+                    next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+                    push @ls_files_2, $file;
+                }
+                closedir $dh;
+                @ls_files_2 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_files_2;
+            }
+        }
+        (@ls_files_2 ? join("\n", @ls_files_2) . "\n" : q{});
+    };
+    use IPC::Open3;
+    my @wc_args_1_1 = ("-l");
+    my ($wc_in_1_1, $wc_out_1_1, $wc_err_1_1);
+    my $wc_pid_1_1 = open3($wc_in_1_1, $wc_out_1_1, $wc_err_1_1, 'wc', @wc_args_1_1);
+    print {$wc_in_1_1} $output_1;
+    close $wc_in_1_1 or die "Close failed: $!\n";
+    $output_1 = do { local $/ = undef; <$wc_out_1_1> };
+    close $wc_out_1_1 or die "Close failed: $!\n";
+    waitpid $wc_pid_1_1, 0;
+    if ( !$pipeline_success_1 ) { $main_exit_code = 1; }
+    $output_1 =~ s/\n+\z//msx;
+    $output_1;
+};
+do {
+    my $output = "File count: $count";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+my $current_user;
+$current_user = ('root');
+if ("$current_user" eq "root") {
+    print "Running as root\n";
+}
+else {
+    print "Not running as root\n";
+}
+my $system_name;
+$system_name = "Darwin";
+if ($system_name =~ /^Linux$/msx) {
+        print "Running on Linux\n";
+} elsif ($system_name =~ /^Darwin$/msx) {
+        print "Running on macOS\n";
+} elsif ($system_name =~ /^.*$/msx) {
+        print "Running on other " . "sys" . "tem\n";
+}
+
+sub get_file_size {
+    my ($file) = @_;
+    my $size = do {
+my $wc_input_4 = do {
+    local $INPUT_RECORD_SEPARATOR = undef;
+    open my $fh, '<', "$file"
+        or croak "Cannot open file: $OS_ERROR";
+    my $content = <$fh>;
+    close $fh
+        or croak "Close failed: $OS_ERROR";
+    $content
+};
+use IPC::Open3;
+my @wc_args_4 = ("-c");
+my ($wc_in_4, $wc_out_4, $wc_err_4);
+my $wc_pid_4 = open3($wc_in_4, $wc_out_4, $wc_err_4, 'wc', @wc_args_4);
+print {$wc_in_4} $wc_input_4;
+close $wc_in_4 or die "Close failed: $!\n";
+my $wc_output_4 = do { local $/ = undef; <$wc_out_4> };
+close $wc_out_4 or die "Close failed: $!\n";
+waitpid $wc_pid_4, 0;
+$wc_output_4 =~ s/\n+\z//msx;
+$wc_output_4;
+};
+    do {
+    my $output = "File $file has $size bytes";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+    return;
+}
+get_file_size('000__01_file_directory_operations.sh');
+my @files = ((grep { !/\//msx } glob '*.sh'), (glob 'examples/*.sh'));
+print "Shell scripts found: " . scalar(@files) . "\n";
+my $file;
+for my $file (@files) {
+    do {
+    my $output = "  - $file";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+}
+do {
+    open my $original_stdout, '>&', STDOUT
+      or die "Cannot save STDOUT: $!\n";
+    open STDOUT, '>', 'file1.txt'
+      or die "Cannot open file: $!\n";
+    print "apple
+banana
+cherry\n";
+    open STDOUT, '>&', $original_stdout
+      or die "Cannot restore STDOUT: $!\n";
+    close $original_stdout
+      or die "Close failed: $!\n";
+};
+do {
+    open my $original_stdout, '>&', STDOUT
+      or die "Cannot save STDOUT: $!\n";
+    open STDOUT, '>', 'file2.txt'
+      or die "Cannot open file: $!\n";
+    print "banana
+cherry
+date\n";
+    open STDOUT, '>&', $original_stdout
+      or die "Cannot restore STDOUT: $!\n";
+    close $original_stdout
+      or die "Close failed: $!\n";
+};
+my $process_result = do { my $temp_file_ps_5 = q{/tmp} . '/process_sub_5.tmp';
+{
+    open my $fh, '>', $temp_file_ps_5 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_6 = do {
+    local $INPUT_RECORD_SEPARATOR = undef;
+    open my $fh, '<', 'file1.txt'
+        or croak "Cannot open file: $OS_ERROR";
+    my $content = <$fh>;
+    close $fh
+        or croak "Close failed: $OS_ERROR";
+    $content
+};
+my @sort_lines_6 = split /\n/msx, $file_content_6;
+my @sort_sorted_6 = sort @sort_lines_6;
+my $sort_output_6 = join "\n", @sort_sorted_6;
+if ($sort_output_6 ne q{} && !($sort_output_6 =~ m{\n\z}msx)) {
+    $sort_output_6 .= "\n";
+}
+$file_content_6 = $sort_output_6;
+;
+    print {$fh} $temp_output;
+    close $fh
+        or croak "Close failed: $OS_ERROR\n";
+}
+my $temp_file_ps_7 = q{/tmp} . '/process_sub_7.tmp';
+{
+    open my $fh, '>', $temp_file_ps_7 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_8 = do {
+    local $INPUT_RECORD_SEPARATOR = undef;
+    open my $fh, '<', 'file2.txt'
+        or croak "Cannot open file: $OS_ERROR";
+    my $content = <$fh>;
+    close $fh
+        or croak "Close failed: $OS_ERROR";
+    $content
+};
+my @sort_lines_8 = split /\n/msx, $file_content_8;
+my @sort_sorted_8 = sort @sort_lines_8;
+my $sort_output_8 = join "\n", @sort_sorted_8;
+if ($sort_output_8 ne q{} && !($sort_output_8 =~ m{\n\z}msx)) {
+    $sort_output_8 .= "\n";
+}
+$file_content_8 = $sort_output_8;
+;
+    print {$fh} $temp_output;
+    close $fh
+        or croak "Close failed: $OS_ERROR\n";
+}
+ my @file1_lines;
+my @file2_lines;
+if (open my $fh1, '<', $temp_file_ps_5) {
+    while (my $line = <$fh1>) {
+        chomp $line;
+        push @file1_lines, $line;
+    }
+    close $fh1 or croak "Close failed: $OS_ERROR";
+}
+if (open my $fh2, '<', $temp_file_ps_7) {
+    while (my $line = <$fh2>) {
+        chomp $line;
+        push @file2_lines, $line;
+    }
+    close $fh2 or croak "Close failed: $OS_ERROR";
+}
+my %file1_set = map { $_ => 1 } @file1_lines;
+my %file2_set = map { $_ => 1 } @file2_lines;
+my @common_lines;
+foreach my $line (@file1_lines) {
+    if (exists $file2_set{$line}) {
+        push @common_lines, $line;
+    }
+}
+my $comm_output = q{};
+foreach my $line (@file1_lines) {
+    if (!exists $file2_set{$line}) {
+        $comm_output .= $line . "\n";
+    }
+}
+$comm_output =~ s/\n$//msx;
+$comm_output };
+print "Process substitution result:\n";
+print $process_result;
+if ( !( $process_result =~ m{\n\z}msx ) ) { print "\n"; }
+my $here_string_result = do { my $input_data = "hello world"; my $set1_10 = 'a-z';
+my $set2_10 = 'A-Z';
+my $input_10 = $input_data;
+# Expand character ranges for tr command
+my $expanded_set1_10 = $set1_10;
+my $expanded_set2_10 = $set2_10;
+# Handle a-z range in set1
+if ($expanded_set1_10 =~ /a-z/msx) {
+    $expanded_set1_10 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+}
+# Handle A-Z range in set1
+if ($expanded_set1_10 =~ /A-Z/msx) {
+    $expanded_set1_10 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+# Handle a-z range in set2
+if ($expanded_set2_10 =~ /a-z/msx) {
+    $expanded_set2_10 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+}
+# Handle A-Z range in set2
+if ($expanded_set2_10 =~ /A-Z/msx) {
+    $expanded_set2_10 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+my $tr_result_9 = q{};
+for my $char ( split //msx, $input_10 ) {
+    my $pos_10 = index $expanded_set1_10, $char;
+    if ( $pos_10 >= 0 && $pos_10 < length $expanded_set2_10 ) {
+        $tr_result_9 .= substr $expanded_set2_10, $pos_10, 1;
+    } else {
+        $tr_result_9 .= $char;
+    }
+}
+$tr_result_9 };
+do {
+    my $output = "Here string result: $here_string_result";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+my $perl_result = do {
+    my $result;
+    my $eval_success = eval {
+        $result = capture_stdout( sub { print "Hello from Perl\n" } );
+        1;
+    };
+    if ( !$eval_success ) {
+        $result = "Error executing Perl code: $EVAL_ERROR";
+    }
+    $result;
+};
+do {
+    my $output = "Perl result: $perl_result";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+if ( -e "file1.txt" ) {
+    if ( -d "file1.txt" ) {
+        carp "rm: carping: ", "file1.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "file1.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "file1.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "file1.txt", ": No such file or directory\n";
+}
+if ( -e "file2.txt" ) {
+    if ( -d "file2.txt" ) {
+        carp "rm: carping: ", "file2.txt",
+          " is a directory (use -r to remove recursively)\n";
+    }
+    else {
+        if ( unlink "file2.txt" ) {
+            $main_exit_code = 0;
+        }
+        else {
+            carp "rm: carping: could not remove ", "file2.txt",
+              ": $OS_ERROR\n";
+        }
+    }
+}
+else {
+    local $CHILD_ERROR = 0;
+    carp "rm: carping: ", "file2.txt", ": No such file or directory\n";
+}
+print "=== Complex Backtick Examples Complete ===\n";
+
+exit $main_exit_code;
+
+
+ABSTRACT SYNTAX TREE:
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Complex Backtick Examples ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Nested backticks: "), Variable("nested_result")] }, None)], redirects: [], env_vars: {"nested_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Three wells: "), CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("yes", None), args: [Literal("well", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }))] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File count: "), Variable("count")] }, None)], redirects: [], env_vars: {"count": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Assignment(Assignment { variable: "current_user", value: CommandSubstitution(Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("root", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None), operator: Assign }), If(IfStatement { condition: TestExpression(TestExpression { expression: "\"$current_user\"=\"root\"", modifiers: TestModifiers { extglob: false, nocasematch: false, globstar: false, nullglob: false, failglob: false, dotglob: false } }), then_branch: Block(Block { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Running as root")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] }), else_branch: Some(Block(Block { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Not running as root")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] })) }), Assignment(Assignment { variable: "system_name", value: Literal("Darwin", None), operator: Assign }), Case(CaseStatement { word: Variable("system_name", false, None), cases: [CaseClause { patterns: [Literal("Linux", None)], body: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Running on Linux")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] }, CaseClause { patterns: [Literal("Darwin", None)], body: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Running on macOS")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] }, CaseClause { patterns: [Literal("*", None)], body: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Running on other system")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] }] }), Function(Function { name: "get_file_size", parameters: [], body: Block { commands: [BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("file=$1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("size=", None), CommandSubstitution(Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-c", None)], redirects: [Redirect { fd: None, operator: Input, target: StringInterpolation(StringInterpolation { parts: [Variable("file")] }, None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File "), Variable("file"), Literal(" has "), Variable("size"), Literal(" bytes")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] } }), Simple(SimpleCommand { name: Literal("get_file_size", None), args: [Literal("000__01_file_directory_operations.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Shell scripts found: "), ParameterExpansion(ParameterExpansion { variable: "#files", operator: ArraySlice("@", None), is_mutable: true })] }, None)], redirects: [], env_vars: {"files": Array("files", ["`ls -1 *.sh examples/*.sh 2>/dev/null`"], None)}, stdout_used: true, stderr_used: true }), For(ForLoop { variable: "file", items: [StringInterpolation(StringInterpolation { parts: [ParameterExpansion(ParameterExpansion { variable: "files", operator: ArraySlice("@", None), is_mutable: true })] }, None)], body: Block { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("  - "), Variable("file")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] } }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("apple\\nbanana\\ncherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("file1.txt", None), heredoc_body: None }] }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("banana\\ncherry\\ndate")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("file2.txt", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Process substitution result:")] }, None)], redirects: [], env_vars: {"process_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("comm", None), args: [Literal("-23", None)], redirects: [Redirect { fd: None, operator: ProcessSubstitutionInput(Simple(SimpleCommand { name: Literal("sort", None), args: [Literal("file1.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), target: Literal("", None), heredoc_body: None }, Redirect { fd: None, operator: ProcessSubstitutionInput(Simple(SimpleCommand { name: Literal("sort", None), args: [Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), target: Literal("", None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("process_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Here string result: "), Variable("here_string_result")] }, None)], redirects: [], env_vars: {"here_string_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("tr", None), args: [Literal("a-z", None), Literal("A-Z", None)], redirects: [Redirect { fd: None, operator: HereString, target: StringInterpolation(StringInterpolation { parts: [Literal("hello world")] }, None), heredoc_body: Some("hello world") }], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Perl result: "), Variable("perl_result")] }, None)], redirects: [], env_vars: {"perl_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-f", None), Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Complex Backtick Examples Complete ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+Test run completed at Mon Apr  6 17:28:16 AWST 2026

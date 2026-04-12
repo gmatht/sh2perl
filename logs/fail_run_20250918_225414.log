@@ -1,0 +1,319 @@
+Starting test run at Thu, Sep 18, 2025 10:54:14 PM
+Logging to: logs/fail_run_20250918_225414.log
+Test arguments: 000__04
+----------------------------------------
+Compiling debashc...
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:334:37
+    |
+334 | ...         let command_str = generator.word_...
+    |                 ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+20   | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Res...
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> ...
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1862:4
+     |
+1862 | fn parse_parameter_expansion(_lexer: &mut Le...
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:16:4
+   |
+16 | fn generate_tr_linebyline_impl(generator: &mut...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:65:4
+   |
+65 | fn generate_tr_buffered_impl(generator: &mut G...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:228:4
+    |
+228 | fn is_variable_used_after_for_loop(commands: ...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+6  | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+7  |     /// Maps variable names to their usage inf...
+8  |     variable_usage: HashMap<String, VariableUs...
+   |     ^^^^^^^^^^^^^^
+9  |     /// Current scope depth for tracking neste...
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 11 warnings (run `cargo fix --lib -p debashl` to apply 1 suggestion)
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Err...
+  |        ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usiz...
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize,...
+   |        ^^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:29:9
+   |
+16 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+29 |     pub shell_duration: std::time::Duration, /...
+   |         ^^^^^^^^^^^^^^
+30 |     pub translated_duration: std::time::Durati...
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:529:8
+    |
+529 | pub fn test_file_equivalence_detailed(lang: &...
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:193:4
+    |
+193 | fn extract_core_perl_logic(perl_code: &str) -...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:440:8
+    |
+440 | pub fn export_mir_to_json(input: &str, _optim...
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 7 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+Running debashc with 1 second timeout (DEBUG)...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail "000__04" --perl-critic
+Timeout: 1s
+----------------------------------------
+
+DEBUG: Looking for prefix '000__04'
+
+Found example matching prefix '000__04': 000__04_basic_backtick_usage.sh
+
+Running only the specified example
+==================================================
+Test 4/138: 000__04_basic_backtick_usage.sh with perl     DEBUG: Starting parse_array_elements
+DEBUG: Skipping opening parenthesis
+DEBUG: Loop 1: token = Some(BacktickString), current_element = ''
+DEBUG: Found other token: '`ls -1 examples/*.sh 2>/dev/null`'
+DEBUG: Loop 2: token = Some(ParenClose), current_element = '`ls -1 examples/*.sh 2>/dev/null`'
+DEBUG: Found closing parenthesis, adding current_element: '`ls -1 examples/*.sh 2>/dev/null`'
+DEBUG: Final elements: ["`ls -1 examples/*.sh 2>/dev/null`"]
+DEBUG: Setting original script name to: 000__04_basic_backtick_usage.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("pwd", None), args: [Literal("|", None), Literal("basename", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("pwd", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("basename", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: trimmed output: do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        use Cwd;
+    my $pwd = getcwd();
+    print $pwd;
+    my $path = $output_0;
+    $path =~ s/.*\///msx;
+    $output_0 = $path;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y%m", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("cat", None), args: [Literal("/etc/passwd", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-5", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: trimmed output: do {
+    my $output_5;
+    my $pipeline_success_5 = 1;
+        $output_5 = q{};
+    if (open my $fh, '<', '/etc/passwd') {
+    while (my $line = <$fh>) {
+    $output_5 .= $line;
+    }
+    close $fh or croak "Close failed: $OS_ERROR";
+    # Ensure content ends with newline to prevent line concatenation
+        if (!($output_5 =~ /\n$/msx)) {
+            $output_5 .= "\n";
+        }
+    } else {
+    carp "cat: /etc/passwd: No such file or directory";
+    $output_5 = q{};
+    }
+    my $num_lines = 5;
+    my $head_line_count = 0;
+    my $result = q{};
+    my $input = $output_5;
+    my $pos = 0;
+    while ($pos < length $input && $head_line_count < $num_lines) {
+        my $line_end = index $input, "\n", $pos;
+        if ($line_end == -1) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_5 = $result;
+    if (!$pipeline_success_5) { $main_exit_code = 1; }
+        $output_5;
+}
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-n", None), Literal("bash", None), Literal("/etc/passwd", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native grep implementation for command substitution
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sed", None), args: [Literal("s/World/Universe/", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: trimmed output: do {
+    my $output_9;
+    my $pipeline_success_9 = 1;
+        $output_9 .= "Hello World\n";
+    my @sed_lines_9 = split /\n/msx, $output_9;
+    my @sed_result_9;
+    foreach my $line (@sed_lines_9) {
+    chomp $line;
+    $line =~ s/World/Universe/gmsx;
+    push @sed_result_9, $line;
+    }
+    $output_9 = join "\n", @sed_result_9;
+    if (!$pipeline_success_9) { $main_exit_code = 1; }
+        $output_9;
+}
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("1 2 3 4 5")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("awk", None), args: [Literal("{print $1 + $2}", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: trimmed output: do {
+    my $output_11;
+    my $pipeline_success_11 = 1;
+        $output_11 .= "1 2 3 4 5\n";
+    my @lines = split /\n/msx, $output_11;
+    my @result;
+    foreach my $line (@lines) {
+    chomp $line;
+    if ($line =~ /^\\s*$/msx) { next; }
+    my @fields = split /\s+/msx, $line;
+    if (@fields > 0) {
+    my $sum = $fields[0] + $fields[1];
+    push @result, $sum;
+    }
+    }
+    $output_11 = join "\n", @result;
+    if (!$pipeline_success_11) { $main_exit_code = 1; }
+        $output_11;
+}
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("zebra\\napple\\nbanana")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sort", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: trimmed output: do {
+    my $output_13;
+    my $pipeline_success_13 = 1;
+        $output_13 .= "zebra\napple\nbanana";
+    my @sort_lines_13_1 = split /\n/msx, $output_13;
+    my @sort_sorted_13_1 = sort @sort_lines_13_1;
+    $output_13 = join "\n", @sort_sorted_13_1;
+        if (!($output_13 =~ /\n$/msx)) {
+            $output_13 .= "\n";
+        }
+    if (!$pipeline_success_13) { $main_exit_code = 1; }
+        $output_13;
+}
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("apple\\napple\\nbanana\\nbanana\\ncherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("uniq", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: trimmed output: do {
+    my $output_15;
+    my $pipeline_success_15 = 1;
+        $output_15 .= "apple\napple\nbanana\nbanana\ncherry";
+    my @uniq_lines_15_1 = split /\n/msx, $output_15;
+    @uniq_lines_15_1 = grep { $_ ne q{} } @uniq_lines_15_1; # Filter out empty lines
+    my %uniq_seen_15_1;
+    my @uniq_result_15_1;
+    foreach my $line (@uniq_lines_15_1) {
+    if (!$uniq_seen_15_1{$line}++) { push @uniq_result_15_1, $line; }
+    }
+    $output_15 = join "\n", @uniq_result_15_1;
+        if (!($output_15 =~ /\n$/msx)) {
+            $output_15 .= "\n";
+        }
+    if (!$pipeline_success_15) { $main_exit_code = 1; }
+        $output_15;
+}
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("line1\\nline2\\nline3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: trimmed output: do {
+    my $output_17;
+    my $pipeline_success_17 = 1;
+        $output_17 .= "line1\nline2\nline3";
+    my @wc_lines_17_1 = split /\n/msx, $output_17;
+    my $wc_line_count_17_1 = scalar @wc_lines_17_1;
+    $output_17 = q{};
+    $output_17 .= "$wc_line_count_17_1 ";
+    $output_17 =~ s/\s+$//msx;
+    if (!$pipeline_success_17) { $main_exit_code = 1; }
+        $output_17;
+}
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-w", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+Command timed out after 1s
+----------------------------------------
+Command completed with exit code: 124
+----------------------------------------

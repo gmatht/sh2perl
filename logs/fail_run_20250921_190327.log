@@ -1,0 +1,1172 @@
+Starting test run at Sun, Sep 21, 2025  7:03:28 PM
+Logging to: logs/fail_run_20250921_190327.log
+Test arguments: 000__04c
+----------------------------------------
+Compiling debashc...
+   Compiling debashl v0.1.0 (D:\GitHub\sh2perl)
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `glob_exprs`
+  --> src\generator\commands\simple_commands.rs:38:45
+   |
+38 | ...                   let glob_exprs: Vec<String> = patterns.iter()
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_glob_exprs`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:834:22
+    |
+834 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:848:34
+    |
+848 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+    |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `input_var`
+ --> src\generator\commands\comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:564:37
+    |
+564 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `s`
+   --> src\generator\words.rs:830:23
+    |
+830 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+    |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+20   | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1885:4
+     |
+1885 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:188:4
+    |
+188 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:16:4
+   |
+16 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:65:4
+   |
+65 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:228:4
+    |
+228 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for_loop_index: usize) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+6  | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+7  |     /// Maps variable names to their usage information
+8  |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+9  |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 21 warnings (run `cargo fix --lib -p debashl` to apply 3 suggestions)
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src\testing.rs:14:5
+   |
+14 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused variable: `status`
+  --> src\execution.rs:58:21
+   |
+58 |             Ok(Some(status)) => {
+   |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_status`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `operation_handle`
+  --> src\testing.rs:23:9
+   |
+23 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1149:9
+     |
+1149 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src\testing.rs:1358:9
+     |
+1358 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src\testing.rs:1406:9
+     |
+1406 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1956:13
+     |
+1956 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1956:9
+     |
+1956 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src\testing.rs:17:4
+   |
+17 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String> 
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:50:9
+   |
+37 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+50 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+51 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:550:8
+    |
+550 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>) -> Result<TestResult, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src\testing.rs:1354:8
+     |
+1354 | pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 17 warnings (run `cargo fix --bin "debashc"` to apply 3 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.59s
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail "000__04c"
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '000__04c'
+
+Found example matching prefix '000__04c': 000__04c_text_processing_commands.sh
+
+Running only the specified example
+==================================================
+DEBUG: Progress: 5/146 tests completed (3.4%)
+Test 6/146: 000__04c_text_processing_commands.sh with perl     DEBUG: Starting test execution for examples\000__04c_text_processing_commands.sh with generator perl
+DEBUG: Running shell script: examples\000__04c_text_processing_commands.sh
+DEBUG: Shell script completed in 0.31s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04c_text_processing_commands.sh
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("cat", None), args: [Literal("000__04c_text_processing_commands.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-5", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-n", None), Literal("echo", None), Literal("000__04c_text_processing_commands.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native grep implementation for command substitution
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sed", None), args: [Literal("s/World/Universe/", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("1 2 3 4 5")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("awk", None), args: [Literal("{print $1 + $2}", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("zebra\\napple\\nbanana")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sort", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("apple\\napple\\nbanana\\nbanana\\ncherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("uniq", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("line1\\nline2\\nline3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-w", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("seq", None), args: [Literal("1", None), Literal("10", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("seq", None), args: [Literal("1", None), Literal("10", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tail", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("apple:banana:cherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("cut", None), args: [Literal("-d", None), Literal(":", None), Literal("-f", None), Literal("2", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("paste", None), args: [Literal("temp1.txt", None), Literal("temp2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("comm", None), args: [Literal("-12", None), Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has no process substitution, using dedicated implementation
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("diff", None), args: [Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing diff command in command substitution with args: [Literal("file1.txt", None), Literal("file2.txt", None)]
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("HELLO WORLD")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tr", None), args: [Literal("A-Z", None), Literal("a-z", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("1 2 3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("xargs", None), args: [Literal("-n", None), Literal("1", None), Literal("echo", None), StringInterpolation(StringInterpolation { parts: [Literal("Number:")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Perl code generated, length: 14730 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 14730 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success 
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 5.5µs
+DEBUG: Execution loop iteration, elapsed: 10.2807ms
+DEBUG: Execution loop iteration, elapsed: 20.8395ms
+DEBUG: Execution loop iteration, elapsed: 31.3915ms
+DEBUG: Execution loop iteration, elapsed: 41.9562ms
+DEBUG: Execution loop iteration, elapsed: 52.4895ms
+DEBUG: Execution loop iteration, elapsed: 63.0675ms
+DEBUG: Execution loop iteration, elapsed: 73.5641ms
+DEBUG: Execution loop iteration, elapsed: 84.1134ms
+DEBUG: Execution loop iteration, elapsed: 94.6286ms
+DEBUG: Execution loop iteration, elapsed: 105.1808ms
+DEBUG: Execution loop iteration, elapsed: 115.7458ms
+DEBUG: Execution loop iteration, elapsed: 126.2998ms
+DEBUG: Execution loop iteration, elapsed: 136.8564ms
+DEBUG: Execution loop iteration, elapsed: 147.0885ms
+DEBUG: Execution loop iteration, elapsed: 157.265ms
+DEBUG: Execution loop iteration, elapsed: 167.8142ms
+DEBUG: Execution loop iteration, elapsed: 178.4187ms
+DEBUG: Execution loop iteration, elapsed: 189.0868ms
+DEBUG: Execution loop iteration, elapsed: 199.4882ms
+DEBUG: Execution loop iteration, elapsed: 210.0321ms
+DEBUG: Execution loop iteration, elapsed: 220.6897ms
+DEBUG: Execution loop iteration, elapsed: 231.1382ms
+DEBUG: Execution loop iteration, elapsed: 241.6965ms
+DEBUG: Execution loop iteration, elapsed: 252.2755ms
+DEBUG: Execution loop iteration, elapsed: 262.7509ms
+DEBUG: Execution loop iteration, elapsed: 272.9122ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 273.109ms, timed_out: false
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 2154, Translated stdout length: 2132
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: Test success: false
+DEBUG: Test execution completed in 616ms
+[2J[1;1H================================================================================
+                                    TEST FAILED
+================================================================================
+File: examples\000__04c_text_processing_commands.sh
+Generator: perl
+Test: 6/146
+Tests passed before failure: 0
+Failure Reason: Failed due to: stdout mismatch
+================================================================================
+
+Exit Code Comparison (IGNORED):
+Shell script exit code: 0
+Translated code exit code: 0
+
+================================================================================
+ORIGINAL SHELL SCRIPT:
+================================================================================
+#!/bin/bash
+
+# Text processing commands using backticks
+# This file demonstrates various text processing commands with backticks
+
+echo "=== Text Processing Commands ==="
+
+# cat command with backticks
+#PERL_MUST_NOT_CONTAIN `cat
+file_content=`cat 000__04c_text_processing_commands.sh | head -5`
+echo "First 5 lines of this file:"
+echo "$file_content"
+
+# grep command with backticks
+#PERL_MUST_NOT_CONTAIN `grep
+grep_result=`grep -n "echo" 000__04c_text_processing_commands.sh`
+echo "Lines containing 'echo':"
+echo "$grep_result"
+
+# sed command with backticks
+#PERL_MUST_NOT_CONTAIN `sed
+sed_result=`echo "Hello World" | sed 's/World/Universe/'`
+echo "Sed result: $sed_result"
+
+# awk command with backticks
+#PERL_MUST_NOT_CONTAIN `awk
+awk_result=`echo "1 2 3 4 5" | awk '{print $1 + $2}'`
+echo "Awk sum result: $awk_result"
+
+# sort command with backticks
+#PERL_MUST_NOT_CONTAIN `sort
+sort_result=`echo -e "zebra\napple\nbanana" | sort`
+echo "Sorted words:"
+echo "$sort_result"
+
+# uniq command with backticks
+#PERL_MUST_NOT_CONTAIN `uniq
+uniq_result=`echo -e "apple\napple\nbanana\nbanana\ncherry" | uniq`
+echo "Unique words:"
+echo "$uniq_result"
+
+# wc command with backticks
+#PERL_MUST_NOT_CONTAIN `wc
+word_count=`echo "Hello World" | wc -w`
+line_count=`echo -e "line1\nline2\nline3" | wc -l`
+echo "Word count: $word_count"
+echo "Line count: $line_count"
+
+# head command with backticks
+#PERL_MUST_NOT_CONTAIN `head
+head_result=`seq 1 10 | head -3`
+echo "First 3 numbers: $head_result"
+
+# tail command with backticks
+#PERL_MUST_NOT_CONTAIN `tail
+tail_result=`seq 1 10 | tail -3`
+echo "Last 3 numbers: $tail_result"
+
+# cut command with backticks
+#PERL_MUST_NOT_CONTAIN `cut
+cut_result=`echo "apple:banana:cherry" | cut -d: -f2`
+echo "Second field: $cut_result"
+
+# paste command with backticks
+#PERL_MUST_NOT_CONTAIN `paste
+echo -e "1\n2\n3" > temp1.txt
+echo -e "a\nb\nc" > temp2.txt
+paste_result=`paste temp1.txt temp2.txt`
+echo "Pasted columns:"
+echo "$paste_result"
+rm -f temp1.txt temp2.txt
+
+# comm command with backticks
+#PERL_MUST_NOT_CONTAIN `comm
+echo -e "apple\nbanana\ncherry" > file1.txt
+echo -e "banana\ncherry\ndate" > file2.txt
+comm_result=`comm -12 file1.txt file2.txt`
+echo "Common lines:"
+echo "$comm_result"
+
+# diff command with backticks
+#PERL_MUST_NOT_CONTAIN `diff
+diff_result=`diff file1.txt file2.txt`
+echo "File differences:"
+echo "$diff_result"
+
+# tr command with backticks
+#PERL_MUST_NOT_CONTAIN `tr
+tr_result=`echo "HELLO WORLD" | tr 'A-Z' 'a-z'`
+echo "Lowercase: $tr_result"
+
+# xargs command with backticks
+#PERL_MUST_NOT_CONTAIN `xargs
+xargs_result=`echo "1 2 3" | xargs -n1 echo "Number:"`
+echo "Xargs result:"
+echo "$xargs_result"
+
+# Cleanup
+rm -f file1.txt file2.txt
+
+echo "=== Text Processing Commands Complete ==="
+
+
+================================================================================
+TRANSLATED PERL CODE:
+================================================================================
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+my $MAGIC_5 = 5;
+my $MAGIC_3 = 3;
+
+print "=== Text Processing Commands ===\n";
+my $file_content = do {
+    my $cmd_result_1 = do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        $output_0 = q{};
+    if (open my $fh, '<', '000__04c_text_processing_commands.sh') {
+    while (my $line = <$fh>) {
+    $output_0 .= $line;
+    }
+    close $fh or croak "Close failed: $OS_ERROR";
+    # Ensure content ends with newline to prevent line concatenation
+        if (!($output_0 =~ /\n$/msx)) {
+            $output_0 .= "\n";
+        }
+    } else {
+    carp "cat: 000__04c_text_processing_commands.sh: No such file or directory";
+    $output_0 = q{};
+    }
+    my $num_lines = 5;
+    my $head_line_count = 0;
+    my $result = q{};
+    my $input = $output_0;
+    my $pos = 0;
+    while ($pos < length $input && $head_line_count < $num_lines) {
+        my $line_end = index $input, "\n", $pos;
+        if ($line_end == -1) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_0 = $result;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+;
+    chomp $cmd_result_1;
+    $cmd_result_1;
+};
+print "First 5 lines of this file:\n";
+print $file_content, "\n";
+my $grep_result = do {
+    my $cmd_result_3 = do { my @grep_lines_2; my $fh_2; my $line_num_2 = 0; if (-f '000__04c_text_processing_commands.sh') { open $fh_2, '<', '000__04c_text_processing_commands.sh' or croak "Cannot open file: $OS_ERROR"; while (my $line = <$fh_2>) { $line_num_2++; chomp $line; if ($line =~ /echo/msx) { push @grep_lines_2, "$line_num_2:$line"; } } close $fh_2 or croak "Close failed: $OS_ERROR"; } join "\n", @grep_lines_2; };
+    chomp $cmd_result_3;
+    $cmd_result_3;
+};
+print "Lines containing 'echo':\n";
+print $grep_result, "\n";
+my $sed_result = do {
+    my $cmd_result_5 = do {
+    my $output_4;
+    my $pipeline_success_4 = 1;
+        $output_4 .= "Hello World\n";
+    my @sed_lines_4 = split /\n/msx, $output_4;
+    my @sed_result_4;
+    foreach my $line (@sed_lines_4) {
+    chomp $line;
+    $line =~ s/World/Universe/gmsx;
+    push @sed_result_4, $line;
+    }
+    $output_4 = join "\n", @sed_result_4;
+    if (!$pipeline_success_4) { $main_exit_code = 1; }
+        $output_4;
+}
+;
+    chomp $cmd_result_5;
+    $cmd_result_5;
+};
+print "Sed result: $sed_result\n";
+my $awk_result = do {
+    my $cmd_result_7 = do {
+    my $output_6;
+    my $pipeline_success_6 = 1;
+        $output_6 .= "1 2 3 4 5\n";
+    my @lines = split /\n/msx, $output_6;
+    my @result;
+    foreach my $line (@lines) {
+    chomp $line;
+    if ($line =~ /^\\s*$/msx) { next; }
+    my @fields = split /\s+/msx, $line;
+    if (@fields > 0) {
+    my $sum = $fields[0] + $fields[1];
+    push @result, $sum;
+    }
+    }
+    $output_6 = join "\n", @result;
+    if (!$pipeline_success_6) { $main_exit_code = 1; }
+        $output_6;
+}
+;
+    chomp $cmd_result_7;
+    $cmd_result_7;
+};
+print "Awk sum result: $awk_result\n";
+my $sort_result = do {
+    my $cmd_result_9 = do {
+    my $output_8;
+    my $pipeline_success_8 = 1;
+        $output_8 .= "zebra\napple\nbanana";
+    my @sort_lines_8_1 = split /\n/msx, $output_8;
+    my @sort_sorted_8_1 = sort @sort_lines_8_1;
+    $output_8 = join "\n", @sort_sorted_8_1;
+        if (!($output_8 =~ /\n$/msx)) {
+            $output_8 .= "\n";
+        }
+    if (!$pipeline_success_8) { $main_exit_code = 1; }
+        $output_8;
+}
+;
+    chomp $cmd_result_9;
+    $cmd_result_9;
+};
+print "Sorted words:\n";
+print $sort_result, "\n";
+my $uniq_result = do {
+    my $cmd_result_11 = do {
+    my $output_10;
+    my $pipeline_success_10 = 1;
+        $output_10 .= "apple\napple\nbanana\nbanana\ncherry";
+    my @uniq_lines_10_1 = split /\n/msx, $output_10;
+    @uniq_lines_10_1 = grep { $_ ne q{} } @uniq_lines_10_1; # Filter out empty lines
+    my %uniq_seen_10_1;
+    my @uniq_result_10_1;
+    foreach my $line (@uniq_lines_10_1) {
+    if (!$uniq_seen_10_1{$line}++) { push @uniq_result_10_1, $line; }
+    }
+    $output_10 = join "\n", @uniq_result_10_1;
+        if (!($output_10 =~ /\n$/msx)) {
+            $output_10 .= "\n";
+        }
+    if (!$pipeline_success_10) { $main_exit_code = 1; }
+        $output_10;
+}
+;
+    chomp $cmd_result_11;
+    $cmd_result_11;
+};
+print "Unique words:\n";
+print $uniq_result, "\n";
+my $line_count = do {
+    my $cmd_result_13 = do {
+    my $output_12;
+    my $pipeline_success_12 = 1;
+        $output_12 .= "line1\nline2\nline3";
+    my @wc_lines_12_1 = split /\n/msx, $output_12;
+    my $wc_line_count_12_1 = scalar @wc_lines_12_1;
+    $output_12 = q{};
+    $output_12 .= "$wc_line_count_12_1 ";
+    $output_12 =~ s/\s+$//msx;
+    if (!$pipeline_success_12) { $main_exit_code = 1; }
+        $output_12;
+}
+;
+    chomp $cmd_result_13;
+    $cmd_result_13;
+};
+my $word_count = do {
+    my $cmd_result_15 = do {
+    my $output_14;
+    my $pipeline_success_14 = 1;
+        $output_14 .= "Hello World\n";
+    my @wc_lines_14_1 = split /\n/msx, $output_14;
+    my $wc_word_count_14_1 = 0;
+    foreach my $line (@wc_lines_14_1) {
+        my @wc_words_14_1 = split /\s+/msx, $line;
+        $wc_word_count_14_1 += scalar @wc_words_14_1;
+    }
+    $output_14 = q{};
+    $output_14 .= "$wc_word_count_14_1 ";
+    $output_14 =~ s/\s+$//msx;
+    if (!$pipeline_success_14) { $main_exit_code = 1; }
+        $output_14;
+}
+;
+    chomp $cmd_result_15;
+    $cmd_result_15;
+};
+print "Word count: $word_count\n";
+print "Line count: $line_count\n";
+my $head_result = do {
+    my $cmd_result_18 = do {
+    my $seq_output_17 = do {
+    my $result = q{};
+    for my $i (1..10) {
+        $result .= "$i\n";
+    }
+    $result;
+};
+    my @seq_lines_17 = split /\n/msx, $seq_output_17;
+    my $output_17 = q{};
+    my $head_line_count = 0;
+    foreach my $line (@seq_lines_17) {
+        chomp $line;
+        if ($head_line_count < 3) {
+    $output_17 .= $line . "\n";
+    ++$head_line_count;
+} else {
+    $line = q{}; # Clear line to prevent printing
+}
+    }
+    $output_17;
+}
+;
+    chomp $cmd_result_18;
+    $cmd_result_18;
+};
+print "First 3 numbers: $head_result\n";
+my $tail_result = do {
+    my $cmd_result_21 = do {
+    my $seq_output_20 = do {
+    my $result = q{};
+    for my $i (1..10) {
+        $result .= "$i\n";
+    }
+    $result;
+};
+    my @seq_lines_20 = split /\n/msx, $seq_output_20;
+    my $output_20 = q{};
+    my @tail_lines = ();
+    foreach my $line (@seq_lines_20) {
+        chomp $line;
+        # tail -3: collecting all lines first (pipeline limitation)
+        push @tail_lines, $line;
+        $line = q{}; # Clear line to prevent printing
+    }
+    if (@tail_lines > 0) {
+        my @last_lines = @tail_lines[-3..-1];
+        $output_20 = join "\n", @last_lines;
+        if ($output_20 ne q{}) {
+            $output_20 .= "\n";
+        }
+    }
+    $output_20;
+}
+;
+    chomp $cmd_result_21;
+    $cmd_result_21;
+};
+print "Last 3 numbers: $tail_result\n";
+my $cut_result = do {
+    my $cmd_result_24 = do {
+    my $output_22;
+    my $pipeline_success_22 = 1;
+        $output_22 .= "apple:banana:cherry\n";
+    my @lines_23 = split /\n/msx, $output_22;
+    my @result_23;
+    foreach my $line (@lines_23) {
+    chomp $line;
+    my @fields = split /:/msx, $line;
+    if (@fields > 1) {
+    push @result_23, $fields[1];
+    }
+    }
+    $output_22 = join "\n", @result_23;
+    if (!$pipeline_success_22) { $main_exit_code = 1; }
+        $output_22;
+}
+;
+    chomp $cmd_result_24;
+    $cmd_result_24;
+};
+print "Second field: $cut_result\n";
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'temp1.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "1\n2\n3\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'temp2.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "a\nb\nc\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+my $paste_result = do {
+    my $cmd_result_25 = do {
+my @paste_file1_lines_fh_1;
+my @paste_file2_lines_fh_1;
+if (open my $fh1, '<', 'temp1.txt') {
+    while (my $line = <$fh1>) {
+        chomp $line;
+        push @paste_file1_lines_fh_1, $line;
+    }
+    close $fh1;
+}
+if (open my $fh2, '<', 'temp2.txt') {
+    while (my $line = <$fh2>) {
+        chomp $line;
+        push @paste_file2_lines_fh_1, $line;
+    }
+    close $fh2;
+}
+my $max_lines = scalar(@paste_file1_lines_fh_1) > scalar(@paste_file2_lines_fh_1) ? scalar(@paste_file1_lines_fh_1) : scalar(@paste_file2_lines_fh_1);
+my $paste_output = "";
+for (my $i = 0; $i < $max_lines; $i++) {
+    my $line1 = $i < scalar(@paste_file1_lines_fh_1) ? $paste_file1_lines_fh_1[$i] : q{};
+    my $line2 = $i < scalar(@paste_file2_lines_fh_1) ? $paste_file2_lines_fh_1[$i] : q{};
+    $paste_output .= "$line1\t$line2\n";
+}
+$paste_output
+};
+    chomp $cmd_result_25;
+    $cmd_result_25;
+};
+print "Pasted columns:\n";
+print $paste_result, "\n";
+if (-e "temp1.txt") {
+if (-d "temp1.txt") {
+carp "rm: carping: ", "temp1.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "temp1.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "temp1.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "temp1.txt",
+    ": No such file or directory\n";
+}
+if (-e "temp2.txt") {
+if (-d "temp2.txt") {
+carp "rm: carping: ", "temp2.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "temp2.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "temp2.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "temp2.txt",
+    ": No such file or directory\n";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file1.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "apple\nbanana\ncherry\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file2.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "banana\ncherry\ndate\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+my $comm_result = do {
+    my $cmd_result_26 = do { my @file1_lines;
+my @file2_lines;
+if (open my $fh1, '<', 'file1.txt') {
+    while (my $line = <$fh1>) {
+        chomp $line;
+        push @file1_lines, $line;
+    }
+    close($fh1);
+}
+if (open my $fh2, '<', 'file2.txt') {
+    while (my $line = <$fh2>) {
+        chomp $line;
+        push @file2_lines, $line;
+    }
+    close($fh2);
+}
+my %file1_set = map { $_ => 1 } @file1_lines;
+my %file2_set = map { $_ => 1 } @file2_lines;
+my @common_lines;
+foreach my $line (@file1_lines) {
+    if (exists($file2_set{$line})) {
+        push @common_lines, $line;
+    }
+}
+my $comm_result = "";
+foreach my $line (@common_lines) {
+    $comm_result .= $line . "\n";
+}
+$comm_result =~ s/\n$//;
+$comm_result };
+    chomp $cmd_result_26;
+    $cmd_result_26;
+};
+print "Common lines:\n";
+print $comm_result, "\n";
+my $diff_result = do {
+    my $cmd_result_27 = do {
+    my $diff_output = "";
+    {
+        local $/;  # Read entire input at once
+        open my $pipe, '-|', 'diff.exe', "file1.txt", "file2.txt";
+        $diff_output = <$pipe>;
+        close $pipe;
+    }
+    $diff_output;
+};
+    chomp $cmd_result_27;
+    $cmd_result_27;
+};
+print "File differences:\n";
+print $diff_result, "\n";
+my $tr_result = do { my $input_data = ("HELLO WORLD") . "\n"; my $set1_29 = 'A-Z';
+my $set2_29 = 'a-z';
+my $input_29 = $input_data;
+# Expand character ranges for tr command
+my $expanded_set1_29 = $set1_29;
+my $expanded_set2_29 = $set2_29;
+# Handle A-Z range
+if ($expanded_set1_29 =~ /A-Z/) {
+    $expanded_set1_29 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/;
+}
+if ($expanded_set2_29 =~ /a-z/) {
+    $expanded_set2_29 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/;
+}
+my $tr_result_28 = q{};
+for my $char ( split //msx, $input_29 ) {
+    my $pos_29 = index $expanded_set1_29, $char;
+    if ( $pos_29 >= 0 && $pos_29 < length $expanded_set2_29 ) {
+        $tr_result_28 .= substr $expanded_set2_29, $pos_29, 1;
+    } else {
+        $tr_result_28 .= $char;
+    }
+}
+if ( !( $tr_result_28 =~ /\n$/msx || $tr_result_28 eq q{} ) ) {
+    $tr_result_28 .= "\n";
+}
+ $tr_result_28; };
+print "Lowercase: $tr_result\n";
+my $xargs_result = do {
+    my $cmd_result_31 = do {
+    my $output_30;
+    my $pipeline_success_30 = 1;
+        $output_30 .= "1 2 3\n";
+    my @xargs_input_30_1 = split /\s+/msx, $output_30;
+    my @xargs_output_30_1;
+    for (my $i = 0; $i < @xargs_input_30_1; $i += 1) {
+        my @xargs_args_30_1;
+        for (my $j = 0; $j < 1 && $i + $j < @xargs_input_30_1; $j++) {
+            push @xargs_args_30_1, $xargs_input_30_1[$i + $j];
+        }
+        my $xargs_line_30_1 = "";
+        $xargs_line_30_1 .= "Number:";
+        foreach my $arg (@xargs_args_30_1) {
+            $xargs_line_30_1 .= " " . $arg;
+        }
+        push @xargs_output_30_1, $xargs_line_30_1;
+    }
+    my $xargs_result_30_1 = join "\n", @xargs_output_30_1;
+    if (!$pipeline_success_30) { $main_exit_code = 1; }
+        $output_30;
+}
+;
+    chomp $cmd_result_31;
+    $cmd_result_31;
+};
+print "Xargs result:\n";
+print $xargs_result, "\n";
+if (-e "file1.txt") {
+if (-d "file1.txt") {
+carp "rm: carping: ", "file1.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file1.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file1.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file1.txt",
+    ": No such file or directory\n";
+}
+if (-e "file2.txt") {
+if (-d "file2.txt") {
+carp "rm: carping: ", "file2.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file2.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file2.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file2.txt",
+    ": No such file or directory\n";
+}
+print "=== Text Processing Commands Complete ===\n";
+
+
+================================================================================
+ABSTRACT SYNTAX TREE:
+================================================================================
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Text Processing Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("First 5 lines of this file:")] }, None)], redirects: [], env_vars: {"file_content": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("cat", None), args: [Literal("000__04c_text_processing_commands.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-5", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("file_content")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Lines containing 'echo':")] }, None)], redirects: [], env_vars: {"grep_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-n", None), Literal("echo", None), Literal("000__04c_text_processing_commands.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("grep_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Sed result: "), Variable("sed_result")] }, None)], redirects: [], env_vars: {"sed_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sed", None), args: [Literal("s/World/Universe/", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Awk sum result: "), Variable("awk_result")] }, None)], redirects: [], env_vars: {"awk_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("1 2 3 4 5")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("awk", None), args: [Literal("{print $1 + $2}", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Sorted words:")] }, None)], redirects: [], env_vars: {"sort_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("zebra\\napple\\nbanana")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sort", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("sort_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Unique words:")] }, None)], redirects: [], env_vars: {"uniq_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("apple\\napple\\nbanana\\nbanana\\ncherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("uniq", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("uniq_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Word count: "), Variable("word_count")] }, None)], redirects: [], env_vars: {"line_count": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("line1\\nline2\\nline3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None), "word_count": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-w", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Line count: "), Variable("line_count")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("First 3 numbers: "), Variable("head_result")] }, None)], redirects: [], env_vars: {"head_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("seq", None), args: [Literal("1", None), Literal("10", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Last 3 numbers: "), Variable("tail_result")] }, None)], redirects: [], env_vars: {"tail_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("seq", None), args: [Literal("1", None), Literal("10", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tail", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Second field: "), Variable("cut_result")] }, None)], redirects: [], env_vars: {"cut_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("apple:banana:cherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("cut", None), args: [Literal("-d", None), Literal(":", None), Literal("-f", None), Literal("2", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("1\\n2\\n3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("temp1.txt", None), heredoc_body: None }] }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("a\\nb\\nc")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("temp2.txt", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Pasted columns:")] }, None)], redirects: [], env_vars: {"paste_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("paste", None), args: [Literal("temp1.txt", None), Literal("temp2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("paste_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-f", None), Literal("temp1.txt", None), Literal("temp2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("apple\\nbanana\\ncherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("file1.txt", None), heredoc_body: None }] }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("banana\\ncherry\\ndate")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("file2.txt", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Common lines:")] }, None)], redirects: [], env_vars: {"comm_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("comm", None), args: [Literal("-12", None), Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("comm_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File differences:")] }, None)], redirects: [], env_vars: {"diff_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("diff", None), args: [Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("diff_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Lowercase: "), Variable("tr_result")] }, None)], redirects: [], env_vars: {"tr_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("HELLO WORLD")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tr", None), args: [Literal("A-Z", None), Literal("a-z", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Xargs result:")] }, None)], redirects: [], env_vars: {"xargs_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("1 2 3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("xargs", None), args: [Literal("-n", None), Literal("1", None), Literal("echo", None), StringInterpolation(StringInterpolation { parts: [Literal("Number:")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("xargs_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-f", None), Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Text Processing Commands Complete ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+
+================================================================================
+STDOUT COMPARISON (DIFF):
+================================================================================
+--- shell_stdout
++++ perl_stdout
+ === Text Processing Commands ===
+ First 5 lines of this file:
+ #!/bin/bash
+ 
+ # Text processing commands using backticks
+ # This file demonstrates various text processing commands with backticks
++
+ Lines containing 'echo':
+ 6:echo "=== Text Processing Commands ==="
+ 11:echo "First 5 lines of this file:"
+ 12:echo "$file_content"
+ 16:grep_result=`grep -n "echo" 000__04c_text_processing_commands.sh`
+ 17:echo "Lines containing 'echo':"
+ 18:echo "$grep_result"
+ 22:sed_result=`echo "Hello World" | sed 's/World/Universe/'`
+ 23:echo "Sed result: $sed_result"
+ 27:awk_result=`echo "1 2 3 4 5" | awk '{print $1 + $2}'`
+ 28:echo "Awk sum result: $awk_result"
+ 32:sort_result=`echo -e "zebra\napple\nbanana" | sort`
+ 33:echo "Sorted words:"
+ 34:echo "$sort_result"
+ 38:uniq_result=`echo -e "apple\napple\nbanana\nbanana\ncherry" | uniq`
+ 39:echo "Unique words:"
+ 40:echo "$uniq_result"
+ 44:word_count=`echo "Hello World" | wc -w`
+ 45:line_count=`echo -e "line1\nline2\nline3" | wc -l`
+ 46:echo "Word count: $word_count"
+ 47:echo "Line count: $line_count"
+ 52:echo "First 3 numbers: $head_result"
+ 57:echo "Last 3 numbers: $tail_result"
+ 61:cut_result=`echo "apple:banana:cherry" | cut -d: -f2`
+ 62:echo "Second field: $cut_result"
+ 66:echo -e "1\n2\n3" > temp1.txt
+ 67:echo -e "a\nb\nc" > temp2.txt
+ 69:echo "Pasted columns:"
+ 70:echo "$paste_result"
+ 75:echo -e "apple\nbanana\ncherry" > file1.txt
+ 76:echo -e "banana\ncherry\ndate" > file2.txt
+ 78:echo "Common lines:"
+ 79:echo "$comm_result"
+ 84:echo "File differences:"
+ 85:echo "$diff_result"
+ 89:tr_result=`echo "HELLO WORLD" | tr 'A-Z' 'a-z'`
+ 90:echo "Lowercase: $tr_result"
+ 94:xargs_result=`echo "1 2 3" | xargs -n1 echo "Number:"`
+ 95:echo "Xargs result:"
+ 96:echo "$xargs_result"
+ 101:echo "=== Text Processing Commands Complete ==="
+ Sed result: Hello Universe
+ Awk sum result: 3
+ Sorted words:
+ apple
+ banana
+ zebra
+ Unique words:
+ apple
+ banana
+ cherry
+ Word count: 2
+ Line count: 3
+ First 3 numbers: 1
+ 2
+ 3
+ Last 3 numbers: 8
+ 9
+ 10
+ Second field: banana
+ Pasted columns:
+ 1\x09a
+ 2\x09b
+ 3\x09c
+ Common lines:
+ banana
+ cherry
+ File differences:
+ 1d0
+ < apple
+ 3a3
+ > date
+ Lowercase: hello world
++
+ Xargs result:
+-Number: 1
++1 2 3
+-Number: 2
+-Number: 3
+ === Text Processing Commands Complete ===
+
+
+================================================================================
+STDERR COMPARISON:
+================================================================================
+STDERR values are identical:
+Shell stderr: ''
+Perl stderr: ''
+
+================================================================================
+SUMMARY: 0 out of 146 tests passed before first failure
+================================================================================
+
+BRIEF FAILURE SUMMARY:
+Failed due to: stdout mismatch
+Writing test count 0 to first_n_tests_passed.txt
+Current working directory: "D:\\GitHub\\sh2perl"
+Successfully wrote test count 0 and matching stdout lines 6 to first_n_tests_passed.txt
+
+To run test again: ./fail 000__04c
+Running test_purify.pl validation...
+Running test_purify.pl with verbose output
+Running test_purify.pl with next option
+Testing purify.pl exists...
+Testing debashc exists...
+Testing examples.impurl directory exists...
+Testing purify.pl on examples.impurl/001_echo_basic.pl...
+  ✓ examples.impurl/001_echo_basic.pl processed successfully
+Testing purify.pl on examples.impurl/002_printf_basic.pl...
+  ✓ examples.impurl/002_printf_basic.pl processed successfully
+Testing purify.pl on examples.impurl/003_ls_basic.pl...
+  ✓ examples.impurl/003_ls_basic.pl processed successfully
+Testing purify.pl --help...
+test_purify.pl completed successfully
+test_purify.pl passed, continuing with other commands...
+Test run completed at Sun, Sep 21, 2025  7:03:40 PM

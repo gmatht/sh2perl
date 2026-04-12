@@ -1,0 +1,44 @@
+=== Example 024: Basic rm command ===
+Using system() to call rm (remove file):
+File removed successfully
+
+rm with verbose (-v):
+removed 'test_rm_file2.txt'
+
+rm with force (-f):
+Force removal attempted
+
+rm with interactive (-i):
+rm: remove regular empty file 'test_rm_interactive.txt'? 
+rm with recursive (-r):
+Directory removed recursively
+
+rm with recursive and force (-rf):
+
+rm with preserve root (--preserve-root):
+Protected from removing root
+
+rm with one file system (-x):
+rm: invalid option -- 'x'
+Try 'rm --help' for more information.
+
+rm with no dereference (-P):
+rm: carping: nonexistent_file.txt: No such file or directory
+ at /home/llm/src/sh2perl/.test-work/purify/024_rm_basic/pure/024_rm_basic.pl line 319.
+No files to remove
+
+rm with ignore missing (-f):
+Ignored missing file
+
+rm with directory (-d):
+rm: carping: test_rm_dir: No such file or directory
+ at /home/llm/src/sh2perl/.test-work/purify/024_rm_basic/pure/024_rm_basic.pl line 509.
+rm: carping: test_rm_dir2: No such file or directory
+ at /home/llm/src/sh2perl/.test-work/purify/024_rm_basic/pure/024_rm_basic.pl line 539.
+rm: carping: test_rm_empty_dir: No such file or directory
+ at /home/llm/src/sh2perl/.test-work/purify/024_rm_basic/pure/024_rm_basic.pl line 599.
+Empty directory removed
+
+rm with multiple files:
+Multiple files removed
+=== Example 024 completed successfully ===

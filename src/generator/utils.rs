@@ -49,12 +49,8 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 return "q{}".to_string();
             }
 
-            // Check if string needs interpolation (contains variables or special chars)
-            let needs_interpolation =
-                s.contains('$') || s.contains('@') || s.contains('\\') || s.contains('`');
-
-            if needs_interpolation {
-                // Always escape quotes and backslashes for Perl string literals
+            // Use double quotes only when we need actual escape sequences in the Perl source.
+            if s.contains('\n') || s.contains('\t') || s.contains('\r') {
                 let escaped = s
                     .replace("\\", "\\\\")
                     .replace("\"", "\\\"")
@@ -63,27 +59,14 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     .replace("\r", "\\r");
                 format!("\"{}\"", escaped)
             } else {
-                // Check if string contains newlines, tabs, or carriage returns
-                // If it does, we need to use double quotes with escape sequences
-                if s.contains('\n') || s.contains('\t') || s.contains('\r') {
-                    // Use double quotes and escape special characters
-                    let escaped = s
-                        .replace("\\", "\\\\")
-                        .replace("\"", "\\\"")
-                        .replace("\n", "\\n")
-                        .replace("\t", "\\t")
-                        .replace("\r", "\\r");
-                    format!("\"{}\"", escaped)
+                // Use q{} for single characters to avoid "noisy quotes" violations
+                // Use single quotes for longer strings that don't need interpolation
+                if s.len() == 1 {
+                    // Always use q{} for single characters to avoid Perl::Critic violations
+                    format!("q{{{}}}", s)
                 } else {
-                    // Use q{} for single characters to avoid "noisy quotes" violations
-                    // Use single quotes for longer strings that don't need interpolation
-                    if s.len() == 1 {
-                        // Always use q{} for single characters to avoid Perl::Critic violations
-                        format!("q{{{}}}", s)
-                    } else {
-                        let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
-                        format!("'{}'", escaped)
-                    }
+                    let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
+                    format!("'{}'", escaped)
                 }
             }
         }
@@ -255,27 +238,14 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             // Special handling for pwd in command substitution
                             "do { use Cwd; getcwd(); }".to_string()
                         } else if name == "basename" {
-                            // Special handling for basename in command substitution
-                            if let Some(path) = simple_cmd.args.first() {
-                                let path_str = generator.word_to_perl(path);
-                                let suffix = if simple_cmd.args.len() > 1 {
-                                    generator.word_to_perl(&simple_cmd.args[1])
-                                } else {
-                                    "q{}".to_string()
-                                };
-                                // Generate with proper formatting
-                                format!("do {{\n    my $basename_path = {};\n    my $basename_suffix = {};\n    if ($basename_suffix ne q{{}}) {{\n        $basename_path =~ s/\\Q$basename_suffix\\E$//msx;\n    }}\n    $basename_path =~ s/.*\\///msx;\n    $basename_path;\n}}", path_str.replace("$0", "$PROGRAM_NAME"), suffix)
-                            } else {
-                                "\".\"".to_string()
-                            }
+                            // Run basename via the host command so output and edge cases match.
+                            let basename_cmd = generator.generate_command_string_for_system(&Command::Simple(simple_cmd.clone()));
+                            let basename_lit = generator.perl_string_literal(&Word::literal(basename_cmd));
+                            format!("do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}", basename_lit)
                         } else if name == "dirname" {
-                            // Special handling for dirname in command substitution
-                            if let Some(path) = simple_cmd.args.first() {
-                                let path_str = generator.word_to_perl(path);
-                                format!("do {{ my $path = {}; if ($path =~ /\\//msx) {{ $path =~ s/\\/[^\\/]*$//msx; if ($path eq q{{}}) {{ $path = q{{.}}; }} }} else {{ $path = q{{.}}; }} $path; }}", path_str.replace("$0", "$PROGRAM_NAME"))
-                            } else {
-                                "\".\"".to_string()
-                            }
+                            let dirname_cmd = generator.generate_command_string_for_system(&Command::Simple(simple_cmd.clone()));
+                            let dirname_lit = generator.perl_string_literal(&Word::literal(dirname_cmd));
+                            format!("do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}", dirname_lit)
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
                             let which_cmd = generator.generate_command_string_for_system(cmd);

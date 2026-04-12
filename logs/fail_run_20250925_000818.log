@@ -1,0 +1,793 @@
+Starting test run at Thu, Sep 25, 2025 12:08:18 AM
+Logging to: logs/fail_run_20250925_000818.log
+Test arguments: 000__02
+----------------------------------------
+Compiling debashc...
+   Compiling debashl v0.1.0 (D:\GitHub\sh2perl)
+warning: unused import: `Token`
+    --> src\parser\commands.rs:1351:31
+     |
+1351 |     use crate::lexer::{Lexer, Token};
+     |                               ^^^^^
+     |
+     = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src\timeout_manager.rs:282:1
+    |
+282 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\parser\commands.rs:1354:9
+     |
+1354 |     let mut lexer = Lexer::new(text);
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `cmd2`
+   --> src\generator\commands\pipeline_commands.rs:469:66
+    |
+469 |         if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline.commands[1]) {
+    |                                                                  ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: variable `head_max` is assigned to, but never used
+   --> src\generator\commands\pipeline_commands.rs:836:25
+    |
+836 |                 let mut head_max = 10; // Default value
+    |                         ^^^^^^^^
+    |
+    = note: consider using `_head_max` instead
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:847:53
+    |
+847 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:854:53
+    |
+854 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:859:49
+    |
+859 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:883:22
+    |
+883 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:897:34
+    |
+897 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+    |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `input_var`
+ --> src\generator\commands\comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:554:37
+    |
+554 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `literal`
+   --> src\generator\words.rs:385:59
+    |
+385 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `s`
+   --> src\generator\words.rs:842:23
+    |
+842 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+    |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `literal`
+   --> src\generator\utils.rs:151:59
+    |
+151 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:151:13
+    |
+151 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:194:13
+    |
+194 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+  20 | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1885:4
+     |
+1885 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:195:4
+    |
+195 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:24:4
+   |
+24 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:73:4
+   |
+73 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:230:4
+    |
+230 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for_loop_index: usize) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 32 warnings (run `cargo fix --lib -p debashl` to apply 5 suggestions)
+warning: unused import: `execute_with_progress`
+ --> src\testing.rs:9:67
+  |
+9 | use crate::timeout_manager::{OperationType, execute_with_timeout, execute_with_progress, 
+  |                                                                   ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src\testing.rs:16:5
+   |
+16 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src\testing.rs:25:9
+   |
+25 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1188:9
+     |
+1188 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src\testing.rs:1397:9
+     |
+1397 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src\testing.rs:1445:9
+     |
+1445 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1994:13
+     |
+1994 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1994:9
+     |
+1994 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src\execution.rs:62:8
+   |
+62 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String> {
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src\testing.rs:19:4
+   |
+19 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String> 
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:52:9
+   |
+39 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+52 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+53 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:552:8
+    |
+552 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>) -> Result<TestResult, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src\testing.rs:1393:8
+     |
+1393 | pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src\timeout_manager.rs:11:5
+   |
+ 8 | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src\timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src\timeout_manager.rs:117:12
+    |
+ 90 | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: Duration) {
+    |            ^^^^^^^^^^^
+...
+178 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src\timeout_manager.rs:302:8
+    |
+302 | pub fn execute_with_progress<F, T>(operation: OperationType, operation_fn: F) -> Result<T, String>
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.95s
+Running test_purify.pl validation...
+Unknown option: verbose
+Error in command line arguments
+test_purify.pl passed, continuing with other commands...
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic "000__02"
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '000__02'
+
+Found example matching prefix '000__02': 000__02_output_formatting_commands.sh
+
+Running only the specified example
+==================================================
+Test 2/146: 000__02_output_formatting_commands.sh with perl     DEBUG: Starting test execution for examples\000__02_output_formatting_commands.sh with generator perl
+DEBUG: Running shell script: examples\000__02_output_formatting_commands.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 5.37s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__02_output_formatting_commands.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("Hello from backticks", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("printf", None), args: [Literal("Number: %d, String: %s\\n", None), Literal("42", None), Literal("test", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha256sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha256sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha512sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha512sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("strings", None), args: [Literal("test_binary.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test output")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tee", None), args: [Literal("test_tee.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 6103 characters
+DEBUG: check_perl_no_open3_builtins called with 6103 characters
+DEBUG: check_perl_no_system_builtins called with 6103 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 6103 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use Digest::SHA qw(sha256_hex sha512_hex);
+use File::Path qw(make_path remove_tree
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 4.6µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 245.9893ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 660, Translated stdout length: 660
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 13900ms
+✓
+
+
+================================================================================
+                                    TEST PASSED
+================================================================================
+File: examples\000__02_output_formatting_commands.sh
+Generator: perl
+Test: 2/146
+================================================================================
+
+ORIGINAL SHELL SCRIPT:
+#!/bin/bash
+
+# Output and formatting commands with backticks
+# This file demonstrates using backticks with output and formatting commands
+
+echo "=== Output and Formatting Commands ==="
+
+# echo command with backticks
+#PERL_MUST_NOT_CONTAIN `echo
+echo_result=`echo "Hello from backticks"`
+echo "Echo result: $echo_result"
+
+# printf command with backticks
+#PERL_MUST_NOT_CONTAIN `printf
+printf_result=`printf "Number: %d, String: %s\n" 42 "test"`
+echo "Printf result: $printf_result"
+
+echo "=== Compression Commands ==="
+
+# gzip command with backticks
+#PERL_MUST_NOT_CONTAIN `gzip
+#echo "test content for compression" > test_compress.txt
+#gzip_result=`gzip test_compress.txt && echo "Compression successful"`
+#echo "Gzip result: $gzip_result"
+
+# zcat command with backticks
+#PERL_MUST_NOT_CONTAIN `zcat
+#zcat_result=`zcat test_compress.txt.gz`
+#echo "Zcat result: $zcat_result"
+
+echo "=== Network Commands ==="
+
+# wget command with backticks
+#PERL_MUST_NOT_CONTAIN `wget
+# wget_result=`wget -qO- http://httpbin.org/get | head -1`
+# echo "Wget result: $wget_result"
+
+# curl command with backticks
+#PERL_MUST_NOT_CONTAIN `curl
+# curl_result=`curl -s http://httpbin.org/get | head -1`
+# echo "Curl result: $curl_result"
+
+echo "=== Process Management Commands ==="
+
+# kill command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `kill
+# kill_result=`kill -0 $$ && echo "Process exists"`
+# echo "Kill result: $kill_result"
+
+# nohup command with backticks
+#PERL_MUST_NOT_CONTAIN `nohup
+# nohup_result=`nohup echo "background process" 2>&1`
+# echo "Nohup result: $nohup_result"
+
+# nice command with backticks
+#PERL_MUST_NOT_CONTAIN `nice
+#nice_result=`nice echo "low priority process"`
+#echo "Nice result: $nice_result"
+
+echo "=== Checksum Commands ==="
+
+# sha256sum command with backticks
+#PERL_MUST_NOT_CONTAIN `sha256sum
+echo "test content" > test_checksum.txt
+sha256_result=`sha256sum test_checksum.txt`
+echo "SHA256 result: $sha256_result"
+
+# sha512sum command with backticks
+#PERL_MUST_NOT_CONTAIN `sha512sum
+sha512_result=`sha512sum test_checksum.txt`
+echo "SHA512 result: $sha512_result"
+
+# strings command with backticks
+#PERL_MUST_NOT_CONTAIN `strings
+strings_result=`strings test_binary.txt | head -3`
+echo "Strings result:"
+echo "$strings_result"
+
+echo "=== I/O Redirection Commands ==="
+
+# tee command with backticks
+#PERL_MUST_NOT_CONTAIN `tee
+tee_result=`echo "test output" | tee test_tee.txt`
+echo "Tee result: $tee_result"
+
+echo "=== Perl Command ==="
+
+# perl command with backticks
+#PERL_MUST_NOT_CONTAIN `perl
+perl_result=`perl -e 'print "Hello from Perl\n"'`
+echo "Perl result: $perl_result"
+
+# Cleanup
+rm -f test_checksum.txt test_tee.txt
+
+
+
+TRANSLATED PERL CODE:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use Digest::SHA qw(sha256_hex sha512_hex);
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== Output and Formatting Commands ===\n";
+my $echo_result = ('Hello from backticks');
+print "Echo result: $echo_result\n";
+my $printf_result = do { my $result = sprintf "Number: %d, String: %s\n", "42", "test"; chomp $result; $result; };
+print "Printf result: $printf_result\n";
+print "=== Compression Commands ===\n";
+print "=== Network Commands ===\n";
+print "=== Process Management Commands ===\n";
+print "=== Checksum Commands ===\n";
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'test_checksum.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "test content\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+my $sha256_result = do {
+    my $cmd_result_0 = do { do {
+my @results;
+if (-f 'test_checksum.txt') {
+my $hash = sha256_hex(do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'test_checksum.txt' or croak "Cannot open 'test_checksum.txt': $ERRNO"; my $content = <$fh>; close $fh or croak "Close failed: $ERRNO"; $content });
+push @results, "$hash  test_checksum.txt";
+} else {
+push @results, "0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+}
+join "\n", @results;
+}
+ };
+    chomp $cmd_result_0;
+    $cmd_result_0;
+};
+print "SHA256 result: $sha256_result\n";
+my $sha512_result = do {
+    my $cmd_result_1 = do { do {
+my @results;
+if (-f 'test_checksum.txt') {
+my $hash = sha512_hex(do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'test_checksum.txt' or croak "Cannot open 'test_checksum.txt': $ERRNO"; my $content = <$fh>; close $fh or croak "Close failed: $ERRNO"; $content });
+push @results, "$hash  test_checksum.txt";
+} else {
+push @results, "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
+}
+join "\n", @results;
+}
+ };
+    chomp $cmd_result_1;
+    $cmd_result_1;
+};
+print "SHA512 result: $sha512_result\n";
+my $strings_result = do {
+    my $cmd_result_3 = do { do {
+    my $output_2;
+    my $pipeline_success_2 = 1;
+        my $input_data;
+    if (open my $fh, '<', 'test_binary.txt') {
+    local $INPUT_RECORD_SEPARATOR = undef;  # Read entire file at once
+    $input_data = <$fh>;
+    close $fh or croak "Close failed: $ERRNO";
+    } else {
+    print {*STDERR} "strings: 'test_binary.txt': No such file\n";
+    $input_data = q{};
+    }
+    my @result;
+    my @lines = split /\n/msx, $input_data;
+    for my $line (@lines) {
+    if (length $line >= 4) {
+    push @result, $line;
+    }
+    }
+    my $line = join "\n", @result;
+    $output_2 = $line;
+    my $num_lines = 3;
+    my $head_line_count = 0;
+    my $result = q{};
+    my $input = $output_2;
+    my $pos = 0;
+    while ($pos < length $input && $head_line_count < $num_lines) {
+        my $line_end = index $input, "\n", $pos;
+        if ($line_end == -1) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_2 = $result;
+    if (!$pipeline_success_2) { $main_exit_code = 1; }
+        $output_2;
+}
+ };
+    chomp $cmd_result_3;
+    $cmd_result_3;
+};
+print "Strings result:\n";
+print $strings_result;
+if (!($strings_result =~ /\n$/msx)) { print "\n"; }
+print "=== I/O Redirection Commands ===\n";
+my $tee_result = do {
+    my $cmd_result_5 = do { do {
+    my $output_4;
+    my $pipeline_success_4 = 1;
+        $output_4 .= "test output\n";
+    my @lines = split /\n/msx, $output_4;
+    if (open my $fh, '>', 'test_tee.txt') {
+    foreach my $line (@lines) {
+    print {$fh} "$line\n";
+    }
+    close $fh or croak "Close failed: $ERRNO";
+    } else {
+    carp "tee: Cannot open 'test_tee.txt': $ERRNO";
+    }
+    if (!$pipeline_success_4) { $main_exit_code = 1; }
+        $output_4;
+}
+ };
+    chomp $cmd_result_5;
+    $cmd_result_5;
+};
+print "Tee result: $tee_result\n";
+print "=== Perl Command ===\n";
+my $perl_result = do {
+    my $cmd_result_6 = do { do {
+                                            use Capture::Tiny qw(capture_stdout);
+                                            my $result;
+                                            my $eval_success = eval {
+                                                $result = capture_stdout(sub { print "Hello from Perl\n" });
+                                                1;
+                                            };
+                                            if (!$eval_success) {
+                                                $result = "Error executing Perl code: $EVAL_ERROR";
+                                            }
+                                            $result;
+                                        } };
+    chomp $cmd_result_6;
+    $cmd_result_6;
+};
+print "Perl result: $perl_result\n";
+if (-e "test_checksum.txt") {
+if (-d "test_checksum.txt") {
+carp "rm: carping: ", "test_checksum.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "test_checksum.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "test_checksum.txt",
+    ": $OS_ERROR\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_checksum.txt",
+    ": No such file or directory\n";
+}
+if (-e "test_tee.txt") {
+if (-d "test_tee.txt") {
+carp "rm: carping: ", "test_tee.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "test_tee.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "test_tee.txt",
+    ": $OS_ERROR\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "test_tee.txt",
+    ": No such file or directory\n";
+}
+
+
+ABSTRACT SYNTAX TREE:
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Output and Formatting Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Echo result: "), Variable("echo_result")] }, None)], redirects: [], env_vars: {"echo_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("Hello from backticks", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Printf result: "), Variable("printf_result")] }, None)], redirects: [], env_vars: {"printf_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("printf", None), args: [Literal("Number: %d, String: %s\\n", None), Literal("42", None), Literal("test", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Compression Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Network Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Process Management Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Checksum Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test content")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("test_checksum.txt", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("SHA256 result: "), Variable("sha256_result")] }, None)], redirects: [], env_vars: {"sha256_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("sha256sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("SHA512 result: "), Variable("sha512_result")] }, None)], redirects: [], env_vars: {"sha512_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("sha512sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Strings result:")] }, None)], redirects: [], env_vars: {"strings_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("strings", None), args: [Literal("test_binary.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("strings_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== I/O Redirection Commands ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Tee result: "), Variable("tee_result")] }, None)], redirects: [], env_vars: {"tee_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test output")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tee", None), args: [Literal("test_tee.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Perl Command ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Perl result: "), Variable("perl_result")] }, None)], redirects: [], env_vars: {"perl_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-f", None), Literal("test_checksum.txt", None), Literal("test_tee.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+Test run completed at Thu, Sep 25, 2025 12:08:39 AM

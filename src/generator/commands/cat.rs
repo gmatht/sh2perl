@@ -1,18 +1,52 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
+fn cat_requires_shell(cmd: &SimpleCommand) -> bool {
+    cmd.args.iter().any(|arg| match arg {
+        Word::Literal(text, _) => text.starts_with('-'),
+        Word::StringInterpolation(interp, _) => {
+            if interp.parts.len() == 1 {
+                if let StringPart::Literal(text) = &interp.parts[0] {
+                    text.starts_with('-')
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        }
+        _ => true,
+    })
+}
+
 pub fn generate_cat_command_for_substitution(
     generator: &mut Generator,
     cmd: &SimpleCommand,
 ) -> String {
-    let command = Command::Simple(cmd.clone());
-    let command_str = generator.generate_command_string_for_system(&command);
-    let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+    if cmd.args.is_empty() {
+        return "do { local $INPUT_RECORD_SEPARATOR = undef; <STDIN> };".to_string();
+    }
 
-    format!(
-        "do {{ my $cat_cmd = {}; my $result = qx{{$cat_cmd}}; $result; }};",
-        command_lit
-    )
+    if cat_requires_shell(cmd) {
+        let cmd_str = generator.generate_command_string_for_system(&Command::Simple(cmd.clone()));
+        let cmd_lit = generator.perl_string_literal(&Word::literal(cmd_str));
+        return format!("do {{ my $cat_cmd = {}; qx{{$cat_cmd}}; }}", cmd_lit);
+    }
+
+    let mut parts = Vec::new();
+    for arg in &cmd.args {
+        let path = generator.perl_string_literal(arg);
+        parts.push(format!(
+            "do {{ open my $fh, '<', {} or die 'cat: ' . {} . ': ' . $OS_ERROR . \"\\n\"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . \"\\n\"; $chunk; }}",
+            path, path
+        ));
+    }
+
+    if parts.len() == 1 {
+        parts.pop().unwrap()
+    } else {
+        format!("({})", parts.join(" . "))
+    }
 }
 
 pub fn generate_cat_command(
@@ -44,20 +78,11 @@ pub fn generate_cat_command(
 
     // If no heredocs, handle file reading as before
     if !has_heredoc {
-        let command = Command::Simple(cmd.clone());
-        let command_str = generator.generate_command_string_for_system(&command);
-        let command_lit = generator.perl_string_literal(&Word::literal(command_str));
-
+        let substitution = generate_cat_command_for_substitution(generator, cmd);
         if target_var.is_empty() {
-            output.push_str(&format!(
-                "do {{ my $cat_cmd = {}; print qx{{$cat_cmd}}; }};\n",
-                command_lit
-            ));
+            output.push_str(&format!("print {};\n", substitution));
         } else {
-            output.push_str(&format!(
-                "do {{ my $cat_cmd = {}; ${} = qx{{$cat_cmd}}; }};\n",
-                command_lit, target_var
-            ));
+            output.push_str(&format!("${} = {};\n", target_var, substitution));
         }
     }
 

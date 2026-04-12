@@ -1,0 +1,688 @@
+Starting test run at Sun, Sep 21, 2025  8:41:49 PM
+Logging to: logs/fail_run_20250921_204148.log
+Test arguments: 000__01
+----------------------------------------
+Compiling debashc...
+   Compiling debashl v0.1.0 (D:\GitHub\sh2perl)
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src\timeout_manager.rs:277:1
+    |
+277 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: unused variable: `glob_exprs`
+  --> src\generator\commands\simple_commands.rs:38:45
+   |
+38 | ...                   let glob_exprs: Vec<String> = patterns.iter()
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_glob_exprs`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:836:22
+    |
+836 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:850:34
+    |
+850 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+    |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `input_var`
+ --> src\generator\commands\comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:564:37
+    |
+564 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `s`
+   --> src\generator\words.rs:830:23
+    |
+830 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+    |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:150:13
+    |
+150 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:189:13
+    |
+189 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+20   | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1885:4
+     |
+1885 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:188:4
+    |
+188 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:24:4
+   |
+24 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:73:4
+   |
+73 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:228:4
+    |
+228 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for_loop_index: usize) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+6  | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+7  |     /// Maps variable names to their usage information
+8  |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+9  |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 24 warnings (run `cargo fix --lib -p debashl` to apply 3 suggestions)
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src\testing.rs:16:5
+   |
+16 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused variable: `operation_handle`
+  --> src\testing.rs:25:9
+   |
+25 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1160:9
+     |
+1160 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src\testing.rs:1369:9
+     |
+1369 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src\testing.rs:1417:9
+     |
+1417 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1968:13
+     |
+1968 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1968:9
+     |
+1968 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src\execution.rs:62:8
+   |
+62 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String> {
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src\testing.rs:19:4
+   |
+19 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String> 
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:52:9
+   |
+39 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+52 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+53 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:552:8
+    |
+552 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>) -> Result<TestResult, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src\testing.rs:1365:8
+     |
+1365 | pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, and `DebugFreeze` are never constructed
+  --> src\timeout_manager.rs:11:5
+   |
+8  | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src\timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: method `set_timeout` is never used
+   --> src\timeout_manager.rs:117:12
+    |
+90  | impl TimeoutManager {
+    | ------------------- method in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: Duration) {
+    |            ^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 23 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 3 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 53.12s
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail "000__01"
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '000__01'
+
+Found example matching prefix '000__01': 000__01_file_directory_operations.sh
+
+Running only the specified example
+==================================================
+Test 1/146: 000__01_file_directory_operations.sh with perl     DEBUG: Starting test execution for examples\000__01_file_directory_operations.sh with generator perl
+DEBUG: Running shell script: examples\000__01_file_directory_operations.sh
+DEBUG: TestExecution in progress... 0.3% (1.0s/300.0s)
+DEBUG: TestExecution in progress... 0.7% (2.1s/300.0s)
+DEBUG: TestExecution in progress... 1.1% (3.2s/300.0s)
+DEBUG: TestExecution in progress... 1.4% (4.2s/300.0s)
+DEBUG: TestExecution in progress... 1.8% (5.3s/300.0s)
+DEBUG: TestExecution in progress... 2.1% (6.3s/300.0s)
+DEBUG: TestExecution in progress... 2.5% (7.4s/300.0s)
+DEBUG: TestExecution in progress... 2.8% (8.4s/300.0s)
+DEBUG: TestExecution in progress... 3.2% (9.5s/300.0s)
+DEBUG: TestExecution in progress... 3.5% (10.5s/300.0s)
+DEBUG: TestExecution in progress... 3.9% (11.6s/300.0s)
+DEBUG: TestExecution in progress... 4.2% (12.7s/300.0s)
+DEBUG: TestExecution in progress... 4.6% (13.7s/300.0s)
+DEBUG: TestExecution in progress... 4.9% (14.7s/300.0s)
+DEBUG: TestExecution in progress... 5.3% (15.8s/300.0s)
+DEBUG: TestExecution in progress... 5.6% (16.9s/300.0s)
+DEBUG: TestExecution in progress... 6.0% (18.0s/300.0s)
+DEBUG: TestExecution in progress... 6.3% (19.0s/300.0s)
+DEBUG: TestExecution in progress... 6.7% (20.2s/300.0s)
+DEBUG: TestExecution in progress... 7.1% (21.2s/300.0s)
+DEBUG: TestExecution in progress... 7.4% (22.3s/300.0s)
+DEBUG: TestExecution in progress... 7.8% (23.4s/300.0s)
+DEBUG: TestExecution in progress... 8.1% (24.4s/300.0s)
+DEBUG: TestExecution in progress... 8.5% (25.5s/300.0s)
+DEBUG: TestExecution in progress... 8.8% (26.5s/300.0s)
+DEBUG: TestExecution in progress... 9.2% (27.6s/300.0s)
+DEBUG: TestExecution in progress... 9.6% (28.7s/300.0s)
+DEBUG: TestExecution in progress... 9.9% (29.8s/300.0s)
+DEBUG: TestExecution in progress... 10.3% (30.9s/300.0s)
+DEBUG: TestExecution in progress... 10.7% (32.0s/300.0s)
+DEBUG: TestExecution in progress... 11.0% (33.1s/300.0s)
+DEBUG: TestExecution in progress... 11.4% (34.2s/300.0s)
+DEBUG: TestExecution in progress... 11.8% (35.3s/300.0s)
+DEBUG: TestExecution in progress... 12.1% (36.3s/300.0s)
+DEBUG: TestExecution in progress... 12.5% (37.4s/300.0s)
+DEBUG: TestExecution in progress... 12.8% (38.5s/300.0s)
+DEBUG: TestExecution in progress... 13.2% (39.6s/300.0s)
+DEBUG: TestExecution in progress... 13.5% (40.6s/300.0s)
+DEBUG: TestExecution in progress... 13.9% (41.6s/300.0s)
+DEBUG: TestExecution in progress... 14.2% (42.7s/300.0s)
+DEBUG: TestExecution in progress... 14.6% (43.8s/300.0s)
+DEBUG: TestExecution in progress... 15.0% (44.9s/300.0s)
+DEBUG: TestExecution in progress... 15.3% (46.0s/300.0s)
+DEBUG: TestExecution in progress... 15.7% (47.1s/300.0s)
+DEBUG: TestExecution in progress... 16.1% (48.2s/300.0s)
+DEBUG: TestExecution in progress... 16.4% (49.2s/300.0s)
+DEBUG: TestExecution in progress... 16.8% (50.3s/300.0s)
+DEBUG: TestExecution in progress... 17.1% (51.4s/300.0s)
+DEBUG: TestExecution in progress... 17.5% (52.4s/300.0s)
+DEBUG: TestExecution in progress... 17.8% (53.5s/300.0s)
+DEBUG: TestExecution in progress... 18.2% (54.6s/300.0s)
+DEBUG: TestExecution in progress... 18.6% (55.7s/300.0s)
+DEBUG: TestExecution in progress... 18.9% (56.7s/300.0s)
+DEBUG: TestExecution in progress... 19.3% (57.8s/300.0s)
+DEBUG: TestExecution in progress... 19.6% (58.9s/300.0s)
+DEBUG: TestExecution in progress... 20.0% (60.0s/300.0s)
+DEBUG: TestExecution in progress... 20.4% (61.1s/300.0s)
+DEBUG: TestExecution in progress... 20.7% (62.1s/300.0s)
+DEBUG: TestExecution in progress... 21.0% (63.1s/300.0s)
+DEBUG: TestExecution in progress... 21.4% (64.1s/300.0s)
+DEBUG: TestExecution in progress... 21.8% (65.3s/300.0s)
+DEBUG: TestExecution in progress... 22.1% (66.4s/300.0s)
+DEBUG: TestExecution in progress... 22.5% (67.5s/300.0s)
+DEBUG: TestExecution in progress... 22.9% (68.6s/300.0s)
+DEBUG: TestExecution in progress... 23.2% (69.7s/300.0s)
+DEBUG: TestExecution in progress... 23.6% (70.8s/300.0s)
+DEBUG: TestExecution in progress... 23.9% (71.8s/300.0s)
+DEBUG: TestExecution in progress... 24.3% (72.9s/300.0s)
+DEBUG: TestExecution in progress... 24.7% (74.0s/300.0s)
+DEBUG: TestExecution in progress... 25.0% (75.1s/300.0s)
+DEBUG: TestExecution in progress... 25.4% (76.2s/300.0s)
+DEBUG: TestExecution in progress... 25.8% (77.3s/300.0s)
+DEBUG: TestExecution in progress... 26.1% (78.4s/300.0s)
+DEBUG: TestExecution in progress... 26.5% (79.5s/300.0s)
+DEBUG: TestExecution in progress... 26.9% (80.6s/300.0s)
+DEBUG: TestExecution in progress... 27.2% (81.7s/300.0s)
+DEBUG: TestExecution in progress... 27.6% (82.7s/300.0s)
+DEBUG: TestExecution in progress... 27.9% (83.8s/300.0s)
+DEBUG: TestExecution in progress... 28.3% (84.9s/300.0s)
+DEBUG: TestExecution in progress... 28.7% (86.0s/300.0s)
+DEBUG: TestExecution in progress... 29.0% (87.1s/300.0s)
+DEBUG: TestExecution in progress... 29.4% (88.2s/300.0s)
+DEBUG: TestExecution in progress... 29.8% (89.3s/300.0s)
+DEBUG: TestExecution in progress... 30.1% (90.4s/300.0s)
+DEBUG: TestExecution in progress... 30.5% (91.4s/300.0s)
+DEBUG: TestExecution in progress... 30.8% (92.5s/300.0s)
+DEBUG: TestExecution in progress... 31.2% (93.6s/300.0s)
+DEBUG: TestExecution in progress... 31.6% (94.7s/300.0s)
+DEBUG: TestExecution in progress... 31.9% (95.8s/300.0s)
+DEBUG: TestExecution in progress... 32.3% (96.9s/300.0s)
+DEBUG: TestExecution in progress... 32.7% (98.0s/300.0s)
+DEBUG: TestExecution in progress... 33.0% (99.1s/300.0s)
+DEBUG: TestExecution in progress... 33.4% (100.2s/300.0s)
+DEBUG: TestExecution in progress... 33.8% (101.3s/300.0s)
+DEBUG: TestExecution in progress... 34.1% (102.3s/300.0s)
+DEBUG: TestExecution in progress... 34.5% (103.4s/300.0s)
+DEBUG: TestExecution in progress... 34.8% (104.5s/300.0s)
+DEBUG: TestExecution in progress... 35.2% (105.6s/300.0s)
+DEBUG: TestExecution in progress... 35.6% (106.7s/300.0s)
+DEBUG: TestExecution in progress... 35.9% (107.8s/300.0s)
+DEBUG: TestExecution in progress... 36.3% (108.9s/300.0s)
+DEBUG: TestExecution in progress... 36.7% (110.0s/300.0s)
+DEBUG: TestExecution in progress... 37.0% (111.0s/300.0s)
+DEBUG: TestExecution in progress... 37.4% (112.1s/300.0s)
+DEBUG: TestExecution in progress... 37.7% (113.2s/300.0s)
+DEBUG: TestExecution in progress... 38.1% (114.3s/300.0s)
+DEBUG: TestExecution in progress... 38.5% (115.4s/300.0s)
+DEBUG: TestExecution in progress... 38.8% (116.5s/300.0s)
+DEBUG: TestExecution in progress... 39.2% (117.6s/300.0s)
+DEBUG: TestExecution in progress... 39.6% (118.7s/300.0s)
+DEBUG: TestExecution in progress... 39.9% (119.8s/300.0s)
+DEBUG: TestExecution in progress... 40.3% (120.8s/300.0s)
+DEBUG: TestExecution in progress... 40.6% (121.9s/300.0s)
+DEBUG: TestExecution in progress... 41.0% (123.0s/300.0s)
+DEBUG: TestExecution in progress... 41.4% (124.1s/300.0s)
+DEBUG: TestExecution in progress... 41.7% (125.2s/300.0s)
+DEBUG: TestExecution in progress... 42.1% (126.3s/300.0s)
+DEBUG: TestExecution in progress... 42.5% (127.4s/300.0s)
+DEBUG: TestExecution in progress... 42.8% (128.5s/300.0s)
+DEBUG: TestExecution in progress... 43.2% (129.5s/300.0s)
+DEBUG: TestExecution in progress... 43.6% (130.7s/300.0s)
+DEBUG: TestExecution in progress... 43.9% (131.7s/300.0s)
+DEBUG: TestExecution in progress... 44.3% (132.8s/300.0s)
+DEBUG: TestExecution in progress... 44.6% (133.9s/300.0s)
+DEBUG: TestExecution in progress... 45.0% (135.0s/300.0s)
+DEBUG: TestExecution in progress... 45.4% (136.1s/300.0s)
+DEBUG: TestExecution in progress... 45.7% (137.2s/300.0s)
+DEBUG: TestExecution in progress... 46.1% (138.3s/300.0s)
+DEBUG: TestExecution in progress... 46.5% (139.4s/300.0s)
+DEBUG: TestExecution in progress... 46.8% (140.5s/300.0s)
+DEBUG: TestExecution in progress... 47.2% (141.5s/300.0s)
+DEBUG: TestExecution in progress... 47.5% (142.6s/300.0s)
+DEBUG: TestExecution in progress... 47.9% (143.7s/300.0s)
+DEBUG: TestExecution in progress... 48.3% (144.8s/300.0s)
+DEBUG: TestExecution in progress... 48.6% (145.9s/300.0s)
+DEBUG: TestExecution in progress... 49.0% (147.0s/300.0s)
+DEBUG: TestExecution in progress... 49.4% (148.1s/300.0s)
+DEBUG: TestExecution in progress... 49.7% (149.2s/300.0s)
+DEBUG: TestExecution in progress... 50.1% (150.3s/300.0s)
+DEBUG: TestExecution in progress... 50.4% (151.3s/300.0s)
+DEBUG: TestExecution in progress... 50.8% (152.4s/300.0s)
+DEBUG: TestExecution in progress... 51.2% (153.5s/300.0s)
+DEBUG: TestExecution in progress... 51.5% (154.6s/300.0s)
+DEBUG: TestExecution in progress... 51.9% (155.7s/300.0s)
+DEBUG: TestExecution in progress... 52.3% (156.8s/300.0s)
+DEBUG: TestExecution in progress... 52.6% (157.9s/300.0s)
+DEBUG: TestExecution in progress... 53.0% (159.0s/300.0s)
+DEBUG: TestExecution in progress... 53.4% (160.1s/300.0s)
+DEBUG: TestExecution in progress... 53.7% (161.1s/300.0s)
+DEBUG: TestExecution in progress... 54.1% (162.2s/300.0s)
+DEBUG: TestExecution in progress... 54.4% (163.3s/300.0s)
+DEBUG: TestExecution in progress... 54.8% (164.4s/300.0s)
+DEBUG: TestExecution in progress... 55.2% (165.5s/300.0s)
+DEBUG: TestExecution in progress... 55.5% (166.6s/300.0s)
+DEBUG: TestExecution in progress... 55.9% (167.7s/300.0s)
+DEBUG: TestExecution in progress... 56.3% (168.8s/300.0s)
+DEBUG: TestExecution in progress... 56.6% (169.8s/300.0s)
+DEBUG: TestExecution in progress... 57.0% (170.9s/300.0s)
+DEBUG: TestExecution in progress... 57.3% (172.0s/300.0s)
+DEBUG: TestExecution in progress... 57.7% (173.1s/300.0s)
+DEBUG: TestExecution in progress... 58.1% (174.2s/300.0s)
+DEBUG: TestExecution in progress... 58.4% (175.3s/300.0s)
+DEBUG: TestExecution in progress... 58.8% (176.4s/300.0s)
+DEBUG: TestExecution in progress... 59.2% (177.5s/300.0s)
+DEBUG: TestExecution in progress... 59.5% (178.5s/300.0s)
+DEBUG: TestExecution in progress... 59.9% (179.6s/300.0s)
+DEBUG: TestExecution in progress... 60.2% (180.7s/300.0s)
+DEBUG: TestExecution in progress... 60.6% (181.8s/300.0s)
+DEBUG: TestExecution in progress... 61.0% (182.9s/300.0s)
+DEBUG: TestExecution in progress... 61.3% (184.0s/300.0s)
+DEBUG: TestExecution in progress... 61.7% (185.1s/300.0s)
+DEBUG: TestExecution in progress... 62.1% (186.2s/300.0s)
+DEBUG: TestExecution in progress... 62.4% (187.3s/300.0s)
+DEBUG: TestExecution in progress... 62.8% (188.3s/300.0s)
+DEBUG: TestExecution in progress... 63.1% (189.4s/300.0s)
+DEBUG: TestExecution in progress... 63.5% (190.5s/300.0s)
+DEBUG: TestExecution in progress... 63.9% (191.6s/300.0s)
+DEBUG: TestExecution in progress... 64.2% (192.7s/300.0s)
+DEBUG: TestExecution in progress... 64.6% (193.8s/300.0s)
+DEBUG: TestExecution in progress... 65.0% (194.9s/300.0s)
+DEBUG: TestExecution in progress... 65.3% (196.0s/300.0s)
+DEBUG: TestExecution in progress... 65.7% (197.1s/300.0s)
+DEBUG: TestExecution in progress... 66.1% (198.2s/300.0s)
+DEBUG: TestExecution in progress... 66.4% (199.3s/300.0s)
+DEBUG: TestExecution in progress... 66.8% (200.4s/300.0s)
+DEBUG: TestExecution in progress... 67.1% (201.4s/300.0s)
+DEBUG: TestExecution in progress... 67.5% (202.5s/300.0s)
+DEBUG: TestExecution in progress... 67.9% (203.6s/300.0s)
+DEBUG: TestExecution in progress... 68.2% (204.7s/300.0s)
+DEBUG: TestExecution in progress... 68.6% (205.8s/300.0s)
+DEBUG: TestExecution in progress... 69.0% (206.9s/300.0s)
+DEBUG: TestExecution in progress... 69.3% (208.0s/300.0s)
+DEBUG: TestExecution in progress... 69.7% (209.1s/300.0s)
+DEBUG: TestExecution in progress... 70.0% (210.1s/300.0s)
+DEBUG: TestExecution in progress... 70.4% (211.2s/300.0s)
+DEBUG: TestExecution in progress... 70.8% (212.3s/300.0s)
+DEBUG: TestExecution in progress... 71.1% (213.4s/300.0s)
+DEBUG: TestExecution in progress... 71.5% (214.5s/300.0s)
+DEBUG: TestExecution in progress... 71.9% (215.6s/300.0s)
+DEBUG: TestExecution in progress... 72.2% (216.7s/300.0s)
+DEBUG: TestExecution in progress... 72.6% (217.8s/300.0s)
+DEBUG: TestExecution in progress... 73.0% (218.9s/300.0s)
+DEBUG: TestExecution in progress... 73.3% (219.9s/300.0s)
+DEBUG: TestExecution in progress... 73.7% (221.0s/300.0s)
+DEBUG: TestExecution in progress... 74.0% (222.1s/300.0s)
+DEBUG: TestExecution in progress... 74.4% (223.2s/300.0s)
+DEBUG: TestExecution in progress... 74.8% (224.3s/300.0s)
+DEBUG: TestExecution in progress... 75.1% (225.4s/300.0s)
+DEBUG: TestExecution in progress... 75.5% (226.5s/300.0s)
+DEBUG: TestExecution in progress... 75.9% (227.6s/300.0s)
+DEBUG: TestExecution in progress... 76.2% (228.6s/300.0s)
+DEBUG: TestExecution in progress... 76.6% (229.7s/300.0s)
+DEBUG: TestExecution in progress... 76.9% (230.8s/300.0s)
+DEBUG: TestExecution in progress... 77.3% (231.9s/300.0s)
+DEBUG: TestExecution in progress... 77.7% (233.0s/300.0s)
+DEBUG: TestExecution in progress... 78.0% (234.1s/300.0s)
+DEBUG: TestExecution in progress... 78.4% (235.2s/300.0s)
+DEBUG: TestExecution in progress... 78.8% (236.3s/300.0s)
+DEBUG: TestExecution in progress... 79.1% (237.3s/300.0s)
+DEBUG: TestExecution in progress... 79.5% (238.4s/300.0s)
+DEBUG: TestExecution in progress... 79.8% (239.5s/300.0s)
+DEBUG: TestExecution in progress... 80.2% (240.6s/300.0s)
+DEBUG: TestExecution in progress... 80.6% (241.7s/300.0s)
+DEBUG: TestExecution in progress... 80.9% (242.8s/300.0s)
+DEBUG: TestExecution in progress... 81.3% (243.9s/300.0s)
+DEBUG: TestExecution in progress... 81.7% (245.0s/300.0s)
+DEBUG: TestExecution in progress... 82.0% (246.0s/300.0s)
+DEBUG: TestExecution in progress... 82.4% (247.1s/300.0s)
+DEBUG: TestExecution in progress... 82.7% (248.2s/300.0s)
+DEBUG: TestExecution in progress... 83.1% (249.3s/300.0s)
+DEBUG: TestExecution in progress... 83.5% (250.4s/300.0s)
+DEBUG: TestExecution in progress... 83.8% (251.5s/300.0s)
+DEBUG: TestExecution in progress... 84.2% (252.6s/300.0s)
+DEBUG: TestExecution in progress... 84.6% (253.7s/300.0s)
+DEBUG: TestExecution in progress... 84.9% (254.8s/300.0s)
+DEBUG: TestExecution in progress... 85.3% (255.8s/300.0s)
+DEBUG: TestExecution in progress... 85.6% (256.9s/300.0s)
+DEBUG: TestExecution in progress... 86.0% (258.0s/300.0s)
+DEBUG: TestExecution in progress... 86.4% (259.1s/300.0s)
+DEBUG: TestExecution in progress... 86.7% (260.2s/300.0s)
+DEBUG: TestExecution in progress... 87.1% (261.3s/300.0s)
+DEBUG: TestExecution in progress... 87.5% (262.4s/300.0s)
+DEBUG: TestExecution in progress... 87.8% (263.5s/300.0s)
+DEBUG: TestExecution in progress... 88.2% (264.6s/300.0s)
+DEBUG: TestExecution in progress... 88.6% (265.7s/300.0s)
+DEBUG: TestExecution in progress... 88.9% (266.7s/300.0s)
+DEBUG: TestExecution in progress... 89.3% (267.8s/300.0s)
+DEBUG: TestExecution in progress... 89.6% (268.9s/300.0s)
+DEBUG: TestExecution in progress... 90.0% (270.0s/300.0s)
+DEBUG: TestExecution in progress... 90.4% (271.1s/300.0s)
+DEBUG: TestExecution in progress... 90.7% (272.2s/300.0s)
+DEBUG: TestExecution in progress... 91.1% (273.3s/300.0s)
+DEBUG: TestExecution in progress... 91.4% (274.3s/300.0s)
+DEBUG: TestExecution in progress... 91.8% (275.4s/300.0s)
+DEBUG: TestExecution in progress... 92.2% (276.5s/300.0s)
+DEBUG: TestExecution in progress... 92.5% (277.6s/300.0s)
+DEBUG: TestExecution in progress... 92.9% (278.7s/300.0s)
+DEBUG: TestExecution in progress... 93.2% (279.7s/300.0s)
+DEBUG: TestExecution in progress... 93.6% (280.8s/300.0s)
+DEBUG: TestExecution in progress... 94.0% (281.9s/300.0s)
+DEBUG: TestExecution in progress... 94.3% (283.0s/300.0s)
+DEBUG: TestExecution in progress... 94.7% (284.1s/300.0s)
+DEBUG: TestExecution in progress... 95.1% (285.2s/300.0s)
+DEBUG: TestExecution in progress... 95.4% (286.3s/300.0s)
+DEBUG: TestExecution in progress... 95.8% (287.4s/300.0s)
+DEBUG: TestExecution in progress... 96.1% (288.4s/300.0s)
+DEBUG: TestExecution in progress... 96.5% (289.5s/300.0s)
+DEBUG: TestExecution in progress... 96.9% (290.6s/300.0s)
+DEBUG: TestExecution in progress... 97.2% (291.7s/300.0s)
+DEBUG: TestExecution in progress... 97.6% (292.8s/300.0s)
+DEBUG: TestExecution in progress... 98.0% (293.9s/300.0s)
+DEBUG: TestExecution in progress... 98.3% (295.0s/300.0s)
+DEBUG: TestExecution in progress... 98.7% (296.1s/300.0s)
+DEBUG: TestExecution in progress... 99.1% (297.2s/300.0s)
+DEBUG: TestExecution in progress... 99.4% (298.2s/300.0s)
+DEBUG: TestExecution in progress... 99.8% (299.3s/300.0s)
+DEBUG: Test execution completed in 300090ms
+
+
+
+TEST ERROR: examples\000__01_file_directory_operations.sh with perl generator
+Test: 1/146 (0 passed before error)
+Error: TestExecution timed out after 300.0 seconds
+
+ORIGINAL SHELL SCRIPT:
+#!/bin/bash
+
+# File and directory operations with backticks
+# This file demonstrates using backticks with file system commands
+
+echo "=== File and Directory Operations ==="
+
+# ls command with backticks
+#PERL_MUST_NOT_CONTAIN `ls
+file_list=`ls -a`
+echo "File listing:"
+echo "$file_list"
+
+# find command with backticks
+#PERL_MUST_NOT_CONTAIN `find
+found_files=`find . -maxdepth 1 -name "*.sh" -type f`
+echo "Found shell scripts:"
+echo "$found_files"
+
+# basename and dirname with backticks
+#PERL_MUST_NOT_CONTAIN `basename
+#PERL_MUST_NOT_CONTAIN `dirname
+#script_name=`basename $0`
+#script_dir=`dirname $0`
+#echo "Script name: $script_name"
+#echo "Script directory: $script_dir"
+
+
+Writing test count 0 to first_n_tests_passed.txt (parsing error)
+Current working directory: "D:\\GitHub\\sh2perl"
+Successfully wrote test count 0 and error code 6 (parser error) to first_n_tests_passed.txt
+To run test again: ./fail 000__01
+Running test_purify.pl validation...
+Running test_purify.pl with verbose output
+Running test_purify.pl with next option
+Testing purify.pl exists...
+Testing debashc exists...
+Testing examples.impurl directory exists...
+Testing purify.pl on examples.impurl/001_echo_basic.pl...
+  ✓ examples.impurl/001_echo_basic.pl processed successfully
+Testing purify.pl on examples.impurl/002_printf_basic.pl...
+  ✓ examples.impurl/002_printf_basic.pl processed successfully
+Testing purify.pl on examples.impurl/003_ls_basic.pl...
+  ✓ examples.impurl/003_ls_basic.pl processed successfully
+Testing purify.pl --help...
+test_purify.pl completed successfully
+test_purify.pl passed, continuing with other commands...
+Test run completed at Sun, Sep 21, 2025  8:48:01 PM

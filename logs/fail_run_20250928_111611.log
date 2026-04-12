@@ -1,0 +1,1499 @@
+Starting test run at Sun Sep 28 11:16:11 AWST 2025
+Logging to: logs/fail_run_20250928_111611.log
+Test arguments: 
+----------------------------------------
+Compiling debashc...
+   Compiling wasm-bindgen-shared v0.2.103
+   Compiling generic-array v0.14.7
+   Compiling rustversion v1.0.22
+   Compiling serde_core v1.0.226
+   Compiling serde_json v1.0.145
+   Compiling wasm-bindgen v0.2.103
+   Compiling logos-codegen v0.15.1
+   Compiling wasm-bindgen-backend v0.2.103
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.6
+   Compiling digest v0.10.7
+   Compiling serde v1.0.226
+   Compiling wasm-bindgen-macro-support v0.2.103
+   Compiling logos-derive v0.15.1
+   Compiling sha2 v0.10.9
+   Compiling wasm-bindgen-macro v0.2.103
+   Compiling logos v0.15.1
+   Compiling js-sys v0.3.80
+   Compiling console_error_panic_hook v0.1.7
+   Compiling web-sys v0.3.80
+   Compiling debashl v0.1.0 (/mnt/d/GitHub/sh2perl)
+warning: unused import: `Token`
+    --> src/parser/commands.rs:1351:31
+     |
+1351 |     use crate::lexer::{Lexer, Token};
+     |                               ^^^^^
+     |
+     = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `regex::Regex`
+ --> src/generator/commands/pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src/generator/redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src/timeout_manager.rs:282:1
+    |
+282 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: variable does not need to be mutable
+    --> src/parser/commands.rs:1354:9
+     |
+1354 |     let mut lexer = Lexer::new(text);
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `cmd2`
+   --> src/generator/commands/pipeline_commands.rs:469:66
+    |
+469 |         if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline.commands[1]) {
+    |                                                                  ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: variable `head_max` is assigned to, but never used
+   --> src/generator/commands/pipeline_commands.rs:836:25
+    |
+836 |                 let mut head_max = 10; // Default value
+    |                         ^^^^^^^^
+    |
+    = note: consider using `_head_max` instead
+
+warning: value assigned to `head_max` is never read
+   --> src/generator/commands/pipeline_commands.rs:847:53
+    |
+847 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `head_max` is never read
+   --> src/generator/commands/pipeline_commands.rs:854:53
+    |
+854 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `head_max` is never read
+   --> src/generator/commands/pipeline_commands.rs:859:49
+    |
+859 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+   --> src/generator/commands/pipeline_commands.rs:883:22
+    |
+883 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src/generator/commands/pipeline_commands.rs:897:34
+    |
+897 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+    |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src/generator/commands/system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src/generator/commands/find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src/generator/commands/find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `input_var`
+ --> src/generator/commands/comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `command_str`
+   --> src/generator/words.rs:554:37
+    |
+554 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `literal`
+   --> src/generator/words.rs:385:59
+    |
+385 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `s`
+   --> src/generator/words.rs:842:23
+    |
+842 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+    |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `literal`
+   --> src/generator/utils.rs:151:59
+    |
+151 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:151:13
+    |
+151 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:194:13
+    |
+194 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src/parser/commands.rs:1186:8
+     |
+  20 | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src/parser/control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src/parser/control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src/parser/words.rs:1885:4
+     |
+1885 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src/generator/commands/find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src/generator/commands/find.rs:195:4
+    |
+195 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src/generator/commands/tr.rs:24:4
+   |
+24 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src/generator/commands/tr.rs:73:4
+   |
+73 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src/generator/control_flow.rs:230:4
+    |
+230 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for_loop_index: usize) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src/variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 32 warnings (run `cargo fix --lib -p debashl` to apply 5 suggestions)
+warning: unused import: `execute_with_progress`
+ --> src/testing.rs:9:67
+  |
+9 | use crate::timeout_manager::{OperationType, execute_with_timeout, execute_with_progress, 
+  |                                                                   ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src/testing.rs:16:5
+   |
+16 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src/testing.rs:25:9
+   |
+25 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src/testing.rs:1188:9
+     |
+1188 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src/testing.rs:1397:9
+     |
+1397 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src/testing.rs:1445:9
+     |
+1445 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src/testing.rs:1994:13
+     |
+1994 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src/testing.rs:1994:9
+     |
+1994 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src/execution.rs:62:8
+   |
+62 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String> {
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src/utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src/utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src/utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src/testing.rs:19:4
+   |
+19 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String> 
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src/testing.rs:52:9
+   |
+39 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+52 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+53 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src/testing.rs:552:8
+    |
+552 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>) -> Result<TestResult, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src/testing.rs:1393:8
+     |
+1393 | pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src/cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src/cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src/timeout_manager.rs:11:5
+   |
+ 8 | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src/timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src/timeout_manager.rs:117:12
+    |
+ 90 | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: Duration) {
+    |            ^^^^^^^^^^^
+...
+178 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src/timeout_manager.rs:302:8
+    |
+302 | pub fn execute_with_progress<F, T>(operation: OperationType, operation_fn: F) -> Result<T, String>
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 05s
+Running test_purify.pl validation...
+Running test_purify.pl with verbose output
+Running test_purify.pl with next option
+DEBUG[1759029437.870]: Found 54 .pl files in examples.impurl directory
+DEBUG[1759029437.870]: Files to process: examples.impurl/000benchmark.pl, examples.impurl/001_echo_basic.pl, examples.impurl/002_printf_basic.pl, examples.impurl/003__ls_basic.pl, examples.impurl/003_ls_basic.pl, examples.impurl/004_cat_basic.pl, examples.impurl/005_wc_basic.pl, examples.impurl/006_head_basic.pl, examples.impurl/007_tail_basic.pl, examples.impurl/008_date_basic.pl, examples.impurl/009_sleep_basic.pl, examples.impurl/010_which_basic.pl, examples.impurl/011_grep_basic.pl, examples.impurl/012_sed_basic.pl, examples.impurl/013_awk_basic.pl, examples.impurl/014_tr_basic.pl, examples.impurl/015_cut_basic.pl, examples.impurl/016_sort_basic.pl, examples.impurl/017_uniq_basic.pl, examples.impurl/018_paste_basic.pl, examples.impurl/019_comm_basic.pl, examples.impurl/020_diff_basic.pl, examples.impurl/021_find_basic.pl, examples.impurl/022_cp_basic.pl, examples.impurl/023_mv_basic.pl, examples.impurl/024_rm_basic.pl, examples.impurl/025_mkdir_basic.pl, examples.impurl/026_touch_basic.pl, examples.impurl/027_basename_basic.pl, examples.impurl/028_dirname_basic.pl, examples.impurl/029_xargs_basic.pl, examples.impurl/030_tee_basic.pl, examples.impurl/031_time_basic.pl, examples.impurl/032_kill_basic.pl, examples.impurl/033_nice_basic.pl, examples.impurl/034_nohup_basic.pl, examples.impurl/035_pipeline_basic.pl, examples.impurl/036_control_flow_basic.pl, examples.impurl/037_complex_pipeline.pl, examples.impurl/038_advanced_control_flow.pl, examples.impurl/039_subshell_operations.pl, examples.impurl/040_most_complex_example.pl, examples.impurl/041_compression_network.pl, examples.impurl/042_checksum_verification.pl, examples.impurl/043_string_processing.pl, examples.impurl/044_yes_command.pl, examples.impurl/045_read_command.pl, examples.impurl/046_perl_command.pl, examples.impurl/047_advanced_pipelines.pl, examples.impurl/048_nested_control_flow.pl, examples.impurl/049_ultimate_complex_example.pl, examples.impurl/050_final_example.pl, examples.impurl/051_remaining_examples.pl, examples.impurl/052_complex_usage_examples.pl
+DEBUG[1759029437.870]: Testing purify.pl --help...
+DEBUG[1759029437.870]: Starting purify.pl help test (timeout: 5s, type: purify_help)
+DEBUG[1759029438.405]: purify.pl help test completed in 0.534433841705322s (exit code: 0)
+DEBUG[1759029438.405]: purify.pl --help test passed
+DEBUG[1759029438.405]: Progress: [                    ] 1% (1/54) - Processing files
+DEBUG[1759029438.405]: Testing purify.pl on examples.impurl/000benchmark.pl -> pure/000benchmark.pl
+DEBUG[1759029438.405]: File 1 of 54
+DEBUG[1759029438.405]: Running purify.pl on examples.impurl/000benchmark.pl
+DEBUG[1759029438.405]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029438.980]: purify.pl execution completed in 0.575088977813721s (exit code: 0)
+DEBUG[1759029438.980]: purify.pl result: 0
+DEBUG[1759029438.980]: ✓ examples.impurl/000benchmark.pl: purify.pl processed successfully
+DEBUG[1759029438.980]: Checking if pure/000benchmark.pl still contains system calls or backticks
+DEBUG[1759029438.980]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029439.080]: grep check completed in 0.0994491577148438s (exit code: 1)
+DEBUG[1759029439.080]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029439.080]: Running original file: examples.impurl/000benchmark.pl
+DEBUG[1759029439.080]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029439.376]: original file execution completed in 0.295953035354614s (exit code: 0)
+DEBUG[1759029439.376]: Original file execution result: 0
+DEBUG[1759029439.376]: Running purified file: pure/000benchmark.pl
+DEBUG[1759029439.376]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029439.599]: purified file execution completed in 0.223011016845703s (exit code: 0)
+DEBUG[1759029439.599]: Purified file execution result: 0
+DEBUG[1759029439.599]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759029439.599]: Progress: [                    ] 3% (2/54) - Processing files
+DEBUG[1759029439.599]: Testing purify.pl on examples.impurl/001_echo_basic.pl -> pure/001_echo_basic.pl
+DEBUG[1759029439.599]: File 2 of 54
+DEBUG[1759029439.599]: Running purify.pl on examples.impurl/001_echo_basic.pl
+DEBUG[1759029439.599]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029440.336]: purify.pl execution completed in 0.736932039260864s (exit code: 0)
+DEBUG[1759029440.336]: purify.pl result: 0
+DEBUG[1759029440.336]: ✓ examples.impurl/001_echo_basic.pl: purify.pl processed successfully
+DEBUG[1759029440.336]: Checking if pure/001_echo_basic.pl still contains system calls or backticks
+DEBUG[1759029440.337]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029440.385]: grep check completed in 0.0485100746154785s (exit code: 1)
+DEBUG[1759029440.385]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029440.385]: Running original file: examples.impurl/001_echo_basic.pl
+DEBUG[1759029440.385]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029440.917]: original file execution completed in 0.531898975372314s (exit code: 0)
+DEBUG[1759029440.917]: Original file execution result: 0
+DEBUG[1759029440.917]: Running purified file: pure/001_echo_basic.pl
+DEBUG[1759029440.917]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029441.289]: purified file execution completed in 0.372199058532715s (exit code: 0)
+DEBUG[1759029441.289]: Purified file execution result: 0
+DEBUG[1759029441.289]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759029441.290]: Progress: [=                   ] 5% (3/54) - Processing files
+DEBUG[1759029441.290]: Testing purify.pl on examples.impurl/002_printf_basic.pl -> pure/002_printf_basic.pl
+DEBUG[1759029441.290]: File 3 of 54
+DEBUG[1759029441.290]: Running purify.pl on examples.impurl/002_printf_basic.pl
+DEBUG[1759029441.290]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029442.213]: purify.pl execution completed in 0.923722982406616s (exit code: 0)
+DEBUG[1759029442.213]: purify.pl result: 0
+DEBUG[1759029442.213]: ✓ examples.impurl/002_printf_basic.pl: purify.pl processed successfully
+DEBUG[1759029442.213]: Checking if pure/002_printf_basic.pl still contains system calls or backticks
+DEBUG[1759029442.213]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029442.253]: grep check completed in 0.0401070117950439s (exit code: 1)
+DEBUG[1759029442.254]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029442.254]: Running original file: examples.impurl/002_printf_basic.pl
+DEBUG[1759029442.254]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029443.295]: original file execution completed in 1.04149723052979s (exit code: 0)
+DEBUG[1759029443.295]: Original file execution result: 0
+DEBUG[1759029443.295]: Running purified file: pure/002_printf_basic.pl
+DEBUG[1759029443.295]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029443.839]: purified file execution completed in 0.544323205947876s (exit code: 0)
+DEBUG[1759029443.839]: Purified file execution result: 0
+DEBUG[1759029443.840]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759029443.840]: Progress: [=                   ] 7% (4/54) - Processing files
+DEBUG[1759029443.840]: Testing purify.pl on examples.impurl/003__ls_basic.pl -> pure/003__ls_basic.pl
+DEBUG[1759029443.840]: File 4 of 54
+DEBUG[1759029443.840]: Running purify.pl on examples.impurl/003__ls_basic.pl
+DEBUG[1759029443.840]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029444.396]: purify.pl execution completed in 0.556733846664429s (exit code: 0)
+DEBUG[1759029444.397]: purify.pl result: 0
+DEBUG[1759029444.397]: ✓ examples.impurl/003__ls_basic.pl: purify.pl processed successfully
+DEBUG[1759029444.397]: Checking if pure/003__ls_basic.pl still contains system calls or backticks
+DEBUG[1759029444.397]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029444.431]: grep check completed in 0.0348081588745117s (exit code: 1)
+DEBUG[1759029444.431]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029444.431]: Running original file: examples.impurl/003__ls_basic.pl
+DEBUG[1759029444.431]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029444.639]: original file execution completed in 0.207357883453369s (exit code: 0)
+DEBUG[1759029444.639]: Original file execution result: 0
+DEBUG[1759029444.639]: Running purified file: pure/003__ls_basic.pl
+DEBUG[1759029444.639]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029444.791]: purified file execution completed in 0.152427911758423s (exit code: 0)
+DEBUG[1759029444.791]: Purified file execution result: 0
+DEBUG[1759029444.791]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759029444.791]: Progress: [=                   ] 9% (5/54) - Processing files
+DEBUG[1759029444.791]: Testing purify.pl on examples.impurl/003_ls_basic.pl -> pure/003_ls_basic.pl
+DEBUG[1759029444.791]: File 5 of 54
+DEBUG[1759029444.791]: Running purify.pl on examples.impurl/003_ls_basic.pl
+DEBUG[1759029444.791]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029445.500]: purify.pl execution completed in 0.708178997039795s (exit code: 0)
+DEBUG[1759029445.500]: purify.pl result: 0
+DEBUG[1759029445.500]: ✓ examples.impurl/003_ls_basic.pl: purify.pl processed successfully
+DEBUG[1759029445.500]: Checking if pure/003_ls_basic.pl still contains system calls or backticks
+DEBUG[1759029445.500]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029445.539]: grep check completed in 0.0395259857177734s (exit code: 1)
+DEBUG[1759029445.539]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029445.539]: Running original file: examples.impurl/003_ls_basic.pl
+DEBUG[1759029445.539]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029446.053]: original file execution completed in 0.514000177383423s (exit code: 0)
+DEBUG[1759029446.053]: Original file execution result: 0
+DEBUG[1759029446.053]: Running purified file: pure/003_ls_basic.pl
+DEBUG[1759029446.053]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029446.407]: purified file execution completed in 0.353404998779297s (exit code: 0)
+DEBUG[1759029446.407]: Purified file execution result: 0
+DEBUG[1759029446.407]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759029446.407]: Progress: [==                  ] 11% (6/54) - Processing files
+DEBUG[1759029446.407]: Testing purify.pl on examples.impurl/004_cat_basic.pl -> pure/004_cat_basic.pl
+DEBUG[1759029446.407]: File 6 of 54
+DEBUG[1759029446.407]: Running purify.pl on examples.impurl/004_cat_basic.pl
+DEBUG[1759029446.407]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029447.198]: purify.pl execution completed in 0.790590047836304s (exit code: 0)
+DEBUG[1759029447.198]: purify.pl result: 0
+DEBUG[1759029447.198]: ✓ examples.impurl/004_cat_basic.pl: purify.pl processed successfully
+DEBUG[1759029447.198]: Checking if pure/004_cat_basic.pl still contains system calls or backticks
+DEBUG[1759029447.198]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029447.235]: grep check completed in 0.0373599529266357s (exit code: 1)
+DEBUG[1759029447.235]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029447.235]: Running original file: examples.impurl/004_cat_basic.pl
+DEBUG[1759029447.235]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029447.807]: original file execution completed in 0.57188892364502s (exit code: 0)
+DEBUG[1759029447.807]: Original file execution result: 0
+DEBUG[1759029447.807]: Running purified file: pure/004_cat_basic.pl
+DEBUG[1759029447.807]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029448.173]: purified file execution completed in 0.365525007247925s (exit code: 0)
+DEBUG[1759029448.173]: Purified file execution result: 0
+DEBUG[1759029448.173]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759029448.173]: Progress: [==                  ] 12% (7/54) - Processing files
+DEBUG[1759029448.173]: Testing purify.pl on examples.impurl/005_wc_basic.pl -> pure/005_wc_basic.pl
+DEBUG[1759029448.173]: File 7 of 54
+DEBUG[1759029448.173]: Running purify.pl on examples.impurl/005_wc_basic.pl
+DEBUG[1759029448.173]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029448.938]: purify.pl execution completed in 0.764487028121948s (exit code: 0)
+DEBUG[1759029448.938]: purify.pl result: 0
+DEBUG[1759029448.938]: ✓ examples.impurl/005_wc_basic.pl: purify.pl processed successfully
+DEBUG[1759029448.938]: Checking if pure/005_wc_basic.pl still contains system calls or backticks
+DEBUG[1759029448.938]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029448.982]: grep check completed in 0.0447781085968018s (exit code: 1)
+DEBUG[1759029448.982]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029448.982]: Running original file: examples.impurl/005_wc_basic.pl
+DEBUG[1759029448.983]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029449.675]: original file execution completed in 0.69202709197998s (exit code: 0)
+DEBUG[1759029449.675]: Original file execution result: 0
+DEBUG[1759029449.675]: Running purified file: pure/005_wc_basic.pl
+DEBUG[1759029449.675]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029450.172]: purified file execution completed in 0.49774694442749s (exit code: 0)
+DEBUG[1759029450.172]: Purified file execution result: 0
+DEBUG[1759029450.172]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759029450.173]: Progress: [==                  ] 14% (8/54) - Processing files
+DEBUG[1759029450.173]: Testing purify.pl on examples.impurl/006_head_basic.pl -> pure/006_head_basic.pl
+DEBUG[1759029450.173]: File 8 of 54
+DEBUG[1759029450.173]: Running purify.pl on examples.impurl/006_head_basic.pl
+DEBUG[1759029450.173]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029450.934]: purify.pl execution completed in 0.760949850082397s (exit code: 0)
+DEBUG[1759029450.934]: purify.pl result: 0
+DEBUG[1759029450.934]: ✓ examples.impurl/006_head_basic.pl: purify.pl processed successfully
+DEBUG[1759029450.934]: Checking if pure/006_head_basic.pl still contains system calls or backticks
+DEBUG[1759029450.934]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029450.970]: grep check completed in 0.0359020233154297s (exit code: 1)
+DEBUG[1759029450.970]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029450.970]: Running original file: examples.impurl/006_head_basic.pl
+DEBUG[1759029450.970]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029451.462]: original file execution completed in 0.492680072784424s (exit code: 0)
+DEBUG[1759029451.462]: Original file execution result: 0
+DEBUG[1759029451.462]: Running purified file: pure/006_head_basic.pl
+DEBUG[1759029451.462]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029451.765]: purified file execution completed in 0.302312135696411s (exit code: 0)
+DEBUG[1759029451.765]: Purified file execution result: 0
+DEBUG[1759029451.765]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759029451.765]: Progress: [===                 ] 16% (9/54) - Processing files
+DEBUG[1759029451.765]: Testing purify.pl on examples.impurl/007_tail_basic.pl -> pure/007_tail_basic.pl
+DEBUG[1759029451.765]: File 9 of 54
+DEBUG[1759029451.765]: Running purify.pl on examples.impurl/007_tail_basic.pl
+DEBUG[1759029451.765]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029452.842]: purify.pl execution completed in 1.07674789428711s (exit code: 0)
+DEBUG[1759029452.842]: purify.pl result: 0
+DEBUG[1759029452.842]: ✓ examples.impurl/007_tail_basic.pl: purify.pl processed successfully
+DEBUG[1759029452.842]: Checking if pure/007_tail_basic.pl still contains system calls or backticks
+DEBUG[1759029452.842]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029452.895]: grep check completed in 0.0527899265289307s (exit code: 1)
+DEBUG[1759029452.895]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029452.895]: Running original file: examples.impurl/007_tail_basic.pl
+DEBUG[1759029452.895]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029453.541]: original file execution completed in 0.646476030349731s (exit code: 0)
+DEBUG[1759029453.541]: Original file execution result: 0
+DEBUG[1759029453.541]: Running purified file: pure/007_tail_basic.pl
+DEBUG[1759029453.541]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759029454.078]: purified file execution completed in 0.537058115005493s (exit code: 0)
+DEBUG[1759029454.078]: Purified file execution result: 0
+DEBUG[1759029454.078]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759029454.079]: Progress: [===                 ] 18% (10/54) - Processing files
+DEBUG[1759029454.079]: Testing purify.pl on examples.impurl/008_date_basic.pl -> pure/008_date_basic.pl
+DEBUG[1759029454.079]: File 10 of 54
+DEBUG[1759029454.079]: Running purify.pl on examples.impurl/008_date_basic.pl
+DEBUG[1759029454.079]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759029455.110]: purify.pl execution completed in 1.03180503845215s (exit code: 0)
+DEBUG[1759029455.110]: purify.pl result: 0
+DEBUG[1759029455.111]: ✓ examples.impurl/008_date_basic.pl: purify.pl processed successfully
+DEBUG[1759029455.111]: Checking if pure/008_date_basic.pl still contains system calls or backticks
+DEBUG[1759029455.111]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759029455.143]: grep check completed in 0.0321810245513916s (exit code: 1)
+DEBUG[1759029455.143]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759029455.143]: Running original file: examples.impurl/008_date_basic.pl
+DEBUG[1759029455.143]: Starting original file execution (timeout: 30s, type: perl_execution)
+test_purify.pl passed, continuing with other commands...
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+DEBUG: Starting test execution for 
+Running 146 tests across 146 examples with perl generator
+==================================================
+examples\000__01_file_directory_operations.sh with generator perl
+Test 1/146: 000__01_file_directory_operations.sh with perl     DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__01_file_directory_operations.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-maxdepth", None), Literal("1", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1547 characters
+DEBUG: check_perl_no_open3_builtins called with 1547 characters
+DEBUG: check_perl_no_system_builtins called with 1547 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1547 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== File an
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 5.2µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 220.2006ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 9035, Translated stdout length: 9035
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+✓DEBUG: Test execution completed in Test 2/146: 000__02_output_formatting_commands.sh with perl     7211ms
+DEBUG: Starting test execution for examples\000__02_output_formatting_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__02_output_formatting_commands.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("Hello from backticks", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("printf", None), args: [Literal("Number: %d, String: %s\\n", None), Literal("42", None), Literal("test", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha256sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha256sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha512sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha512sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("strings", None), args: [Literal("test_binary.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test output")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tee", None), args: [Literal("test_tee.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 6106 characters
+DEBUG: check_perl_no_open3_builtins called with 6106 characters
+DEBUG: check_perl_no_system_builtins called with 6106 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 6106 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use Digest::SHA qw(sha256_hex sha512_hex);
+use File::Path qw(make_path remove_tree
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 4.9µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 252.0336ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 660, Translated stdout length: 660
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+✓DEBUG: Test execution completed in Test 3/146: 000__03_file_manipulation_commands.sh with perl     7179ms
+DEBUG: Starting test execution for examples\000__03_file_manipulation_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__03_file_manipulation_commands.sh
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("cp", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("cp", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native cp implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("mv", None), args: [Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("mv", None), args: [Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native mv implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_file.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_file.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native rm implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory created")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native mkdir implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory created")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_dir'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File touched")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native touch implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File touched")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Perl code generated, length: 15968 characters
+DEBUG: check_perl_no_open3_builtins called with 15968 characters
+DEBUG: check_perl_no_system_builtins called with 15968 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 15968 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+use POSIX 
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 5µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 262.4806ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 422, Translated stdout length: 422
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 7081ms
+✓DEBUG: Starting test execution for Test 4/146: 000__04a_basic_command_substitution.sh with perl     examples\000__04a_basic_command_substitution.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: String interpolation parsed command 'date +%Y' as 1 commands
+DEBUG: String interpolation parsed command 'basename $(pwd)' as 1 commands
+DEBUG: Setting original script name to: 000__04a_basic_command_substitution.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("basename", None), args: [CommandSubstitution(Simple(SimpleCommand { name: Literal("pwd", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("pwd", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("basename", None), args: [CommandSubstitution(Simple(SimpleCommand { name: Literal("pwd", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("pwd", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y%m", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Perl code generated, length: 1148 characters
+DEBUG: check_perl_no_open3_builtins called with 1148 characters
+DEBUG: check_perl_no_system_builtins called with 1148 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1148 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== Basic C
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 7.2µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 189.8047ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 172, Translated stdout length: 172
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+✓DEBUG: Test execution completed in Test 5/146: 000__04b_file_directory_operations.sh with perl     6700ms
+DEBUG: Progress: 5/146 tests completed (3.4%)
+DEBUG: Starting test execution for examples\000__04b_file_directory_operations.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04b_file_directory_operations.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1628 characters
+DEBUG: check_perl_no_open3_builtins called with 1628 characters
+DEBUG: check_perl_no_system_builtins called with 1628 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1628 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== File an
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 12.4µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 210.7786ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 9082, Translated stdout length: 9082
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+✓DEBUG: Test execution completed in Test 6/146: 000__04c_text_processing_commands.sh with perl     6896ms
+DEBUG: Starting test execution for examples\000__04c_text_processing_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04c_text_processing_commands.sh
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("cat", None), args: [Literal("000__04c_text_processing_commands.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-5", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-n", None), Literal("echo", None), Literal("000__04c_text_processing_commands.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sed", None), args: [Literal("s/World/Universe/", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("1 2 3 4 5")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("awk", None), args: [Literal("{print $1 + $2}", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("zebra\\napple\\nbanana")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sort", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("apple\\napple\\nbanana\\nbanana\\ncherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("uniq", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("line1\\nline2\\nline3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-w", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("seq", None), args: [Literal("1", None), Literal("10", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("seq", None), args: [Literal("1", None), Literal("10", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tail", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("apple:banana:cherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("cut", None), args: [Literal("-d", None), Literal(":", None), Literal("-f", None), Literal("2", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("paste", None), args: [Literal("temp1.txt", None), Literal("temp2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("comm", None), args: [Literal("-12", None), Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has no process substitution, using dedicated implementation
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("diff", None), args: [Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing diff command in command substitution with args: [Literal("file1.txt", None), Literal("file2.txt", None)]
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("HELLO WORLD")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tr", None), args: [Literal("A-Z", None), Literal("a-z", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("1 2 3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("xargs", None), args: [Literal("-n", None), Literal("1", None), Literal("echo", None), StringInterpolation(StringInterpolation { parts: [Literal("Number:")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 16302 characters
+DEBUG: check_perl_no_open3_builtins called with 16302 characters
+DEBUG: check_perl_no_system_builtins called with 16302 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 16302 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success 
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 4.9µs
+DEBUG: Execution loop iteration, elapsed: 200.2593ms
+DEBUG: Execution loop iteration, elapsed: 400.0833ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 400.3854ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 2154, Translated stdout length: 2154
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+✓DEBUG: Test execution completed in Test 7/146: 000__04d_system_utilities.sh with perl     11902ms
+DEBUG: Starting test execution for examples\000__04d_system_utilities.sh with generator perl
+DEBUG: Running shell script: examples\000__04d_system_utilities.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 1.16s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04d_system_utilities.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y-%m-%d", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("yes", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 1076 characters
+DEBUG: check_perl_no_open3_builtins called with 1076 characters
+DEBUG: check_perl_no_system_builtins called with 1076 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1076 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== System 
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 4.6µs
+DEBUG: Execution loop iteration, elapsed: 700.0899ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 1.1271228s, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+✓DEBUG: Test completed, comparing outputs
+Test 8/146: 000__04e_file_manipulation.sh with perl     DEBUG: Shell stdout length: 149, Translated stdout length: 149
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 9538ms
+DEBUG: Starting test execution for examples\000__04e_file_manipulation.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04e_file_manipulation.sh
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("cp", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("cp", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native cp implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("mv", None), args: [Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("mv", None), args: [Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native mv implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_file.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_file.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native rm implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory created")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native mkdir implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory created")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_dir'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File touched")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native touch implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File touched")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Perl code generated, length: 15230 characters
+DEBUG: check_perl_no_open3_builtins called with 15230 characters
+DEBUG: check_perl_no_system_builtins called with 15230 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 15230 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+use POSIX 
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 4.9µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 176.9713ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+✓DEBUG: Shell stdout length: 360, Translated stdout length: 360
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+Test 9/146: 000__04f_output_formatting.sh with perl     DEBUG: Test execution completed in 6176ms
+DEBUG: Starting test execution for examples\000__04f_output_formatting.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04f_output_formatting.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("Hello from backticks", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("printf", None), args: [Literal("Number: %d, String: %s\\n", None), Literal("42", None), Literal("test", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test output")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tee", None), args: [Literal("test_tee.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 1555 characters
+DEBUG: check_perl_no_open3_builtins called with 1555 characters
+DEBUG: check_perl_no_system_builtins called with 1555 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1555 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success 
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 3.8µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 178.5914ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 184, Translated stdout length: 184
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 6684ms
+✓DEBUG: Progress: Test 10/146: 000__04g_checksum_commands.sh with perl     10/146 tests completed (6.8%)
+DEBUG: Starting test execution for examples\000__04g_checksum_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04g_checksum_commands.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha256sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha256sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha512sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha512sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("strings", None), args: [Literal("target/debug/debashc.exe", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 3856 characters
+DEBUG: check_perl_no_open3_builtins called with 3856 characters
+DEBUG: check_perl_no_system_builtins called with 3856 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 3856 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use Digest::SHA qw(sha256_hex sha512_hex);
+use File::Path qw(make_path remove_tree
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 5.1µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 188.7992ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+✓DEBUG: Test completed, comparing outputs
+Test 11/146: 000__04h_complex_examples.sh with perl     DEBUG: Shell stdout length: 339, Translated stdout length: 339
+DEBUG: Shell stderr length: 49, Translated stderr length: 49
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 6382ms
+DEBUG: Starting test execution for examples\000__04h_complex_examples.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Starting parse_array_elements
+DEBUG: Skipping opening parenthesis
+DEBUG: Loop 1: token = Some(BacktickString), current_element = ''
+DEBUG: Found other token: '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Loop 2: token = Some(ParenClose), current_element = '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Found closing parenthesis, adding current_element: '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Final elements: ["`ls -1 *.sh examples/*.sh 2>/dev/null`"]
+DEBUG: Setting original script name to: 000__04h_complex_examples.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Three wells: "), CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("yes", None), args: [Literal("well", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }))] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("yes", None), args: [Literal("well", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Processing Assignment command: current_user = CommandSubstitution(Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("root", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("root", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing Assignment command: system_name = Literal("Darwin", None)
+DEBUG: Generating function body for get_file_size
+DEBUG: Function body commands: [BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("file=$1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("size=", None), CommandSubstitution(Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-c", None)], redirects: [Redirect { fd: None, operator: Input, target: StringInterpolation(StringInterpolation { parts: [Variable("file")] }, None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File "), Variable("file"), Literal(" has "), Variable("size"), Literal(" bytes")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-c", None)], redirects: [Redirect { fd: None, operator: Input, target: StringInterpolation(StringInterpolation { parts: [Variable("file")] }, None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("comm", None), args: [Literal("-23", None)], redirects: [Redirect { fd: None, operator: ProcessSubstitutionInput(Simple(SimpleCommand { name: Literal("sort", None), args: [Literal("file1.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), target: Literal("", None), heredoc_body: None }, Redirect { fd: None, operator: ProcessSubstitutionInput(Simple(SimpleCommand { name: Literal("sort", None), args: [Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), target: Literal("", None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has process substitution redirects
+DEBUG: Using builtin comm command generator for process substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("tr", None), args: [Literal("a-z", None), Literal("A-Z", None)], redirects: [Redirect { fd: None, operator: HereString, target: StringInterpolation(StringInterpolation { parts: [Literal("hello world")] }, None), heredoc_body: Some("hello world") }], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing tr command in command substitution with args: [Literal("a-z", None), Literal("A-Z", None)]
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 8898 characters
+DEBUG: check_perl_no_open3_builtins called with 8898 characters
+DEBUG: check_perl_no_system_builtins called with 8898 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 8898 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success 
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 5.8µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 407.6984ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 5202, Translated stdout length: 5202
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: true, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: true
+DEBUG: failure_reason: ''
+DEBUG: Test execution completed in 6821ms
+✓DEBUG: Starting test execution for Test 12/146: 000__05_system_utilities.sh with perl     examples\000__05_system_utilities.sh with generator perl
+DEBUG: Running shell script: examples\000__05_system_utilities.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.24s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__05_system_utilities.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y-%m-%d %H", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%r", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("yes", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Perl code generated, length: 1012 characters
+DEBUG: check_perl_no_open3_builtins called with 1012 characters
+DEBUG: check_perl_no_system_builtins called with 1012 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1012 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== System 
+DEBUG: Saved Perl code to debug_perl_code.pl
+DEBUG: Starting Perl execution with timeout manager
+DEBUG: Timeout manager starting PerlExecution with timeout of 30.0 seconds
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 5.8µs
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 178.3038ms, timed_out: false
+DEBUG: Ending Perl execution with timeout manager
+DEBUG: Timeout manager completed PerlExecution successfully
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 115, Translated stdout length: 115
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: stdout_match: false, stderr_match: true, exit_code_match: true
+DEBUG: timed_out: false
+DEBUG: Test success: false
+DEBUG: failure_reason: 'Failed due to: stdout mismatch'
+DEBUG: Test execution completed in 7381ms
+[2J[1;1H================================================================================
+                                    TEST FAILED
+================================================================================
+File: examples\000__05_system_utilities.sh
+Generator: perl
+Test: 12/146
+Tests passed before failure: 11
+Failure Reason: Failed due to: stdout mismatch
+================================================================================
+
+Exit Code Comparison (IGNORED):
+Shell script exit code: 0
+Translated code exit code: 0
+
+================================================================================
+ORIGINAL SHELL SCRIPT:
+================================================================================
+#!/bin/bash
+
+# System utilities with backticks
+# This file demonstrates using backticks with system utility commands
+
+echo "=== System Utilities ==="
+
+# date command with backticks
+#PERL_MUST_NOT_CONTAIN `date
+timestamp=`date +%r`
+formatted_date=`date '+%Y-%m-%d %H'`
+echo "Timestamp: $timestamp"
+echo "Formatted date: $formatted_date"
+
+# time command with backticks
+#PERL_MUST_NOT_CONTAIN `time
+#time_result=`(time sleep 1) 2>&1 | sed s/...$//`
+#echo "Time result: $time_result"
+
+# sleep command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `sleep
+#sleep_duration=`echo "2"`
+#echo "Sleeping for $sleep_duration seconds..."
+#sleep $sleep_duration
+
+# which command with backticks
+#PERL_MUST_NOT_CONTAIN `which
+#bash_path=`which bash`
+#echo "Bash path: $bash_path"
+
+# yes command with backticks
+#PERL_MUST_NOT_CONTAIN `yes
+yes_result=`yes "Hello" | head -3`
+echo "Yes command result:"
+echo "$yes_result"
+
+
+
+================================================================================
+TRANSLATED PERL CODE:
+================================================================================
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== System Utilities ===\n";
+my $formatted_date = do { use POSIX qw(strftime); strftime("%Y-%m-%d %H", localtime); };
+my $timestamp = do { use POSIX qw(strftime); strftime("%r", localtime); };
+print "Timestamp: $timestamp\n";
+print "Formatted date: $formatted_date\n";
+my $yes_result = do {
+my $head_line_count = 0;
+my $output_0 = q{};
+while (1) {
+    my $line = "Hello";
+    # yes doesn't support line-by-line processing
+    if ($head_line_count < 3) {
+        if ($head_line_count > 0) { $output_0 .= "\n"; }
+        $output_0 .= $line;
+        ++$head_line_count;
+    } else {
+        $line = q{}; # Clear line to prevent printing
+        last; # Break out of the yes loop when head limit is reached
+    }
+}
+$output_0
+
+};
+print "Yes command result:\n";
+print $yes_result;
+if (!($yes_result =~ /\n$/msx)) { print "\n"; }
+
+
+================================================================================
+PERL::CRITIC RESULTS:
+================================================================================
+Perl::Critic: No violations found
+
+================================================================================
+ABSTRACT SYNTAX TREE:
+================================================================================
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== System Utilities ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Timestamp: "), Variable("timestamp")] }, None)], redirects: [], env_vars: {"formatted_date": CommandSubstitution(Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y-%m-%d %H", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None), "timestamp": CommandSubstitution(Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%r", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Formatted date: "), Variable("formatted_date")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Yes command result:")] }, None)], redirects: [], env_vars: {"yes_result": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("yes", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("yes_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+
+================================================================================
+STDOUT COMPARISON (DIFF):
+================================================================================
+--- shell_stdout
++++ perl_stdout
+ === System Utilities ===
+-Timestamp: 11:19:10 AM
++Timestamp: 11:19:17 AM
+ Formatted date: 2025-09-28 11
+ Yes command result:
+ Hello
+ Hello
+ Hello
+
+
+================================================================================
+STDERR COMPARISON:
+================================================================================
+STDERR values are identical:
+Shell stderr: ''
+Perl stderr: ''
+
+================================================================================
+SUMMARY: 11 out of 146 tests passed before first failure
+================================================================================
+
+BRIEF FAILURE SUMMARY:
+Failed due to: stdout mismatch
+Writing test count 11 to first_n_tests_passed.txt
+Current working directory: "D:\\GitHub\\sh2perl"
+Successfully wrote test count 11 and matching stdout lines 1 to first_n_tests_passed.txt
+
+To run test again: ./fail 000__05
+Test run completed at Sun Sep 28 11:19:23 AWST 2025

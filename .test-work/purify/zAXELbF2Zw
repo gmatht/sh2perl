@@ -1,0 +1,36 @@
+=== Example 025: Basic mkdir command ===
+Using system() to call mkdir (create directory):
+Directory created successfully
+
+mkdir with parents (-p):
+Nested directories created successfully
+
+mkdir with mode (-m 755):
+Directory created with mode 755
+
+mkdir with verbose (-v):
+mkdir: created directory 'test_mkdir_verbose'
+
+mkdir with multiple directories:
+Multiple directories created successfully
+
+mkdir with parents and mode (-p -m 700):
+Secure directory created successfully
+
+mkdir with parents and verbose (-p -v):
+mkdir: created directory 'test_mkdir_pv'
+mkdir: created directory 'test_mkdir_pv/subdir1'
+mkdir: created directory 'test_mkdir_pv/subdir1/subdir2'
+
+mkdir with ignore existing (-p):
+Attempted to create existing directory (should not fail with -p)
+
+mkdir with specific mode (777):
+Directory created with mode 777
+
+mkdir with parents and multiple directories:
+Batch directories created successfully
+
+mkdir with error handling:
+Directory created successfully
+=== Example 025 completed successfully ===

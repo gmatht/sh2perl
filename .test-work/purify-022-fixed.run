@@ -1,0 +1,33 @@
+=== Example 022: Basic cp command ===
+Using system() to call cp (copy file):
+File copied successfully
+Content: This is a test file for copying
+It has multiple lines
+To demonstrate cp functionality
+
+cp with recursive (-r):
+Directory copied successfully
+
+cp with preserve (-p):
+
+cp with verbose (-v):
+'test_cp_source.txt' -> 'test_cp_verbose.txt'
+
+cp with force (-f):
+
+cp with interactive (-i):
+
+cp with update (-u):
+
+cp with backup (-b):
+
+cp with suffix (--suffix=.bak):
+
+cp with multiple files:
+cp: cannot stat 'test_cp_source2.txt': No such file or directory
+
+cp with preserve all (-a):
+
+cp with no dereference (-P):
+rm: -rf is a directory (use -r to remove recursively)
+ at .test-work/purify-022-fixed.out line 213.

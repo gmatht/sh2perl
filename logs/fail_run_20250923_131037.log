@@ -1,0 +1,1939 @@
+Starting test run at Tue, Sep 23, 2025  1:10:37 PM
+Logging to: logs/fail_run_20250923_131037.log
+Test arguments: 000__04h
+----------------------------------------
+Compiling debashc...
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src\timeout_manager.rs:282:1
+    |
+282 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: unused variable: `glob_exprs`
+  --> src\generator\commands\simple_commands.rs:38:45
+   |
+38 | ...                   let glob_exprs: Vec<String> = patterns.iter()
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_glob_exprs`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `cmd2`
+   --> src\generator\commands\pipeline_commands.rs:469:66
+    |
+469 | ...ct_cmd), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline....
+    |                             ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+
+warning: variable `head_max` is assigned to, but never used
+   --> src\generator\commands\pipeline_commands.rs:836:25
+    |
+836 |                 let mut head_max = 10; // Default value
+    |                         ^^^^^^^^
+    |
+    = note: consider using `_head_max` instead
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:847:53
+    |
+847 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:854:53
+    |
+854 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:859:49
+    |
+859 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:883:22
+    |
+883 |                 for (i, command) in pipeline.commands[start_index..].it...
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:897:34
+    |
+897 | ...                      for (j, nested_command) in nested_pipeline.com...
+    |                               ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `input_var`
+ --> src\generator\commands\comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:592:37
+    |
+592 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `s`
+   --> src\generator\words.rs:889:23
+    |
+889 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+    |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:151:13
+    |
+151 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:194:13
+    |
+194 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+  20 | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserEr...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserErro...
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1885:4
+     |
+1885 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, Parse...
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:195:4
+    |
+195 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:24:4
+   |
+24 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCo...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:73:4
+   |
+73 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleComm...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:228:4
+    |
+228 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: ...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 29 warnings (run `cargo fix --lib -p debashl` to apply 3 suggestions)
+warning: unused import: `execute_with_progress`
+ --> src\testing.rs:9:67
+  |
+9 | ..., execute_with_timeout, execute_with_progress, 
+  |                            ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src\testing.rs:16:5
+   |
+16 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src\testing.rs:25:9
+   |
+25 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1163:9
+     |
+1163 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src\testing.rs:1372:9
+     |
+1372 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src\testing.rs:1420:9
+     |
+1420 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1969:13
+     |
+1969 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1969:9
+     |
+1969 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src\execution.rs:62:8
+   |
+62 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output...
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usiz...
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<Str...
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src\testing.rs:19:4
+   |
+19 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, Stri...
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:52:9
+   |
+39 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+52 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+53 |     pub translated_duration: std::time::Duration, // Translated program ...
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:552:8
+    |
+552 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_o...
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src\testing.rs:1368:8
+     |
+1368 | pub fn test_all_examples_next_fail(generators: &[String], test_prefix:...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src\timeout_manager.rs:11:5
+   |
+ 8 | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src\timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src\timeout_manager.rs:117:12
+    |
+ 90 | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: D...
+    |            ^^^^^^^^^^^
+...
+178 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType,...
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src\timeout_manager.rs:302:8
+    |
+302 | pub fn execute_with_progress<F, T>(operation: OperationType, operation_...
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s
+Running test_purify.pl validation...
+Unknown option: verbose
+Error in command line arguments
+test_purify.pl passed, continuing with other commands...
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic "000__04h"
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+DEBUG: Looking for prefix '000__04h'
+
+Found example matching prefix '000__04h': 000__04h_complex_examples.sh
+
+Running only the specified example
+==================================================
+DEBUG: Progress: 5/146 tests completed (3.4%)
+DEBUG: Progress: 10/146 tests completed (6.8%)
+Test 11/146: 000__04h_complex_examples.sh with perl     DEBUG: Starting test execution for examples\000__04h_complex_examples.sh with generator perl
+DEBUG: Running shell script: examples\000__04h_complex_examples.sh
+DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
+DEBUG: Timeout manager completed ShellExecution successfully
+DEBUG: Shell script completed in 0.58s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Starting parse_array_elements
+DEBUG: Skipping opening parenthesis
+DEBUG: Loop 1: token = Some(BacktickString), current_element = ''
+DEBUG: Found other token: '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Loop 2: token = Some(ParenClose), current_element = '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Found closing parenthesis, adding current_element: '`ls -1 *.sh examples/*.sh 2>/dev/null`'
+DEBUG: Final elements: ["`ls -1 *.sh examples/*.sh 2>/dev/null`"]
+DEBUG: Setting original script name to: 000__04h_complex_examples.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("Current time: \\`date\\`", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Pipeline has 2 commands
+DEBUG: Processing 2-command pipeline
+DEBUG: Processing Assignment command: current_user = CommandSubstitution(Simple(SimpleCommand { name: Literal("whoami", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("whoami", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing Assignment command: system_name = CommandSubstitution(Simple(SimpleCommand { name: Literal("uname", None), args: [Literal("-s", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("uname", None), args: [Literal("-s", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Generating function body for get_file_size
+DEBUG: Function body commands: [BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("file=$1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("size=", None), CommandSubstitution(Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-c", None)], redirects: [Redirect { fd: None, operator: Input, target: StringInterpolation(StringInterpolation { parts: [Variable("file")] }, None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File "), Variable("file"), Literal(" has "), Variable("size"), Literal(" bytes")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-c", None)], redirects: [Redirect { fd: None, operator: Input, target: StringInterpolation(StringInterpolation { parts: [Variable("file")] }, None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("comm", None), args: [Literal("-23", None)], redirects: [Redirect { fd: None, operator: ProcessSubstitutionInput(Simple(SimpleCommand { name: Literal("sort", None), args: [Literal("file1.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), target: Literal("", None), heredoc_body: None }, Redirect { fd: None, operator: ProcessSubstitutionInput(Simple(SimpleCommand { name: Literal("sort", None), args: [Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), target: Literal("", None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has process substitution redirects
+DEBUG: Using builtin comm command generator for process substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("tr", None), args: [Literal("a-z", None), Literal("A-Z", None)], redirects: [Redirect { fd: None, operator: HereString, target: StringInterpolation(StringInterpolation { parts: [Literal("hello world")] }, None), heredoc_body: Some("hello world") }], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing tr command in command substitution with args: [Literal("a-z", None), Literal("A-Z", None)]
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 8874 characters
+DEBUG: Test execution completed in 9999ms
+[2J[1;1H================================================================================
+                                    TEST FAILED
+================================================================================
+File: examples\000__04h_complex_examples.sh
+Generator: perl
+Test: 11/146
+Tests passed before failure: 0
+Failure Reason: Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== Complex Backtick Examples ===\n";
+my $nested_result = ("Current time: " . (do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime); }));
+print "Nested backticks: $nested_result\n";
+my $count = do {
+    my $cmd_result_2 = do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        $output_0 = do {
+            my @ls_files_1 = ();
+            if (-f q{.}) {
+                push @ls_files_1, q{.};
+            } elsif (-d q{.}) {
+                if (opendir my $dh, q{.}) {
+                    while (my $file = readdir $dh) {
+                        next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+                        next if $file =~ /^__tmp_.*[.]pl$/msx;
+                        push @ls_files_1, $file;
+                    }
+                    closedir $dh;
+                    @ls_files_1 = sort { lc $a cmp lc $b } @ls_files_1;
+                }
+            }
+            join "\n", @ls_files_1;
+        };
+    my @wc_lines_0_1 = split /\n/msx, $output_0;
+    my $wc_line_count_0_1 = scalar @wc_lines_0_1;
+    $output_0 = q{};
+    $output_0 .= "$wc_line_count_0_1 ";
+    $output_0 =~ s/\s+$//msx;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+;
+    chomp $cmd_result_2;
+    $cmd_result_2;
+};
+print "File count: $count\n";
+my $current_user;
+$current_user = do {
+    my $cmd_result_4 =  my ($in_3, $out_3, $err_3);
+    my $pid_3 = open3($in_3, $out_3, $err_3, 'whoami');
+    close $in_3 or croak 'Close failed: $OS_ERROR';
+    my $result_3 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_3> };
+    close $out_3 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid_3, 0;
+    $result_3;
+    chomp $cmd_result_4;
+    $cmd_result_4;
+};
+if ("$current_user" eq "root") {
+    print "Running as root\n";
+}
+else {
+    print "Not running as root\n";
+}
+my $system_name;
+$system_name = do {
+    my $cmd_result_6 =  my ($in_5, $out_5, $err_5);
+    my $pid_5 = open3($in_5, $out_5, $err_5, 'uname', '-s');
+    close $in_5 or croak 'Close failed: $OS_ERROR';
+    my $result_5 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_5> };
+    close $out_5 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid_5, 0;
+    $result_5;
+    chomp $cmd_result_6;
+    $cmd_result_6;
+};
+if ($system_name =~ /^'Linux'$/msx) {
+        print "Running on Linux\n";
+} elsif ($system_name =~ /^'Darwin'$/msx) {
+        print "Running on macOS\n";
+} elsif ($system_name =~ /^.*$/msx) {
+        print "Running on other system\n";
+}
+
+sub get_file_size {
+    my ($file) = @_;
+    my $size = -s "$file";
+    print "File $file has $size bytes\n";
+    return;
+}
+get_file_size('000__01_file_directory_operations.sh');
+my @files = (map { glob '{}' } ('*.sh', 'examples/*.sh'));
+print "Shell scripts found: ${scalar(@files)}\n";
+my $file;
+for my $file (@files) {
+    print "  - $file\n";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file1.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "apple\nbanana\ncherry\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file2.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "banana\ncherry\ndate\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+my $process_result = do { my $temp_file_ps_7 = ($ENV{TEMP} || $ENV{TMP} || "C:\\temp") . '/process_sub_7.tmp';
+{
+    open my $fh, '>', $temp_file_ps_7 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_8 = do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'file1.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+my @sort_lines_8 = split /\n/msx, $file_content_8;
+my @sort_sorted_8 = sort @sort_lines_8;
+$sort_output_8 = join "\n", @sort_sorted_8;
+if (!($sort_output_8 =~ /\n$/msx)) {
+    $sort_output_8 .= "\n";
+}
+;
+    print {$fh} $temp_output;
+    close $fh or croak "Close failed: $OS_ERROR\n";
+}
+my $temp_file_ps_9 = ($ENV{TEMP} || $ENV{TMP} || "C:\\temp") . '/process_sub_9.tmp';
+{
+    open my $fh, '>', $temp_file_ps_9 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_10 = do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'file2.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+my @sort_lines_10 = split /\n/msx, $file_content_10;
+my @sort_sorted_10 = sort @sort_lines_10;
+$sort_output_10 = join "\n", @sort_sorted_10;
+if (!($sort_output_10 =~ /\n$/msx)) {
+    $sort_output_10 .= "\n";
+}
+;
+    print {$fh} $temp_output;
+    close $fh or croak "Close failed: $OS_ERROR\n";
+}
+ my @file1_lines;
+my @file2_lines;
+if (open my $fh1, '<', $temp_file_ps_7) {
+    while (my $line = <$fh1>) {
+        chomp $line;
+        push @file1_lines, $line;
+    }
+    close $fh1 or croak "Close failed: $OS_ERROR";
+}
+if (open my $fh2, '<', $temp_file_ps_9) {
+    while (my $line = <$fh2>) {
+        chomp $line;
+        push @file2_lines, $line;
+    }
+    close $fh2 or croak "Close failed: $OS_ERROR";
+}
+my %file1_set = map { $_ => 1 } @file1_lines;
+my %file2_set = map { $_ => 1 } @file2_lines;
+my @common_lines;
+foreach my $line (@file1_lines) {
+    if (exists $file2_set{$line}) {
+        push @common_lines, $line;
+    }
+}
+my $comm_output = q{};
+foreach my $line (@file1_lines) {
+    if (!exists $file2_set{$line}) {
+        $comm_output .= $line . "\n";
+    }
+}
+$comm_output =~ s/\n$//msx;
+$comm_output };
+print "Process substitution result:\n";
+print $process_result;
+if (!($process_result =~ /\n$/msx)) { print "\n"; }
+my $here_string_result = do { my $input_data = q{}; my $set1_12 = 'a-z';
+my $set2_12 = 'A-Z';
+my $input_12 = $input_data;
+# Expand character ranges for tr command
+my $expanded_set1_12 = $set1_12;
+my $expanded_set2_12 = $set2_12;
+# Handle A-Z range
+if ($expanded_set1_12 =~ /A-Z/msx) {
+    $expanded_set1_12 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+if ($expanded_set2_12 =~ /a-z/msx) {
+    $expanded_set2_12 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+}
+my $tr_result_11 = q{};
+for my $char ( split //msx, $input_12 ) {
+    my $pos_12 = index $expanded_set1_12, $char;
+    if ( $pos_12 >= 0 && $pos_12 < length $expanded_set2_12 ) {
+        $tr_result_11 .= substr $expanded_set2_12, $pos_12, 1;
+    } else {
+        $tr_result_11 .= $char;
+    }
+}
+ };
+print "Here string result: $here_string_result\n";
+my $perl_result = do {
+    my $cmd_result_14 = do {
+                                            open my $fh, '>', 'temp_perl_22228.pl' or croak 'Cannot create temp file: $OS_ERROR';
+                                            print {$fh} "print \"Hello from Perl\\n\"";
+                                            close $fh or croak 'Close failed: $OS_ERROR';
+                                            my ($in_13, $out_13, $err_13);
+                                            my $pid_13 = open3($in_13, $out_13, $err_13, 'perl', 'temp_perl_22228.pl');
+                                            close $in_13 or croak 'Close failed: $OS_ERROR';
+                                            my $result_13 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_13> };
+                                            close $out_13 or croak 'Close failed: $OS_ERROR';
+                                            waitpid $pid_13, 0;
+                                            unlink 'temp_perl_22228.pl' or carp 'Cannot remove temp file: $OS_ERROR';
+                                            $result_13;
+                                        };
+    chomp $cmd_result_14;
+    $cmd_result_14;
+};
+print "Perl result: $perl_result\n";
+if (-e "file1.txt") {
+if (-d "file1.txt") {
+carp "rm: carping: ", "file1.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file1.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file1.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file1.txt",
+    ": No such file or directory\n";
+}
+if (-e "file2.txt") {
+if (-d "file2.txt") {
+carp "rm: carping: ", "file2.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file2.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file2.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file2.txt",
+    ": No such file or directory\n";
+}
+print "=== Complex Backtick Examples Complete ===\n";
+
+```
+
+perlcritic_wrapper: Started, parse args took 2e-05s
+perlcritic_wrapper: File read took 0.000357s
+perlcritic_wrapper: SHA1 hash took 6.2e-05s
+perlcritic_wrapper: No cache file found
+perlcritic_wrapper: Perl::Critic init took 0.340829s
+perlcritic_wrapper: Perl::Critic analysis took 0.986506s
+The system cannot find the path specified.
+The system cannot find the path specified.
+The system cannot find the path specified.
+The system cannot find the path specified.
+The system cannot find the path specified.
+perlcritic_wrapper: Perltidy subprocess took 1.760584s
+perlcritic_wrapper: check_tidy total took 1.761661s
+perlcritic_wrapper: Perltidy check took 1.761781s
+perlcritic_wrapper: Output generation took 0.004643s
+perlcritic_wrapper: Cache write took 0.000796s
+perlcritic_wrapper: Total time 3.095496s
+
+Perl::Critic violations found:
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 124, Column 5
+  Code:     [VIOLATION!]open my $fh, '>', $temp_file_ps_7 or croak "Cannot create temp file: $OS_ERROR\n";
+  Explanation: See page 209 of PBP
+
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 126, Column 86
+  Code:     $temp_output .= my $file_content_8 = do { local $INPUT_RECORD_SEPARATOR = undef; [VIOLATION!]open my $fh, '<', 'file1.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+  Explanation: See page 209 of PBP
+
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 139, Column 5
+  Code:     [VIOLATION!]open my $fh, '>', $temp_file_ps_9 or croak "Cannot create temp file: $OS_ERROR\n";
+  Explanation: See page 209 of PBP
+
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 141, Column 87
+  Code:     $temp_output .= my $file_content_10 = do { local $INPUT_RECORD_SEPARATOR = undef; [VIOLATION!]open my $fh, '<', 'file2.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+  Explanation: See page 209 of PBP
+
+
+================================================================================
+
+Exit Code Comparison (IGNORED):
+Shell script exit code: 0
+Translated code exit code: -1
+
+================================================================================
+ORIGINAL SHELL SCRIPT:
+================================================================================
+#!/bin/bash
+
+# Complex backtick examples
+# This file demonstrates complex usage patterns with backticks
+
+echo "=== Complex Backtick Examples ==="
+
+# Nested backticks
+nested_result=`echo "Current time: \`date\`"`
+echo "Nested backticks: $nested_result"
+
+# Backticks in arithmetic
+count=`ls -1 | wc -l`
+echo "File count: $count"
+
+# Backticks in conditional
+current_user=`whoami`
+if [ "$current_user" = "root" ]; then
+    echo "Running as root"
+else
+    echo "Not running as root"
+fi
+
+# Backticks in case statement
+system_name=`uname -s`
+case $system_name in
+    Linux)
+        echo "Running on Linux"
+        ;;
+    Darwin)
+        echo "Running on macOS"
+        ;;
+    *)
+        echo "Running on other system"
+        ;;
+esac
+
+# Backticks in function
+get_file_size() {
+    local file=$1
+    local size=`wc -c < "$file"`
+    echo "File $file has $size bytes"
+}
+
+get_file_size 000__01_file_directory_operations.sh
+
+# Backticks in array
+files=(`ls -1 *.sh examples/*.sh 2>/dev/null`)
+echo "Shell scripts found: ${#files[@]}"
+for file in "${files[@]}"; do
+    echo "  - $file"
+done
+
+# Backticks with process substitution
+echo -e "apple\nbanana\ncherry" > file1.txt
+echo -e "banana\ncherry\ndate" > file2.txt
+process_result=`comm -23 <(sort file1.txt) <(sort file2.txt)`
+echo "Process substitution result:"
+echo "$process_result"
+
+# Backticks with here strings
+here_string_result=`tr 'a-z' 'A-Z' <<< "hello world"`
+echo "Here string result: $here_string_result"
+
+# perl command with backticks
+#PERL_MUST_NOT_CONTAIN `perl
+perl_result=`perl -e 'print "Hello from Perl\n"'`
+echo "Perl result: $perl_result"
+
+# Cleanup
+rm -f file1.txt file2.txt
+
+echo "=== Complex Backtick Examples Complete ==="
+
+
+
+================================================================================
+TRANSLATED PERL CODE:
+================================================================================
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== Complex Backtick Examples ===\n";
+my $nested_result = ("Current time: " . (do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime); }));
+print "Nested backticks: $nested_result\n";
+my $count = do {
+    my $cmd_result_2 = do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        $output_0 = do {
+            my @ls_files_1 = ();
+            if (-f q{.}) {
+                push @ls_files_1, q{.};
+            } elsif (-d q{.}) {
+                if (opendir my $dh, q{.}) {
+                    while (my $file = readdir $dh) {
+                        next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+                        next if $file =~ /^__tmp_.*[.]pl$/msx;
+                        push @ls_files_1, $file;
+                    }
+                    closedir $dh;
+                    @ls_files_1 = sort { lc $a cmp lc $b } @ls_files_1;
+                }
+            }
+            join "\n", @ls_files_1;
+        };
+    my @wc_lines_0_1 = split /\n/msx, $output_0;
+    my $wc_line_count_0_1 = scalar @wc_lines_0_1;
+    $output_0 = q{};
+    $output_0 .= "$wc_line_count_0_1 ";
+    $output_0 =~ s/\s+$//msx;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+;
+    chomp $cmd_result_2;
+    $cmd_result_2;
+};
+print "File count: $count\n";
+my $current_user;
+$current_user = do {
+    my $cmd_result_4 =  my ($in_3, $out_3, $err_3);
+    my $pid_3 = open3($in_3, $out_3, $err_3, 'whoami');
+    close $in_3 or croak 'Close failed: $OS_ERROR';
+    my $result_3 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_3> };
+    close $out_3 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid_3, 0;
+    $result_3;
+    chomp $cmd_result_4;
+    $cmd_result_4;
+};
+if ("$current_user" eq "root") {
+    print "Running as root\n";
+}
+else {
+    print "Not running as root\n";
+}
+my $system_name;
+$system_name = do {
+    my $cmd_result_6 =  my ($in_5, $out_5, $err_5);
+    my $pid_5 = open3($in_5, $out_5, $err_5, 'uname', '-s');
+    close $in_5 or croak 'Close failed: $OS_ERROR';
+    my $result_5 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_5> };
+    close $out_5 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid_5, 0;
+    $result_5;
+    chomp $cmd_result_6;
+    $cmd_result_6;
+};
+if ($system_name =~ /^'Linux'$/msx) {
+        print "Running on Linux\n";
+} elsif ($system_name =~ /^'Darwin'$/msx) {
+        print "Running on macOS\n";
+} elsif ($system_name =~ /^.*$/msx) {
+        print "Running on other system\n";
+}
+
+sub get_file_size {
+    my ($file) = @_;
+    my $size = -s "$file";
+    print "File $file has $size bytes\n";
+    return;
+}
+get_file_size('000__01_file_directory_operations.sh');
+my @files = (map { glob '{}' } ('*.sh', 'examples/*.sh'));
+print "Shell scripts found: ${scalar(@files)}\n";
+my $file;
+for my $file (@files) {
+    print "  - $file\n";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file1.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "apple\nbanana\ncherry\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file2.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "banana\ncherry\ndate\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+my $process_result = do { my $temp_file_ps_7 = ($ENV{TEMP} || $ENV{TMP} || "C:\\temp") . '/process_sub_7.tmp';
+{
+    open my $fh, '>', $temp_file_ps_7 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_8 = do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'file1.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+my @sort_lines_8 = split /\n/msx, $file_content_8;
+my @sort_sorted_8 = sort @sort_lines_8;
+$sort_output_8 = join "\n", @sort_sorted_8;
+if (!($sort_output_8 =~ /\n$/msx)) {
+    $sort_output_8 .= "\n";
+}
+;
+    print {$fh} $temp_output;
+    close $fh or croak "Close failed: $OS_ERROR\n";
+}
+my $temp_file_ps_9 = ($ENV{TEMP} || $ENV{TMP} || "C:\\temp") . '/process_sub_9.tmp';
+{
+    open my $fh, '>', $temp_file_ps_9 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_10 = do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'file2.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+my @sort_lines_10 = split /\n/msx, $file_content_10;
+my @sort_sorted_10 = sort @sort_lines_10;
+$sort_output_10 = join "\n", @sort_sorted_10;
+if (!($sort_output_10 =~ /\n$/msx)) {
+    $sort_output_10 .= "\n";
+}
+;
+    print {$fh} $temp_output;
+    close $fh or croak "Close failed: $OS_ERROR\n";
+}
+ my @file1_lines;
+my @file2_lines;
+if (open my $fh1, '<', $temp_file_ps_7) {
+    while (my $line = <$fh1>) {
+        chomp $line;
+        push @file1_lines, $line;
+    }
+    close $fh1 or croak "Close failed: $OS_ERROR";
+}
+if (open my $fh2, '<', $temp_file_ps_9) {
+    while (my $line = <$fh2>) {
+        chomp $line;
+        push @file2_lines, $line;
+    }
+    close $fh2 or croak "Close failed: $OS_ERROR";
+}
+my %file1_set = map { $_ => 1 } @file1_lines;
+my %file2_set = map { $_ => 1 } @file2_lines;
+my @common_lines;
+foreach my $line (@file1_lines) {
+    if (exists $file2_set{$line}) {
+        push @common_lines, $line;
+    }
+}
+my $comm_output = q{};
+foreach my $line (@file1_lines) {
+    if (!exists $file2_set{$line}) {
+        $comm_output .= $line . "\n";
+    }
+}
+$comm_output =~ s/\n$//msx;
+$comm_output };
+print "Process substitution result:\n";
+print $process_result;
+if (!($process_result =~ /\n$/msx)) { print "\n"; }
+my $here_string_result = do { my $input_data = q{}; my $set1_12 = 'a-z';
+my $set2_12 = 'A-Z';
+my $input_12 = $input_data;
+# Expand character ranges for tr command
+my $expanded_set1_12 = $set1_12;
+my $expanded_set2_12 = $set2_12;
+# Handle A-Z range
+if ($expanded_set1_12 =~ /A-Z/msx) {
+    $expanded_set1_12 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+if ($expanded_set2_12 =~ /a-z/msx) {
+    $expanded_set2_12 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+}
+my $tr_result_11 = q{};
+for my $char ( split //msx, $input_12 ) {
+    my $pos_12 = index $expanded_set1_12, $char;
+    if ( $pos_12 >= 0 && $pos_12 < length $expanded_set2_12 ) {
+        $tr_result_11 .= substr $expanded_set2_12, $pos_12, 1;
+    } else {
+        $tr_result_11 .= $char;
+    }
+}
+ };
+print "Here string result: $here_string_result\n";
+my $perl_result = do {
+    my $cmd_result_14 = do {
+                                            open my $fh, '>', 'temp_perl_22228.pl' or croak 'Cannot create temp file: $OS_ERROR';
+                                            print {$fh} "print \"Hello from Perl\\n\"";
+                                            close $fh or croak 'Close failed: $OS_ERROR';
+                                            my ($in_13, $out_13, $err_13);
+                                            my $pid_13 = open3($in_13, $out_13, $err_13, 'perl', 'temp_perl_22228.pl');
+                                            close $in_13 or croak 'Close failed: $OS_ERROR';
+                                            my $result_13 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_13> };
+                                            close $out_13 or croak 'Close failed: $OS_ERROR';
+                                            waitpid $pid_13, 0;
+                                            unlink 'temp_perl_22228.pl' or carp 'Cannot remove temp file: $OS_ERROR';
+                                            $result_13;
+                                        };
+    chomp $cmd_result_14;
+    $cmd_result_14;
+};
+print "Perl result: $perl_result\n";
+if (-e "file1.txt") {
+if (-d "file1.txt") {
+carp "rm: carping: ", "file1.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file1.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file1.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file1.txt",
+    ": No such file or directory\n";
+}
+if (-e "file2.txt") {
+if (-d "file2.txt") {
+carp "rm: carping: ", "file2.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file2.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file2.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file2.txt",
+    ": No such file or directory\n";
+}
+print "=== Complex Backtick Examples Complete ===\n";
+
+
+================================================================================
+PERL::CRITIC RESULTS:
+================================================================================
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== Complex Backtick Examples ===\n";
+my $nested_result = ("Current time: " . (do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime); }));
+print "Nested backticks: $nested_result\n";
+my $count = do {
+    my $cmd_result_2 = do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        $output_0 = do {
+            my @ls_files_1 = ();
+            if (-f q{.}) {
+                push @ls_files_1, q{.};
+            } elsif (-d q{.}) {
+                if (opendir my $dh, q{.}) {
+                    while (my $file = readdir $dh) {
+                        next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+                        next if $file =~ /^__tmp_.*[.]pl$/msx;
+                        push @ls_files_1, $file;
+                    }
+                    closedir $dh;
+                    @ls_files_1 = sort { lc $a cmp lc $b } @ls_files_1;
+                }
+            }
+            join "\n", @ls_files_1;
+        };
+    my @wc_lines_0_1 = split /\n/msx, $output_0;
+    my $wc_line_count_0_1 = scalar @wc_lines_0_1;
+    $output_0 = q{};
+    $output_0 .= "$wc_line_count_0_1 ";
+    $output_0 =~ s/\s+$//msx;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+;
+    chomp $cmd_result_2;
+    $cmd_result_2;
+};
+print "File count: $count\n";
+my $current_user;
+$current_user = do {
+    my $cmd_result_4 =  my ($in_3, $out_3, $err_3);
+    my $pid_3 = open3($in_3, $out_3, $err_3, 'whoami');
+    close $in_3 or croak 'Close failed: $OS_ERROR';
+    my $result_3 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_3> };
+    close $out_3 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid_3, 0;
+    $result_3;
+    chomp $cmd_result_4;
+    $cmd_result_4;
+};
+if ("$current_user" eq "root") {
+    print "Running as root\n";
+}
+else {
+    print "Not running as root\n";
+}
+my $system_name;
+$system_name = do {
+    my $cmd_result_6 =  my ($in_5, $out_5, $err_5);
+    my $pid_5 = open3($in_5, $out_5, $err_5, 'uname', '-s');
+    close $in_5 or croak 'Close failed: $OS_ERROR';
+    my $result_5 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_5> };
+    close $out_5 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid_5, 0;
+    $result_5;
+    chomp $cmd_result_6;
+    $cmd_result_6;
+};
+if ($system_name =~ /^'Linux'$/msx) {
+        print "Running on Linux\n";
+} elsif ($system_name =~ /^'Darwin'$/msx) {
+        print "Running on macOS\n";
+} elsif ($system_name =~ /^.*$/msx) {
+        print "Running on other system\n";
+}
+
+sub get_file_size {
+    my ($file) = @_;
+    my $size = -s "$file";
+    print "File $file has $size bytes\n";
+    return;
+}
+get_file_size('000__01_file_directory_operations.sh');
+my @files = (map { glob '{}' } ('*.sh', 'examples/*.sh'));
+print "Shell scripts found: ${scalar(@files)}\n";
+my $file;
+for my $file (@files) {
+    print "  - $file\n";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file1.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "apple\nbanana\ncherry\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file2.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "banana\ncherry\ndate\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+my $process_result = do { my $temp_file_ps_7 = ($ENV{TEMP} || $ENV{TMP} || "C:\\temp") . '/process_sub_7.tmp';
+{
+    open my $fh, '>', $temp_file_ps_7 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_8 = do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'file1.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+my @sort_lines_8 = split /\n/msx, $file_content_8;
+my @sort_sorted_8 = sort @sort_lines_8;
+$sort_output_8 = join "\n", @sort_sorted_8;
+if (!($sort_output_8 =~ /\n$/msx)) {
+    $sort_output_8 .= "\n";
+}
+;
+    print {$fh} $temp_output;
+    close $fh or croak "Close failed: $OS_ERROR\n";
+}
+my $temp_file_ps_9 = ($ENV{TEMP} || $ENV{TMP} || "C:\\temp") . '/process_sub_9.tmp';
+{
+    open my $fh, '>', $temp_file_ps_9 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_10 = do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'file2.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+my @sort_lines_10 = split /\n/msx, $file_content_10;
+my @sort_sorted_10 = sort @sort_lines_10;
+$sort_output_10 = join "\n", @sort_sorted_10;
+if (!($sort_output_10 =~ /\n$/msx)) {
+    $sort_output_10 .= "\n";
+}
+;
+    print {$fh} $temp_output;
+    close $fh or croak "Close failed: $OS_ERROR\n";
+}
+ my @file1_lines;
+my @file2_lines;
+if (open my $fh1, '<', $temp_file_ps_7) {
+    while (my $line = <$fh1>) {
+        chomp $line;
+        push @file1_lines, $line;
+    }
+    close $fh1 or croak "Close failed: $OS_ERROR";
+}
+if (open my $fh2, '<', $temp_file_ps_9) {
+    while (my $line = <$fh2>) {
+        chomp $line;
+        push @file2_lines, $line;
+    }
+    close $fh2 or croak "Close failed: $OS_ERROR";
+}
+my %file1_set = map { $_ => 1 } @file1_lines;
+my %file2_set = map { $_ => 1 } @file2_lines;
+my @common_lines;
+foreach my $line (@file1_lines) {
+    if (exists $file2_set{$line}) {
+        push @common_lines, $line;
+    }
+}
+my $comm_output = q{};
+foreach my $line (@file1_lines) {
+    if (!exists $file2_set{$line}) {
+        $comm_output .= $line . "\n";
+    }
+}
+$comm_output =~ s/\n$//msx;
+$comm_output };
+print "Process substitution result:\n";
+print $process_result;
+if (!($process_result =~ /\n$/msx)) { print "\n"; }
+my $here_string_result = do { my $input_data = q{}; my $set1_12 = 'a-z';
+my $set2_12 = 'A-Z';
+my $input_12 = $input_data;
+# Expand character ranges for tr command
+my $expanded_set1_12 = $set1_12;
+my $expanded_set2_12 = $set2_12;
+# Handle A-Z range
+if ($expanded_set1_12 =~ /A-Z/msx) {
+    $expanded_set1_12 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+if ($expanded_set2_12 =~ /a-z/msx) {
+    $expanded_set2_12 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+}
+my $tr_result_11 = q{};
+for my $char ( split //msx, $input_12 ) {
+    my $pos_12 = index $expanded_set1_12, $char;
+    if ( $pos_12 >= 0 && $pos_12 < length $expanded_set2_12 ) {
+        $tr_result_11 .= substr $expanded_set2_12, $pos_12, 1;
+    } else {
+        $tr_result_11 .= $char;
+    }
+}
+ };
+print "Here string result: $here_string_result\n";
+my $perl_result = do {
+    my $cmd_result_14 = do {
+                                            open my $fh, '>', 'temp_perl_22228.pl' or croak 'Cannot create temp file: $OS_ERROR';
+                                            print {$fh} "print \"Hello from Perl\\n\"";
+                                            close $fh or croak 'Close failed: $OS_ERROR';
+                                            my ($in_13, $out_13, $err_13);
+                                            my $pid_13 = open3($in_13, $out_13, $err_13, 'perl', 'temp_perl_22228.pl');
+                                            close $in_13 or croak 'Close failed: $OS_ERROR';
+                                            my $result_13 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_13> };
+                                            close $out_13 or croak 'Close failed: $OS_ERROR';
+                                            waitpid $pid_13, 0;
+                                            unlink 'temp_perl_22228.pl' or carp 'Cannot remove temp file: $OS_ERROR';
+                                            $result_13;
+                                        };
+    chomp $cmd_result_14;
+    $cmd_result_14;
+};
+print "Perl result: $perl_result\n";
+if (-e "file1.txt") {
+if (-d "file1.txt") {
+carp "rm: carping: ", "file1.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file1.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file1.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file1.txt",
+    ": No such file or directory\n";
+}
+if (-e "file2.txt") {
+if (-d "file2.txt") {
+carp "rm: carping: ", "file2.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file2.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file2.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file2.txt",
+    ": No such file or directory\n";
+}
+print "=== Complex Backtick Examples Complete ===\n";
+
+```
+
+perlcritic_wrapper: Started, parse args took 1.4e-05s
+perlcritic_wrapper: File read took 0.00055s
+perlcritic_wrapper: SHA1 hash took 8.1e-05s
+perlcritic_wrapper: Cache hit, read took 0.018103s
+
+Perl::Critic violations found:
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 124, Column 5
+  Code:     [VIOLATION!]open my $fh, '>', $temp_file_ps_7 or croak "Cannot create temp file: $OS_ERROR\n";
+  Explanation: See page 209 of PBP
+
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 126, Column 86
+  Code:     $temp_output .= my $file_content_8 = do { local $INPUT_RECORD_SEPARATOR = undef; [VIOLATION!]open my $fh, '<', 'file1.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+  Explanation: See page 209 of PBP
+
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 139, Column 5
+  Code:     [VIOLATION!]open my $fh, '>', $temp_file_ps_9 or croak "Cannot create temp file: $OS_ERROR\n";
+  Explanation: See page 209 of PBP
+
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 141, Column 87
+  Code:     $temp_output .= my $file_content_10 = do { local $INPUT_RECORD_SEPARATOR = undef; [VIOLATION!]open my $fh, '<', 'file2.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+  Explanation: See page 209 of PBP
+
+
+
+================================================================================
+ABSTRACT SYNTAX TREE:
+================================================================================
+[Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Complex Backtick Examples ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Nested backticks: "), Variable("nested_result")] }, None)], redirects: [], env_vars: {"nested_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("Current time: \\`date\\`", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File count: "), Variable("count")] }, None)], redirects: [], env_vars: {"count": CommandSubstitution(Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Assignment(Assignment { variable: "current_user", value: CommandSubstitution(Simple(SimpleCommand { name: Literal("whoami", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None), operator: Assign }), If(IfStatement { condition: TestExpression(TestExpression { expression: "\"$current_user\"=\"root\"", modifiers: TestModifiers { extglob: false, nocasematch: false, globstar: false, nullglob: false, failglob: false, dotglob: false } }), then_branch: Block(Block { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Running as root")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] }), else_branch: Some(Block(Block { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Not running as root")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] })) }), Assignment(Assignment { variable: "system_name", value: CommandSubstitution(Simple(SimpleCommand { name: Literal("uname", None), args: [Literal("-s", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None), operator: Assign }), Case(CaseStatement { word: Variable("system_name", false, None), cases: [CaseClause { patterns: [Literal("Linux", None)], body: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Running on Linux")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] }, CaseClause { patterns: [Literal("Darwin", None)], body: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Running on macOS")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] }, CaseClause { patterns: [Literal("*", None)], body: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Running on other system")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] }] }), Function(Function { name: "get_file_size", parameters: [], body: Block { commands: [BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("file=$1", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), BuiltinCommand(BuiltinCommand { name: "local", args: [Literal("size=", None), CommandSubstitution(Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-c", None)], redirects: [Redirect { fd: None, operator: Input, target: StringInterpolation(StringInterpolation { parts: [Variable("file")] }, None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File "), Variable("file"), Literal(" has "), Variable("size"), Literal(" bytes")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] } }), Simple(SimpleCommand { name: Literal("get_file_size", None), args: [Literal("000__01_file_directory_operations.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Shell scripts found: "), ParameterExpansion(ParameterExpansion { variable: "#files", operator: ArraySlice("@", None), is_mutable: true })] }, None)], redirects: [], env_vars: {"files": Array("files", ["`ls -1 *.sh examples/*.sh 2>/dev/null`"], None)}, stdout_used: true, stderr_used: true }), For(ForLoop { variable: "file", items: [StringInterpolation(StringInterpolation { parts: [ParameterExpansion(ParameterExpansion { variable: "files", operator: ArraySlice("@", None), is_mutable: true })] }, None)], body: Block { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("  - "), Variable("file")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })] } }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("apple\\nbanana\\ncherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("file1.txt", None), heredoc_body: None }] }), Redirect(RedirectCommand { command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("banana\\ncherry\\ndate")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), redirects: [Redirect { fd: None, operator: Output, target: Literal("file2.txt", None), heredoc_body: None }] }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Process substitution result:")] }, None)], redirects: [], env_vars: {"process_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("comm", None), args: [Literal("-23", None)], redirects: [Redirect { fd: None, operator: ProcessSubstitutionInput(Simple(SimpleCommand { name: Literal("sort", None), args: [Literal("file1.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), target: Literal("", None), heredoc_body: None }, Redirect { fd: None, operator: ProcessSubstitutionInput(Simple(SimpleCommand { name: Literal("sort", None), args: [Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })), target: Literal("", None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Variable("process_result")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Here string result: "), Variable("here_string_result")] }, None)], redirects: [], env_vars: {"here_string_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("tr", None), args: [Literal("a-z", None), Literal("A-Z", None)], redirects: [Redirect { fd: None, operator: HereString, target: StringInterpolation(StringInterpolation { parts: [Literal("hello world")] }, None), heredoc_body: Some("hello world") }], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Perl result: "), Variable("perl_result")] }, None)], redirects: [], env_vars: {"perl_result": CommandSubstitution(Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("-f", None), Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("=== Complex Backtick Examples Complete ===")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })]
+
+================================================================================
+STDOUT COMPARISON (DIFF):
+================================================================================
+--- shell_stdout
++++ perl_stdout
+-=== Complex Backtick Examples ===
+-Nested backticks: Current time: Tue Sep 23 13:10:39 AWST 2025
+-File count: 157
+-Running as root
+-Running on Linux
+-File 000__01_file_directory_operations.sh has 676 bytes
+-Shell scripts found: 146
+-  - 000__01_file_directory_operations.sh
+-  - 000__02_output_formatting_commands.sh
+-  - 000__03_file_manipulation_commands.sh
+-  - 000__04a_basic_command_substitution.sh
+-  - 000__04b_file_directory_operations.sh
+-  - 000__04c_text_processing_commands.sh
+-  - 000__04d_system_utilities.sh
+-  - 000__04e_file_manipulation.sh
+-  - 000__04f_output_formatting.sh
+-  - 000__04g_checksum_commands.sh
+-  - 000__04h_complex_examples.sh
+-  - 000__05_system_utilities.sh
+-  - 000__06_text_processing_commands.sh
+-  - 000__07_find_path_commands.sh
+-  - 001_simple.sh
+-  - 002_control_flow.sh
+-  - 003_pipeline.sh
+-  - 004_test_quoted.sh
+-  - 005_args.sh
+-  - 006_misc.sh
+-  - 007_cat_EOF.sh
+-  - 008_simple_backup.sh
+-  - 009_arrays.sh
+-  - 010_pattern_matching.sh
+-  - 011_brace_expansion.sh
+-  - 012_process_substitution.sh
+-  - 013_parameter_expansion.sh
+-  - 014_ansi_quoting.sh
+-  - 015_grep_advanced.sh
+-  - 016_grep_basic.sh
+-  - 017_grep_context.sh
+-  - 018_grep_params.sh
+-  - 019_grep_regex.sh
+-  - 020_ansi_quoting_basic.sh
+-  - 021_ansi_quoting_escape.sh
+-  - 022_ansi_quoting_unicode.sh
+-  - 023_ansi_quoting_practical.sh
+-  - 024_parameter_expansion_case.sh
+-  - 025_parameter_expansion_advanced.sh
+-  - 026_parameter_expansion_more.sh
+-  - 027_parameter_expansion_defaults.sh
+-  - 028_arrays_indexed.sh
+-  - 029_arrays_associative.sh
+-  - 030_control_flow_if.sh
+-  - 031_control_flow_loops.sh
+-  - 032_control_flow_function.sh
+-  - 033_brace_expansion_basic.sh
+-  - 034_brace_expansion_advanced.sh
+-  - 035_brace_expansion_practical.sh
+-  - 036_pattern_matching_basic.sh
+-  - 037_pattern_matching_extglob.sh
+-  - 038_pattern_matching_nocase.sh
+-  - 039_process_substitution_here.sh
+-  - 040_process_substitution_comm.sh
+-  - 041_process_substitution_mapfile.sh
+-  - 042_process_substitution_advanced.sh
+-  - 043_home.sh
+-  - 044_find_example.sh
+-  - 045_shell_calling_perl.sh
+-  - 046_cd..sh
+-  - 047_for_arithematic.sh
+-  - 048_subprocess.sh
+-  - 049_local.sh
+-  - 050_test_ls_star_dot_sh.sh
+-  - 051_primes.sh
+-  - 052_numeric_computations.sh
+-  - 053_gcd.sh
+-  - 054_fibonacci.sh
+-  - 055_factorize.sh
+-  - 056_send_args.sh
+-  - 057_case.sh
+-  - 058_advanced_bash_idioms.sh
+-  - 059_issue3.sh
+-  - 060_issue5.sh
+-  - 061_test_local_names_preserved.sh
+-  - 062_01_ambiguous_operators.sh
+-  - 062_02_complex_parameter_expansions.sh
+-  - 062_03_complex_heredocs.sh
+-  - 062_04_nested_arithmetic.sh
+-  - 062_05_nested_command_substitution.sh
+-  - 062_06_process_substitution.sh
+-  - 062_07_complex_brace_expansion.sh
+-  - 062_08_simple_case.sh
+-  - 062_09_complex_function.sh
+-  - 062_10_simple_pipeline.sh
+-  - 062_11_mixed_arithmetic.sh
+-  - 062_12_complex_string_interpolation.sh
+-  - 062_13_simple_test_expressions.sh
+-  - 062_14_complex_array_operations.sh
+-  - 062_15_complex_local_variables.sh
+-  - 062_hard_to_lex.sh
+-  - 063_01_deeply_nested_arithmetic.sh
+-  - 063_02_complex_array_assignments.sh
+-  - 063_03_nested_command_substitutions.sh
+-  - 063_04_complex_parameter_expansion.sh
+-  - 063_05_heredoc_with_complex_content.sh
+-  - 063_06_complex_pipeline_background.sh
+-  - 063_07_nested_if_statements.sh
+-  - 063_08_complex_case_statement.sh
+-  - 063_09_complex_function_parameter_handling.sh
+-  - 063_10_complex_for_loop.sh
+-  - 063_11_complex_while_loop.sh
+-  - 063_12_complex_eval.sh
+-  - 063_13_nested_subshells.sh
+-  - 063_14_complex_redirects.sh
+-  - 063_15_complex_function_definition.sh
+-  - 063_16_complex_test_expressions.sh
+-  - 063_17_nested_brace_expansion.sh
+-  - 063_18_complex_here_string.sh
+-  - 063_19_complex_function_call.sh
+-  - 063_20_final_complex_construct.sh
+-  - 063_hard_to_parse.sh
+-  - 064_01_complex_nested_subshells.sh
+-  - 064_02_nested_brace_expansions.sh
+-  - 064_03_complex_parameter_expansion.sh
+-  - 064_04_extended_glob_patterns.sh
+-  - 064_05_complex_case_statement.sh
+-  - 064_06_nested_arithmetic_expressions.sh
+-  - 064_07_complex_array_operations.sh
+-  - 064_08_heredocs_with_variable_interpolation.sh
+-  - 064_09_process_substitution_pipeline.sh
+-  - 064_10_nested_function_definitions.sh
+-  - 064_11_complex_test_expressions.sh
+-  - 064_12_brace_expansion_nested_sequences.sh
+-  - 064_13_complex_string_manipulation.sh
+-  - 064_14_nested_command_substitution_arithmetic.sh
+-  - 064_15_complex_pipeline_multiple_redirects.sh
+-  - 064_16_function_complex_argument_handling.sh
+-  - 064_17_complex_while_loop_nested_conditionals.sh
+-  - 064_18_array_slicing_manipulation.sh
+-  - 064_19_complex_pattern_matching_extended_globs.sh
+-  - 064_20_nested_subshells_environment_variables.sh
+-  - 064_21_complex_string_interpolation_multiple_variables.sh
+-  - 064_22_function_returning_complex_data_structures.sh
+-  - 064_23_complex_error_handling_traps.sh
+-  - 064_24_advanced_parameter_expansion.sh
+-  - 064_25_complex_command_chaining.sh
+-  - 064_hard_to_generate.sh
+-  - 065_yes_head_while.sh
+-  - 900_if2echo.sh
+-  - 999_pwd.sh
+-  - test_find.sh
+-  - test_grep.sh
+-  - test_perl_critic.sh
+-  - test_simple_function.sh
+-  - test_system_builtin.sh
+-Process substitution result:
+-apple
+-Here string result: HELLO WORLD
+-Perl result: Hello from Perl
+-=== Complex Backtick Examples Complete ===
+
+
+================================================================================
+STDERR COMPARISON:
+================================================================================
+STDERR values are identical:
+Shell stderr: ''
+Perl stderr: ''
+
+================================================================================
+SUMMARY: 0 out of 146 tests passed before first failure
+================================================================================
+
+BRIEF FAILURE SUMMARY:
+Perl::Critic violations found:
+Generated Perl code:
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== Complex Backtick Examples ===\n";
+my $nested_result = ("Current time: " . (do { use POSIX qw(strftime); strftime('%a, %d %b %Y %H:%M:%S %z', localtime); }));
+print "Nested backticks: $nested_result\n";
+my $count = do {
+    my $cmd_result_2 = do {
+    my $output_0;
+    my $pipeline_success_0 = 1;
+        $output_0 = do {
+            my @ls_files_1 = ();
+            if (-f q{.}) {
+                push @ls_files_1, q{.};
+            } elsif (-d q{.}) {
+                if (opendir my $dh, q{.}) {
+                    while (my $file = readdir $dh) {
+                        next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+                        next if $file =~ /^__tmp_.*[.]pl$/msx;
+                        push @ls_files_1, $file;
+                    }
+                    closedir $dh;
+                    @ls_files_1 = sort { lc $a cmp lc $b } @ls_files_1;
+                }
+            }
+            join "\n", @ls_files_1;
+        };
+    my @wc_lines_0_1 = split /\n/msx, $output_0;
+    my $wc_line_count_0_1 = scalar @wc_lines_0_1;
+    $output_0 = q{};
+    $output_0 .= "$wc_line_count_0_1 ";
+    $output_0 =~ s/\s+$//msx;
+    if (!$pipeline_success_0) { $main_exit_code = 1; }
+        $output_0;
+}
+;
+    chomp $cmd_result_2;
+    $cmd_result_2;
+};
+print "File count: $count\n";
+my $current_user;
+$current_user = do {
+    my $cmd_result_4 =  my ($in_3, $out_3, $err_3);
+    my $pid_3 = open3($in_3, $out_3, $err_3, 'whoami');
+    close $in_3 or croak 'Close failed: $OS_ERROR';
+    my $result_3 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_3> };
+    close $out_3 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid_3, 0;
+    $result_3;
+    chomp $cmd_result_4;
+    $cmd_result_4;
+};
+if ("$current_user" eq "root") {
+    print "Running as root\n";
+}
+else {
+    print "Not running as root\n";
+}
+my $system_name;
+$system_name = do {
+    my $cmd_result_6 =  my ($in_5, $out_5, $err_5);
+    my $pid_5 = open3($in_5, $out_5, $err_5, 'uname', '-s');
+    close $in_5 or croak 'Close failed: $OS_ERROR';
+    my $result_5 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_5> };
+    close $out_5 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid_5, 0;
+    $result_5;
+    chomp $cmd_result_6;
+    $cmd_result_6;
+};
+if ($system_name =~ /^'Linux'$/msx) {
+        print "Running on Linux\n";
+} elsif ($system_name =~ /^'Darwin'$/msx) {
+        print "Running on macOS\n";
+} elsif ($system_name =~ /^.*$/msx) {
+        print "Running on other system\n";
+}
+
+sub get_file_size {
+    my ($file) = @_;
+    my $size = -s "$file";
+    print "File $file has $size bytes\n";
+    return;
+}
+get_file_size('000__01_file_directory_operations.sh');
+my @files = (map { glob '{}' } ('*.sh', 'examples/*.sh'));
+print "Shell scripts found: ${scalar(@files)}\n";
+my $file;
+for my $file (@files) {
+    print "  - $file\n";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file1.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "apple\nbanana\ncherry\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+{
+    open my $original_stdout, '>&', STDOUT
+    or croak "Cannot save STDOUT: $ERRNO";
+    open STDOUT, '>', 'file2.txt'
+    or croak "Cannot open file: $ERRNO";
+    print "banana\ncherry\ndate\n";
+    open STDOUT, '>&', $original_stdout
+    or croak "Cannot restore STDOUT: $ERRNO";
+    close $original_stdout or croak "Close failed: $ERRNO";
+}
+my $process_result = do { my $temp_file_ps_7 = ($ENV{TEMP} || $ENV{TMP} || "C:\\temp") . '/process_sub_7.tmp';
+{
+    open my $fh, '>', $temp_file_ps_7 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_8 = do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'file1.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+my @sort_lines_8 = split /\n/msx, $file_content_8;
+my @sort_sorted_8 = sort @sort_lines_8;
+$sort_output_8 = join "\n", @sort_sorted_8;
+if (!($sort_output_8 =~ /\n$/msx)) {
+    $sort_output_8 .= "\n";
+}
+;
+    print {$fh} $temp_output;
+    close $fh or croak "Close failed: $OS_ERROR\n";
+}
+my $temp_file_ps_9 = ($ENV{TEMP} || $ENV{TMP} || "C:\\temp") . '/process_sub_9.tmp';
+{
+    open my $fh, '>', $temp_file_ps_9 or croak "Cannot create temp file: $OS_ERROR\n";
+    my $temp_output = q{};
+    $temp_output .= my $file_content_10 = do { local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', 'file2.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+my @sort_lines_10 = split /\n/msx, $file_content_10;
+my @sort_sorted_10 = sort @sort_lines_10;
+$sort_output_10 = join "\n", @sort_sorted_10;
+if (!($sort_output_10 =~ /\n$/msx)) {
+    $sort_output_10 .= "\n";
+}
+;
+    print {$fh} $temp_output;
+    close $fh or croak "Close failed: $OS_ERROR\n";
+}
+ my @file1_lines;
+my @file2_lines;
+if (open my $fh1, '<', $temp_file_ps_7) {
+    while (my $line = <$fh1>) {
+        chomp $line;
+        push @file1_lines, $line;
+    }
+    close $fh1 or croak "Close failed: $OS_ERROR";
+}
+if (open my $fh2, '<', $temp_file_ps_9) {
+    while (my $line = <$fh2>) {
+        chomp $line;
+        push @file2_lines, $line;
+    }
+    close $fh2 or croak "Close failed: $OS_ERROR";
+}
+my %file1_set = map { $_ => 1 } @file1_lines;
+my %file2_set = map { $_ => 1 } @file2_lines;
+my @common_lines;
+foreach my $line (@file1_lines) {
+    if (exists $file2_set{$line}) {
+        push @common_lines, $line;
+    }
+}
+my $comm_output = q{};
+foreach my $line (@file1_lines) {
+    if (!exists $file2_set{$line}) {
+        $comm_output .= $line . "\n";
+    }
+}
+$comm_output =~ s/\n$//msx;
+$comm_output };
+print "Process substitution result:\n";
+print $process_result;
+if (!($process_result =~ /\n$/msx)) { print "\n"; }
+my $here_string_result = do { my $input_data = q{}; my $set1_12 = 'a-z';
+my $set2_12 = 'A-Z';
+my $input_12 = $input_data;
+# Expand character ranges for tr command
+my $expanded_set1_12 = $set1_12;
+my $expanded_set2_12 = $set2_12;
+# Handle A-Z range
+if ($expanded_set1_12 =~ /A-Z/msx) {
+    $expanded_set1_12 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+if ($expanded_set2_12 =~ /a-z/msx) {
+    $expanded_set2_12 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+}
+my $tr_result_11 = q{};
+for my $char ( split //msx, $input_12 ) {
+    my $pos_12 = index $expanded_set1_12, $char;
+    if ( $pos_12 >= 0 && $pos_12 < length $expanded_set2_12 ) {
+        $tr_result_11 .= substr $expanded_set2_12, $pos_12, 1;
+    } else {
+        $tr_result_11 .= $char;
+    }
+}
+ };
+print "Here string result: $here_string_result\n";
+my $perl_result = do {
+    my $cmd_result_14 = do {
+                                            open my $fh, '>', 'temp_perl_22228.pl' or croak 'Cannot create temp file: $OS_ERROR';
+                                            print {$fh} "print \"Hello from Perl\\n\"";
+                                            close $fh or croak 'Close failed: $OS_ERROR';
+                                            my ($in_13, $out_13, $err_13);
+                                            my $pid_13 = open3($in_13, $out_13, $err_13, 'perl', 'temp_perl_22228.pl');
+                                            close $in_13 or croak 'Close failed: $OS_ERROR';
+                                            my $result_13 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_13> };
+                                            close $out_13 or croak 'Close failed: $OS_ERROR';
+                                            waitpid $pid_13, 0;
+                                            unlink 'temp_perl_22228.pl' or carp 'Cannot remove temp file: $OS_ERROR';
+                                            $result_13;
+                                        };
+    chomp $cmd_result_14;
+    $cmd_result_14;
+};
+print "Perl result: $perl_result\n";
+if (-e "file1.txt") {
+if (-d "file1.txt") {
+carp "rm: carping: ", "file1.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file1.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file1.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file1.txt",
+    ": No such file or directory\n";
+}
+if (-e "file2.txt") {
+if (-d "file2.txt") {
+carp "rm: carping: ", "file2.txt",
+    " is a directory (use -r to remove recursively)\n";
+} else {
+if (unlink "file2.txt") {
+$main_exit_code = 0;
+} else {
+carp "rm: carping: could not remove ", "file2.txt",
+    ": $ERRNO\n";
+}
+}
+} else {
+local $CHILD_ERROR = 0;
+carp "rm: carping: ", "file2.txt",
+    ": No such file or directory\n";
+}
+print "=== Complex Backtick Examples Complete ===\n";
+
+```
+
+perlcritic_wrapper: Started, parse args took 2e-05s
+perlcritic_wrapper: File read took 0.000357s
+perlcritic_wrapper: SHA1 hash took 6.2e-05s
+perlcritic_wrapper: No cache file found
+perlcritic_wrapper: Perl::Critic init took 0.340829s
+perlcritic_wrapper: Perl::Critic analysis took 0.986506s
+The system cannot find the path specified.
+The system cannot find the path specified.
+The system cannot find the path specified.
+The system cannot find the path specified.
+The system cannot find the path specified.
+perlcritic_wrapper: Perltidy subprocess took 1.760584s
+perlcritic_wrapper: check_tidy total took 1.761661s
+perlcritic_wrapper: Perltidy check took 1.761781s
+perlcritic_wrapper: Output generation took 0.004643s
+perlcritic_wrapper: Cache write took 0.000796s
+perlcritic_wrapper: Total time 3.095496s
+
+Perl::Critic violations found:
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 124, Column 5
+  Code:     [VIOLATION!]open my $fh, '>', $temp_file_ps_7 or croak "Cannot create temp file: $OS_ERROR\n";
+  Explanation: See page 209 of PBP
+
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 126, Column 86
+  Code:     $temp_output .= my $file_content_8 = do { local $INPUT_RECORD_SEPARATOR = undef; [VIOLATION!]open my $fh, '<', 'file1.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+  Explanation: See page 209 of PBP
+
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 139, Column 5
+  Code:     [VIOLATION!]open my $fh, '>', $temp_file_ps_9 or croak "Cannot create temp file: $OS_ERROR\n";
+  Explanation: See page 209 of PBP
+
+Close filehandles as soon as possible after opening them
+  Policy: Perl::Critic::Policy::InputOutput::RequireBriefOpen
+  Severity: 4
+  Location: Line 141, Column 87
+  Code:     $temp_output .= my $file_content_10 = do { local $INPUT_RECORD_SEPARATOR = undef; [VIOLATION!]open my $fh, '<', 'file2.txt' or croak "Cannot open file: $OS_ERROR"; <$fh> };
+  Explanation: See page 209 of PBP
+
+
+Writing test count 0 to first_n_tests_passed.txt
+Current working directory: "D:\\GitHub\\sh2perl"
+Successfully wrote test count 0 and matching stdout lines 0 to first_n_tests_passed.txt
+
+To run test again: ./fail 000__04h
+Test run completed at Tue, Sep 23, 2025  1:10:58 PM

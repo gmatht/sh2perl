@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sh2perl-test:latest
+    container_name: sh2perl-test
+    volumes:
+      # Mount the project directory for live development
+      - .:/workspace
+      # Persist cargo cache for faster rebuilds
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git-cache:/usr/local/cargo/git
+    working_dir: /workspace
+    environment:
+      - LOCALE=C
+      - LC_COLLATE=C
+    # Override command to keep container running for interactive use
+    command: tail -f /dev/null
+    # Uncomment to run tests automatically
+    # command: bash ./fail
+
+volumes:
+  cargo-cache:
+  cargo-git-cache:
+
+
+
+

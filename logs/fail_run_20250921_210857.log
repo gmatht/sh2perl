@@ -1,0 +1,1835 @@
+Starting test run at Sun, Sep 21, 2025  9:08:58 PM
+Logging to: logs/fail_run_20250921_210857.log
+Test arguments: 
+----------------------------------------
+Compiling debashc...
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src\timeout_manager.rs:277:1
+    |
+277 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: unused variable: `glob_exprs`
+  --> src\generator\commands\simple_commands.rs:38:45
+   |
+38 | ...                   let glob_exprs: Vec<String> = patterns.iter()
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_glob_exprs`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:836:22
+    |
+836 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:850:34
+    |
+850 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+    |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `input_var`
+ --> src\generator\commands\comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:564:37
+    |
+564 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `s`
+   --> src\generator\words.rs:830:23
+    |
+830 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+    |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:150:13
+    |
+150 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:189:13
+    |
+189 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+20   | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1885:4
+     |
+1885 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:188:4
+    |
+188 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:24:4
+   |
+24 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:73:4
+   |
+73 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:228:4
+    |
+228 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for_loop_index: usize) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+6  | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+7  |     /// Maps variable names to their usage information
+8  |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+9  |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 24 warnings (run `cargo fix --lib -p debashl` to apply 3 suggestions)
+warning: unused import: `execute_with_progress`
+ --> src\testing.rs:9:67
+  |
+9 | use crate::timeout_manager::{OperationType, execute_with_timeout, execute_with_progress, 
+  |                                                                   ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src\testing.rs:16:5
+   |
+16 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src\testing.rs:25:9
+   |
+25 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1158:9
+     |
+1158 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src\testing.rs:1367:9
+     |
+1367 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src\testing.rs:1415:9
+     |
+1415 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1964:13
+     |
+1964 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1964:9
+     |
+1964 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src\execution.rs:62:8
+   |
+62 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String> {
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src\testing.rs:19:4
+   |
+19 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String> 
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:52:9
+   |
+39 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+52 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+53 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:552:8
+    |
+552 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>) -> Result<TestResult, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src\testing.rs:1363:8
+     |
+1363 | pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src\timeout_manager.rs:11:5
+   |
+8  | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src\timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src\timeout_manager.rs:117:12
+    |
+90  | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: Duration) {
+    |            ^^^^^^^^^^^
+...
+173 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src\timeout_manager.rs:297:8
+    |
+297 | pub fn execute_with_progress<F, T>(operation: OperationType, operation_fn: F) -> Result<T, String>
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s
+Running debashc with fine-grained per-test timeouts...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail
+Timeout: Per-test timeouts (30s shell, 10s parse, 5s generate)
+----------------------------------------
+Running ALL 146 examples (limited to 50 tests to prevent timeout)
+
+Running 146 tests across 146 examples with perl generator
+==================================================
+Test 1/146: 000__01_file_directory_operations.sh with perl     DEBUG: Starting test execution for examples\000__01_file_directory_operations.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__01_file_directory_operations.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-maxdepth", None), Literal("1", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1391 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1391 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== File an
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 2.9µs
+DEBUG: Execution loop iteration, elapsed: 10.5026ms
+DEBUG: Execution loop iteration, elapsed: 20.9588ms
+DEBUG: Execution loop iteration, elapsed: 31.5ms
+DEBUG: Execution loop iteration, elapsed: 42.1198ms
+DEBUG: Execution loop iteration, elapsed: 52.263ms
+DEBUG: Execution loop iteration, elapsed: 62.3693ms
+DEBUG: Execution loop iteration, elapsed: 72.8293ms
+DEBUG: Execution loop iteration, elapsed: 83.4753ms
+DEBUG: Execution loop iteration, elapsed: 94.0128ms
+DEBUG: Execution loop iteration, elapsed: 104.5882ms
+DEBUG: Execution loop iteration, elapsed: 115.1277ms
+DEBUG: Execution loop iteration, elapsed: 125.7087ms
+DEBUG: Execution loop iteration, elapsed: 136.2216ms
+DEBUG: Execution loop iteration, elapsed: 146.8046ms
+DEBUG: Execution loop iteration, elapsed: 156.9666ms
+DEBUG: Execution loop iteration, elapsed: 167.4982ms
+DEBUG: Execution loop iteration, elapsed: 178.0588ms
+DEBUG: Execution loop iteration, elapsed: 188.7949ms
+DEBUG: Execution loop iteration, elapsed: 198.952ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 199.2998ms, timed_out: false
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 9058, Translated stdout length: 9058
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: Test success: true
+DEBUG: Test execution completed in 222ms
+✓Test 2/146: 000__02_output_formatting_commands.sh with perl     DEBUG: Starting test execution for examples\000__02_output_formatting_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__02_output_formatting_commands.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("Hello from backticks", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("printf", None), args: [Literal("Number: %d, String: %s\\n", None), Literal("42", None), Literal("test", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha256sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha256sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("sha512sum", None), args: [Literal("test_checksum.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native sha512sum implementation for command substitution
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("strings", None), args: [Literal("test_binary.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("test output")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tee", None), args: [Literal("test_tee.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("perl", None), args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing perl command in command substitution with args: [Literal("-e", None), Literal("print \"Hello from Perl\\n\"", None)]
+DEBUG: Perl code generated, length: 5553 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 5553 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use Digest::SHA qw(sha256_hex sha512_hex);
+use File::Path qw(make_path remove_tree
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 3.3µs
+DEBUG: Execution loop iteration, elapsed: 10.2249ms
+DEBUG: Execution loop iteration, elapsed: 21.0389ms
+DEBUG: Execution loop iteration, elapsed: 31.37ms
+DEBUG: Execution loop iteration, elapsed: 41.9093ms
+DEBUG: Execution loop iteration, elapsed: 52.4465ms
+DEBUG: Execution loop iteration, elapsed: 63.1387ms
+DEBUG: Execution loop iteration, elapsed: 73.5543ms
+DEBUG: Execution loop iteration, elapsed: 84.0973ms
+DEBUG: Execution loop iteration, elapsed: 94.3704ms
+DEBUG: Execution loop iteration, elapsed: 104.8612ms
+DEBUG: Execution loop iteration, elapsed: 115.2503ms
+DEBUG: Execution loop iteration, elapsed: 125.8739ms
+DEBUG: Execution loop iteration, elapsed: 136.4403ms
+DEBUG: Execution loop iteration, elapsed: 146.9749ms
+DEBUG: Execution loop iteration, elapsed: 157.5452ms
+DEBUG: Execution loop iteration, elapsed: 168.0694ms
+DEBUG: Execution loop iteration, elapsed: 178.6139ms
+DEBUG: Execution loop iteration, elapsed: 189.1641ms
+DEBUG: Execution loop iteration, elapsed: 199.7101ms
+DEBUG: Execution loop iteration, elapsed: 210.2662ms
+DEBUG: Execution loop iteration, elapsed: 220.8291ms
+DEBUG: Execution loop iteration, elapsed: 231.3159ms
+DEBUG: Execution loop iteration, elapsed: 241.8295ms
+DEBUG: Execution loop iteration, elapsed: 251.9701ms
+DEBUG: Execution loop iteration, elapsed: 262.4792ms
+DEBUG: Execution loop iteration, elapsed: 272.6279ms
+DEBUG: Execution loop iteration, elapsed: 282.7507ms
+DEBUG: Execution loop iteration, elapsed: 293.2727ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 293.6369ms, timed_out: false
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 660, Translated stdout length: 660
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: Test success: true
+DEBUG: Test execution completed in 342ms
+✓Test 3/146: 000__03_file_manipulation_commands.sh with perl     DEBUG: Starting test execution for examples\000__03_file_manipulation_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__03_file_manipulation_commands.sh
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("cp", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("cp", None), args: [Literal("test_file.txt", None), Literal("test_file_copy.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native cp implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Copy successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("mv", None), args: [Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("mv", None), args: [Literal("test_file_copy.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native mv implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Move successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_file.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("rm", None), args: [Literal("test_file.txt", None), Literal("test_file_moved.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native rm implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Remove successful")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_file.txt'
+DEBUG: ls command file/directory argument: 'test_file_copy.txt'
+DEBUG: ls command file/directory argument: 'test_file_moved.txt'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory created")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("mkdir", None), args: [Literal("test_dir", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native mkdir implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Directory created")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: ls command file/directory argument: 'test_dir'
+DEBUG: CommandSubstitution called with command: And(Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File touched")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }))
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("touch", None), args: [Literal("test_file.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native touch implementation for command substitution
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("File touched")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Perl code generated, length: 15418 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 15418 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+use POSIX 
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 5.9µs
+DEBUG: Execution loop iteration, elapsed: 10.5744ms
+DEBUG: Execution loop iteration, elapsed: 21.0195ms
+DEBUG: Execution loop iteration, elapsed: 31.3551ms
+DEBUG: Execution loop iteration, elapsed: 41.9064ms
+DEBUG: Execution loop iteration, elapsed: 52.4394ms
+DEBUG: Execution loop iteration, elapsed: 62.9941ms
+DEBUG: Execution loop iteration, elapsed: 73.5943ms
+DEBUG: Execution loop iteration, elapsed: 84.3545ms
+DEBUG: Execution loop iteration, elapsed: 94.8951ms
+DEBUG: Execution loop iteration, elapsed: 105.4917ms
+DEBUG: Execution loop iteration, elapsed: 115.9599ms
+DEBUG: Execution loop iteration, elapsed: 126.0798ms
+DEBUG: Execution loop iteration, elapsed: 136.603ms
+DEBUG: Execution loop iteration, elapsed: 147.1446ms
+DEBUG: Execution loop iteration, elapsed: 158.0638ms
+DEBUG: Execution loop iteration, elapsed: 168.4148ms
+DEBUG: Execution loop iteration, elapsed: 178.9332ms
+DEBUG: Execution loop iteration, elapsed: 189.5016ms
+DEBUG: Execution loop iteration, elapsed: 199.8922ms
+DEBUG: Execution loop iteration, elapsed: 210.2454ms
+DEBUG: Execution loop iteration, elapsed: 220.8217ms
+DEBUG: Execution loop iteration, elapsed: 231.4081ms
+DEBUG: Execution loop iteration, elapsed: 241.8936ms
+DEBUG: Execution loop iteration, elapsed: 252.2381ms
+DEBUG: Execution loop iteration, elapsed: 262.7847ms
+DEBUG: Execution loop iteration, elapsed: 273.5399ms
+DEBUG: Execution loop iteration, elapsed: 284.0263ms
+DEBUG: Execution loop iteration, elapsed: 294.5457ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 294.9403ms, timed_out: false
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 422, Translated stdout length: 422
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: Test success: true
+DEBUG: Test execution completed in 361ms
+✓Test 4/146: 000__04a_basic_command_substitution.sh with perl     DEBUG: Starting test execution for examples\000__04a_basic_command_substitution.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: String interpolation parsed command 'date +%Y' as 1 commands
+DEBUG: String interpolation parsed command 'basename $(pwd)' as 1 commands
+DEBUG: Setting original script name to: 000__04a_basic_command_substitution.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("basename", None), args: [CommandSubstitution(Simple(SimpleCommand { name: Literal("pwd", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("pwd", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("basename", None), args: [CommandSubstitution(Simple(SimpleCommand { name: Literal("pwd", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("pwd", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y%m", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Perl code generated, length: 1143 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1143 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== Basic C
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 5.1µs
+DEBUG: Execution loop iteration, elapsed: 10.1419ms
+DEBUG: Execution loop iteration, elapsed: 20.7072ms
+DEBUG: Execution loop iteration, elapsed: 31.1751ms
+DEBUG: Execution loop iteration, elapsed: 41.6678ms
+DEBUG: Execution loop iteration, elapsed: 52.897ms
+DEBUG: Execution loop iteration, elapsed: 63.3508ms
+DEBUG: Execution loop iteration, elapsed: 73.9653ms
+DEBUG: Execution loop iteration, elapsed: 84.573ms
+DEBUG: Execution loop iteration, elapsed: 95.088ms
+DEBUG: Execution loop iteration, elapsed: 105.642ms
+DEBUG: Execution loop iteration, elapsed: 115.7502ms
+DEBUG: Execution loop iteration, elapsed: 126.3211ms
+DEBUG: Execution loop iteration, elapsed: 136.8348ms
+DEBUG: Execution loop iteration, elapsed: 146.9494ms
+DEBUG: Execution loop iteration, elapsed: 157.7332ms
+DEBUG: Execution loop iteration, elapsed: 168.2072ms
+DEBUG: Execution loop iteration, elapsed: 179.3329ms
+DEBUG: Execution loop iteration, elapsed: 189.9202ms
+DEBUG: Execution loop iteration, elapsed: 200.5487ms
+DEBUG: Execution loop iteration, elapsed: 211.0944ms
+DEBUG: Execution loop iteration, elapsed: 221.7008ms
+DEBUG: Execution loop iteration, elapsed: 232.2115ms
+DEBUG: Execution loop iteration, elapsed: 242.4889ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 242.8105ms, timed_out: false
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 172, Translated stdout length: 172
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: Test success: true
+DEBUG: Test execution completed in 302ms
+✓DEBUG: Progress: 5/146 tests completed (3.4%)
+Test 5/146: 000__04b_file_directory_operations.sh with perl     DEBUG: Starting test execution for examples\000__04b_file_directory_operations.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04b_file_directory_operations.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("ls", None), args: [Literal("-a", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("find", None), args: [Literal(".", None), Literal("-name", None), Literal("*.sh", None), Literal("-type", None), Literal("f", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: generate_find_command called with generate_output: true, input_var: 'found_files'
+DEBUG: Using generate_find_for_substitution with input_var: 'found_files'
+DEBUG: Perl code generated, length: 1472 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1472 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== File an
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 3.7µs
+DEBUG: Execution loop iteration, elapsed: 10.4818ms
+DEBUG: Execution loop iteration, elapsed: 21.0223ms
+DEBUG: Execution loop iteration, elapsed: 31.2801ms
+DEBUG: Execution loop iteration, elapsed: 41.833ms
+DEBUG: Execution loop iteration, elapsed: 52.3776ms
+DEBUG: Execution loop iteration, elapsed: 62.8979ms
+DEBUG: Execution loop iteration, elapsed: 73.4539ms
+DEBUG: Execution loop iteration, elapsed: 84.0216ms
+DEBUG: Execution loop iteration, elapsed: 94.2882ms
+DEBUG: Execution loop iteration, elapsed: 104.8603ms
+DEBUG: Execution loop iteration, elapsed: 115.422ms
+DEBUG: Execution loop iteration, elapsed: 125.9649ms
+DEBUG: Execution loop iteration, elapsed: 136.513ms
+DEBUG: Execution loop iteration, elapsed: 146.6574ms
+DEBUG: Execution loop iteration, elapsed: 157.248ms
+DEBUG: Execution loop iteration, elapsed: 167.397ms
+DEBUG: Execution loop iteration, elapsed: 178.007ms
+DEBUG: Execution loop iteration, elapsed: 188.5312ms
+DEBUG: Execution loop iteration, elapsed: 199.144ms
+DEBUG: Execution loop iteration, elapsed: 209.6793ms
+DEBUG: Execution loop iteration, elapsed: 220.1205ms
+DEBUG: Execution loop iteration, elapsed: 230.6757ms
+DEBUG: Execution loop iteration, elapsed: 241.222ms
+DEBUG: Execution loop iteration, elapsed: 251.3325ms
+DEBUG: Execution loop iteration, elapsed: 261.5952ms
+DEBUG: Execution loop iteration, elapsed: 271.9124ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 272.2392ms, timed_out: false
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 9105, Translated stdout length: 9105
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: Test success: true
+DEBUG: Test execution completed in 324ms
+✓Test 6/146: 000__04c_text_processing_commands.sh with perl     DEBUG: Starting test execution for examples\000__04c_text_processing_commands.sh with generator perl
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04c_text_processing_commands.sh
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("cat", None), args: [Literal("000__04c_text_processing_commands.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-5", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("grep", None), args: [Literal("-n", None), Literal("echo", None), Literal("000__04c_text_processing_commands.sh", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: words.rs - Using native grep implementation for command substitution
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sed", None), args: [Literal("s/World/Universe/", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("1 2 3 4 5")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("awk", None), args: [Literal("{print $1 + $2}", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("zebra\\napple\\nbanana")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("sort", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("apple\\napple\\nbanana\\nbanana\\ncherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("uniq", None), args: [], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("-e", None), StringInterpolation(StringInterpolation { parts: [Literal("line1\\nline2\\nline3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-l", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello World")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("wc", None), args: [Literal("-w", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("seq", None), args: [Literal("1", None), Literal("10", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("seq", None), args: [Literal("1", None), Literal("10", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tail", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("apple:banana:cherry")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("cut", None), args: [Literal("-d", None), Literal(":", None), Literal("-f", None), Literal("2", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("paste", None), args: [Literal("temp1.txt", None), Literal("temp2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("comm", None), args: [Literal("-12", None), Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: comm command detected, checking for process substitution
+DEBUG: comm command has no process substitution, using dedicated implementation
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("diff", None), args: [Literal("file1.txt", None), Literal("file2.txt", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: Processing diff command in command substitution with args: [Literal("file1.txt", None), Literal("file2.txt", None)]
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("HELLO WORLD")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("tr", None), args: [Literal("A-Z", None), Literal("a-z", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("echo", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("1 2 3")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("xargs", None), args: [Literal("-n", None), Literal("1", None), Literal("echo", None), StringInterpolation(StringInterpolation { parts: [Literal("Number:")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Perl code generated, length: 15082 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 15082 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+use File::Path qw(make_path remove_tree);
+
+my $main_exit_code = 0;
+my $ls_success 
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 4.8µs
+DEBUG: Execution loop iteration, elapsed: 10.5115ms
+DEBUG: Execution loop iteration, elapsed: 21.0658ms
+DEBUG: Execution loop iteration, elapsed: 31.3629ms
+DEBUG: Execution loop iteration, elapsed: 42.0701ms
+DEBUG: Execution loop iteration, elapsed: 52.4759ms
+DEBUG: Execution loop iteration, elapsed: 63.0251ms
+DEBUG: Execution loop iteration, elapsed: 73.7012ms
+DEBUG: Execution loop iteration, elapsed: 83.9903ms
+DEBUG: Execution loop iteration, elapsed: 94.5611ms
+DEBUG: Execution loop iteration, elapsed: 105.2451ms
+DEBUG: Execution loop iteration, elapsed: 115.7874ms
+DEBUG: Execution loop iteration, elapsed: 126.1917ms
+DEBUG: Execution loop iteration, elapsed: 136.5806ms
+DEBUG: Execution loop iteration, elapsed: 146.9831ms
+DEBUG: Execution loop iteration, elapsed: 157.5524ms
+DEBUG: Execution loop iteration, elapsed: 168.1183ms
+DEBUG: Execution loop iteration, elapsed: 178.5349ms
+DEBUG: Execution loop iteration, elapsed: 189.0875ms
+DEBUG: Execution loop iteration, elapsed: 199.8119ms
+DEBUG: Execution loop iteration, elapsed: 210.2087ms
+DEBUG: Execution loop iteration, elapsed: 220.7688ms
+DEBUG: Execution loop iteration, elapsed: 231.1314ms
+DEBUG: Execution loop iteration, elapsed: 241.4438ms
+DEBUG: Execution loop iteration, elapsed: 251.9999ms
+DEBUG: Execution loop iteration, elapsed: 262.5305ms
+DEBUG: Execution loop iteration, elapsed: 273.0875ms
+DEBUG: Execution loop iteration, elapsed: 284.0296ms
+DEBUG: Execution loop iteration, elapsed: 294.7439ms
+DEBUG: Execution loop iteration, elapsed: 304.9503ms
+DEBUG: Execution loop iteration, elapsed: 315.0777ms
+DEBUG: Execution loop iteration, elapsed: 325.6157ms
+DEBUG: Execution loop iteration, elapsed: 336.1349ms
+DEBUG: Execution loop iteration, elapsed: 346.6859ms
+DEBUG: Execution loop iteration, elapsed: 357.2958ms
+DEBUG: Execution loop iteration, elapsed: 367.8567ms
+DEBUG: Execution loop iteration, elapsed: 378.4095ms
+DEBUG: Perl process completed with status: ExitStatus(ExitStatus(0))
+DEBUG: Perl execution completed, duration: 378.8424ms, timed_out: false
+DEBUG: Test completed, comparing outputs
+DEBUG: Shell stdout length: 2154, Translated stdout length: 2154
+DEBUG: Shell stderr length: 0, Translated stderr length: 0
+DEBUG: Shell exit: 0, Translated exit: 0
+DEBUG: Test success: true
+DEBUG: Test execution completed in 443ms
+✓Test 7/146: 000__04d_system_utilities.sh with perl     DEBUG: Starting test execution for examples\000__04d_system_utilities.sh with generator perl
+DEBUG: Running shell script: examples\000__04d_system_utilities.sh
+DEBUG: Shell script completed in 3.17s
+DEBUG: Shell script execution completed, now starting Perl generation
+DEBUG: Setting original script name to: 000__04d_system_utilities.sh
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%rms", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("date", None), args: [Literal("+%Y-%m-%d %H", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("time", None), args: [Literal("sleep", None), Literal("1", None)], redirects: [Redirect { fd: Some(2), operator: StderrOutput, target: Literal("1", None), heredoc_body: None }], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("echo", None), args: [Literal("2", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Simple(SimpleCommand { name: Literal("which", None), args: [Literal("bash", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })
+DEBUG: CommandSubstitution called with command: Pipeline(Pipeline { commands: [Simple(SimpleCommand { name: Literal("yes", None), args: [StringInterpolation(StringInterpolation { parts: [Literal("Hello")] }, None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true }), Simple(SimpleCommand { name: Literal("head", None), args: [Literal("-3", None)], redirects: [], env_vars: {}, stdout_used: true, stderr_used: true })], source_text: None, stdout_used: true, stderr_used: true })
+DEBUG: generate_pipeline_for_substitution called
+DEBUG: Perl code generated, length: 1964 characters
+DEBUG: About to start translated program execution
+DEBUG: About to execute Perl command: ["perl", "C:\\Users\\s_pam\\AppData\\Local\\Temp\\__tmp_test_output.pl"]
+DEBUG: Perl code length: 1964 characters
+DEBUG: First 200 characters of Perl code:
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw( -no_match_vars );
+use locale;
+use IPC::Open3;
+
+my $main_exit_code = 0;
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+print "=== System 
+DEBUG: Successfully spawned Perl process
+DEBUG: Starting execution loop for Perl process
+DEBUG: Execution loop iteration, elapsed: 4.3µs
+DEBUG: Execution loop iteration, elapsed: 10.5012ms
+DEBUG: Execution loop iteration, elapsed: 21.1125ms
+DEBUG: Execution loop iteration, elapsed: 31.6022ms
+DEBUG: Execution loop iteration, elapsed: 41.9675ms
+DEBUG: Execution loop iteration, elapsed: 52.4115ms
+DEBUG: Execution loop iteration, elapsed: 63.0052ms
+DEBUG: Execution loop iteration, elapsed: 73.1889ms
+DEBUG: Execution loop iteration, elapsed: 83.7604ms
+DEBUG: Execution loop iteration, elapsed: 94.3198ms
+DEBUG: Execution loop iteration, elapsed: 104.8623ms
+DEBUG: Execution loop iteration, elapsed: 115.4583ms
+DEBUG: Execution loop iteration, elapsed: 126.0236ms
+DEBUG: Execution loop iteration, elapsed: 136.3496ms
+DEBUG: Execution loop iteration, elapsed: 146.8958ms
+DEBUG: Execution loop iteration, elapsed: 157.439ms
+DEBUG: Execution loop iteration, elapsed: 168.009ms
+DEBUG: Execution loop iteration, elapsed: 178.5676ms
+DEBUG: Execution loop iteration, elapsed: 189.1863ms
+DEBUG: Execution loop iteration, elapsed: 199.7902ms
+DEBUG: Execution loop iteration, elapsed: 210.3534ms
+DEBUG: Execution loop iteration, elapsed: 221.0348ms
+DEBUG: Execution loop iteration, elapsed: 231.3763ms
+DEBUG: Execution loop iteration, elapsed: 241.9793ms
+DEBUG: Execution loop iteration, elapsed: 252.5309ms
+DEBUG: Execution loop iteration, elapsed: 263.0343ms
+DEBUG: Execution loop iteration, elapsed: 273.2238ms
+DEBUG: Execution loop iteration, elapsed: 283.8214ms
+DEBUG: Execution loop iteration, elapsed: 294.3829ms
+DEBUG: Execution loop iteration, elapsed: 304.9333ms
+DEBUG: Execution loop iteration, elapsed: 315.5046ms
+DEBUG: Execution loop iteration, elapsed: 326.0992ms
+DEBUG: Execution loop iteration, elapsed: 336.6637ms
+DEBUG: Execution loop iteration, elapsed: 347.196ms
+DEBUG: Execution loop iteration, elapsed: 357.7257ms
+DEBUG: Execution loop iteration, elapsed: 367.9074ms
+DEBUG: Execution loop iteration, elapsed: 378.0079ms
+DEBUG: Execution loop iteration, elapsed: 388.5895ms
+DEBUG: Execution loop iteration, elapsed: 399.1291ms
+DEBUG: Execution loop iteration, elapsed: 409.2718ms
+DEBUG: Execution loop iteration, elapsed: 419.8485ms
+DEBUG: Execution loop iteration, elapsed: 430.3208ms
+DEBUG: Execution loop iteration, elapsed: 440.9047ms
+DEBUG: Execution loop iteration, elapsed: 451.2726ms
+DEBUG: Execution loop iteration, elapsed: 461.8223ms
+DEBUG: Execution loop iteration, elapsed: 472.3953ms
+DEBUG: Execution loop iteration, elapsed: 483.0095ms
+DEBUG: Execution loop iteration, elapsed: 493.7042ms
+DEBUG: Execution loop iteration, elapsed: 504.0414ms
+DEBUG: Execution loop iteration, elapsed: 514.5505ms
+DEBUG: Execution loop iteration, elapsed: 524.6784ms
+DEBUG: Execution loop iteration, elapsed: 535.3084ms
+DEBUG: Execution loop iteration, elapsed: 545.8676ms
+DEBUG: Execution loop iteration, elapsed: 556.3311ms
+DEBUG: Execution loop iteration, elapsed: 566.8378ms
+DEBUG: Execution loop iteration, elapsed: 577.2356ms
+DEBUG: Execution loop iteration, elapsed: 587.3861ms
+DEBUG: Execution loop iteration, elapsed: 597.958ms
+DEBUG: Execution loop iteration, elapsed: 608.1174ms
+DEBUG: Execution loop iteration, elapsed: 618.4466ms
+DEBUG: Execution loop iteration, elapsed: 628.9815ms
+DEBUG: Execution loop iteration, elapsed: 639.4014ms
+DEBUG: Execution loop iteration, elapsed: 649.9442ms
+DEBUG: Execution loop iteration, elapsed: 660.5674ms
+DEBUG: Execution loop iteration, elapsed: 670.9823ms
+DEBUG: Execution loop iteration, elapsed: 681.587ms
+DEBUG: Execution loop iteration, elapsed: 691.7385ms
+DEBUG: Execution loop iteration, elapsed: 702.2804ms
+DEBUG: Execution loop iteration, elapsed: 712.8111ms
+DEBUG: Execution loop iteration, elapsed: 723.5665ms
+DEBUG: Execution loop iteration, elapsed: 733.9586ms
+DEBUG: Execution loop iteration, elapsed: 744.4866ms
+DEBUG: Execution loop iteration, elapsed: 755.3046ms
+DEBUG: Execution loop iteration, elapsed: 765.5448ms
+DEBUG: Execution loop iteration, elapsed: 775.6627ms
+DEBUG: Execution loop iteration, elapsed: 786.4152ms
+DEBUG: Execution loop iteration, elapsed: 796.9262ms
+DEBUG: Execution loop iteration, elapsed: 807.084ms
+DEBUG: Execution loop iteration, elapsed: 817.2819ms
+DEBUG: Execution loop iteration, elapsed: 827.5517ms
+DEBUG: Execution loop iteration, elapsed: 838.07ms
+DEBUG: Execution loop iteration, elapsed: 848.5072ms
+DEBUG: Execution loop iteration, elapsed: 858.677ms
+DEBUG: Execution loop iteration, elapsed: 869.2684ms
+DEBUG: Execution loop iteration, elapsed: 879.6812ms
+DEBUG: Execution loop iteration, elapsed: 890.1532ms
+DEBUG: Execution loop iteration, elapsed: 900.4568ms
+DEBUG: Execution loop iteration, elapsed: 911.0341ms
+DEBUG: Execution loop iteration, elapsed: 921.2426ms
+DEBUG: Execution loop iteration, elapsed: 931.5411ms
+DEBUG: Execution loop iteration, elapsed: 942.0651ms
+DEBUG: Execution loop iteration, elapsed: 952.661ms
+DEBUG: Execution loop iteration, elapsed: 963.1952ms
+DEBUG: Execution loop iteration, elapsed: 973.7734ms
+DEBUG: Execution loop iteration, elapsed: 984.3489ms
+DEBUG: Execution loop iteration, elapsed: 994.571ms
+DEBUG: Execution loop iteration, elapsed: 1.0050786s
+DEBUG: Execution loop iteration, elapsed: 1.0156437s
+DEBUG: Execution loop iteration, elapsed: 1.0257142s
+DEBUG: Execution loop iteration, elapsed: 1.0360923s
+DEBUG: Execution loop iteration, elapsed: 1.0465988s
+DEBUG: Execution loop iteration, elapsed: 1.0568248s
+DEBUG: Execution loop iteration, elapsed: 1.0672837s
+DEBUG: Execution loop iteration, elapsed: 1.0777715s
+DEBUG: Execution loop iteration, elapsed: 1.0878733s
+DEBUG: Execution loop iteration, elapsed: 1.0982307s
+DEBUG: Execution loop iteration, elapsed: 1.1087163s
+DEBUG: Execution loop iteration, elapsed: 1.1188547s
+DEBUG: Execution loop iteration, elapsed: 1.1294028s
+DEBUG: Execution loop iteration, elapsed: 1.139913s
+DEBUG: Execution loop iteration, elapsed: 1.1504688s
+DEBUG: Execution loop iteration, elapsed: 1.1606336s
+DEBUG: Execution loop iteration, elapsed: 1.1710278s
+DEBUG: Execution loop iteration, elapsed: 1.1815434s
+DEBUG: Execution loop iteration, elapsed: 1.1921091s
+DEBUG: Execution loop iteration, elapsed: 1.2023482s
+DEBUG: Execution loop iteration, elapsed: 1.2128639s
+DEBUG: Execution loop iteration, elapsed: 1.2234566s
+DEBUG: Execution loop iteration, elapsed: 1.2339488s
+DEBUG: Execution loop iteration, elapsed: 1.2444869s
+DEBUG: Execution loop iteration, elapsed: 1.2548766s
+DEBUG: Execution loop iteration, elapsed: 1.2657521s
+DEBUG: Execution loop iteration, elapsed: 1.2763736s
+DEBUG: Execution loop iteration, elapsed: 1.2866208s
+DEBUG: Execution loop iteration, elapsed: 1.2970941s
+DEBUG: Execution loop iteration, elapsed: 1.3076276s
+DEBUG: Execution loop iteration, elapsed: 1.3178297s
+DEBUG: Execution loop iteration, elapsed: 1.3282071s
+DEBUG: Execution loop iteration, elapsed: 1.3383946s
+DEBUG: Execution loop iteration, elapsed: 1.3489446s
+DEBUG: Execution loop iteration, elapsed: 1.3594437s
+DEBUG: Execution loop iteration, elapsed: 1.3696772s
+DEBUG: Execution loop iteration, elapsed: 1.3797748s
+DEBUG: Execution loop iteration, elapsed: 1.3899867s
+DEBUG: Execution loop iteration, elapsed: 1.4003376s
+DEBUG: Execution loop iteration, elapsed: 1.4109241s
+DEBUG: Execution loop iteration, elapsed: 1.421144s
+DEBUG: Execution loop iteration, elapsed: 1.431647s
+DEBUG: Execution loop iteration, elapsed: 1.4421707s
+DEBUG: Execution loop iteration, elapsed: 1.452783s
+DEBUG: Execution loop iteration, elapsed: 1.4633079s
+DEBUG: Execution loop iteration, elapsed: 1.4738582s
+DEBUG: Execution loop iteration, elapsed: 1.484417s
+DEBUG: Execution loop iteration, elapsed: 1.494937s
+DEBUG: Execution loop iteration, elapsed: 1.5055388s
+DEBUG: Execution loop iteration, elapsed: 1.5160496s
+DEBUG: Execution loop iteration, elapsed: 1.5266448s
+DEBUG: Execution loop iteration, elapsed: 1.5371802s
+DEBUG: Execution loop iteration, elapsed: 1.5478669s
+DEBUG: Execution loop iteration, elapsed: 1.5582778s
+DEBUG: Execution loop iteration, elapsed: 1.5689587s
+DEBUG: Execution loop iteration, elapsed: 1.5792551s
+DEBUG: Execution loop iteration, elapsed: 1.5897639s
+DEBUG: Execution loop iteration, elapsed: 1.6003021s
+DEBUG: Execution loop iteration, elapsed: 1.6110801s
+DEBUG: Execution loop iteration, elapsed: 1.6212268s
+DEBUG: Execution loop iteration, elapsed: 1.631712s
+DEBUG: Execution loop iteration, elapsed: 1.6423017s
+DEBUG: Execution loop iteration, elapsed: 1.6528118s
+DEBUG: Execution loop iteration, elapsed: 1.6633211s
+DEBUG: Execution loop iteration, elapsed: 1.673575s
+DEBUG: Execution loop iteration, elapsed: 1.6841955s
+DEBUG: Execution loop iteration, elapsed: 1.6943429s
+DEBUG: Execution loop iteration, elapsed: 1.7049205s
+DEBUG: Execution loop iteration, elapsed: 1.7155144s
+DEBUG: Execution loop iteration, elapsed: 1.7261095s
+DEBUG: Execution loop iteration, elapsed: 1.7366338s
+DEBUG: Execution loop iteration, elapsed: 1.7470061s
+DEBUG: Execution loop iteration, elapsed: 1.757571s
+DEBUG: Execution loop iteration, elapsed: 1.7681274s
+DEBUG: Execution loop iteration, elapsed: 1.7783079s
+DEBUG: Execution loop iteration, elapsed: 1.7884629s
+DEBUG: Execution loop iteration, elapsed: 1.7989881s
+DEBUG: Execution loop iteration, elapsed: 1.8091164s
+DEBUG: Execution loop iteration, elapsed: 1.819681s
+DEBUG: Execution loop iteration, elapsed: 1.8298127s
+DEBUG: Execution loop iteration, elapsed: 1.840438s
+DEBUG: Execution loop iteration, elapsed: 1.8509776s
+DEBUG: Execution loop iteration, elapsed: 1.8615075s
+DEBUG: Execution loop iteration, elapsed: 1.8721098s
+DEBUG: Execution loop iteration, elapsed: 1.8826582s
+DEBUG: Execution loop iteration, elapsed: 1.8928906s
+DEBUG: Execution loop iteration, elapsed: 1.9034479s
+DEBUG: Execution loop iteration, elapsed: 1.9140328s
+DEBUG: Execution loop iteration, elapsed: 1.9243333s
+DEBUG: Execution loop iteration, elapsed: 1.9348759s
+DEBUG: Execution loop iteration, elapsed: 1.9454461s
+DEBUG: Execution loop iteration, elapsed: 1.9559701s
+DEBUG: Execution loop iteration, elapsed: 1.9665119s
+DEBUG: Execution loop iteration, elapsed: 1.9771391s
+DEBUG: Execution loop iteration, elapsed: 1.9876874s
+DEBUG: Execution loop iteration, elapsed: 1.9980502s
+DEBUG: Execution loop iteration, elapsed: 2.008144s
+DEBUG: Execution loop iteration, elapsed: 2.018266s
+DEBUG: Execution loop iteration, elapsed: 2.0284594s
+DEBUG: Execution loop iteration, elapsed: 2.0390028s
+DEBUG: Execution loop iteration, elapsed: 2.0492043s
+DEBUG: Execution loop iteration, elapsed: 2.0599815s
+DEBUG: Execution loop iteration, elapsed: 2.0703346s
+DEBUG: Execution loop iteration, elapsed: 2.0834335s
+DEBUG: Execution loop iteration, elapsed: 2.095375s
+DEBUG: Execution loop iteration, elapsed: 2.1055022s
+DEBUG: Execution loop iteration, elapsed: 2.1175944s
+DEBUG: Execution loop iteration, elapsed: 2.1281024s
+DEBUG: Execution loop iteration, elapsed: 2.1386398s
+DEBUG: Execution loop iteration, elapsed: 2.1492168s
+DEBUG: Execution loop iteration, elapsed: 2.1597779s
+DEBUG: Execution loop iteration, elapsed: 2.1703581s
+DEBUG: Execution loop iteration, elapsed: 2.1842897s
+DEBUG: Execution loop iteration, elapsed: 2.1953844s
+DEBUG: Execution loop iteration, elapsed: 2.205583s
+DEBUG: Execution loop iteration, elapsed: 2.2161052s
+DEBUG: Execution loop iteration, elapsed: 2.228279s
+DEBUG: Execution loop iteration, elapsed: 2.2399119s
+DEBUG: Execution loop iteration, elapsed: 2.2503017s
+DEBUG: Execution loop iteration, elapsed: 2.268502s
+DEBUG: Execution loop iteration, elapsed: 2.278971s
+DEBUG: Execution loop iteration, elapsed: 2.2895657s
+DEBUG: Execution loop iteration, elapsed: 2.3000831s
+DEBUG: Execution loop iteration, elapsed: 2.3109082s
+DEBUG: Execution loop iteration, elapsed: 2.3230206s
+DEBUG: Execution loop iteration, elapsed: 2.3332568s
+DEBUG: Execution loop iteration, elapsed: 2.3438125s
+DEBUG: Execution loop iteration, elapsed: 2.3543516s
+DEBUG: Execution loop iteration, elapsed: 2.3649357s
+DEBUG: Execution loop iteration, elapsed: 2.3754449s
+DEBUG: Execution loop iteration, elapsed: 2.3860274s
+DEBUG: Execution loop iteration, elapsed: 2.396564s
+DEBUG: Execution loop iteration, elapsed: 2.4076206s
+DEBUG: Execution loop iteration, elapsed: 2.4181954s
+DEBUG: Execution loop iteration, elapsed: 2.4287519s
+DEBUG: Execution loop iteration, elapsed: 2.4392821s
+DEBUG: Execution loop iteration, elapsed: 2.4498397s
+DEBUG: Execution loop iteration, elapsed: 2.4605122s
+DEBUG: Execution loop iteration, elapsed: 2.4708036s
+DEBUG: Execution loop iteration, elapsed: 2.4839244s
+DEBUG: Execution loop iteration, elapsed: 2.494447s
+DEBUG: Execution loop iteration, elapsed: 2.5049972s
+DEBUG: Execution loop iteration, elapsed: 2.5155348s
+DEBUG: Execution loop iteration, elapsed: 2.5260924s
+DEBUG: Execution loop iteration, elapsed: 2.5367194s
+DEBUG: Execution loop iteration, elapsed: 2.5471906s
+DEBUG: Execution loop iteration, elapsed: 2.5577231s
+DEBUG: Execution loop iteration, elapsed: 2.5682333s
+DEBUG: Execution loop iteration, elapsed: 2.5787978s
+DEBUG: Execution loop iteration, elapsed: 2.5893026s
+DEBUG: Execution loop iteration, elapsed: 2.5997945s
+DEBUG: Execution loop iteration, elapsed: 2.6103361s
+DEBUG: Execution loop iteration, elapsed: 2.6205908s
+DEBUG: Execution loop iteration, elapsed: 2.6311534s
+DEBUG: Execution loop iteration, elapsed: 2.6416772s
+DEBUG: Execution loop iteration, elapsed: 2.6522743s
+DEBUG: Execution loop iteration, elapsed: 2.6628279s
+DEBUG: Execution loop iteration, elapsed: 2.6733968s
+DEBUG: Execution loop iteration, elapsed: 2.6839344s
+DEBUG: Execution loop iteration, elapsed: 2.6944647s
+DEBUG: Execution loop iteration, elapsed: 2.7051631s
+DEBUG: Execution loop iteration, elapsed: 2.7155403s
+DEBUG: Execution loop iteration, elapsed: 2.727345s
+DEBUG: Execution loop iteration, elapsed: 2.7400297s
+DEBUG: Execution loop iteration, elapsed: 2.7501846s
+DEBUG: Execution loop iteration, elapsed: 2.7612336s
+DEBUG: Execution loop iteration, elapsed: 2.77186s
+DEBUG: Execution loop iteration, elapsed: 2.7824618s
+DEBUG: Execution loop iteration, elapsed: 2.7929972s
+DEBUG: Execution loop iteration, elapsed: 2.8035662s
+DEBUG: Execution loop iteration, elapsed: 2.8141324s
+DEBUG: Execution loop iteration, elapsed: 2.8247042s
+DEBUG: Execution loop iteration, elapsed: 2.8352229s
+DEBUG: Execution loop iteration, elapsed: 2.8457582s
+DEBUG: Execution loop iteration, elapsed: 2.8563414s
+DEBUG: Execution loop iteration, elapsed: 2.8668754s
+DEBUG: Execution loop iteration, elapsed: 2.8774329s
+DEBUG: Execution loop iteration, elapsed: 2.8880055s
+DEBUG: Execution loop iteration, elapsed: 2.8985569s
+DEBUG: Execution loop iteration, elapsed: 2.9091238s
+DEBUG: Execution loop iteration, elapsed: 2.9197941s
+DEBUG: Execution loop iteration, elapsed: 2.9299697s
+DEBUG: Execution loop iteration, elapsed: 2.9405538s
+DEBUG: Execution loop iteration, elapsed: 2.9509066s
+DEBUG: Execution loop iteration, elapsed: 2.9613084s
+DEBUG: Execution loop iteration, elapsed: 2.97189s
+DEBUG: Execution loop iteration, elapsed: 2.9825701s
+DEBUG: Execution loop iteration, elapsed: 2.9929563s
+DEBUG: Execution loop iteration, elapsed: 3.0035417s
+DEBUG: Execution loop iteration, elapsed: 3.0140594s
+DEBUG: Execution loop iteration, elapsed: 3.0246112s
+DEBUG: Execution loop iteration, elapsed: 3.0351237s
+DEBUG: Execution loop iteration, elapsed: 3.0457034s
+DEBUG: Execution loop iteration, elapsed: 3.0562287s
+DEBUG: Execution loop iteration, elapsed: 3.0667368s
+DEBUG: Execution loop iteration, elapsed: 3.0772937s
+DEBUG: Execution loop iteration, elapsed: 3.087904s
+DEBUG: Execution loop iteration, elapsed: 3.0983815s
+DEBUG: Execution loop iteration, elapsed: 3.1086793s
+DEBUG: Execution loop iteration, elapsed: 3.1192279s
+DEBUG: Execution loop iteration, elapsed: 3.1297847s
+DEBUG: Execution loop iteration, elapsed: 3.1402514s
+DEBUG: Execution loop iteration, elapsed: 3.1507924s
+DEBUG: Execution loop iteration, elapsed: 3.161067s
+DEBUG: Execution loop iteration, elapsed: 3.1713836s
+DEBUG: Execution loop iteration, elapsed: 3.1819351s
+DEBUG: Execution loop iteration, elapsed: 3.1924757s
+DEBUG: Execution loop iteration, elapsed: 3.2028911s
+DEBUG: Execution loop iteration, elapsed: 3.2134324s
+DEBUG: Execution loop iteration, elapsed: 3.2235165s
+DEBUG: Execution loop iteration, elapsed: 3.2340452s
+DEBUG: Execution loop iteration, elapsed: 3.2445957s
+DEBUG: Execution loop iteration, elapsed: 3.2548601s
+DEBUG: Execution loop iteration, elapsed: 3.2649684s
+DEBUG: Execution loop iteration, elapsed: 3.2755282s
+DEBUG: Execution loop iteration, elapsed: 3.2856513s
+DEBUG: Execution loop iteration, elapsed: 3.2961931s
+DEBUG: Execution loop iteration, elapsed: 3.3063942s
+DEBUG: Execution loop iteration, elapsed: 3.3168954s
+DEBUG: Execution loop iteration, elapsed: 3.3270324s
+DEBUG: Execution loop iteration, elapsed: 3.3373354s
+DEBUG: Execution loop iteration, elapsed: 3.3478827s
+DEBUG: Execution loop iteration, elapsed: 3.358068s
+DEBUG: Execution loop iteration, elapsed: 3.3684781s
+DEBUG: Execution loop iteration, elapsed: 3.379049s
+DEBUG: Execution loop iteration, elapsed: 3.389683s
+DEBUG: Execution loop iteration, elapsed: 3.399856s
+DEBUG: Execution loop iteration, elapsed: 3.4103904s
+DEBUG: Execution loop iteration, elapsed: 3.4204938s
+DEBUG: Execution loop iteration, elapsed: 3.4310341s
+DEBUG: Execution loop iteration, elapsed: 3.4416231s
+DEBUG: Execution loop iteration, elapsed: 3.4521435s
+DEBUG: Execution loop iteration, elapsed: 3.4626722s
+DEBUG: Execution loop iteration, elapsed: 3.4732586s
+DEBUG: Execution loop iteration, elapsed: 3.4837765s
+DEBUG: Execution loop iteration, elapsed: 3.4943238s
+DEBUG: Execution loop iteration, elapsed: 3.5048484s
+DEBUG: Execution loop iteration, elapsed: 3.5149606s
+DEBUG: Execution loop iteration, elapsed: 3.5255132s
+DEBUG: Execution loop iteration, elapsed: 3.5360434s
+DEBUG: Execution loop iteration, elapsed: 3.546606s
+DEBUG: Execution loop iteration, elapsed: 3.5574362s
+DEBUG: Execution loop iteration, elapsed: 3.5677112s
+DEBUG: Execution loop iteration, elapsed: 3.578282s
+DEBUG: Execution loop iteration, elapsed: 3.5887618s
+DEBUG: Execution loop iteration, elapsed: 3.5991357s
+DEBUG: Execution loop iteration, elapsed: 3.6096881s
+DEBUG: Execution loop iteration, elapsed: 3.6202821s
+DEBUG: Execution loop iteration, elapsed: 3.6310151s
+DEBUG: Execution loop iteration, elapsed: 3.641472s
+DEBUG: Execution loop iteration, elapsed: 3.6518972s
+DEBUG: Execution loop iteration, elapsed: 3.6624718s
+DEBUG: Execution loop iteration, elapsed: 3.6730791s
+DEBUG: Execution loop iteration, elapsed: 3.6836214s
+DEBUG: Execution loop iteration, elapsed: 3.6941522s
+DEBUG: Execution loop iteration, elapsed: 3.7046892s
+DEBUG: Execution loop iteration, elapsed: 3.7152684s
+DEBUG: Execution loop iteration, elapsed: 3.7255749s
+DEBUG: Execution loop iteration, elapsed: 3.7360573s
+DEBUG: Execution loop iteration, elapsed: 3.7465623s
+DEBUG: Execution loop iteration, elapsed: 3.7571365s
+DEBUG: Execution loop iteration, elapsed: 3.7676714s
+DEBUG: Execution loop iteration, elapsed: 3.7779773s
+DEBUG: Execution loop iteration, elapsed: 3.7885416s
+DEBUG: Execution loop iteration, elapsed: 3.7987628s
+DEBUG: Execution loop iteration, elapsed: 3.8089711s
+DEBUG: Execution loop iteration, elapsed: 3.8192763s
+DEBUG: Execution loop iteration, elapsed: 3.8298197s
+DEBUG: Execution loop iteration, elapsed: 3.8401412s
+DEBUG: Execution loop iteration, elapsed: 3.8506923s
+DEBUG: Execution loop iteration, elapsed: 3.861288s
+DEBUG: Execution loop iteration, elapsed: 3.8719705s
+DEBUG: Execution loop iteration, elapsed: 3.8823266s
+DEBUG: Execution loop iteration, elapsed: 3.8926816s
+DEBUG: Execution loop iteration, elapsed: 3.9029689s
+DEBUG: Execution loop iteration, elapsed: 3.9136817s
+DEBUG: Execution loop iteration, elapsed: 3.9240665s
+DEBUG: Execution loop iteration, elapsed: 3.9346249s
+DEBUG: Execution loop iteration, elapsed: 3.9453449s
+DEBUG: Execution loop iteration, elapsed: 3.9557256s
+DEBUG: Execution loop iteration, elapsed: 3.9663335s
+DEBUG: Execution loop iteration, elapsed: 3.9768018s
+DEBUG: Execution loop iteration, elapsed: 3.9872178s
+DEBUG: Execution loop iteration, elapsed: 3.9977247s
+DEBUG: Execution loop iteration, elapsed: 4.0084578s
+DEBUG: Execution loop iteration, elapsed: 4.0188582s
+DEBUG: Execution loop iteration, elapsed: 4.0293366s
+DEBUG: Execution loop iteration, elapsed: 4.0398764s
+DEBUG: Execution loop iteration, elapsed: 4.0502481s
+DEBUG: Execution loop iteration, elapsed: 4.0605378s
+DEBUG: Execution loop iteration, elapsed: 4.0707148s
+DEBUG: Execution loop iteration, elapsed: 4.0810564s
+DEBUG: Execution loop iteration, elapsed: 4.0912535s
+DEBUG: Execution loop iteration, elapsed: 4.1019966s
+DEBUG: Execution loop iteration, elapsed: 4.1123518s
+DEBUG: Execution loop iteration, elapsed: 4.122954s
+DEBUG: Execution loop iteration, elapsed: 4.1336877s
+DEBUG: Execution loop iteration, elapsed: 4.1440138s
+DEBUG: Execution loop iteration, elapsed: 4.1545777s
+DEBUG: Execution loop iteration, elapsed: 4.1652813s
+DEBUG: Execution loop iteration, elapsed: 4.1755356s
+DEBUG: Execution loop iteration, elapsed: 4.1861233s
+DEBUG: Execution loop iteration, elapsed: 4.1968249s
+DEBUG: Execution loop iteration, elapsed: 4.2072486s
+DEBUG: Execution loop iteration, elapsed: 4.2178032s
+DEBUG: Execution loop iteration, elapsed: 4.2282443s
+DEBUG: Execution loop iteration, elapsed: 4.2385379s
+DEBUG: Execution loop iteration, elapsed: 4.24937s
+DEBUG: Execution loop iteration, elapsed: 4.2596663s
+DEBUG: Execution loop iteration, elapsed: 4.2700568s
+DEBUG: Execution loop iteration, elapsed: 4.2805665s
+DEBUG: Execution loop iteration, elapsed: 4.2917447s
+DEBUG: Execution loop iteration, elapsed: 4.3021776s
+DEBUG: Execution loop iteration, elapsed: 4.3127465s
+DEBUG: Execution loop iteration, elapsed: 4.323305s
+DEBUG: Execution loop iteration, elapsed: 4.3338374s
+DEBUG: Execution loop iteration, elapsed: 4.3450606s
+DEBUG: Execution loop iteration, elapsed: 4.3554899s
+DEBUG: Execution loop iteration, elapsed: 4.3660383s
+DEBUG: Execution loop iteration, elapsed: 4.376592s
+DEBUG: Execution loop iteration, elapsed: 4.3871435s
+DEBUG: Execution loop iteration, elapsed: 4.397676s
+DEBUG: Execution loop iteration, elapsed: 4.4082386s
+DEBUG: Execution loop iteration, elapsed: 4.4187942s
+DEBUG: Execution loop iteration, elapsed: 4.4293326s
+DEBUG: Execution loop iteration, elapsed: 4.4399099s
+DEBUG: Execution loop iteration, elapsed: 4.4504423s
+DEBUG: Execution loop iteration, elapsed: 4.4612682s
+DEBUG: Execution loop iteration, elapsed: 4.4715763s
+DEBUG: Execution loop iteration, elapsed: 4.4821277s
+DEBUG: Execution loop iteration, elapsed: 4.4933458s
+DEBUG: Execution loop iteration, elapsed: 4.5037607s
+DEBUG: Execution loop iteration, elapsed: 4.5142895s
+DEBUG: Execution loop iteration, elapsed: 4.525254s
+DEBUG: Execution loop iteration, elapsed: 4.535782s
+DEBUG: Execution loop iteration, elapsed: 4.546307s
+DEBUG: Execution loop iteration, elapsed: 4.5590269s
+DEBUG: Execution loop iteration, elapsed: 4.569446s
+DEBUG: Execution loop iteration, elapsed: 4.580365s
+DEBUG: Execution loop iteration, elapsed: 4.5907861s
+DEBUG: Execution loop iteration, elapsed: 4.6011506s
+DEBUG: Execution loop iteration, elapsed: 4.6117126s
+DEBUG: Execution loop iteration, elapsed: 4.6218717s
+DEBUG: Execution loop iteration, elapsed: 4.6324178s
+DEBUG: Execution loop iteration, elapsed: 4.6429442s
+DEBUG: Execution loop iteration, elapsed: 4.653495s
+DEBUG: Execution loop iteration, elapsed: 4.6641799s
+DEBUG: Execution loop iteration, elapsed: 4.6748086s
+DEBUG: Execution loop iteration, elapsed: 4.6858203s
+DEBUG: Execution loop iteration, elapsed: 4.6963344s
+DEBUG: Execution loop iteration, elapsed: 4.7068906s
+DEBUG: Execution loop iteration, elapsed: 4.7174237s
+DEBUG: Execution loop iteration, elapsed: 4.7279812s
+DEBUG: Execution loop iteration, elapsed: 4.7385249s
+DEBUG: Execution loop iteration, elapsed: 4.7487215s
+DEBUG: Execution loop iteration, elapsed: 4.759259s
+DEBUG: Execution loop iteration, elapsed: 4.769797s
+DEBUG: Execution loop iteration, elapsed: 4.7799405s
+DEBUG: Execution loop iteration, elapsed: 4.7901079s
+DEBUG: Execution loop iteration, elapsed: 4.8006527s
+DEBUG: Execution loop iteration, elapsed: 4.8112002s
+DEBUG: Execution loop iteration, elapsed: 4.8217203s
+DEBUG: Execution loop iteration, elapsed: 4.8319152s
+DEBUG: Execution loop iteration, elapsed: 4.8424114s
+DEBUG: Execution loop iteration, elapsed: 4.8529874s
+DEBUG: Execution loop iteration, elapsed: 4.8631807s
+DEBUG: Execution loop iteration, elapsed: 4.8738107s
+DEBUG: Execution loop iteration, elapsed: 4.8843046s
+DEBUG: Execution loop iteration, elapsed: 4.8948182s
+DEBUG: Execution loop iteration, elapsed: 4.9054448s
+DEBUG: Execution loop iteration, elapsed: 4.9159871s
+DEBUG: Execution loop iteration, elapsed: 4.9265383s
+DEBUG: Execution loop iteration, elapsed: 4.9371356s
+DEBUG: Execution loop iteration, elapsed: 4.9476589s
+DEBUG: Execution loop iteration, elapsed: 4.958186s
+DEBUG: Execution loop iteration, elapsed: 4.9688184s
+DEBUG: Execution loop iteration, elapsed: 4.9790216s
+DEBUG: Execution loop iteration, elapsed: 4.989304s
+DEBUG: Execution loop iteration, elapsed: 4.9998573s
+DEBUG: Execution loop iteration, elapsed: 5.010442s
+DEBUG: Execution loop iteration, elapsed: 5.0210325s
+DEBUG: Execution loop iteration, elapsed: 5.0311477s
+DEBUG: Execution loop iteration, elapsed: 5.0416973s
+DEBUG: Execution loop iteration, elapsed: 5.0521854s
+DEBUG: Execution loop iteration, elapsed: 5.0624523s
+DEBUG: Execution loop iteration, elapsed: 5.0730894s
+DEBUG: Execution loop iteration, elapsed: 5.0836929s
+DEBUG: Execution loop iteration, elapsed: 5.0942495s
+DEBUG: Execution loop iteration, elapsed: 5.1048762s
+DEBUG: Execution loop iteration, elapsed: 5.115507s
+DEBUG: Execution loop iteration, elapsed: 5.1257421s
+DEBUG: Execution loop iteration, elapsed: 5.1362963s
+DEBUG: Execution loop iteration, elapsed: 5.146741s
+DEBUG: Execution loop iteration, elapsed: 5.15723s
+DEBUG: Execution loop iteration, elapsed: 5.1676905s
+DEBUG: Execution loop iteration, elapsed: 5.1779775s
+DEBUG: Execution loop iteration, elapsed: 5.1886652s
+DEBUG: Execution loop iteration, elapsed: 5.1991693s
+DEBUG: Execution loop iteration, elapsed: 5.2096712s
+DEBUG: Execution loop iteration, elapsed: 5.2197793s
+DEBUG: Execution loop iteration, elapsed: 5.2300387s
+DEBUG: Execution loop iteration, elapsed: 5.2402839s
+DEBUG: Execution loop iteration, elapsed: 5.2508469s
+DEBUG: Execution loop iteration, elapsed: 5.2612454s
+DEBUG: Execution loop iteration, elapsed: 5.2717969s
+DEBUG: Execution loop iteration, elapsed: 5.2823847s
+DEBUG: Execution loop iteration, elapsed: 5.2927138s
+DEBUG: Execution loop iteration, elapsed: 5.3029777s
+DEBUG: Execution loop iteration, elapsed: 5.3134677s
+DEBUG: Execution loop iteration, elapsed: 5.3236066s
+DEBUG: Execution loop iteration, elapsed: 5.3341759s
+DEBUG: Execution loop iteration, elapsed: 5.3447285s
+DEBUG: Execution loop iteration, elapsed: 5.3552458s
+DEBUG: Execution loop iteration, elapsed: 5.365837s
+DEBUG: Execution loop iteration, elapsed: 5.376376s
+DEBUG: Execution loop iteration, elapsed: 5.3869578s
+DEBUG: Execution loop iteration, elapsed: 5.3974929s
+DEBUG: Execution loop iteration, elapsed: 5.4082115s
+DEBUG: Execution loop iteration, elapsed: 5.4185795s
+DEBUG: Execution loop iteration, elapsed: 5.4286887s
+DEBUG: Execution loop iteration, elapsed: 5.4393077s
+DEBUG: Execution loop iteration, elapsed: 5.4495588s
+DEBUG: Execution loop iteration, elapsed: 5.4601118s
+DEBUG: Execution loop iteration, elapsed: 5.4702918s
+DEBUG: Execution loop iteration, elapsed: 5.4804865s
+DEBUG: Execution loop iteration, elapsed: 5.4906119s
+DEBUG: Execution loop iteration, elapsed: 5.5010357s
+DEBUG: Execution loop iteration, elapsed: 5.5116657s
+DEBUG: Execution loop iteration, elapsed: 5.5222547s
+DEBUG: Execution loop iteration, elapsed: 5.5328791s
+DEBUG: Execution loop iteration, elapsed: 5.5432691s
+DEBUG: Execution loop iteration, elapsed: 5.5538605s
+DEBUG: Execution loop iteration, elapsed: 5.5647075s
+DEBUG: Execution loop iteration, elapsed: 5.575478s
+DEBUG: Execution loop iteration, elapsed: 5.586128s
+DEBUG: Execution loop iteration, elapsed: 5.5965993s
+DEBUG: Execution loop iteration, elapsed: 5.6070056s
+DEBUG: Execution loop iteration, elapsed: 5.6175592s
+DEBUG: Execution loop iteration, elapsed: 5.6280855s
+DEBUG: Execution loop iteration, elapsed: 5.6386404s
+DEBUG: Execution loop iteration, elapsed: 5.6492223s
+DEBUG: Execution loop iteration, elapsed: 5.6595692s
+DEBUG: Execution loop iteration, elapsed: 5.6701576s
+DEBUG: Execution loop iteration, elapsed: 5.680746s
+DEBUG: Execution loop iteration, elapsed: 5.6912865s
+DEBUG: Execution loop iteration, elapsed: 5.701897s
+DEBUG: Execution loop iteration, elapsed: 5.7124604s
+DEBUG: Execution loop iteration, elapsed: 5.723002s
+DEBUG: Execution loop iteration, elapsed: 5.7338621s
+DEBUG: Execution loop iteration, elapsed: 5.7444935s
+DEBUG: Execution loop iteration, elapsed: 5.7551472s
+DEBUG: Execution loop iteration, elapsed: 5.7656356s
+DEBUG: Execution loop iteration, elapsed: 5.7762254s
+DEBUG: Execution loop iteration, elapsed: 5.7863589s
+DEBUG: Execution loop iteration, elapsed: 5.796874s
+DEBUG: Execution loop iteration, elapsed: 5.8074828s
+DEBUG: Execution loop iteration, elapsed: 5.8179269s
+DEBUG: Execution loop iteration, elapsed: 5.8283831s
+DEBUG: Execution loop iteration, elapsed: 5.8389498s
+DEBUG: Execution loop iteration, elapsed: 5.8495156s
+DEBUG: Execution loop iteration, elapsed: 5.8596098s
+DEBUG: Execution loop iteration, elapsed: 5.8701845s
+DEBUG: Execution loop iteration, elapsed: 5.8807473s
+DEBUG: Execution loop iteration, elapsed: 5.8913278s
+DEBUG: Execution loop iteration, elapsed: 5.9019145s
+DEBUG: Execution loop iteration, elapsed: 5.9121458s
+DEBUG: Execution loop iteration, elapsed: 5.9227093s
+DEBUG: Execution loop iteration, elapsed: 5.9331002s
+DEBUG: Execution loop iteration, elapsed: 5.9436094s
+DEBUG: Execution loop iteration, elapsed: 5.9540519s
+DEBUG: Execution loop iteration, elapsed: 5.9645916s
+DEBUG: Execution loop iteration, elapsed: 5.9749814s
+DEBUG: Execution loop iteration, elapsed: 5.9850539s
+DEBUG: Execution loop iteration, elapsed: 5.9953605s
+DEBUG: Execution loop iteration, elapsed: 6.0058624s
+DEBUG: Execution loop iteration, elapsed: 6.0159945s
+DEBUG: Execution loop iteration, elapsed: 6.0265063s
+DEBUG: Execution loop iteration, elapsed: 6.0370136s
+DEBUG: Execution loop iteration, elapsed: 6.0475217s
+DEBUG: Execution loop iteration, elapsed: 6.0580588s
+DEBUG: Execution loop iteration, elapsed: 6.0686659s
+DEBUG: Execution loop iteration, elapsed: 6.0789357s
+DEBUG: Execution loop iteration, elapsed: 6.0891396s
+DEBUG: Execution loop iteration, elapsed: 6.09969s
+DEBUG: Execution loop iteration, elapsed: 6.1098418s
+DEBUG: Execution loop iteration, elapsed: 6.1200259s
+DEBUG: Execution loop iteration, elapsed: 6.130524s
+DEBUG: Execution loop iteration, elapsed: 6.1410665s
+DEBUG: Execution loop iteration, elapsed: 6.1516261s
+DEBUG: Execution loop iteration, elapsed: 6.1621619s
+DEBUG: Execution loop iteration, elapsed: 6.1727831s
+DEBUG: Execution loop iteration, elapsed: 6.183298s
+DEBUG: Execution loop iteration, elapsed: 6.1938005s
+DEBUG: Execution loop iteration, elapsed: 6.2043381s
+DEBUG: Execution loop iteration, elapsed: 6.214887s
+DEBUG: Execution loop iteration, elapsed: 6.225726s
+DEBUG: Execution loop iteration, elapsed: 6.2362463s
+DEBUG: Execution loop iteration, elapsed: 6.2464047s
+DEBUG: Execution loop iteration, elapsed: 6.2573743s
+DEBUG: Execution loop iteration, elapsed: 6.2675573s
+DEBUG: Execution loop iteration, elapsed: 6.2777148s
+DEBUG: Execution loop iteration, elapsed: 6.2884178s
+DEBUG: Execution loop iteration, elapsed: 6.2987834s
+DEBUG: Execution loop iteration, elapsed: 6.3089963s
+DEBUG: Execution loop iteration, elapsed: 6.3194181s
+DEBUG: Execution loop iteration, elapsed: 6.3297659s
+DEBUG: Execution loop iteration, elapsed: 6.3403233s
+DEBUG: Execution loop iteration, elapsed: 6.3511106s
+DEBUG: Execution loop iteration, elapsed: 6.3614786s
+DEBUG: Execution loop iteration, elapsed: 6.372042s
+DEBUG: Execution loop iteration, elapsed: 6.3826581s
+DEBUG: Execution loop iteration, elapsed: 6.3932082s
+DEBUG: Execution loop iteration, elapsed: 6.4036923s
+DEBUG: Execution loop iteration, elapsed: 6.4140707s
+DEBUG: Execution loop iteration, elapsed: 6.425081s
+DEBUG: Execution loop iteration, elapsed: 6.4357241s
+DEBUG: Execution loop iteration, elapsed: 6.4459157s
+DEBUG: Execution loop iteration, elapsed: 6.4564649s
+DEBUG: Execution loop iteration, elapsed: 6.4670017s
+DEBUG: Execution loop iteration, elapsed: 6.4775565s
+DEBUG: Execution loop iteration, elapsed: 6.4881698s
+DEBUG: Execution loop iteration, elapsed: 6.4986842s
+DEBUG: Execution loop iteration, elapsed: 6.5092137s
+DEBUG: Execution loop iteration, elapsed: 6.5199699s
+DEBUG: Execution loop iteration, elapsed: 6.5304962s
+DEBUG: Execution loop iteration, elapsed: 6.5410922s
+DEBUG: Execution loop iteration, elapsed: 6.5515826s
+DEBUG: Execution loop iteration, elapsed: 6.5621437s
+DEBUG: Execution loop iteration, elapsed: 6.5723224s
+DEBUG: Execution loop iteration, elapsed: 6.5828631s
+DEBUG: Execution loop iteration, elapsed: 6.5933653s
+DEBUG: Execution loop iteration, elapsed: 6.6039368s
+DEBUG: Execution loop iteration, elapsed: 6.6144897s
+DEBUG: Execution loop iteration, elapsed: 6.6250529s
+DEBUG: Execution loop iteration, elapsed: 6.6356039s
+DEBUG: Execution loop iteration, elapsed: 6.6462068s
+DEBUG: Execution loop iteration, elapsed: 6.6567803s
+DEBUG: Execution loop iteration, elapsed: 6.6672937s
+DEBUG: Execution loop iteration, elapsed: 6.6775154s
+DEBUG: Execution loop iteration, elapsed: 6.6880346s
+DEBUG: Execution loop iteration, elapsed: 6.6985773s
+DEBUG: Execution loop iteration, elapsed: 6.7091349s
+DEBUG: Execution loop iteration, elapsed: 6.7197577s
+DEBUG: Execution loop iteration, elapsed: 6.7303233s
+DEBUG: Execution loop iteration, elapsed: 6.7408851s
+DEBUG: Execution loop iteration, elapsed: 6.751045s
+DEBUG: Execution loop iteration, elapsed: 6.7611726s
+DEBUG: Execution loop iteration, elapsed: 6.7717451s
+DEBUG: Execution loop iteration, elapsed: 6.7822957s
+DEBUG: Execution loop iteration, elapsed: 6.792842s
+DEBUG: Execution loop iteration, elapsed: 6.803048s
+DEBUG: Execution loop iteration, elapsed: 6.8135398s
+DEBUG: Execution loop iteration, elapsed: 6.8240745s
+DEBUG: Execution loop iteration, elapsed: 6.8346068s
+DEBUG: Execution loop iteration, elapsed: 6.8451818s
+DEBUG: Execution loop iteration, elapsed: 6.8553344s
+DEBUG: Execution loop iteration, elapsed: 6.865862s
+DEBUG: Execution loop iteration, elapsed: 6.8764269s
+DEBUG: Execution loop iteration, elapsed: 6.8869968s
+DEBUG: Execution loop iteration, elapsed: 6.8974983s
+DEBUG: Execution loop iteration, elapsed: 6.908007s
+DEBUG: Execution loop iteration, elapsed: 6.9185595s
+DEBUG: Execution loop iteration, elapsed: 6.928719s
+DEBUG: Execution loop iteration, elapsed: 6.9393024s
+DEBUG: Execution loop iteration, elapsed: 6.949879s
+DEBUG: Execution loop iteration, elapsed: 6.9603952s
+DEBUG: Execution loop iteration, elapsed: 6.9709716s
+DEBUG: Execution loop iteration, elapsed: 6.9815124s
+DEBUG: Execution loop iteration, elapsed: 6.9916326s
+DEBUG: Execution loop iteration, elapsed: 7.0024733s
+DEBUG: Execution loop iteration, elapsed: 7.0127302s
+DEBUG: Execution loop iteration, elapsed: 7.0228989s
+DEBUG: Execution loop iteration, elapsed: 7.0332488s
+DEBUG: Execution loop iteration, elapsed: 7.0435866s
+DEBUG: Execution loop iteration, elapsed: 7.0541726s
+DEBUG: Execution loop iteration, elapsed: 7.0646793s
+DEBUG: Execution loop iteration, elapsed: 7.0748417s
+DEBUG: Execution loop iteration, elapsed: 7.0849329s
+DEBUG: Execution loop iteration, elapsed: 7.0952617s
+DEBUG: Execution loop iteration, elapsed: 7.1056588s
+DEBUG: Execution loop iteration, elapsed: 7.1160833s
+DEBUG: Execution loop iteration, elapsed: 7.1264858s
+DEBUG: Execution loop iteration, elapsed: 7.1369079s
+DEBUG: Execution loop iteration, elapsed: 7.1475424s
+DEBUG: Execution loop iteration, elapsed: 7.158157s
+DEBUG: Execution loop iteration, elapsed: 7.1686753s
+DEBUG: Execution loop iteration, elapsed: 7.1789363s
+DEBUG: Execution loop iteration, elapsed: 7.1892565s
+DEBUG: Execution loop iteration, elapsed: 7.1998649s
+DEBUG: Execution loop iteration, elapsed: 7.2104488s
+DEBUG: Execution loop iteration, elapsed: 7.2210841s
+DEBUG: Execution loop iteration, elapsed: 7.2315317s
+DEBUG: Execution loop iteration, elapsed: 7.2419878s
+DEBUG: Execution loop iteration, elapsed: 7.2525302s
+DEBUG: Execution loop iteration, elapsed: 7.2629779s
+DEBUG: Execution loop iteration, elapsed: 7.2734917s
+DEBUG: Execution loop iteration, elapsed: 7.2841974s
+DEBUG: Execution loop iteration, elapsed: 7.2949633s
+DEBUG: Execution loop iteration, elapsed: 7.3056062s
+DEBUG: Execution loop iteration, elapsed: 7.3161624s
+DEBUG: Execution loop iteration, elapsed: 7.3264559s
+DEBUG: Execution loop iteration, elapsed: 7.3370184s
+DEBUG: Execution loop iteration, elapsed: 7.3471965s
+DEBUG: Execution loop iteration, elapsed: 7.3573496s
+DEBUG: Execution loop iteration, elapsed: 7.3678852s
+DEBUG: Execution loop iteration, elapsed: 7.3780324s
+DEBUG: Execution loop iteration, elapsed: 7.3884117s
+DEBUG: Execution loop iteration, elapsed: 7.3990632s
+DEBUG: Execution loop iteration, elapsed: 7.4093433s
+DEBUG: Execution loop iteration, elapsed: 7.4195222s
+DEBUG: Execution loop iteration, elapsed: 7.4299908s
+DEBUG: Execution loop iteration, elapsed: 7.4405299s
+DEBUG: Execution loop iteration, elapsed: 7.4506863s
+DEBUG: Execution loop iteration, elapsed: 7.4609604s
+DEBUG: Execution loop iteration, elapsed: 7.4715355s
+DEBUG: Execution loop iteration, elapsed: 7.4821284s
+DEBUG: Execution loop iteration, elapsed: 7.4923389s
+DEBUG: Execution loop iteration, elapsed: 7.5029736s
+DEBUG: Execution loop iteration, elapsed: 7.5134868s
+DEBUG: Execution loop iteration, elapsed: 7.5236692s
+DEBUG: Execution loop iteration, elapsed: 7.5344435s
+DEBUG: Execution loop iteration, elapsed: 7.545273s
+DEBUG: Execution loop iteration, elapsed: 7.5557874s
+DEBUG: Execution loop iteration, elapsed: 7.5663108s
+DEBUG: Execution loop iteration, elapsed: 7.5766342s
+DEBUG: Execution loop iteration, elapsed: 7.5871364s
+DEBUG: Execution loop iteration, elapsed: 7.59798s
+DEBUG: Execution loop iteration, elapsed: 7.6085428s
+DEBUG: Execution loop iteration, elapsed: 7.6190702s
+DEBUG: Execution loop iteration, elapsed: 7.6291912s
+DEBUG: Execution loop iteration, elapsed: 7.6398199s
+DEBUG: Execution loop iteration, elapsed: 7.6502881s
+DEBUG: Execution loop iteration, elapsed: 7.6607122s
+DEBUG: Execution loop iteration, elapsed: 7.6708551s
+DEBUG: Execution loop iteration, elapsed: 7.6811445s
+DEBUG: Execution loop iteration, elapsed: 7.6916557s
+DEBUG: Execution loop iteration, elapsed: 7.7023304s
+DEBUG: Execution loop iteration, elapsed: 7.7125026s
+DEBUG: Execution loop iteration, elapsed: 7.7230556s
+DEBUG: Execution loop iteration, elapsed: 7.7338098s
+DEBUG: Execution loop iteration, elapsed: 7.744382s
+DEBUG: Execution loop iteration, elapsed: 7.754943s
+DEBUG: Execution loop iteration, elapsed: 7.7652615s
+DEBUG: Execution loop iteration, elapsed: 7.7758527s
+DEBUG: Execution loop iteration, elapsed: 7.7864643s
+DEBUG: Execution loop iteration, elapsed: 7.7972887s
+DEBUG: Execution loop iteration, elapsed: 7.8074177s
+DEBUG: Execution loop iteration, elapsed: 7.8179805s
+DEBUG: Execution loop iteration, elapsed: 7.8281858s
+DEBUG: Execution loop iteration, elapsed: 7.8387639s
+DEBUG: Execution loop iteration, elapsed: 7.8490552s
+DEBUG: Execution loop iteration, elapsed: 7.8596174s
+DEBUG: Execution loop iteration, elapsed: 7.8700716s
+DEBUG: Execution loop iteration, elapsed: 7.8804266s
+DEBUG: Execution loop iteration, elapsed: 7.8910207s
+DEBUG: Execution loop iteration, elapsed: 7.9015383s
+DEBUG: Execution loop iteration, elapsed: 7.9117202s
+DEBUG: Execution loop iteration, elapsed: 7.9221579s
+DEBUG: Execution loop iteration, elapsed: 7.9323346s
+DEBUG: Execution loop iteration, elapsed: 7.9428355s
+DEBUG: Execution loop iteration, elapsed: 7.9535281s
+DEBUG: Execution loop iteration, elapsed: 7.9639986s
+DEBUG: Execution loop iteration, elapsed: 7.9746007s
+DEBUG: Execution loop iteration, elapsed: 7.9851755s
+DEBUG: Execution loop iteration, elapsed: 7.9958222s
+DEBUG: Execution loop iteration, elapsed: 8.0063123s
+DEBUG: Execution loop iteration, elapsed: 8.0165536s
+DEBUG: Execution loop iteration, elapsed: 8.0271945s
+DEBUG: Execution loop iteration, elapsed: 8.0377086s
+DEBUG: Execution loop iteration, elapsed: 8.0483387s
+DEBUG: Execution loop iteration, elapsed: 8.0587614s
+DEBUG: Execution loop iteration, elapsed: 8.0693501s
+DEBUG: Execution loop iteration, elapsed: 8.0799264s
+DEBUG: Execution loop iteration, elapsed: 8.0900997s
+DEBUG: Execution loop iteration, elapsed: 8.100655s
+DEBUG: Execution loop iteration, elapsed: 8.1107524s
+DEBUG: Execution loop iteration, elapsed: 8.1213261s
+DEBUG: Execution loop iteration, elapsed: 8.1319219s
+DEBUG: Execution loop iteration, elapsed: 8.1424552s
+DEBUG: Execution loop iteration, elapsed: 8.1531206s
+DEBUG: Execution loop iteration, elapsed: 8.1636673s
+DEBUG: Execution loop iteration, elapsed: 8.1740902s
+DEBUG: Execution loop iteration, elapsed: 8.1846389s
+DEBUG: Execution loop iteration, elapsed: 8.1953374s
+DEBUG: Execution loop iteration, elapsed: 8.2059391s
+DEBUG: Execution loop iteration, elapsed: 8.216465s
+DEBUG: Execution loop iteration, elapsed: 8.226599s
+DEBUG: Execution loop iteration, elapsed: 8.2371924s
+DEBUG: Execution loop iteration, elapsed: 8.247336s
+DEBUG: Execution loop iteration, elapsed: 8.2579025s
+DEBUG: Execution loop iteration, elapsed: 8.2683798s
+DEBUG: Execution loop iteration, elapsed: 8.2787974s
+DEBUG: Execution loop iteration, elapsed: 8.2889427s
+DEBUG: Execution loop iteration, elapsed: 8.2994881s
+DEBUG: Execution loop iteration, elapsed: 8.3100082s
+DEBUG: Execution loop iteration, elapsed: 8.3205071s
+DEBUG: Execution loop iteration, elapsed: 8.331064s
+DEBUG: Execution loop iteration, elapsed: 8.3415798s
+DEBUG: Execution loop iteration, elapsed: 8.3521755s
+DEBUG: Execution loop iteration, elapsed: 8.3627408s
+DEBUG: Execution loop iteration, elapsed: 8.3732871s
+DEBUG: Execution loop iteration, elapsed: 8.3838161s
+DEBUG: Execution loop iteration, elapsed: 8.3943738s
+DEBUG: Execution loop iteration, elapsed: 8.4049132s
+DEBUG: Execution loop iteration, elapsed: 8.415431s
+DEBUG: Execution loop iteration, elapsed: 8.4255424s
+DEBUG: Execution loop iteration, elapsed: 8.4359679s
+DEBUG: Execution loop iteration, elapsed: 8.4463401s
+DEBUG: Execution loop iteration, elapsed: 8.456922s
+DEBUG: Execution loop iteration, elapsed: 8.4674648s
+DEBUG: Execution loop iteration, elapsed: 8.4781082s
+DEBUG: Execution loop iteration, elapsed: 8.4885257s
+DEBUG: Execution loop iteration, elapsed: 8.4990723s
+DEBUG: Execution loop iteration, elapsed: 8.5097434s
+DEBUG: Execution loop iteration, elapsed: 8.5201593s
+DEBUG: Execution loop iteration, elapsed: 8.5306875s
+DEBUG: Execution loop iteration, elapsed: 8.5414085s
+DEBUG: Execution loop iteration, elapsed: 8.5518173s
+DEBUG: Execution loop iteration, elapsed: 8.5623363s
+DEBUG: Execution loop iteration, elapsed: 8.5729461s
+DEBUG: Execution loop iteration, elapsed: 8.5831069s
+DEBUG: Execution loop iteration, elapsed: 8.5936175s
+DEBUG: Execution loop iteration, elapsed: 8.6041576s
+DEBUG: Execution loop iteration, elapsed: 8.6144034s
+DEBUG: Execution loop iteration, elapsed: 8.625083s
+DEBUG: Execution loop iteration, elapsed: 8.6355216s
+DEBUG: Execution loop iteration, elapsed: 8.6457939s
+DEBUG: Execution loop iteration, elapsed: 8.6558713s
+DEBUG: Execution loop iteration, elapsed: 8.6661059s
+DEBUG: Execution loop iteration, elapsed: 8.6767039s
+DEBUG: Execution loop iteration, elapsed: 8.6872378s
+DEBUG: Execution loop iteration, elapsed: 8.6977679s
+DEBUG: Execution loop iteration, elapsed: 8.7079651s
+DEBUG: Execution loop iteration, elapsed: 8.7185686s
+DEBUG: Execution loop iteration, elapsed: 8.7290996s
+DEBUG: Execution loop iteration, elapsed: 8.7397082s
+DEBUG: Execution loop iteration, elapsed: 8.7502515s
+DEBUG: Execution loop iteration, elapsed: 8.7608167s
+DEBUG: Execution loop iteration, elapsed: 8.7714271s
+DEBUG: Execution loop iteration, elapsed: 8.7819785s
+DEBUG: Execution loop iteration, elapsed: 8.7924835s
+DEBUG: Execution loop iteration, elapsed: 8.8030234s
+DEBUG: Execution loop iteration, elapsed: 8.8135551s
+DEBUG: Execution loop iteration, elapsed: 8.8241336s
+DEBUG: Execution loop iteration, elapsed: 8.8346212s
+DEBUG: Execution loop iteration, elapsed: 8.8451539s
+DEBUG: Execution loop iteration, elapsed: 8.8554238s
+DEBUG: Execution loop iteration, elapsed: 8.8661571s
+DEBUG: Execution loop iteration, elapsed: 8.876434s
+DEBUG: Execution loop iteration, elapsed: 8.8869875s
+DEBUG: Execution loop iteration, elapsed: 8.8972538s
+DEBUG: Execution loop iteration, elapsed: 8.9078014s
+DEBUG: Execution loop iteration, elapsed: 8.918331s
+DEBUG: Execution loop iteration, elapsed: 8.928597s
+DEBUG: Execution loop iteration, elapsed: 8.9387137s
+DEBUG: Execution loop iteration, elapsed: 8.9492904s
+DEBUG: Execution loop iteration, elapsed: 8.9598593s
+DEBUG: Execution loop iteration, elapsed: 8.9700916s
+DEBUG: Execution loop iteration, elapsed: 8.9803091s
+DEBUG: Execution loop iteration, elapsed: 8.9908755s
+DEBUG: Execution loop iteration, elapsed: 9.0011662s
+DEBUG: Execution loop iteration, elapsed: 9.0117369s
+DEBUG: Execution loop iteration, elapsed: 9.0223006s
+DEBUG: Execution loop iteration, elapsed: 9.0328746s
+DEBUG: Execution loop iteration, elapsed: 9.0430846s
+DEBUG: Execution loop iteration, elapsed: 9.054059s
+DEBUG: Execution loop iteration, elapsed: 9.0645737s
+DEBUG: Execution loop iteration, elapsed: 9.0747395s
+DEBUG: Execution loop iteration, elapsed: 9.0853896s
+DEBUG: Execution loop iteration, elapsed: 9.0959386s
+DEBUG: Execution loop iteration, elapsed: 9.1065602s
+DEBUG: Execution loop iteration, elapsed: 9.1171074s
+DEBUG: Execution loop iteration, elapsed: 9.1277609s
+DEBUG: Execution loop iteration, elapsed: 9.1381766s
+DEBUG: Execution loop iteration, elapsed: 9.1487751s
+DEBUG: Execution loop iteration, elapsed: 9.1590772s
+DEBUG: Execution loop iteration, elapsed: 9.1695533s
+DEBUG: Execution loop iteration, elapsed: 9.1797991s
+DEBUG: Execution loop iteration, elapsed: 9.1905187s
+DEBUG: Execution loop iteration, elapsed: 9.2009766s
+DEBUG: Execution loop iteration, elapsed: 9.2115494s
+DEBUG: Execution loop iteration, elapsed: 9.2220966s
+DEBUG: Execution loop iteration, elapsed: 9.2325077s
+DEBUG: Execution loop iteration, elapsed: 9.2428555s
+DEBUG: Execution loop iteration, elapsed: 9.2533139s
+DEBUG: Execution loop iteration, elapsed: 9.2637939s
+DEBUG: Execution loop iteration, elapsed: 9.2739186s
+DEBUG: Execution loop iteration, elapsed: 9.2844911s
+DEBUG: Execution loop iteration, elapsed: 9.2950528s
+DEBUG: Execution loop iteration, elapsed: 9.3055953s
+DEBUG: Execution loop iteration, elapsed: 9.3158664s
+DEBUG: Execution loop iteration, elapsed: 9.3264642s
+DEBUG: Execution loop iteration, elapsed: 9.3370062s
+DEBUG: Execution loop iteration, elapsed: 9.3475363s
+DEBUG: Execution loop iteration, elapsed: 9.3580363s
+DEBUG: Execution loop iteration, elapsed: 9.3686577s
+DEBUG: Execution loop iteration, elapsed: 9.3792246s
+DEBUG: Execution loop iteration, elapsed: 9.3893858s
+DEBUG: Execution loop iteration, elapsed: 9.3999803s
+DEBUG: Execution loop iteration, elapsed: 9.4104712s
+DEBUG: Execution loop iteration, elapsed: 9.4209057s
+DEBUG: Execution loop iteration, elapsed: 9.4315741s
+DEBUG: Execution loop iteration, elapsed: 9.4418922s
+DEBUG: Execution loop iteration, elapsed: 9.4525118s
+DEBUG: Execution loop iteration, elapsed: 9.4630569s
+DEBUG: Execution loop iteration, elapsed: 9.4736062s
+DEBUG: Execution loop iteration, elapsed: 9.4837305s
+DEBUG: Execution loop iteration, elapsed: 9.4943547s
+DEBUG: Execution loop iteration, elapsed: 9.5049448s
+DEBUG: Execution loop iteration, elapsed: 9.5157013s
+DEBUG: Execution loop iteration, elapsed: 9.525983s
+DEBUG: Execution loop iteration, elapsed: 9.5361493s
+DEBUG: Execution loop iteration, elapsed: 9.5464068s
+DEBUG: Execution loop iteration, elapsed: 9.5570034s
+DEBUG: Execution loop iteration, elapsed: 9.5672761s
+DEBUG: Execution loop iteration, elapsed: 9.5779286s
+DEBUG: Execution loop iteration, elapsed: 9.5885243s
+DEBUG: Execution loop iteration, elapsed: 9.5990831s
+DEBUG: Execution loop iteration, elapsed: 9.609603s
+DEBUG: Execution loop iteration, elapsed: 9.6196811s
+DEBUG: Execution loop iteration, elapsed: 9.6298572s
+DEBUG: Execution loop iteration, elapsed: 9.6401068s
+DEBUG: Execution loop iteration, elapsed: 9.650699s
+DEBUG: Execution loop iteration, elapsed: 9.6612578s
+DEBUG: Execution loop iteration, elapsed: 9.6716393s
+DEBUG: Execution loop iteration, elapsed: 9.6818551s
+DEBUG: Execution loop iteration, elapsed: 9.6921933s
+DEBUG: Execution loop iteration, elapsed: 9.7023746s
+DEBUG: Execution loop iteration, elapsed: 9.7129073s
+DEBUG: Execution loop iteration, elapsed: 9.7233515s
+DEBUG: Execution loop iteration, elapsed: 9.7338676s
+DEBUG: Execution loop iteration, elapsed: 9.7445004s
+DEBUG: Execution loop iteration, elapsed: 9.7550722s
+DEBUG: Execution loop iteration, elapsed: 9.7655729s
+DEBUG: Execution loop iteration, elapsed: 9.7763195s
+DEBUG: Execution loop iteration, elapsed: 9.7872381s
+DEBUG: Execution loop iteration, elapsed: 9.7977397s
+DEBUG: Execution loop iteration, elapsed: 9.808245s
+DEBUG: Execution loop iteration, elapsed: 9.8188309s
+DEBUG: Execution loop iteration, elapsed: 9.8293633s
+DEBUG: Execution loop iteration, elapsed: 9.8399087s
+DEBUG: Execution loop iteration, elapsed: 9.8504758s
+DEBUG: Execution loop iteration, elapsed: 9.8610541s
+DEBUG: Execution loop iteration, elapsed: 9.8716584s
+DEBUG: Execution loop iteration, elapsed: 9.8821211s
+DEBUG: Execution loop iteration, elapsed: 9.8926703s
+DEBUG: Execution loop iteration, elapsed: 9.9032438s
+DEBUG: Execution loop iteration, elapsed: 9.9137666s
+DEBUG: Execution loop iteration, elapsed: 9.9242712s
+DEBUG: Execution loop iteration, elapsed: 9.934627s
+DEBUG: Execution loop iteration, elapsed: 9.9457276s
+DEBUG: Execution loop iteration, elapsed: 9.9562849s
+DEBUG: Execution loop iteration, elapsed: 9.9668293s
+DEBUG: Execution loop iteration, elapsed: 9.9774211s
+DEBUG: Execution loop iteration, elapsed: 9.9878714s
+DEBUG: Test execution completed in 13215ms
+DEBUG: Execution loop iteration, elapsed: 9.9980077s
+
+
+
+TEST ERROR: examples\000__04d_system_utilities.sh with perl generator
+Test: 7/146 (6 passed before error)
+Error: PerlExecution timed out after 10.0 seconds
+
+ORIGINAL SHELL SCRIPT:
+#!/bin/bash
+
+# System utilities using backticks
+# This file demonstrates system utility commands with backticks
+
+echo "=== System Utilities ==="
+
+# date command with backticks
+#PERL_MUST_NOT_CONTAIN `date
+timestamp=`date +%rms`
+formatted_date=`date '+%Y-%m-%d %H'`
+echo "Timestamp: $timestamp"
+echo "Formatted date: $formatted_date"
+
+# time command with backticks
+#PERL_MUST_NOT_CONTAIN `time
+time_result=`time sleep 1 2>&1`
+echo "Time result: $time_result"
+
+# sleep command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `sleep
+sleep_duration=`echo "2"`
+echo "Sleeping for $sleep_duration seconds..."
+sleep $sleep_duration
+
+# which command with backticks
+#PERL_MUST_NOT_CONTAIN `which
+bash_path=`which bash`
+echo "Bash path: $bash_path"
+
+# yes command with backticks
+#PERL_MUST_NOT_CONTAIN `yes
+yes_result=`yes "Hello" | head -3`
+echo "Yes command result:"
+echo "$yes_result"
+
+echo "=== System Utilities Complete ==="
+
+
+
+Writing test count 6 to first_n_tests_passed.txt (parsing error)
+Current working directory: "D:\\GitHub\\sh2perl"
+Successfully wrote test count 6 and error code 6 (parser error) to first_n_tests_passed.txt
+To run test again: ./fail 000__04d

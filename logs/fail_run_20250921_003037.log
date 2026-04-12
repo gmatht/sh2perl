@@ -1,0 +1,270 @@
+Starting test run at Sun, Sep 21, 2025 12:30:37 AM
+Logging to: logs/fail_run_20250921_003037.log
+Test arguments: 
+----------------------------------------
+Compiling debashc...
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `glob_exprs`
+  --> src\generator\commands\simple_commands.rs:38:45
+   |
+38 | ...                   let glob_exprs: Vec<String> = patterns.iter()
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_glob_exprs`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:769:22
+    |
+769 |                 for (i, command) in pipeline.commands[start_index..].i...
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:783:34
+    |
+783 | ...                      for (j, nested_command) in nested_pipeline.co...
+    |                               ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:521:37
+    |
+521 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+20   | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserErro...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserE...
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserErr...
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1862:4
+     |
+1862 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, Pars...
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:188:4
+    |
+188 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:16:4
+   |
+16 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleC...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:65:4
+   |
+65 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCom...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:228:4
+    |
+228 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var:...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+6  | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+7  |     /// Maps variable names to their usage information
+8  |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+9  |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 19 warnings (run `cargo fix --lib -p debashl` to apply 3 suggestions)
+   Compiling debashl v0.1.0 (D:\GitHub\sh2perl)
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `parser`
+   --> src\testing.rs:661:21
+    |
+661 |                 Err(parser::ParserError::LexerError("Parsing timed out after 10 seconds".to_string()))
+    |                     ^^^^^^ use of unresolved module or unlinked crate `parser`
+    |
+    = help: if you wanted to use a crate named `parser`, use `cargo add parser` to add it to your `Cargo.toml`
+help: consider importing this enum
+    |
+1   + use debashl::parser::errors::ParserError;
+    |
+help: if you import `ParserError`, refer to it directly
+    |
+661 -                 Err(parser::ParserError::LexerError("Parsing timed out after 10 seconds".to_string()))
+661 +                 Err(ParserError::LexerError("Parsing timed out after 10 seconds".to_string()))
+    |
+
+error[E0277]: the `?` operator can only be applied to values that implement `Try`
+   --> src\testing.rs:623:31
+    |
+623 |                 Ok(result) => result?,
+    |                               ^^^^^^^ the `?` operator cannot be applied to type `std::process::Output`
+    |
+    = help: the trait `Try` is not implemented for `std::process::Output`
+
+error[E0308]: mismatched types
+   --> src\testing.rs:726:21
+    |
+717 |                   let code = match std::thread::scope(|s| {
+    |  __________________________________-
+718 | |                     let handle = s.spawn(|| gen.generate(&commands));
+719 | |                     std::thread::sleep(Duration::from_secs(5)); // 5 second timeout for generation
+720 | |                     if handle.is_finished() {
+...   |
+725 | |                 }) {
+    | |__________________- this expression has type `std::string::String`
+726 |                       Ok(result) => result,
+    |                       ^^^^^^^^^^ expected `String`, found `Result<_, _>`
+    |
+    = note: expected struct `std::string::String`
+                 found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+   --> src\testing.rs:727:21
+    |
+717 |                   let code = match std::thread::scope(|s| {
+    |  __________________________________-
+718 | |                     let handle = s.spawn(|| gen.generate(&commands));
+719 | |                     std::thread::sleep(Duration::from_secs(5)); // 5 second timeout for generation
+720 | |                     if handle.is_finished() {
+...   |
+725 | |                 }) {
+    | |__________________- this expression has type `std::string::String`
+726 |                       Ok(result) => result,
+727 |                       Err(e) => return Err(format!("Perl code generation failed: {}", e)),
+    |                       ^^^^^^ expected `String`, found `Result<_, _>`
+    |
+    = note: expected struct `std::string::String`
+                 found enum `Result<_, _>`
+
+warning: unused variable: `status`
+  --> src\execution.rs:58:21
+   |
+58 |             Ok(Some(status)) => {
+   |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_status`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1165:9
+     |
+1165 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1921:13
+     |
+1921 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1921:9
+     |
+1921 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+Some errors have detailed explanations: E0277, E0308, E0433.
+For more information about an error, try `rustc --explain E0277`.
+warning: `debashl` (bin "debashc") generated 4 warnings
+error: could not compile `debashl` (bin "debashc") due to 4 previous errors; 4 warnings emitted
+Running debashc with 300 second timeout...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail
+Timeout: 300s
+----------------------------------------
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail
+Timeout: 300s
+----------------------------------------
+True
+----------------------------------------
+Command completed with exit code: 0
+----------------------------------------
+Running test_purify.pl validation...
+Running test_purify.pl with verbose output
+Running test_purify.pl with next option
+Testing purify.pl exists...
+Testing debashc exists...
+Testing examples.impurl directory exists...
+Testing purify.pl on examples.impurl/001_echo_basic.pl...
+  ✓ examples.impurl/001_echo_basic.pl processed successfully
+Testing purify.pl on examples.impurl/002_printf_basic.pl...
+  ✓ examples.impurl/002_printf_basic.pl processed successfully
+Testing purify.pl on examples.impurl/003_ls_basic.pl...
+  ✓ examples.impurl/003_ls_basic.pl processed successfully
+Testing purify.pl --help...
+test_purify.pl completed successfully
+test_purify.pl passed, continuing with other commands...
+Test run completed at Sun, Sep 21, 2025 12:35:43 AM

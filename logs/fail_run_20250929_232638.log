@@ -1,0 +1,626 @@
+Starting test run at Mon, Sep 29, 2025 11:26:38 PM
+Logging to: logs/fail_run_20250929_232638.log
+Test arguments: 000__04d
+----------------------------------------
+Compiling debashc...
+warning: unused import: `Token`
+    --> src\parser\commands.rs:1351:31
+     |
+1351 |     use crate::lexer::{Lexer, Token};
+     |                               ^^^^^
+     |
+     = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `regex::Regex`
+ --> src\generator\commands\pipeline_commands.rs:4:5
+  |
+4 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src\timeout_manager.rs:282:1
+    |
+282 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\parser\commands.rs:1354:9
+     |
+1354 |     let mut lexer = Lexer::new(text);
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `cmd2`
+   --> src\generator\commands\pipeline_commands.rs:469:66
+    |
+469 |         if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) = (&pipeline.commands[0], &pipeline.commands[1]) {
+    |                                                                  ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: variable `head_max` is assigned to, but never used
+   --> src\generator\commands\pipeline_commands.rs:836:25
+    |
+836 |                 let mut head_max = 10; // Default value
+    |                         ^^^^^^^^
+    |
+    = note: consider using `_head_max` instead
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:847:53
+    |
+847 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:854:53
+    |
+854 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `head_max` is never read
+   --> src\generator\commands\pipeline_commands.rs:859:49
+    |
+859 | ...                   head_max = num;
+    |                       ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+   --> src\generator\commands\pipeline_commands.rs:883:22
+    |
+883 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+    |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+   --> src\generator\commands\pipeline_commands.rs:897:34
+    |
+897 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+    |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `input_var`
+ --> src\generator\commands\comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:554:37
+    |
+554 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: unused variable: `literal`
+   --> src\generator\words.rs:385:59
+    |
+385 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `s`
+   --> src\generator\words.rs:842:23
+    |
+842 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+    |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `literal`
+   --> src\generator\utils.rs:151:59
+    |
+151 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:151:13
+    |
+151 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src\timeout_manager.rs:194:13
+    |
+194 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: methods `parse_variable_expansion` and `parse_arithmetic_expression` are never used
+    --> src\parser\commands.rs:1186:8
+     |
+  20 | impl Parser {
+     | ----------- methods in this implementation
+...
+1186 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1255 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` on by default
+
+warning: function `parse_command` is never used
+    --> src\parser\control_flow.rs:1075:4
+     |
+1075 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src\parser\control_flow.rs:1285:4
+     |
+1285 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src\parser\words.rs:1885:4
+     |
+1885 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `escape_glob_pattern` is never used
+ --> src\generator\commands\find.rs:4:4
+  |
+4 | fn escape_glob_pattern(pattern: &str) -> String {
+  |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_size_to_bytes` is never used
+   --> src\generator\commands\find.rs:195:4
+    |
+195 | fn parse_size_to_bytes(size_str: &str) -> u64 {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src\generator\commands\tr.rs:24:4
+   |
+24 | fn generate_tr_linebyline_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, _command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+  --> src\generator\commands\tr.rs:73:4
+   |
+73 | fn generate_tr_buffered_impl(generator: &mut Generator, cmd: &SimpleCommand, input_var: &str, command_index: &str) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src\generator\control_flow.rs:230:4
+    |
+230 | fn is_variable_used_after_for_loop(commands: &[Command], for_loop_var: &str, for_loop_index: usize) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src\variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 32 warnings (run `cargo fix --lib -p debashl` to apply 5 suggestions)
+warning: unused import: `execute_with_progress`
+ --> src\testing.rs:9:67
+  |
+9 | use crate::timeout_manager::{OperationType, execute_with_timeout, execute_with_progress, 
+  |                                                                   ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debashl::parser::errors::ParserError`
+  --> src\testing.rs:16:5
+   |
+16 | use debashl::parser::errors::ParserError;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `operation_handle`
+  --> src\testing.rs:25:9
+   |
+25 |     let operation_handle = std::thread::spawn(move || {
+   |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1188:9
+     |
+1188 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `overall_start`
+    --> src\testing.rs:1397:9
+     |
+1397 |     let overall_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_overall_start`
+
+warning: unused variable: `test_loop_start`
+    --> src\testing.rs:1445:9
+     |
+1445 |     let test_loop_start = std::time::Instant::now();
+     |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_test_loop_start`
+
+warning: unused variable: `should_break`
+    --> src\testing.rs:1994:13
+     |
+1994 |     let mut should_break = false;
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_should_break`
+
+warning: variable does not need to be mutable
+    --> src\testing.rs:1994:9
+     |
+1994 |     let mut should_break = false;
+     |         ----^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `run_perl_script` is never used
+  --> src\execution.rs:62:8
+   |
+62 | pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String> {
+   |        ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: function `extract_line_col` is never used
+ --> src\utils.rs:4:8
+  |
+4 | pub fn extract_line_col(e: &dyn std::error::Error) -> Option<(usize, usize)> {
+  |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_line_col` is never used
+  --> src\utils.rs:17:8
+   |
+17 | pub fn parse_line_col(s: &str) -> Option<(usize, usize)> {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `caret_snippet` is never used
+  --> src\utils.rs:25:8
+   |
+25 | pub fn caret_snippet(input: &str, line: usize, col: usize) -> Option<String> {
+   |        ^^^^^^^^^^^^^
+
+warning: function `with_timeout` is never used
+  --> src\testing.rs:19:4
+   |
+19 | fn with_timeout<F, T>(timeout_secs: u64, operation: F) -> Result<T, String> 
+   |    ^^^^^^^^^^^^
+
+warning: fields `shell_duration` and `translated_duration` are never read
+  --> src\testing.rs:52:9
+   |
+39 | pub struct TestResult {
+   |            ---------- fields in this struct
+...
+52 |     pub shell_duration: std::time::Duration, // Shell execution time
+   |         ^^^^^^^^^^^^^^
+53 |     pub translated_duration: std::time::Duration, // Translated program execution time
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `test_file_equivalence_detailed` is never used
+   --> src\testing.rs:552:8
+    |
+552 | pub fn test_file_equivalence_detailed(lang: &str, filename: &str, ast_options: Option<AstFormatOptions>) -> Result<TestResult, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_all_examples_next_fail` is never used
+    --> src\testing.rs:1393:8
+     |
+1393 | pub fn test_all_examples_next_fail(generators: &[String], test_prefix: Option<String>, enable_perl_critic: bool) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_core_perl_logic` is never used
+   --> src\cli_commands.rs:198:4
+    |
+198 | fn extract_core_perl_logic(perl_code: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `export_mir_to_json` is never used
+   --> src\cli_commands.rs:445:8
+    |
+445 | pub fn export_mir_to_json(input: &str, _optimize: bool) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: variants `Parsing`, `CodeGeneration`, `FileOperations`, `TestExecution`, and `DebugFreeze` are never constructed
+  --> src\timeout_manager.rs:11:5
+   |
+ 8 | pub enum OperationType {
+   |          ------------- variants in this enum
+...
+11 |     Parsing,            // Parsing shell scripts
+   |     ^^^^^^^
+12 |     CodeGeneration,     // Generating Perl code
+   |     ^^^^^^^^^^^^^^
+13 |     FileOperations,     // File I/O operations
+   |     ^^^^^^^^^^^^^^
+14 |     TestExecution,      // Overall test execution
+   |     ^^^^^^^^^^^^^
+15 |     DebugFreeze,        // Debug freeze pause
+   |     ^^^^^^^^^^^
+   |
+   = note: `OperationType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `set_freeze_duration` and `get_freeze_duration` are never used
+  --> src\timeout_manager.rs:74:12
+   |
+51 | impl DebugFreezeManager {
+   | ----------------------- methods in this implementation
+...
+74 |     pub fn set_freeze_duration(&mut self, duration: Duration) {
+   |            ^^^^^^^^^^^^^^^^^^^
+...
+78 |     pub fn get_freeze_duration(&self) -> Duration {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `set_timeout` and `execute_with_progress` are never used
+   --> src\timeout_manager.rs:117:12
+    |
+ 90 | impl TimeoutManager {
+    | ------------------- methods in this implementation
+...
+117 |     pub fn set_timeout(&mut self, operation: OperationType, duration: Duration) {
+    |            ^^^^^^^^^^^
+...
+178 |     pub fn execute_with_progress<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `execute_with_progress` is never used
+   --> src\timeout_manager.rs:302:8
+    |
+302 | pub fn execute_with_progress<F, T>(operation: OperationType, operation_fn: F) -> Result<T, String>
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `debashl` (bin "debashc") generated 25 warnings (3 duplicates) (run `cargo fix --bin "debashc"` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s
+Running test_purify.pl validation...
+Running test_purify.pl with verbose output
+Running test_purify.pl with next option
+DEBUG[1759159600.353]: Found 54 .pl files in examples.impurl directory
+DEBUG[1759159600.353]: Files to process: examples.impurl/000benchmark.pl, examples.impurl/001_echo_basic.pl, examples.impurl/002_printf_basic.pl, examples.impurl/003__ls_basic.pl, examples.impurl/003_ls_basic.pl, examples.impurl/004_cat_basic.pl, examples.impurl/005_wc_basic.pl, examples.impurl/006_head_basic.pl, examples.impurl/007_tail_basic.pl, examples.impurl/008_date_basic.pl, examples.impurl/009_sleep_basic.pl, examples.impurl/010_which_basic.pl, examples.impurl/011_grep_basic.pl, examples.impurl/012_sed_basic.pl, examples.impurl/013_awk_basic.pl, examples.impurl/014_tr_basic.pl, examples.impurl/015_cut_basic.pl, examples.impurl/016_sort_basic.pl, examples.impurl/017_uniq_basic.pl, examples.impurl/018_paste_basic.pl, examples.impurl/019_comm_basic.pl, examples.impurl/020_diff_basic.pl, examples.impurl/021_find_basic.pl, examples.impurl/022_cp_basic.pl, examples.impurl/023_mv_basic.pl, examples.impurl/024_rm_basic.pl, examples.impurl/025_mkdir_basic.pl, examples.impurl/026_touch_basic.pl, examples.impurl/027_basename_basic.pl, examples.impurl/028_dirname_basic.pl, examples.impurl/029_xargs_basic.pl, examples.impurl/030_tee_basic.pl, examples.impurl/031_time_basic.pl, examples.impurl/032_kill_basic.pl, examples.impurl/033_nice_basic.pl, examples.impurl/034_nohup_basic.pl, examples.impurl/035_pipeline_basic.pl, examples.impurl/036_control_flow_basic.pl, examples.impurl/037_complex_pipeline.pl, examples.impurl/038_advanced_control_flow.pl, examples.impurl/039_subshell_operations.pl, examples.impurl/040_most_complex_example.pl, examples.impurl/041_compression_network.pl, examples.impurl/042_checksum_verification.pl, examples.impurl/043_string_processing.pl, examples.impurl/044_yes_command.pl, examples.impurl/045_read_command.pl, examples.impurl/046_perl_command.pl, examples.impurl/047_advanced_pipelines.pl, examples.impurl/048_nested_control_flow.pl, examples.impurl/049_ultimate_complex_example.pl, examples.impurl/050_final_example.pl, examples.impurl/051_remaining_examples.pl, examples.impurl/052_complex_usage_examples.pl
+DEBUG[1759159600.353]: Testing purify.pl --help...
+DEBUG[1759159600.353]: Starting purify.pl help test (timeout: 5s, type: purify_help)
+DEBUG[1759159601.154]: purify.pl help test completed in 0.801366806030273s (exit code: 0)
+DEBUG[1759159601.154]: purify.pl --help test passed
+DEBUG[1759159601.155]: Progress: [                    ] 1% (1/54) - Processing files
+DEBUG[1759159601.155]: Testing purify.pl on examples.impurl/000benchmark.pl -> pure/000benchmark.pl
+DEBUG[1759159601.155]: File 1 of 54
+DEBUG[1759159601.155]: Running purify.pl on examples.impurl/000benchmark.pl
+DEBUG[1759159601.155]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159602.123]: purify.pl execution completed in 0.968199968338013s (exit code: 0)
+DEBUG[1759159602.123]: purify.pl result: 0
+DEBUG[1759159602.123]: ✓ examples.impurl/000benchmark.pl: purify.pl processed successfully
+DEBUG[1759159602.123]: Checking if pure/000benchmark.pl still contains system calls or backticks
+DEBUG[1759159602.123]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159602.170]: grep check completed in 0.0470449924468994s (exit code: 1)
+DEBUG[1759159602.170]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159602.170]: Running original file: examples.impurl/000benchmark.pl
+DEBUG[1759159602.170]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159602.358]: original file execution completed in 0.188141822814941s (exit code: 0)
+DEBUG[1759159602.358]: Original file execution result: 0
+DEBUG[1759159602.358]: Running purified file: pure/000benchmark.pl
+DEBUG[1759159602.358]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159602.551]: purified file execution completed in 0.192495822906494s (exit code: 0)
+DEBUG[1759159602.551]: Purified file execution result: 0
+DEBUG[1759159602.551]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759159602.551]: Progress: [                    ] 3% (2/54) - Processing files
+DEBUG[1759159602.551]: Testing purify.pl on examples.impurl/001_echo_basic.pl -> pure/001_echo_basic.pl
+DEBUG[1759159602.551]: File 2 of 54
+DEBUG[1759159602.551]: Running purify.pl on examples.impurl/001_echo_basic.pl
+DEBUG[1759159602.551]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159603.487]: purify.pl execution completed in 0.935549974441528s (exit code: 0)
+DEBUG[1759159603.487]: purify.pl result: 0
+DEBUG[1759159603.487]: ✓ examples.impurl/001_echo_basic.pl: purify.pl processed successfully
+DEBUG[1759159603.487]: Checking if pure/001_echo_basic.pl still contains system calls or backticks
+DEBUG[1759159603.487]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159603.538]: grep check completed in 0.0509710311889648s (exit code: 1)
+DEBUG[1759159603.538]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159603.538]: Running original file: examples.impurl/001_echo_basic.pl
+DEBUG[1759159603.538]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159604.208]: original file execution completed in 0.670262098312378s (exit code: 0)
+DEBUG[1759159604.208]: Original file execution result: 0
+DEBUG[1759159604.208]: Running purified file: pure/001_echo_basic.pl
+DEBUG[1759159604.208]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159604.761]: purified file execution completed in 0.552922964096069s (exit code: 0)
+DEBUG[1759159604.761]: Purified file execution result: 0
+DEBUG[1759159604.761]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759159604.762]: Progress: [=                   ] 5% (3/54) - Processing files
+DEBUG[1759159604.762]: Testing purify.pl on examples.impurl/002_printf_basic.pl -> pure/002_printf_basic.pl
+DEBUG[1759159604.762]: File 3 of 54
+DEBUG[1759159604.762]: Running purify.pl on examples.impurl/002_printf_basic.pl
+DEBUG[1759159604.762]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159606.192]: purify.pl execution completed in 1.42987108230591s (exit code: 0)
+DEBUG[1759159606.192]: purify.pl result: 0
+DEBUG[1759159606.192]: ✓ examples.impurl/002_printf_basic.pl: purify.pl processed successfully
+DEBUG[1759159606.192]: Checking if pure/002_printf_basic.pl still contains system calls or backticks
+DEBUG[1759159606.192]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159606.233]: grep check completed in 0.041032075881958s (exit code: 1)
+DEBUG[1759159606.233]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159606.233]: Running original file: examples.impurl/002_printf_basic.pl
+DEBUG[1759159606.233]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159607.516]: original file execution completed in 1.28359508514404s (exit code: 0)
+DEBUG[1759159607.516]: Original file execution result: 0
+DEBUG[1759159607.516]: Running purified file: pure/002_printf_basic.pl
+DEBUG[1759159607.516]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159608.144]: purified file execution completed in 0.62753701210022s (exit code: 0)
+DEBUG[1759159608.144]: Purified file execution result: 0
+DEBUG[1759159608.144]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759159608.144]: Progress: [=                   ] 7% (4/54) - Processing files
+DEBUG[1759159608.144]: Testing purify.pl on examples.impurl/003__ls_basic.pl -> pure/003__ls_basic.pl
+DEBUG[1759159608.144]: File 4 of 54
+DEBUG[1759159608.144]: Running purify.pl on examples.impurl/003__ls_basic.pl
+DEBUG[1759159608.144]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159609.080]: purify.pl execution completed in 0.935124158859253s (exit code: 0)
+DEBUG[1759159609.080]: purify.pl result: 0
+DEBUG[1759159609.080]: ✓ examples.impurl/003__ls_basic.pl: purify.pl processed successfully
+DEBUG[1759159609.080]: Checking if pure/003__ls_basic.pl still contains system calls or backticks
+DEBUG[1759159609.080]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159609.132]: grep check completed in 0.0526819229125977s (exit code: 1)
+DEBUG[1759159609.132]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159609.132]: Running original file: examples.impurl/003__ls_basic.pl
+DEBUG[1759159609.132]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159609.426]: original file execution completed in 0.293856143951416s (exit code: 0)
+DEBUG[1759159609.426]: Original file execution result: 0
+DEBUG[1759159609.426]: Running purified file: pure/003__ls_basic.pl
+DEBUG[1759159609.426]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159609.696]: purified file execution completed in 0.26935601234436s (exit code: 0)
+DEBUG[1759159609.696]: Purified file execution result: 0
+DEBUG[1759159609.696]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759159609.696]: Progress: [=                   ] 9% (5/54) - Processing files
+DEBUG[1759159609.696]: Testing purify.pl on examples.impurl/003_ls_basic.pl -> pure/003_ls_basic.pl
+DEBUG[1759159609.696]: File 5 of 54
+DEBUG[1759159609.696]: Running purify.pl on examples.impurl/003_ls_basic.pl
+DEBUG[1759159609.696]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159610.892]: purify.pl execution completed in 1.1955041885376s (exit code: 0)
+DEBUG[1759159610.892]: purify.pl result: 0
+DEBUG[1759159610.892]: ✓ examples.impurl/003_ls_basic.pl: purify.pl processed successfully
+DEBUG[1759159610.892]: Checking if pure/003_ls_basic.pl still contains system calls or backticks
+DEBUG[1759159610.892]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159610.940]: grep check completed in 0.0479578971862793s (exit code: 1)
+DEBUG[1759159610.940]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159610.940]: Running original file: examples.impurl/003_ls_basic.pl
+DEBUG[1759159610.940]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159611.586]: original file execution completed in 0.646342992782593s (exit code: 0)
+DEBUG[1759159611.586]: Original file execution result: 0
+DEBUG[1759159611.586]: Running purified file: pure/003_ls_basic.pl
+DEBUG[1759159611.586]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159612.003]: purified file execution completed in 0.416656017303467s (exit code: 0)
+DEBUG[1759159612.003]: Purified file execution result: 0
+DEBUG[1759159612.003]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759159612.004]: Progress: [==                  ] 11% (6/54) - Processing files
+DEBUG[1759159612.004]: Testing purify.pl on examples.impurl/004_cat_basic.pl -> pure/004_cat_basic.pl
+DEBUG[1759159612.004]: File 6 of 54
+DEBUG[1759159612.004]: Running purify.pl on examples.impurl/004_cat_basic.pl
+DEBUG[1759159612.004]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159613.078]: purify.pl execution completed in 1.0739049911499s (exit code: 0)
+DEBUG[1759159613.078]: purify.pl result: 0
+DEBUG[1759159613.078]: ✓ examples.impurl/004_cat_basic.pl: purify.pl processed successfully
+DEBUG[1759159613.078]: Checking if pure/004_cat_basic.pl still contains system calls or backticks
+DEBUG[1759159613.078]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159613.125]: grep check completed in 0.0474770069122314s (exit code: 1)
+DEBUG[1759159613.125]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159613.125]: Running original file: examples.impurl/004_cat_basic.pl
+DEBUG[1759159613.125]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159614.057]: original file execution completed in 0.931798934936523s (exit code: 0)
+DEBUG[1759159614.057]: Original file execution result: 0
+DEBUG[1759159614.057]: Running purified file: pure/004_cat_basic.pl
+DEBUG[1759159614.057]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159614.600]: purified file execution completed in 0.542715787887573s (exit code: 0)
+DEBUG[1759159614.600]: Purified file execution result: 0
+DEBUG[1759159614.600]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759159614.600]: Progress: [==                  ] 12% (7/54) - Processing files
+DEBUG[1759159614.600]: Testing purify.pl on examples.impurl/005_wc_basic.pl -> pure/005_wc_basic.pl
+DEBUG[1759159614.600]: File 7 of 54
+DEBUG[1759159614.600]: Running purify.pl on examples.impurl/005_wc_basic.pl
+DEBUG[1759159614.600]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159615.803]: purify.pl execution completed in 1.20244288444519s (exit code: 0)
+DEBUG[1759159615.803]: purify.pl result: 0
+DEBUG[1759159615.803]: ✓ examples.impurl/005_wc_basic.pl: purify.pl processed successfully
+DEBUG[1759159615.803]: Checking if pure/005_wc_basic.pl still contains system calls or backticks
+DEBUG[1759159615.803]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159615.847]: grep check completed in 0.0444798469543457s (exit code: 1)
+DEBUG[1759159615.847]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159615.847]: Running original file: examples.impurl/005_wc_basic.pl
+DEBUG[1759159615.847]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159616.610]: original file execution completed in 0.762707948684692s (exit code: 0)
+DEBUG[1759159616.610]: Original file execution result: 0
+DEBUG[1759159616.610]: Running purified file: pure/005_wc_basic.pl
+DEBUG[1759159616.610]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159617.235]: purified file execution completed in 0.624861001968384s (exit code: 0)
+DEBUG[1759159617.235]: Purified file execution result: 0
+DEBUG[1759159617.235]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759159617.236]: Progress: [==                  ] 14% (8/54) - Processing files
+DEBUG[1759159617.236]: Testing purify.pl on examples.impurl/006_head_basic.pl -> pure/006_head_basic.pl
+DEBUG[1759159617.236]: File 8 of 54
+DEBUG[1759159617.236]: Running purify.pl on examples.impurl/006_head_basic.pl
+DEBUG[1759159617.236]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159618.886]: purify.pl execution completed in 1.64995098114014s (exit code: 0)
+DEBUG[1759159618.886]: purify.pl result: 0
+DEBUG[1759159618.886]: ✓ examples.impurl/006_head_basic.pl: purify.pl processed successfully
+DEBUG[1759159618.886]: Checking if pure/006_head_basic.pl still contains system calls or backticks
+DEBUG[1759159618.886]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159618.928]: grep check completed in 0.0419929027557373s (exit code: 1)
+DEBUG[1759159618.928]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159618.928]: Running original file: examples.impurl/006_head_basic.pl
+DEBUG[1759159618.928]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159620.648]: original file execution completed in 1.71988487243652s (exit code: 0)
+DEBUG[1759159620.648]: Original file execution result: 0
+DEBUG[1759159620.648]: Running purified file: pure/006_head_basic.pl
+DEBUG[1759159620.648]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159621.195]: purified file execution completed in 0.547122955322266s (exit code: 0)
+DEBUG[1759159621.195]: Purified file execution result: 0
+DEBUG[1759159621.195]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759159621.195]: Progress: [===                 ] 16% (9/54) - Processing files
+DEBUG[1759159621.195]: Testing purify.pl on examples.impurl/007_tail_basic.pl -> pure/007_tail_basic.pl
+DEBUG[1759159621.195]: File 9 of 54
+DEBUG[1759159621.195]: Running purify.pl on examples.impurl/007_tail_basic.pl
+DEBUG[1759159621.195]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159623.073]: purify.pl execution completed in 1.87776517868042s (exit code: 0)
+DEBUG[1759159623.073]: purify.pl result: 0
+DEBUG[1759159623.073]: ✓ examples.impurl/007_tail_basic.pl: purify.pl processed successfully
+DEBUG[1759159623.073]: Checking if pure/007_tail_basic.pl still contains system calls or backticks
+DEBUG[1759159623.073]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159623.123]: grep check completed in 0.0499989986419678s (exit code: 1)
+DEBUG[1759159623.123]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159623.123]: Running original file: examples.impurl/007_tail_basic.pl
+DEBUG[1759159623.123]: Starting original file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159623.889]: original file execution completed in 0.765225887298584s (exit code: 0)
+DEBUG[1759159623.889]: Original file execution result: 0
+DEBUG[1759159623.889]: Running purified file: pure/007_tail_basic.pl
+DEBUG[1759159623.889]: Starting purified file execution (timeout: 30s, type: perl_execution)
+DEBUG[1759159624.326]: purified file execution completed in 0.437129020690918s (exit code: 0)
+DEBUG[1759159624.326]: Purified file execution result: 0
+DEBUG[1759159624.326]: ✓ Output comparison passed - files produce identical output
+DEBUG[1759159624.326]: Progress: [===                 ] 18% (10/54) - Processing files
+DEBUG[1759159624.326]: Testing purify.pl on examples.impurl/008_date_basic.pl -> pure/008_date_basic.pl
+DEBUG[1759159624.326]: File 10 of 54
+DEBUG[1759159624.326]: Running purify.pl on examples.impurl/008_date_basic.pl
+DEBUG[1759159624.326]: Starting purify.pl execution (timeout: 60s, type: purify_execution)
+DEBUG[1759159625.783]: purify.pl execution completed in 1.45633697509766s (exit code: 0)
+DEBUG[1759159625.783]: purify.pl result: 0
+DEBUG[1759159625.783]: ✓ examples.impurl/008_date_basic.pl: purify.pl processed successfully
+DEBUG[1759159625.783]: Checking if pure/008_date_basic.pl still contains system calls or backticks
+DEBUG[1759159625.783]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1759159625.831]: grep check completed in 0.0482320785522461s (exit code: 1)
+DEBUG[1759159625.831]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1759159625.831]: Running original file: examples.impurl/008_date_basic.pl
+DEBUG[1759159625.831]: Starting original file execution (timeout: 30s, type: perl_execution)

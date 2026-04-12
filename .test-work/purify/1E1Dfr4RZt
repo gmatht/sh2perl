@@ -1,0 +1,60 @@
+=== Example 018: Basic paste command ===
+Using backticks to call paste (two files):
+Alice	25
+Bob	30
+Charlie	35
+
+paste with custom delimiter (-d ','):
+Alice,25
+Bob,30
+Charlie,35
+
+paste with multiple files:
+Alice	25	Engineer
+Bob	30	Manager
+Charlie	35	Developer
+
+paste with serial (-s):
+Alice	Bob	Charlie
+
+paste with newline delimiter (-d '\n'):
+Alice
+25
+Bob
+30
+Charlie
+35
+
+paste with tab delimiter (-d '\t'):
+Alice	25
+Bob	30
+Charlie	35
+
+paste with zero delimiter (-d '\0'):
+Alice25
+Bob30
+Charlie35
+
+paste with space delimiter (-d ' '):
+Alice 25
+Bob 30
+Charlie 35
+
+paste with pipe delimiter (-d '|'):
+Alice|25
+Bob|30
+Charlie|35
+
+paste from stdin (echo | paste):
+Alice	25
+Bob	30
+	35
+
+paste with multiple delimiters:
+Alice|25,Engineer
+Bob|30,Manager
+Charlie|35,Developer
+
+paste with serial and delimiter (-s -d ','):
+Alice,Bob,Charlie
+=== Example 018 completed successfully ===

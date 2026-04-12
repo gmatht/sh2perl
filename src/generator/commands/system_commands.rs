@@ -5,14 +5,19 @@ use crate::generator::Generator;
 pub fn word_to_bash_string_for_system(word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
-            // If the literal is already properly quoted (starts and ends with same quote), use it as-is
-            if (s.starts_with('\'') && s.ends_with('\''))
-                || (s.starts_with('"') && s.ends_with('"'))
-            {
+            // Preserve existing shell single quotes, but re-quote double-quoted literals
+            // so shell variables like $0 do not get expanded unexpectedly.
+            if s.starts_with('\'') && s.ends_with('\'') {
                 s.clone()
+            }
+            else if s.is_empty() {
+                "''".to_string()
             }
             // Always quote literals that contain spaces, quotes, or special characters to ensure proper shell parsing
             else if s.contains(' ')
+                || s.contains('\n')
+                || s.contains('\r')
+                || s.contains('\t')
                 || s.contains('"')
                 || s.contains('\'')
                 || s.contains(';')
@@ -39,7 +44,15 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
                     _ => result.push_str("UNSUPPORTED_INTERPOLATION"),
                 }
             }
-            if result.contains(' ') || result.contains(';') {
+            if result.is_empty() {
+                return "''".to_string();
+            }
+            if result.contains(' ')
+                || result.contains('\n')
+                || result.contains('\r')
+                || result.contains('\t')
+                || result.contains(';')
+            {
                 format!("'{}'", result.replace("'", "'\"'\"'"))
             } else {
                 result
@@ -77,27 +90,9 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
             }
         }
         Command::Pipeline(pipeline) => {
-            let commands: Vec<String> = pipeline
-                .commands
-                .iter()
-                .filter_map(|cmd| {
-                    if let Command::Simple(simple_cmd) = cmd {
-                        let args: Vec<String> = simple_cmd
-                            .args
-                            .iter()
-                            .map(|arg| word_to_bash_string_for_system(arg))
-                            .collect();
-                        if args.is_empty() {
-                            Some(simple_cmd.name.to_string())
-                        } else {
-                            Some(format!("{} {}", simple_cmd.name, args.join(" ")))
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            commands.join(" | ")
+            crate::generator::redirects::generate_bash_command_string(&Command::Pipeline(
+                pipeline.clone(),
+            ))
         }
         Command::Subshell(subshell_cmd) => {
             match &**subshell_cmd {

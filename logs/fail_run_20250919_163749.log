@@ -1,0 +1,73 @@
+Starting test run at Fri, Sep 19, 2025  4:37:49 PM
+Logging to: logs/fail_run_20250919_163749.log
+Test arguments: 
+----------------------------------------
+Compiling debashc...
+   Compiling debashl v0.1.0 (D:\GitHub\sh2perl)
+error: argument never used
+   --> src\generator\commands\find.rs:154:72
+    |
+154 |     result.push_str(&format!("    my $start_{} = q{{}};\n", unique_id, start_path));
+    |                              -----------------------------             ^^^^^^^^^^ argument never used
+    |                              |
+    |                              formatting specifier missing
+
+warning: unused import: `std::collections::HashMap`
+ --> src\generator\redirects.rs:4:5
+  |
+4 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused variable: `cmd`
+  --> src\generator\commands\system_commands.rs:36:35
+   |
+36 |         Word::CommandSubstitution(cmd, _) => {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_cmd`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `output`
+  --> src\generator\commands\find.rs:42:13
+   |
+42 |     let mut output = String::new();
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: variable does not need to be mutable
+  --> src\generator\commands\find.rs:42:9
+   |
+42 |     let mut output = String::new();
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `command_str`
+   --> src\generator\words.rs:334:37
+    |
+334 | ...                   let command_str = generator.word_to_perl(command);
+    |                           ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_str`
+
+warning: `debashl` (lib) generated 5 warnings
+error: could not compile `debashl` (lib) due to 1 previous error; 5 warnings emitted
+Running debashc with 60 second timeout...
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic
+Timeout: 60s
+----------------------------------------
+Running: debashc test generation and execution
+Command: ./target/debug/debashc.exe fail --perl-critic
+Timeout: 60s
+----------------------------------------
+True
+Command timed out after 60s, killing process...
+True
+----------------------------------------
+Command timed out with exit code: 124
+----------------------------------------
+Command timed out after 60s
+----------------------------------------
+Command completed with exit code: 124
+----------------------------------------

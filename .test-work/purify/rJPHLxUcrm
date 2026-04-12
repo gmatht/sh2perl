@@ -1,0 +1,3 @@
+Bareword found where operator expected (Missing operator before "test_mv_source"?) at /mnt/d/GitHub/sh2perl/.test-work/purify/023_mv_basic/pure/023_mv_basic.pl line 38, near ""$dest/"test_mv_source"
+syntax error at /mnt/d/GitHub/sh2perl/.test-work/purify/023_mv_basic/pure/023_mv_basic.pl line 38, near ""$dest/"test_mv_source"
+Execution of /mnt/d/GitHub/sh2perl/.test-work/purify/023_mv_basic/pure/023_mv_basic.pl aborted due to compilation errors.

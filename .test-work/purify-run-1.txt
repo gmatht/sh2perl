@@ -1,0 +1,237 @@
+Running test_purify.pl with verbose output
+DEBUG[1775563024.905]: Found 54 .pl files in examples.impurl directory
+DEBUG[1775563024.905]: Files to process: /mnt/d/GitHub/sh2perl/examples.impurl/000benchmark.pl, /mnt/d/GitHub/sh2perl/examples.impurl/001_echo_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/002_printf_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/003__ls_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/003_ls_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/004_cat_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/005_wc_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/006_head_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/007_tail_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/008_date_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/009_sleep_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/010_which_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/011_grep_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/012_sed_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/013_awk_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/014_tr_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/015_cut_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/016_sort_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/017_uniq_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/018_paste_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/019_comm_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/020_diff_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/021_find_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/022_cp_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/023_mv_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/024_rm_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/025_mkdir_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/026_touch_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/027_basename_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/028_dirname_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/029_xargs_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/030_tee_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/031_time_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/032_kill_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/033_nice_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/034_nohup_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/035_pipeline_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/036_control_flow_basic.pl, /mnt/d/GitHub/sh2perl/examples.impurl/037_complex_pipeline.pl, /mnt/d/GitHub/sh2perl/examples.impurl/038_advanced_control_flow.pl, /mnt/d/GitHub/sh2perl/examples.impurl/039_subshell_operations.pl, /mnt/d/GitHub/sh2perl/examples.impurl/040_most_complex_example.pl, /mnt/d/GitHub/sh2perl/examples.impurl/041_compression_network.pl, /mnt/d/GitHub/sh2perl/examples.impurl/042_checksum_verification.pl, /mnt/d/GitHub/sh2perl/examples.impurl/043_string_processing.pl, /mnt/d/GitHub/sh2perl/examples.impurl/044_yes_command.pl, /mnt/d/GitHub/sh2perl/examples.impurl/045_read_command.pl, /mnt/d/GitHub/sh2perl/examples.impurl/046_perl_command.pl, /mnt/d/GitHub/sh2perl/examples.impurl/047_advanced_pipelines.pl, /mnt/d/GitHub/sh2perl/examples.impurl/048_nested_control_flow.pl, /mnt/d/GitHub/sh2perl/examples.impurl/049_ultimate_complex_example.pl, /mnt/d/GitHub/sh2perl/examples.impurl/050_final_example.pl, /mnt/d/GitHub/sh2perl/examples.impurl/051_remaining_examples.pl, /mnt/d/GitHub/sh2perl/examples.impurl/052_complex_usage_examples.pl
+DEBUG[1775563024.905]: Testing purify.pl --help...
+DEBUG[1775563024.905]: Starting purify.pl help test (timeout: 5s, type: purify_help)
+DEBUG[1775563024.932]: purify.pl help test completed in 0.0270500183105469s (exit code: 0)
+DEBUG[1775563024.933]: purify.pl --help test passed
+DEBUG[1775563024.933]: Starting backtick command substitution (timeout: 30s, type: purify_execution)
+DEBUG[1775563025.305]: backtick command substitution completed in 0.371427059173584s (exit code: 0)
+DEBUG[1775563025.305]: Starting bare mv backtick (timeout: 30s, type: purify_execution)
+DEBUG[1775563025.720]: bare mv backtick completed in 0.414523124694824s (exit code: 0)
+DEBUG[1775563025.737]: Progress: [                    ] 1% (1/54) - Processing files
+DEBUG[1775563025.737]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/000benchmark.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/000benchmark/pure/000benchmark.pl
+DEBUG[1775563025.737]: File 1 of 54
+DEBUG[1775563025.738]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/000benchmark.pl
+DEBUG[1775563025.738]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563025.907]: purify.pl execution completed in 0.169352054595947s (exit code: 0)
+DEBUG[1775563025.907]: purify.pl result: 0
+DEBUG[1775563025.907]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/000benchmark.pl: purify.pl processed successfully
+DEBUG[1775563025.907]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/000benchmark/pure/000benchmark.pl still contains system calls or backticks
+DEBUG[1775563025.907]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563025.921]: grep check completed in 0.0134639739990234s (exit code: 0)
+DEBUG[1775563025.921]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563025.921]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/000benchmark.pl
+DEBUG[1775563025.923]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563025.935]: original file execution completed in 0.0115828514099121s (exit code: 0)
+DEBUG[1775563025.935]: Original file execution result: 0
+DEBUG[1775563025.935]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/000benchmark/pure/000benchmark.pl
+DEBUG[1775563025.937]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563025.949]: purified file execution completed in 0.0119519233703613s (exit code: 0)
+DEBUG[1775563025.949]: Purified file execution result: 0
+DEBUG[1775563025.959]: ✓ Output comparison passed - files produce identical output
+DEBUG[1775563025.969]: Progress: [                    ] 3% (2/54) - Processing files
+DEBUG[1775563025.969]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/001_echo_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/001_echo_basic/pure/001_echo_basic.pl
+DEBUG[1775563025.969]: File 2 of 54
+DEBUG[1775563025.970]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/001_echo_basic.pl
+DEBUG[1775563025.970]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563028.005]: purify.pl execution completed in 2.03494906425476s (exit code: 0)
+DEBUG[1775563028.005]: purify.pl result: 0
+DEBUG[1775563028.005]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/001_echo_basic.pl: purify.pl processed successfully
+DEBUG[1775563028.005]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/001_echo_basic/pure/001_echo_basic.pl still contains system calls or backticks
+DEBUG[1775563028.005]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563028.019]: grep check completed in 0.0144760608673096s (exit code: 0)
+DEBUG[1775563028.019]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563028.019]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/001_echo_basic.pl
+DEBUG[1775563028.022]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563028.048]: original file execution completed in 0.0266439914703369s (exit code: 0)
+DEBUG[1775563028.048]: Original file execution result: 0
+DEBUG[1775563028.048]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/001_echo_basic/pure/001_echo_basic.pl
+DEBUG[1775563028.050]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563028.068]: purified file execution completed in 0.017219066619873s (exit code: 0)
+DEBUG[1775563028.068]: Purified file execution result: 0
+DEBUG[1775563028.071]: ✓ Output comparison passed - files produce identical output
+DEBUG[1775563028.077]: Progress: [=                   ] 5% (3/54) - Processing files
+DEBUG[1775563028.077]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/002_printf_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/002_printf_basic/pure/002_printf_basic.pl
+DEBUG[1775563028.077]: File 3 of 54
+DEBUG[1775563028.078]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/002_printf_basic.pl
+DEBUG[1775563028.078]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563032.516]: purify.pl execution completed in 4.43807411193848s (exit code: 0)
+DEBUG[1775563032.516]: purify.pl result: 0
+DEBUG[1775563032.516]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/002_printf_basic.pl: purify.pl processed successfully
+DEBUG[1775563032.516]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/002_printf_basic/pure/002_printf_basic.pl still contains system calls or backticks
+DEBUG[1775563032.516]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563032.529]: grep check completed in 0.013530969619751s (exit code: 0)
+DEBUG[1775563032.529]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563032.529]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/002_printf_basic.pl
+DEBUG[1775563032.531]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563032.559]: original file execution completed in 0.0277230739593506s (exit code: 0)
+DEBUG[1775563032.559]: Original file execution result: 0
+DEBUG[1775563032.559]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/002_printf_basic/pure/002_printf_basic.pl
+DEBUG[1775563032.574]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563032.588]: purified file execution completed in 0.0136520862579346s (exit code: 0)
+DEBUG[1775563032.588]: Purified file execution result: 0
+DEBUG[1775563032.592]: ✓ Output comparison passed - files produce identical output
+DEBUG[1775563032.601]: Progress: [=                   ] 7% (4/54) - Processing files
+DEBUG[1775563032.601]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/003__ls_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/003__ls_basic/pure/003__ls_basic.pl
+DEBUG[1775563032.601]: File 4 of 54
+DEBUG[1775563032.602]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/003__ls_basic.pl
+DEBUG[1775563032.602]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563033.223]: purify.pl execution completed in 0.620827913284302s (exit code: 0)
+DEBUG[1775563033.223]: purify.pl result: 0
+DEBUG[1775563033.223]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/003__ls_basic.pl: purify.pl processed successfully
+DEBUG[1775563033.223]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/003__ls_basic/pure/003__ls_basic.pl still contains system calls or backticks
+DEBUG[1775563033.223]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563033.242]: grep check completed in 0.0195820331573486s (exit code: 0)
+DEBUG[1775563033.242]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563033.242]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/003__ls_basic.pl
+DEBUG[1775563033.245]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563033.255]: original file execution completed in 0.0106348991394043s (exit code: 0)
+DEBUG[1775563033.255]: Original file execution result: 0
+DEBUG[1775563033.255]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/003__ls_basic/pure/003__ls_basic.pl
+DEBUG[1775563033.257]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563033.272]: purified file execution completed in 0.0148651599884033s (exit code: 0)
+DEBUG[1775563033.272]: Purified file execution result: 0
+DEBUG[1775563033.275]: ✓ Output comparison passed - files produce identical output
+DEBUG[1775563033.283]: Progress: [=                   ] 9% (5/54) - Processing files
+DEBUG[1775563033.283]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/003_ls_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/003_ls_basic/pure/003_ls_basic.pl
+DEBUG[1775563033.283]: File 5 of 54
+DEBUG[1775563033.284]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/003_ls_basic.pl
+DEBUG[1775563033.284]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563033.389]: purify.pl execution completed in 0.104683876037598s (exit code: 0)
+DEBUG[1775563033.389]: purify.pl result: 0
+DEBUG[1775563033.389]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/003_ls_basic.pl: purify.pl processed successfully
+DEBUG[1775563033.389]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/003_ls_basic/pure/003_ls_basic.pl still contains system calls or backticks
+DEBUG[1775563033.389]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563033.403]: grep check completed in 0.0138630867004395s (exit code: 0)
+DEBUG[1775563033.403]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563033.403]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/003_ls_basic.pl
+DEBUG[1775563033.405]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563033.411]: original file execution completed in 0.00657486915588379s (exit code: 0)
+DEBUG[1775563033.411]: Original file execution result: 0
+DEBUG[1775563033.411]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/003_ls_basic/pure/003_ls_basic.pl
+DEBUG[1775563033.414]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563033.420]: purified file execution completed in 0.00651192665100098s (exit code: 0)
+DEBUG[1775563033.420]: Purified file execution result: 0
+DEBUG[1775563033.423]: ✓ Output comparison passed - files produce identical output
+DEBUG[1775563033.432]: Progress: [==                  ] 11% (6/54) - Processing files
+DEBUG[1775563033.432]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/004_cat_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/004_cat_basic/pure/004_cat_basic.pl
+DEBUG[1775563033.432]: File 6 of 54
+DEBUG[1775563033.432]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/004_cat_basic.pl
+DEBUG[1775563033.432]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563035.912]: purify.pl execution completed in 2.47957992553711s (exit code: 0)
+DEBUG[1775563035.912]: purify.pl result: 0
+DEBUG[1775563035.912]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/004_cat_basic.pl: purify.pl processed successfully
+DEBUG[1775563035.912]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/004_cat_basic/pure/004_cat_basic.pl still contains system calls or backticks
+DEBUG[1775563035.912]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563035.924]: grep check completed in 0.0119199752807617s (exit code: 0)
+DEBUG[1775563035.924]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563035.924]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/004_cat_basic.pl
+DEBUG[1775563035.926]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563035.979]: original file execution completed in 0.0528929233551025s (exit code: 0)
+DEBUG[1775563035.979]: Original file execution result: 0
+DEBUG[1775563035.979]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/004_cat_basic/pure/004_cat_basic.pl
+DEBUG[1775563035.981]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563036.028]: purified file execution completed in 0.0474309921264648s (exit code: 0)
+DEBUG[1775563036.028]: Purified file execution result: 0
+DEBUG[1775563036.032]: ✓ Output comparison passed - files produce identical output
+DEBUG[1775563036.042]: Progress: [==                  ] 12% (7/54) - Processing files
+DEBUG[1775563036.042]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/005_wc_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/005_wc_basic/pure/005_wc_basic.pl
+DEBUG[1775563036.042]: File 7 of 54
+DEBUG[1775563036.043]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/005_wc_basic.pl
+DEBUG[1775563036.043]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563039.024]: purify.pl execution completed in 2.98090600967407s (exit code: 0)
+DEBUG[1775563039.024]: purify.pl result: 0
+DEBUG[1775563039.024]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/005_wc_basic.pl: purify.pl processed successfully
+DEBUG[1775563039.024]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/005_wc_basic/pure/005_wc_basic.pl still contains system calls or backticks
+DEBUG[1775563039.024]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563039.041]: grep check completed in 0.01708984375s (exit code: 0)
+DEBUG[1775563039.041]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563039.041]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/005_wc_basic.pl
+DEBUG[1775563039.043]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563039.088]: original file execution completed in 0.0452320575714111s (exit code: 0)
+DEBUG[1775563039.088]: Original file execution result: 0
+DEBUG[1775563039.088]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/005_wc_basic/pure/005_wc_basic.pl
+DEBUG[1775563039.090]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563039.154]: purified file execution completed in 0.0641400814056396s (exit code: 0)
+DEBUG[1775563039.154]: Purified file execution result: 0
+DEBUG[1775563039.158]: ✓ Output comparison passed - files produce identical output
+DEBUG[1775563039.167]: Progress: [==                  ] 14% (8/54) - Processing files
+DEBUG[1775563039.167]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/006_head_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/006_head_basic/pure/006_head_basic.pl
+DEBUG[1775563039.167]: File 8 of 54
+DEBUG[1775563039.168]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/006_head_basic.pl
+DEBUG[1775563039.168]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563041.912]: purify.pl execution completed in 2.74442505836487s (exit code: 0)
+DEBUG[1775563041.912]: purify.pl result: 0
+DEBUG[1775563041.912]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/006_head_basic.pl: purify.pl processed successfully
+DEBUG[1775563041.912]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/006_head_basic/pure/006_head_basic.pl still contains system calls or backticks
+DEBUG[1775563041.912]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563041.926]: grep check completed in 0.0141181945800781s (exit code: 0)
+DEBUG[1775563041.926]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563041.926]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/006_head_basic.pl
+DEBUG[1775563041.929]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563041.967]: original file execution completed in 0.0379898548126221s (exit code: 0)
+DEBUG[1775563041.967]: Original file execution result: 0
+DEBUG[1775563041.967]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/006_head_basic/pure/006_head_basic.pl
+DEBUG[1775563041.969]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563042.002]: purified file execution completed in 0.0327138900756836s (exit code: 0)
+DEBUG[1775563042.002]: Purified file execution result: 0
+DEBUG[1775563042.005]: ✓ Output comparison passed - files produce identical output
+DEBUG[1775563042.015]: Progress: [===                 ] 16% (9/54) - Processing files
+DEBUG[1775563042.015]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/007_tail_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/007_tail_basic/pure/007_tail_basic.pl
+DEBUG[1775563042.015]: File 9 of 54
+DEBUG[1775563042.016]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/007_tail_basic.pl
+DEBUG[1775563042.016]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563044.751]: purify.pl execution completed in 2.73518085479736s (exit code: 0)
+DEBUG[1775563044.751]: purify.pl result: 0
+DEBUG[1775563044.751]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/007_tail_basic.pl: purify.pl processed successfully
+DEBUG[1775563044.751]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/007_tail_basic/pure/007_tail_basic.pl still contains system calls or backticks
+DEBUG[1775563044.751]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563044.764]: grep check completed in 0.0134038925170898s (exit code: 0)
+DEBUG[1775563044.764]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563044.764]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/007_tail_basic.pl
+DEBUG[1775563044.767]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563044.801]: original file execution completed in 0.0336968898773193s (exit code: 0)
+DEBUG[1775563044.801]: Original file execution result: 0
+DEBUG[1775563044.801]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/007_tail_basic/pure/007_tail_basic.pl
+DEBUG[1775563044.803]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563044.838]: purified file execution completed in 0.0354609489440918s (exit code: 0)
+DEBUG[1775563044.838]: Purified file execution result: 0
+DEBUG[1775563044.842]: ✓ Output comparison passed - files produce identical output
+DEBUG[1775563044.852]: Progress: [===                 ] 18% (10/54) - Processing files
+DEBUG[1775563044.852]: Testing purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/008_date_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/008_date_basic/pure/008_date_basic.pl
+DEBUG[1775563044.852]: File 10 of 54
+DEBUG[1775563044.852]: Running purify.pl on /mnt/d/GitHub/sh2perl/examples.impurl/008_date_basic.pl
+DEBUG[1775563044.852]: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG[1775563048.340]: purify.pl execution completed in 3.48729014396667s (exit code: 0)
+DEBUG[1775563048.340]: purify.pl result: 0
+DEBUG[1775563048.340]: ✓ /mnt/d/GitHub/sh2perl/examples.impurl/008_date_basic.pl: purify.pl processed successfully
+DEBUG[1775563048.340]: Checking if /mnt/d/GitHub/sh2perl/.test-work/purify/008_date_basic/pure/008_date_basic.pl still contains system calls or backticks
+DEBUG[1775563048.340]: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG[1775563048.349]: grep check completed in 0.009246826171875s (exit code: 0)
+DEBUG[1775563048.349]: ✓ Purification check passed - no system calls or backticks found
+DEBUG[1775563048.349]: Running original file: /mnt/d/GitHub/sh2perl/examples.impurl/008_date_basic.pl
+DEBUG[1775563048.352]: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563048.389]: original file execution completed in 0.037553071975708s (exit code: 0)
+DEBUG[1775563048.389]: Original file execution result: 0
+DEBUG[1775563048.389]: Running purified file: /mnt/d/GitHub/sh2perl/.test-work/purify/008_date_basic/pure/008_date_basic.pl
+DEBUG[1775563048.391]: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG[1775563048.419]: purified file execution completed in 0.0275321006774902s (exit code: 0)
+DEBUG[1775563048.419]: Purified file execution result: 0
+DEBUG[1775563048.428]: Output mismatch detected between original and purified files
+DEBUG[1775563048.428]:  === purified === 
+
+ === end purified ===
+DEBUG[1775563048.428]: Starting diff comparison (timeout: 10s, type: diff_comparison)
+FAILED - Output mismatch for /mnt/d/GitHub/sh2perl/examples.impurl/008_date_basic.pl -> /mnt/d/GitHub/sh2perl/.test-work/purify/008_date_basic/pure/008_date_basic.pl (diff exit code: 1)
+DEBUG[1775563048.435]: diff comparison completed in 0.00663995742797852s (exit code: 1)
+Diff excerpt (showing first 8 of 44 lines)
+--- /mnt/d/GitHub/sh2perl/.test-work/purify/CVG0KoyG6n	2026-04-07 11:57:28.557780000 +0000
++++ /mnt/d/GitHub/sh2perl/.test-work/purify/cnXvGvJa1z	2026-04-07 11:57:28.587261800 +0000
+@@ -1,30 +1,30 @@
+ === Example 008: Basic date command ===
+ Using backticks to call date with a fixed timestamp:
+-Sun Jan  1 12:34:56 UTC 2023
++-u
+ 
+... truncated after 8 lines ...

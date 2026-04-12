@@ -1,0 +1,69 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Test outputs and logs
+logs/
+*.log
+out*.txt
+temp*.txt
+test_*.txt
+*.ERR
+*.tdy
+
+# Generated files
+pure/
+examples.out/
+examples.pl/
+examples.impurl/
+cache/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation builds
+docs/_build/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.backup2
+
+# WASM build artifacts
+www/pkg/
+pkg/
+
+# Benchmark outputs
+benchmark_*.txt
+*.pdb
+*.exe
+
+# Test data
+temp_dir/
+in/
+nul
+ls
+rm
+touch
+cat
+cd
+echo
+dir'
+
+
+
+

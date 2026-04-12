@@ -1,0 +1,348 @@
+#!/bin/bash
+
+# Examples of various uses of backticks in shell scripts
+# This file demonstrates command substitution using backticks (`) 
+# and shows how they can be assigned to variables and used as arguments
+
+echo "=== Basic Backtick Usage ==="
+
+# Simple command substitution
+echo "Current date: `date +%Y`"
+#echo "Current user: `whoami`"
+echo "Current directory: `pwd | basename`"
+
+# Assigning backtick results to variables
+current_date=`date +%Y%m`
+#current_user=`whoami`
+current_dir=`pwd | basename`
+
+echo "Stored date: $current_date"
+#echo "Stored user: $current_user"
+echo "Stored directory: $current_dir"
+
+echo "=== File and Directory Operations ==="
+
+# ls command with backticks
+#PERL_MUST_NOT_CONTAIN `ls
+file_list=`ls -a`
+echo "File listing:"
+echo "$file_list"
+
+# find command with backticks
+#PERL_MUST_NOT_CONTAIN `find
+found_files=`find . -name "*.sh" -type f`
+echo "Found shell scripts:"
+echo "$found_files"
+
+# basename and dirname with backticks
+#PERL_MUST_NOT_CONTAIN `basename
+#PERL_MUST_NOT_CONTAIN `dirname
+#script_name=`basename $0`
+#script_dir=`dirname $0`
+#echo "Script name: $script_name"
+#echo "Script directory: $script_dir"
+
+echo "=== Text Processing Commands ==="
+
+# cat command with backticks
+#PERL_MUST_NOT_CONTAIN `cat
+file_content=`cat /etc/passwd | head -5`
+echo "First 5 lines of /etc/passwd:"
+echo "$file_content"
+
+# grep command with backticks
+#PERL_MUST_NOT_CONTAIN `grep
+grep_result=`grep -n "bash" /etc/passwd`
+echo "Lines containing 'bash':"
+echo "$grep_result"
+
+# sed command with backticks
+#PERL_MUST_NOT_CONTAIN `sed
+sed_result=`echo "Hello World" | sed 's/World/Universe/'`
+echo "Sed result: $sed_result"
+
+# awk command with backticks
+#PERL_MUST_NOT_CONTAIN `awk
+awk_result=`echo "1 2 3 4 5" | awk '{print $1 + $2}'`
+echo "Awk sum result: $awk_result"
+
+# sort command with backticks
+#PERL_MUST_NOT_CONTAIN `sort
+sort_result=`echo -e "zebra\napple\nbanana" | sort`
+echo "Sorted words:"
+echo "$sort_result"
+
+# uniq command with backticks
+#PERL_MUST_NOT_CONTAIN `uniq
+uniq_result=`echo -e "apple\napple\nbanana\nbanana\ncherry" | uniq`
+echo "Unique words:"
+echo "$uniq_result"
+
+# wc command with backticks
+#PERL_MUST_NOT_CONTAIN `wc
+word_count=`echo "Hello World" | wc -w`
+line_count=`echo -e "line1\nline2\nline3" | wc -l`
+echo "Word count: $word_count"
+echo "Line count: $line_count"
+
+# head command with backticks
+#PERL_MUST_NOT_CONTAIN `head
+head_result=`seq 1 10 | head -3`:
+echo "First 3 numbers: $head_result"
+
+# tail command with backticks
+#PERL_MUST_NOT_CONTAIN `tail
+tail_result=`seq 1 10 | tail -3`
+echo "Last 3 numbers: $tail_result"
+
+# cut command with backticks
+#PERL_MUST_NOT_CONTAIN `cut
+cut_result=`echo "apple:banana:cherry" | cut -d: -f2`
+echo "Second field: $cut_result"
+
+# paste command with backticks
+#PERL_MUST_NOT_CONTAIN `paste
+paste_result=`paste <(echo -e "1\n2\n3") <(echo -e "a\nb\nc")`
+echo "Pasted columns:"
+echo "$paste_result"
+
+# comm command with backticks
+#PERL_MUST_NOT_CONTAIN `comm
+echo -e "apple\nbanana\ncherry" > file1.txt
+echo -e "banana\ncherry\ndate" > file2.txt
+comm_result=`comm -12 file1.txt file2.txt`
+echo "Common lines:"
+echo "$comm_result"
+
+# diff command with backticks
+#PERL_MUST_NOT_CONTAIN `diff
+diff_result=`diff file1.txt file2.txt`
+echo "File differences:"
+echo "$diff_result"
+
+# tr command with backticks
+#PERL_MUST_NOT_CONTAIN `tr
+tr_result=`echo "HELLO WORLD" | tr 'A-Z' 'a-z'`
+echo "Lowercase: $tr_result"
+
+# xargs command with backticks
+#PERL_MUST_NOT_CONTAIN `xargs
+xargs_result=`echo "1 2 3" | xargs -n1 echo "Number:"`
+echo "Xargs result:"
+echo "$xargs_result"
+
+echo "=== System Utilities ==="
+
+# date command with backticks
+#PERL_MUST_NOT_CONTAIN `date
+timestamp=`date +%rms`
+formatted_date=`date '+%Y-%m-%d %H'`
+echo "Timestamp: $timestamp"
+echo "Formatted date: $formatted_date"
+
+# time command with backticks
+#PERL_MUST_NOT_CONTAIN `time
+time_result=`time sleep 1 2>&1`
+echo "Time result: $time_result"
+
+# sleep command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `sleep
+sleep_duration=`echo "2"`
+echo "Sleeping for $sleep_duration seconds..."
+sleep $sleep_duration
+
+# which command with backticks
+#PERL_MUST_NOT_CONTAIN `which
+bash_path=`which bash`
+echo "Bash path: $bash_path"
+
+# yes command with backticks
+#PERL_MUST_NOT_CONTAIN `yes
+yes_result=`yes "Hello" | head -3`
+echo "Yes command result:"
+echo "$yes_result"
+
+echo "=== File Manipulation Commands ==="
+
+# cp command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `cp
+echo "test content" > test_file.txt
+cp_result=`cp test_file.txt test_file_copy.txt && echo "Copy successful"`
+echo "Copy result: $cp_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+# mv command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `mv
+mv_result=`mv test_file_copy.txt test_file_moved.txt && echo "Move successful"`
+echo "Move result: $mv_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+# rm command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `rm
+rm_result=`rm test_file.txt test_file_moved.txt && echo "Remove successful"`
+echo "Remove result: $rm_result"
+ls test_file.txt test_file_copy.txt test_file_moved.txt 2>/dev/null || echo "No test files found"
+
+# mkdir command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `mkdir
+mkdir_result=`mkdir test_dir && echo "Directory created"`
+echo "Mkdir result: $mkdir_result"
+touch test_dir/file
+ls test_dir 2>/dev/null || echo "Directory not found"
+
+# touch command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `touch
+touch_result=`touch test_file.txt && echo "File touched"`
+echo "Touch result: $touch_result"
+
+echo "=== Output and Formatting Commands ==="
+
+# echo command with backticks
+#PERL_MUST_NOT_CONTAIN `echo
+echo_result=`echo "Hello from backticks"`
+echo "Echo result: $echo_result"
+
+# printf command with backticks
+#PERL_MUST_NOT_CONTAIN `printf
+printf_result=`printf "Number: %d, String: %s\n" 42 "test"`
+echo "Printf result: $printf_result"
+
+echo "=== Compression Commands ==="
+
+# gzip command with backticks
+#PERL_MUST_NOT_CONTAIN `gzip
+#echo "test content for compression" > test_compress.txt
+#gzip_result=`gzip test_compress.txt && echo "Compression successful"`
+#echo "Gzip result: $gzip_result"
+
+# zcat command with backticks
+#PERL_MUST_NOT_CONTAIN `zcat
+#zcat_result=`zcat test_compress.txt.gz`
+#echo "Zcat result: $zcat_result"
+
+echo "=== Network Commands ==="
+
+# wget command with backticks
+#PERL_MUST_NOT_CONTAIN `wget
+# wget_result=`wget -qO- http://httpbin.org/get | head -1`
+# echo "Wget result: $wget_result"
+
+# curl command with backticks
+#PERL_MUST_NOT_CONTAIN `curl
+# curl_result=`curl -s http://httpbin.org/get | head -1`
+# echo "Curl result: $curl_result"
+
+echo "=== Process Management Commands ==="
+
+# kill command with backticks (though it doesn't produce output)
+#PERL_MUST_NOT_CONTAIN `kill
+# kill_result=`kill -0 $$ && echo "Process exists"`
+# echo "Kill result: $kill_result"
+
+# nohup command with backticks
+#PERL_MUST_NOT_CONTAIN `nohup
+# nohup_result=`nohup echo "background process" 2>&1`
+# echo "Nohup result: $nohup_result"
+
+# nice command with backticks
+#PERL_MUST_NOT_CONTAIN `nice
+#nice_result=`nice echo "low priority process"`
+#echo "Nice result: $nice_result"
+
+echo "=== Checksum Commands ==="
+
+# sha256sum command with backticks
+#PERL_MUST_NOT_CONTAIN `sha256sum
+echo "test content" > test_checksum.txt
+sha256_result=`sha256sum test_checksum.txt`
+echo "SHA256 result: $sha256_result"
+
+# sha512sum command with backticks
+#PERL_MUST_NOT_CONTAIN `sha512sum
+sha512_result=`sha512sum test_checksum.txt`
+echo "SHA512 result: $sha512_result"
+
+# strings command with backticks
+#PERL_MUST_NOT_CONTAIN `strings
+strings_result=`strings target/debug/debashc.exe | head -3`
+echo "Strings result:"
+echo "$strings_result"
+
+echo "=== I/O Redirection Commands ==="
+
+# tee command with backticks
+#PERL_MUST_NOT_CONTAIN `tee
+tee_result=`echo "test output" | tee test_tee.txt`
+echo "Tee result: $tee_result"
+
+echo "=== Perl Command ==="
+
+# perl command with backticks
+#PERL_MUST_NOT_CONTAIN `perl
+perl_result=`perl -e 'print "Hello from Perl\n"'`
+echo "Perl result: $perl_result"
+
+echo "=== Complex Backtick Examples ==="
+
+# Nested backticks
+nested_result=`echo "Current time: \`date\`"`
+echo "Nested backticks: $nested_result"
+
+# Backticks in arithmetic
+count=`ls -1 | wc -l`
+echo "File count: $count"
+
+# Backticks in conditional
+current_user=`whoami`
+if [ "$current_user" = "root" ]; then
+    echo "Running as root"
+else
+    echo "Not running as root"
+fi
+
+# Backticks in case statement
+system_name=`uname -s`
+case $system_name in
+    Linux)
+        echo "Running on Linux"
+        ;;
+    Darwin)
+        echo "Running on macOS"
+        ;;
+    *)
+        echo "Running on other system"
+        ;;
+esac
+
+# Backticks in function
+get_file_size() {
+    local file=$1
+    local size=`wc -c < "$file"`
+    echo "File $file has $size bytes"
+}
+
+get_file_size 000__01_file_directory_operations.sh
+
+
+
+# Backticks in array
+files=(`ls -1 *.sh examples/*.sh 2>/dev/null`)
+echo "Shell scripts found: ${#files[@]}"
+for file in "${files[@]}"; do
+    echo "  - $file"
+done
+
+# Backticks with process substitution
+process_result=`comm -23 <(sort file1.txt) <(sort file2.txt)`
+echo "Process substitution result:"
+echo "$process_result"
+
+# Backticks with here strings
+here_string_result=`tr 'a-z' 'A-Z' <<< "hello world"`
+echo "Here string result: $here_string_result"
+
+# Cleanup
+rm -f file1.txt file2.txt test_file.txt test_file_copy.txt test_file_moved.txt test_checksum.txt test_tee.txt
+rm -rf test_dir 2>/dev/null || true
+
+echo "=== Backtick Examples Complete ==="
