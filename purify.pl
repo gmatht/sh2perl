@@ -158,6 +158,28 @@ sub purify_perl_code {
     # Return the modified content
     $serialized = rewrite_banned_substrings_in_plain_strings($serialized);
     $serialized =~ s/^\s*exit(?:\s*\(\s*|\s+)\$main_exit_code(?:\s*\))?\s*;?\s*$//mg;
+
+    # Ensure the purified script sees the same program name ($0) as the
+    # original input file. Put the assignment in a BEGIN block so it runs
+    # during compilation, before any double-quoted string interpolation
+    # that references $0 occurs.
+    if (defined $input_file && length $input_file) {
+        my $escaped = _escape_perl_fragment($input_file);
+        if ($serialized =~ s/^(#![^\n]*\n)//) {
+            $serialized = $1 . "BEGIN { \$0 = \"$escaped\" }\n" . $serialized;
+        } else {
+            $serialized = "BEGIN { \$0 = \"$escaped\" }\n" . $serialized;
+        }
+    }
+
+    # If the converted code uses Carp's helpers (croak/confess) but the
+    # final document does not contain a 'use Carp' import, prepend one so
+    # the helper functions are available. Prepending is the simplest and
+    # most robust approach after we've finished all other transformations.
+    if ($serialized =~ /\b(?:croak|confess)\b/ && $serialized !~ /\buse\s+Carp\b/) {
+        $serialized = "use Carp;\n" . $serialized;
+    }
+
     return $serialized;
 }
 
@@ -167,22 +189,66 @@ sub process_system_calls_string {
     my $document = PPI::Document->new(\$content);
     return $content unless $document;
 
+    # Find the actual 'system' token nodes. The previous approach that
+    # matched whole statements could return an enclosing compound
+    # statement (for/if/etc.) where the first PPI::Structure::List is not
+    # the argument list of the system() call (for example a for(..) list).
+    # That caused us to accidentally pick up the for-loop range as the
+    # system() arguments and generate incorrect replacements.  By
+    # matching the PPI::Token::Word nodes with content 'system' we can
+    # reliably locate the real call site and then climb to the nearest
+    # enclosing PPI::Statement to perform the replacement.
     my $find = PPI::Find->new(sub {
         my $node = shift;
-        return 1 if $node->isa('PPI::Statement') &&
-                   $node->first_token &&
-                   $node->first_token->content eq 'system';
+        return ($node->isa('PPI::Token::Word') && $node->content eq 'system') ? 1 : 0;
     });
 
-    my @system_calls = reverse $find->in($document);
-    for my $system_call (@system_calls) {
-        my $full_command = reconstruct_shell_command_from_system_call($system_call);
-        next unless $full_command;
+    my @system_tokens = reverse $find->in($document);
+    for my $system_token (@system_tokens) {
+        # Locate the nearest enclosing statement for this 'system' token
+        # so we can replace the full statement containing the call.
+        my $system_call_stmt = $system_token;
+        $system_call_stmt = $system_call_stmt->parent while $system_call_stmt && !$system_call_stmt->isa('PPI::Statement');
+        next unless $system_call_stmt;
+        print "DEBUG: Processing system statement: " . $system_call_stmt->content . "\n" if $verbose;
+        # Try to extract raw argument tokens for the system() call.
+        my @tokens = get_system_call_tokens($system_call_stmt);
+        if ($verbose) {
+            if (@tokens) {
+                for my $t (@tokens) {
+                    my ($txt, $qt) = ref($t) eq 'ARRAY' ? @{$t} : ($t, 'bare');
+                    print "DEBUG:  token -> text=[" . $txt . "] quote_type=[" . $qt . "]\n";
+                }
+            } else {
+                print "DEBUG:  get_system_call_tokens returned no tokens\n";
+            }
+        }
+        next unless @tokens;
 
-        my $perl_result = convert_shell_to_perl($full_command, 0);
-        next unless $perl_result;
+        # Single-argument system() - treat as shell string and pass to debashc
+        if (@tokens == 1) {
+            my $full_command = reconstruct_shell_command_from_system_call($system_call_stmt);
+            next unless $full_command;
 
-        replace_system_call_with_code($system_call, $perl_result);
+            my $perl_result = convert_shell_to_perl($full_command, 0);
+            next unless $perl_result;
+
+            replace_system_call_with_code($system_call_stmt, $perl_result);
+            next;
+        }
+
+        # Multi-argument system() - preserve list-form semantics by
+        # generating a fork+exec do-block. Using an exec block here
+        # ensures Perl interpolation and quoting semantics from the
+        # original source are preserved (e.g. double-quoted args will
+        # still interpolate variables like $i). Previously we sometimes
+        # reconstructed a shell command and passed it through debashc,
+        # which could change semantics (notably interpolation) and
+        # produced incorrect behavior for examples like
+        # system("echo", "Processing item $i").
+        my $exec_block = generate_exec_do_block(\@tokens);
+        replace_system_call_with_code($system_call_stmt, $exec_block);
+        next;
     }
 
     return $document->serialize;
@@ -279,13 +345,71 @@ sub process_backticks_string {
 sub process_single_backtick_string {
     my ($declaration, $var_name, $command) = @_;
     my $prefix = defined $declaration ? $declaration : '';
+    # Preserve the raw command text for heuristic checks, but decode
+    # escape sequences for conversion. decode_perl_double_quoted_string
+    # turns sequences like \n into actual newlines which debashc expects.
+    my $raw_command = $command;
     $command = decode_perl_double_quoted_string($command);
-    
+
     print "DEBUG: Processing backtick command: $command\n" if $verbose;
-    
+
     # Convert using debashc
     my $perl_result = convert_shell_to_perl($command, 1);
     if ($perl_result) {
+        # Heuristic fix: debashc sometimes emits a Perl command string where
+        # an echo argument that originally was single-quoted and contained
+        # embedded newlines ends up unquoted. That leaves literal newlines
+        # outside quotes which the shell interprets as command separators.
+        # Detect and repair the common pattern: an assignment of the form
+        #   my $X = "echo ...\n... | ...";
+        # and wrap the echo argument in single quotes so the shell treats
+        # the embedded newlines as part of the single argument.
+        # debashc may emit the assigned command string using different
+        # Perl quoting styles (single-quoted '...', double-quoted "...",
+        # or q{...}). The previous heuristic only handled the ' or "
+        # forms which missed q{...} and allowed multiline echo arguments
+        # to be left unquoted, causing the shell to treat embedded
+        # newlines as command separators. Extend the heuristic to detect
+        # q{...} and operate on the inner command text regardless of the
+        # surrounding quoting delimiter.
+        if ($perl_result =~ /my\s+\$([A-Za-z0-9_]+)\s*=\s*(?:(['"])(.*?)\2|q\{(.*?)\})/s) {
+            my ($var, $q, $cmdstr1, $cmdstr2) = ($1, $2, $3, $4);
+            my $cmdstr = defined $cmdstr1 ? $cmdstr1 : $cmdstr2;
+            if (defined $cmdstr && $cmdstr =~ /\becho\s+([^|]*?)\s*\|/s) {
+                my $arg = $1;
+                # If the echo argument contains an actual newline and is not
+                # already single-quoted, wrap it in single quotes so the
+                # shell treats the embedded newlines as part of the argument
+                # instead of command separators.
+                if ($arg =~ /\n/ && $arg !~ /^\s*'/s) {
+                    my $escaped = $arg;
+                    # Escape single quotes for a shell single-quoted string: ' -> '\''
+                    $escaped =~ s/'/'\\''/g;
+                    my $new_arg = "'" . $escaped . "'";
+                    my $quoted_arg_re = quotemeta($arg);
+                    my $new_cmdstr = $cmdstr;
+                    $new_cmdstr =~ s/\becho\s+$quoted_arg_re(\s*\|)/echo $new_arg$1/s;
+
+                    # Replace the inner command string in the debashc result.
+                    # Using quotemeta on the original inner text is the most
+                    # robust way to swap just the command contents regardless
+                    # of whether it was quoted with ' " or q{ }.
+                    $perl_result =~ s/\Q$cmdstr\E/$new_cmdstr/s;
+                }
+            }
+        }
+        # Normalize common English.pm variable names in backtick-generated
+        # snippets so they behave correctly even when the snippet is
+        # inserted into a file that does not 'use English'. Debashc often
+        # emits readable names (e.g. $INPUT_RECORD_SEPARATOR, $OS_ERROR)
+        # which won't affect the core variables ($/, $!) without
+        # 'use English'. Replace them here for the inline backtick cases.
+        $perl_result =~ s/\$INPUT_RECORD_SEPARATOR\b/\$\//g;  # $INPUT_RECORD_SEPARATOR -> $/
+        $perl_result =~ s/\$OS_ERROR\b/\$!/g;                 # $OS_ERROR -> $!
+        $perl_result =~ s/\$ERRNO\b/\$!/g;                   # $ERRNO -> $!
+        $perl_result =~ s/\$CHILD_ERROR\b(?!\s*=)/\$\?/g;   # $CHILD_ERROR -> $? (contextual)
+        $perl_result =~ s/\$EVAL_ERROR\b/\$\@/g;            # $EVAL_ERROR -> $@
+
         print "DEBUG: Got perl result for backtick: [$perl_result]\n" if $verbose;
         return defined $var_name ? "$prefix$var_name = $perl_result;" : $perl_result;
     } else {
@@ -343,27 +467,201 @@ sub reconstruct_shell_command_from_system_call {
     for my $token (@{$tokens}) {
         next if $token->content eq ',';
 
-        my $part = $token->content;
-        if ($token->isa('PPI::Token::Quote')) {
-            # Keep the original escape text but drop the surrounding quotes.
-            $part =~ s/^['"]//;
-            $part =~ s/['"]$//;
-        }
-
-        push @parts, $part;
+        # Preserve the original token text. For quoted tokens keep the
+        # surrounding quotes so that when we reconstruct a multi-argument
+        # system() call into a shell command we retain the original
+        # quoting semantics (important for arguments that contain spaces
+        # or special characters). Commas are skipped above.
+        my $part_text = $token->content;
+        push @parts, $part_text;
     }
 
     return unless @parts;
 
     # A single-argument system() call is already a shell command string.
     # Preserve it verbatim so debashc can see the original shell syntax.
-    return $parts[0] if @parts == 1;
+    if (@parts == 1) {
+        my $single = $parts[0];
+        # Drop surrounding quotes for the single-argument case so the
+        # debashc invokation receives the raw command text.
+        $single =~ s/^['"]//;
+        $single =~ s/['"]$//;
+        return $single;
+    }
 
-    # List-form system() should keep arguments literal, so quote every part.
-    # This preserves tokens like | as data instead of shell operators.
-    my @rendered_parts = map { _shell_quote_for_system($_) } @parts;
+    # For multi-argument (list-form) system() calls, reconstruct a
+    # reasonable shell command by joining the token pieces with spaces.
+    # Preserve any original quoting on tokens; for bare words, apply
+    # shell-quoting heuristics so that arguments with spaces are kept as
+    # single shell arguments. This allows debashc to convert common
+    # list-form system(...) usages into equivalent Perl logic.
+    my @reconstructed;
+    for my $p (@parts) {
+        # Normalize tokens by removing outer quotes (if any) and then
+        # re-quoting via our shell-quoting helper. Preserving the original
+        # surrounding quotes here caused embedded quote characters to be
+        # passed through into the debashc input which in some cases
+        # (e.g. system("rm", "-rf", "dir")) led debashc to misinterpret
+        # option tokens like "-rf" as separate filenames. Stripping outer
+        # quotes and re-applying controlled quoting keeps semantics while
+        # avoiding that confusion.
+        my $clean = $p;
+        if ($clean =~ /^(['"])(.*)\1$/s) {
+            $clean = $2;
+        }
+        push @reconstructed, _shell_quote_for_system($clean);
+    }
 
-    return join(' ', @rendered_parts);
+    return join(' ', @reconstructed);
+}
+
+
+sub get_system_call_tokens {
+    my ($system_call) = @_;
+    my $args = $system_call->find('PPI::Structure::List');
+    return unless $args && @{$args};
+
+    my $arg_list = $args->[0];
+    my $tokens = $arg_list->find(sub {
+        my ($top, $node) = @_;
+        return $node->isa('PPI::Token::Quote')
+            || $node->isa('PPI::Token::Word')
+            || $node->isa('PPI::Token::Number')
+            || $node->isa('PPI::Token::Symbol');
+    });
+
+    return unless $tokens && @{$tokens};
+
+    my @parts;
+    for my $token (@{$tokens}) {
+        next if $token->content eq ',';
+
+        my $quote_type = 'bare';
+        my $text = $token->content;
+
+        # For quoted tokens prefer using PPI helpers to extract the inner
+        # string without surrounding quotes. Also record whether the
+        # original token was single- or double-quoted so we can preserve
+        # interpolation semantics when generating Perl literals later.
+        if ($token->isa('PPI::Token::Quote::Single')) {
+            $quote_type = 'single';
+            $text = $token->string;
+        } elsif ($token->isa('PPI::Token::Quote::Double') || $token->isa('PPI::Token::Quote::Interpolate')) {
+            $quote_type = 'double';
+            $text = $token->string;
+        } elsif ($token->isa('PPI::Token::Quote')) {
+            # Fallback for other quote forms (q{}, qq{}, etc.) - use
+            # the string() value and conservatively treat qq-like forms
+            # as double-quoted when the content implies interpolation.
+            $text = $token->string;
+            if ($token->content =~ /^qq/ || $token->content =~ /\$/) {
+                $quote_type = 'double';
+            } else {
+                $quote_type = 'single';
+            }
+        } else {
+            # Word, Number, Symbol -> keep as bare
+            $quote_type = 'bare';
+            $text = $token->content;
+        }
+
+        push @parts, [ $text, $quote_type ];
+    }
+
+    return @parts;
+}
+
+
+sub generate_exec_do_block {
+    my ($tokens_ref) = @_;
+    my @tokens = @{$tokens_ref};
+    # Build a Perl-friendly list of quoted argv elements. Each token is an
+    # arrayref [ text, quote_type ] where quote_type is 'single', 'double',
+    # or 'bare'. Preserve the original quoting semantics by preferring the
+    # same kind of Perl literal when possible.
+    my @perl_args;
+    for my $t (@tokens) {
+        my ($txt, $q) = ref($t) eq 'ARRAY' ? @{$t} : ($t, 'bare');
+        push @perl_args, _perl_quote_literal_with_pref($txt, $q);
+    }
+
+    # Debug: show the tokens and their perl-quoted forms when verbose
+    if ($verbose) {
+        my $raw = join(', ', map { ref($_) eq 'ARRAY' ? "'" . $_->[0] . "'" : "'" . $_ . "'" } @tokens);
+        my $quoted = join(', ', @perl_args);
+        print "DEBUG: generate_exec_do_block - raw tokens: [$raw]\n";
+        print "DEBUG: generate_exec_do_block - perl-quoted tokens: [$quoted]\n";
+    }
+
+    # The generated block forks and execs the given command. This preserves
+    # list-form system() semantics (no shell interpretation) while producing
+    # a self-contained do{ ... } block we can splice into the PPI tree.
+    my $first = shift @tokens; # program name
+    my ($exe, $exe_q) = ref($first) eq 'ARRAY' ? @{$first} : ($first, 'bare');
+    my $exe_quoted = _perl_quote_literal_with_pref($exe, $exe_q);
+
+    my $args_list = join(', ', @perl_args[1..$#perl_args]);
+    # Build the exec block as a string with literal Perl variables ($pid, $!)
+    my $block = 'my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec (' . $exe_quoted;
+    if (length $args_list) {
+        $block .= ', ' . $args_list;
+    }
+    $block .= '); die "exec failed: " . $!; } else { waitpid($pid, 0); }';
+
+    # Return the generated code as a simple statement sequence so
+    # replace_system_call_with_code can insert it cleanly.
+    return $block . "\n";
+}
+
+
+sub _perl_quote_literal_with_pref {
+    my ($text, $pref) = @_;
+    # If preference is double, force a double-quoted Perl literal so Perl
+    # interpolation behavior matches the original source. If preference is
+    # single, use single-quoted literal. For bare tokens, fall back to the
+    # default heuristic.
+    if (defined $pref && $pref eq 'double') {
+        my $escaped = $text;
+        $escaped =~ s/\\/\\\\/g;    # escape backslashes
+        $escaped =~ s/"/\\"/g;        # escape double quotes
+        $escaped =~ s/\n/\\n/g;
+        $escaped =~ s/\r/\\r/g;
+        $escaped =~ s/\t/\\t/g;
+        return "\"$escaped\"";
+    }
+    if (defined $pref && $pref eq 'single') {
+        my $t = $text;
+        $t =~ s/'/'"'"'/g;
+        return "'$t'";
+    }
+
+    return _perl_quote_literal($text);
+}
+
+
+sub _perl_quote_literal {
+    my ($text) = @_;
+    return "''" unless defined $text && length $text;
+    # Prefer double-quoted Perl literals only when the text contains
+    # characters that cannot sensibly be represented in a single-quoted
+    # literal (newlines, double quotes, backslashes, or control chars).
+    # Do NOT treat "$" or "@" as a reason to double-quote because
+    # these are commonly present in shell snippets (awk/sed programs)
+    # and must be preserved verbatim when embedded in the generated Perl
+    # code (we don't want Perl to interpolate them).
+    if ($text =~ /[\n\r\t"\\]/ ) {
+        my $escaped = $text;
+        $escaped =~ s/\\/\\\\/g;    # escape backslashes
+        $escaped =~ s/"/\\"/g;        # escape double quotes
+        $escaped =~ s/\n/\\n/g;
+        $escaped =~ s/\r/\\r/g;
+        $escaped =~ s/\t/\\t/g;
+        return "\"$escaped\"";
+    }
+
+    # Fallback: use single-quoted literal and escape single quotes inside
+    $text =~ s/'/'"'"'/g; # escape single quotes for single-quoted string
+    return "'$text'";
 }
 
 sub _shell_quote_for_system {
@@ -435,14 +733,73 @@ sub replace_system_call_with_code {
     return unless $statement->isa('PPI::Statement');
     
     # Wrap the generated code so it stays a single statement in the original tree.
+    # Use set_content on the existing statement which is more robust than
+    # parsing the replacement into a separate PPI::Document and cloning
+    # individual child nodes. Some replacement snippets can confuse the
+    # child(0) selection and lead to partially-applied replacements which
+    # produce invalid Perl (unbalanced braces/parentheses). Setting the
+    # full statement content directly keeps the replacement atomic.
     my $wrapped_code = "do {\n$replacement_code\n};";
-    my $replacement_doc = PPI::Document->new(\$wrapped_code);
-    return unless $replacement_doc;
+    # Attempt to atomically set the statement content if supported. This
+    # is the simplest and safest approach because PPI will reparse the
+    # statement content in-place, avoiding partial-clone issues seen when
+    # parsing into a separate document and extracting child(0).
+    if ($statement->can('set_content')) {
+        print "DEBUG: Attempting set_content replacement; replacement length=" . length($wrapped_code) . "\n" if $verbose;
+        eval {
+            $statement->set_content($wrapped_code);
+            1;
+        } or do {
+            # If set_content dies for any reason, fall back to the
+            # multi-statement insertion approach below which is more
+            # explicit about cloning all top-level statements from the
+            # parsed replacement document.
+            warn "DEBUG: set_content failed, falling back to explicit insertion: $@\n" if $verbose;
+            goto FALLBACK_INSERT;
+        };
+    } else {
+        FALLBACK_INSERT: {
+            print "DEBUG: Falling back to explicit insertion; replacement length=" . length($wrapped_code) . "\n" if $verbose;
+            # Parse the wrapped replacement into a document and insert all
+            # top-level statements after the original statement. We insert
+            # in reverse order so the final order in the tree matches the
+            # replacement document.
+            my $replacement_doc = PPI::Document->new(\$wrapped_code);
+            return unless $replacement_doc;
 
-    my $replacement_stmt = $replacement_doc->child(0);
-    return unless $replacement_stmt;
+            # Collect top-level statements from the replacement document
+            my $found_stmts = $replacement_doc->find('PPI::Statement');
+            my @stmts = $found_stmts ? grep { $_->parent && $_->parent->isa('PPI::Document') } @{$found_stmts} : ();
 
-    $statement->replace($replacement_stmt->clone);
+            print "DEBUG: Parsed replacement document contains " . scalar(@stmts) . " top-level statements\n" if $verbose;
+            if ($verbose && @stmts) {
+                my $first = $stmts[0]->content;
+                my $last = $stmts[-1]->content;
+                print "DEBUG: First stmt preview: " . substr($first,0,200) . "\n";
+                print "DEBUG: Last stmt preview: " . substr($last,0,200) . "\n";
+            }
+
+            # If there are no top-level statements, fall back to child(0)
+            # replacement to preserve previous behavior.
+            unless (@stmts) {
+                my $replacement_stmt = $replacement_doc->child(0);
+                return unless $replacement_stmt;
+                $statement->replace($replacement_stmt->clone);
+                return;
+            }
+
+            # Insert clones after the original statement in reverse order
+            # to maintain ordering. Use insert_after on the statement node.
+            for my $stmt (reverse @stmts) {
+                my $clone = $stmt->clone;
+                $statement->insert_after($clone);
+            }
+
+            # Remove the original statement now that the replacements are
+            # in place.
+            $statement->remove;
+        }
+    }
 }
 
 sub replace_backtick_with_code {
@@ -652,7 +1009,33 @@ sub extract_core_perl_logic_ppi {
         push @filtered_statements, $content;
     }
 
-    return @filtered_statements ? join("\n", @filtered_statements) . "\n" : $core_code;
+    my $out = @filtered_statements ? join("\n", @filtered_statements) . "\n" : $core_code;
+
+    # Normalize common English.pm variable names to their punctuation
+    # equivalents so the replacement snippet behaves correctly even when
+    # we splice it into the original file without adding a top-level
+    # "use English". This avoids relying on English.pm being present
+    # and fixes cases where debashc emitted readable names like
+    # $INPUT_RECORD_SEPARATOR or $OS_ERROR which would otherwise not
+    # affect the usual variables ($/ or $!) and cause subtle bugs
+    # (for example, reading a file into a scalar via local $/ = undef).
+    $out =~ s/\$INPUT_RECORD_SEPARATOR\b/\$\//g;  # $INPUT_RECORD_SEPARATOR -> $/
+    $out =~ s/\$OS_ERROR\b/\$!/g;                 # $OS_ERROR -> $!
+    $out =~ s/\$ERRNO\b/\$!/g;                   # $ERRNO -> $!
+    # Avoid replacing $CHILD_ERROR when it's the target of an assignment
+    # (e.g. "$CHILD_ERROR = $? >> 8;"). Only replace usages that are
+    # not immediately followed by an '=' so we don't produce constructs
+    # like "$? = $? >> 8;" which are incorrect.
+    $out =~ s/\$CHILD_ERROR\b(?!\s*=)/\$\?/g;    # $CHILD_ERROR -> $? (contextual)
+    $out =~ s/\$EVAL_ERROR\b/\$\@/g;            # $EVAL_ERROR -> $@
+
+    # Replace Carp helpers with fully-qualified names so we don't rely on
+    # 'use Carp;' being present when the snippet is spliced into the
+    # original file. Avoid touching occurrences like $croak by ensuring
+    # the name is not preceded by a dollar sign.
+    $out =~ s/(?<!\$)\b(croak|confess)\b/Carp::$1/g;
+
+    return $out;
 }
 
 __END__

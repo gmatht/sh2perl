@@ -43,10 +43,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         Command::Pipeline(pipeline) => generator.word_to_perl(
                             &Word::CommandSubstitution(Box::new(Command::Pipeline(pipeline)), None),
                         ),
-                        other => generator.word_to_perl(&Word::CommandSubstitution(Box::new(other), None)),
+                        other => generator
+                            .word_to_perl(&Word::CommandSubstitution(Box::new(other), None)),
                     };
                 }
-                let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+                let command_lit =
+                    generator.perl_string_literal_no_interp(&Word::literal(command_str));
                 format!(
                     "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
                     command_lit
@@ -56,8 +58,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
             } else if Regex::new(r"^\d+(?:\s*,\s*\d+)+$").unwrap().is_match(s) {
                 generator.handle_comma_expansion(s)
             } else {
-                // For literal strings, quote them to avoid bareword errors
-                format!("\"{}\"", s.replace("\"", "\\\""))
+                // For literal strings, delegate to the central Perl string literal
+                // helper so quoting/escaping rules are consistent and we avoid
+                // accidental Perl interpolation of shell snippets (like awk/sed)
+                // which may contain "$" or "@". Using generator.perl_string_literal
+                // ensures single-quoting is used when safe.
+                generator.perl_string_literal(&Word::literal(s.clone()))
             }
         }
         Word::ParameterExpansion(pe, _) => generator.generate_parameter_expansion(pe),
@@ -84,7 +90,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 Command::Redirect(_) => {
                     let command_str =
                         crate::generator::redirects::generate_bash_command_string(cmd);
-                    let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+                    let command_lit =
+                        generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
                     format!(
                         "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
@@ -121,12 +128,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "head" {
                             // Use the shell command directly so file and flag handling stays faithful
                             let head_cmd = generator.generate_command_string_for_system(cmd);
-                            let head_lit = generator.perl_string_literal(&Word::literal(head_cmd));
+                            let head_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(head_cmd));
                             format!("do {{ my $head_cmd = {}; qx{{$head_cmd}}; }}", head_lit)
                         } else if name == "tail" {
                             // Use the shell command directly so file and flag handling stays faithful
                             let tail_cmd = generator.generate_command_string_for_system(cmd);
-                            let tail_lit = generator.perl_string_literal(&Word::literal(tail_cmd));
+                            let tail_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(tail_cmd));
                             format!("do {{ my $tail_cmd = {}; qx{{$tail_cmd}}; }}", tail_lit)
                         } else if name == "cat" {
                             crate::generator::commands::cat::generate_cat_command_for_substitution(
@@ -265,9 +274,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "comm" {
                             // Special handling for comm command with process substitution
                             // Check if this command has process substitution redirects
-                            eprintln!(
-                                "DEBUG: comm command detected, checking for process substitution"
-                            );
+
                             let mut has_process_sub = false;
                             for redirect in &simple_cmd.redirects {
                                 if matches!(
@@ -275,15 +282,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     crate::ast::RedirectOperator::ProcessSubstitutionInput(_)
                                 ) {
                                     has_process_sub = true;
-                                    eprintln!(
-                                        "DEBUG: comm command has process substitution redirects"
-                                    );
+
                                     break;
                                 }
                             }
 
                             if has_process_sub {
-                                eprintln!("DEBUG: Using builtin comm command generator for process substitution");
                                 // Handle comm command with process substitution like paste command
                                 let mut process_sub_code = String::new();
                                 let mut process_sub_files = Vec::new();
@@ -344,7 +348,6 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     );
                                 format!("do {{ {} {} }}", process_sub_code, comm_output)
                             } else {
-                                eprintln!("DEBUG: comm command has no process substitution, using dedicated implementation");
                                 // Regular comm command without process substitution - use dedicated implementation
                                 let comm_output =
                                     crate::generator::commands::comm::generate_comm_command(
@@ -357,7 +360,6 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             }
                         } else if name == "diff" {
                             // Special handling for diff command in command substitution
-                            eprintln!("DEBUG: Processing diff command in command substitution with args: {:?}", simple_cmd.args);
 
                             // Use the dedicated diff command implementation
                             let diff_output =
@@ -371,7 +373,6 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             format!("do {{ {} }}", diff_output)
                         } else if name == "xargs" {
                             // Special handling for xargs command in command substitution
-                            eprintln!("DEBUG: Processing xargs command in command substitution with args: {:?}", simple_cmd.args);
 
                             // Use the dedicated xargs command generator
                             let unique_id = generator.get_unique_id();
@@ -381,7 +382,6 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             format!("do {{ my $input_data = q{{}}; {} }}", xargs_output)
                         } else if name == "tr" {
                             // Special handling for tr command in command substitution
-                            eprintln!("DEBUG: Processing tr command in command substitution with args: {:?}", simple_cmd.args);
 
                             // Check if this tr command has here string redirects
                             let has_here_string = simple_cmd
@@ -411,7 +411,6 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             format!("do {{ {} {} }}", input_data, tr_output)
                         } else if name == "perl" {
                             // Special handling for perl in command substitution - use native Perl instead of open3
-                            eprintln!("DEBUG: Processing perl command in command substitution with args: {:?}", simple_cmd.args);
 
                             if simple_cmd.args.len() >= 2 {
                                 if let (Word::Literal(flag, _), Word::Literal(code, _)) =
@@ -544,13 +543,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             }
                         } else if name == "sha256sum" {
                             // Use the sha256sum command handler for proper conversion
-                            eprintln!("DEBUG: words.rs - Using native sha256sum implementation for command substitution");
+
                             crate::generator::commands::sha256sum::generate_sha256sum_command(
                                 generator, simple_cmd, "",
                             )
                         } else if name == "sha512sum" {
                             // Use the sha512sum command handler for proper conversion
-                            eprintln!("DEBUG: words.rs - Using native sha512sum implementation for command substitution");
+
                             crate::generator::commands::sha512sum::generate_sha512sum_command(
                                 generator, simple_cmd, "",
                             )
@@ -655,12 +654,18 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             "do { use Cwd; getcwd(); }".to_string()
                         } else if name == "basename" {
                             // Run basename via the host command so output and edge cases match.
-                            let basename_cmd = generator.generate_command_string_for_system(&Command::Simple(simple_cmd.clone()));
-                            let basename_lit = generator.perl_string_literal(&Word::literal(basename_cmd));
+                            let basename_cmd = generator.generate_command_string_for_system(
+                                &Command::Simple(simple_cmd.clone()),
+                            );
+                            let basename_lit =
+                                generator.perl_string_literal(&Word::literal(basename_cmd));
                             format!("do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}", basename_lit)
                         } else if name == "dirname" {
-                            let dirname_cmd = generator.generate_command_string_for_system(&Command::Simple(simple_cmd.clone()));
-                            let dirname_lit = generator.perl_string_literal(&Word::literal(dirname_cmd));
+                            let dirname_cmd = generator.generate_command_string_for_system(
+                                &Command::Simple(simple_cmd.clone()),
+                            );
+                            let dirname_lit =
+                                generator.perl_string_literal(&Word::literal(dirname_cmd));
                             format!("do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}", dirname_lit)
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
@@ -758,7 +763,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             }
                         } else if name == "cp" {
                             // Use native Perl cp implementation for command substitution
-                            eprintln!("DEBUG: words.rs - Using native cp implementation for command substitution");
+
                             // Generate cp code - need to preserve relative indentation
                             let cp_code = crate::generator::commands::cp::generate_cp_command(
                                 generator, simple_cmd,
@@ -816,7 +821,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "mv" {
                             // Use native Perl mv implementation for command substitution
-                            eprintln!("DEBUG: words.rs - Using native mv implementation for command substitution");
+
                             let mv_code = crate::generator::commands::mv::generate_mv_command(
                                 generator, simple_cmd,
                             );
@@ -857,7 +862,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "rm" {
                             // Use native Perl rm implementation for command substitution
-                            eprintln!("DEBUG: words.rs - Using native rm implementation for command substitution");
+
                             let rm_code = crate::generator::commands::rm::generate_rm_command(
                                 generator, simple_cmd,
                             );
@@ -898,7 +903,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "mkdir" {
                             // Use native Perl mkdir implementation for command substitution
-                            eprintln!("DEBUG: words.rs - Using native mkdir implementation for command substitution");
+
                             let mkdir_code =
                                 crate::generator::commands::mkdir::generate_mkdir_command(
                                     generator, simple_cmd,
@@ -935,7 +940,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "touch" {
                             // Use native Perl touch implementation for command substitution
-                            eprintln!("DEBUG: words.rs - Using native touch implementation for command substitution");
+
                             let touch_code =
                                 crate::generator::commands::touch::generate_touch_command(
                                     generator, simple_cmd,
@@ -1044,8 +1049,19 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 Command::Pipeline(pipeline) => {
                     // For command substitution pipelines, keep the shell pipeline intact
                     // but emit it through qx{} so the purified script does not contain backticks.
-                    let pipeline_cmd = generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
-                    let pipeline_lit = generator.perl_string_literal(&Word::literal(pipeline_cmd));
+                    let pipeline_cmd = generator
+                        .generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
+                    // Debug: print the raw pipeline command and the Perl literal that will be
+                    // embedded into the generated source. This helps diagnose quoting/escaping
+                    // issues where Perl interpolation or escape sequences change the runtime
+                    // shell command semantics.
+                    // Ensure we emit a non-interpolating Perl literal for the
+                    // shell pipeline string so Perl does not interpret "$" or
+                    // turn "\\n" sequences into real newlines at compile-time.
+                    // Using a non-interpolating literal preserves the exact
+                    // shell command text that will be passed to qx{}.
+                    let pipeline_lit = generator
+                        .perl_string_literal_no_interp(&Word::literal(pipeline_cmd.clone()));
                     format!(
                         "do {{ my $pipeline_cmd = {}; my $result = qx{{$pipeline_cmd}}; $CHILD_ERROR = $? >> 8; $result; }}",
                         pipeline_lit
@@ -1094,7 +1110,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 _ => {
                     // For other command types, execute the real shell command so
                     // control operators and redirections keep working.
-                    let command_str = crate::generator::redirects::generate_bash_command_string(cmd);
+                    let command_str =
+                        crate::generator::redirects::generate_bash_command_string(cmd);
                     let command_lit = generator.perl_string_literal(&Word::literal(command_str));
                     format!(
                         "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",

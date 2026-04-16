@@ -95,7 +95,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 output.push_str(&format!("}}\n"));
             } else {
                 let cmd_str = generate_bash_command_string(cmd);
-                let cmd_literal = generator.perl_string_literal(&Word::literal(cmd_str));
+                let cmd_literal = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                 output.push_str(&format!(
                     "my ($in, $out, $err);
 my $pid = open3($in, $out, $err, 'bash', '-c', {});

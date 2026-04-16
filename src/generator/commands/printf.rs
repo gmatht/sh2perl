@@ -16,13 +16,72 @@ pub fn generate_printf_command(
 
     for (i, arg) in cmd.args.iter().enumerate() {
         if i == 0 {
-            // First argument is the format string
-            format_string = generator.word_to_perl(arg);
-            // Remove quotes if they exist around the format string
-            if format_string.starts_with('\'') && format_string.ends_with('\'') {
-                format_string = format_string[1..format_string.len() - 1].to_string();
-            } else if format_string.starts_with('"') && format_string.ends_with('"') {
-                format_string = format_string[1..format_string.len() - 1].to_string();
+            // First argument is the format string. Keep the Perl-quoted literal
+            // returned by word_to_perl then normalize doubled backslashes
+            // (which were produced by perl_string_literal_impl) into single
+            // backslashes so sequences like "\\n" become "\n" in the
+            // generated Perl source and are interpreted as newlines at
+            // runtime.
+            // Obtain the raw Perl literal for the format string. If this is
+            // a quoted literal like '"..."' or '\'...\'', strip the outer
+            // quotes and decode common shell-style escape sequences so that
+            // perl_string_literal_impl will emit a single-escaped \n (not a
+            // double-escaped \\n) in the generated source.
+            // Decode common escapes (
+            // "\\n", "\\t", etc.) into actual characters so that
+            // perl_string_literal_impl will emit the correct single-escaped
+            // sequences in the generated Perl source. Prefer handling
+            // literal AST nodes directly so we decode only user-provided
+            // content.
+            // Use shared helper from utils to decode common shell-style escapes
+            // (\n, \t, \r, \\\) so the resulting string contains actual
+            // control characters before we re-quote it for Perl source.
+
+            match arg {
+                Word::Literal(s, _) => {
+                    // Strip outer shell quotes if present
+                    let mut raw = s.clone();
+                    // Debug prints removed: avoid polluting debashc stderr/stdout which
+                    // can end up embedded into the generated Perl output.
+                    if (raw.starts_with('"') && raw.ends_with('"'))
+                        || (raw.starts_with('\'') && raw.ends_with('\''))
+                    {
+                        raw = raw[1..raw.len() - 1].to_string();
+                    }
+                    let decoded = crate::generator::utils::decode_shell_escapes_impl(&raw);
+                    // decoded value computed above
+                    format_string = generator.perl_string_literal(&Word::literal(decoded));
+                    // final perl literal stored in format_string
+                }
+                Word::StringInterpolation(interp, _) => {
+                    let reconstructed = interp
+                        .parts
+                        .iter()
+                        .map(|part| match part {
+                            crate::ast::StringPart::Literal(s) => s.clone(),
+                            _ => "".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    // Decode common shell-style escapes in the reconstructed literal
+                    let decoded =
+                        crate::generator::utils::decode_shell_escapes_impl(&reconstructed);
+                    // decoded interpolation available in `decoded`
+                    format_string = generator.perl_string_literal(&Word::literal(decoded));
+                    // final perl literal for interpolation stored in format_string
+                }
+                _ => {
+                    // Fallback: use the generic word_to_perl path and attempt
+                    // to decode any surrounding quoting.
+                    let mut tmp = generator.word_to_perl(arg);
+                    if (tmp.starts_with('"') && tmp.ends_with('"'))
+                        || (tmp.starts_with('\'') && tmp.ends_with('\''))
+                    {
+                        tmp = tmp[1..tmp.len() - 1].to_string();
+                    }
+                    let decoded = crate::generator::utils::decode_shell_escapes_impl(&tmp);
+                    format_string = generator.perl_string_literal(&Word::literal(decoded));
+                }
             }
         } else {
             // Subsequent arguments are the values to format
@@ -61,7 +120,8 @@ pub fn generate_printf_command(
 
             // Generate Perl code to print array elements with the format
             output.push_str(&format!("foreach my $item (@{}) {{\n", array_var));
-            output.push_str(&format!("    printf(\"{}\", $item);\n", format_string));
+            // format_string already includes Perl quoting; emit it directly.
+            output.push_str(&format!("    printf({}, $item);\n", format_string));
             output.push_str("}\n");
         } else {
             // Regular printf with individual arguments
@@ -76,15 +136,18 @@ pub fn generate_printf_command(
                         "    open STDOUT, '>', \\${} or die \"Cannot redirect STDOUT\";\n",
                         var
                     ));
-                    output.push_str(&format!("    printf(\"{}\");\n", format_string));
+                    // format_string includes quoting; use it directly
+                    output.push_str(&format!("    printf({});\n", format_string));
                     output.push_str(&format!("}}\n"));
                 } else {
-                    output.push_str(&format!("printf(\"{}\");\n", format_string));
+                    // Emit printf using the Perl-quoted format string directly
+                    output.push_str(&format!("printf({});\n", format_string));
                 }
             } else {
                 // Build the printf call with format string and arguments properly separated
                 // For compatibility with broken printf system call behavior, convert numeric arguments to strings
-                let mut printf_call = format!("printf(\"{}\"", format_string);
+                // Start the printf call using the already-quoted format string
+                let mut printf_call = format!("printf({}", format_string);
                 for (_i, arg) in args.iter().enumerate() {
                     let raw_arg = arg.trim_matches(|c| c == '"' || c == '\'');
                     // Check if the argument is a numeric literal and if the corresponding format specifier is %c
