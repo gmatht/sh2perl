@@ -1,2 +1,21 @@
 # Ignore local build/test artifacts
 purify.out
+
+# Rust/Cargo build artifacts
+/target/
+
+# Test work directories and temporary outputs
+.test-work/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.out
+
+# Editor swap/backup files
+*~
+*.swp
+
+# IDE settings
+.idea/
+.vscode/
