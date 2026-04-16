@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/005_wc_basic.pl" }
 
 
 print "=== Example 005: Basic wc command ===\n";
@@ -14,7 +15,7 @@ close($fh);
 print "Using backticks to call wc:\n";
 my $wc_output = do {
 use IPC::Open3;
-my @wc_args_0 = ("test_wc.txt");
+my @wc_args_0 = ('test_wc.txt');
 my ($wc_in_0, $wc_out_0, $wc_err_0);
 my $wc_pid_0 = open3($wc_in_0, $wc_out_0, $wc_err_0, 'wc', @wc_args_0);
 close $wc_in_0 or die "Close failed: $!\n";
@@ -28,56 +29,29 @@ print $wc_output;
 
 print "\nwc -l (line count only):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use IPC::Open3;
-use IPC::Open3;
-my @wc_args_0 = ("-l", "test_wc.txt");
-my ($wc_in_0, $wc_out_0, $wc_err_0);
-my $wc_pid_0 = open3($wc_in_0, $wc_out_0, $wc_err_0, 'wc', @wc_args_0);
-close $wc_in_0 or die "Close failed: $!\n";
-my $wc_output_0 = do { local $/ = undef; <$wc_out_0> };
-close $wc_out_0 or die "Close failed: $!\n";
-waitpid $wc_pid_0, 0;
-print $wc_output_0;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-l", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "\nwc -w (word count only):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use IPC::Open3;
-use IPC::Open3;
-my @wc_args_0 = ("-w", "test_wc.txt");
-my ($wc_in_0, $wc_out_0, $wc_err_0);
-my $wc_pid_0 = open3($wc_in_0, $wc_out_0, $wc_err_0, 'wc', @wc_args_0);
-close $wc_in_0 or die "Close failed: $!\n";
-my $wc_output_0 = do { local $/ = undef; <$wc_out_0> };
-close $wc_out_0 or die "Close failed: $!\n";
-waitpid $wc_pid_0, 0;
-print $wc_output_0;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-w", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "\nwc -c (character count only):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use IPC::Open3;
-use IPC::Open3;
-my @wc_args_0 = ("-c", "test_wc.txt");
-my ($wc_in_0, $wc_out_0, $wc_err_0);
-my $wc_pid_0 = open3($wc_in_0, $wc_out_0, $wc_err_0, 'wc', @wc_args_0);
-close $wc_in_0 or die "Close failed: $!\n";
-my $wc_output_0 = do { local $/ = undef; <$wc_out_0> };
-close $wc_out_0 or die "Close failed: $!\n";
-waitpid $wc_pid_0, 0;
-print $wc_output_0;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-c", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "\nwc with multiple files:\n";
 my $multi_wc = do {
 use IPC::Open3;
-my @wc_args_0 = ("test_wc.txt", "test_wc.txt");
+my @wc_args_0 = ('test_wc.txt', 'test_wc.txt');
 my ($wc_in_0, $wc_out_0, $wc_err_0);
 my $wc_pid_0 = open3($wc_in_0, $wc_out_0, $wc_err_0, 'wc', @wc_args_0);
 close $wc_in_0 or die "Close failed: $!\n";
@@ -91,7 +65,6 @@ print $multi_wc;
 
 print "\nwc from stdin (echo | wc):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use IPC::Open3;
 {
     my $output_0;
@@ -124,7 +97,7 @@ if ( !($output_0 =~ m{\n\z}msx) ) { $output_0 .= "\n"; }
 print "\nwc -c (bytes):\n";
 my $bytes = do {
 use IPC::Open3;
-my @wc_args_0 = ("-c", "test_wc.txt");
+my @wc_args_0 = ('-c', 'test_wc.txt');
 my ($wc_in_0, $wc_out_0, $wc_err_0);
 my $wc_pid_0 = open3($wc_in_0, $wc_out_0, $wc_err_0, 'wc', @wc_args_0);
 close $wc_in_0 or die "Close failed: $!\n";
@@ -138,24 +111,15 @@ print $bytes;
 
 print "\nwc -L (maximum line length):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use IPC::Open3;
-use IPC::Open3;
-my @wc_args_0 = ("-L", "test_wc.txt");
-my ($wc_in_0, $wc_out_0, $wc_err_0);
-my $wc_pid_0 = open3($wc_in_0, $wc_out_0, $wc_err_0, 'wc', @wc_args_0);
-close $wc_in_0 or die "Close failed: $!\n";
-my $wc_output_0 = do { local $/ = undef; <$wc_out_0> };
-close $wc_out_0 or die "Close failed: $!\n";
-waitpid $wc_pid_0, 0;
-print $wc_output_0;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-L", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "\nwc -lwc (lines, words, characters):\n";
 my $all_wc = do {
 use IPC::Open3;
-my @wc_args_0 = ("-lwc", "test_wc.txt");
+my @wc_args_0 = ('-lwc', 'test_wc.txt');
 my ($wc_in_0, $wc_out_0, $wc_err_0);
 my $wc_pid_0 = open3($wc_in_0, $wc_out_0, $wc_err_0, 'wc', @wc_args_0);
 close $wc_in_0 or die "Close failed: $!\n";
@@ -169,17 +133,8 @@ print $all_wc;
 
 print "\nwc with totals on multiple files:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use IPC::Open3;
-use IPC::Open3;
-my @wc_args_0 = ("test_wc.txt", "test_wc.txt");
-my ($wc_in_0, $wc_out_0, $wc_err_0);
-my $wc_pid_0 = open3($wc_in_0, $wc_out_0, $wc_err_0, 'wc', @wc_args_0);
-close $wc_in_0 or die "Close failed: $!\n";
-my $wc_output_0 = do { local $/ = undef; <$wc_out_0> };
-close $wc_out_0 or die "Close failed: $!\n";
-waitpid $wc_pid_0, 0;
-print $wc_output_0;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "test_wc.txt", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 

@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/027_basename_basic.pl" }
 
 
 print "=== Example 027: Basic basename command ===\n";
@@ -28,7 +29,7 @@ print "\nbasename with zero suffix (-s ''):\n";
 do {
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use File::Basename;
-my $basename_cmd = 'basename -s \'\' /path/to/file.txt';
+my $basename_cmd = q{basename -s '' /path/to/file.txt};
 my $basename_output = qx{$basename_cmd};
 $CHILD_ERROR = $? >> 8;
 print $basename_output;
@@ -76,7 +77,7 @@ print "\nbasename with empty string:\n";
 do {
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use File::Basename;
-my $basename_cmd = 'basename \'\'';
+my $basename_cmd = q{basename ''};
 my $basename_output = qx{$basename_cmd};
 $CHILD_ERROR = $? >> 8;
 print $basename_output;

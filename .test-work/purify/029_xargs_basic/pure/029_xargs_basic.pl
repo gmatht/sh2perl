@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/029_xargs_basic.pl" }
 
 
 use strict;

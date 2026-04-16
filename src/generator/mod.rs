@@ -451,6 +451,10 @@ impl Generator {
         utils::perl_string_literal_impl(self, word)
     }
 
+    pub fn perl_string_literal_no_interp(&mut self, word: &Word) -> String {
+        utils::perl_string_literal_no_interp_impl(self, word)
+    }
+
     pub fn strip_shell_quotes_and_convert_to_perl(&mut self, word: &Word) -> String {
         utils::strip_shell_quotes_and_convert_to_perl_impl(self, word)
     }

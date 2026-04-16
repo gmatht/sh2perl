@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/006_head_basic.pl" }
 
 
 print "=== Example 006: Basic head command ===\n";
@@ -16,9 +17,8 @@ print $head_output;
 
 print "\nhead -n 5 (first 5 lines):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-my $MAGIC_5 = 5;
-do { my $head_cmd = 'head -n 5 test_head.txt'; print qx{$head_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-n", "5", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -29,8 +29,8 @@ print $head3;
 
 print "\nhead -n 1 (first line only):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-do { my $head_cmd = 'head -n 1 test_head.txt'; print qx{$head_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-n", "1", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -41,9 +41,8 @@ print $head15;
 
 print "\nhead -c 50 (first 50 characters):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-my $MAGIC_50 = 50;
-do { my $head_cmd = 'head -c 50 test_head.txt'; print qx{$head_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-c", "50", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -54,16 +53,11 @@ print $head_bytes;
 
 print "\nhead from stdin (echo | head):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 {
     my $output_0;
     my $output_printed_0;
     my $pipeline_success_0 = 1;
-    $output_0 .= 'Line 1
-Line 2
-Line 3
-Line 4
-Line 5' . "\n";
+    $output_0 .= "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
 if ( !($output_0 =~ m{\n\z}msx) ) { $output_0 .= "\n"; }
 
         my $num_lines       = 3;
@@ -100,8 +94,8 @@ print $head_quiet;
 
 print "\nhead -v (verbose mode, with filename):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-do { my $head_cmd = 'head -v test_head.txt'; print qx{$head_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-v", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 

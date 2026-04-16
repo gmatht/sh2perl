@@ -457,12 +457,49 @@ pub fn generate_generic_builtin(
                     format!("${} = ${};\n", output_var, input_var)
                 }
             } else {
-                crate::generator::commands::cat::generate_cat_command(
-                    generator,
-                    cmd,
-                    &[],
-                    output_var,
-                )
+                // If any argument explicitly contains a pipe token, treat this as
+                // a shell pipeline invocation rather than as filenames to open.
+                let has_pipe = cmd.args.iter().any(|arg| match arg {
+                    Word::Literal(s, _) => s == "|",
+                    Word::StringInterpolation(interp, _) => {
+                        interp.parts.len() == 1
+                            && matches!(
+                                &interp.parts[0],
+                                StringPart::Literal(t) if t == "|"
+                            )
+                    }
+                    _ => false,
+                });
+
+                if has_pipe {
+                    // Generate the full command string and use qx{} to execute the
+                    // pipeline, matching how head/tail handle external commands.
+                    let command = Command::Simple(cmd.clone());
+                    let command_str = generator.generate_command_string_for_system(&command);
+                    // This literal will be used as the qx{} operand to execute the
+                    // pipeline at runtime. Emit a non-interpolating Perl literal so
+                    // embedded shell $-sequences and escape sequences are preserved.
+                    let command_lit =
+                        generator.perl_string_literal_no_interp(&Word::literal(command_str));
+                    if output_var.is_empty() {
+                        format!(
+                            "do {{ my $cat_cmd = {}; print qx{{$cat_cmd}}; }};\n",
+                            command_lit
+                        )
+                    } else {
+                        format!(
+                            "${} = do {{ my $cat_cmd = {}; qx{{$cat_cmd}}; }};\n",
+                            output_var, command_lit
+                        )
+                    }
+                } else {
+                    crate::generator::commands::cat::generate_cat_command(
+                        generator,
+                        cmd,
+                        &[],
+                        output_var,
+                    )
+                }
             }
         }
         "find" => {
@@ -498,7 +535,9 @@ pub fn generate_generic_builtin(
             if input_var.is_empty() {
                 let command = Command::Simple(cmd.clone());
                 let command_str = generator.generate_command_string_for_system(&command);
-                let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+                // Emit non-interpolating literal for qx{} usage
+                let command_lit =
+                    generator.perl_string_literal_no_interp(&Word::literal(command_str));
                 if output_var.is_empty() {
                     format!(
                         "do {{ my $head_cmd = {}; print qx{{$head_cmd}}; }};\n",
@@ -534,7 +573,9 @@ pub fn generate_generic_builtin(
             if input_var.is_empty() {
                 let command = Command::Simple(cmd.clone());
                 let command_str = generator.generate_command_string_for_system(&command);
-                let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+                // Emit non-interpolating literal for qx{} usage
+                let command_lit =
+                    generator.perl_string_literal_no_interp(&Word::literal(command_str));
                 if output_var.is_empty() {
                     format!(
                         "do {{ my $tail_cmd = {}; print qx{{$tail_cmd}}; }};\n",
@@ -701,10 +742,7 @@ pub fn generate_generic_builtin(
         "tee" => {
             // For now, use the existing signature but we should standardize this
             crate::generator::commands::tee::generate_tee_command(
-                generator,
-                cmd,
-                input_var,
-                output_var,
+                generator, cmd, input_var, output_var,
             )
         }
         "read" => {
@@ -774,22 +812,43 @@ fn generate_system_call_fallback(
         }
     }
 
-    let args: Vec<String> = cmd
+    // Preserve original string literal semantics when emitting Perl code by
+    // using generator.perl_string_literal for each literal argument. This
+    // ensures that arguments which originally used double-quote style (and
+    // therefore require interpolation at runtime) remain double-quoted in the
+    // generated Perl so interpolation happens when the purified script runs.
+    let args_perl: Vec<String> = cmd
         .args
         .iter()
         .filter_map(|arg| match arg {
-            Word::Literal(s, _) => Some(s.clone()),
+            Word::Literal(_, _) => Some(generator.perl_string_literal(arg)),
             _ => None,
         })
         .collect();
-    let args_str = args.join(" ");
+    let args_str = args_perl.join(", ");
 
     let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
     if input_var.is_empty() {
-        // First command in pipeline
-        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
+        // First command in pipeline - pass program name and args directly to open3
+        format!(
+            "\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
+            in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var
+        )
     } else {
-        // Subsequent command
-        format!("\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | {} {}');\nclose {} or croak 'Close failed: $OS_ERROR';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, input_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var)
+        // Subsequent command - build a full shell command string and pass it as
+        // the argument to bash -c so pipelines and quoting are preserved.
+        let command = Command::Simple(cmd.clone());
+        let mut command_str = generator.generate_command_string_for_system(&command);
+        // Prepend an echo of the input variable so the previous pipeline stage
+        // is piped into this command.
+        command_str = format!("echo \"${}\" | {}", input_var, command_str);
+        // This command string will be passed to bash -c in open3 at runtime.
+        // Use a non-interpolating Perl literal to ensure the shell program
+        // text is preserved exactly.
+        let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+        format!(
+            "\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
+            in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_lit, in_var, output_var, out_var, out_var, pid_var
+        )
     }
 }

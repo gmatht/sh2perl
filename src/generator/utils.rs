@@ -49,8 +49,18 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 return "q{}".to_string();
             }
 
-            // Use double quotes only when we need actual escape sequences in the Perl source.
-            if s.contains('\n') || s.contains('\t') || s.contains('\r') {
+            // Use double quotes when we need escape sequences (newlines,
+            // tabs, carriage returns) or when the string contains backslashes
+            // or embedded double quotes that must be escaped. Avoid forcing
+            // double-quoted strings simply because the content contains
+            // dollar or at-sign characters; those are often shell code or
+            // awk programs and should not be interpolated by Perl.
+            if s.contains('\n')
+                || s.contains('\t')
+                || s.contains('\r')
+                || s.contains('\\')
+                || s.contains('"')
+            {
                 let escaped = s
                     .replace("\\", "\\\\")
                     .replace("\"", "\\\"")
@@ -60,7 +70,6 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 format!("\"{}\"", escaped)
             } else {
                 // Use q{} for single characters to avoid "noisy quotes" violations
-                // Use single quotes for longer strings that don't need interpolation
                 if s.len() == 1 {
                     // Always use q{} for single characters to avoid Perl::Critic violations
                     format!("q{{{}}}", s)
@@ -239,12 +248,18 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             "do { use Cwd; getcwd(); }".to_string()
                         } else if name == "basename" {
                             // Run basename via the host command so output and edge cases match.
-                            let basename_cmd = generator.generate_command_string_for_system(&Command::Simple(simple_cmd.clone()));
-                            let basename_lit = generator.perl_string_literal(&Word::literal(basename_cmd));
+                            let basename_cmd = generator.generate_command_string_for_system(
+                                &Command::Simple(simple_cmd.clone()),
+                            );
+                            let basename_lit =
+                                generator.perl_string_literal(&Word::literal(basename_cmd));
                             format!("do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}", basename_lit)
                         } else if name == "dirname" {
-                            let dirname_cmd = generator.generate_command_string_for_system(&Command::Simple(simple_cmd.clone()));
-                            let dirname_lit = generator.perl_string_literal(&Word::literal(dirname_cmd));
+                            let dirname_cmd = generator.generate_command_string_for_system(
+                                &Command::Simple(simple_cmd.clone()),
+                            );
+                            let dirname_lit =
+                                generator.perl_string_literal(&Word::literal(dirname_cmd));
                             format!("do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}", dirname_lit)
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
@@ -340,11 +355,87 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     // For other command types, use system command fallback
                     let (in_var, out_var, err_var, pid_var, result_var) =
                         generator.get_unique_ipc_vars();
-                    format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd), in_var, result_var, out_var, out_var, pid_var, result_var)
+                    // Ensure the command string is embedded as a non-interpolating
+                    // Perl literal so embedded single quotes or "$" sequences
+                    // (e.g. awk programs containing $0) are preserved verbatim and
+                    // not interpreted by the generated Perl code.
+                    let cmd_str = generator.generate_command_string_for_system(cmd);
+                    let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+                    format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_lit, in_var, result_var, out_var, out_var, pid_var, result_var)
                 }
             }
         }
         _ => format!("{:?}", word),
+    }
+}
+
+/// Emit a Perl string literal that never interpolates (no "$" or "\\n" processing).
+/// This is used for shell snippets that will later be passed to qx{} so the
+/// exact byte-for-byte contents must be preserved.
+pub fn perl_string_literal_no_interp_impl(_generator: &mut Generator, word: &Word) -> String {
+    match word {
+        Word::Literal(s, _) => {
+            // Empty string -> q{} is compact and safe
+            if s.is_empty() {
+                return "q{}".to_string();
+            }
+
+            // Prefer a single-quoted literal when the content has no single
+            // quotes and is a simple one-line value. This keeps generated
+            // output readable. For strings that contain single quotes or
+            // embedded newlines prefer Perl's q{}-style non-interpolating
+            // operator which can contain single quotes and newlines safely.
+            let contains_single_quote = s.contains('\'');
+            let contains_newline = s.contains('\n');
+
+            if !contains_single_quote && !contains_newline {
+                // Escape backslashes and single quotes conservatively
+                let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
+                return format!("'{}'", escaped);
+            }
+
+            // Otherwise try a variety of delimiter pairs for q<delim>...<delim>
+            // Choose a pair where neither the open nor close delimiter appears
+            // in the content. This preserves the literal bytes (including newlines)
+            // without requiring interpolation or escape processing.
+            let delimiters = vec![
+                ('{', '}'),
+                ('(', ')'),
+                ('[', ']'),
+                ('<', '>'),
+                ('|', '|'),
+                ('/', '/'),
+                ('#', '#'),
+                ('%', '%'),
+                ('@', '@'),
+                ('!', '!'),
+                ('~', '~'),
+                ('^', '^'),
+                (':', ':'),
+                (';', ';'),
+            ];
+
+            for (open, close) in delimiters {
+                let open_s = open.to_string();
+                let close_s = close.to_string();
+                if !s.contains(&open_s) && !s.contains(&close_s) {
+                    return format!("q{}{}{}", open, s, close);
+                }
+            }
+
+            // If every candidate delimiter appears in the string (rare),
+            // fall back to a double-quoted literal with explicit escaping.
+            // Double-quoting is safe because we properly escape backslashes,
+            // quotes and control characters.
+            let escaped = s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t")
+                .replace("\r", "\\r");
+            format!("\"{}\"", escaped)
+        }
+        _ => perl_string_literal_impl(_generator, word),
     }
 }
 
@@ -369,11 +460,18 @@ pub fn strip_shell_quotes_and_convert_to_perl_impl(
                 return "q{}".to_string();
             }
 
-            // Check if string needs interpolation (contains variables or special chars)
-            let needs_interpolation =
-                stripped.contains('$') || stripped.contains('@') || stripped.contains('\\');
+            // Check if string needs escape processing for use in double-quoted
+            // Perl literals. We avoid treating '$' and '@' as a reason to force
+            // double-quoting because those characters commonly appear in shell
+            // fragments (awk/sed programs, etc.) and should not trigger Perl
+            // interpolation.
+            let needs_double_quoted = stripped.contains('\\')
+                || stripped.contains('\n')
+                || stripped.contains('\t')
+                || stripped.contains('\r')
+                || stripped.contains('"');
 
-            if needs_interpolation {
+            if needs_double_quoted {
                 // Escape quotes and backslashes for Perl string literals
                 let escaped = stripped
                     .replace("\\", "\\\\")
@@ -505,6 +603,36 @@ pub fn convert_escaped_metacharacters(pattern: &str) -> String {
         .replace("\\r", "\r")
         .replace("{", "\\{")
         .replace("}", "\\}")
+}
+
+/// Decode common shell-style escape sequences in a string literal.
+/// Converts sequences like "\\n", "\\t", "\\r", "\\\\",
+/// "\\\"" and "\\'" into their actual characters. Unknown escape
+/// sequences are replaced by the character following the backslash.
+pub fn decode_shell_escapes_impl(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                match n {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    '\'' => out.push('\''),
+                    other => out.push(other),
+                }
+            } else {
+                // Trailing backslash - preserve it
+                out.push('\\');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Generate a regex pattern for checking if string ends with newline

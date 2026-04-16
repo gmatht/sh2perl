@@ -158,9 +158,12 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     if use_shell_fallback {
         let command = Command::Simple(cmd.clone());
         let command_str = crate::generator::redirects::generate_bash_command_string(&command);
-        let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+        let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
-        return format!("do {{ my $touch_cmd = {}; qx{{$touch_cmd}}; }};\n", command_lit);
+        return format!(
+            "do {{ my $touch_cmd = {}; qx{{$touch_cmd}}; }};\n",
+            command_lit
+        );
     }
 
     if files.is_empty() {

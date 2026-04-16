@@ -11,7 +11,7 @@ pub fn generate_dirname_command(
     if !cmd.args.is_empty() {
         let command = Command::Simple(cmd.clone());
         let command_str = generator.generate_command_string_for_system(&command);
-        let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+        let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
         output.push_str(&format!("my $dirname_cmd = {};\n", command_lit));
         output.push_str("my $dirname_output = qx{$dirname_cmd};\n");

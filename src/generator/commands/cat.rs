@@ -2,12 +2,27 @@ use crate::ast::*;
 use crate::generator::Generator;
 
 fn cat_requires_shell(cmd: &SimpleCommand) -> bool {
+    // If any argument looks like a shell operator (pipe) or an option (-...),
+    // we must run via the shell instead of treating args as filenames.
     cmd.args.iter().any(|arg| match arg {
-        Word::Literal(text, _) => text.starts_with('-'),
+        Word::Literal(text, _) => {
+            // If the literal is exactly a pipe token or starts with an option dash,
+            // require shell execution.
+            if text == "|" {
+                true
+            } else {
+                text.starts_with('-')
+            }
+        }
         Word::StringInterpolation(interp, _) => {
+            // If it's a simple literal interpolation, inspect the literal value.
             if interp.parts.len() == 1 {
                 if let StringPart::Literal(text) = &interp.parts[0] {
-                    text.starts_with('-')
+                    if text == "|" {
+                        true
+                    } else {
+                        text.starts_with('-')
+                    }
                 } else {
                     true
                 }
@@ -29,7 +44,7 @@ pub fn generate_cat_command_for_substitution(
 
     if cat_requires_shell(cmd) {
         let cmd_str = generator.generate_command_string_for_system(&Command::Simple(cmd.clone()));
-        let cmd_lit = generator.perl_string_literal(&Word::literal(cmd_str));
+        let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
         return format!("do {{ my $cat_cmd = {}; qx{{$cat_cmd}}; }}", cmd_lit);
     }
 
@@ -70,7 +85,7 @@ pub fn generate_cat_command(
                 // Print the heredoc content directly
                 output.push_str(&format!(
                     "print {};\n",
-                    generator.perl_string_literal(&Word::literal(body.clone()))
+                    generator.perl_string_literal_no_interp(&Word::literal(body.clone()))
                 ));
             }
         }

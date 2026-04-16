@@ -1,4 +1,6 @@
+use Carp;
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/023_mv_basic.pl" }
 
 
 print "=== Example 023: Basic mv command ===\n";
@@ -10,63 +12,20 @@ print $fh "To demonstrate mv functionality\n";
 close($fh);
 
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Path qw(make_path);
-my $err;
-if ( !-d 'test_mv_dir' ) {
-    make_path( 'test_mv_dir', { error => \$err } );
-    if ( @{$err} ) {
-        croak "mkdir: cannot create directory " . 'test_mv_dir' . ": $err->[0]\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_mv_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "Using " . "sys" . "tem" . "() to call mv (move file):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Copy qw(copy move);
-my $err;
-my $force = 0;
-if ( -e 'test_mv_source.txt' ) {
-    my $dest = 'test_mv_dest.txt';
-    if ( -e $dest && -d $dest ) {
-        my $source_name = 'test_mv_source.txt';
-        $source_name =~ s{^.*[\/]}{};
-        $dest = "$dest/$source_name";
-    }
-    if ( -e $dest && !$force ) {
-        croak "mv: $dest: File exists (use -f to force overwrite)\n";
-    }
-    my $dest_dir = $dest;
-    $dest_dir =~ s/\/[^\/]*$//msx;
-    if ( $dest_dir eq $dest ) {
-        $dest_dir = q{};
-    }
-    if ( $dest_dir ne q{} && !-d $dest_dir ) {
-        my $err;
-        make_path( $dest_dir, { error => \$err } );
-        if ( @{$err} ) {
-            croak "mv: cannot create directory $dest_dir: $err->[0]\n";
-        }
-    }
-    if ( move( 'test_mv_source.txt', $dest ) ) {
-    } else {
-        croak
-  "mv: cannot move 'test_mv_source.txt' to $dest: $ERRNO\n";
-    }
-} else {
-    croak "mv: 'test_mv_source.txt': No such file or directory\n";
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "test_mv_source.txt", "test_mv_dest.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 if (-f "test_mv_dest.txt") {
     print "File moved successfully\n";
-    my $content = do { open my $fh, '<', 'test_mv_dest.txt' or die 'cat: ' . 'test_mv_dest.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; }
+    my $content = do { open my $fh, '<', 'test_mv_dest.txt' or die 'cat: ' . 'test_mv_dest.txt' . ': ' . $! . "\n"; local $/ = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $! . "\n"; $chunk; }
 ;
     print "Content: $content";
 } else {
@@ -75,43 +34,8 @@ if (-f "test_mv_dest.txt") {
 
 print "\nmv with verbose (-v):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Copy qw(copy move);
-my $err;
-my $force = 0;
-if ( -e 'test_mv_dest.txt' ) {
-    my $dest = 'test_mv_verbose.txt';
-    if ( -e $dest && -d $dest ) {
-        my $source_name = 'test_mv_dest.txt';
-        $source_name =~ s{^.*[\/]}{};
-        $dest = "$dest/$source_name";
-    }
-    if ( -e $dest && !$force ) {
-        croak "mv: $dest: File exists (use -f to force overwrite)\n";
-    }
-    my $dest_dir = $dest;
-    $dest_dir =~ s/\/[^\/]*$//msx;
-    if ( $dest_dir eq $dest ) {
-        $dest_dir = q{};
-    }
-    if ( $dest_dir ne q{} && !-d $dest_dir ) {
-        my $err;
-        make_path( $dest_dir, { error => \$err } );
-        if ( @{$err} ) {
-            croak "mv: cannot create directory $dest_dir: $err->[0]\n";
-        }
-    }
-    if ( move( 'test_mv_dest.txt', $dest ) ) {
-        print "renamed 'test_mv_dest.txt' -> '$dest'\n";
-    } else {
-        croak
-  "mv: cannot move 'test_mv_dest.txt' to $dest: $ERRNO\n";
-    }
-} else {
-    croak "mv: 'test_mv_dest.txt': No such file or directory\n";
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-v", "test_mv_dest.txt", "test_mv_verbose.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -146,7 +70,7 @@ my $mv_force = do {
                 if ( move( 'test_mv_verbose.txt', $dest ) ) {
                 } else {
                     croak
-              "mv: cannot move 'test_mv_verbose.txt' to $dest: $ERRNO\n";
+              "mv: cannot move 'test_mv_verbose.txt' to $dest: $!\n";
                 }
             } else {
                 croak "mv: 'test_mv_verbose.txt': No such file or directory\n";
@@ -166,13 +90,8 @@ if (-f "test_mv_force.txt") {
 
 print "\nmv with interactive (-i):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Copy qw(copy move);
-do {
-    my $mv_cmd = 'mv -i test_mv_force.txt test_mv_interactive.txt';
-    qx{$mv_cmd};
-};
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-i", "test_mv_force.txt", "test_mv_interactive.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -199,13 +118,8 @@ if (-f "test_mv_backup.txt") {
 
 print "\nmv with suffix (--suffix=.bak):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Copy qw(copy move);
-do {
-    my $mv_cmd = 'mv --suffix=.bak test_mv_backup.txt test_mv_suffix.txt';
-    qx{$mv_cmd};
-};
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "--suffix=.bak", "test_mv_backup.txt", "test_mv_suffix.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -232,13 +146,8 @@ if (-f "test_mv_no_target.txt") {
 
 print "\nmv with update (-u):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Copy qw(copy move);
-do {
-    my $mv_cmd = 'mv -u test_mv_no_target.txt test_mv_update.txt';
-    qx{$mv_cmd};
-};
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-u", "test_mv_no_target.txt", "test_mv_update.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -265,82 +174,20 @@ if (-f "test_mv_no_clobber.txt") {
 
 print "\nmv with strip trailing slashes (--strip-trailing-slashes):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Copy qw(copy move);
-my $err;
-my $force = 0;
-if ( -e 'test_mv_no_clobber.txt' ) {
-    my $dest = 'test_mv_strip.txt';
-    if ( -e $dest && -d $dest ) {
-        my $source_name = 'test_mv_no_clobber.txt';
-        $source_name =~ s{^.*[\/]}{};
-        $dest = "$dest/$source_name";
-    }
-    if ( -e $dest && !$force ) {
-        croak "mv: $dest: File exists (use -f to force overwrite)\n";
-    }
-    my $dest_dir = $dest;
-    $dest_dir =~ s/\/[^\/]*$//msx;
-    if ( $dest_dir eq $dest ) {
-        $dest_dir = q{};
-    }
-    if ( $dest_dir ne q{} && !-d $dest_dir ) {
-        my $err;
-        make_path( $dest_dir, { error => \$err } );
-        if ( @{$err} ) {
-            croak "mv: cannot create directory $dest_dir: $err->[0]\n";
-        }
-    }
-    if ( move( 'test_mv_no_clobber.txt', $dest ) ) {
-    } else {
-        croak
-  "mv: cannot move 'test_mv_no_clobber.txt' to $dest: $ERRNO\n";
-    }
-} else {
-    croak "mv: 'test_mv_no_clobber.txt': No such file or directory\n";
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "--strip-trailing-slashes", "test_mv_no_clobber.txt", "test_mv_strip.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "\nmv with multiple files:\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_mv_file1.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_mv_file1.txt";
-}
-else {
-    if ( open my $fh, '>', "test_mv_file1.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_mv_file1.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_mv_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_mv_file2.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_mv_file2.txt";
-}
-else {
-    if ( open my $fh, '>', "test_mv_file2.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_mv_file2.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_mv_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 my $mv_multi = do {
@@ -373,7 +220,7 @@ my $mv_multi = do {
                 if ( move( 'test_mv_file1.txt', $dest ) ) {
                 } else {
                     croak
-              "mv: cannot move 'test_mv_file1.txt' to $dest: $ERRNO\n";
+              "mv: cannot move 'test_mv_file1.txt' to $dest: $!\n";
                 }
             } else {
                 croak "mv: 'test_mv_file1.txt': No such file or directory\n";
@@ -403,7 +250,7 @@ my $mv_multi = do {
                 if ( move( 'test_mv_file2.txt', $dest ) ) {
                 } else {
                     croak
-              "mv: cannot move 'test_mv_file2.txt' to $dest: $ERRNO\n";
+              "mv: cannot move 'test_mv_file2.txt' to $dest: $!\n";
                 }
             } else {
                 croak "mv: 'test_mv_file2.txt': No such file or directory\n";
@@ -423,64 +270,21 @@ if (-f "test_mv_dir/test_mv_file1.txt" && -f "test_mv_dir/test_mv_file2.txt") {
 
 print "\nmv with preserve all (-a):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_mv_preserve.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_mv_preserve.txt";
-}
-else {
-    if ( open my $fh, '>', "test_mv_preserve.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_mv_preserve.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_mv_preserve.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Copy qw(copy move);
-do {
-    my $mv_cmd = 'mv -a test_mv_preserve.txt test_mv_preserve_dest.txt';
-    qx{$mv_cmd};
-};
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-a", "test_mv_preserve.txt", "test_mv_preserve_dest.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 unlink('test_mv_strip.txt') if -f 'test_mv_strip.txt';
 unlink('test_mv_preserve_dest.txt') if -f 'test_mv_preserve_dest.txt';
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "test_mv_dir" ) {
-    if ( -d "test_mv_dir" ) {
-        my $err;
-        remove_tree("test_mv_dir", {error => \$err});
-        if (@{$err}) {
-            carp "rm: carping: could not remove ", "test_mv_dir", ": $err->[0]\n";
-        }
-        else {
-            $main_exit_code = 0;
-        }
-    }
-    else {
-        if ( unlink "test_mv_dir" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            carp "rm: carping: could not remove ", "test_mv_dir",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mv_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 

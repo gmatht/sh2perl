@@ -99,7 +99,28 @@ pub fn generate_echo_command(
                                             .replace("\r", "\\r")
                                     )
                                 } else {
-                                    generator.perl_string_literal(arg)
+                                    // If this echo is being captured into an output variable
+                                    // (pipeline context), decode common shell-style escapes
+                                    // so that inlined output contains real newlines at runtime.
+                                    if !output_var.is_empty() {
+                                        // Reconstruct the literal and strip outer quotes
+                                        let mut raw = literal.clone();
+                                        if (raw.starts_with('"') && raw.ends_with('"'))
+                                            || (raw.starts_with('\'') && raw.ends_with('\''))
+                                        {
+                                            raw = raw[1..raw.len() - 1].to_string();
+                                        }
+                                        let decoded =
+                                            crate::generator::utils::decode_shell_escapes_impl(
+                                                &raw,
+                                            );
+                                        generator.perl_string_literal(&Word::literal(decoded))
+                                    } else {
+                                        // Use a non-interpolating Perl literal so embedded shell
+                                        // programs (awk/cut/paste pipelines, here-strings) are
+                                        // preserved exactly when echoed into pipelines.
+                                        generator.perl_string_literal_no_interp(arg)
+                                    }
                                 }
                             } else {
                                 generator.perl_string_literal(arg)
@@ -179,13 +200,7 @@ pub fn generate_echo_command(
                                 )
                             } else {
                                 // For multi-part string interpolation without -e flag, use the general string interpolation handler
-                                eprintln!(
-                                    "DEBUG: echo.rs - Processing StringInterpolation with {} parts",
-                                    interp.parts.len()
-                                );
-                                for (i, part) in interp.parts.iter().enumerate() {
-                                    eprintln!("DEBUG: echo.rs - Part {}: {:?}", i, part);
-                                }
+                                // multi-part string interpolation: fall through to generic handler
                                 generator.convert_string_interpolation_to_perl(interp)
                             }
                         }
@@ -195,7 +210,6 @@ pub fn generate_echo_command(
                         handle_brace_expansion_for_echo(generator, expansion)
                     }
                     Word::Literal(literal, _) => {
-                        eprintln!("DEBUG: echo.rs - Processing literal word: '{}'", literal);
                         if has_e_flag {
                             // If -e flag is present, interpret backslash escapes
                             let mut interpreted = literal.clone();
@@ -235,18 +249,45 @@ pub fn generate_echo_command(
                                 {
                                     generator.convert_string_interpolation_to_perl(&interp)
                                 } else {
-                                    let rendered = generator.perl_string_literal(arg);
-                                    rendered
-                                        .replace("\\\\n", "\n")
-                                        .replace("\\\\t", "\t")
-                                        .replace("\\\\r", "\r")
+                                    // If this echo is being captured into an output variable
+                                    // (pipeline context), decode common escapes so the inlined
+                                    // string has real newlines at runtime. Otherwise, keep
+                                    // non-interpolating literal to preserve shell fragments.
+                                    if !output_var.is_empty() {
+                                        let mut raw = literal.clone();
+                                        if (raw.starts_with('"') && raw.ends_with('"'))
+                                            || (raw.starts_with('\'') && raw.ends_with('\''))
+                                        {
+                                            raw = raw[1..raw.len() - 1].to_string();
+                                        }
+                                        let decoded =
+                                            crate::generator::utils::decode_shell_escapes_impl(
+                                                &raw,
+                                            );
+                                        generator.perl_string_literal(&Word::literal(decoded))
+                                    } else {
+                                        // Use a non-interpolating literal here so that any
+                                        // embedded shell content (including $ sequences
+                                        // and actual newlines) are preserved verbatim.
+                                        generator.perl_string_literal_no_interp(arg)
+                                    }
                                 }
                             } else {
-                                let rendered = generator.perl_string_literal(arg);
-                                rendered
-                                    .replace("\\\\n", "\n")
-                                    .replace("\\\\t", "\t")
-                                    .replace("\\\\r", "\r")
+                                // No special backticks detected - emit a non-interpolating
+                                // Perl literal so shell fragments are preserved exactly.
+                                if !output_var.is_empty() {
+                                    let mut raw = literal.clone();
+                                    if (raw.starts_with('"') && raw.ends_with('"'))
+                                        || (raw.starts_with('\'') && raw.ends_with('\''))
+                                    {
+                                        raw = raw[1..raw.len() - 1].to_string();
+                                    }
+                                    let decoded =
+                                        crate::generator::utils::decode_shell_escapes_impl(&raw);
+                                    generator.perl_string_literal(&Word::literal(decoded))
+                                } else {
+                                    generator.perl_string_literal_no_interp(arg)
+                                }
                             }
                         }
                     }
@@ -391,7 +432,6 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                     );
                 } else if name == "grep" {
                     // Special handling for grep in command substitution
-                    eprintln!("DEBUG: echo.rs - Using native grep implementation for command substitution");
                     let unique_id = generator.get_unique_id();
                     let args: Vec<String> = simple_cmd
                         .args
@@ -447,7 +487,6 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                     }
                 } else if name == "paste" {
                     // Special handling for paste in command substitution
-                    eprintln!("DEBUG: echo.rs - Using native paste implementation for command substitution");
                     return crate::generator::commands::paste::generate_paste_command(
                         generator,
                         simple_cmd,
@@ -455,7 +494,6 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                     );
                 } else if name == "comm" {
                     // Special handling for comm in command substitution
-                    eprintln!("DEBUG: echo.rs - Using native comm implementation for command substitution");
                     return crate::generator::commands::comm::generate_comm_command(
                         generator,
                         simple_cmd,
@@ -464,13 +502,11 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                     );
                 } else if name == "diff" {
                     // Special handling for diff in command substitution
-                    eprintln!("DEBUG: echo.rs - Using native diff implementation for command substitution");
                     return crate::generator::commands::diff::generate_diff_command(
                         generator, simple_cmd, "", 0, false,
                     );
                 } else if name == "xargs" {
                     // Special handling for xargs in command substitution
-                    eprintln!("DEBUG: echo.rs - Using native xargs implementation for command substitution");
                     return crate::generator::commands::xargs::generate_xargs_command(
                         generator, simple_cmd, "", "0",
                     );
@@ -493,7 +529,8 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                     .iter()
                     .map(|arg| {
                         let word = Word::Literal(arg.clone(), Default::default());
-                        generator.perl_string_literal(&word)
+                        // Use non-interpolating literal here because these args are passed verbatim to the system command
+                        generator.perl_string_literal_no_interp(&word)
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -577,7 +614,9 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
         _ => {
             // For other command types, use system command fallback
             let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-            format!(" my ({}); my {} = open3({}, {}, {}, 'bash', '-c', '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, err_var, generator.generate_command_string_for_system(cmd), in_var, result_var, out_var, out_var, pid_var, result_var)
+            let cmd_str = generator.generate_command_string_for_system(cmd);
+            let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+            format!(" my ({}); my {} = open3({}, {}, {}, 'bash', '-c', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, err_var, cmd_lit, in_var, result_var, out_var, out_var, pid_var, result_var)
         }
     }
 }

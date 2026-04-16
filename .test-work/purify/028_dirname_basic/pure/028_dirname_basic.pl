@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/028_dirname_basic.pl" }
 
 
 print "=== Example 028: Basic dirname command ===\n";
@@ -41,7 +42,7 @@ print "Root directory: $dirname_root";
 print "\ndirname with empty string:\n";
 do {
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-my $dirname_cmd = 'dirname \'\'';
+my $dirname_cmd = q{dirname ''};
 my $dirname_output = qx{$dirname_cmd};
 $CHILD_ERROR = $? >> 8;
 print $dirname_output;

@@ -491,8 +491,8 @@ pub fn generate_pipeline_for_substitution(
     generator: &mut Generator,
     pipeline: &Pipeline,
 ) -> String {
-    eprintln!("DEBUG: generate_pipeline_for_substitution called");
-    eprintln!("DEBUG: Pipeline has {} commands", pipeline.commands.len());
+    // generate_pipeline_for_substitution: produce Perl code for pipelines used in
+    // command substitution. (Debug prints removed.)
 
     // For simple pipelines, use a much simpler approach
     if pipeline.commands.len() == 1 {
@@ -605,12 +605,12 @@ pub fn generate_pipeline_for_substitution(
         }
     } else if pipeline.commands.len() == 2 {
         // Handle specific 2-command pipelines
-        eprintln!("DEBUG: Processing 2-command pipeline");
+        // Processing 2-command pipeline
         // Check for time command with redirect
         if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) =
             (&pipeline.commands[0], &pipeline.commands[1])
         {
-            eprintln!("DEBUG: Found RedirectCommand + SimpleCommand pipeline");
+            // Found RedirectCommand + SimpleCommand pipeline
             if let Command::Simple(time_cmd) = redirect_cmd.command.as_ref() {
                 if let Word::Literal(name, _) = &time_cmd.name {
                     if name == "time" {
@@ -683,11 +683,27 @@ pub fn generate_pipeline_for_substitution(
             if cmd1_name == "echo" && cmd2_name == "tr" {
                 // Special case for echo | tr
                 let unique_id = generator.get_unique_id();
-                // Generate echo output directly as a string value
+                // Generate echo output directly as a string value. Decode
+                // literal arguments so any shell-style escapes become actual
+                // characters in the inlined Perl literal (so downstream
+                // builtins like head see real newlines).
                 let echo_args: Vec<String> = cmd1
                     .args
                     .iter()
-                    .map(|arg| generator.word_to_perl(arg))
+                    .map(|arg| match arg {
+                        Word::Literal(s, _) => {
+                            // Strip outer quotes if present
+                            let mut raw = s.clone();
+                            if (raw.starts_with('"') && raw.ends_with('"'))
+                                || (raw.starts_with('\'') && raw.ends_with('\''))
+                            {
+                                raw = raw[1..raw.len() - 1].to_string();
+                            }
+                            let decoded = crate::generator::utils::decode_shell_escapes_impl(&raw);
+                            generator.perl_string_literal(&Word::literal(decoded))
+                        }
+                        _ => generator.word_to_perl(arg),
+                    })
                     .collect();
                 let echo_string = if echo_args.is_empty() {
                     "\"\"".to_string()
@@ -717,10 +733,23 @@ pub fn generate_pipeline_for_substitution(
 
     // Simplify the output by removing excessive complexity
     let simplified = if output.len() > 5000 {
-        // If output is too long, use a simple system call instead
+        // If output is too long, use a simple system call instead. Use a
+        // non-interpolating Perl literal for the original pipeline source so
+        // embedded "$" or newlines are preserved exactly when passed to
+        // bash -c.
         let unique_id = generator.get_unique_id();
-        format!("do {{\n    my $result_{} = qx{{bash -c \"{}\"}};\n    chomp $result_{};\n    $result_{};\n}}", 
-                unique_id, pipeline.source_text.as_ref().unwrap_or(&"echo 'pipeline'".to_string()), unique_id, unique_id)
+        // Reconstruct the pipeline command string using the generator's
+        // system-command rendering so each argument is properly shell-quoted.
+        // This is more robust than using pipeline.source_text which may have
+        // been altered by the parser/environment and can lead to nested-quote
+        // collisions when embedded in an outer Perl literal.
+        let reconstructed_cmd =
+            generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
+        let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(reconstructed_cmd));
+        format!(
+            "do {{\n    my $result_{} = qx{{bash -c {} }};\n    chomp $result_{};\n    $result_{};\n}}",
+            unique_id, cmd_lit, unique_id, unique_id
+        )
     } else {
         // Preserve Perl backtick newline semantics.
         // If output is already a do block, don't nest it - just return it (chomp is handled elsewhere)

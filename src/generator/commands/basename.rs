@@ -13,7 +13,7 @@ pub fn generate_basename_command(
     if let Some(path) = cmd.args.first() {
         let command = Command::Simple(cmd.clone());
         let command_str = generator.generate_command_string_for_system(&command);
-        let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+        let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
         output.push_str(&format!("my $basename_cmd = {};\n", command_lit));
         output.push_str("my $basename_output = qx{$basename_cmd};\n");

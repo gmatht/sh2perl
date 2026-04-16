@@ -80,7 +80,9 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
                     output.push_str(&generator.indent());
-                    output.push_str("push @mkdir_verbose_paths, $mkdir_prefix if !-d $mkdir_prefix;\n");
+                    output.push_str(
+                        "push @mkdir_verbose_paths, $mkdir_prefix if !-d $mkdir_prefix;\n",
+                    );
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
@@ -104,7 +106,9 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                     output.push_str("for my $mkdir_created (@mkdir_verbose_paths) {\n");
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
-                    output.push_str("print \"mkdir: created directory '\" . $mkdir_created . \"'\\n\";\n");
+                    output.push_str(
+                        "print \"mkdir: created directory '\" . $mkdir_created . \"'\\n\";\n",
+                    );
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
@@ -118,7 +122,10 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                 generator.indent_level += 1;
                 if verbose {
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("print \"mkdir: created directory '\" . {} . \"'\\n\";\n", dir));
+                    output.push_str(&format!(
+                        "print \"mkdir: created directory '\" . {} . \"'\\n\";\n",
+                        dir
+                    ));
                 }
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
