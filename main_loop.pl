@@ -118,7 +118,11 @@ while (1) {
         print "\nInvoking opencode to ask whether to keep or stash changes...\n";
 
         my $oc_out = '';
-        if (open my $oc, '-|', 'opencode', 'run',  '-m', 'github-copilot/gpt-5-mini', '--variant', 'high', '--prompt', $prompt) {
+        # The opencode CLI accepts the prompt as a positional argument for `run`.
+        # Passing a `--prompt` option causes the CLI to print its usage and exit,
+        # so pass the prompt string as the final positional argument (same as
+        # the earlier system() call above).
+        if (open my $oc, '-|', 'opencode', 'run',  '-m', 'github-copilot/gpt-5-mini', '--variant', 'high', $prompt) {
             local $/;
             $oc_out = <$oc>;
             close $oc;
