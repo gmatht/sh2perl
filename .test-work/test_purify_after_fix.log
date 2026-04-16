@@ -3,31 +3,31 @@ DEBUG: Found 54 .pl files in examples.impurl directory
 DEBUG: Files to process: /home/llm/src/sh2perl/examples.impurl/000benchmark.pl, /home/llm/src/sh2perl/examples.impurl/001_echo_basic.pl, /home/llm/src/sh2perl/examples.impurl/002_printf_basic.pl, /home/llm/src/sh2perl/examples.impurl/003__ls_basic.pl, /home/llm/src/sh2perl/examples.impurl/003_ls_basic.pl, /home/llm/src/sh2perl/examples.impurl/004_cat_basic.pl, /home/llm/src/sh2perl/examples.impurl/005_wc_basic.pl, /home/llm/src/sh2perl/examples.impurl/006_head_basic.pl, /home/llm/src/sh2perl/examples.impurl/007_tail_basic.pl, /home/llm/src/sh2perl/examples.impurl/008_date_basic.pl, /home/llm/src/sh2perl/examples.impurl/009_sleep_basic.pl, /home/llm/src/sh2perl/examples.impurl/010_which_basic.pl, /home/llm/src/sh2perl/examples.impurl/011_grep_basic.pl, /home/llm/src/sh2perl/examples.impurl/012_sed_basic.pl, /home/llm/src/sh2perl/examples.impurl/013_awk_basic.pl, /home/llm/src/sh2perl/examples.impurl/014_tr_basic.pl, /home/llm/src/sh2perl/examples.impurl/015_cut_basic.pl, /home/llm/src/sh2perl/examples.impurl/016_sort_basic.pl, /home/llm/src/sh2perl/examples.impurl/017_uniq_basic.pl, /home/llm/src/sh2perl/examples.impurl/018_paste_basic.pl, /home/llm/src/sh2perl/examples.impurl/019_comm_basic.pl, /home/llm/src/sh2perl/examples.impurl/020_diff_basic.pl, /home/llm/src/sh2perl/examples.impurl/021_find_basic.pl, /home/llm/src/sh2perl/examples.impurl/022_cp_basic.pl, /home/llm/src/sh2perl/examples.impurl/023_mv_basic.pl, /home/llm/src/sh2perl/examples.impurl/024_rm_basic.pl, /home/llm/src/sh2perl/examples.impurl/025_mkdir_basic.pl, /home/llm/src/sh2perl/examples.impurl/026_touch_basic.pl, /home/llm/src/sh2perl/examples.impurl/027_basename_basic.pl, /home/llm/src/sh2perl/examples.impurl/028_dirname_basic.pl, /home/llm/src/sh2perl/examples.impurl/029_xargs_basic.pl, /home/llm/src/sh2perl/examples.impurl/030_tee_basic.pl, /home/llm/src/sh2perl/examples.impurl/031_time_basic.pl, /home/llm/src/sh2perl/examples.impurl/032_kill_basic.pl, /home/llm/src/sh2perl/examples.impurl/033_nice_basic.pl, /home/llm/src/sh2perl/examples.impurl/034_nohup_basic.pl, /home/llm/src/sh2perl/examples.impurl/035_pipeline_basic.pl, /home/llm/src/sh2perl/examples.impurl/036_control_flow_basic.pl, /home/llm/src/sh2perl/examples.impurl/037_complex_pipeline.pl, /home/llm/src/sh2perl/examples.impurl/038_advanced_control_flow.pl, /home/llm/src/sh2perl/examples.impurl/039_subshell_operations.pl, /home/llm/src/sh2perl/examples.impurl/040_most_complex_example.pl, /home/llm/src/sh2perl/examples.impurl/041_compression_network.pl, /home/llm/src/sh2perl/examples.impurl/042_checksum_verification.pl, /home/llm/src/sh2perl/examples.impurl/043_string_processing.pl, /home/llm/src/sh2perl/examples.impurl/044_yes_command.pl, /home/llm/src/sh2perl/examples.impurl/045_read_command.pl, /home/llm/src/sh2perl/examples.impurl/046_perl_command.pl, /home/llm/src/sh2perl/examples.impurl/047_advanced_pipelines.pl, /home/llm/src/sh2perl/examples.impurl/048_nested_control_flow.pl, /home/llm/src/sh2perl/examples.impurl/049_ultimate_complex_example.pl, /home/llm/src/sh2perl/examples.impurl/050_final_example.pl, /home/llm/src/sh2perl/examples.impurl/051_remaining_examples.pl, /home/llm/src/sh2perl/examples.impurl/052_complex_usage_examples.pl
 DEBUG: Testing purify.pl --help...
 DEBUG: Starting purify.pl help test (timeout: 5s, type: purify_help)
-DEBUG: purify.pl help test completed in 0.0241019725799561s (exit code: 0)
+DEBUG: purify.pl help test completed in 0.0246880054473877s (exit code: 0)
 DEBUG: purify.pl --help test passed
 DEBUG: Starting backtick command substitution (timeout: 30s, type: purify_execution)
-DEBUG: backtick command substitution completed in 0.131199836730957s (exit code: 0)
+DEBUG: backtick command substitution completed in 0.124214887619019s (exit code: 0)
 DEBUG: Starting bare mv backtick (timeout: 30s, type: purify_execution)
-DEBUG: bare mv backtick completed in 0.173557043075562s (exit code: 0)
+DEBUG: bare mv backtick completed in 0.177982091903687s (exit code: 0)
 DEBUG: Progress: [                    ] 1% (1/54) - Processing files
 DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/000benchmark.pl -> /home/llm/src/sh2perl/.test-work/purify/000benchmark/pure/000benchmark.pl
 DEBUG: File 1 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/000benchmark.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.20805811882019s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.220445871353149s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/000benchmark.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/000benchmark/pure/000benchmark.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.0027010440826416s (exit code: 0)
+DEBUG: grep check completed in 0.00270390510559082s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/000benchmark.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00766491889953613s (exit code: 0)
+DEBUG: original file execution completed in 0.0088810920715332s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/000benchmark/pure/000benchmark.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00785398483276367s (exit code: 0)
+DEBUG: purified file execution completed in 0.00863885879516602s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [                    ] 3% (2/54) - Processing files
@@ -35,20 +35,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/001_echo_basic
 DEBUG: File 2 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/001_echo_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.213005065917969s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.233036041259766s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/001_echo_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/001_echo_basic/pure/001_echo_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00301885604858398s (exit code: 0)
+DEBUG: grep check completed in 0.00294399261474609s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/001_echo_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00774598121643066s (exit code: 0)
+DEBUG: original file execution completed in 0.00894498825073242s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/001_echo_basic/pure/001_echo_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00841212272644043s (exit code: 0)
+DEBUG: purified file execution completed in 0.00848388671875s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=                   ] 5% (3/54) - Processing files
@@ -56,20 +56,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/002_printf_bas
 DEBUG: File 3 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/002_printf_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.367930889129639s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.381026983261108s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/002_printf_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/002_printf_basic/pure/002_printf_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00284099578857422s (exit code: 0)
+DEBUG: grep check completed in 0.00285887718200684s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/002_printf_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0151660442352295s (exit code: 0)
+DEBUG: original file execution completed in 0.014854907989502s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/002_printf_basic/pure/002_printf_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0085299015045166s (exit code: 0)
+DEBUG: purified file execution completed in 0.00757884979248047s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=                   ] 7% (4/54) - Processing files
@@ -77,20 +77,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/003__ls_basic.
 DEBUG: File 4 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/003__ls_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.174751996994019s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.167536020278931s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/003__ls_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/003__ls_basic/pure/003__ls_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00306987762451172s (exit code: 0)
+DEBUG: grep check completed in 0.00276708602905273s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/003__ls_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00676298141479492s (exit code: 0)
+DEBUG: original file execution completed in 0.00411081314086914s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/003__ls_basic/pure/003__ls_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0122199058532715s (exit code: 0)
+DEBUG: purified file execution completed in 0.0100529193878174s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=                   ] 9% (5/54) - Processing files
@@ -98,20 +98,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/003_ls_basic.p
 DEBUG: File 5 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/003_ls_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.115752220153809s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.12440299987793s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/003_ls_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/003_ls_basic/pure/003_ls_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00289201736450195s (exit code: 0)
+DEBUG: grep check completed in 0.00270891189575195s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/003_ls_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00268697738647461s (exit code: 0)
+DEBUG: original file execution completed in 0.00247693061828613s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/003_ls_basic/pure/003_ls_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00262904167175293s (exit code: 0)
+DEBUG: purified file execution completed in 0.00261306762695312s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [==                  ] 11% (6/54) - Processing files
@@ -119,20 +119,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/004_cat_basic.
 DEBUG: File 6 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/004_cat_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.27873706817627s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.32309103012085s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/004_cat_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/004_cat_basic/pure/004_cat_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00297689437866211s (exit code: 0)
+DEBUG: grep check completed in 0.0027158260345459s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/004_cat_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0106329917907715s (exit code: 0)
+DEBUG: original file execution completed in 0.011725902557373s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/004_cat_basic/pure/004_cat_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0131289958953857s (exit code: 0)
+DEBUG: purified file execution completed in 0.0135560035705566s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [==                  ] 12% (7/54) - Processing files
@@ -140,20 +140,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/005_wc_basic.p
 DEBUG: File 7 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/005_wc_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.530313968658447s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.570343017578125s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/005_wc_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/005_wc_basic/pure/005_wc_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00304818153381348s (exit code: 0)
+DEBUG: grep check completed in 0.00304007530212402s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/005_wc_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0113189220428467s (exit code: 0)
+DEBUG: original file execution completed in 0.0119669437408447s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/005_wc_basic/pure/005_wc_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0387980937957764s (exit code: 0)
+DEBUG: purified file execution completed in 0.0372800827026367s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [==                  ] 14% (8/54) - Processing files
@@ -161,20 +161,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/006_head_basic
 DEBUG: File 8 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/006_head_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.327130079269409s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.329770803451538s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/006_head_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/006_head_basic/pure/006_head_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00293111801147461s (exit code: 0)
+DEBUG: grep check completed in 0.0027620792388916s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/006_head_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0116569995880127s (exit code: 0)
+DEBUG: original file execution completed in 0.0121769905090332s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/006_head_basic/pure/006_head_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0158021450042725s (exit code: 0)
+DEBUG: purified file execution completed in 0.0161621570587158s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [===                 ] 16% (9/54) - Processing files
@@ -182,20 +182,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/007_tail_basic
 DEBUG: File 9 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/007_tail_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.294410943984985s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.319705963134766s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/007_tail_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/007_tail_basic/pure/007_tail_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.0026860237121582s (exit code: 0)
+DEBUG: grep check completed in 0.00252199172973633s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/007_tail_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0112330913543701s (exit code: 0)
+DEBUG: original file execution completed in 0.0110790729522705s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/007_tail_basic/pure/007_tail_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0151898860931396s (exit code: 0)
+DEBUG: purified file execution completed in 0.0149190425872803s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [===                 ] 18% (10/54) - Processing files
@@ -203,20 +203,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/008_date_basic
 DEBUG: File 10 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/008_date_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.184561014175415s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.19563102722168s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/008_date_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/008_date_basic/pure/008_date_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00274205207824707s (exit code: 0)
+DEBUG: grep check completed in 0.00295186042785645s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/008_date_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0131380558013916s (exit code: 0)
+DEBUG: original file execution completed in 0.0131809711456299s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/008_date_basic/pure/008_date_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0132119655609131s (exit code: 0)
+DEBUG: purified file execution completed in 0.0123980045318604s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [====                ] 20% (11/54) - Processing files
@@ -224,20 +224,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/009_sleep_basi
 DEBUG: File 11 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/009_sleep_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.107445955276489s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.124831914901733s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/009_sleep_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/009_sleep_basic/pure/009_sleep_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.0028989315032959s (exit code: 0)
+DEBUG: grep check completed in 0.00291895866394043s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/009_sleep_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00253200531005859s (exit code: 0)
+DEBUG: original file execution completed in 0.00251483917236328s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/009_sleep_basic/pure/009_sleep_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00220584869384766s (exit code: 0)
+DEBUG: purified file execution completed in 0.00250387191772461s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [====                ] 22% (12/54) - Processing files
@@ -245,20 +245,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/010_which_basi
 DEBUG: File 12 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/010_which_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.167386054992676s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.185548067092896s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/010_which_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/010_which_basic/pure/010_which_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00286102294921875s (exit code: 0)
+DEBUG: grep check completed in 0.00276303291320801s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/010_which_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0137801170349121s (exit code: 0)
+DEBUG: original file execution completed in 0.0159201622009277s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/010_which_basic/pure/010_which_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0130860805511475s (exit code: 0)
+DEBUG: purified file execution completed in 0.0145611763000488s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [====                ] 24% (13/54) - Processing files
@@ -266,20 +266,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/011_grep_basic
 DEBUG: File 13 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/011_grep_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.28483510017395s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.285903930664062s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/011_grep_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/011_grep_basic/pure/011_grep_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00262713432312012s (exit code: 0)
+DEBUG: grep check completed in 0.00258493423461914s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/011_grep_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00478100776672363s (exit code: 0)
+DEBUG: original file execution completed in 0.0049889087677002s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/011_grep_basic/pure/011_grep_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00482702255249023s (exit code: 0)
+DEBUG: purified file execution completed in 0.00518703460693359s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=====               ] 25% (14/54) - Processing files
@@ -287,20 +287,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/012_sed_basic.
 DEBUG: File 14 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/012_sed_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.264928102493286s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.275252103805542s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/012_sed_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/012_sed_basic/pure/012_sed_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00318193435668945s (exit code: 0)
+DEBUG: grep check completed in 0.00297784805297852s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/012_sed_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00643014907836914s (exit code: 0)
+DEBUG: original file execution completed in 0.00564193725585938s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/012_sed_basic/pure/012_sed_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00621604919433594s (exit code: 0)
+DEBUG: purified file execution completed in 0.00510287284851074s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=====               ] 27% (15/54) - Processing files
@@ -308,20 +308,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/013_awk_basic.
 DEBUG: File 15 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/013_awk_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.29195499420166s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.341506004333496s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/013_awk_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/013_awk_basic/pure/013_awk_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00439310073852539s (exit code: 0)
+DEBUG: grep check completed in 0.00289511680603027s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/013_awk_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00553584098815918s (exit code: 0)
+DEBUG: original file execution completed in 0.00565195083618164s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/013_awk_basic/pure/013_awk_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00569605827331543s (exit code: 0)
+DEBUG: purified file execution completed in 0.00589895248413086s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=====               ] 29% (16/54) - Processing files
@@ -329,20 +329,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/014_tr_basic.p
 DEBUG: File 16 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/014_tr_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.212423801422119s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.235966920852661s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/014_tr_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/014_tr_basic/pure/014_tr_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00288796424865723s (exit code: 0)
+DEBUG: grep check completed in 0.00277996063232422s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/014_tr_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00507211685180664s (exit code: 0)
+DEBUG: original file execution completed in 0.00475478172302246s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/014_tr_basic/pure/014_tr_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00551199913024902s (exit code: 0)
+DEBUG: purified file execution completed in 0.00508284568786621s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [======              ] 31% (17/54) - Processing files
@@ -350,20 +350,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/015_cut_basic.
 DEBUG: File 17 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/015_cut_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.222840070724487s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.258551120758057s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/015_cut_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/015_cut_basic/pure/015_cut_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00280308723449707s (exit code: 0)
+DEBUG: grep check completed in 0.00282597541809082s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/015_cut_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00501012802124023s (exit code: 0)
+DEBUG: original file execution completed in 0.0051581859588623s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/015_cut_basic/pure/015_cut_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00539612770080566s (exit code: 0)
+DEBUG: purified file execution completed in 0.00480318069458008s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [======              ] 33% (18/54) - Processing files
@@ -371,20 +371,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/016_sort_basic
 DEBUG: File 18 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/016_sort_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.260644912719727s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.269451141357422s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/016_sort_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/016_sort_basic/pure/016_sort_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00312209129333496s (exit code: 0)
+DEBUG: grep check completed in 0.00286507606506348s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/016_sort_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00590705871582031s (exit code: 0)
+DEBUG: original file execution completed in 0.00556492805480957s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/016_sort_basic/pure/016_sort_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00606513023376465s (exit code: 0)
+DEBUG: purified file execution completed in 0.00547599792480469s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=======             ] 35% (19/54) - Processing files
@@ -392,20 +392,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/017_uniq_basic
 DEBUG: File 19 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/017_uniq_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.379307985305786s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.395625114440918s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/017_uniq_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/017_uniq_basic/pure/017_uniq_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00297403335571289s (exit code: 0)
+DEBUG: grep check completed in 0.0028688907623291s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/017_uniq_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00582385063171387s (exit code: 0)
+DEBUG: original file execution completed in 0.00508999824523926s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/017_uniq_basic/pure/017_uniq_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00559401512145996s (exit code: 0)
+DEBUG: purified file execution completed in 0.00537204742431641s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=======             ] 37% (20/54) - Processing files
@@ -413,20 +413,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/018_paste_basi
 DEBUG: File 20 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/018_paste_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.211995124816895s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.222247838973999s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/018_paste_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/018_paste_basic/pure/018_paste_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00298714637756348s (exit code: 0)
+DEBUG: grep check completed in 0.00281310081481934s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/018_paste_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00465202331542969s (exit code: 0)
+DEBUG: original file execution completed in 0.00546002388000488s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/018_paste_basic/pure/018_paste_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00470209121704102s (exit code: 0)
+DEBUG: purified file execution completed in 0.0054168701171875s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=======             ] 38% (21/54) - Processing files
@@ -434,20 +434,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/019_comm_basic
 DEBUG: File 21 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/019_comm_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.262762784957886s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.313961029052734s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/019_comm_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/019_comm_basic/pure/019_comm_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00268101692199707s (exit code: 0)
+DEBUG: grep check completed in 0.00295305252075195s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/019_comm_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00564193725585938s (exit code: 0)
+DEBUG: original file execution completed in 0.00557899475097656s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/019_comm_basic/pure/019_comm_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00525403022766113s (exit code: 0)
+DEBUG: purified file execution completed in 0.00523614883422852s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [========            ] 40% (22/54) - Processing files
@@ -455,20 +455,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/020_diff_basic
 DEBUG: File 22 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/020_diff_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.327788114547729s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.338293075561523s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/020_diff_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/020_diff_basic/pure/020_diff_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00323104858398438s (exit code: 0)
+DEBUG: grep check completed in 0.00311803817749023s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/020_diff_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0060269832611084s (exit code: 0)
+DEBUG: original file execution completed in 0.00635385513305664s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/020_diff_basic/pure/020_diff_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0059199333190918s (exit code: 0)
+DEBUG: purified file execution completed in 0.0053250789642334s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [========            ] 42% (23/54) - Processing files
@@ -476,20 +476,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/021_find_basic
 DEBUG: File 23 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/021_find_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.19035005569458s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.226660013198853s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/021_find_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/021_find_basic/pure/021_find_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.0029449462890625s (exit code: 0)
+DEBUG: grep check completed in 0.00280904769897461s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/021_find_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0164539813995361s (exit code: 0)
+DEBUG: original file execution completed in 0.0152328014373779s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/021_find_basic/pure/021_find_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.016848087310791s (exit code: 0)
+DEBUG: purified file execution completed in 0.0149500370025635s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [========            ] 44% (24/54) - Processing files
@@ -497,20 +497,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/022_cp_basic.p
 DEBUG: File 24 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/022_cp_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.59972095489502s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.677545070648193s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/022_cp_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/022_cp_basic/pure/022_cp_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00273299217224121s (exit code: 0)
+DEBUG: grep check completed in 0.00279521942138672s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/022_cp_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.017474889755249s (exit code: 0)
+DEBUG: original file execution completed in 0.0204260349273682s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/022_cp_basic/pure/022_cp_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0368130207061768s (exit code: 0)
+DEBUG: purified file execution completed in 0.0419991016387939s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=========           ] 46% (25/54) - Processing files
@@ -518,20 +518,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/023_mv_basic.p
 DEBUG: File 25 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/023_mv_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 1.05161309242249s (exit code: 0)
+DEBUG: purify.pl execution completed in 1.13255000114441s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/023_mv_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/023_mv_basic/pure/023_mv_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00303196907043457s (exit code: 0)
+DEBUG: grep check completed in 0.00325703620910645s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/023_mv_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0184779167175293s (exit code: 0)
+DEBUG: original file execution completed in 0.0236539840698242s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/023_mv_basic/pure/023_mv_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.036262035369873s (exit code: 0)
+DEBUG: purified file execution completed in 0.0474720001220703s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=========           ] 48% (26/54) - Processing files
@@ -539,20 +539,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/024_rm_basic.p
 DEBUG: File 26 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/024_rm_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 1.20888495445251s (exit code: 0)
+DEBUG: purify.pl execution completed in 2.96133208274841s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/024_rm_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/024_rm_basic/pure/024_rm_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00422883033752441s (exit code: 0)
+DEBUG: grep check completed in 0.0032958984375s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/024_rm_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0249202251434326s (exit code: 0)
+DEBUG: original file execution completed in 0.0273580551147461s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/024_rm_basic/pure/024_rm_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0383379459381104s (exit code: 0)
+DEBUG: purified file execution completed in 0.0408580303192139s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [==========          ] 50% (27/54) - Processing files
@@ -560,20 +560,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/025_mkdir_basi
 DEBUG: File 27 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/025_mkdir_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 1.43337392807007s (exit code: 0)
+DEBUG: purify.pl execution completed in 1.57569599151611s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/025_mkdir_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/025_mkdir_basic/pure/025_mkdir_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00312280654907227s (exit code: 0)
+DEBUG: grep check completed in 0.0027921199798584s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/025_mkdir_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.02610182762146s (exit code: 0)
+DEBUG: original file execution completed in 0.0274949073791504s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/025_mkdir_basic/pure/025_mkdir_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0285370349884033s (exit code: 0)
+DEBUG: purified file execution completed in 0.0345261096954346s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [==========          ] 51% (28/54) - Processing files
@@ -581,20 +581,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/026_touch_basi
 DEBUG: File 28 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/026_touch_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.386071920394897s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.420150995254517s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/026_touch_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/026_touch_basic/pure/026_touch_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00290894508361816s (exit code: 0)
+DEBUG: grep check completed in 0.00269412994384766s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/026_touch_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0131039619445801s (exit code: 0)
+DEBUG: original file execution completed in 0.0121409893035889s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/026_touch_basic/pure/026_touch_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0241899490356445s (exit code: 0)
+DEBUG: purified file execution completed in 0.031635046005249s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [==========          ] 53% (29/54) - Processing files
@@ -602,20 +602,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/027_basename_b
 DEBUG: File 29 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/027_basename_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.30691385269165s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.355467081069946s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/027_basename_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/027_basename_basic/pure/027_basename_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00257515907287598s (exit code: 0)
+DEBUG: grep check completed in 0.0027308464050293s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/027_basename_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0139391422271729s (exit code: 0)
+DEBUG: original file execution completed in 0.0135929584503174s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/027_basename_basic/pure/027_basename_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0193159580230713s (exit code: 0)
+DEBUG: purified file execution completed in 0.026993989944458s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [===========         ] 55% (30/54) - Processing files
@@ -623,20 +623,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/028_dirname_ba
 DEBUG: File 30 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/028_dirname_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.295674085617065s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.355180978775024s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/028_dirname_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/028_dirname_basic/pure/028_dirname_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00281310081481934s (exit code: 0)
+DEBUG: grep check completed in 0.00272202491760254s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/028_dirname_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0114381313323975s (exit code: 0)
+DEBUG: original file execution completed in 0.0190939903259277s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/028_dirname_basic/pure/028_dirname_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0179648399353027s (exit code: 0)
+DEBUG: purified file execution completed in 0.0258669853210449s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [===========         ] 57% (31/54) - Processing files
@@ -644,20 +644,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/029_xargs_basi
 DEBUG: File 31 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/029_xargs_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.134690046310425s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.161863088607788s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/029_xargs_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/029_xargs_basic/pure/029_xargs_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00289511680603027s (exit code: 0)
+DEBUG: grep check completed in 0.00282788276672363s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/029_xargs_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00526094436645508s (exit code: 0)
+DEBUG: original file execution completed in 0.00652313232421875s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/029_xargs_basic/pure/029_xargs_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00614500045776367s (exit code: 0)
+DEBUG: purified file execution completed in 0.00610685348510742s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [===========         ] 59% (32/54) - Processing files
@@ -665,20 +665,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/030_tee_basic.
 DEBUG: File 32 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/030_tee_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.270418882369995s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.316689968109131s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/030_tee_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/030_tee_basic/pure/030_tee_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00276899337768555s (exit code: 0)
+DEBUG: grep check completed in 0.00287699699401855s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/030_tee_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0170590877532959s (exit code: 0)
+DEBUG: original file execution completed in 0.0180740356445312s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/030_tee_basic/pure/030_tee_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0178070068359375s (exit code: 0)
+DEBUG: purified file execution completed in 0.0175189971923828s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [============        ] 61% (33/54) - Processing files
@@ -686,20 +686,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/031_time_basic
 DEBUG: File 33 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/031_time_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.103142976760864s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.11500096321106s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/031_time_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/031_time_basic/pure/031_time_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00284004211425781s (exit code: 0)
+DEBUG: grep check completed in 0.00253820419311523s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/031_time_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00231194496154785s (exit code: 0)
+DEBUG: original file execution completed in 0.00224089622497559s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/031_time_basic/pure/031_time_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00227189064025879s (exit code: 0)
+DEBUG: purified file execution completed in 0.00238299369812012s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [============        ] 62% (34/54) - Processing files
@@ -707,20 +707,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/032_kill_basic
 DEBUG: File 34 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/032_kill_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.100195169448853s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.113160848617554s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/032_kill_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/032_kill_basic/pure/032_kill_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00278019905090332s (exit code: 0)
+DEBUG: grep check completed in 0.00261521339416504s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/032_kill_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00220108032226562s (exit code: 0)
+DEBUG: original file execution completed in 0.00230598449707031s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/032_kill_basic/pure/032_kill_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00221109390258789s (exit code: 0)
+DEBUG: purified file execution completed in 0.00243902206420898s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [============        ] 64% (35/54) - Processing files
@@ -728,20 +728,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/033_nice_basic
 DEBUG: File 35 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/033_nice_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.129345893859863s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.127240180969238s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/033_nice_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/033_nice_basic/pure/033_nice_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00308513641357422s (exit code: 0)
+DEBUG: grep check completed in 0.00289011001586914s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/033_nice_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00547909736633301s (exit code: 0)
+DEBUG: original file execution completed in 0.00519609451293945s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/033_nice_basic/pure/033_nice_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00525784492492676s (exit code: 0)
+DEBUG: purified file execution completed in 0.00582003593444824s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=============       ] 66% (36/54) - Processing files
@@ -749,20 +749,20 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/034_nohup_basi
 DEBUG: File 36 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/034_nohup_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.123677968978882s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.138309001922607s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/034_nohup_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/034_nohup_basic/pure/034_nohup_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.0028529167175293s (exit code: 0)
+DEBUG: grep check completed in 0.00290107727050781s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/034_nohup_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.00501394271850586s (exit code: 0)
+DEBUG: original file execution completed in 0.00510787963867188s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/034_nohup_basic/pure/034_nohup_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.00508308410644531s (exit code: 0)
+DEBUG: purified file execution completed in 0.00484514236450195s (exit code: 0)
 DEBUG: Purified file execution result: 0
 DEBUG: ✓ Output comparison passed - files produce identical output
 DEBUG: Progress: [=============       ] 68% (37/54) - Processing files
@@ -770,37 +770,58 @@ DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/035_pipeline_b
 DEBUG: File 37 of 54
 DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/035_pipeline_basic.pl
 DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
-DEBUG: purify.pl execution completed in 0.478368043899536s (exit code: 0)
+DEBUG: purify.pl execution completed in 0.330661058425903s (exit code: 0)
 DEBUG: purify.pl result: 0
 DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/035_pipeline_basic.pl: purify.pl processed successfully
 DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/035_pipeline_basic/pure/035_pipeline_basic.pl still contains system calls or backticks
 DEBUG: Starting grep check (timeout: 5s, type: grep_check)
-DEBUG: grep check completed in 0.00290918350219727s (exit code: 0)
+DEBUG: grep check completed in 0.00364804267883301s (exit code: 0)
 DEBUG: ✓ Purification check passed - no system calls or backticks found
 DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/035_pipeline_basic.pl
 DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
-DEBUG: original file execution completed in 0.0208768844604492s (exit code: 0)
+DEBUG: original file execution completed in 0.0183780193328857s (exit code: 0)
 DEBUG: Original file execution result: 0
 DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/035_pipeline_basic/pure/035_pipeline_basic.pl
 DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
-DEBUG: purified file execution completed in 0.0156939029693604s (exit code: 2)
-DEBUG: Purified file execution result: 2
+DEBUG: purified file execution completed in 0.0190298557281494s (exit code: 0)
+DEBUG: Purified file execution result: 0
+DEBUG: ✓ Output comparison passed - files produce identical output
+DEBUG: Progress: [==============      ] 70% (38/54) - Processing files
+DEBUG: Testing purify.pl on /home/llm/src/sh2perl/examples.impurl/036_control_flow_basic.pl -> /home/llm/src/sh2perl/.test-work/purify/036_control_flow_basic/pure/036_control_flow_basic.pl
+DEBUG: File 38 of 54
+DEBUG: Running purify.pl on /home/llm/src/sh2perl/examples.impurl/036_control_flow_basic.pl
+DEBUG: Starting purify.pl execution (timeout: 30s, type: purify_execution)
+DEBUG: purify.pl execution completed in 0.660945892333984s (exit code: 0)
+DEBUG: purify.pl result: 0
+DEBUG: ✓ /home/llm/src/sh2perl/examples.impurl/036_control_flow_basic.pl: purify.pl processed successfully
+DEBUG: Checking if /home/llm/src/sh2perl/.test-work/purify/036_control_flow_basic/pure/036_control_flow_basic.pl still contains system calls or backticks
+DEBUG: Starting grep check (timeout: 5s, type: grep_check)
+DEBUG: grep check completed in 0.00269293785095215s (exit code: 0)
+DEBUG: ✓ Purification check passed - no system calls or backticks found
+DEBUG: Running original file: /home/llm/src/sh2perl/examples.impurl/036_control_flow_basic.pl
+DEBUG: Starting original file execution (timeout: 15s, type: perl_execution)
+DEBUG: original file execution completed in 0.032200813293457s (exit code: 0)
+DEBUG: Original file execution result: 0
+DEBUG: Running purified file: /home/llm/src/sh2perl/.test-work/purify/036_control_flow_basic/pure/036_control_flow_basic.pl
+DEBUG: Starting purified file execution (timeout: 15s, type: perl_execution)
+DEBUG: purified file execution completed in 0.0301978588104248s (exit code: 0)
+DEBUG: Purified file execution result: 0
 DEBUG: Output mismatch detected between original and purified files; re-running original to check for nondeterminism
 DEBUG:  === purified === 
 
  === end purified ===
 DEBUG: Starting original file re-run (timeout: 15s, type: perl_execution)
-DEBUG: original file re-run completed in 0.0220811367034912s (exit code: 0)
+DEBUG: original file re-run completed in 0.0196220874786377s (exit code: 0)
 DEBUG: Starting diff comparison (timeout: 10s, type: diff_comparison)
-FAILED - Output mismatch for /home/llm/src/sh2perl/examples.impurl/035_pipeline_basic.pl -> /home/llm/src/sh2perl/.test-work/purify/035_pipeline_basic/pure/035_pipeline_basic.pl (diff exit code: 1)
-DEBUG: diff comparison completed in 0.00234603881835938s (exit code: 1)
-Diff excerpt (showing first 8 of 83 lines)
---- /home/llm/src/sh2perl/.test-work/purify/KS_rKieLdp	2026-04-12 05:38:26.031500383 +0000
-+++ /home/llm/src/sh2perl/.test-work/purify/Vj4pAkQkYW	2026-04-12 05:38:26.051500193 +0000
-@@ -6,78 +6,12 @@
- grape
+FAILED - Output mismatch for /home/llm/src/sh2perl/examples.impurl/036_control_flow_basic.pl -> /home/llm/src/sh2perl/.test-work/purify/036_control_flow_basic/pure/036_control_flow_basic.pl (diff exit code: 1)
+DEBUG: diff comparison completed in 0.00197386741638184s (exit code: 1)
+Diff excerpt (showing first 8 of 26 lines)
+--- /home/llm/src/sh2perl/.test-work/purify/2IbW6IVl5l	2026-04-13 07:11:59.911481249 +0000
++++ /home/llm/src/sh2perl/.test-work/purify/f7394gopM4	2026-04-13 07:11:59.949732297 +0000
+@@ -10,11 +10,11 @@
  
- Pipeline with multiple commands (cat | grep | wc):
--cat: invalid option -- 'l'
--Try 'cat --help' for more information.
+ Using system() for for loop with builtins:
+ Loop iteration 1:
+-Processing item 1
++Processing item $i
 ... truncated after 8 lines ...

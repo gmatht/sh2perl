@@ -9,9 +9,16 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
             // so shell variables like $0 do not get expanded unexpectedly.
             if s.starts_with('\'') && s.ends_with('\'') {
                 s.clone()
-            }
-            else if s.is_empty() {
+            } else if s.is_empty() {
                 "''".to_string()
+            }
+            // Keep common shell operator tokens verbatim so generated shell command
+            // strings can contain real operators (like pipes) instead of quoted
+            // literal arguments. This is important for reconstructing
+            // list-form `system("cat", "file", "|", "grep", ... )`
+            // into a proper shell pipeline string.
+            else if s == "|" {
+                s.clone()
             }
             // Always quote literals that contain spaces, quotes, or special characters to ensure proper shell parsing
             else if s.contains(' ')
@@ -89,11 +96,9 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                 format!("{} {}", simple_cmd.name, args.join(" "))
             }
         }
-        Command::Pipeline(pipeline) => {
-            crate::generator::redirects::generate_bash_command_string(&Command::Pipeline(
-                pipeline.clone(),
-            ))
-        }
+        Command::Pipeline(pipeline) => crate::generator::redirects::generate_bash_command_string(
+            &Command::Pipeline(pipeline.clone()),
+        ),
         Command::Subshell(subshell_cmd) => {
             match &**subshell_cmd {
                 Command::Simple(simple_cmd) => {

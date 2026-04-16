@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/026_touch_basic.pl" }
 
 
 print "=== Example 026: Basic touch command ===\n";
@@ -91,7 +92,7 @@ print "\ntouch with date (-d '2023-01-01 12:00:00'):\n";
 do {
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use POSIX qw(time);
-do { my $touch_cmd = 'touch -d \'2023-01-01 12:00:00\' test_touch_date.txt'; qx{$touch_cmd}; };
+do { my $touch_cmd = q{touch -d '2023-01-01 12:00:00' test_touch_date.txt}; qx{$touch_cmd}; };
 
 };
 print "File created with specific date\n" if -f "test_touch_date.txt";

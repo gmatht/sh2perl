@@ -146,7 +146,8 @@ fn generate_ls_sections_helper(
     output.push_str(&format!("my @{} = ();\n", inputs_array));
 
     for (idx, file_arg) in file_args.iter().enumerate() {
-        let literal = generator.perl_string_literal(&Word::literal((*file_arg).to_string()));
+        let literal =
+            generator.perl_string_literal_no_interp(&Word::literal((*file_arg).to_string()));
         if file_arg.contains('*') || file_arg.contains('?') {
             let glob_array = format!("ls_glob_{}_{}", inputs_array, idx);
             output.push_str(&generator.indent());

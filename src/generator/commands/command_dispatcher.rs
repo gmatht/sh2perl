@@ -214,7 +214,7 @@ pub fn generate_command_impl_with_input(
                             // Use backticks when not in STDOUT context for simple commands
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_literal =
-                                generator.perl_string_literal(&Word::literal(cmd_str));
+                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                             result.push_str(&generator.indent());
                             result.push_str(&format!("my $output_ps_{};\n", global_counter));
                             result.push_str(&generator.indent());

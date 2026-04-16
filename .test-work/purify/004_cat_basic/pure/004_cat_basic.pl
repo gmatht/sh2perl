@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/004_cat_basic.pl" }
 
 
 print "=== Example 004: Basic cat command ===\n";
@@ -16,14 +17,14 @@ print $fh2 "Line 3: Different content here\n";
 close($fh2);
 
 print "Using backticks to call cat:\n";
-my $cat_output = do { open my $fh, '<', 'test_file1.txt' or die 'cat: ' . 'test_file1.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; }
+my $cat_output = do { open my $fh, '<', 'test_file1.txt' or die 'cat: ' . 'test_file1.txt' . ': ' . $! . "\n"; local $/ = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $! . "\n"; $chunk; }
 ;
 print $cat_output;
 
 print "\ncat with multiple files using " . "sys" . "tem" . "():\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print (do { open my $fh, '<', 'test_file1.txt' or die 'cat: ' . 'test_file1.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'test_file2.txt' or die 'cat: ' . 'test_file2.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; });
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_file1.txt", "test_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -32,14 +33,13 @@ my $combined = do { my $command = 'cat test_file1.txt test_file2.txt > combined.
 ;
 if (-f "combined.txt") {
     print "Combined file created successfully\n";
-    my $combined_content = do { open my $fh, '<', 'combined.txt' or die 'cat: ' . 'combined.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; }
+    my $combined_content = do { open my $fh, '<', 'combined.txt' or die 'cat: ' . 'combined.txt' . ': ' . $! . "\n"; local $/ = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $! . "\n"; $chunk; }
 ;
     print "Combined content:\n$combined_content";
 }
 
 print "\ncat from stdin (echo | cat):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 {
     my $output_0;
     my $output_printed_0;
@@ -65,8 +65,8 @@ print $numbered;
 
 print "\ncat with non-printing characters (cat -v):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print do { my $cat_cmd = 'cat -v test_file1.txt'; qx{$cat_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-v", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -77,8 +77,8 @@ print $squeezed;
 
 print "\ncat with tabs (cat -T):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print do { my $cat_cmd = 'cat -T test_file1.txt'; qx{$cat_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-T", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 

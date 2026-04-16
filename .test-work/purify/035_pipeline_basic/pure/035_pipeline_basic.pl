@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/035_pipeline_basic.pl" }
 
 
 print "=== Example 035: Basic pipeline ===\n";
@@ -20,8 +21,8 @@ print $pipeline_output;
 
 print "\nPipeline with multiple commands (cat | grep | wc):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print do { my $cat_cmd = 'cat test_pipeline.txt | grep a | wc -l'; qx{$cat_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "a", "|", "wc", "-l"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -32,20 +33,22 @@ print $pipeline_head_tail;
 
 print "\nPipeline with sed and awk:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print (do { open my $fh, '<', 'test_pipeline.txt' or die 'cat: ' . 'test_pipeline.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', q{|} or die 'cat: ' . q{|} . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'sed' or die 'cat: ' . 'sed' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 's/a/A/g' or die 'cat: ' . 's/a/A/g' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', q{|} or die 'cat: ' . q{|} . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'awk' or die 'cat: ' . 'awk' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', '{print toupper($0)}' or die 'cat: ' . '{print toupper($0)}' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; });
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "sed", "s/a/A/g", "|", "awk", "{print toupper($0)}"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "\nPipeline with cut and paste:\n";
-my $pipeline_cut_paste = do { my $pipeline_cmd = "echo '1,2,3\n4,5,6\n7,8,9' | cut -d, -f 1,3 | paste - -"; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
+my $pipeline_cut_paste = do { my $pipeline_cmd = q{echo '1,2,3
+4,5,6
+7,8,9' | cut -d, -f 1,3 | paste - -}; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print $pipeline_cut_paste;
 
 print "\nPipeline with tr and sort:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print (do { open my $fh, '<', 'test_pipeline.txt' or die 'cat: ' . 'test_pipeline.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', q{|} or die 'cat: ' . q{|} . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'tr' or die 'cat: ' . 'tr' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'a-z' or die 'cat: ' . 'a-z' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'A-Z' or die 'cat: ' . 'A-Z' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', q{|} or die 'cat: ' . q{|} . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'sort' or die 'cat: ' . 'sort' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; });
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "tr", "a-z", "A-Z", "|", "sort"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -56,8 +59,8 @@ print "Unique lines: $pipeline_uniq_wc";
 
 print "\nPipeline with grep and head:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print do { my $cat_cmd = 'cat test_pipeline.txt | grep e | head -2'; qx{$cat_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "e", "|", "head", "-2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -68,20 +71,20 @@ print $pipeline_tail_grep;
 
 print "\nPipeline with multiple filters:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print do { my $cat_cmd = 'cat test_pipeline.txt | grep a | sort | head -3'; qx{$cat_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "a", "|", "sort", "|", "head", "-3"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "\nPipeline with error handling:\n";
-my $pipeline_error = do { my $pipeline_cmd = 'cat test_pipeline.txt | grep x'; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
+my $pipeline_error = do { my $pipeline_cmd = 'cat test_pipeline.txt | grep x | wc -l 2> /dev/null'; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print "Lines with 'x': $pipeline_error";
 
 print "\nPipeline with tee:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print (do { open my $fh, '<', 'test_pipeline.txt' or die 'cat: ' . 'test_pipeline.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', q{|} or die 'cat: ' . q{|} . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'grep' or die 'cat: ' . 'grep' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', q{a} or die 'cat: ' . q{a} . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', q{|} or die 'cat: ' . q{|} . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'tee' or die 'cat: ' . 'tee' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; } . do { open my $fh, '<', 'pipeline_output.txt' or die 'cat: ' . 'pipeline_output.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; });
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "a", "|", "tee", "pipeline_output.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 

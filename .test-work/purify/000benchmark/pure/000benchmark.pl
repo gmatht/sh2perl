@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/000benchmark.pl" }
 use strict;
 use warnings;
 use File::Basename;

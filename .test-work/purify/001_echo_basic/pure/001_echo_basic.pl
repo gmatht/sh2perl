@@ -1,19 +1,20 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/001_echo_basic.pl" }
 
 
 print "=== Example 001: Basic echo command ===\n";
 
 print "Using " . "sys" . "tem" . "() to call echo:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print 'Hello, World!' . "\n";
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "Hello, World!"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "\nEcho with multiple arguments:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print 'This is a test of the echo builtin' . "\n";
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a test of the echo builtin"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
@@ -33,19 +34,18 @@ print $var_output;
 
 print "\nEcho with quotes:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print 'This is a \'quoted\' string' . "\n";
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a 'quoted' string"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-print 'This is a "double quoted" string' . "\n";
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", 'This is a "double quoted" string'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 };
 
 print "\nEcho with redirection:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 do {
     open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $!\n";

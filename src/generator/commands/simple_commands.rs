@@ -307,9 +307,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 // Store the command string in a local variable to avoid borrowing issues
                 let cmd_str = generator.generate_command_string_for_system(&**cmd);
                 output.push_str(&generator.indent());
+                // The command string will be passed verbatim to bash -c at runtime,
+                // so emit a non-interpolating Perl literal to prevent Perl from
+                // interpreting $ or escape sequences at compile time.
                 output.push_str(&format!(
                     "open my $pipe, '-|', 'bash', '-c', {};\n",
-                    generator.perl_string_literal(&Word::literal(cmd_str))
+                    generator.perl_string_literal_no_interp(&Word::literal(cmd_str))
                 ));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $output_ps_{} = <$pipe>;\n", global_counter));
@@ -402,7 +405,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&format!(
                         "print ${} {};\n",
                         fh_var,
-                        generator.perl_string_literal(&Word::literal(content.clone()))
+                        // Here-string content is written verbatim into a temp file. Use a
+                        // non-interpolating Perl literal so $-sequences and backslashes
+                        // are preserved exactly.
+                        generator.perl_string_literal_no_interp(&Word::literal(content.clone()))
                     ));
                     output.push_str(&generator.indent());
                     output.push_str(&format!("close(${});\n", fh_var));
@@ -436,31 +442,18 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             value.trim_start_matches('`').trim_end_matches('`');
 
                                         // Try to parse the command properly instead of wrapping in bash -c
-                                        eprintln!(
-                                            "DEBUG: Parsing command substitution: {}",
-                                            command_substitution
-                                        );
+
                                         if let Ok(parsed_commands) =
                                             Parser::new(command_substitution).parse()
                                         {
-                                            eprintln!(
-                                                "DEBUG: Parsed commands: {:?}",
-                                                parsed_commands
-                                            );
                                             if !parsed_commands.is_empty() {
-                                                eprintln!(
-                                                    "DEBUG: Creating CommandSubstitution word"
-                                                );
                                                 let perl_command = generator.word_to_perl(
                                                     &Word::CommandSubstitution(
                                                         Box::new(parsed_commands[0].clone()),
                                                         None,
                                                     ),
                                                 );
-                                                eprintln!(
-                                                    "DEBUG: Generated Perl command: {}",
-                                                    perl_command
-                                                );
+
                                                 output.push_str(&generator.indent());
                                                 output.push_str(&format!(
                                                     "my ${} = {};\n",

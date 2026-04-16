@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/024_rm_basic.pl" }
 
 
 print "=== Example 024: Basic rm command ===\n";

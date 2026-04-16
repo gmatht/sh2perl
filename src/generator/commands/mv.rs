@@ -33,7 +33,7 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     if use_shell_fallback {
         let command = Command::Simple(cmd.clone());
         let command_str = generator.generate_command_string_for_system(&command);
-        let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+        let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
         return format!(
             "do {{\n    my $mv_cmd = {};\n    qx{{$mv_cmd}};\n}};\n",
