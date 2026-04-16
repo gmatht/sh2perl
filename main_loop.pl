@@ -6,6 +6,7 @@ use Time::HiRes qw(sleep);
 $| = 1; 
 print "Auto flush enabled\n";
 
+our $exit_code;
 
 sub run_purify() {
 my $test_cmd = $^O eq 'MSWin32' ? 'perl test_purify.pl' : './test_purify.pl';
@@ -17,7 +18,7 @@ while (my $line = <$pipe>) {
 }
 close($out);
 close($pipe);
-    my $exit_code = $? >> 8;
+    $exit_code = $? >> 8;
 print "Ran\n";
 open(my $fh, '<', 'purify.out') or die "Cannot open purify.out: $!";
 my $output = do { local $/; <$fh> };
@@ -32,14 +33,14 @@ return $last_10k;
 }
 
 while (1) {
-    print "Running $test_cmd \n";
+	#print "Running $test_cmd \n";
     #my $output = `$test_cmd 2>&1`;
     #Work In Progress
     #system("stdbuf -o0 perl ./test_purify.pl 2>&1 | tee > purify.out");
 
     print "\nInvoking opencode to fix the failure...\n";
 
-    my $output=run_purify() {
+    my $output=run_purify();
 
     my $prompt = join("\n",
         "Fix the failure reported by test_purify.pl.",
