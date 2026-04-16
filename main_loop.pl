@@ -6,14 +6,9 @@ use Time::HiRes qw(sleep);
 $| = 1; 
 print "Auto flush enabled\n";
 
+
+sub run_purify() {
 my $test_cmd = $^O eq 'MSWin32' ? 'perl test_purify.pl' : './test_purify.pl';
-
-while (1) {
-    print "Running $test_cmd \n";
-    #my $output = `$test_cmd 2>&1`;
-    #Work In Progress
-    #system("stdbuf -o0 perl ./test_purify.pl 2>&1 | tee > purify.out");
-
 open(my $pipe, '-|', 'perl', './test_purify.pl') or die "Cannot run test_purify.pl: $!";
 open(my $out, '>', 'purify.out') or die "Cannot open purify.out: $!";
 while (my $line = <$pipe>) {
@@ -28,6 +23,42 @@ open(my $fh, '<', 'purify.out') or die "Cannot open purify.out: $!";
 my $output = do { local $/; <$fh> };
 close($fh);
 print "Slurped\n";
+
+my $length = 10000;
+my $start = length($output) - $length;
+$start = 0 if $start < 0; # Prevent negative start if string is too short
+my $last_10k = substr($output, $start);
+return $last_10k;
+}
+
+while (1) {
+    print "Running $test_cmd \n";
+    #my $output = `$test_cmd 2>&1`;
+    #Work In Progress
+    #system("stdbuf -o0 perl ./test_purify.pl 2>&1 | tee > purify.out");
+
+    print "\nInvoking opencode to fix the failure...\n";
+
+    my $output=run_purify() {
+
+    my $prompt = join("\n",
+        "Fix the failure reported by test_purify.pl.",
+        "Use the output below as the task description and make the smallest correct code change.",
+       "Try to fix the underlying Rust code, keeping purify.pl a thin wrapper around the real smarts in Rust, unless the bug is really in purify.pl",
+       "read FIX.md, and after you have fixed the bug add a note to FIX.md as to what you fixed and why.",
+        "",
+        $output,
+        "",
+        "After fixing the issue, stop.",
+    );
+
+    # This CLI exposes prompt text via `opencode run --prompt`; top-level `-p` is password.
+    #system('opencode', 'run', '--prompt', $prompt);
+    #system('opencode', 'run',  '-m', 'github-copilot/gpt-5.4-mini', '--variant', 'xhigh', $prompt);
+    #system('opencode', 'run',  '-m', 'github-copilot/gpt-5.4-mini', '--variant', 'high', $prompt);
+    system('opencode', 'run',  '-m', 'github-copilot/gpt-5-mini', '--variant', 'high', $prompt);
+
+    sleep 8;
 
 #print "Ran $test_cmd \n";
 #my $output = `cat purify.out`;
@@ -75,9 +106,9 @@ print "Slurped\n";
         # No improvement (equal or regression). Ask opencode whether to keep or stash.
         my $prompt;
         if ($passed == $old_max) {
-            $prompt = "No new tests pass, should this work in progress be accepted into the main branch. The final line of your answer should contain 'KEEP' or 'STASH'";
+            $prompt = "No new tests pass, should the git diff in progress be accepted into the main branch. The final line of your answer should contain 'KEEP' or 'STASH'";
         } else {
-            $prompt = "There is a regression in tests passing in this commit. Is this the result of important refactoring that is worth keeping in and building on? In the final line of your answer say KEEP or STASH";
+            $prompt = "The git diff results in a regression of tests passing. Is this the result of important refactoring that is worth keeping in and building on? In the final line of your answer say KEEP or STASH";
         }
 
         # Include the failing output to provide context
@@ -97,7 +128,7 @@ print "Slurped\n";
         print "opencode response:\n" . ($oc_out // '') . "\n";
 
         # Determine final non-empty line from opencode output
-        my $decision = 'STASH';
+        my $decision = 'DEBUG';
         if (defined $oc_out && $oc_out ne '') {
             my @lines = split /\n/, $oc_out;
             for (my $i = $#lines; $i >= 0; $i--) {
@@ -115,8 +146,11 @@ print "Slurped\n";
             my $msg = $passed == $old_max ? "WIP accepted (tests: ${passed})" : "Keep changes (tests: ${old_max}->${passed})";
             system('git', 'commit', '.', '-m', $msg);
         } else {
-            print "Stashing changes...\n";
-            system('git', 'stash', 'push', '-m', "auto-stash: tests ${old_max}->${passed}");
+		#print "Stashing changes...\n";
+		#system('git', 'stash', 'push', '-m', "auto-stash: tests ${old_max}->${passed}");
+		print "No Decision made!";
+		die;
         }
+
     }
 }
