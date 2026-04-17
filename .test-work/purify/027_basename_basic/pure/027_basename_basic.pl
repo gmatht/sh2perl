@@ -11,12 +11,9 @@ print "basename /path/to/file.txt: $basename_output";
 
 print "\nbasename with suffix (remove .txt):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Basename;
-my $basename_cmd = 'basename /path/to/file.txt .txt';
-my $basename_output = qx{$basename_cmd};
-$CHILD_ERROR = $? >> 8;
-print $basename_output;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("basename", "/path/to/file.txt", ".txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -27,12 +24,9 @@ print "basename /path/to/file.txt .txt .bak: $basename_multi";
 
 print "\nbasename with zero suffix (-s ''):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Basename;
-my $basename_cmd = q{basename -s '' /path/to/file.txt};
-my $basename_output = qx{$basename_cmd};
-$CHILD_ERROR = $? >> 8;
-print $basename_output;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("basename", "-s", "", "/path/to/file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -43,12 +37,9 @@ print "Multiple paths: $basename_paths";
 
 print "\nbasename with directory:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Basename;
-my $basename_cmd = 'basename /home/user/documents/';
-my $basename_output = qx{$basename_cmd};
-$CHILD_ERROR = $? >> 8;
-print $basename_output;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("basename", "/home/user/documents/"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -59,12 +50,9 @@ print "Current directory: $basename_current";
 
 print "\nbasename with parent directory:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Basename;
-my $basename_cmd = 'basename ..';
-my $basename_output = qx{$basename_cmd};
-$CHILD_ERROR = $? >> 8;
-print $basename_output;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("basename", ".."); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -75,12 +63,9 @@ print "Root directory: $basename_root";
 
 print "\nbasename with empty string:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Basename;
-my $basename_cmd = q{basename ''};
-my $basename_output = qx{$basename_cmd};
-$CHILD_ERROR = $? >> 8;
-print $basename_output;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("basename", ""); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -91,12 +76,9 @@ print "Relative path: $basename_relative";
 
 print "\nbasename with hidden file:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Basename;
-my $basename_cmd = 'basename /path/to/.hidden.txt';
-my $basename_output = qx{$basename_cmd};
-$CHILD_ERROR = $? >> 8;
-print $basename_output;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("basename", "/path/to/.hidden.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -107,12 +89,9 @@ print "File without extension: $basename_no_ext";
 
 print "\nbasename with multiple extensions:\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Basename;
-my $basename_cmd = 'basename /path/to/file.txt.bak .txt.bak';
-my $basename_output = qx{$basename_cmd};
-$CHILD_ERROR = $? >> 8;
-print $basename_output;
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("basename", "/path/to/file.txt.bak", ".txt.bak"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 

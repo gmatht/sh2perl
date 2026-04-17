@@ -23,6 +23,7 @@ print "\nPipeline with multiple commands (cat | grep | wc):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "a", "|", "wc", "-l"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -35,6 +36,7 @@ print "\nPipeline with sed and awk:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "sed", "s/a/A/g", "|", "awk", "{print toupper($0)}"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -49,6 +51,7 @@ print "\nPipeline with tr and sort:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "tr", "a-z", "A-Z", "|", "sort"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -61,6 +64,7 @@ print "\nPipeline with grep and head:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "e", "|", "head", "-2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -73,6 +77,7 @@ print "\nPipeline with multiple filters:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "a", "|", "sort", "|", "head", "-3"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -85,12 +90,13 @@ print "\nPipeline with tee:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "a", "|", "tee", "pipeline_output.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
 if (-f "pipeline_output.txt") {
     print "Pipeline output file created\n";
-    my $output_content = do { open my $fh, '<', 'pipeline_output.txt' or die 'cat: ' . 'pipeline_output.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; }
+    my $output_content = do { open my $fh, '<', 'pipeline_output.txt' or die 'cat: ' . 'pipeline_output.txt' . ': ' . $! . "\n"; local $/ = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $! . "\n"; $chunk; }
 ;
     print "Output content: $output_content";
 }

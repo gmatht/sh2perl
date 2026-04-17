@@ -9,10 +9,9 @@ $ENV{LC_ALL} = 'C';
 
 print "Using " . "sys" . "tem" . "() to call touch (create file):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-my $MAGIC_202301011200 = 202301011200;
-do { my $touch_cmd = 'touch -t 202301011200 test_touch_file.txt'; qx{$touch_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-t", "202301011200", "test_touch_file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 print -f "test_touch_file.txt" ? "File created successfully\n" : "File creation failed\n";
@@ -35,10 +34,9 @@ print "Multiple files created successfully\n" if -f "test_touch_file1.txt" && -f
 
 print "\ntouch with verbose (-v):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-my $MAGIC_202301011200 = 202301011200;
-do { my $touch_cmd = 'touch -v -t 202301011200 test_touch_verbose.txt'; qx{$touch_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-v", "-t", "202301011200", "test_touch_verbose.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -65,9 +63,9 @@ print -f "test_touch_no_create.txt" ? "File already existed\n" : "File not creat
 
 print "\ntouch with reference (-r):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-do { my $touch_cmd = 'touch -r test_touch_file.txt test_touch_reference.txt'; qx{$touch_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-r", "test_touch_file.txt", "test_touch_reference.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 print "File created with reference timestamp\n" if -f "test_touch_reference.txt";
@@ -90,9 +88,9 @@ print "File created with specific timestamp\n" if -f "test_touch_time.txt";
 
 print "\ntouch with date (-d '2023-01-01 12:00:00'):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-do { my $touch_cmd = q{touch -d '2023-01-01 12:00:00' test_touch_date.txt}; qx{$touch_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-d", "2023-01-01 12:00:00", "test_touch_date.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 print "File created with specific date\n" if -f "test_touch_date.txt";
@@ -115,9 +113,9 @@ print "Access time updated\n";
 
 print "\ntouch with modification time (-m):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-do { my $touch_cmd = 'touch -m test_touch_file.txt'; qx{$touch_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-m", "test_touch_file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 print "Modification time updated\n";
@@ -140,9 +138,9 @@ print "Both access and modification times updated\n";
 
 print "\ntouch with no dereference (-h):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-do { my $touch_cmd = 'touch -h test_touch_no_deref.txt'; qx{$touch_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-h", "test_touch_no_deref.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 print "File created with no dereference\n" if -f "test_touch_no_deref.txt";
@@ -154,9 +152,9 @@ print -f "test_touch_error.txt" ? "File created successfully\n" : "File creation
 
 print "\ntouch with specific mode (--mode=644):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-do { my $touch_cmd = 'touch --mode=644 test_touch_mode.txt'; qx{$touch_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "--mode=644", "test_touch_mode.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 print "File created with specific mode\n" if -f "test_touch_mode.txt";

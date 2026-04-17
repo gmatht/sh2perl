@@ -25,6 +25,7 @@ print "\ncat with multiple files using " . "sys" . "tem" . "():\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_file1.txt", "test_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -67,6 +68,7 @@ print "\ncat with non-printing characters (cat -v):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-v", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -79,6 +81,7 @@ print "\ncat with tabs (cat -T):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-T", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 

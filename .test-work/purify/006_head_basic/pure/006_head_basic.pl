@@ -19,6 +19,7 @@ print "\nhead -n 5 (first 5 lines):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-n", "5", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -31,6 +32,7 @@ print "\nhead -n 1 (first line only):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-n", "1", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -43,6 +45,7 @@ print "\nhead -c 50 (first 50 characters):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-c", "50", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -96,6 +99,7 @@ print "\nhead -v (verbose mode, with filename):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-v", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 

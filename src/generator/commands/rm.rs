@@ -76,8 +76,14 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
                     output.push_str("my $err;\n");
+                    // Ensure File::Path is available when this snippet is
+                    // emitted inline (backticks) where a top-level
+                    // "use File::Path" may not have been generated.
                     output.push_str(&generator.indent());
-                    output.push_str("remove_tree($file_to_remove, {error => \\$err});\n");
+                    output.push_str("require File::Path;\n");
+                    output.push_str(&generator.indent());
+                    output
+                        .push_str("File::Path::remove_tree($file_to_remove, {error => \\$err});\n");
                     output.push_str(&generator.indent());
                     output.push_str("if (@{$err}) {\n");
                     generator.indent_level += 1;
@@ -236,9 +242,13 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
                     output.push_str("my $err;\n");
+                    // Ensure File::Path is available when this snippet is
+                    // emitted inline so remove_tree() is defined.
+                    output.push_str(&generator.indent());
+                    output.push_str("require File::Path;\n");
                     output.push_str(&generator.indent());
                     output.push_str(&format!(
-                        "remove_tree({}, {{error => \\$err}});\n",
+                        "File::Path::remove_tree({}, {{error => \\$err}});\n",
                         quoted_file
                     ));
                     output.push_str(&generator.indent());

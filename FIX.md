@@ -73,8 +73,40 @@ Files changed
 
 Why this is minimal and safe
 ---------------------------
-This only changes how purify.pl locates system() calls in the parsed
-Perl AST; it does not change the conversion logic or the Rust
-debashc behaviour. It fixes the specific failing example
-examples.impurl/036_control_flow_basic.pl where loop headers were
-being mistaken for system() arguments.
+  This only changes how purify.pl locates system() calls in the parsed
+  Perl AST; it does not change the conversion logic or the Rust
+  debashc behaviour. It fixes the specific failing example
+  examples.impurl/036_control_flow_basic.pl where loop headers were
+  being mistaken for system() arguments.
+
+Fix: tolerate non-executable debashc binary in test harness
+---------------------------------------------------------
+Problem
+-------
+The test harness (test_purify.pl) previously required the debashc
+binary to be present and executable at target/debug/debashc. In some
+environments the file may exist but lack the executable bit (for
+example due to umask or filesystem extraction), causing the test to
+fail early with a confusing "not found" message.
+
+Fix
+---
+Modify test_purify.pl to: (1) try the .exe suffix on Windows when the
+plain name isn't executable, (2) if the file exists but isn't
+executable on Unix-like systems, attempt chmod +x on it, and (3) only
+error out when the file truly doesn't exist or cannot be made
+executable. This makes the test harness more robust in CI and local
+builds where file modes may differ.
+
+Files changed
+-------------
+- test_purify.pl: attempt to set the executable bit on the built
+  debashc binary when present but not executable; improve error
+  messaging.
+
+Why this is minimal and safe
+---------------------------
+This change only affects the test harness and is a small, defensive
+improvement to avoid spurious failures when the debashc binary exists
+but lacks execute permissions. It does not change any code generation
+paths or runtime behaviour of the debashc program itself.

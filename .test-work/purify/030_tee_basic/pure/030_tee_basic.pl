@@ -11,7 +11,7 @@ print "Output: $tee_output";
 
 if (-f "test_tee_output.txt") {
     print "File created successfully\n";
-    my $file_content = do { open my $fh, '<', 'test_tee_output.txt' or die 'cat: ' . 'test_tee_output.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; }
+    my $file_content = do { open my $fh, '<', 'test_tee_output.txt' or die 'cat: ' . 'test_tee_output.txt' . ': ' . $! . "\n"; local $/ = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $! . "\n"; $chunk; }
 ;
     print "File content: $file_content";
 }
@@ -20,6 +20,7 @@ print "\ntee with append (-a):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is another line", "|", "tee", "-a", "test_tee_output.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -36,6 +37,7 @@ print "\ntee with ignore interrupts (-i):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This line ignores interrupts", "|", "tee", "-i", "test_tee_interrupt.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -48,6 +50,7 @@ print "\ntee with append and multiple files:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "Appended line", "|", "tee", "-a", "test_tee1.txt", "test_tee2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -60,6 +63,7 @@ print "\ntee with null output:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This goes to null", "|", "tee", "/dev/null"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -72,6 +76,7 @@ print "\ntee with append and ignore interrupts:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "Appended with ignore interrupts", "|", "tee", "-a", "-i", "test_tee_append_interrupt.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 

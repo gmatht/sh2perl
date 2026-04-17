@@ -130,9 +130,17 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             output.push_str(&generator.indent());
             output.push_str("}\n");
 
-            // Perform the move
+            // Perform the move. Use require File::Copy; and fully-qualified
+            // call to ensure the function is available when this snippet is
+            // emitted in inline mode (backticks) where a top-level "use
+            // File::Copy" may not have been generated.
             output.push_str(&generator.indent());
-            output.push_str(&format!("if ( move( {}, $dest ) ) {{\n", source));
+            output.push_str("require File::Copy;\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "if ( File::Copy::move( {}, $dest ) ) {{\n",
+                source
+            ));
             generator.indent_level += 1;
             if verbose {
                 output.push_str(&generator.indent());
