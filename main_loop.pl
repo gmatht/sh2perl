@@ -141,8 +141,11 @@ while (1) {
                 next unless defined $ln && $ln =~ /\S/;
                 if ($ln =~ /KEEP/i) { $decision = 'KEEP'; last; }
                 if ($ln =~ /STASH/i) { $decision = 'STASH'; last; }
-                # If last non-empty line contains neither, fall through to default
-                last;
+                # If this non-empty line doesn't contain a decision token,
+                # continue scanning earlier non-empty lines instead of
+                # stopping immediately. This ensures we find KEEP/STASH
+                # anywhere in the output rather than only in the last
+                # non-empty line.
             }
         }
 
