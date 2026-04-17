@@ -154,10 +154,13 @@ while (1) {
             my $msg = $passed == $old_max ? "WIP accepted (tests: ${passed})" : "Keep changes (tests: ${old_max}->${passed})";
             system('git', 'commit', '.', '-m', $msg);
         } else {
-		#print "Stashing changes...\n";
-		#system('git', 'stash', 'push', '-m', "auto-stash: tests ${old_max}->${passed}");
-		print "No Decision made!";
-		die;
+        	if ($decision eq 'STASH') {
+			print "Stashing changes...\n";
+			system('git', 'stash', 'push', '-m', "auto-stash: tests ${old_max}->${passed}");
+		} else {
+			print "No Decision made! ($decision)";
+			die;
+		}
         }
 
     }
