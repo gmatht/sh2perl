@@ -608,6 +608,14 @@ sub generate_exec_do_block {
     }
     $block .= '); die "exec failed: " . $!; } else { waitpid($pid, 0); }';
 
+    # Ensure the generated block yields the same return value as Perl's
+    # built-in system() so assignments like `my $r = system(...);` and
+    # checks like `if (system(...) == 0)` continue to work. The
+    # do{ ... } wrapper used during replacement will return the value of
+    # the last expression, so append '$?;' here to return the raw status
+    # value as system() would.
+    $block .= ' $?;';
+
     # Return the generated code as a simple statement sequence so
     # replace_system_call_with_code can insert it cleanly.
     return $block . "\n";
@@ -732,14 +740,26 @@ sub replace_system_call_with_code {
     my $statement = $system_call;
     return unless $statement->isa('PPI::Statement');
     
-    # Wrap the generated code so it stays a single statement in the original tree.
-    # Use set_content on the existing statement which is more robust than
-    # parsing the replacement into a separate PPI::Document and cloning
-    # individual child nodes. Some replacement snippets can confuse the
-    # child(0) selection and lead to partially-applied replacements which
-    # produce invalid Perl (unbalanced braces/parentheses). Setting the
-    # full statement content directly keeps the replacement atomic.
-    my $wrapped_code = "do {\n$replacement_code\n};";
+    # Preserve any left-hand assignment (e.g. `my $r = system(...);`) by
+    # inspecting the PPI AST rather than relying on brittle regexes.
+    # Find a top-level '=' operator in the statement's immediate children
+    # and treat everything up to and including that operator as the LHS.
+    my @children = $statement->children;
+    my $lhs;
+    for (my $i = 0; $i <= $#children; $i++) {
+        my $ch = $children[$i];
+        # Look only for the plain assignment operator '=' (not '==' or '=>' etc.)
+        if ($ch && $ch->isa('PPI::Token::Operator') && $ch->content eq '=') {
+            # Reconstruct the LHS including any intervening whitespace/tokens
+            my $lhs_content = join('', map { defined $_ ? $_->content : '' } @children[0 .. $i]);
+            $lhs = $lhs_content;
+            last;
+        }
+    }
+
+    my $wrapped_code = defined $lhs
+        ? ($lhs . " do {\n" . $replacement_code . "\n};")
+        : ("do {\n" . $replacement_code . "\n};");
     # Attempt to atomically set the statement content if supported. This
     # is the simplest and safest approach because PPI will reparse the
     # statement content in-place, avoiding partial-clone issues seen when

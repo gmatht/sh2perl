@@ -31,6 +31,7 @@ print "\nwc -l (line count only):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-l", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -38,6 +39,7 @@ print "\nwc -w (word count only):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-w", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -45,6 +47,7 @@ print "\nwc -c (character count only):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-c", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -113,6 +116,7 @@ print "\nwc -L (maximum line length):\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-L", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -135,6 +139,7 @@ print "\nwc with totals on multiple files:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "test_wc.txt", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 

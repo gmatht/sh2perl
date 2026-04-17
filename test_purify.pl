@@ -54,11 +54,30 @@ my $workspace_root = File::Spec->catdir($repo_root, '.test-work', 'purify');
 make_path($workspace_root);
 my $purify_pl = File::Spec->catfile($repo_root, 'purify.pl');
 my $debashc_path = File::Spec->catfile($repo_root, 'target', 'debug', 'debashc');
-if ($^O eq 'MSWin32' && !-x $debashc_path) {
+# On Windows try the .exe suffix if the plain name isn't executable
+if ($^O eq 'MSWin32' && !-x $debashc_path && -f "$debashc_path.exe") {
     $debashc_path .= '.exe';
 }
-if (!-x $debashc_path) {
+
+# If the file doesn't exist, error out.
+if (!-e $debashc_path) {
     die "Error: debashc not found at '$debashc_path'. Please build the project first with 'cargo build'\n";
+}
+
+# If the file exists but is not executable, attempt to set the executable
+# bit on Unix-like systems so the test harness can run it. If chmod fails
+# or we're on Windows and the file isn't executable, bail with an error.
+if (!-x $debashc_path) {
+    if ($^O ne 'MSWin32') {
+        my $ok = chmod 0755, $debashc_path;
+        if ($ok) {
+            print "Notice: set executable bit on '$debashc_path'\n" if $verbose;
+        } else {
+            die "Error: debashc exists at '$debashc_path' but is not executable and chmod failed. Please run 'chmod +x $debashc_path' or rebuild with cargo.\n";
+        }
+    } else {
+        die "Error: debashc not found or not executable at '$debashc_path'. Please build the project first with 'cargo build'\n";
+    }
 }
 
 # Enhanced debugging functions

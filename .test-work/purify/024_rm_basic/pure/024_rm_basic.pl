@@ -1,3 +1,4 @@
+use Carp;
 #!/usr/bin/perl
 BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/024_rm_basic.pl" }
 
@@ -13,63 +14,23 @@ print $fh2 "This is another test file\n";
 close($fh2);
 
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Path qw(make_path);
-my $err;
-if ( !-d 'test_rm_dir' ) {
-    make_path( 'test_rm_dir', { error => \$err } );
-    if ( @{$err} ) {
-        croak "mkdir: cannot create directory " . 'test_rm_dir' . ": $err->[0]\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_rm_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_rm_dir/file3.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_rm_dir/file3.txt";
-}
-else {
-    if ( open my $fh, '>', "test_rm_dir/file3.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_rm_dir/file3.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_dir/file3.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
 print "Using " . "sys" . "tem" . "() to call rm (remove file):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "test_rm_file1.txt" ) {
-    if ( -d "test_rm_file1.txt" ) {
-        croak "rm: ", "test_rm_file1.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "test_rm_file1.txt" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            croak "rm: cannot remove ", "test_rm_file1.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 1;
-    croak "rm: ", "test_rm_file1.txt", ": No such file or directory\n";
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "test_rm_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 if (!-f "test_rm_file1.txt") {
@@ -80,29 +41,9 @@ if (!-f "test_rm_file1.txt") {
 
 print "\nrm with verbose (-v):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "test_rm_file2.txt" ) {
-    if ( -d "test_rm_file2.txt" ) {
-        croak "rm: ", "test_rm_file2.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "test_rm_file2.txt" ) {
-            $main_exit_code = 0;
-            print "removed '" . "test_rm_file2.txt" . "'\n";
-        }
-        else {
-            croak "rm: cannot remove ", "test_rm_file2.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 1;
-    croak "rm: ", "test_rm_file2.txt", ": No such file or directory\n";
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-v", "test_rm_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -113,28 +54,15 @@ print "Force removal attempted\n";
 
 print "\nrm with interactive (-i):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_rm_interactive.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_rm_interactive.txt";
-}
-else {
-    if ( open my $fh, '>', "test_rm_interactive.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_rm_interactive.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_interactive.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-do { my $rm_cmd = 'rm -i test_rm_interactive.txt'; qx{$rm_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-i", "test_rm_interactive.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -145,7 +73,8 @@ my $rm_recursive = do {
             if ( -e "test_rm_dir" ) {
                 if ( -d "test_rm_dir" ) {
                     my $err;
-                    remove_tree("test_rm_dir", {error => \$err});
+                    require File::Path;
+                    File::Path::remove_tree("test_rm_dir", {error => \$err});
                     if (@{$err}) {
                         croak "rm: cannot remove ", "test_rm_dir", ": $err->[0]\n";
                     }
@@ -159,7 +88,7 @@ my $rm_recursive = do {
                     }
                     else {
                         croak "rm: cannot remove ", "test_rm_dir",
-                          ": $OS_ERROR\n";
+                          ": $!\n";
                     }
                 }
             }
@@ -182,84 +111,27 @@ if (!-d "test_rm_dir") {
 
 print "\nrm with recursive and force (-rf):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Path qw(make_path);
-my $err;
-if ( !-d 'test_rm_dir2/subdir' ) {
-    make_path( 'test_rm_dir2/subdir', { error => \$err } );
-    if ( @{$err} ) {
-        croak "mkdir: cannot create directory " . 'test_rm_dir2/subdir' . ": $err->[0]\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_rm_dir2/subdir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_rm_dir2/file.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_rm_dir2/file.txt";
-}
-else {
-    if ( open my $fh, '>', "test_rm_dir2/file.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_rm_dir2/file.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_dir2/file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_rm_dir2/subdir/file2.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_rm_dir2/subdir/file2.txt";
-}
-else {
-    if ( open my $fh, '>', "test_rm_dir2/subdir/file2.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_rm_dir2/subdir/file2.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_dir2/subdir/file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "test_rm_dir2" ) {
-    if ( -d "test_rm_dir2" ) {
-        my $err;
-        remove_tree("test_rm_dir2", {error => \$err});
-        if (@{$err}) {
-            carp "rm: carping: could not remove ", "test_rm_dir2", ": $err->[0]\n";
-        }
-        else {
-            $main_exit_code = 0;
-        }
-    }
-    else {
-        if ( unlink "test_rm_dir2" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            carp "rm: carping: could not remove ", "test_rm_dir2",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_dir2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -270,23 +142,15 @@ print $rm_preserve;
 
 print "\nrm with one file " . "sys" . "tem" . " (-x):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Path qw(make_path);
-my $err;
-if ( !-d 'test_rm_xfs' ) {
-    make_path( 'test_rm_xfs', { error => \$err } );
-    if ( @{$err} ) {
-        croak "mkdir: cannot create directory " . 'test_rm_xfs' . ": $err->[0]\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_rm_xfs"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-do { my $rm_cmd = 'rm -x test_rm_xfs'; qx{$rm_cmd}; };
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-x", "test_rm_xfs"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -297,43 +161,18 @@ print $rm_no_deref;
 
 print "\nrm with ignore missing (-f):\n";
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "nonexistent_file.txt" ) {
-    if ( -d "nonexistent_file.txt" ) {
-        carp "rm: carping: ", "nonexistent_file.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "nonexistent_file.txt" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            carp "rm: carping: could not remove ", "nonexistent_file.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-f", "nonexistent_file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 print "Ignored missing file\n";
 
 print "\nrm with directory (-d):\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-use File::Path qw(make_path);
-my $err;
-if ( !-d 'test_rm_empty_dir' ) {
-    make_path( 'test_rm_empty_dir', { error => \$err } );
-    if ( @{$err} ) {
-        croak "mkdir: cannot create directory " . 'test_rm_empty_dir' . ": $err->[0]\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_rm_empty_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 my $rm_dir = do {
@@ -355,123 +194,27 @@ if (!-d "test_rm_empty_dir") {
 
 print "\nrm with multiple files:\n";
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_rm_multi1.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_rm_multi1.txt";
-}
-else {
-    if ( open my $fh, '>', "test_rm_multi1.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_rm_multi1.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_multi1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_rm_multi2.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_rm_multi2.txt";
-}
-else {
-    if ( open my $fh, '>', "test_rm_multi2.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_rm_multi2.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_multi2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use POSIX qw(time);
-if ( -e "test_rm_multi3.txt" ) {
-    my $current_time = time;
-    utime $current_time, $current_time, "test_rm_multi3.txt";
-}
-else {
-    if ( open my $fh, '>', "test_rm_multi3.txt" ) {
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        croak "touch: cannot create ", "test_rm_multi3.txt",
-          ": $ERRNO\n";
-    }
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_multi3.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "test_rm_multi1.txt" ) {
-    if ( -d "test_rm_multi1.txt" ) {
-        croak "rm: ", "test_rm_multi1.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "test_rm_multi1.txt" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            croak "rm: cannot remove ", "test_rm_multi1.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 1;
-    croak "rm: ", "test_rm_multi1.txt", ": No such file or directory\n";
-}
-if ( -e "test_rm_multi2.txt" ) {
-    if ( -d "test_rm_multi2.txt" ) {
-        croak "rm: ", "test_rm_multi2.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "test_rm_multi2.txt" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            croak "rm: cannot remove ", "test_rm_multi2.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 1;
-    croak "rm: ", "test_rm_multi2.txt", ": No such file or directory\n";
-}
-if ( -e "test_rm_multi3.txt" ) {
-    if ( -d "test_rm_multi3.txt" ) {
-        croak "rm: ", "test_rm_multi3.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "test_rm_multi3.txt" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            croak "rm: cannot remove ", "test_rm_multi3.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 1;
-    croak "rm: ", "test_rm_multi3.txt", ": No such file or directory\n";
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "test_rm_multi1.txt", "test_rm_multi2.txt", "test_rm_multi3.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 print "Multiple files removed\n";
@@ -480,119 +223,27 @@ unlink('test_rm_file1.txt') if -f 'test_rm_file1.txt';
 unlink('test_rm_file2.txt') if -f 'test_rm_file2.txt';
 unlink('test_rm_interactive.txt') if -f 'test_rm_interactive.txt';
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "test_rm_dir" ) {
-    if ( -d "test_rm_dir" ) {
-        my $err;
-        remove_tree("test_rm_dir", {error => \$err});
-        if (@{$err}) {
-            carp "rm: carping: could not remove ", "test_rm_dir", ": $err->[0]\n";
-        }
-        else {
-            $main_exit_code = 0;
-        }
-    }
-    else {
-        if ( unlink "test_rm_dir" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            carp "rm: carping: could not remove ", "test_rm_dir",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "test_rm_dir2" ) {
-    if ( -d "test_rm_dir2" ) {
-        my $err;
-        remove_tree("test_rm_dir2", {error => \$err});
-        if (@{$err}) {
-            carp "rm: carping: could not remove ", "test_rm_dir2", ": $err->[0]\n";
-        }
-        else {
-            $main_exit_code = 0;
-        }
-    }
-    else {
-        if ( unlink "test_rm_dir2" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            carp "rm: carping: could not remove ", "test_rm_dir2",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_dir2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "test_rm_xfs" ) {
-    if ( -d "test_rm_xfs" ) {
-        my $err;
-        remove_tree("test_rm_xfs", {error => \$err});
-        if (@{$err}) {
-            carp "rm: carping: could not remove ", "test_rm_xfs", ": $err->[0]\n";
-        }
-        else {
-            $main_exit_code = 0;
-        }
-    }
-    else {
-        if ( unlink "test_rm_xfs" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            carp "rm: carping: could not remove ", "test_rm_xfs",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_xfs"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use File::Path qw(make_path remove_tree);
-if ( -e "test_rm_empty_dir" ) {
-    if ( -d "test_rm_empty_dir" ) {
-        my $err;
-        remove_tree("test_rm_empty_dir", {error => \$err});
-        if (@{$err}) {
-            carp "rm: carping: could not remove ", "test_rm_empty_dir", ": $err->[0]\n";
-        }
-        else {
-            $main_exit_code = 0;
-        }
-    }
-    else {
-        if ( unlink "test_rm_empty_dir" ) {
-            $main_exit_code = 0;
-        }
-        else {
-            carp "rm: carping: could not remove ", "test_rm_empty_dir",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
+my $pid = fork;
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_empty_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 

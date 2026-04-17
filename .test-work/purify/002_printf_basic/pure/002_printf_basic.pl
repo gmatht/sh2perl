@@ -8,6 +8,7 @@ print "Using " . "sys" . "tem" . "() to call printf:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Hello, %s!\\n", "World"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -24,31 +25,37 @@ print "\nprintf with different format types:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Integer: %d\\n", '42'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Float: %.2f\\n", '3.14159'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "String: %s\\n", "test"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Character: %c\\n", '65'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };  
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Hexadecimal: %x\\n", '255'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Octal: %o\\n", '64'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
@@ -79,11 +86,13 @@ print "\nprintf with precision:\n";
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "%.3f\\n", '3.14159265359'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 do {
 my $pid = fork;
 if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "%.2e\\n", '1234567.89'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+$?;
 
 };
 
