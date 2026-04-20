@@ -110,3 +110,33 @@ This change only affects the test harness and is a small, defensive
 improvement to avoid spurious failures when the debashc binary exists
 but lacks execute permissions. It does not change any code generation
 paths or runtime behaviour of the debashc program itself.
+
+Fix: Recombine split short-options when serializing shell commands
+-----------------------------------------------------------------
+Problem
+-------
+When reconstructing shell command strings from the parsed AST, some short
+options that were originally combined (for example "-nr") could be split into
+two separate tokens ("-n", "r"). When the generator naively joined tokens with
+spaces this produced strings like "-n r" which many utilities interpret as a
+filename "r" instead of the combined flag.
+
+Fix
+---
+Post-process argument lists when generating shell command strings to conservatively
+merge occurrences where a token of the form "-x" is immediately followed by a
+single ASCII letter token. For example ["-n", "r"] becomes ["-nr"]. This is
+applied in the bash/string generation code paths used for system/inline commands
+and process-substitution generation.
+
+Files changed
+-------------
+- src/generator/redirects.rs: merge short-option fragments in generate_bash_command_string
+- src/generator/commands/system_commands.rs: merge short-option fragments in generate_command_string_for_system_impl
+
+Why this is minimal and safe
+---------------------------
+The change is conservative (only merges when the second token is a single ASCII
+letter) and limited to the serialization step. It avoids broad parser or AST
+changes while fixing a practical class of errors (notably "sort -nr" becoming
+"sort -n r").
