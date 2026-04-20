@@ -34,6 +34,12 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
                 || s.contains('>')
                 || s.contains('\\')
                 || s.contains('$')
+                // Treat shell glob metacharacters as requiring quoting so that
+                // patterns like "*.txt" are preserved when reconstructing
+                // shell commands for system()/qx{} conversion.
+                || s.contains('*')
+                || s.contains('?')
+                || s.contains('[')
             {
                 format!("'{}'", s.replace("'", "'\"'\"'"))
             } else {
@@ -59,6 +65,10 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
                 || result.contains('\r')
                 || result.contains('\t')
                 || result.contains(';')
+                // Preserve glob characters inside interpolated strings as well.
+                || result.contains('*')
+                || result.contains('?')
+                || result.contains('[')
             {
                 format!("'{}'", result.replace("'", "'\"'\"'"))
             } else {
@@ -73,7 +83,12 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
         _ => {
             // For other word types, convert to string and quote if needed
             let s = word.to_string();
-            if s.contains(' ') || s.contains(';') {
+            if s.contains(' ')
+                || s.contains(';')
+                || s.contains('*')
+                || s.contains('?')
+                || s.contains('[')
+            {
                 format!("'{}'", s.replace("'", "'\"'\"'"))
             } else {
                 s
@@ -90,10 +105,34 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                 .iter()
                 .map(|arg| word_to_bash_string_for_system(arg))
                 .collect();
-            if args.is_empty() {
+            // Merge short-option fragments like ["-n", "r"] -> ["-nr"] to avoid
+            // producing strings like "-n r" which would be interpreted as a filename
+            // by many commands (e.g. sort). Conservative check: only merge when the
+            // first arg is exactly two chars starting with '-' and the next is a
+            // single ASCII alphabetic character.
+            let mut merged_args: Vec<String> = Vec::with_capacity(args.len());
+            let mut i = 0;
+            while i < args.len() {
+                if i + 1 < args.len() {
+                    let a = &args[i];
+                    let b = &args[i + 1];
+                    if a.len() == 2 && a.starts_with('-') && b.len() == 1 {
+                        let ch = b.chars().next().unwrap();
+                        if ch.is_ascii_alphabetic() {
+                            merged_args.push(format!("{}{}", a, b));
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                merged_args.push(args[i].clone());
+                i += 1;
+            }
+
+            if merged_args.is_empty() {
                 simple_cmd.name.to_string()
             } else {
-                format!("{} {}", simple_cmd.name, args.join(" "))
+                format!("{} {}", simple_cmd.name, merged_args.join(" "))
             }
         }
         Command::Pipeline(pipeline) => crate::generator::redirects::generate_bash_command_string(
