@@ -187,10 +187,34 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                 .iter()
                 .map(|arg| word_to_bash_string(arg))
                 .collect();
-            if args.is_empty() {
+            // Post-process args to merge short-option fragments like ["-n", "r"] -> ["-nr"]
+            // This handles cases where the parser split combined single-dash flags into
+            // separate tokens. Be conservative: only merge when the first token is
+            // exactly two characters starting with '-' and the second token is exactly
+            // one ASCII alphabetic character.
+            let mut merged_args: Vec<String> = Vec::with_capacity(args.len());
+            let mut i = 0;
+            while i < args.len() {
+                if i + 1 < args.len() {
+                    let a = &args[i];
+                    let b = &args[i + 1];
+                    if a.len() == 2 && a.starts_with('-') && b.len() == 1 {
+                        let ch = b.chars().next().unwrap();
+                        if ch.is_ascii_alphabetic() {
+                            merged_args.push(format!("{}{}", a, b));
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                merged_args.push(args[i].clone());
+                i += 1;
+            }
+
+            if merged_args.is_empty() {
                 simple_cmd.name.to_string()
             } else {
-                format!("{} {}", simple_cmd.name, args.join(" "))
+                format!("{} {}", simple_cmd.name, merged_args.join(" "))
             }
         }
         Command::Pipeline(pipeline) => {
@@ -285,20 +309,31 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
 }
 
 // Helper function to convert Word to bash string representation
+// Decide whether a literal should be shell-quoted when reconstructing a
+// command string. Treat common glob metacharacters as special so patterns
+// like "*.txt" are preserved rather than being unintentionally expanded.
+fn needs_shell_quoting_literal(s: &str) -> bool {
+    s.contains(' ')
+        || s.contains('"')
+        || s.contains('\'')
+        || s.contains(';')
+        || s.contains('|')
+        || s.contains('&')
+        || s.contains('<')
+        || s.contains('>')
+        || s.contains('*')
+        || s.contains('?')
+        || s.contains('[')
+}
+
 fn word_to_bash_string(word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
-            // If the literal contains spaces or special characters, quote it
-            if s.contains(' ')
-                || s.contains('"')
-                || s.contains('\'')
-                || s.contains(';')
-                || s.contains('|')
-                || s.contains('&')
-                || s.contains('<')
-                || s.contains('>')
-            {
-                format!("'{}'", s.replace("'", "'\''"))
+            if needs_shell_quoting_literal(s) {
+                // Single-quote the token and escape embedded single quotes in a
+                // shell-friendly way: abc'd -> 'abc'\'''
+                let escaped = s.replace("'", "'\\'\"'");
+                format!("'{}'", escaped)
             } else {
                 s.clone()
             }
