@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 use Time::HiRes qw(sleep);
+use File::Spec;
 
 $| = 1; 
 print "Auto flush enabled\n";
@@ -29,7 +30,17 @@ my $length = 10000;
 my $start = length($output) - $length;
 $start = 0 if $start < 0; # Prevent negative start if string is too short
 my $last_10k = substr($output, $start);
-return $last_10k;
+    # Prefer the focused failure report if it exists
+    my $failure_file = File::Spec->catfile('.test-work', 'purify', 'failure_report.txt');
+    if (-e $failure_file) {
+        if (open my $ff, '<', $failure_file) {
+            local $/;
+            my $report = <$ff>;
+            close $ff;
+            return $report;
+        }
+    }
+    return $last_10k;
 }
 
 while (1) {
