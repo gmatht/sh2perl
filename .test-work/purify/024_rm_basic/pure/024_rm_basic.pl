@@ -136,7 +136,7 @@ $?;
 };
 
 print "\nrm with preserve root (--preserve-root):\n";
-my $rm_preserve = do { my $command = 'rm -r f / 2> /dev/null || echo Protected from removing root'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
+my $rm_preserve = do { my $command = 'rm -rf / 2> /dev/null || echo Protected from removing root'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print $rm_preserve;
 

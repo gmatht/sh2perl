@@ -40,19 +40,18 @@ pub fn generate_gzip_command(
         // No files specified, compress/decompress input
         if decompress_mode {
             let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+            // Use a non-interpolating Perl literal for the bash -c argument so that
+            // embedded "$" sequences (e.g. from awk) are preserved verbatim.
+            let bash_cmd = format!("echo \"${}\" | gunzip 2>/dev/null", input_var);
             output.push_str(&format!(
-                "my ({});
-my {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | gunzip 2>/dev/null');
-close {} or croak 'Close failed: $OS_ERROR';
-my $decompressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
-close {} or croak 'Close failed: $OS_ERROR';
-waitpid {}, 0;\n",
+                "my ({});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $decompressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
                 in_var,
                 pid_var,
                 in_var,
                 out_var,
                 err_var,
-                input_var,
+                // embed as non-interpolating literal
+                generator.perl_string_literal_no_interp(&crate::ast::Word::literal(bash_cmd.to_string())),
                 in_var,
                 out_var,
                 out_var,
@@ -148,19 +147,16 @@ waitpid {}, 0;\n",
                 };
                 let (in_var, out_var, err_var, pid_var, _result_var) =
                     generator.get_unique_ipc_vars();
+                // Use a non-interpolating Perl literal for the bash -c argument so that
+                // embedded "$" sequences (e.g. from awk) are preserved verbatim.
                 output.push_str(&format!(
-                    "my ({});
-my {} = open3({}, {}, {}, 'bash', '-c', '{}');
-close {} or croak 'Close failed: $OS_ERROR';
-my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
-close {} or croak 'Close failed: $OS_ERROR';
-waitpid {}, 0;\n",
+                    "my ({});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
                     in_var,
                     pid_var,
                     in_var,
                     out_var,
                     err_var,
-                    gzip_cmd,
+                    generator.perl_string_literal_no_interp(&crate::ast::Word::literal(gzip_cmd.to_string())),
                     in_var,
                     out_var,
                     out_var,
