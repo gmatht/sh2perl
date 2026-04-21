@@ -109,7 +109,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             } else {
                                 // For other commands, use open3 to capture output without backticks
                                 let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
-                                format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_text, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                // Use a non-interpolating Perl literal for the bash -c argument
+                                // so that embedded "$" sequences (e.g. in awk) are preserved.
+                                format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}",
+                                    in_var, out_var, err_var, pid_var, in_var, out_var, err_var,
+                                    generator.perl_string_literal_no_interp(&Word::literal(cmd_text.to_string())),
+                                    in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         } else {
                             // Element contains backticks but not at start/end - treat as literal
