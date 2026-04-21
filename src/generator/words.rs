@@ -657,21 +657,27 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let basename_cmd = generator.generate_command_string_for_system(
                                 &Command::Simple(simple_cmd.clone()),
                             );
-                            let basename_lit =
-                                generator.perl_string_literal(&Word::literal(basename_cmd));
-                            format!("do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}", basename_lit)
+                            let basename_lit = generator
+                                .perl_string_literal_no_interp(&Word::literal(basename_cmd));
+                            format!(
+                                "do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}",
+                                basename_lit
+                            )
                         } else if name == "dirname" {
                             let dirname_cmd = generator.generate_command_string_for_system(
                                 &Command::Simple(simple_cmd.clone()),
                             );
-                            let dirname_lit =
-                                generator.perl_string_literal(&Word::literal(dirname_cmd));
-                            format!("do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}", dirname_lit)
+                            let dirname_lit = generator
+                                .perl_string_literal_no_interp(&Word::literal(dirname_cmd));
+                            format!(
+                                "do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}",
+                                dirname_lit
+                            )
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
                             let which_cmd = generator.generate_command_string_for_system(cmd);
                             let which_lit =
-                                generator.perl_string_literal(&Word::literal(which_cmd));
+                                generator.perl_string_literal_no_interp(&Word::literal(which_cmd));
                             format!(
                                 "do {{ my $which_cmd = {}; my $which_output = qx{{$which_cmd}}; $CHILD_ERROR = $? >> 8; $which_output; }}",
                                 which_lit
