@@ -121,6 +121,25 @@ sub print_output_excerpt {
     print "... truncated after $shown_lines lines ...\n" if $total_lines > $shown_lines;
 }
 
+# Write an authoritative failure report used by main_loop.pl
+sub write_failure_report {
+    my ($perl_file, $pure_file, $reason, $extra_text) = @_;
+    $reason ||= 'unknown';
+    $extra_text ||= '';
+    my $failure_file = File::Spec->catfile($workspace_root, 'failure_report.txt');
+    if (open my $fh, '>', $failure_file) {
+        print $fh "failed_test: $perl_file\n";
+        print $fh "pure_file: $pure_file\n";
+        print $fh "reason: $reason\n\n";
+
+        print $fh $extra_text;
+        close $fh;
+        debug_print(1, "Wrote failure report to $failure_file");
+    } else {
+        debug_print(1, "Failed to write failure report to $failure_file: $!");
+    }
+}
+
 # Enhanced timeout functions with fine-grained control
 sub run_system_with_timeout {
     my ($command, $timeout_type, $description) = @_;
@@ -386,6 +405,9 @@ foreach my $perl_file (@test_files) {
                         $skipped_count++;
                         $nondeterministic_skip = 1;
                         unlink $out1_path, $out2_path, $out1b_path;
+                        # Remove any prior failure report for this workspace since the test is nondeterministic
+                        my $maybe_failure = File::Spec->catfile($workspace_root, 'failure_report.txt');
+                        unlink $maybe_failure if -e $maybe_failure;
                     } else {
                         my $diff_command;
                         if ($^O eq 'MSWin32') {
@@ -396,6 +418,8 @@ foreach my $perl_file (@test_files) {
                             $diff_command = "diff -u \"$out1_path\" \"$out2_path\" 2>&1";
                         }
                         my ($diff_output, $diff_result) = run_backticks_with_timeout($diff_command, 'diff_comparison', "diff comparison");
+                        # Store the failing test and the diff into the workspace for main_loop.pl to consume
+                        write_failure_report($perl_file, $pure_file, 'output_mismatch', $diff_output);
                         print_output_excerpt("Diff excerpt", $diff_output, 8);
                         die "FAILED - Output mismatch for $perl_file -> $pure_file (diff exit code: $diff_result)\n";
                     }
@@ -411,6 +435,8 @@ foreach my $perl_file (@test_files) {
                 debug_print(1, "✗ $perl_file: purify.pl failed (exit code: $purify_result)");
                 debug_print(1, "Error output: $output");
                 print_output_excerpt("purify.pl error output", $output, 8);
+                # Record the purify.pl failure output for main_loop.pl
+                write_failure_report($perl_file, $pure_file, 'purify_execution_failed', $output);
                 $purify_failed++;
                 # Quit on first failure
                 die "Stopping on first failure. Fix the issue and run again.\n";
