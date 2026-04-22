@@ -5,25 +5,18 @@ use crate::generator::Generator;
 pub fn word_to_bash_string_for_system(word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
-            // Preserve existing shell single quotes, but re-quote double-quoted literals
-            // so shell variables like $0 do not get expanded unexpectedly.
+            // Preserve existing shell single quotes verbatim
             if s.starts_with('\'') && s.ends_with('\'') {
-                s.clone()
+                return s.clone();
             }
-            // If the literal was originally double-quoted (e.g. "*.txt"),
-            // strip the outer double quotes and re-emit as a single-quoted
-            // literal so that the reconstructed bash command preserves the
-            // literal bytes (and prevents the outer shell from expanding
-            // globs prematurely).
-            else if s.starts_with('\"') && s.ends_with('\"') {
-                // Preserve original double-quoted literals. Converting them to
-                // single-quoted strings would prevent shell variable expansion
-                // ("$VAR" -> '$VAR'), which changes semantics when the inner
-                // shell is executed via bash -c. Keep the double quotes so
-                // variables and expansions continue to work in the subshell.
-                s.clone()
-            } else if s.is_empty() {
-                "''".to_string()
+            // If the literal was originally double-quoted, keep the original
+            // double-quoted form so that inner-shell variable expansion still
+            // occurs when the reconstructed command is executed under bash -c.
+            if s.starts_with('"') && s.ends_with('"') {
+                return s.clone();
+            }
+            if s.is_empty() {
+                return "''".to_string();
             }
             // Keep common shell operator tokens verbatim so generated shell command
             // strings can contain real operators (like pipes) instead of quoted
@@ -60,30 +53,54 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
             }
         }
         Word::StringInterpolation(interp, _) => {
-            // For string interpolation, we need to convert to a bash-compatible format
-            // This is a simplified version - for complex cases we might need more work
+            // Reconstruct interpolation parts. If interpolation contains any
+            // variable or parameter expansion parts we must preserve double-quote
+            // semantics so that the inner shell expands $VAR. In that case emit
+            // a double-quoted fragment (leaving $-style tokens intact). If the
+            // interpolation contains only literal parts, fall back to the
+            // conservative quoting used for literals.
+            let mut has_var = false;
             let mut result = String::new();
             for part in &interp.parts {
                 match part {
                     StringPart::Literal(s) => result.push_str(s),
-                    StringPart::Variable(var) => result.push_str(&format!("${}", var)),
-                    _ => result.push_str("UNSUPPORTED_INTERPOLATION"),
+                    StringPart::Variable(var) => {
+                        has_var = true;
+                        result.push_str(&format!("${}", var))
+                    }
+                    StringPart::ParameterExpansion(pe) => {
+                        has_var = true;
+                        result.push_str(&format!("${{{}}}", pe.variable))
+                    }
+                    _ => {
+                        // For other complex parts, mark as variable-like to
+                        // be conservative and preserve expansion semantics
+                        has_var = true;
+                        result.push_str("$var");
+                    }
                 }
             }
+
             if result.is_empty() {
                 return "''".to_string();
             }
-            if result.contains(' ')
+
+            if has_var {
+                // We must emit a double-quoted string so the inner shell will
+                // perform expansions. Escape double-quotes and backslashes but
+                // do NOT escape $ or ${} sequences.
+                let escaped = result.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{}\"", escaped)
+            } else if result.contains(' ')
                 || result.contains('\n')
                 || result.contains('\r')
                 || result.contains('\t')
                 || result.contains(';')
-                // Preserve glob characters inside interpolated strings as well.
                 || result.contains('*')
                 || result.contains('?')
                 || result.contains('[')
             {
-                // Escape single quotes for safe embedding in single-quoted shell literals
+                // No variables, but contains characters that need quoting - use single-quote
                 format!("'{}'", result.replace("'", "'\\''"))
             } else {
                 result
