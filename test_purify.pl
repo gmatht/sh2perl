@@ -358,15 +358,35 @@ foreach my $perl_file (@test_files) {
 
                 # Check if purified file still contains system calls or backticks
                 debug_print(2, "Checking if $pure_file still contains system calls or backticks");
-                # Use a Perl one-liner to detect untranslated system(...) and backticks.
-                # Special-case: allow system('nonexistent_command') (or similar) —
-                # if the referenced command cannot be found on PATH then purify
-                # can't translate it and this should not be treated as a failure.
-                my $check_script = qq{$perl_cmd -0777 -e 'my \$f = shift; local \$/; open my \$fh, "<", \$f or exit 1; my \$s = do { local \$/; <\$fh> }; my \$failed = 0; while (\$s =~ /system\s*\(\s*(["\'])(.*?)\1\s*\)/g) { my \$cmdline = \$2; my (\$cmd) = split(/\s+/, \$cmdline); next unless \$cmd; my \$check_cmd = \$^O eq "MSWin32" ? "where \$cmd >NUL 2>&1" : "command -v \$cmd >/dev/null 2>&1"; my \$rc = system(\$check_cmd); # if command exists, it's a leftover system call -> fail
-                    if (\$rc == 0) { \$failed = 1; last; } # else command not found -> allowed
-                } # any remaining backticks are considered failures
-                if (\$s =~ /`/) { \$failed = 1; } exit(\$failed ? 1 : 0);' "$pure_file"};
-                my $grep_result = run_system_with_timeout($check_script, 'grep_check', "grep check");
+                # Use a small Perl script written to a temp file to detect
+                # untranslated system(...) and backticks. Writing a file
+                # avoids complex escaping issues when embedding the script
+                # as a one-liner.
+                my ($check_fh, $check_path) = tempfile(DIR => $workspace_root, SUFFIX => '.pl');
+                print $check_fh <<'PERL_SCRIPT';
+use strict;
+use warnings;
+my $f = shift or exit 1;
+open my $fh, '<', $f or exit 1;
+local $/;
+my $s = <$fh>;
+close $fh;
+my $failed = 0;
+while ($s =~ /system\s*\(\s*(["'])(.*?)\1\s*\)/g) {
+    my $cmdline = $2;
+    my ($cmd) = split(/\s+/, $cmdline);
+    next unless $cmd;
+    my $check_cmd = $^O eq 'MSWin32' ? "where $cmd >NUL 2>&1" : "command -v $cmd >/dev/null 2>&1";
+    my $rc = system($check_cmd);
+    # If the command exists on PATH then it's an untranslated system() call -> fail
+    if ($rc == 0) { $failed = 1; last; }
+}
+if ($s =~ /`/) { $failed = 1; }
+exit($failed ? 1 : 0);
+PERL_SCRIPT
+                close $check_fh;
+                my $grep_result = run_system_with_timeout("$perl_cmd \"$check_path\" \"$pure_file\"", 'grep_check', "grep check");
+                unlink $check_path;
                 if ( $grep_result != 0 ){
                     debug_print(1, "Failed to Purify $pure_file - still contains system calls or backticks");
                     die "Failed to Purify $pure_file - still contains system calls or backticks\n";
