@@ -102,7 +102,8 @@ eval {
     die "Command failed with exit code 127";
 };
 if ($@) {
-    print "Exception caught: $@";
+    #print "Exception caught: $@";
+    #$@ includes the path which differs
     print "Falling back to safe operation:\n";
     print join("\n", @lines), "\n";
 }

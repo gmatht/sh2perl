@@ -1029,32 +1029,43 @@ sub extract_core_perl_logic_ppi {
         push @filtered_statements, $content;
     }
 
-    my $out = @filtered_statements ? join("\n", @filtered_statements) . "\n" : $core_code;
+    # Build the output from the filtered statements (or fall back to core)
+    my @source_statements = @filtered_statements ? @filtered_statements : @core_statements;
 
     # Normalize common English.pm variable names to their punctuation
-    # equivalents so the replacement snippet behaves correctly even when
-    # we splice it into the original file without adding a top-level
-    # "use English". This avoids relying on English.pm being present
-    # and fixes cases where debashc emitted readable names like
-    # $INPUT_RECORD_SEPARATOR or $OS_ERROR which would otherwise not
-    # affect the usual variables ($/ or $!) and cause subtle bugs
-    # (for example, reading a file into a scalar via local $/ = undef).
-    $out =~ s/\$INPUT_RECORD_SEPARATOR\b/\$\//g;  # $INPUT_RECORD_SEPARATOR -> $/
-    $out =~ s/\$OS_ERROR\b/\$!/g;                 # $OS_ERROR -> $!
-    $out =~ s/\$ERRNO\b/\$!/g;                   # $ERRNO -> $!
-    # Avoid replacing $CHILD_ERROR when it's the target of an assignment
-    # (e.g. "$CHILD_ERROR = $? >> 8;"). Only replace usages that are
-    # not immediately followed by an '=' so we don't produce constructs
-    # like "$? = $? >> 8;" which are incorrect.
-    $out =~ s/\$CHILD_ERROR\b(?!\s*=)/\$\?/g;    # $CHILD_ERROR -> $? (contextual)
-    $out =~ s/\$EVAL_ERROR\b/\$\@/g;            # $EVAL_ERROR -> $@
+    # equivalents on a per-statement basis so we don't accidentally mangle
+    # 'use English' import lines (which must list the English identifiers,
+    # not the punctuation equivalents). We also avoid re-qualifying already
+    # qualified Carp helpers (e.g. Carp::croak) when normalizing.
+    my @normalized;
+    for my $stmt (@source_statements) {
+        # Preserve use English import statements verbatim
+        if ($stmt =~ /^use\s+English\b/) {
+            push @normalized, $stmt;
+            next;
+        }
 
-    # Replace Carp helpers with fully-qualified names so we don't rely on
-    # 'use Carp;' being present when the snippet is spliced into the
-    # original file. Avoid touching occurrences like $croak by ensuring
-    # the name is not preceded by a dollar sign.
-    $out =~ s/(?<!\$)\b(croak|confess)\b/Carp::$1/g;
+        my $s = $stmt;
+        $s =~ s/\$INPUT_RECORD_SEPARATOR\b/\$\//g;  # $INPUT_RECORD_SEPARATOR -> $/
+        $s =~ s/\$OS_ERROR\b/\$!/g;                 # $OS_ERROR -> $!
+        $s =~ s/\$ERRNO\b/\$!/g;                   # $ERRNO -> $!
+        # Avoid replacing $CHILD_ERROR when it's the target of an assignment
+        # (e.g. "$CHILD_ERROR = $? >> 8;"). Only replace usages that are
+        # not immediately followed by a '=' so we don't produce constructs
+        # like "$? = $? >> 8;" which are incorrect.
+        $s =~ s/\$CHILD_ERROR\b(?!\s*=)/\$\?/g;    # $CHILD_ERROR -> $? (contextual)
+        $s =~ s/\$EVAL_ERROR\b/\$\@/g;            # $EVAL_ERROR -> $@
 
+        # Replace unqualified Carp helpers with fully-qualified names so we
+        # don't rely on 'use Carp;' being present when the snippet is spliced
+        # into the original file. Avoid touching occurrences like $croak and
+        # already-qualified names like Carp::croak.
+        $s =~ s/(?<!\$)(?<!::)\b(croak|confess)\b/Carp::$1/g;
+
+        push @normalized, $s;
+    }
+
+    my $out = @normalized ? join("\n", @normalized) . "\n" : "";
     return $out;
 }
 
