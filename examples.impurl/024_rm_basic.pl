@@ -37,9 +37,10 @@ my $rm_force = `rm -f test_rm_file2.txt 2>/dev/null`;
 print "Force removal attempted\n";
 
 # rm with interactive using system()
-print "\nrm with interactive (-i):\n";
-system("touch", "test_rm_interactive.txt");
-system("rm", "-i", "test_rm_interactive.txt");
+# interactive not really suitable for automated test.
+#print "\nrm with interactive (-i):\n";
+#system("touch", "test_rm_interactive.txt");
+#system("rm", "-i", "test_rm_interactive.txt");
 
 # rm with recursive using backticks
 print "\nrm with recursive (-r):\n";
