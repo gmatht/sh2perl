@@ -468,13 +468,50 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                         result.push_str(&format!(" <<< {}", word_to_bash_string(&redirect.target)));
                     }
                     RedirectOperator::StderrOutput => {
-                        result.push_str(&format!(" 2> {}", word_to_bash_string(&redirect.target)));
+                        // When the redirection target is a numeric file descriptor (e.g. 1)
+                        // the canonical shell syntax uses an ampersand (e.g. 2>&1). If the
+                        // target serializes to a plain digit we render with the '&' form
+                        // to preserve the original semantics instead of producing "2> 1".
+                        let tgt = word_to_bash_string(&redirect.target);
+                        let tgt_unquoted =
+                            if tgt.starts_with('\'') && tgt.ends_with('\'') && tgt.len() > 1 {
+                                tgt[1..tgt.len() - 1].to_string()
+                            } else {
+                                tgt.clone()
+                            };
+                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
+                            result.push_str(&format!(" 2>&{}", tgt_unquoted));
+                        } else {
+                            result.push_str(&format!(" 2> {}", tgt));
+                        }
                     }
                     RedirectOperator::StderrAppend => {
-                        result.push_str(&format!(" 2>> {}", word_to_bash_string(&redirect.target)));
+                        let tgt = word_to_bash_string(&redirect.target);
+                        let tgt_unquoted =
+                            if tgt.starts_with('\'') && tgt.ends_with('\'') && tgt.len() > 1 {
+                                tgt[1..tgt.len() - 1].to_string()
+                            } else {
+                                tgt.clone()
+                            };
+                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
+                            result.push_str(&format!(" 2>>&{}", tgt_unquoted));
+                        } else {
+                            result.push_str(&format!(" 2>> {}", tgt));
+                        }
                     }
                     RedirectOperator::StderrInput => {
-                        result.push_str(&format!(" 2< {}", word_to_bash_string(&redirect.target)));
+                        let tgt = word_to_bash_string(&redirect.target);
+                        let tgt_unquoted =
+                            if tgt.starts_with('\'') && tgt.ends_with('\'') && tgt.len() > 1 {
+                                tgt[1..tgt.len() - 1].to_string()
+                            } else {
+                                tgt.clone()
+                            };
+                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
+                            result.push_str(&format!(" 2<&{}", tgt_unquoted));
+                        } else {
+                            result.push_str(&format!(" 2< {}", tgt));
+                        }
                     }
                     _ => {
                         // Skip other redirect types for now

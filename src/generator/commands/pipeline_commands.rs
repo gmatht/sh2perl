@@ -774,7 +774,11 @@ pub fn generate_pipeline_for_substitution(
         } else {
             generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
         };
-        let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(reconstructed_cmd));
+        // Use the force-interp helper so Perl variables in the pipeline are
+        // interpolated but control characters are encoded as backslash
+        // sequences rather than literal newlines which would create a
+        // multi-line shell script when qx{} is executed.
+        let cmd_lit = generator.perl_string_literal_force_interp(&Word::literal(reconstructed_cmd));
         format!(
             "do {{\n    my $result_{} = qx{{bash -c {} }};\n    chomp $result_{};\n    $result_{};\n}}",
             unique_id, cmd_lit, unique_id, unique_id
