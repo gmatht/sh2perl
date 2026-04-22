@@ -16,9 +16,12 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
             // literal bytes (and prevents the outer shell from expanding
             // globs prematurely).
             else if s.starts_with('\"') && s.ends_with('\"') {
-                let inner = &s[1..s.len() - 1];
-                // Escape single quotes for safe embedding in single-quoted shell literals
-                format!("'{}'", inner.replace("'", "'\\''"))
+                // Preserve original double-quoted literals. Converting them to
+                // single-quoted strings would prevent shell variable expansion
+                // ("$VAR" -> '$VAR'), which changes semantics when the inner
+                // shell is executed via bash -c. Keep the double quotes so
+                // variables and expansions continue to work in the subshell.
+                s.clone()
             } else if s.is_empty() {
                 "''".to_string()
             }
@@ -43,7 +46,6 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
                 || s.contains('<')
                 || s.contains('>')
                 || s.contains('\\')
-                || s.contains('$')
                 // Treat shell glob metacharacters as requiring quoting so that
                 // patterns like "*.txt" are preserved when reconstructing
                 // shell commands for system()/qx{} conversion.
@@ -187,6 +189,12 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                 Command::For(for_loop) => {
                     // For loops need to be handled as Perl code, not system commands
                     generator.generate_for_loop(for_loop)
+                }
+                Command::Block(_block) => {
+                    // Serialize a subshell block (multiple commands) into a bash string
+                    // Delegate to the redirects helper which knows how to join inner
+                    // commands with "; " so constructs like (cmd1; cmd2) round-trip.
+                    crate::generator::redirects::generate_bash_command_string(&**subshell_cmd)
                 }
                 _ => {
                     // For complex commands, generate proper Perl code instead of debug representation

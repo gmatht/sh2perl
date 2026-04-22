@@ -68,6 +68,7 @@ print $multi_wc;
 
 print "\nwc from stdin (echo | wc):\n";
 do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use IPC::Open3;
 {
     my $output_0;
@@ -75,6 +76,7 @@ use IPC::Open3;
     my $pipeline_success_0 = 1;
     $output_0 .= 'This is a test line' . "\n";
 if ( !($output_0 =~ m{\n\z}msx) ) { $output_0 .= "\n"; }
+$CHILD_ERROR = 0;
 
         use IPC::Open3;
     my @wc_args_0_1 = ();

@@ -420,6 +420,19 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                 .collect();
             parts.join("; ")
         }
+        Command::Assignment(assign) => {
+            // Serialize shell-style variable assignments (e.g. VAR=value)
+            // Use the existing word->bash-string helper to quote the value
+            let val = word_to_bash_string(&assign.value);
+            match assign.operator {
+                AssignmentOperator::Assign => format!("{}={}", assign.variable, val),
+                AssignmentOperator::PlusAssign => format!("{}+={}", assign.variable, val),
+                AssignmentOperator::MinusAssign => format!("{}-={}", assign.variable, val),
+                AssignmentOperator::StarAssign => format!("{}*={}", assign.variable, val),
+                AssignmentOperator::SlashAssign => format!("{}/={}", assign.variable, val),
+                AssignmentOperator::PercentAssign => format!("{}%={}", assign.variable, val),
+            }
+        }
         Command::Redirect(redirect_cmd) => {
             // For redirects, we need to generate the base command and redirects
             let base_cmd = if let Command::Simple(cmd) = &*redirect_cmd.command {

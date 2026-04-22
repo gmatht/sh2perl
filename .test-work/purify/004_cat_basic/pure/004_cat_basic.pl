@@ -41,12 +41,14 @@ if (-f "combined.txt") {
 
 print "\ncat from stdin (echo | cat):\n";
 do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 {
     my $output_0;
     my $output_printed_0;
     my $pipeline_success_0 = 1;
     $output_0 .= 'This is from stdin' . "\n";
 if ( !($output_0 =~ m{\n\z}msx) ) { $output_0 .= "\n"; }
+$CHILD_ERROR = 0;
 
         if ($output_0 ne q{} && !defined $output_printed_0) {
         print $output_0;

@@ -220,6 +220,11 @@ Files changed
   generate_bash_command_string which maps inner commands through the same
   generator and joins them with "; ".
 
+- src/generator/commands/system_commands.rs: ensure Command::Block inside
+  Command::Subshell is handled by delegating to generate_bash_command_string so
+  subshells with multiple commands (e.g. (cmd1; cmd2)) serialize into proper
+  bash strings instead of falling back to the placeholder message.
+
 Why this is minimal and safe
 ---------------------------
 The change is localized to the string-serialization helper used when a Perl

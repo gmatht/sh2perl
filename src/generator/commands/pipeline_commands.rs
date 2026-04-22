@@ -179,7 +179,10 @@ fn generate_command_using_builtins(
                                     "close {} or croak 'Close failed: $OS_ERROR';\n",
                                     out_var
                                 ));
-                                output.push_str(&format!("waitpid {}, 0;\n", pid_var));
+                                output.push_str(&format!(
+                                    "waitpid {}, 0;\n$CHILD_ERROR = $? >> 8;\n",
+                                    pid_var
+                                ));
                             }
                         } else {
                             // For other command types, execute and capture output
@@ -211,7 +214,10 @@ fn generate_command_using_builtins(
                                 "close {} or croak 'Close failed: $OS_ERROR';\n",
                                 out_var
                             ));
-                            output.push_str(&format!("waitpid {}, 0;\n", pid_var));
+                            output.push_str(&format!(
+                                "waitpid {}, 0;\n$CHILD_ERROR = $? >> 8;\n",
+                                pid_var
+                            ));
                         }
                     } else {
                         // For non-simple commands, execute and capture output
@@ -242,7 +248,10 @@ fn generate_command_using_builtins(
                             "close {} or croak 'Close failed: $OS_ERROR';\n",
                             out_var
                         ));
-                        output.push_str(&format!("waitpid {}, 0;\n", pid_var));
+                        output.push_str(&format!(
+                            "waitpid {}, 0;\n$CHILD_ERROR = $? >> 8;\n",
+                            pid_var
+                        ));
                     }
                 }
 
