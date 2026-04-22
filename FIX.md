@@ -195,3 +195,39 @@ This change tightens a single regex used for post-processing generated snippets
 and fixes a concrete syntax-error observed in an example. It does not change
 the broader generator logic and keeps purify.pl as a thin wrapper around the
 Rust debashc output.
+
+Fix: Serialize Command::Block in bash string generation
+------------------------------------------------------
+Problem
+-------
+Subshells containing multiple commands were sometimes serialized into the
+placeholder message "Complex command not supported in bash string generation"
+when the generator recursed into a Command::Block that wasn't explicitly
+handled. That caused purify.pl to embed an echo of the placeholder into the
+generated Perl which broke behavior for examples that use subshells with
+multiple statements (e.g. examples.impurl/039_subshell_operations.pl).
+
+Fix
+---
+Handle the Command::Block variant in generate_bash_command_string by
+serializing the inner commands and joining them with "; ". This makes
+subshells like (cmd1; cmd2) round-trip correctly into bash -c invocations and
+avoids the fallback placeholder for multi-command subshells.
+
+Files changed
+-------------
+- src/generator/redirects.rs: add Command::Block arm in
+  generate_bash_command_string which maps inner commands through the same
+  generator and joins them with "; ".
+
+Why this is minimal and safe
+---------------------------
+The change is localized to the string-serialization helper used when a Perl
+snippet needs to construct a bash -c command (process substitution, qx{},
+etc.). It preserves shell semantics by joining commands with the standard
+command-separator and avoids broader changes to the AST or generator logic.
+
+Verification
+------------
+Regenerate the purified Perl for the failing example (examples.impurl/039_subshell_operations.pl)
+and confirm the placeholder no longer appears in the generated output.

@@ -408,6 +408,18 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
         Command::Subshell(subshell_cmd) => {
             format!("({})", generate_bash_command_string(&**subshell_cmd))
         }
+        Command::Block(block) => {
+            // Serialize a block (sequence of commands) by joining inner
+            // command strings with "; " so subshells like
+            // (cmd1; cmd2; cmd3) round-trip when embedded into
+            // bash -c invocations.
+            let parts: Vec<String> = block
+                .commands
+                .iter()
+                .map(|c| generate_bash_command_string(c))
+                .collect();
+            parts.join("; ")
+        }
         Command::Redirect(redirect_cmd) => {
             // For redirects, we need to generate the base command and redirects
             let base_cmd = if let Command::Simple(cmd) = &*redirect_cmd.command {
