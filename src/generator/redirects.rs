@@ -212,6 +212,163 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
             }
 
             if merged_args.is_empty() {
+                // If the parser left the entire command as a single literal (name contains
+                // spaces/operators) then re-tokenize it and quote individual tokens so
+                // shell metacharacters (like globs) are preserved when the command
+                // string is later passed to an inner shell. This is a conservative
+                // fix that avoids changing parser behavior.
+                let name_str = simple_cmd.name.to_string();
+
+                // Only attempt tokenization when the name looks like a joined command
+                if name_str.contains(' ') || name_str.contains('|') || name_str.contains(';') {
+                    // Tokenize while respecting single- and double-quotes
+                    fn tokenize_command_string(s: &str) -> Vec<String> {
+                        let mut tokens: Vec<String> = Vec::new();
+                        let mut buf = String::new();
+                        let mut chars = s.chars().peekable();
+                        let mut in_single = false;
+                        let mut in_double = false;
+                        while let Some(c) = chars.next() {
+                            if in_single {
+                                buf.push(c);
+                                if c == '\'' {
+                                    in_single = false;
+                                }
+                                continue;
+                            }
+                            if in_double {
+                                buf.push(c);
+                                if c == '"' {
+                                    in_double = false;
+                                }
+                                continue;
+                            }
+
+                            match c {
+                                '\'' => {
+                                    // begin single-quoted token (include the quote)
+                                    buf.push(c);
+                                    in_single = true;
+                                }
+                                '"' => {
+                                    // begin double-quoted token (include the quote)
+                                    buf.push(c);
+                                    in_double = true;
+                                }
+                                _ if c.is_whitespace() => {
+                                    // treat as whitespace separators
+                                    if !buf.is_empty() {
+                                        tokens.push(buf.clone());
+                                        buf.clear();
+                                    }
+                                    // skip
+                                }
+                                '|' => {
+                                    if !buf.is_empty() {
+                                        tokens.push(buf.clone());
+                                        buf.clear();
+                                    }
+                                    // check for ||
+                                    if let Some('|') = chars.peek() {
+                                        chars.next();
+                                        tokens.push("||".to_string());
+                                    } else {
+                                        tokens.push("|".to_string());
+                                    }
+                                }
+                                '&' => {
+                                    if !buf.is_empty() {
+                                        tokens.push(buf.clone());
+                                        buf.clear();
+                                    }
+                                    // check for &&
+                                    if let Some('&') = chars.peek() {
+                                        chars.next();
+                                        tokens.push("&&".to_string());
+                                    } else {
+                                        tokens.push("&".to_string());
+                                    }
+                                }
+                                '>' => {
+                                    if !buf.is_empty() {
+                                        tokens.push(buf.clone());
+                                        buf.clear();
+                                    }
+                                    if let Some('>') = chars.peek() {
+                                        chars.next();
+                                        tokens.push(">>".to_string());
+                                    } else {
+                                        tokens.push(">".to_string());
+                                    }
+                                }
+                                '<' => {
+                                    if !buf.is_empty() {
+                                        tokens.push(buf.clone());
+                                        buf.clear();
+                                    }
+                                    if let Some('<') = chars.peek() {
+                                        chars.next();
+                                        tokens.push("<<".to_string());
+                                    } else {
+                                        tokens.push("<".to_string());
+                                    }
+                                }
+                                ';' | '(' | ')' => {
+                                    if !buf.is_empty() {
+                                        tokens.push(buf.clone());
+                                        buf.clear();
+                                    }
+                                    tokens.push(c.to_string());
+                                }
+                                _ => buf.push(c),
+                            }
+                        }
+                        if !buf.is_empty() {
+                            tokens.push(buf);
+                        }
+                        tokens
+                    }
+
+                    fn strip_outer_quotes(s: &str) -> String {
+                        if s.len() >= 2 {
+                            let first = s.chars().next().unwrap();
+                            let last = s.chars().rev().next().unwrap();
+                            if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
+                                return s[1..s.len() - 1].to_string();
+                            }
+                        }
+                        s.to_string()
+                    }
+
+                    fn is_operator_token(s: &str) -> bool {
+                        matches!(
+                            s,
+                            "|" | "||" | "&" | "&&" | ">" | ">>" | "<" | "<<" | ";" | "(" | ")"
+                        )
+                    }
+
+                    let tokens = tokenize_command_string(&name_str);
+                    let mut out_parts: Vec<String> = Vec::new();
+                    for t in tokens {
+                        if is_operator_token(&t) {
+                            out_parts.push(t);
+                            continue;
+                        }
+                        let stripped = strip_outer_quotes(&t);
+                        if needs_shell_quoting_literal(&stripped) {
+                            // Use the same escaping strategy as word_to_bash_string
+                            // Escape single quotes using canonical shell escaping: ' -> '\''
+                            let escaped = stripped.replace("'", "'\\''");
+                            // Note: keep escape sequence similar to other helpers
+                            out_parts.push(format!("'{}'", escaped));
+                        } else {
+                            out_parts.push(stripped);
+                        }
+                    }
+                    return out_parts.join(" ");
+                }
+
+                // Fallback: return as-is
                 simple_cmd.name.to_string()
             } else {
                 format!("{} {}", simple_cmd.name, merged_args.join(" "))
@@ -331,8 +488,8 @@ fn word_to_bash_string(word: &Word) -> String {
         Word::Literal(s, _) => {
             if needs_shell_quoting_literal(s) {
                 // Single-quote the token and escape embedded single quotes in a
-                // shell-friendly way: abc'd -> 'abc'\'''
-                let escaped = s.replace("'", "'\\'\"'");
+                // shell-friendly way: abc'd -> 'abc'\''
+                let escaped = s.replace("'", "'\\''");
                 format!("'{}'", escaped)
             } else {
                 s.clone()
@@ -381,7 +538,16 @@ fn word_to_bash_string(word: &Word) -> String {
                     _ => result.push_str("$var"), // Placeholder for other types
                 }
             }
-            result
+            // If the assembled interpolation contains shell-special characters
+            // treat it like a literal and quote it so patterns like *.txt are
+            // preserved when reconstructing command strings.
+            if needs_shell_quoting_literal(&result) {
+                // Escape single quotes using canonical shell escaping: ' -> '\''
+                let escaped = result.replace("'", "'\\''");
+                format!("'{}'", escaped)
+            } else {
+                result
+            }
         }
         Word::CommandSubstitution(_cmd, _) => {
             // This would need to be handled by the caller

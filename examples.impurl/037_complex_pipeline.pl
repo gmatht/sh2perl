@@ -26,7 +26,7 @@ print $pipeline1;
 # Complex pipeline 2: Text transformation and analysis
 print "\nComplex pipeline 2: Text transformation and analysis\n";
 print "cat | tr | sed | awk | wc\n";
-my $pipeline2 = `cat test_data.txt | tr 'a-z' 'A-Z' | sed 's/,/ | /g' | awk '{print "Name: " $1 " | Age: " $2 " | Role: " $3 " | Score: " $4}' | wc -l`;
+my $pipeline2 = `cat test_data.txt | tr 'a-z' 'A-Z' | sed 's/,/ | /g' | awk '{print "Name: " \$1 " | Age: " \$2 " | Role: " \$3 " | Score: " \$4}' | wc -l`;
 print "Total processed lines: $pipeline2";
 
 # Complex pipeline 3: Multi-step data analysis
@@ -44,7 +44,7 @@ print $pipeline4;
 # Complex pipeline 5: Data aggregation and formatting
 print "\nComplex pipeline 5: Data aggregation and formatting\n";
 print "cat | awk | sort | head\n";
-my $pipeline5 = `cat test_data.txt | awk -F',' '{print $2 "," $4}' | sort -t',' -k2 -nr | head -3`;
+my $pipeline5 = `cat test_data.txt | awk -F',' '{print \$2 "," \$4}' | sort -t',' -k2 -nr | head -3`;
 print $pipeline5;
 
 # Complex pipeline 6: Text processing with multiple filters
@@ -56,7 +56,7 @@ print $pipeline6;
 # Complex pipeline 7: Data validation and reporting
 print "\nComplex pipeline 7: Data validation and reporting\n";
 print "cat | awk | grep | wc\n";
-my $pipeline7 = `cat test_data.txt | awk -F',' '$4 > 90 {print $1 " has high score: " $4}' | wc -l`;
+my $pipeline7 = `cat test_data.txt | awk -F',' '\$4 > 90 {print \$1 " has high score: " \$4}' | wc -l`;
 print "High performers: $pipeline7";
 
 # Complex pipeline 8: File system operations
@@ -81,7 +81,7 @@ if (-f "roles.txt") {
 # Complex pipeline 10: Error handling and conditional processing
 print "\nComplex pipeline 10: Error handling and conditional processing\n";
 print "cat | grep | awk | sort | head\n";
-my $pipeline10 = `cat test_data.txt | grep 'Engineer\\|Developer' | awk -F',' '{print $1 " (" $3 "): " $4}' | sort -k3 -nr | head -3`;
+my $pipeline10 = `cat test_data.txt | grep 'Engineer\\|Developer' | awk -F',' '{print \$1 " (" \$3 "): " \$4}' | sort -k3 -nr | head -3`;
 print $pipeline10;
 
 # Complex pipeline 11: Multi-file processing
@@ -93,7 +93,7 @@ print "Total Engineer mentions: $pipeline11";
 # Complex pipeline 12: Data formatting and presentation
 print "\nComplex pipeline 12: Data formatting and presentation\n";
 print "cat | awk | sort | head | tee\n";
-my $pipeline12 = `cat test_data.txt | awk -F',' '{printf "%-10s %3d %-10s %5.1f\\n", $1, $2, $3, $4}' | sort -k4 -nr | head -5 | tee top_performers.txt`;
+my $pipeline12 = `cat test_data.txt | awk -F',' '{printf "%-10s %3d %-10s %5.1f\\n", \$1, \$2, \$3, \$4}' | sort -k4 -nr | head -5 | tee top_performers.txt`;
 print "Top performers saved to file\n";
 
 # Check if top performers file was created

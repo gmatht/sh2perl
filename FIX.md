@@ -140,3 +140,28 @@ The change is conservative (only merges when the second token is a single ASCII
 letter) and limited to the serialization step. It avoids broad parser or AST
 changes while fixing a practical class of errors (notably "sort -nr" becoming
 "sort -n r").
+
+Fix: Escape awk-style $ variables in example 037
+------------------------------------------------
+Problem
+-------
+In example 037 some embedded awk snippets used unescaped "$" tokens inside
+Perl backtick strings. When the example was parsed and regenerated the
+embedded $1/$2/etc. could be interpreted by Perl or altered during
+reconstruction, causing the purified script to behave differently from the
+original.
+
+Fix
+---
+Escape awk-style variables in examples.impurl/037_complex_pipeline.pl so they
+remain literal in the shell/awk programs when embedded within Perl
+backtick contexts (i.e. use \$1 instead of $1 inside those strings). This
+keeps purify.pl as a thin wrapper around the Rust generator and avoids adding
+ad-hoc quoting logic for this specific case in the generator.
+
+Why this is minimal and safe
+---------------------------
+This change only updates the example source to use the correct escaping when a
+shell snippet containing awk variables is embedded in a Perl string. It does not
+change generator logic and resolves the output mismatch observed in the test
+suite.
