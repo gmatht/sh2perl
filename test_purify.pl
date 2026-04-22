@@ -484,12 +484,15 @@ PERL_SCRIPT
 }
 
 # Final summary with timing information
-my $end_time = time();
-my $total_duration = $end_time - $start_time;
-my $avg_time_per_file = $total_duration / $purify_tested if $purify_tested > 0;
+    my $end_time = time();
+    my $total_duration = $end_time - $start_time;
+    my $avg_time_per_file = $total_duration / $purify_tested if $purify_tested > 0;
 
 debug_print(1, "=== TEST SUMMARY ===");
-debug_print(1, "Purify.pl test summary: $purify_passed passed, $purify_failed failed out of $purify_tested tested");
+    debug_print(1, "Purify.pl test summary: $purify_passed passed, $purify_failed failed out of $purify_tested tested");
+    # Always emit a concise numeric summary line for automation scripts
+    # (main_loop.pl parses this line to detect improvements).
+    print "Purify.pl tests: $purify_passed passed, $purify_failed failed out of $purify_tested tested\n";
 debug_print(1, "Total execution time: ${total_duration}s");
 debug_print(1, "Average time per file: ${avg_time_per_file}s") if $purify_tested > 0;
 debug_print(1, "Files processed: $purify_tested of $total_files");
@@ -500,9 +503,8 @@ if ($purify_failed > 0) {
     die "Error: $purify_failed purify.pl tests failed. The purify.pl script is not working correctly.\n";
 }
 
-debug_print(1, "test_purify.pl completed successfully");
-debug_print(1, "Summary: Tested $tested_count files, skipped $skipped_count files");
-debug_print(1, "Purify.pl tests: $purify_passed passed, $purify_failed failed out of $purify_tested tested");
+    debug_print(1, "test_purify.pl completed successfully");
+    debug_print(1, "Summary: Tested $tested_count files, skipped $skipped_count files");
 
 # If no failures, print nothing else. Individual passed tests already printed concise lines.
 if ($purify_failed == 0) {

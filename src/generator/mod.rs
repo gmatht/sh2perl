@@ -274,6 +274,12 @@ impl Generator {
             output.push('\n');
         }
 
+        // Historically we applied a textual post-processing step here to
+        // replace occurrences of "$?" checks with "$CHILD_ERROR". That
+        // was a brittle, global substitution. Generator emitters should
+        // produce $CHILD_ERROR directly; remove the global replacement so
+        // any remaining instances are fixed at the source site instead.
+
         output
     }
 
