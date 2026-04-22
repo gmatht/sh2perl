@@ -197,10 +197,10 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
-            | Some(Token::Colon)
-            | Some(Token::Star)
-            | Some(Token::Percent)
-            | Some(Token::Comma) => {
+                | Some(Token::Colon)
+                | Some(Token::Star)
+                | Some(Token::Percent)
+                | Some(Token::Comma) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -523,10 +523,10 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
-            | Some(Token::Colon)
-            | Some(Token::Star)
-            | Some(Token::Percent)
-            | Some(Token::Comma) => {
+                | Some(Token::Colon)
+                | Some(Token::Star)
+                | Some(Token::Percent)
+                | Some(Token::Comma) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -1332,15 +1332,15 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 parts.push(StringPart::Literal("`".to_string()));
                 i = cmd_start;
             }
-        } else if content[i..].starts_with("$") && i + 1 < content.len() {
-            // We found a variable reference
+        } else if content[i..].starts_with("$") {
+            // We found a variable reference (or a literal $ that's not a variable)
             // First, add any accumulated literal text
             if !current_literal.is_empty() {
                 parts.push(StringPart::Literal(current_literal.clone()));
                 current_literal.clear();
             }
 
-            // Check if this is a parameter expansion like ${var} or ${var[key]}
+            // If this is a braced expansion like ${...}
             if i + 1 < content.len() && content[i + 1..].starts_with('{') {
                 // This is a parameter expansion ${...}
                 i += 2; // skip $ and {
@@ -1375,38 +1375,113 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     i = expansion_start;
                 }
             } else {
-                // Simple variable reference like $var
+                // Simple variable reference like $var or a literal $ followed by a non-variable char
+                // Skip the $ for inspection, but if it's not a valid variable start we'll treat it as literal
                 i += 1; // skip the $
-                if i < content.len() {
-                    let var_start = i;
 
-                    // Handle special shell variables like $#, $@, $*
-                    if i < content.len() {
-                        let next_char = content[i..].chars().next().unwrap();
-                        if next_char == '#' || next_char == '@' || next_char == '*' {
-                            // Special shell variable
-                            parts.push(StringPart::Variable(next_char.to_string()));
-                            i += 1;
-                        } else if next_char.is_alphanumeric() || next_char == '_' {
-                            // Regular variable name
-                            while i < content.len() {
-                                let next_char = content[i..].chars().next();
-                                if let Some(c) = next_char {
-                                    if c.is_alphanumeric() || c == '_' {
-                                        i += 1;
-                                    } else {
-                                        break;
-                                    }
-                                } else {
-                                    break;
-                                }
+                // If there's no following character, treat the $ as a literal
+                if i >= content.len() {
+                    current_literal.push('$');
+                    break;
+                }
+
+                let next_char = content[i..].chars().next().unwrap();
+                if next_char == '#' || next_char == '@' || next_char == '*' {
+                    // Special shell variable
+                    parts.push(StringPart::Variable(next_char.to_string()));
+                    i += 1;
+                } else if next_char.is_alphanumeric() || next_char == '_' {
+                    // Regular variable name
+                    let var_start = i;
+                    while i < content.len() {
+                        let nc = content[i..].chars().next();
+                        if let Some(c) = nc {
+                            if c.is_alphanumeric() || c == '_' {
+                                i += 1;
+                            } else {
+                                break;
                             }
-                            let var_name = &content[var_start..i];
-                            if !var_name.is_empty() {
-                                parts.push(StringPart::Variable(var_name.to_string()));
-                            }
+                        } else {
+                            break;
                         }
                     }
+                    let var_name = &content[var_start..i];
+                    if !var_name.is_empty() {
+                        parts.push(StringPart::Variable(var_name.to_string()));
+                    }
+                } else {
+                    // Not a recognized variable start; treat the $ as a literal and
+                    // leave the following character to be processed in the next loop iteration.
+                    current_literal.push('$');
+                }
+            }
+        } else if content[i..].starts_with("$") {
+            // Found a $ inside a literal-style string. This could be a variable or a literal $.
+            // Treat it similarly to parse_string_interpolation: preserve $ when it's not a valid variable start.
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+
+            // If this is a braced expansion like ${...}
+            if i + 1 < content.len() && content[i + 1..].starts_with('{') {
+                i += 2; // skip $ and {
+                let expansion_start = i;
+                let mut brace_count = 1;
+                while i < content.len() && brace_count > 0 {
+                    match content[i..].chars().next() {
+                        Some('{') => brace_count += 1,
+                        Some('}') => brace_count -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+
+                if brace_count == 0 {
+                    let expansion_content = &content[expansion_start..i - 1];
+                    if let Ok(expansion_word) = parse_parameter_expansion_content(expansion_content)
+                    {
+                        parts.push(StringPart::ParameterExpansion(expansion_word));
+                    } else {
+                        parts.push(StringPart::Literal(format!("${{{}}}", expansion_content)));
+                    }
+                } else {
+                    parts.push(StringPart::Literal("${".to_string()));
+                    i = expansion_start;
+                }
+            } else {
+                // Simple $var or special var or literal $
+                i += 1; // skip $
+                if i >= content.len() {
+                    current_literal.push('$');
+                    break;
+                }
+
+                let next_char = content[i..].chars().next().unwrap();
+                if next_char == '#' || next_char == '@' || next_char == '*' {
+                    parts.push(StringPart::Variable(next_char.to_string()));
+                    i += 1;
+                } else if next_char.is_alphanumeric() || next_char == '_' {
+                    let var_start = i;
+                    while i < content.len() {
+                        let nc = content[i..].chars().next();
+                        if let Some(c) = nc {
+                            if c.is_alphanumeric() || c == '_' {
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    let var_name = &content[var_start..i];
+                    if !var_name.is_empty() {
+                        parts.push(StringPart::Variable(var_name.to_string()));
+                    }
+                } else {
+                    // Not a variable - keep the $ as a literal and continue
+                    current_literal.push('$');
                 }
             }
         } else {

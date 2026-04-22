@@ -146,7 +146,7 @@ $?;
 print "File created with no dereference\n" if -f "test_touch_no_deref.txt";
 
 print "\ntouch with error handling:\n";
-my $touch_error = do { my $command = 'touch test_touch_error.txt 2> 1'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
+my $touch_error = do { my $command = 'touch test_touch_error.txt 2>&1'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print -f "test_touch_error.txt" ? "File created successfully\n" : "File creation failed\n";
 

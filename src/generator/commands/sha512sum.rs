@@ -61,7 +61,7 @@ pub fn generate_sha512sum_command(
                 output.push_str("        chomp $line;\n");
                 output.push_str(&format!(
                     "        if ($line =~ {}) {{\n",
-                    generator.format_regex_pattern(r"^([a-f0-9]{128})\\s+(.+)$")
+                    generator.format_regex_pattern(r"^([a-f0-9]{128})\s+(.+)$")
                 ));
                 output.push_str("        my ($expected_hash, $filename) = ($1, $2);\n");
                 output.push_str("        if (-f \"$filename\") {\n");
@@ -87,7 +87,10 @@ pub fn generate_sha512sum_command(
 
             // Return the joined results as the value of the do-block so
             // callers may choose to assign it to a variable if needed.
-            output.push_str("    join \"\\n\", @results;\n};");
+            // Ensure the joined string ends with a trailing newline so the
+            // command-substitution semantics (qx// or backticks) match the
+            // original shell behaviour which includes trailing newlines.
+            output.push_str("    join(\"\\n\", @results) . \"\\n\";\n};");
         } else {
             // No checksum files specified; treat the input_var as the checksum content
             // When an input_var is provided we still emit an expression-valued
@@ -123,7 +126,11 @@ pub fn generate_sha512sum_command(
             output.push_str("}\n");
             output.push_str("}\n");
             // Return the joined results as the expression value
-            output.push_str("    join \"\\n\", @results;\n};");
+            // When used as a command-substitution the result should include
+            // a trailing newline. Keep the trailing-newline behaviour only
+            // for expression-valued do-blocks which are used in qx/backtick
+            // contexts (input_var == "").
+            output.push_str("    join(\"\\n\", @results) . \"\\n\";\n};");
         }
     } else if files.is_empty() {
         // No files specified, calculate hash of input.
@@ -163,7 +170,9 @@ pub fn generate_sha512sum_command(
                 output.push_str(&format!("\"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", unquoted_file));
                 output.push_str("    }\n");
             }
-            output.push_str("    join \"\\n\", @results;\n");
+            // For command-substitution contexts append a trailing newline so
+            // the returned string matches qx/backticks which include final newlines.
+            output.push_str("    join(\"\\n\", @results) . \"\\n\";\n");
             output.push_str("};");
         } else {
             // When an input_var is supplied, emit an expression-valued do-block
@@ -190,7 +199,7 @@ pub fn generate_sha512sum_command(
                 output.push_str(&format!("\"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", unquoted_file));
                 output.push_str("    }\n");
             }
-            output.push_str("    join \"\\n\", @results;\n};");
+            output.push_str("    join(\"\\n\", @results) . \"\\n\";\n};");
         }
     }
     output.push_str("\n");

@@ -461,6 +461,16 @@ impl Generator {
         utils::perl_string_literal_no_interp_impl(self, word)
     }
 
+    /// Emit a Perl double-quoted string literal that allows Perl interpolation
+    /// (do not escape $ or @) but encodes control characters like newline,
+    /// tab and carriage-return as backslash sequences so the Perl parser will
+    /// turn them into the intended characters at runtime. Use this when we
+    /// need Perl interpolation (e.g. for backtick/qx{} operands) but must avoid
+    /// embedding real newlines in the generated source.
+    pub fn perl_string_literal_force_interp(&mut self, word: &Word) -> String {
+        utils::perl_string_literal_force_interp_impl(self, word)
+    }
+
     pub fn strip_shell_quotes_and_convert_to_perl(&mut self, word: &Word) -> String {
         utils::strip_shell_quotes_and_convert_to_perl_impl(self, word)
     }

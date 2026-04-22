@@ -459,6 +459,37 @@ pub fn perl_string_literal_no_interp_impl(_generator: &mut Generator, word: &Wor
     }
 }
 
+/// Emit a Perl double-quoted string literal that allows Perl interpolation
+/// (do not escape "$" or "@") but encodes control characters like newline,
+/// tab and carriage-return as backslash sequences so the Perl parser will
+/// turn them into the intended characters at runtime. This avoids embedding
+/// real newlines in the generated Perl source which would change qx{} runtime
+/// behaviour by creating multi-line shell scripts instead of the intended
+/// single-line command with embedded "\\n" characters.
+pub fn perl_string_literal_force_interp_impl(_generator: &mut Generator, word: &Word) -> String {
+    match word {
+        Word::Literal(s, _) => {
+            // Empty string -> "" is fine
+            if s.is_empty() {
+                return "\"\"".to_string();
+            }
+
+            // We must not escape $ or @ so Perl interpolation can occur.
+            // Escape backslashes and double quotes and encode control characters
+            // as backslash sequences so the generated Perl source contains
+            // visible escapes (e.g. "\\n") rather than actual newlines.
+            let escaped = s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t")
+                .replace("\r", "\\r");
+            format!("\"{}\"", escaped)
+        }
+        _ => perl_string_literal_impl(_generator, word),
+    }
+}
+
 pub fn strip_shell_quotes_and_convert_to_perl_impl(
     generator: &mut Generator,
     word: &Word,
