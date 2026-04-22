@@ -177,7 +177,7 @@ while (1) {
 			system('git', 'stash', 'push', '-m', "auto-stash: tests ${old_max}->${passed}");
 		} else {
 			print "No Decision made! ($decision)";
-			die;
+			#die;
 		}
         }
 
