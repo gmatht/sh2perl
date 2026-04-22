@@ -165,3 +165,33 @@ This change only updates the example source to use the correct escaping when a
 shell snippet containing awk variables is embedded in a Perl string. It does not
 change generator logic and resolves the output mismatch observed in the test
 suite.
+
+Fix: Avoid double-qualifying Carp helpers in purify.pl
+----------------------------------------------------
+Problem
+-------
+When splicing generated Perl snippets back into an existing document we
+previously replaced unqualified Carp helpers (croak/confess) with fully
+qualified Carp::croak/Carp::confess. However the replacement pattern did not
+guard against already-qualified names like Carp::croak; this produced
+Carp::Carp::croak which is a syntax error in Perl and caused purify to emit
+invalid code.
+
+Fix
+---
+Update purify.pl to only replace unqualified occurrences of croak/confess and
+avoid touching identifiers that are already namespace-qualified. This prevents
+creating Carp::Carp::croak tokens and keeps the purified output syntactically
+valid.
+
+Files changed
+-------------
+- purify.pl: only qualify unqualified croak/confess identifiers when
+  normalizing generated snippets.
+
+Why this is minimal and safe
+---------------------------
+This change tightens a single regex used for post-processing generated snippets
+and fixes a concrete syntax-error observed in an example. It does not change
+the broader generator logic and keeps purify.pl as a thin wrapper around the
+Rust debashc output.

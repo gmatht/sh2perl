@@ -1,3 +1,0 @@
-DEBUG: Setting original script name to: 001_simple.sh
-DEBUG: Timeout manager starting ShellExecution with timeout of 120.0 seconds
-DEBUG: Timeout manager completed ShellExecution successfully
