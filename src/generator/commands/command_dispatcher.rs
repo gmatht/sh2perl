@@ -233,7 +233,7 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&generator.indent());
                             result.push_str("close $out or croak 'Close failed: $OS_ERROR';\n");
                             result.push_str(&generator.indent());
-                            result.push_str("waitpid $pid, 0;\n");
+                            result.push_str("waitpid $pid, 0;\n$CHILD_ERROR = $? >> 8;\n");
                             result.push_str(&generator.indent());
                             result.push_str("}\n");
                         }
