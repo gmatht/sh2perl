@@ -636,8 +636,9 @@ pub fn convert_escaped_metacharacters(pattern: &str) -> String {
         .replace("\\|", "[|]")
         .replace("\\t", "\t")
         .replace("\\r", "\r")
-        .replace("{", "\\{")
-        .replace("}", "\\}")
+    // Do not escape curly braces here - they are commonly used as
+    // quantifiers in patterns (e.g. {64}, {128}) and escaping them
+    // would turn them into literal braces which breaks the regex.
 }
 
 /// Decode common shell-style escape sequences in a string literal.
