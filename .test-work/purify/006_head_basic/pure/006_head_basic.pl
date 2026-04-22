@@ -56,12 +56,14 @@ print $head_bytes;
 
 print "\nhead from stdin (echo | head):\n";
 do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 {
     my $output_0;
     my $output_printed_0;
     my $pipeline_success_0 = 1;
     $output_0 .= "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
 if ( !($output_0 =~ m{\n\z}msx) ) { $output_0 .= "\n"; }
+$CHILD_ERROR = 0;
 
         my $num_lines       = 3;
     my $head_line_count = 0;

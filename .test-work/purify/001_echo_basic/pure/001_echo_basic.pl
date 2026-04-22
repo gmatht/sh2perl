@@ -50,12 +50,14 @@ $?;
 
 print "\nEcho with redirection:\n";
 do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 do {
     open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $!\n";
     open STDOUT, '>', 'temp_echo.txt'
       or die "Cannot open file: $!\n";
     print 'Redirected output' . "\n";
+    $CHILD_ERROR = 0;
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $!\n";
     close $original_stdout

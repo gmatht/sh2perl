@@ -90,6 +90,13 @@ while (1) {
         $passed = $1;
     } elsif ($output =~ /(\d+)\s+passed,?\s*\d+\s+failed/s) {
         $passed = $1;
+    } else {
+        # Fallback: test_purify.pl prints concise "PASSED: name" lines by
+        # default rather than the debug summary. Count those lines so we
+        # still detect the number of passing tests when the summary isn't
+        # emitted.
+        my $count = () = $output =~ /^PASSED:/mg;
+        $passed = $count if $count > 0;
     }
 
     # File that records the previous maximum passed tests

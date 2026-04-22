@@ -329,6 +329,12 @@ pub fn generate_echo_command(
         }
     }
 
+    // Echo is a shell builtin that returns success on normal operation.
+    // Ensure the generated Perl code models that by setting $CHILD_ERROR = 0
+    // so that surrounding shell-like logical operations observe the correct
+    // last-exit status semantics.
+    output.push_str("$CHILD_ERROR = 0;\n");
+
     output
 }
 

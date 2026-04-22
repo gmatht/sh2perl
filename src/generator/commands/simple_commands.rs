@@ -723,6 +723,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             if cmd.args.is_empty() {
                 output.push_str(&generator.indent());
                 output.push_str("print \"\\n\";\n");
+                // Emulate successful builtin exit status for echo
+                output.push_str(&generator.indent());
+                output.push_str("$CHILD_ERROR = 0;\n");
             } else {
                 // Check for -e flag
                 let has_e_flag = cmd.args.iter().any(|arg| {
@@ -975,6 +978,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
                         }
+
+                        // echo as a builtin succeeded
+                        output.push_str(&generator.indent());
+                        output.push_str("$CHILD_ERROR = 0;\n");
                     }
                 } else {
                     // Check if we have multiple brace expansions that need cartesian product
@@ -987,6 +994,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     if brace_expansions.len() > 1 {
                         // Generate cartesian product for multiple brace expansions
                         output.push_str(&generate_cartesian_product_for_echo(generator, &cmd.args));
+
+                        // echo as a builtin succeeded
+                        output.push_str(&generator.indent());
+                        output.push_str("$CHILD_ERROR = 0;\n");
                     } else {
                         // For multiple arguments, join them with spaces
                         let args_str = args.join(" . q{ } . ");
@@ -1005,6 +1016,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args_str));
                         }
+
+                        // echo as a builtin succeeded
+                        output.push_str(&generator.indent());
+                        output.push_str("$CHILD_ERROR = 0;\n");
                     }
                 }
             }
