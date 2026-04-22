@@ -74,6 +74,8 @@ pub fn generate_sha512sum_command(
                 output.push_str("        } else {\n");
                 output.push_str("            push @results, \"$filename: No such file\";\n");
                 output.push_str("        }\n");
+                // Close the outer regex match block (if ($line =~ ...))
+                output.push_str("        }\n");
                 output.push_str("    }\n");
                 output.push_str("} else {\n");
                 output.push_str(&format!(
