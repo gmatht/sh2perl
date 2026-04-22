@@ -237,6 +237,35 @@ Verification
 Regenerate the purified Perl for the failing example (examples.impurl/039_subshell_operations.pl)
 and confirm the placeholder no longer appears in the generated output.
 
+Fix: Preserve first argument when generating exec(...) blocks from system() calls
+---------------------------------------------------------------------------------
+Problem
+-------
+During purify.pl post-processing the code that built the argument list for
+generated exec(...) calls accidentally skipped the first argv element. This
+produced exec invocations that dropped a command's first argument (for
+example `echo` was called with no arguments) leading to missing output lines
+in purified examples.
+
+Fix
+---
+Adjust the join step in generate_exec_do_block so it joins all collected
+@argv_tokens instead of slicing off the first element. The first element was
+already removed from the original @tokens earlier in the function, so omitting
+it here was incorrect. This minimal change restores the intended argument
+passing semantics.
+
+Files changed
+-------------
+- purify.pl: ensure args_list includes all argv tokens when emitting exec(...)
+
+Why this is minimal and safe
+---------------------------
+This is a small fix in the purify wrapper that preserves the full argument
+list when translating multi-argument system() calls into fork/exec blocks. It
+does not change the Rust generator and keeps purify.pl as a thin integration
+layer.
+
 
 Fix: Ensure Digest::SHA is imported for generated sha*_hex usages
 ----------------------------------------------------------------
