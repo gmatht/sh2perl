@@ -511,6 +511,13 @@ fn needs_shell_quoting_literal(s: &str) -> bool {
 fn word_to_bash_string(word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
+            // Preserve original quoting where possible. If the literal was
+            // originally double-quoted, keep it so inner bash -c invocations
+            // still perform variable expansions.
+            if s.starts_with('"') && s.ends_with('"') {
+                return s.clone();
+            }
+
             if needs_shell_quoting_literal(s) {
                 // Single-quote the token and escape embedded single quotes in a
                 // shell-friendly way: abc'd -> 'abc'\''
@@ -555,19 +562,40 @@ fn word_to_bash_string(word: &Word) -> String {
             format!("${{{}}}", param)
         }
         Word::StringInterpolation(parts, _) => {
+            // If interpolation contains variables or parameter expansions,
+            // emit a double-quoted fragment so the inner shell will expand
+            // $VAR sequences. Escape double-quotes and backslashes but leave
+            // $-style tokens intact. If there are only literal parts, fall
+            // back to conservative single-quoting when necessary.
+            let mut has_var = false;
             let mut result = String::new();
             for part in &parts.parts {
                 match part {
                     StringPart::Literal(s) => result.push_str(&s),
-                    StringPart::Variable(var) => result.push_str(&format!("${{{}}}", var)),
-                    _ => result.push_str("$var"), // Placeholder for other types
+                    StringPart::Variable(var) => {
+                        has_var = true;
+                        result.push_str(&format!("${}", var));
+                    }
+                    StringPart::ParameterExpansion(pe) => {
+                        has_var = true;
+                        result.push_str(&format!("${{{}}}", pe.variable));
+                    }
+                    _ => {
+                        has_var = true;
+                        result.push_str("$var");
+                    }
                 }
             }
-            // If the assembled interpolation contains shell-special characters
-            // treat it like a literal and quote it so patterns like *.txt are
-            // preserved when reconstructing command strings.
-            if needs_shell_quoting_literal(&result) {
-                // Escape single quotes using canonical shell escaping: ' -> '\''
+
+            if result.is_empty() {
+                return String::new();
+            }
+
+            if has_var {
+                // Preserve expansion semantics: double-quote and escape " and \\ only
+                let escaped = result.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{}\"", escaped)
+            } else if needs_shell_quoting_literal(&result) {
                 let escaped = result.replace("'", "'\\''");
                 format!("'{}'", escaped)
             } else {

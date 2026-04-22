@@ -180,6 +180,14 @@ sub purify_perl_code {
         $serialized = "use Carp;\n" . $serialized;
     }
 
+    # If the converted code uses Digest::SHA helpers (sha256_hex/sha512_hex)
+    # but the document does not already import Digest::SHA, add the
+    # import so the generated calls to sha256_hex/sha512_hex are defined.
+    if ($serialized =~ /\b(?:sha256_hex|sha512_hex)\b/ && $serialized !~ /\buse\s+Digest::SHA\b/) {
+        # Align with generator output spacing for readability
+        $serialized = "use Digest::SHA   qw(sha256_hex sha512_hex);\n" . $serialized;
+    }
+
     return $serialized;
 }
 
@@ -407,7 +415,10 @@ sub process_single_backtick_string {
         $perl_result =~ s/\$INPUT_RECORD_SEPARATOR\b/\$\//g;  # $INPUT_RECORD_SEPARATOR -> $/
         $perl_result =~ s/\$OS_ERROR\b/\$!/g;                 # $OS_ERROR -> $!
         $perl_result =~ s/\$ERRNO\b/\$!/g;                   # $ERRNO -> $!
-        $perl_result =~ s/\$CHILD_ERROR\b(?!\s*=)/\$\?/g;   # $CHILD_ERROR -> $? (contextual)
+        # Preserve $CHILD_ERROR as emitted by the generator. Do not
+        # rewrite it to $? here because the generator's canonical
+        # exit-code variable must be preserved verbatim in the final
+        # output so further processing and checks remain correct.
         $perl_result =~ s/\$EVAL_ERROR\b/\$\@/g;            # $EVAL_ERROR -> $@
 
         print "DEBUG: Got perl result for backtick: [$perl_result]\n" if $verbose;
@@ -575,20 +586,21 @@ sub get_system_call_tokens {
 sub generate_exec_do_block {
     my ($tokens_ref) = @_;
     my @tokens = @{$tokens_ref};
-    # Build a Perl-friendly list of quoted argv elements. Each token is an
-    # arrayref [ text, quote_type ] where quote_type is 'single', 'double',
-    # or 'bare'. Preserve the original quoting semantics by preferring the
-    # same kind of Perl literal when possible.
-    my @perl_args;
+    # Parse tokens and detect simple redirection operators so we can emit
+    # child-side open() calls instead of passing redirection tokens as argv.
+    # Each token is an arrayref [ text, quote_type ] where quote_type is
+    # 'single', 'double', or 'bare'. Preserve the original quoting
+    # semantics by preferring the same kind of Perl literal when possible.
+    my @perl_args_all;    # original quoted args for debugging
     for my $t (@tokens) {
         my ($txt, $q) = ref($t) eq 'ARRAY' ? @{$t} : ($t, 'bare');
-        push @perl_args, _perl_quote_literal_with_pref($txt, $q);
+        push @perl_args_all, _perl_quote_literal_with_pref($txt, $q);
     }
 
     # Debug: show the tokens and their perl-quoted forms when verbose
     if ($verbose) {
         my $raw = join(', ', map { ref($_) eq 'ARRAY' ? "'" . $_->[0] . "'" : "'" . $_ . "'" } @tokens);
-        my $quoted = join(', ', @perl_args);
+        my $quoted = join(', ', @perl_args_all);
         print "DEBUG: generate_exec_do_block - raw tokens: [$raw]\n";
         print "DEBUG: generate_exec_do_block - perl-quoted tokens: [$quoted]\n";
     }
@@ -600,9 +612,81 @@ sub generate_exec_do_block {
     my ($exe, $exe_q) = ref($first) eq 'ARRAY' ? @{$first} : ($first, 'bare');
     my $exe_quoted = _perl_quote_literal_with_pref($exe, $exe_q);
 
-    my $args_list = join(', ', @perl_args[1..$#perl_args]);
+    # Scan remaining tokens for redirection operators. Build a list of
+    # argv elements (without redirections) and a list of child-side
+    # redirection statements to emit before exec. For complex fd dup
+    # forms (other than the common '2>&1') fall back to shell mode.
+    my @argv_tokens;
+    my @child_redirects;
+    my $fallback_to_shell = 0;
+    my $i = 0;
+    while ($i <= $#tokens) {
+        my $t = $tokens[$i];
+        my ($txt, $q) = ref($t) eq 'ARRAY' ? @{$t} : ($t, 'bare');
+
+        # Common simple redirections: >, >>, <, 2>, 2>> (followed by filename)
+        if ($txt eq '>' || $txt eq '>>' || $txt eq '<' || $txt eq '2>' || $txt eq '2>>') {
+            # Need a following filename token - if missing, fall back to shell
+            if ($i + 1 > $#tokens) { $fallback_to_shell = 1; last; }
+            my $file_t = $tokens[$i+1];
+            my ($file_txt, $file_q) = ref($file_t) eq 'ARRAY' ? @{$file_t} : ($file_t, 'bare');
+            my $file_literal = _perl_quote_literal_with_pref($file_txt, $file_q);
+            if ($txt eq '>') {
+                push @child_redirects, "open STDOUT, '>', $file_literal or die \"Cannot open $file_txt: \" . \$!;";
+            } elsif ($txt eq '>>') {
+                push @child_redirects, "open STDOUT, '>>', $file_literal or die \"Cannot open $file_txt: \" . \$!;";
+            } elsif ($txt eq '<') {
+                push @child_redirects, "open STDIN, '<', $file_literal or die \"Cannot open $file_txt: \" . \$!;";
+            } elsif ($txt eq '2>') {
+                push @child_redirects, "open STDERR, '>', $file_literal or die \"Cannot open $file_txt: \" . \$!;";
+            } elsif ($txt eq '2>>') {
+                push @child_redirects, "open STDERR, '>>', $file_literal or die \"Cannot open $file_txt: \" . \$!;";
+            }
+            $i += 2; # skip op and filename
+            next;
+        }
+
+        # Handle 2>&1 specifically (dup stderr to stdout)
+        if ($txt eq '2>&1') {
+            push @child_redirects, "open STDERR, '>&', \*STDOUT or die \"Cannot dup STDERR to STDOUT: \" . \$!;";
+            $i += 1;
+            next;
+        }
+
+        # Anything containing '&' (complex fd dup) is treated as complex - fall back
+        if ($txt =~ /&/) {
+            $fallback_to_shell = 1;
+            last;
+        }
+
+        # Regular argv token - preserve original quoting preference
+        push @argv_tokens, _perl_quote_literal_with_pref($txt, $q);
+        $i += 1;
+    }
+
+    # If we couldn't safely translate redirects, fall back to executing via shell
+    if ($fallback_to_shell) {
+        # Reconstruct a shell command string and execute with bash -c
+        my $shell_cmd = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); _shell_quote_for_system($t) } ($first, @tokens));
+        my $cmd_lit = _perl_quote_literal_with_pref($shell_cmd, 'single');
+        my $block = 'my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec (\'bash\', \'-c\', ' . $cmd_lit . '); die "exec failed: " . $!; } else { waitpid($pid, 0); }';
+        $block .= ' $?;';
+        return $block . "\n";
+    }
+
+    # Build the exec argument list (exclude the program itself which is in $exe_quoted)
+    my $args_list = '';
+    if (@argv_tokens) {
+        $args_list = join(', ', @argv_tokens[1..$#argv_tokens]);
+    }
+
     # Build the exec block as a string with literal Perl variables ($pid, $!)
-    my $block = 'my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec (' . $exe_quoted;
+    my $block = 'my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) {';
+    # Emit child-side redirections before exec
+    if (@child_redirects) {
+        $block .= ' ' . join(' ', @child_redirects);
+    }
+    $block .= ' exec (' . $exe_quoted;
     if (length $args_list) {
         $block .= ', ' . $args_list;
     }
@@ -1049,11 +1133,8 @@ sub extract_core_perl_logic_ppi {
         $s =~ s/\$INPUT_RECORD_SEPARATOR\b/\$\//g;  # $INPUT_RECORD_SEPARATOR -> $/
         $s =~ s/\$OS_ERROR\b/\$!/g;                 # $OS_ERROR -> $!
         $s =~ s/\$ERRNO\b/\$!/g;                   # $ERRNO -> $!
-        # Avoid replacing $CHILD_ERROR when it's the target of an assignment
-        # (e.g. "$CHILD_ERROR = $? >> 8;"). Only replace usages that are
-        # not immediately followed by a '=' so we don't produce constructs
-        # like "$? = $? >> 8;" which are incorrect.
-        $s =~ s/\$CHILD_ERROR\b(?!\s*=)/\$\?/g;    # $CHILD_ERROR -> $? (contextual)
+        # Avoid replacing $CHILD_ERROR here - keep the generator's
+        # canonical variable name intact so emitters can rely on it.
         $s =~ s/\$EVAL_ERROR\b/\$\@/g;            # $EVAL_ERROR -> $@
 
         # Replace unqualified Carp helpers with fully-qualified names so we

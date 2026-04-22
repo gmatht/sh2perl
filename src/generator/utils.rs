@@ -163,13 +163,39 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             }
                         } else if name == "sha256sum" {
                             // Use the sha256sum command handler for proper conversion
-                            crate::generator::commands::sha256sum::generate_sha256sum_command(
-                                generator, simple_cmd, "",
+                            // For command substitution, capture the command output into a
+                            // temporary Perl variable and pass that variable into the
+                            // sha256 generator so it has a proper input_var to work with.
+                            let unique_id = generator.get_unique_id();
+                            let input_var = format!("$cmd_output_{}", unique_id);
+                            let cmd_str = generator.generate_command_string_for_system(cmd);
+                            let cmd_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+                            let sha_code =
+                                crate::generator::commands::sha256sum::generate_sha256sum_command(
+                                    generator, simple_cmd, &input_var,
+                                );
+                            format!(
+                                "do {{ my {} = qx{{{}}}; $CHILD_ERROR = $? >> 8; {} }}",
+                                input_var, cmd_lit, sha_code
                             )
                         } else if name == "sha512sum" {
                             // Use the sha512sum command handler for proper conversion
-                            crate::generator::commands::sha512sum::generate_sha512sum_command(
-                                generator, simple_cmd, "",
+                            // For command substitution, capture the command output into a
+                            // temporary Perl variable and pass that variable into the
+                            // sha512 generator so it has a proper input_var to work with.
+                            let unique_id = generator.get_unique_id();
+                            let input_var = format!("$cmd_output_{}", unique_id);
+                            let cmd_str = generator.generate_command_string_for_system(cmd);
+                            let cmd_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+                            let sha_code =
+                                crate::generator::commands::sha512sum::generate_sha512sum_command(
+                                    generator, simple_cmd, &input_var,
+                                );
+                            format!(
+                                "do {{ my {} = qx{{{}}}; $CHILD_ERROR = $? >> 8; {} }}",
+                                input_var, cmd_lit, sha_code
                             )
                         } else if name == "printf" {
                             // Special handling for printf in command substitution
