@@ -542,42 +542,21 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 }
                             }
                         } else if name == "sha256sum" {
-                            // Use the sha256sum command handler for proper conversion
-                            // Capture the command substitution output into a temporary
-                            // Perl variable and pass that variable name into the
-                            // sha256 generator so split/other operations have a
-                            // valid input variable.
-                            let unique_id = generator.get_unique_id();
-                            let input_var = format!("$cmd_output_{}", unique_id);
-                            let cmd_str = generator.generate_command_string_for_system(cmd);
-                            let cmd_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-                            let sha_code =
-                                crate::generator::commands::sha256sum::generate_sha256sum_command(
-                                    generator, simple_cmd, &input_var,
-                                );
-                            format!(
-                                "do {{ my {} = qx{{{}}}; $CHILD_ERROR = $? >> 8; {} }}",
-                                input_var, cmd_lit, sha_code
+                            // Generate the sha256 handling directly in Perl for
+                            // command substitution instead of running the external
+                            // sha256sum program which may be missing in some
+                            // environments. The generator emits equivalent logic
+                            // so inline it here as a single expression.
+                            crate::generator::commands::sha256sum::generate_sha256sum_command(
+                                generator, simple_cmd, "",
                             )
                         } else if name == "sha512sum" {
-                            // Use the sha512sum command handler for proper conversion
-                            // Capture the command substitution output into a temporary
-                            // Perl variable and pass that variable name into the
-                            // sha512 generator so split/other operations have a
-                            // valid input variable.
-                            let unique_id = generator.get_unique_id();
-                            let input_var = format!("$cmd_output_{}", unique_id);
-                            let cmd_str = generator.generate_command_string_for_system(cmd);
-                            let cmd_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-                            let sha_code =
-                                crate::generator::commands::sha512sum::generate_sha512sum_command(
-                                    generator, simple_cmd, &input_var,
-                                );
-                            format!(
-                                "do {{ my {} = qx{{{}}}; $CHILD_ERROR = $? >> 8; {} }}",
-                                input_var, cmd_lit, sha_code
+                            // Generate the sha512 handling directly in Perl for
+                            // command substitution instead of running the external
+                            // sha512sum program which may be missing in some
+                            // environments.
+                            crate::generator::commands::sha512sum::generate_sha512sum_command(
+                                generator, simple_cmd, "",
                             )
                         } else if name == "grep" {
                             // Use the proper grep command generator
@@ -1120,6 +1099,95 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     };
 
                     if !is_simple_pair {
+                        // Special-case: left side writes a checksum file (via > or >>)
+                        // and the right side is a matching sha256sum/sha512sum -c
+                        // verifier that reads that file. In that case, avoid
+                        // falling back to running the whole expression in the
+                        // shell (which uses external sha*sum binaries). Instead
+                        // compute the checksum in Perl, write the checksum file,
+                        // and then invoke the existing pure-Perl sha verifier.
+                        if let (Command::Simple(simple_left), Command::Simple(simple_right)) =
+                            (left_cmd.as_ref(), right_cmd.as_ref())
+                        {
+                            // Only handle the common literal-name case here
+                            if let (Word::Literal(lname, _), Word::Literal(rname, _)) =
+                                (&simple_left.name, &simple_right.name)
+                            {
+                                if (lname == "sha256sum" || lname == "sha512sum") && rname == lname
+                                {
+                                    // Look for an output redirect on the left side
+                                    if let Some(redirect) = simple_left.redirects.iter().find(|r| {
+                                        matches!(
+                                            r.operator,
+                                            RedirectOperator::Output | RedirectOperator::Append
+                                        )
+                                    }) {
+                                        // Require the redirect target to be a literal filename
+                                        if let Word::Literal(target_name, _) = &redirect.target {
+                                            // Verify the right-hand args include "-c" and the same filename
+                                            let mut found_c = false;
+                                            let mut found_target = false;
+                                            for arg in &simple_right.args {
+                                                if let Word::Literal(a, _) = arg {
+                                                    if a == "-c" {
+                                                        found_c = true;
+                                                    } else if a == target_name {
+                                                        found_target = true;
+                                                    }
+                                                }
+                                            }
+
+                                            if found_c && found_target {
+                                                // Prepare a left-side simple command without the redirect
+                                                let mut left_clone = simple_left.clone();
+                                                left_clone.redirects.clear();
+
+                                                // Compute checksum content using existing generators
+                                                let compute_expr = if lname == "sha256sum" {
+                                                    crate::generator::commands::sha256sum::generate_sha256sum_command(
+                                                        generator,
+                                                        &left_clone,
+                                                        "",
+                                                    )
+                                                } else {
+                                                    crate::generator::commands::sha512sum::generate_sha512sum_command(
+                                                        generator,
+                                                        &left_clone,
+                                                        "",
+                                                    )
+                                                };
+
+                                                let target_lit =
+                                                    generator.perl_string_literal(&redirect.target);
+
+                                                // Generate verifier code using the right-hand command
+                                                let check_expr = if rname == "sha256sum" {
+                                                    crate::generator::commands::sha256sum::generate_sha256sum_command(
+                                                        generator,
+                                                        simple_right,
+                                                        "",
+                                                    )
+                                                } else {
+                                                    crate::generator::commands::sha512sum::generate_sha512sum_command(
+                                                        generator,
+                                                        simple_right,
+                                                        "",
+                                                    )
+                                                };
+
+                                                // Compose a do-block: compute checksum string, write it to
+                                                // the checksum file, then run verifier and return its output.
+                                                return format!(
+                                                    "do {{\n    my $checksum_content = {}\n    open my $fh, '>', {} or croak \"Cannot create {}: $OS_ERROR\\n\";\n    print $fh $checksum_content;\n    close $fh or croak \"Close failed: $OS_ERROR\\n\";\n    {}\n}}",
+                                                    compute_expr, target_lit, target_lit, check_expr
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Fallback: run the combined command via the shell
                         let command_str =
                             crate::generator::redirects::generate_bash_command_string(cmd);
