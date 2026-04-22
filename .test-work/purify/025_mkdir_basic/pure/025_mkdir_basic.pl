@@ -200,7 +200,7 @@ if (-d "test_mkdir_batch1/subdir" && -d "test_mkdir_batch2/subdir" && -d "test_m
 }
 
 print "\nmkdir with error handling:\n";
-my $mkdir_error = do { my $command = 'mkdir test_mkdir_error 2> 1'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
+my $mkdir_error = do { my $command = 'mkdir test_mkdir_error 2>&1'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 if (-d "test_mkdir_error") {
     print "Directory created successfully\n";

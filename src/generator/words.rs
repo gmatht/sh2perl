@@ -47,8 +47,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             .word_to_perl(&Word::CommandSubstitution(Box::new(other), None)),
                     };
                 }
+                // Emit an interpolating Perl literal so qx{} will see Perl
+                // interpolation of any $-variables present in the command text.
+                // Use the centralized helper which preserves Perl interpolation
+                // ($ and @ are not escaped) but encodes control characters as
+                // backslash sequences ("\n", "\t", "\r") so the generated
+                // Perl source does not contain real newlines.
                 let command_lit =
-                    generator.perl_string_literal_no_interp(&Word::literal(command_str));
+                    generator.perl_string_literal_force_interp(&Word::literal(command_str));
                 format!(
                     "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
                     command_lit
@@ -128,14 +134,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "head" {
                             // Use the shell command directly so file and flag handling stays faithful
                             let head_cmd = generator.generate_command_string_for_system(cmd);
-                            let head_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(head_cmd));
+                            let head_lit = generator
+                                .perl_string_literal_force_interp(&Word::literal(head_cmd));
                             format!("do {{ my $head_cmd = {}; qx{{$head_cmd}}; }}", head_lit)
                         } else if name == "tail" {
                             // Use the shell command directly so file and flag handling stays faithful
                             let tail_cmd = generator.generate_command_string_for_system(cmd);
-                            let tail_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(tail_cmd));
+                            let tail_lit = generator
+                                .perl_string_literal_force_interp(&Word::literal(tail_cmd));
                             format!("do {{ my $tail_cmd = {}; qx{{$tail_cmd}}; }}", tail_lit)
                         } else if name == "cat" {
                             crate::generator::commands::cat::generate_cat_command_for_substitution(
@@ -663,7 +669,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 &Command::Simple(simple_cmd.clone()),
                             );
                             let basename_lit = generator
-                                .perl_string_literal_no_interp(&Word::literal(basename_cmd));
+                                .perl_string_literal_force_interp(&Word::literal(basename_cmd));
                             format!(
                                 "do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}",
                                 basename_lit
@@ -673,7 +679,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 &Command::Simple(simple_cmd.clone()),
                             );
                             let dirname_lit = generator
-                                .perl_string_literal_no_interp(&Word::literal(dirname_cmd));
+                                .perl_string_literal_force_interp(&Word::literal(dirname_cmd));
                             format!(
                                 "do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}",
                                 dirname_lit
@@ -681,8 +687,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
                             let which_cmd = generator.generate_command_string_for_system(cmd);
-                            let which_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(which_cmd));
+                            let which_lit = generator
+                                .perl_string_literal_force_interp(&Word::literal(which_cmd));
                             format!(
                                 "do {{ my $which_cmd = {}; my $which_output = qx{{$which_cmd}}; $CHILD_ERROR = $? >> 8; $which_output; }}",
                                 which_lit
@@ -1066,13 +1072,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     // embedded into the generated source. This helps diagnose quoting/escaping
                     // issues where Perl interpolation or escape sequences change the runtime
                     // shell command semantics.
-                    // Ensure we emit a non-interpolating Perl literal for the
-                    // shell pipeline string so Perl does not interpret "$" or
-                    // turn "\\n" sequences into real newlines at compile-time.
-                    // Using a non-interpolating literal preserves the exact
-                    // shell command text that will be passed to qx{}.
-                    let pipeline_lit = generator
-                        .perl_string_literal_no_interp(&Word::literal(pipeline_cmd.clone()));
+                    // Use the force-interp helper so Perl variables in the
+                    // pipeline (e.g. $%) are interpolated but control
+                    // characters are encoded as backslash sequences rather
+                    // than literal newlines.
+                    let pipeline_lit =
+                        generator.perl_string_literal_force_interp(&Word::literal(pipeline_cmd));
                     format!(
                         "do {{ my $pipeline_cmd = {}; my $result = qx{{$pipeline_cmd}}; $CHILD_ERROR = $? >> 8; $result; }}",
                         pipeline_lit
