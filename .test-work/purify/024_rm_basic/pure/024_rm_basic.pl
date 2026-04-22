@@ -15,13 +15,13 @@ close($fh2);
 
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_rm_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', '-p', 'test_rm_dir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_dir/file3.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', 'test_rm_dir/file3.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -29,7 +29,7 @@ $?;
 print "Using " . "sys" . "tem" . "() to call rm (remove file):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "test_rm_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', 'test_rm_file1.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -42,7 +42,7 @@ if (!-f "test_rm_file1.txt") {
 print "\nrm with verbose (-v):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-v", "test_rm_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-v', 'test_rm_file2.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -99,25 +99,25 @@ if (!-d "test_rm_dir") {
 print "\nrm with recursive and force (-rf):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_rm_dir2/subdir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', '-p', 'test_rm_dir2/subdir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_dir2/file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', 'test_rm_dir2/file.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_dir2/subdir/file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', 'test_rm_dir2/subdir/file2.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_dir2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_rm_dir2'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -130,13 +130,13 @@ print $rm_preserve;
 print "\nrm with one file " . "sys" . "tem" . " (-x):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_rm_xfs"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', '-p', 'test_rm_xfs'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-x", "test_rm_xfs"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-x', 'test_rm_xfs'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -149,7 +149,7 @@ print $rm_no_deref;
 print "\nrm with ignore missing (-f):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-f", "nonexistent_file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-f', 'nonexistent_file.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -158,7 +158,7 @@ print "Ignored missing file\n";
 print "\nrm with directory (-d):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_rm_empty_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', '-p', 'test_rm_empty_dir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -182,25 +182,25 @@ if (!-d "test_rm_empty_dir") {
 print "\nrm with multiple files:\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_multi1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', 'test_rm_multi1.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_multi2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', 'test_rm_multi2.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_multi3.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', 'test_rm_multi3.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "test_rm_multi1.txt", "test_rm_multi2.txt", "test_rm_multi3.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', 'test_rm_multi1.txt', 'test_rm_multi2.txt', 'test_rm_multi3.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -211,25 +211,25 @@ unlink('test_rm_file2.txt') if -f 'test_rm_file2.txt';
 unlink('test_rm_interactive.txt') if -f 'test_rm_interactive.txt';
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_rm_dir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_dir2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_rm_dir2'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_xfs"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_rm_xfs'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_rm_empty_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_rm_empty_dir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };

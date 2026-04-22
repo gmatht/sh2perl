@@ -692,6 +692,19 @@ sub generate_exec_do_block {
         my $t = $tokens[$i];
         my ($txt, $q) = ref($t) eq 'ARRAY' ? @{$t} : ($t, 'bare');
 
+        # If the argument list contains a pipeline operator ('|') then this
+        # is really a shell pipeline expressed as a list of tokens. In that
+        # case we cannot faithfully exec the program directly with argv;
+        # treat the whole thing as a shell command and run it via
+        # bash -c so pipes and shell operators behave correctly. This
+        # prevents generating exec(...) with '|' and other tokens passed
+        # as literal argv elements which caused errors like
+        # "cat: '|': No such file or directory".
+        if ($txt eq '|') {
+            $fallback_to_shell = 1;
+            last;
+        }
+
         # Common simple redirections: >, >>, <, 2>, 2>> (followed by filename)
         if ($txt eq '>' || $txt eq '>>' || $txt eq '<' || $txt eq '2>' || $txt eq '2>>') {
             # Need a following filename token - if missing, fall back to shell
@@ -783,26 +796,35 @@ sub generate_exec_do_block {
 
 sub _perl_quote_literal_with_pref {
     my ($text, $pref) = @_;
-    # If preference is double, force a double-quoted Perl literal so Perl
-    # interpolation behavior matches the original source. If preference is
-    # single, use single-quoted literal. For bare tokens, fall back to the
-    # default heuristic.
+    # If the original token preferred double-quotes, try to respect that
+    # preference but avoid forcing a double-quoted Perl literal when it's
+    # not necessary. Many shell snippets (awk/sed programs) contain "$" or
+    # "@" which must be preserved verbatim; forcing a double-quoted Perl
+    # literal here would cause Perl interpolation and change the contents.
+    # Only use a double-quoted Perl literal when the text actually contains
+    # characters that require it (newlines, double quotes, backslashes or
+    # control characters). Otherwise prefer a single-quoted literal so
+    # "$" and "@" remain literal in the emitted Perl source.
     if (defined $pref && $pref eq 'double') {
-        my $escaped = $text;
-        $escaped =~ s/\\/\\\\/g;    # escape backslashes
-        $escaped =~ s/"/\\"/g;        # escape double quotes
-        $escaped =~ s/\n/\\n/g;
-        $escaped =~ s/\r/\\r/g;
-        $escaped =~ s/\t/\\t/g;
-        return "\"$escaped\"";
+        if ($text =~ /[\n\r\t"\\]/) {
+            my $escaped = $text;
+            $escaped =~ s/\\/\\\\/g;    # escape backslashes
+            $escaped =~ s/"/\\"/g;        # escape double quotes
+            $escaped =~ s/\n/\\n/g;
+            $escaped =~ s/\r/\\r/g;
+            $escaped =~ s/\t/\\t/g;
+            return "\"$escaped\"";
+        } else {
+            # Prefer single-quoted literal to avoid accidental interpolation
+            my $t = $text;
+            $t =~ s/'/\\'/g;
+            return "'$t'";
+        }
     }
+
     if (defined $pref && $pref eq 'single') {
         my $t = $text;
-        # Escape single quotes for a Perl single-quoted literal (use \' )
-        # Note: do NOT use the shell-style '\'"'"'\'' trick here; that's
-        # valid for shell quoting but produces adjacent quoted tokens in
-        # Perl source which leads to syntax errors. Use backslash-escaped
-        # single quotes so the generated Perl is a single, valid literal.
+        # Escape single quotes for a Perl single-quoted literal.
         $t =~ s/'/\\'/g;
         return "'$t'";
     }
