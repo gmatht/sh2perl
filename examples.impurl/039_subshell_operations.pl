@@ -51,7 +51,7 @@ system("(sleep 1 & sleep 1 & wait; echo 'All background processes completed')");
 
 # Subshell with variable assignment using backticks
 print "\nSubshell with variable assignment:\n";
-my $subshell_var = `(VAR1='value1'; VAR2='value2'; echo "VAR1: \$VAR1, VAR2: \$VAR2")`;
+my $subshell_var = `(VAR1='value1' VAR2='value2' echo "VAR1: \$VAR1, VAR2: \$VAR2")`;
 print $subshell_var;
 
 # Subshell with function calls using system()

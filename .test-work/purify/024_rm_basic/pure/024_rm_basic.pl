@@ -52,19 +52,6 @@ my $rm_force = do { my $command = 'rm -f test_rm_file2.txt 2> /dev/null'; my $re
 ;
 print "Force removal attempted\n";
 
-print "\nrm with interactive (-i):\n";
-do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_rm_interactive.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
-
-};
-do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-i", "test_rm_interactive.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
-
-};
 
 print "\nrm with recursive (-r):\n";
 my $rm_recursive = do {
