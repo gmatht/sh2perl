@@ -82,7 +82,7 @@ print $strings_multi;
 
 # strings with pipe using system()
 print "\nstrings with pipe:\n";
-system("cat", "test_strings.txt", "|", "strings");
+system("sh", "-c", "cat test_strings.txt | strings");
 
 # strings with pipe using backticks
 print "\nstrings with pipe:\n";

@@ -34,11 +34,11 @@ pub fn generate_sha256sum_command(
             // If this is used in a command-substitution context (input_var is empty)
             // wrap the multi-statement verifier in a do { ... } block so it can
             // be used as a single expression.
-            if input_var.is_empty() {
-                output.push_str("do {\n    my @results;\n");
-            } else {
-                output.push_str("my @results;\n");
-            }
+            // Always emit an expression-valued do-block for the verifier so
+            // callers can inline it safely. This avoids emitting top-level
+            // assignments that can unbalance surrounding blocks when the
+            // generator result is spliced into larger do { ... } expressions.
+            output.push_str("do {\n    my @results;\n");
 
             for file in &files {
                 // Unquote the filename for user-facing messages when possible
@@ -83,28 +83,27 @@ pub fn generate_sha256sum_command(
                 output.push_str("}\n");
             }
 
-            if input_var.is_empty() {
-                output.push_str("    join \"\\n\", @results;\n};");
-            } else {
-                output.push_str(&format!("{} = join \"\\n\", @results;\n", input_var));
-            }
+            // Return the joined results as the value of the do-block so
+            // callers may choose to assign it to a variable if needed.
+            output.push_str("    join \"\\n\", @results;\n};");
         } else {
             // No checksum files specified; treat the input_var as the checksum content
+            // When an input_var is provided we still emit an expression-valued
+            // do-block that reads from that variable; callers will assign the
+            // result if they want. This simplifies composition and avoids
+            // leaking assignments into surrounding scopes.
             if input_var.is_empty() {
-                // When used in command substitution, wrap in a do-block so the
-                // multi-statement verifier becomes a single expression.
+                // No input var: operate on implicit input (e.g., STDIN) when used
+                // as a standalone command substitution.
+                output.push_str("do {\n    my @lines = split /\\n/msx, do { local $/ = undef; <STDIN> };\n    my @results;\n");
+            } else {
+                // Read lines from the provided input variable and run verifier
                 output.push_str(&format!(
                     "do {{\n    my @lines = split /\\n/msx, {};\n    my @results;\n",
                     input_var
                 ));
-                output.push_str("    foreach my $line (@lines) {\n");
-                output.push_str("        chomp $line;\n");
-            } else {
-                output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
-                output.push_str("my @results;\n");
-                output.push_str("foreach my $line (@lines) {\n");
-                output.push_str("chomp $line;\n");
             }
+            output.push_str("    foreach my $line (@lines) {\n        chomp $line;\n");
             output.push_str(&format!(
                 "if ($line =~ {}) {{\n",
                 generator.format_regex_pattern(r"^([a-f0-9]{64})\\s+(.+)$")
@@ -121,11 +120,8 @@ pub fn generate_sha256sum_command(
             output.push_str("push @results, \"$filename: No such file\";\n");
             output.push_str("}\n");
             output.push_str("}\n");
-            if input_var.is_empty() {
-                output.push_str("    join \"\\n\", @results;\n};");
-            } else {
-                output.push_str(&format!("{} = join \"\\n\", @results;\n", input_var));
-            }
+            // Return the joined results as the expression value
+            output.push_str("    join \"\\n\", @results;\n};");
         }
     } else if files.is_empty() {
         // No files specified, calculate hash of input
@@ -159,7 +155,10 @@ pub fn generate_sha256sum_command(
             output.push_str("    join \"\\n\", @results;\n");
             output.push_str("};");
         } else {
-            output.push_str("my @results;\n");
+            // When an input_var is supplied, emit an expression-valued do-block
+            // that computes and returns the joined results instead of
+            // assigning into the caller's variable.
+            output.push_str("do {\n    my @results;\n");
             for file in &files {
                 // Extract the unquoted filename for output
                 let unquoted_file =
@@ -180,7 +179,7 @@ pub fn generate_sha256sum_command(
                 output.push_str(&format!("\"0000000000000000000000000000000000000000000000000000000000000000  {}  FAILED open or read\";\n", unquoted_file));
                 output.push_str("    }\n");
             }
-            output.push_str(&format!("{} = join \"\\n\", @results;\n", input_var));
+            output.push_str("    join \"\\n\", @results;\n};");
         }
     }
     output.push_str("\n");
