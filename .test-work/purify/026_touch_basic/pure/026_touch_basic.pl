@@ -10,7 +10,7 @@ $ENV{LC_ALL} = 'C';
 print "Using " . "sys" . "tem" . "() to call touch (create file):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-t", "202301011200", "test_touch_file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', '-t', '202301011200', 'test_touch_file.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -35,7 +35,7 @@ print "Multiple files created successfully\n" if -f "test_touch_file1.txt" && -f
 print "\ntouch with verbose (-v):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-v", "-t", "202301011200", "test_touch_verbose.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', '-v', '-t', '202301011200', 'test_touch_verbose.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -64,7 +64,7 @@ print -f "test_touch_no_create.txt" ? "File already existed\n" : "File not creat
 print "\ntouch with reference (-r):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-r", "test_touch_file.txt", "test_touch_reference.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', '-r', 'test_touch_file.txt', 'test_touch_reference.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -89,7 +89,7 @@ print "File created with specific timestamp\n" if -f "test_touch_time.txt";
 print "\ntouch with date (-d '2023-01-01 12:00:00'):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-d", "2023-01-01 12:00:00", "test_touch_date.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', '-d', '2023-01-01 12:00:00', 'test_touch_date.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -114,7 +114,7 @@ print "Access time updated\n";
 print "\ntouch with modification time (-m):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-m", "test_touch_file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', '-m', 'test_touch_file.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -139,7 +139,7 @@ print "Both access and modification times updated\n";
 print "\ntouch with no dereference (-h):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "-h", "test_touch_no_deref.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', '-h', 'test_touch_no_deref.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -153,7 +153,7 @@ print -f "test_touch_error.txt" ? "File created successfully\n" : "File creation
 print "\ntouch with specific mode (--mode=644):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "--mode=644", "test_touch_mode.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('touch', '--mode=644', 'test_touch_mode.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };

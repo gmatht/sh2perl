@@ -45,6 +45,14 @@ it. The awk program should receive the literal string containing $0 (not the
 script path), and the runtime error about "No such file or directory" should
 no longer occur.
 
+Note: In addition to the Rust-side fixes described above, I adjusted purify.pl's
+literal-quoting helper so it no longer forces double-quoted Perl literals when
+the original token was double-quoted but does not contain characters that
+require double-quoting (newlines, double quotes, backslashes or control
+characters). This prevents accidental Perl interpolation of shell fragments
+containing "$" or "@" (for example awk programs with $0) when purify splices
+generated snippets back into the host document.
+
 Fix: Locate 'system' tokens precisely in purify.pl
 -------------------------------------------------
 Problem
