@@ -24,7 +24,7 @@ if ($file_size > 50) {
     chomp $line_count;
     if ($line_count > 3) {
         print "File has many lines ($line_count), processing:\n";
-        system("cat", "nested_test.txt", "|", "head", "-3");
+        system("sh", "-c", "cat nested_test.txt | head -3");
     } else {
         print "File has few lines ($line_count), displaying all:\n";
         system("cat", "nested_test.txt");
@@ -101,7 +101,7 @@ if ($file_exists =~ /exists/) {
     
     if ($permissions =~ /r/) {
         print "File is readable, processing:\n";
-        system("cat", "nested_test.txt", "|", "head", "-2");
+        system("sh", "-c", "cat nested_test.txt | head -2");
     } else {
         print "File is not readable\n";
     }
@@ -138,7 +138,7 @@ if (-f "nested_test.txt") {
     
     if (-f "nested_test_backup.txt") {
         print "Backup created, processing original:\n";
-        system("cat", "nested_test.txt", "|", "grep", "line", "|", "wc", "-l");
+        system("sh", "-c", "cat nested_test.txt | grep line | wc -l");
         
         print "Cleaning up backup:\n";
         system("rm", "nested_test_backup.txt");

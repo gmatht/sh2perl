@@ -35,7 +35,8 @@ print $sha512_output;
 
 # SHA256 with check using system()
 print "\nSHA256 with check (-c):\n";
-system("sha256sum", "test_checksum.txt", ">", "test_checksum.sha256");
+# create checksum file via shell redirection
+system("sh", "-c", "sha256sum test_checksum.txt > test_checksum.sha256");
 system("sha256sum", "-c", "test_checksum.sha256");
 
 # SHA512 with check using backticks
@@ -91,7 +92,7 @@ print $sha512_multi;
 
 # SHA256 with pipe using system()
 print "\nSHA256 with pipe:\n";
-system("cat", "test_checksum.txt", "|", "sha256sum");
+system("sh", "-c", "cat test_checksum.txt | sha256sum");
 
 # SHA512 with pipe using backticks
 print "\nSHA512 with pipe:\n";

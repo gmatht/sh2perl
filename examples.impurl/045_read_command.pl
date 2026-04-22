@@ -19,16 +19,17 @@ print "First line: $read_output";
 
 # read with variable assignment using system()
 print "\nread with variable assignment (simulated):\n";
-system("echo", "Hello World", "|", "read", "VAR", "&&", "echo", "Variable: $VAR");
+# shell 'read' won't populate Perl vars; simulate via sh -c and print
+system("sh", "-c", "echo Hello World | { read VAR; echo Variable: \$VAR; }");
 
 # read with multiple variables using backticks
 print "\nread with multiple variables (simulated):\n";
-my $read_multi = `echo "Alice 25 Engineer" | awk '{print "Name: " $1 ", Age: " $2 ", Role: " $3}'`;
+my $read_multi = `echo "Alice 25 Engineer" | awk '{print "Name: " \$1 ", Age: " \$2 ", Role: " \$3}'`;
 print $read_multi;
 
 # read with delimiter using system()
 print "\nread with delimiter (simulated):\n";
-system("echo", "Alice,25,Engineer", "|", "awk", "-F,", "{print \"Name: \" $1 \", Age: \" $2 \", Role: \" $3}");
+system('sh', ' -c', 'echo "Alice,25,Engineer" | awk -F, \'{print "Name: " $1 ", Age: " $2 ", Role: " $3}\'');
 
 # read with timeout using backticks
 print "\nread with timeout (simulated):\n";
@@ -37,7 +38,7 @@ print "Timeout result: $read_timeout";
 
 # read with prompt using system()
 print "\nread with prompt (simulated):\n";
-system("echo", "-n", "Enter your name: ", "&&", "echo", "John Doe");
+system("sh", "-c", "printf '%s' 'Enter your name: '; echo 'John Doe'");
 
 # read with silent input using backticks
 print "\nread with silent input (simulated):\n";
@@ -46,7 +47,7 @@ print "Silent input: $read_silent";
 
 # read with array using system()
 print "\nread with array (simulated):\n";
-system("echo", "Alice Bob Charlie", "|", "awk", "{for(i=1;i<=NF;i++) print \"Element \" i \": \" $i}");
+system("sh", "-c", "echo 'Alice Bob Charlie' | awk '{for(i=1;i<=NF;i++) print \"Element \" i \": \" $i}'");
 
 # read with file descriptor using backticks
 print "\nread with file descriptor (simulated):\n";
@@ -55,7 +56,7 @@ print "File descriptor result: $read_fd";
 
 # read with error handling using system()
 print "\nread with error handling:\n";
-system("echo", "Error test", "2>/dev/null", "|", "cat");
+system("sh", "-c", "echo 'Error test' 2>/dev/null | cat");
 
 # read with pipe using backticks
 print "\nread with pipe:\n";
@@ -64,7 +65,7 @@ print $read_pipe;
 
 # read with multiple lines using system()
 print "\nread with multiple lines:\n";
-system("cat", "test_read_input.txt", "|", "head", "-3");
+system("sh", "-c", "cat test_read_input.txt | head -3");
 
 # read with line counting using backticks
 print "\nread with line counting:\n";
@@ -73,7 +74,7 @@ print "Total lines: $read_count";
 
 # read with character counting using system()
 print "\nread with character counting:\n";
-system("cat", "test_read_input.txt", "|", "wc", "-c");
+system("sh", "-c", "cat test_read_input.txt | wc -c");
 
 # read with word counting using backticks
 print "\nread with word counting:\n";
