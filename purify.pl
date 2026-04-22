@@ -188,6 +188,12 @@ sub purify_perl_code {
         $serialized = "use Digest::SHA   qw(sha256_hex sha512_hex);\n" . $serialized;
     }
 
+    # If the converted code uses IPC::Open3's open3 but does not import it,
+    # add the import so the generated open3() calls are defined at runtime.
+    if ($serialized =~ /\bopen3\b/ && $serialized !~ /\buse\s+IPC::Open3\b/) {
+        $serialized = "use IPC::Open3;\n" . $serialized;
+    }
+
     return $serialized;
 }
 
@@ -422,6 +428,53 @@ sub process_single_backtick_string {
         $perl_result =~ s/\$EVAL_ERROR\b/\$\@/g;            # $EVAL_ERROR -> $@
 
         print "DEBUG: Got perl result for backtick: [$perl_result]\n" if $verbose;
+        # Sanitize debashc inline backtick snippets: debashc sometimes emits
+        # a Perl assignment where the assigned command string contains
+        # literal newlines (e.g. my $X = "echo 1,2,3\n4,5,6\n7,8,9 | ...";).
+        # When such a literal contains actual newline characters they end
+        # up in the generated Perl source and later qx{...} will be given
+        # a multi-line script instead of a single command string. Fix by
+        # locating the assigned command string, re-encoding control
+        # characters into visible backslash sequences (\n, \t, \r) and
+        # reconstructing the assignment so the generated Perl source
+        # contains escapes rather than raw control characters.
+        if ($perl_result =~ /(my\s+\$[A-Za-z0-9_]+\s*=\s*)(?:(['"])(.*?)\2|q\{(.*?)\});/s) {
+            my ($assign_prefix, $q, $cmdstr1, $cmdstr2) = ($1, $2, $3, $4);
+            my $cmdstr = defined $cmdstr1 ? $cmdstr1 : $cmdstr2;
+            if (defined $cmdstr && $cmdstr =~ /\becho\s+([^|]*?)\s*\|/s) {
+                my $echo_arg = $1;
+                # If the echo argument contains a literal newline and is
+                # not already single-quoted, replace it with an escaped
+                # representation so the shell sees the same argument text
+                # at runtime but the Perl source remains a single-line
+                # literal.
+                if ($echo_arg =~ /\n/ && $echo_arg !~ /^\s*'/s) {
+                    # Escape single quotes for shell single-quoted strings
+                    my $escaped_for_shell = $echo_arg;
+                    $escaped_for_shell =~ s/'/'\\''/g;
+                    my $new_echo_arg = "'" . $escaped_for_shell . "'";
+                    my $quoted_arg_re = quotemeta($echo_arg);
+                    my $new_cmdstr = $cmdstr;
+                    $new_cmdstr =~ s/\becho\s+$quoted_arg_re(\s*\|)/echo $new_echo_arg$1/s;
+                    # Replace the inner command string in perl_result
+                    $perl_result =~ s/\Q$cmdstr\E/$new_cmdstr/s;
+                }
+            }
+            # Additionally, ensure that any double-quoted literal used for
+            # the assigned command string has control characters escaped
+            # (so the generated Perl source doesn't contain raw newlines).
+            $perl_result =~ s{(my\s+\$[A-Za-z0-9_]+\s*=\s*)(['"])(.*?)\2}{
+                my ($pref, $delim, $inner) = ($1, $2, $3);
+                my $fixed = $inner;
+                $fixed =~ s/\\/\\\\/g;   # backslashes
+                $fixed =~ s/\"/\\\"/g;   # escaped quotes
+                $fixed =~ s/\n/\\n/g;       # newline -> \n
+                $fixed =~ s/\r/\\r/g;       # cr -> \r
+                $fixed =~ s/\t/\\t/g;       # tab -> \t
+                $pref . $delim . $fixed . $delim;
+            }es;
+        }
+
         return defined $var_name ? "$prefix$var_name = $perl_result;" : $perl_result;
     } else {
         print "DEBUG: No perl result for backtick command\n" if $verbose;
@@ -730,7 +783,12 @@ sub _perl_quote_literal_with_pref {
     }
     if (defined $pref && $pref eq 'single') {
         my $t = $text;
-        $t =~ s/'/'"'"'/g;
+        # Escape single quotes for a Perl single-quoted literal (use \' )
+        # Note: do NOT use the shell-style '\'"'"'\'' trick here; that's
+        # valid for shell quoting but produces adjacent quoted tokens in
+        # Perl source which leads to syntax errors. Use backslash-escaped
+        # single quotes so the generated Perl is a single, valid literal.
+        $t =~ s/'/\\'/g;
         return "'$t'";
     }
 
@@ -759,7 +817,9 @@ sub _perl_quote_literal {
     }
 
     # Fallback: use single-quoted literal and escape single quotes inside
-    $text =~ s/'/'"'"'/g; # escape single quotes for single-quoted string
+    # Escape single quotes for a Perl single-quoted literal. See note above
+    # about avoiding shell-style escapes.
+    $text =~ s/'/\\'/g; # escape single quotes as \'
     return "'$text'";
 }
 

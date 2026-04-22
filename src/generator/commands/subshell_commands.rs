@@ -87,14 +87,45 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
     output.push_str("# Child process executes the background command\n");
 
     if prefer_shell_fallback {
-        // Reconstruct the original shell command and exec bash -c so parsing and
-        // diagnostics match the host shell exactly (preserves syntax errors).
-        let cmd_str = crate::generator::redirects::generate_bash_command_string(command);
-        let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-        output.push_str(&generator.indent());
-        output.push_str(&format!("exec 'bash', '-c', {};\n", cmd_lit));
-        output.push_str(&generator.indent());
-        output.push_str("croak \"exec failed: $OS_ERROR\\n\";\n");
+        // Prefer preserving the original exec argument list for simple
+        // invocations like `sh -c '...'` to avoid creating nested
+        // "bash -c 'sh -c ...'" forms which require fragile escaping.
+        // If we detect a simple sh/bash -c <literal> form, emit
+        // exec('sh'|'bash', '-c', <literal>) using a non-interpolating
+        // Perl literal for the inner command. Otherwise fall back to the
+        // generic bash -c wrapper.
+        let mut handled = false;
+        if let Command::Simple(simple_cmd) = command {
+            if let Word::Literal(name, _) = &simple_cmd.name {
+                if (name == "sh" || name == "bash") && simple_cmd.args.len() >= 2 {
+                    if let Word::Literal(flag, _) = &simple_cmd.args[0] {
+                        if flag == "-c" {
+                            if let Word::Literal(inner_cmd, _) = &simple_cmd.args[1] {
+                                let inner_lit = generator.perl_string_literal_no_interp(
+                                    &Word::literal(inner_cmd.clone()),
+                                );
+                                output.push_str(&generator.indent());
+                                output
+                                    .push_str(&format!("exec '{}', '-c', {};\n", name, inner_lit));
+                                output.push_str(&generator.indent());
+                                output.push_str("croak \"exec failed: $OS_ERROR\\n\";\n");
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !handled {
+            // Generic fallback: reconstruct the original shell command and exec bash -c
+            let cmd_str = crate::generator::redirects::generate_bash_command_string(command);
+            let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("exec 'bash', '-c', {};\n", cmd_lit));
+            output.push_str(&generator.indent());
+            output.push_str("croak \"exec failed: $OS_ERROR\\n\";\n");
+        }
     } else {
         output.push_str(&generator.generate_command(command));
         output.push_str(&generator.indent());
