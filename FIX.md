@@ -320,3 +320,34 @@ Wrapping existing multi-statement output in a `do { ... }` block doesn't change
 the generated logic; it merely ensures the fragment is a single expression and
 thus valid in substitution contexts. This is localized to generator output
 formatting and keeps purify.pl as a thin integration layer.
+
+Fix: Close regex match blocks in sha*sum generators
+--------------------------------------------------
+Problem
+-------
+The generated Perl for sha256sum/sha512sum in check mode contained a missing
+closing brace for the inner regex match handling. When the multi-statement
+verifier was inlined into backtick/command-substitution contexts this produced
+invalid Perl like "} else" at compile time.
+
+Fix
+---
+Emit the missing closing brace in both sha256sum and sha512sum generators so the
+`if ($line =~ /.../) { ... }` block is properly balanced. This keeps the
+generator output syntactically valid when wrapped in `do { ... }` expression
+blocks for command-substitution contexts.
+
+Files changed
+-------------
+- src/generator/commands/sha256sum.rs: add the missing brace for the regex
+  match handling branch.
+- src/generator/commands/sha512sum.rs: add the missing brace for the regex
+  match handling branch.
+
+Why this is minimal and safe
+---------------------------
+This merely corrects a small omission in the emitted Perl code (a missing
+`}`) and does not alter the runtime behaviour of the generated verifier. It
+avoids producing invalid Perl when the verifier is placed inside expression
+contexts (backticks) and preserves purify.pl as a thin wrapper around the
+generator output.
