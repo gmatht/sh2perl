@@ -46,7 +46,8 @@ print $subshell_cond;
 
 # Subshell with background processes using system()
 print "\nSubshell with background processes:\n";
-system("(sleep 1 &; sleep 1 &; wait; echo 'All background processes completed')");
+#system("(sleep 1 &; sleep 1 &; wait; echo 'All background processes completed')");
+system("(sleep 1 & sleep 1 & wait; echo 'All background processes completed')");
 
 # Subshell with variable assignment using backticks
 print "\nSubshell with variable assignment:\n";
