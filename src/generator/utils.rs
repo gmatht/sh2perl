@@ -478,10 +478,14 @@ pub fn perl_string_literal_force_interp_impl(_generator: &mut Generator, word: &
             // Escape backslashes and double quotes and encode control characters
             // as backslash sequences so the generated Perl source contains
             // visible escapes (e.g. "\\n") rather than actual newlines.
+            // Use a double-escaped replacement for newlines so the Perl
+            // parser does not convert the source escape into an actual
+            // newline at parse time (we want the runtime string to contain
+            // literal backslash+n sequences when appropriate).
             let escaped = s
                 .replace("\\", "\\\\")
                 .replace("\"", "\\\"")
-                .replace("\n", "\\n")
+                .replace("\n", "\\\\n")
                 .replace("\t", "\\t")
                 .replace("\r", "\\r");
             format!("\"{}\"", escaped)

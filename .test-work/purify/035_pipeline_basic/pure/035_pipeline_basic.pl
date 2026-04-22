@@ -41,7 +41,7 @@ $?;
 };
 
 print "\nPipeline with cut and paste:\n";
-my $pipeline_cut_paste = do { my $pipeline_cmd = "echo 1,2,3\n4,5,6\n7,8,9 | cut -d, -f 1,3 | paste - -"; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
+my $pipeline_cut_paste = do { my $pipeline_cmd = "echo 1,2,3\\n4,5,6\\n7,8,9 | cut -d, -f 1,3 | paste - -"; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print $pipeline_cut_paste;
 
