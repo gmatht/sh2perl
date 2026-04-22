@@ -5,7 +5,7 @@ BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/030_tee_basic.pl" }
 print "=== Example 030: Basic tee command ===\n";
 
 print "Using backticks to call tee (write to file and stdout):\n";
-my $tee_output = do { my $pipeline_cmd = 'echo This is a test line | tee test_tee_output.txt'; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
+my $tee_output = do { my $pipeline_cmd = q{echo 'This is a test line' | tee test_tee_output.txt}; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print "Output: $tee_output";
 
@@ -25,7 +25,7 @@ $?;
 };
 
 print "\ntee with multiple files:\n";
-my $tee_multi = do { my $pipeline_cmd = 'echo Line for multiple files | tee test_tee1.txt test_tee2.txt test_tee3.txt'; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
+my $tee_multi = do { my $pipeline_cmd = q{echo 'Line for multiple files' | tee test_tee1.txt test_tee2.txt test_tee3.txt}; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print "Output: $tee_multi";
 
@@ -42,7 +42,7 @@ $?;
 };
 
 print "\ntee with pipe fail (-p):\n";
-my $tee_pipe = do { my $pipeline_cmd = 'echo This line has pipe fail | tee -p test_tee_pipe.txt'; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
+my $tee_pipe = do { my $pipeline_cmd = q{echo 'This line has pipe fail' | tee -p test_tee_pipe.txt}; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print "Output: $tee_pipe";
 
@@ -55,7 +55,7 @@ $?;
 };
 
 print "\ntee with output to stderr:\n";
-my $tee_stderr = do { my $pipeline_cmd = 'echo This goes to stderr | tee /dev/stderr'; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
+my $tee_stderr = do { my $pipeline_cmd = q{echo 'This goes to stderr' | tee /dev/stderr}; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print "Output: $tee_stderr";
 
@@ -68,7 +68,7 @@ $?;
 };
 
 print "\ntee with multiple outputs:\n";
-my $tee_multi_out = do { my $pipeline_cmd = 'echo Multiple outputs | tee test_tee_multi1.txt test_tee_multi2.txt /dev/stdout'; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
+my $tee_multi_out = do { my $pipeline_cmd = q{echo 'Multiple outputs' | tee test_tee_multi1.txt test_tee_multi2.txt /dev/stdout}; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print "Output: $tee_multi_out";
 
@@ -81,7 +81,7 @@ $?;
 };
 
 print "\ntee with pipe fail and multiple files:\n";
-my $tee_pipe_multi = do { my $pipeline_cmd = 'echo Pipe fail with multiple files | tee -p test_tee_pipe1.txt test_tee_pipe2.txt'; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
+my $tee_pipe_multi = do { my $pipeline_cmd = q{echo 'Pipe fail with multiple files' | tee -p test_tee_pipe1.txt test_tee_pipe2.txt}; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print "Output: $tee_pipe_multi";
 
