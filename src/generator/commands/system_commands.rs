@@ -9,6 +9,16 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
             // so shell variables like $0 do not get expanded unexpectedly.
             if s.starts_with('\'') && s.ends_with('\'') {
                 s.clone()
+            }
+            // If the literal was originally double-quoted (e.g. "*.txt"),
+            // strip the outer double quotes and re-emit as a single-quoted
+            // literal so that the reconstructed bash command preserves the
+            // literal bytes (and prevents the outer shell from expanding
+            // globs prematurely).
+            else if s.starts_with('\"') && s.ends_with('\"') {
+                let inner = &s[1..s.len() - 1];
+                // Escape single quotes for safe embedding in single-quoted shell literals
+                format!("'{}'", inner.replace("'", "'\\''"))
             } else if s.is_empty() {
                 "''".to_string()
             }
@@ -41,7 +51,8 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
                 || s.contains('?')
                 || s.contains('[')
             {
-                format!("'{}'", s.replace("'", "'\"'\"'"))
+                // Escape single quotes for safe embedding in single-quoted shell literals
+                format!("'{}'", s.replace("'", "'\\''"))
             } else {
                 s.clone()
             }
@@ -70,7 +81,8 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
                 || result.contains('?')
                 || result.contains('[')
             {
-                format!("'{}'", result.replace("'", "'\"'\"'"))
+                // Escape single quotes for safe embedding in single-quoted shell literals
+                format!("'{}'", result.replace("'", "'\\''"))
             } else {
                 result
             }
@@ -89,7 +101,8 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
                 || s.contains('?')
                 || s.contains('[')
             {
-                format!("'{}'", s.replace("'", "'\"'\"'"))
+                // Escape single quotes for safe embedding in single-quoted shell literals
+                format!("'{}'", s.replace("'", "'\\''"))
             } else {
                 s
             }

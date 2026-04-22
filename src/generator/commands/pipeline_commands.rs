@@ -754,8 +754,17 @@ pub fn generate_pipeline_for_substitution(
         // This is more robust than using pipeline.source_text which may have
         // been altered by the parser/environment and can lead to nested-quote
         // collisions when embedded in an outer Perl literal.
-        let reconstructed_cmd =
-            generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
+        // Prefer the original source text for the pipeline (first line) when
+        // available. The parser's source_text preserves the original quoting
+        // (for example: "-name \"*.txt\"") which we want to keep when
+        // embedding the pipeline into a shell -c / qx invocation. Fall back to
+        // the reconstructed command when source_text is not present.
+        let reconstructed_cmd = if let Some(src) = &pipeline.source_text {
+            // Use only the first line to avoid including nearby unrelated text
+            src.lines().next().unwrap_or(src).to_string()
+        } else {
+            generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
+        };
         let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(reconstructed_cmd));
         format!(
             "do {{\n    my $result_{} = qx{{bash -c {} }};\n    chomp $result_{};\n    $result_{};\n}}",
