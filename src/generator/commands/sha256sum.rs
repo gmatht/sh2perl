@@ -124,8 +124,17 @@ pub fn generate_sha256sum_command(
             output.push_str("    join \"\\n\", @results;\n};");
         }
     } else if files.is_empty() {
-        // No files specified, calculate hash of input
-        output.push_str(&format!("{} = sha256_hex({});\n", input_var, input_var));
+        // No files specified, calculate hash of input.
+        // Emit an expression-valued snippet instead of assigning into the
+        // caller's variable. This ensures the generator can be inlined safely
+        // into surrounding do { ... } expressions.
+        if input_var.is_empty() {
+            // No input var: read from STDIN and return the hash as an expression
+            output.push_str("sha256_hex(do { local $/ = undef; <STDIN> })");
+        } else {
+            // Compute hash of the provided Perl variable and return it as an expression
+            output.push_str(&format!("sha256_hex({})", input_var));
+        }
     } else {
         // Calculate hashes of specified files
         if input_var.is_empty() {
