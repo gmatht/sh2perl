@@ -676,8 +676,15 @@ sub generate_exec_do_block {
 
     # Build the exec argument list (exclude the program itself which is in $exe_quoted)
     my $args_list = '';
+    # @argv_tokens contains only the argv elements (the program name was
+    # removed earlier when we shifted @tokens). Join all entries here so the
+    # exec call receives the full argument list. The previous code
+    # mistakenly skipped the first element (as if @argv_tokens still
+    # contained the program at index 0) which dropped the first argument
+    # and produced empty/incorrect command invocations (e.g. `echo` with
+    # no args).
     if (@argv_tokens) {
-        $args_list = join(', ', @argv_tokens[1..$#argv_tokens]);
+        $args_list = join(', ', @argv_tokens);
     }
 
     # Build the exec block as a string with literal Perl variables ($pid, $!)
