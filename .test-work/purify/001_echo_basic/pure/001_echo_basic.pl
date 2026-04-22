@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-BEGIN { $0 = "examples.impurl/001_echo_basic.pl" }
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/001_echo_basic.pl" }
 
 
 print "=== Example 001: Basic echo command ===\n";
