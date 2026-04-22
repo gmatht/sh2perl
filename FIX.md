@@ -71,6 +71,39 @@ Files changed
   purify logic robust for constructs like for/if where the previous
   approach could misidentify the argument list.
 
+Fix: Avoid over-escaping single-quoted debashc literals in purify.pl
+-----------------------------------------------------------------
+Problem
+-------
+When sanitizing debashc's emitted Perl snippets, purify.pl applied
+aggressive backslash and quote escaping to all double- or single-quoted
+assigned command strings. That re-escaped already-correct single-quoted
+literals (containing sequences like \' ) turning them into invalid Perl
+source (for example turning \' into \\\' inside the generated file).
+
+Fix
+---
+Only apply the full backslash/double-quote/control-character escaping
+when the assigned string is double-quoted. For single-quoted literals
+preserve existing backslash escapes emitted by debashc and only encode
+raw control characters (\n, \r, \t) into backslash sequences so the
+generated Perl source does not contain literal newlines. This avoids
+producing malformed Perl like unescaped single quotes or excessive
+backslashes.
+
+Files changed
+-------------
+- purify.pl: adjust replacement that normalizes assigned command strings
+  to treat single-quoted and double-quoted cases differently.
+
+Why this is minimal and safe
+---------------------------
+This change is a narrow defensive tweak in purify.pl's post-processing
+of debashc output and only affects how control characters and existing
+escapes are handled for already-quoted literals. It prevents the
+specific syntax error observed in Example 024 without altering the
+generator's emitted Perl semantics.
+
 Why this is minimal and safe
 ---------------------------
   This only changes how purify.pl locates system() calls in the parsed

@@ -463,16 +463,31 @@ sub process_single_backtick_string {
             # Additionally, ensure that any double-quoted literal used for
             # the assigned command string has control characters escaped
             # (so the generated Perl source doesn't contain raw newlines).
-            $perl_result =~ s{(my\s+\$[A-Za-z0-9_]+\s*=\s*)(['"])(.*?)\2}{
-                my ($pref, $delim, $inner) = ($1, $2, $3);
-                my $fixed = $inner;
+        $perl_result =~ s{(my\s+\$[A-Za-z0-9_]+\s*=\s*)(['"])(.*?)\2}{
+            my ($pref, $delim, $inner) = ($1, $2, $3);
+            my $fixed = $inner;
+            # Only perform the full escaping (backslashes, double-quotes,
+            # control characters) when the assigned string is double-quoted.
+            # Debashc already emits safe single-quoted literals that may
+            # contain backslash-escaped single-quotes (e.g. \' ) and
+            # re-escaping backslashes here would turn \' into \\\' which
+            # yields invalid Perl. For single-quoted delimiters just encode
+            # raw control characters so the generated Perl source does not
+            # contain literal newlines.
+            if ($delim eq '"') {
                 $fixed =~ s/\\/\\\\/g;   # backslashes
-                $fixed =~ s/\"/\\\"/g;   # escaped quotes
+                $fixed =~ s/\"/\\\"/g;   # escaped double-quotes
                 $fixed =~ s/\n/\\n/g;       # newline -> \n
                 $fixed =~ s/\r/\\r/g;       # cr -> \r
                 $fixed =~ s/\t/\\t/g;       # tab -> \t
-                $pref . $delim . $fixed . $delim;
-            }es;
+            } else {
+                # single-quoted: avoid touching existing backslash escapes
+                $fixed =~ s/\n/\\n/g;
+                $fixed =~ s/\r/\\r/g;
+                $fixed =~ s/\t/\\t/g;
+            }
+            $pref . $delim . $fixed . $delim;
+        }es;
         }
 
         return defined $var_name ? "$prefix$var_name = $perl_result;" : $perl_result;
