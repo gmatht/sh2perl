@@ -475,3 +475,29 @@ retaining correct pipeline emission for AST-based pipeline commands. It is a
 localized change to the serialization helper and should fix spurious
 output_mismatch cases like examples.impurl/030_tee_basic.pl without broader
 regressions.
+
+Fix: Use quoted shell text when converting sh -c list-form system() in purify.pl
+-------------------------------------------------------------------------------
+Problem
+-------
+When handling list-form calls like system('sh','-c', ...), purify.pl reconstructed
+both a raw and a quoted version of the inner shell command but passed the raw
+form to debashc. The raw form could lose original single-quote characters which
+prevented purify.pl's defensive check from detecting unsafe single-quoted
+generator fallbacks. That allowed nested unescaped single-quotes to be inserted
+into the final Perl output.
+
+Fix
+---
+Pass the semantics-preserving quoted shell command to convert_shell_to_perl so
+debashc sees the same shell quoting as the original source. Also use the same
+quoted string when checking for debashc single-quoted system(...) fallbacks so
+unsafe fallbacks are rejected and a safe exec('sh','-c', q{...}) fallback is
+used instead.
+
+Files changed
+-------------
+- purify.pl: generate_exec_do_block now calls convert_shell_to_perl with the
+  quoted shell command ($shell_cmd_for_exec) and uses that variable in the
+  fallback detection. This prevents nested single-quote Perl source from being
+  inserted into the final output.
