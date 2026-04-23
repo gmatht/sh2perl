@@ -1067,6 +1067,19 @@ sub _perl_quote_literal_with_pref {
     return _perl_quote_literal($text);
 }
 
+# Return true when the text contains an unescaped Perl sigil ($ or @)
+# followed by an identifier-ish token (letter or underscore) or a brace
+# based identifier (e.g. ${var}, @{arr}). This is used to decide whether
+# the original author likely intended Perl interpolation and thus whether
+# we should emit a double-quoted Perl literal. Do not treat numeric-only
+# references like $0 as an identifier sigil.
+sub _has_unescaped_ident_sigil {
+    my ($text) = @_;
+    return 0 unless defined $text && length $text;
+    # Negative lookbehind to ensure the sigil is not escaped (preceded by backslash)
+    return ($text =~ /(?<!\\)(?:\$\{?[A-Za-z_]|@\{?[A-Za-z_])/) ? 1 : 0;
+}
+
 
 sub _perl_quote_literal {
     my ($text) = @_;
