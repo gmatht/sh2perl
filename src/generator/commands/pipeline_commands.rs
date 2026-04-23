@@ -712,15 +712,37 @@ pub fn generate_pipeline_for_substitution(
                     .iter()
                     .map(|arg| match arg {
                         Word::Literal(s, _) => {
-                            // Strip outer quotes if present
-                            let mut raw = s.clone();
-                            if (raw.starts_with('"') && raw.ends_with('"'))
-                                || (raw.starts_with('\'') && raw.ends_with('\''))
+                            // Preserve the original literal so we can tell whether it
+                            // was double-quoted (which implies shell interpolation of
+                            // $/@) and whether any sigils were escaped by a backslash.
+                            let original = s.clone();
+                            let was_double = original.starts_with('"') && original.ends_with('"');
+
+                            // Strip outer quotes if present (single or double)
+                            let raw = if (original.starts_with('"') && original.ends_with('"'))
+                                || (original.starts_with('\'') && original.ends_with('\''))
                             {
-                                raw = raw[1..raw.len() - 1].to_string();
-                            }
+                                original[1..original.len() - 1].to_string()
+                            } else {
+                                original.clone()
+                            };
+
+                            // Decode shell escapes into actual characters for the
+                            // Perl literal content.
                             let decoded = crate::generator::utils::decode_shell_escapes_impl(&raw);
-                            generator.perl_string_literal(&Word::literal(decoded))
+
+                            // If the token was double-quoted in the original shell
+                            // source and it contains an unescaped $ or @, we must
+                            // allow Perl interpolation so variables like "$i" are
+                            // expanded in the generated Perl code. Detect an
+                            // unescaped sigil by looking for a $ or @ not preceded
+                            // by a backslash in the raw (pre-decoded) text.
+                            let sigil_re = Regex::new(r"(?<!\\)[\$@]").unwrap();
+                            if was_double && sigil_re.is_match(&raw) {
+                                generator.perl_string_literal_force_interp(&Word::literal(decoded))
+                            } else {
+                                generator.perl_string_literal(&Word::literal(decoded))
+                            }
                         }
                         _ => generator.word_to_perl(arg),
                     })

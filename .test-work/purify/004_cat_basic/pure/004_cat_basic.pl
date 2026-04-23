@@ -35,10 +35,7 @@ if (-f "combined.txt") {
 }
 
 print "\ncat from stdin (echo | cat):\n";
-do {
-    my $__PURIFY_TMP = do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-{
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);{
     my $output_0 = q{};
     my $output_printed_0;
     my $pipeline_success_0 = 1;
@@ -54,13 +51,6 @@ $CHILD_ERROR = 0;
     }
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     }
-
-    };
-    if (defined $__PURIFY_TMP && $__PURIFY_TMP ne q{}) {
-        print $__PURIFY_TMP;
-        if (!($__PURIFY_TMP =~ m{\n\z}msx)) { print "\n"; }
-    }
-};
 
 print "\ncat with line numbers (cat -n):\n";
 my $numbered = do { my $cat_cmd = 'cat -n test_file1.txt'; qx{$cat_cmd}; }

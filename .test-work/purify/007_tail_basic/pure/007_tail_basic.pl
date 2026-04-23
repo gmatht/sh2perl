@@ -40,10 +40,7 @@ my $tail_bytes = do { my $output_0 = q{}; my $output_printed_0; my $tail_cmd = '
 print $tail_bytes;
 
 print "\ntail from stdin (echo | tail):\n";
-do {
-    my $__PURIFY_TMP = do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-{
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);{
     my $output_0 = q{};
     my $output_printed_0;
     my $pipeline_success_0 = 1;
@@ -69,13 +66,6 @@ $CHILD_ERROR = 0;
     }
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     }
-
-    };
-    if (defined $__PURIFY_TMP && $__PURIFY_TMP ne q{}) {
-        print $__PURIFY_TMP;
-        if (!($__PURIFY_TMP =~ m{\n\z}msx)) { print "\n"; }
-    }
-};
 
 print "\ntail -f simulation (follow mode):\n";
 my $tail_follow = do { my $output_0 = q{}; my $output_printed_0; my $tail_cmd = 'tail -n 3 test_tail.txt'; qx{$tail_cmd}; }
