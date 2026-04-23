@@ -11,9 +11,7 @@ print "dirname /path/to/file.txt: $dirname_output";
 
 print "\ndirname with multiple paths:\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "/path/to/file1.txt", "/path/to/file2.txt", "/path/to/file3.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "/path/to/file1.txt", "/path/to/file2.txt", "/path/to/file3.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 
@@ -24,9 +22,7 @@ print "Current directory: $dirname_current";
 
 print "\ndirname with parent directory:\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", ".."); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", ".."); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 
@@ -37,9 +33,7 @@ print "Root directory: $dirname_root";
 
 print "\ndirname with empty string:\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", ""); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", ""); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 
@@ -50,9 +44,7 @@ print "Relative path: $dirname_relative";
 
 print "\ndirname with hidden file:\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "/path/to/.hidden.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "/path/to/.hidden.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 
@@ -63,9 +55,7 @@ print "File in root: $dirname_root_file";
 
 print "\ndirname with directory path:\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "/home/user/documents/"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "/home/user/documents/"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 
@@ -76,9 +66,7 @@ print "Nested path: $dirname_nested";
 
 print "\ndirname with single level path:\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "/file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "/file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 
@@ -89,9 +77,7 @@ print "Multiple levels: $dirname_multi";
 
 print "\ndirname with zero option (-z):\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "-z", "/path/to/file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("dirname", "-z", "/path/to/file.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 

@@ -6,17 +6,13 @@ print "=== Example 001: Basic echo command ===\n";
 
 print "Using " . "sys" . "tem" . "() to call echo:\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "Hello, World!"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "Hello, World!"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 
 print "\nEcho with multiple arguments:\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a test of the echo builtin"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a test of the echo builtin"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 
@@ -36,15 +32,11 @@ print $var_output;
 
 print "\nEcho with quotes:\n";
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a 'quoted' string"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a 'quoted' string"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 do {
-my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", 'This is a "double quoted" string'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
-$?;
+my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", 'This is a "double quoted" string'); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
 
 };
 

@@ -421,6 +421,25 @@ avoids producing invalid Perl when the verifier is placed inside expression
 contexts (backticks) and preserves purify.pl as a thin wrapper around the
 generator output.
 
+Additional small tweak
+----------------------
+Problem
+-------
+In some environments the external sha*sum binaries are not available which
+caused purify-generated scripts to attempt running `sh -c 'sha256sum ...'` and
+emit shell "not found" messages. This makes the test harness brittle when the
+host tools are absent.
+
+Fix
+---
+When purify reconstructs a list-form `system('sh','-c', ...)` invocation we now
+try to convert the inner shell command to pure Perl first (via debashc). If the
+conversion succeeds we inline the generated Perl instead of emitting an
+exec('sh','-c', ...) call. Only if conversion fails do we fall back to the
+exec/sh approach. This avoids spurious "not found" output when the external
+hashing tools are missing and keeps purify.pl a thin wrapper around the Rust
+generator.
+
 Fix: Preserve literal '|' in list-form system() serialization
 -----------------------------------------------------------
 Problem
