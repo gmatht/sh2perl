@@ -23,7 +23,7 @@ print $pipeline_output;
 
 # Pipeline with multiple commands using system()
 print "\nPipeline with multiple commands (cat | grep | wc):\n";
-system("cat", "test_pipeline.txt", "|", "grep", "a", "|", "wc", "-l");
+system('sh', '-c', q{cat test_pipeline.txt | grep a | wc -l});
 
 # Pipeline with head and tail using backticks
 print "\nPipeline with head and tail:\n";
@@ -32,9 +32,8 @@ print $pipeline_head_tail;
 
 # Pipeline with sed and awk using system()
 print "\nPipeline with sed and awk:\n";
-# Pipeline uses a double-quoted awk program (generator should preserve $0 as
-# a literal when emitting a non-interpolating Perl literal during purification).
-system("cat", "test_pipeline.txt", "|", "sed", "s/a/A/g", "|", "awk", "{print toupper($0)}");
+# Use sh -c so shell pipelines and quoting work; protect $0 from outer interpolation
+system('sh', '-c', q{cat test_pipeline.txt | sed 's/a/A/g' | awk '{print toupper($0)}'});
 
 # Pipeline with cut and paste using backticks
 print "\nPipeline with cut and paste:\n";
@@ -43,7 +42,7 @@ print $pipeline_cut_paste;
 
 # Pipeline with tr and sort using system()
 print "\nPipeline with tr and sort:\n";
-system("cat", "test_pipeline.txt", "|", "tr", "a-z", "A-Z", "|", "sort");
+system('sh', '-c', q{cat test_pipeline.txt | tr 'a-z' 'A-Z' | sort});
 
 # Pipeline with uniq and wc using backticks
 print "\nPipeline with uniq and wc:\n";
@@ -52,7 +51,7 @@ print "Unique lines: $pipeline_uniq_wc";
 
 # Pipeline with grep and head using system()
 print "\nPipeline with grep and head:\n";
-system("cat", "test_pipeline.txt", "|", "grep", "e", "|", "head", "-2");
+system('sh', '-c', q{cat test_pipeline.txt | grep e | head -2});
 
 # Pipeline with tail and grep using backticks
 print "\nPipeline with tail and grep:\n";
@@ -61,7 +60,7 @@ print $pipeline_tail_grep;
 
 # Pipeline with multiple filters using system()
 print "\nPipeline with multiple filters:\n";
-system("cat", "test_pipeline.txt", "|", "grep", "a", "|", "sort", "|", "head", "-3");
+system('sh', '-c', q{cat test_pipeline.txt | grep a | sort | head -3});
 
 # Pipeline with error handling using backticks
 print "\nPipeline with error handling:\n";
@@ -70,7 +69,7 @@ print "Lines with 'x': $pipeline_error";
 
 # Pipeline with tee using system()
 print "\nPipeline with tee:\n";
-system("cat", "test_pipeline.txt", "|", "grep", "a", "|", "tee", "pipeline_output.txt");
+system('sh', '-c', q{cat test_pipeline.txt | grep a | tee pipeline_output.txt});
 
 # Check if output file was created
 if (-f "pipeline_output.txt") {
