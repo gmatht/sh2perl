@@ -1,6 +1,18 @@
 BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/003__ls_basic.pl" }
 print 'Working Directory:';
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);use Cwd;my $pwd = getcwd();print "$pwd\n";
+do {
+    my $__PURIFY_TMP = do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use Cwd;
+my $pwd = getcwd();
+$pwd . "\n";
+
+    };
+    if (defined $__PURIFY_TMP && $__PURIFY_TMP ne q{}) {
+        print $__PURIFY_TMP;
+        if (!($__PURIFY_TMP =~ m{\n\z}msx)) { print "\n"; }
+    }
+};
 
 print 'Files: ';
 my $ls_output = do {

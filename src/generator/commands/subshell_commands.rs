@@ -19,7 +19,18 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
         ));
     }
 
+    // Emit the subshell body. Ensure the block returns an empty string
+    // as its final expression so callers that capture the do-block's
+    // return value (for example the purify wrapper) do not receive a
+    // numeric exit-code assignment like "$CHILD_ERROR = 0" which would
+    // be printed as "0". Returning an explicit empty string avoids
+    // spurious numeric output while preserving any prints performed by
+    // the subshell body itself.
     output.push_str(&generator.generate_command(command));
+    // Add an explicit empty-string expression as the final value
+    // of the do-block.
+    output.push_str(&generator.indent());
+    output.push_str("q{};\n");
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("};\n");
@@ -116,7 +127,15 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
 
                         if normalized_flag == "-c" {
                             if let Word::Literal(inner_cmd, _) = &simple_cmd.args[1] {
-                                let inner_lit = generator.perl_string_literal_no_interp(
+                                // If the original shell used quoting around the -c argument
+                                // (for example: sh -c '...') the parser preserves the
+                                // surrounding single/double quotes in the literal token.
+                                // When we pass the inner program string as an argv element
+                                // to exec/open3 we must provide the raw program text
+                                // (without the shell's outer quotes). Use the helper that
+                                // strips outer shell quotes and produces a safe Perl
+                                // non-interpolating literal for the inner command.
+                                let inner_lit = generator.strip_shell_quotes_and_convert_to_perl(
                                     &Word::literal(inner_cmd.clone()),
                                 );
                                 output.push_str(&generator.indent());
