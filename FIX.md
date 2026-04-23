@@ -21,6 +21,11 @@ Files changed
 -------------
 - src/generator/utils.rs: ensure command strings used in open3('bash','-c', ...)
   are wrapped with perl_string_literal_no_interp before embedding.
+ - src/generator/commands/system_commands.rs: when serializing
+   Command::Subshell simple commands into bash strings use
+   word_to_bash_string_for_system (which preserves literal shell
+   fragments like awk programs containing "$0") instead of
+   generator.word_to_perl which could convert $0 -> $PROGRAM_NAME.
 
 Also changed purify.pl: do not force double-quoting when a shell snippet
 contains "$" or "@". These characters are common in awk/sed programs and
