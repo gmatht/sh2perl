@@ -692,18 +692,17 @@ sub generate_exec_do_block {
         my $t = $tokens[$i];
         my ($txt, $q) = ref($t) eq 'ARRAY' ? @{$t} : ($t, 'bare');
 
-        # If the argument list contains a pipeline operator ('|') then this
-        # is really a shell pipeline expressed as a list of tokens. In that
-        # case we cannot faithfully exec the program directly with argv;
-        # treat the whole thing as a shell command and run it via
-        # bash -c so pipes and shell operators behave correctly. This
-        # prevents generating exec(...) with '|' and other tokens passed
-        # as literal argv elements which caused errors like
-        # "cat: '|': No such file or directory".
-        if ($txt eq '|') {
-            $fallback_to_shell = 1;
-            last;
-        }
+        # Previously we treated the pipeline token '|' as an automatic
+        # indicator that the list-form represented a shell pipeline and
+        # fell back to running the whole thing via `bash -c`. That caused
+        # list-form system() calls that explicitly passed '|' as a literal
+        # argument (for example system("echo", "a", "|", "tee", ...))
+        # to be converted into real shell pipelines and change semantics.
+        # Preserve list-form semantics: do not treat '|' specially here so
+        # a literal '|' remains an argv element. If the caller truly
+        # intended a pipeline the surrounding code can still produce a
+        # pipeline via explicit shell snippets; being conservative here
+        # avoids surprising behavior changes.
 
         # Common simple redirections: >, >>, <, 2>, 2>> (followed by filename)
         if ($txt eq '>' || $txt eq '>>' || $txt eq '<' || $txt eq '2>' || $txt eq '2>>') {
@@ -818,20 +817,18 @@ sub _perl_quote_literal_with_pref {
     # control characters). Otherwise prefer a single-quoted literal so
     # "$" and "@" remain literal in the emitted Perl source.
     if (defined $pref && $pref eq 'double') {
-        if ($text =~ /[\n\r\t"\\]/) {
-            my $escaped = $text;
-            $escaped =~ s/\\/\\\\/g;    # escape backslashes
-            $escaped =~ s/"/\\"/g;        # escape double quotes
-            $escaped =~ s/\n/\\n/g;
-            $escaped =~ s/\r/\\r/g;
-            $escaped =~ s/\t/\\t/g;
-            return "\"$escaped\"";
-        } else {
-            # Prefer single-quoted literal to avoid accidental interpolation
-            my $t = $text;
-            $t =~ s/'/\\'/g;
-            return "'$t'";
-        }
+        # The original token was double-quoted in the source which means
+        # Perl interpolation (e.g. $0, @arr) was intended at the call site.
+        # Preserve that semantic by emitting a double-quoted Perl literal
+        # here. Escape backslashes and double-quotes and encode control
+        # characters so the generated Perl source remains valid.
+        my $escaped = $text;
+        $escaped =~ s/\\/\\\\/g;    # escape backslashes
+        $escaped =~ s/"/\\"/g;        # escape double quotes
+        $escaped =~ s/\n/\\n/g;
+        $escaped =~ s/\r/\\r/g;
+        $escaped =~ s/\t/\\t/g;
+        return "\"$escaped\"";
     }
 
     if (defined $pref && $pref eq 'single') {

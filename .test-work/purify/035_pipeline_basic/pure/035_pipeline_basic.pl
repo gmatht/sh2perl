@@ -22,7 +22,7 @@ print $pipeline_output;
 print "\nPipeline with multiple commands (cat | grep | wc):\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('bash', '-c', 'cat test_pipeline.txt \'|\' grep a \'|\' wc -l'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "a", "|", "wc", "-l"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -35,7 +35,7 @@ print $pipeline_head_tail;
 print "\nPipeline with sed and awk:\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('bash', '-c', 'cat test_pipeline.txt \'|\' sed s/a/A/g \'|\' awk \'{print toupper($0)}\''); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "sed", "s/a/A/g", "|", "awk", "{print toupper($0)}"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -50,7 +50,7 @@ print $pipeline_cut_paste;
 print "\nPipeline with tr and sort:\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('bash', '-c', 'cat test_pipeline.txt \'|\' tr a-z A-Z \'|\' sort'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "tr", "a-z", "A-Z", "|", "sort"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -63,7 +63,7 @@ print "Unique lines: $pipeline_uniq_wc";
 print "\nPipeline with grep and head:\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('bash', '-c', 'cat test_pipeline.txt \'|\' grep e \'|\' head -2'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "e", "|", "head", "-2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -76,7 +76,7 @@ print $pipeline_tail_grep;
 print "\nPipeline with multiple filters:\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('bash', '-c', 'cat test_pipeline.txt \'|\' grep a \'|\' sort \'|\' head -3'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "a", "|", "sort", "|", "head", "-3"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
@@ -89,7 +89,7 @@ print "Lines with 'x': $pipeline_error";
 print "\nPipeline with tee:\n";
 do {
 my $pid = fork;
-if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('bash', '-c', 'cat test_pipeline.txt \'|\' grep a \'|\' tee pipeline_output.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
+if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_pipeline.txt", "|", "grep", "a", "|", "tee", "pipeline_output.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 $?;
 
 };
