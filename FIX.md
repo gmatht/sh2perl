@@ -513,3 +513,31 @@ convert_shell_to_perl. If that conversion fails we still fall back to the
 safe exec('sh','-c', q{...}) path using a non-interpolating Perl literal.
 This prevents spurious "not found" errors in test environments lacking the
 external hashing binaries.
+
+Fix: Append "  -" to sha*sum inline outputs when reading from stdin/pipeline
+--------------------------------------------------------------------------
+Problem
+-------
+When the Rust generator inlined sha256/sha512 computation for stdin or
+pipeline input it emitted only the raw hex digest (for example
+"e3b0c442..."), but the external sha256sum/sha512sum tools print the digest
+followed by two spaces and a dash when reading from STDIN ("<hash>  -"). This
+caused byte-for-byte output mismatches for examples that read checksums from
+stdin or piped data (notably examples.impurl/042_checksum_verification.pl).
+
+Fix
+---
+When generating expression-valued snippets for sha256sum and sha512sum that
+operate on STDIN or pipeline-provided data, append the literal string
+"  -" to the returned value so the purified Perl prints the same bytes as the
+original external tool. Files changed:
+
+- src/generator/commands/sha256sum.rs
+- src/generator/commands/sha512sum.rs
+
+Why this is minimal and safe
+---------------------------
+This preserves the external tool's printed form while keeping the change
+localized to the generator serialization. It makes the purified output match
+the original shell behaviour for stdin/pipeline cases without altering other
+sha*sum behaviours.
