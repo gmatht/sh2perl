@@ -1,12 +1,6 @@
 BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/003__ls_basic.pl" }
 print 'Working Directory:';
-do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use Cwd;
-my $pwd = getcwd();
-print "$pwd\n";
-
-};
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);use Cwd;my $pwd = getcwd();print "$pwd\n";
 
 print 'Files: ';
 my $ls_output = do {

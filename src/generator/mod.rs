@@ -28,6 +28,51 @@ pub struct Generator {
     pub inline_mode: bool,      // New field for inline mode (for backticks)
     pub original_script_name: Option<String>, // Original script name for $0 compatibility
     pub use_function_signatures: bool, // Control whether to use modern function signatures
+    /// Stack of pipeline output ids currently being generated. Used so nested
+    /// generator code (eg. redirect wrappers) can mark the pipeline's buffer
+    /// as printed ($output_printed_<id>) without fragile string scans.
+    pub pipeline_output_stack: Vec<String>,
+}
+
+/// RAII guard that pops the pipeline_output_stack when dropped.
+///
+/// The guard stores a raw pointer to the stack so it does not borrow
+/// &mut Generator for its lifetime and therefore allows re-entrant calls
+/// to generator methods while it's alive. Drop uses unsafe to pop and
+/// validate the pushed id.
+pub struct PipelineOutputIdGuard {
+    pub(crate) stack_ptr: *mut Vec<String>,
+    pub(crate) id: String,
+}
+
+impl Drop for PipelineOutputIdGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(stack) = self.stack_ptr.as_mut() {
+                match stack.pop() {
+                    Some(popped) => {
+                        if popped != self.id {
+                            eprintln!(
+                                "sh2perl: pipeline_output_stack mismatch: popped '{}' but guard expected '{}'",
+                                popped, self.id
+                            );
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "sh2perl: pipeline_output_stack empty when dropping guard for id '{}'",
+                            self.id
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "sh2perl: pipeline_output_stack pointer invalid when dropping guard for id '{}'",
+                    self.id
+                );
+            }
+        }
+    }
 }
 
 impl Generator {
@@ -47,6 +92,7 @@ impl Generator {
             inline_mode: false,
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
+            pipeline_output_stack: Vec::new(),
         }
     }
 
@@ -66,6 +112,7 @@ impl Generator {
             inline_mode: false,
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
+            pipeline_output_stack: Vec::new(),
         }
     }
 
@@ -85,6 +132,39 @@ impl Generator {
             inline_mode: true,
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
+            pipeline_output_stack: Vec::new(),
+        }
+    }
+
+    /// Push the currently-generating pipeline's unique id onto the stack.
+    /// Use this from pipeline generators so nested code (eg redirects)
+    /// can know which $output_<id> to mark as printed.
+    pub fn push_pipeline_output_id(&mut self, id: String) {
+        self.pipeline_output_stack.push(id);
+    }
+
+    /// Pop the most-recent pipeline id. Call after finishing generation of
+    /// a pipeline that previously pushed an id.
+    pub fn pop_pipeline_output_id(&mut self) {
+        self.pipeline_output_stack.pop();
+    }
+
+    /// Return the current pipeline output id, if any.
+    pub fn current_pipeline_output_id(&self) -> Option<&String> {
+        self.pipeline_output_stack.last()
+    }
+
+    /// Push a pipeline id and return a guard that will pop it when dropped.
+    ///
+    /// The guard stores a raw pointer to the stack so it does not borrow
+    /// &mut self for its lifetime and therefore allows re-entrant calls to
+    /// generator methods while it's alive. Drop uses unsafe to pop and
+    /// validate the pushed id.
+    pub fn push_pipeline_output_id_guard(&mut self, id: String) -> PipelineOutputIdGuard {
+        self.pipeline_output_stack.push(id.clone());
+        PipelineOutputIdGuard {
+            stack_ptr: &mut self.pipeline_output_stack as *mut Vec<String>,
+            id,
         }
     }
 

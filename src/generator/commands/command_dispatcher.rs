@@ -97,8 +97,12 @@ pub fn generate_command_impl_with_input(
                 //             eprintln!("DEBUG: Found Pipeline, commands: {:?}", pipeline.commands);
                 // This is now a pure pipe pipeline since logical operators are handled separately
                 if pipeline.commands.len() == 1 {
-                    //                 eprintln!("DEBUG: Found Pipeline with logical operators inside Redirect, delegating to pipeline generator");
-                    return generator.generate_pipeline(pipeline);
+                    // Delegate to the pipeline generator but suppress the final print since
+                    // we're in a redirect context — the redirect-handling wrapper will
+                    // already write to the target and may print a captured tmp value.
+                    return super::pipeline_commands::generate_pipeline_with_print_option(
+                        generator, pipeline, false,
+                    );
                 }
             }
 
@@ -110,8 +114,12 @@ pub fn generate_command_impl_with_input(
                     //                 eprintln!("DEBUG: Found Pipeline in nested Redirect, commands: {:?}", pipeline.commands);
                     // This is now a pure pipe pipeline since logical operators are handled separately
                     if pipeline.commands.len() > 1 {
-                        //                     eprintln!("DEBUG: Delegating to pipeline generator for logical operators");
-                        return generator.generate_pipeline(pipeline);
+                        // Delegate to the pipeline generator but suppress final printing
+                        // because we're inside an outer Redirect; the redirect handler
+                        // will manage writing to the target file.
+                        return super::pipeline_commands::generate_pipeline_with_print_option(
+                            generator, pipeline, false,
+                        );
                     }
                 }
             }
@@ -206,8 +214,40 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&format!("    local *STDOUT;\n"));
                             result.push_str(&generator.indent());
                             result.push_str(&format!("    open STDOUT, '>', \\$output_ps_{} or croak \"Cannot redirect STDOUT\";\n", global_counter));
-                            result.push_str(&generator.indent());
-                            result.push_str(&format!("    {}\n", generator.generate_command(cmd)));
+                            // Ensure nested generators can see the pipeline id so they can
+                            // mark the pipeline buffer as printed. If no pipeline id is
+                            // active, create one, declare minimal Perl vars, and push a guard
+                            // for the duration of nested generation.
+                            if generator.current_pipeline_output_id().is_none() {
+                                let unique_id = generator.get_unique_id();
+                                result.push_str(&generator.indent());
+                                result
+                                    .push_str(&format!("    my $output_{} = q{{}};\n", unique_id));
+                                result.push_str(&generator.indent());
+                                result
+                                    .push_str(&format!("    my $output_printed_{};\n", unique_id));
+                                generator
+                                    .declared_locals
+                                    .insert(format!("output_{}", unique_id));
+
+                                let _pipeline_guard =
+                                    generator.push_pipeline_output_id_guard(unique_id.clone());
+
+                                let perl_code = generator.generate_command(cmd);
+                                for line in perl_code.lines() {
+                                    if !line.trim().is_empty() {
+                                        result.push_str(&format!("    {}\n", line));
+                                    }
+                                }
+                                // _pipeline_guard drops here and pops the id
+                            } else {
+                                let perl_code = generator.generate_command(cmd);
+                                for line in perl_code.lines() {
+                                    if !line.trim().is_empty() {
+                                        result.push_str(&format!("    {}\n", line));
+                                    }
+                                }
+                            }
                             result.push_str(&generator.indent());
                             result.push_str(&format!("}}\n"));
                         } else {
@@ -803,7 +843,47 @@ pub fn generate_command_impl_with_input(
                     // is expression-valued (does not print), capture the result
                     // and explicitly print it so the redirected STDOUT/file gets
                     // the intended content.
-                    let generated_snippet = generator.generate_simple_command(cmd);
+                    //
+                    // Important: when a pipeline is active we must ensure the
+                    // child command receives the pipeline buffer as its input
+                    // variable (eg. output_123). The generic builtin generator
+                    // understands an input_var parameter; use it so commands
+                    // like head/tail operate on the in-memory buffer instead of
+                    // calling qx{{head}} with no stdin attached.
+                    let generated_snippet =
+                        if let Some(current_id) = generator.current_pipeline_output_id() {
+                            // Build a small snippet that assigns into a temporary
+                            // variable by invoking the generic builtin generator
+                            // with the pipeline's output_<id> as input. Ensure the
+                            // do-block returns the temporary variable as its value
+                            // so the wrapper can print it.
+                            let input_var = format!("output_{}", current_id);
+                            let tmp_id = generator.get_unique_id();
+                            let tmp_var = format!("tmp_redirect_{}", tmp_id);
+                            let command_index = generator.get_unique_id();
+
+                            let mut snippet = String::new();
+                            // Declare the temp result variable in this scope
+                            snippet.push_str(&format!("my ${} = q{{}};\n", tmp_var));
+
+                            // Use the generic builtin generator which understands input_var/output_var
+                            snippet.push_str(
+                                &crate::generator::commands::builtins::generate_generic_builtin(
+                                    generator,
+                                    cmd,
+                                    &input_var,
+                                    &tmp_var,
+                                    &command_index,
+                                    false,
+                                ),
+                            );
+
+                            // Ensure the snippet yields the tmp variable as the last expression
+                            snippet.push_str(&format!("${};\n", tmp_var));
+                            snippet
+                        } else {
+                            generator.generate_simple_command(cmd)
+                        };
 
                     // Heuristic: check for top-level print/printf statements which
                     // indicate the snippet already prints to STDOUT. We look for
@@ -834,9 +914,28 @@ pub fn generate_command_impl_with_input(
                         result.push_str("};\n");
                         result.push_str(&generator.indent());
                         result.push_str("print $tmp;\n");
+
+                        // Mark the current pipeline output as printed so the
+                        // pipeline generator will skip its final print. We use
+                        // the explicit pipeline id pushed by the pipeline
+                        // generator (see Generator::push_pipeline_output_id) to
+                        // avoid fragile string scanning of generated snippets.
+                        if let Some(current_id) = generator.current_pipeline_output_id() {
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("$output_printed_{} = 1;\n", current_id));
+                        }
                     } else {
                         // Either not redirecting output, or the snippet already prints
                         result.push_str(&generated_snippet);
+                        // If we are in an output-redirect context, ensure the
+                        // pipeline generator knows the pipeline buffer has been
+                        // consumed (printed) so it won't print the buffer later.
+                        if has_output_redirect {
+                            if let Some(current_id) = generator.current_pipeline_output_id() {
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("$output_printed_{} = 1;\n", current_id));
+                            }
+                        }
                     }
                 }
                 Command::BuiltinCommand(cmd) => {

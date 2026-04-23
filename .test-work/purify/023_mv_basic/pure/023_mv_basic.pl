@@ -11,16 +11,10 @@ print $fh "It has multiple lines\n";
 print $fh "To demonstrate mv functionality\n";
 close($fh);
 
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_mv_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_mv_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "Using " . "sys" . "tem" . "() to call mv (move file):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "test_mv_source.txt", "test_mv_dest.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "test_mv_source.txt", "test_mv_dest.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 if (-f "test_mv_dest.txt") {
     print "File moved successfully\n";
     my $content = do { open my $fh, '<', 'test_mv_dest.txt' or die 'cat: ' . 'test_mv_dest.txt' . ': ' . $! . "\n"; local $/ = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $! . "\n"; $chunk; }
@@ -31,10 +25,7 @@ if (-f "test_mv_dest.txt") {
 }
 
 print "\nmv with verbose (-v):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-v", "test_mv_dest.txt", "test_mv_verbose.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-v", "test_mv_dest.txt", "test_mv_verbose.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nmv with force (-f):\n";
 my $mv_force = do {
@@ -87,10 +78,7 @@ if (-f "test_mv_force.txt") {
 }
 
 print "\nmv with interactive (-i):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-i", "test_mv_force.txt", "test_mv_interactive.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-i", "test_mv_force.txt", "test_mv_interactive.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nmv with backup (-b):\n";
 my $mv_backup = do {
@@ -114,10 +102,7 @@ if (-f "test_mv_backup.txt") {
 }
 
 print "\nmv with suffix (--suffix=.bak):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "--suffix=.bak", "test_mv_backup.txt", "test_mv_suffix.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "--suffix=.bak", "test_mv_backup.txt", "test_mv_suffix.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nmv with no target directory (-T):\n";
 my $mv_no_target = do {
@@ -141,10 +126,7 @@ if (-f "test_mv_no_target.txt") {
 }
 
 print "\nmv with update (-u):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-u", "test_mv_no_target.txt", "test_mv_update.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-u", "test_mv_no_target.txt", "test_mv_update.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nmv with no clobber (-n):\n";
 my $mv_no_clobber = do {
@@ -168,20 +150,11 @@ if (-f "test_mv_no_clobber.txt") {
 }
 
 print "\nmv with strip trailing slashes (--strip-trailing-slashes):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "--strip-trailing-slashes", "test_mv_no_clobber.txt", "test_mv_strip.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "--strip-trailing-slashes", "test_mv_no_clobber.txt", "test_mv_strip.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nmv with multiple files:\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_mv_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_mv_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_mv_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_mv_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 my $mv_multi = do {
         local $CHILD_ERROR = 0;
         my $eval_result = eval {
@@ -263,20 +236,11 @@ if (-f "test_mv_dir/test_mv_file1.txt" && -f "test_mv_dir/test_mv_file2.txt") {
 }
 
 print "\nmv with preserve all (-a):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_mv_preserve.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-a", "test_mv_preserve.txt", "test_mv_preserve_dest.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("touch", "test_mv_preserve.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mv", "-a", "test_mv_preserve.txt", "test_mv_preserve_dest.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 unlink('test_mv_strip.txt') if -f 'test_mv_strip.txt';
 unlink('test_mv_preserve_dest.txt') if -f 'test_mv_preserve_dest.txt';
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mv_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mv_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "=== Example 023 completed successfully ===\n";

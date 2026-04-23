@@ -22,10 +22,7 @@ my $cat_output = do { open my $fh, '<', 'test_file1.txt' or die 'cat: ' . 'test_
 print $cat_output;
 
 print "\ncat with multiple files using " . "sys" . "tem" . "():\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_file1.txt", "test_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_file1.txt", "test_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ncat with redirection (cat file1 file2 > combined.txt):\n";
 my $combined = do { my $command = 'cat test_file1.txt test_file2.txt > combined.txt'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
@@ -38,9 +35,7 @@ if (-f "combined.txt") {
 }
 
 print "\ncat from stdin (echo | cat):\n";
-do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-{
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);{
     my $output_0;
     my $output_printed_0;
     my $pipeline_success_0 = 1;
@@ -57,18 +52,13 @@ $CHILD_ERROR = 0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     }
 
-};
-
 print "\ncat with line numbers (cat -n):\n";
 my $numbered = do { my $cat_cmd = 'cat -n test_file1.txt'; qx{$cat_cmd}; }
 ;
 print $numbered;
 
 print "\ncat with non-printing characters (cat -v):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-v", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-v", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ncat with squeeze blank lines (cat -s):\n";
 my $squeezed = do { my $cat_cmd = 'cat -s test_file1.txt'; qx{$cat_cmd}; }
@@ -76,10 +66,7 @@ my $squeezed = do { my $cat_cmd = 'cat -s test_file1.txt'; qx{$cat_cmd}; }
 print $squeezed;
 
 print "\ncat with tabs (cat -T):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-T", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-T", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 unlink('test_file1.txt') if -f 'test_file1.txt';
 unlink('test_file2.txt') if -f 'test_file2.txt';

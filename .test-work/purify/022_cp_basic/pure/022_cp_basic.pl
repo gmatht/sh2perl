@@ -10,16 +10,10 @@ print $fh "It has multiple lines\n";
 print $fh "To demonstrate cp functionality\n";
 close($fh);
 
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_cp_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_cp_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "Using " . "sys" . "tem" . "() to call cp (copy file):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "test_cp_source.txt", "test_cp_dest.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "test_cp_source.txt", "test_cp_dest.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 if (-f "test_cp_dest.txt") {
     print "File copied successfully\n";
     my $content = do { open my $fh, '<', 'test_cp_dest.txt' or die 'cat: ' . 'test_cp_dest.txt' . ': ' . $! . "\n"; local $/ = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $! . "\n"; $chunk; }
@@ -28,10 +22,7 @@ if (-f "test_cp_dest.txt") {
 }
 
 print "\ncp with recursive (-r):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-r", "test_cp_dir", "test_cp_dir_copy"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-r", "test_cp_dir", "test_cp_dir_copy"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 if (-d "test_cp_dir_copy") {
     print "Directory copied successfully\n";
 }
@@ -59,10 +50,7 @@ if (-f "test_cp_preserve.txt") {
 }
 
 print "\ncp with verbose (-v):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-v", "test_cp_source.txt", "test_cp_verbose.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-v", "test_cp_source.txt", "test_cp_verbose.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ncp with force (-f):\n";
 my $cp_force = do {
@@ -87,10 +75,7 @@ if (-f "test_cp_force.txt") {
 }
 
 print "\ncp with interactive (-i):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-i", "test_cp_source.txt", "test_cp_interactive.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-i", "test_cp_source.txt", "test_cp_interactive.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ncp with update (-u):\n";
 my $cp_update = do {
@@ -115,10 +100,7 @@ if (-f "test_cp_update.txt") {
 }
 
 print "\ncp with backup (-b):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-b", "test_cp_source.txt", "test_cp_backup.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-b", "test_cp_source.txt", "test_cp_backup.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ncp with suffix (--suffix=.bak):\n";
 my $cp_suffix = do {
@@ -143,10 +125,7 @@ if (-f "test_cp_suffix.txt") {
 }
 
 print "\ncp with multiple files:\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "test_cp_source.txt", "test_cp_source2.txt", "test_cp_dir/"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "test_cp_source.txt", "test_cp_source2.txt", "test_cp_dir/"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ncp with preserve all (-a):\n";
 my $cp_all = do {
@@ -171,10 +150,7 @@ if (-f "test_cp_all.txt") {
 }
 
 print "\ncp with no dereference (-P):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-P", "test_cp_source.txt", "test_cp_no_deref.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cp", "-P", "test_cp_source.txt", "test_cp_no_deref.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 unlink('test_cp_source.txt') if -f 'test_cp_source.txt';
 unlink('test_cp_dest.txt') if -f 'test_cp_dest.txt';
@@ -188,13 +164,7 @@ unlink('test_cp_suffix.txt') if -f 'test_cp_suffix.txt';
 unlink('test_cp_source2.txt') if -f 'test_cp_source2.txt';
 unlink('test_cp_all.txt') if -f 'test_cp_all.txt';
 unlink('test_cp_no_deref.txt') if -f 'test_cp_no_deref.txt';
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_cp_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_cp_dir_copy"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_cp_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_cp_dir_copy"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "=== Example 022 completed successfully ===\n";

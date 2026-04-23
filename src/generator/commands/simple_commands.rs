@@ -310,7 +310,32 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 output.push_str(&format!("local $/;  # Read entire input at once\n"));
 
                 // Store the command string in a local variable to avoid borrowing issues
-                let cmd_str = generator.generate_command_string_for_system(&**cmd);
+                // Ensure nested generation can see an active pipeline id so it can
+                // mark $output_printed_<id> when needed. If no pipeline id is
+                // active, create one, emit minimal Perl locals and push an RAII
+                // guard for the duration of the nested generation.
+                let cmd_str = if generator.current_pipeline_output_id().is_none() {
+                    let nested_id = generator.get_unique_id();
+                    // Emit minimal Perl locals immediately so nested generators
+                    // can reference $output_<id> and $output_printed_<id>.
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my $output_{} = q{{}};\n", nested_id));
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my $output_printed_{};\n", nested_id));
+                    // Record the declared local to avoid duplicate declarations
+                    generator
+                        .declared_locals
+                        .insert(format!("output_{}", nested_id));
+
+                    // Push an RAII guard so nested generators see the id while we
+                    // generate the nested command string. The guard will pop the
+                    // id when it goes out of scope at the end of this block.
+                    let _guard = generator.push_pipeline_output_id_guard(nested_id.clone());
+
+                    generator.generate_command_string_for_system(&**cmd)
+                } else {
+                    generator.generate_command_string_for_system(&**cmd)
+                };
                 output.push_str(&generator.indent());
                 // The command string will be passed verbatim to bash -c at runtime,
                 // so emit a non-interpolating Perl literal to prevent Perl from
