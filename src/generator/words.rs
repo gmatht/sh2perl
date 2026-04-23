@@ -53,8 +53,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 // ($ and @ are not escaped) but encodes control characters as
                 // backslash sequences ("\n", "\t", "\r") so the generated
                 // Perl source does not contain real newlines.
+                // Use a non-interpolating Perl literal so any shell "$" or "@"
+                // sequences (e.g. awk/sed programs) are preserved verbatim and not
+                // interpreted by Perl at compile time.
                 let command_lit =
-                    generator.perl_string_literal_force_interp(&Word::literal(command_str));
+                    generator.perl_string_literal_no_interp(&Word::literal(command_str));
                 format!(
                     "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
                     command_lit
@@ -134,14 +137,18 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "head" {
                             // Use the shell command directly so file and flag handling stays faithful
                             let head_cmd = generator.generate_command_string_for_system(cmd);
-                            let head_lit = generator
-                                .perl_string_literal_force_interp(&Word::literal(head_cmd));
+                            // Preserve literal shell program content (do not let Perl
+                            // interpolate $/@ inside awk/sed snippets).
+                            let head_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(head_cmd));
                             format!("do {{ my $head_cmd = {}; qx{{$head_cmd}}; }}", head_lit)
                         } else if name == "tail" {
                             // Use the shell command directly so file and flag handling stays faithful
                             let tail_cmd = generator.generate_command_string_for_system(cmd);
-                            let tail_lit = generator
-                                .perl_string_literal_force_interp(&Word::literal(tail_cmd));
+                            // Preserve literal shell program content (do not let Perl
+                            // interpolate $/@ inside awk/sed snippets).
+                            let tail_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(tail_cmd));
                             format!("do {{ my $tail_cmd = {}; qx{{$tail_cmd}}; }}", tail_lit)
                         } else if name == "cat" {
                             crate::generator::commands::cat::generate_cat_command_for_substitution(
@@ -668,8 +675,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let basename_cmd = generator.generate_command_string_for_system(
                                 &Command::Simple(simple_cmd.clone()),
                             );
+                            // Run basename via the host command; ensure the embedded
+                            // command string is a non-interpolating Perl literal so
+                            // shell-special characters are preserved.
                             let basename_lit = generator
-                                .perl_string_literal_force_interp(&Word::literal(basename_cmd));
+                                .perl_string_literal_no_interp(&Word::literal(basename_cmd));
                             format!(
                                 "do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}",
                                 basename_lit
@@ -679,7 +689,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 &Command::Simple(simple_cmd.clone()),
                             );
                             let dirname_lit = generator
-                                .perl_string_literal_force_interp(&Word::literal(dirname_cmd));
+                                .perl_string_literal_no_interp(&Word::literal(dirname_cmd));
                             format!(
                                 "do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}",
                                 dirname_lit
@@ -687,8 +697,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
                             let which_cmd = generator.generate_command_string_for_system(cmd);
-                            let which_lit = generator
-                                .perl_string_literal_force_interp(&Word::literal(which_cmd));
+                            let which_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(which_cmd));
                             format!(
                                 "do {{ my $which_cmd = {}; my $which_output = qx{{$which_cmd}}; $CHILD_ERROR = $? >> 8; $which_output; }}",
                                 which_lit
@@ -1072,12 +1082,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     // embedded into the generated source. This helps diagnose quoting/escaping
                     // issues where Perl interpolation or escape sequences change the runtime
                     // shell command semantics.
-                    // Use the force-interp helper so Perl variables in the
-                    // pipeline (e.g. $%) are interpolated but control
-                    // characters are encoded as backslash sequences rather
-                    // than literal newlines.
+                    // The pipeline is passed verbatim to qx{}, so ensure the
+                    // embedded shell program is preserved exactly (don't let
+                    // Perl interpolate $/@ tokens that belong to shell/awk).
                     let pipeline_lit =
-                        generator.perl_string_literal_force_interp(&Word::literal(pipeline_cmd));
+                        generator.perl_string_literal_no_interp(&Word::literal(pipeline_cmd));
                     format!(
                         "do {{ my $pipeline_cmd = {}; my $result = qx{{$pipeline_cmd}}; $CHILD_ERROR = $? >> 8; $result; }}",
                         pipeline_lit
