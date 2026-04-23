@@ -11,7 +11,7 @@ for my $i (1..10) {
 close($fh);
 
 print "Using backticks to call tail (default 10 lines):\n";
-my $tail_output = do { my $tail_cmd = "tail test_tail.txt"; qx{$tail_cmd}; }
+my $tail_output = do { my $tail_cmd = 'tail test_tail.txt'; qx{$tail_cmd}; }
 ;
 print $tail_output;
 
@@ -24,7 +24,7 @@ $?;
 };
 
 print "\ntail -n 3 (last 3 lines):\n";
-my $tail3 = do { my $tail_cmd = "tail -n 3 test_tail.txt"; qx{$tail_cmd}; }
+my $tail3 = do { my $tail_cmd = 'tail -n 3 test_tail.txt'; qx{$tail_cmd}; }
 ;
 print $tail3;
 
@@ -37,7 +37,7 @@ $?;
 };
 
 print "\ntail -n 15 (more than available):\n";
-my $tail15 = do { my $tail_cmd = "tail -n 15 test_tail.txt"; qx{$tail_cmd}; }
+my $tail15 = do { my $tail_cmd = 'tail -n 15 test_tail.txt'; qx{$tail_cmd}; }
 ;
 print $tail15;
 
@@ -50,7 +50,7 @@ $?;
 };
 
 print "\ntail -c 100 (last 100 characters):\n";
-my $tail_bytes = do { my $tail_cmd = "tail -c 100 test_tail.txt"; qx{$tail_cmd}; }
+my $tail_bytes = do { my $tail_cmd = 'tail -c 100 test_tail.txt'; qx{$tail_cmd}; }
 ;
 print $tail_bytes;
 
@@ -87,7 +87,7 @@ $CHILD_ERROR = 0;
 };
 
 print "\ntail -f simulation (follow mode):\n";
-my $tail_follow = do { my $tail_cmd = "tail -n 3 test_tail.txt"; qx{$tail_cmd}; }
+my $tail_follow = do { my $tail_cmd = 'tail -n 3 test_tail.txt'; qx{$tail_cmd}; }
 ;
 print $tail_follow;
 
