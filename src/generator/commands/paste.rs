@@ -101,14 +101,45 @@ pub fn generate_paste_command(
         // the pipeline buffer in-memory. This reproduces the behavior of
         // "paste - -" when used in pipelines (group successive stdin lines
         // into columns).
-        if has_dash && generator.current_pipeline_output_id().is_some() {
+        // Defensive fallback: if the generator doesn't currently have a
+        // pipeline id active (due to generation-order quirks), try to find the
+        // most-recently-declared output_<id> variable and use that. This is a
+        // small, localized heuristic to make paste consume in-memory buffers
+        // when they exist instead of attempting to open a literal '-' file.
+        let mut effective_pipeline_id: Option<String> = None;
+        if has_dash {
+            if let Some(id) = generator.current_pipeline_output_id() {
+                effective_pipeline_id = Some(id.clone());
+            } else {
+                // Look for the most recently declared local that matches output_<n>
+                // by scanning declared_locals for the largest numeric suffix.
+                let mut best_id: Option<(usize, String)> = None;
+                for name in &generator.declared_locals {
+                    if let Some(rest) = name.strip_prefix("output_") {
+                        if let Ok(n) = rest.parse::<usize>() {
+                            if best_id.as_ref().map(|(bn, _)| *bn).unwrap_or(0) < n {
+                                best_id = Some((n, name.clone()));
+                            }
+                        }
+                    }
+                }
+                if let Some((_n, name)) = best_id {
+                    // name is like "output_123" - extract the numeric portion
+                    if let Some(num) = name.strip_prefix("output_") {
+                        effective_pipeline_id = Some(num.to_string());
+                    }
+                }
+            }
+        }
+
+        if has_dash && effective_pipeline_id.is_some() {
             let paste_id = generator.get_unique_file_handle();
 
             // Start expression block
             result.push_str(&format!("do {{\n"));
 
             // Split the current pipeline buffer into lines
-            let current_id = generator.current_pipeline_output_id().unwrap();
+            let current_id = effective_pipeline_id.unwrap();
             let input_var = format!("output_{}", current_id);
             result.push_str(&generator.indent());
             result.push_str(&format!(
