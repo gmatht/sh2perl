@@ -1110,9 +1110,27 @@ sub replace_system_call_with_code {
         }
     }
 
-    my $wrapped_code = defined $lhs
-        ? ($lhs . " do {\n" . $replacement_code . "\n};")
-        : ("do {\n" . $replacement_code . "\n};");
+    my $wrapped_code;
+    if (defined $lhs) {
+        $wrapped_code = $lhs . " do {\n" . $replacement_code . "\n};";
+    } else {
+        # When replacing a bare system() statement (no LHS assignment)
+        # the converted Rust/debashc snippet often returns the captured
+        # command output as the last expression (for example "$output_0").
+        # The original system() call would have printed that output to
+        # STDOUT. If we simply splice in a do{ ... } block that evaluates
+        # to the string it will not be printed. To preserve semantics,
+        # wrap the converted fragment so its return value is printed when
+        # non-empty. If the inner fragment already prints to STDOUT the
+        # extra guard avoids duplicating output.
+        $wrapped_code = "do {\n";
+        $wrapped_code .= "    my \$__PURIFY_TMP = do {\n" . $replacement_code . "\n    };\n";
+        $wrapped_code .= "    if (defined \$__PURIFY_TMP && \$__PURIFY_TMP ne q{}) {\n";
+        $wrapped_code .= "        print \$__PURIFY_TMP;\n";
+        $wrapped_code .= "        if (!(\$__PURIFY_TMP =~ m{\\n\\z}msx)) { print \"\\n\"; }\n";
+        $wrapped_code .= "    }\n";
+        $wrapped_code .= "};";
+    }
 
     print "DEBUG: replace_system_call_with_code - lhs=[" . (defined $lhs ? $lhs : '') . "]\n" if $verbose;
     print "DEBUG: replace_system_call_with_code - replacement_code=[" . substr($replacement_code,0,400) . "]\n" if $verbose;
