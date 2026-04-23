@@ -797,7 +797,47 @@ pub fn generate_command_impl_with_input(
                         }
                     }
 
-                    result.push_str(&generator.generate_simple_command(cmd));
+                    // Generate the command snippet first so we can decide whether
+                    // it emits output itself (prints) or returns a string value.
+                    // If we're inside an output-redirect context and the snippet
+                    // is expression-valued (does not print), capture the result
+                    // and explicitly print it so the redirected STDOUT/file gets
+                    // the intended content.
+                    let generated_snippet = generator.generate_simple_command(cmd);
+
+                    // Heuristic: check for top-level print/printf statements which
+                    // indicate the snippet already prints to STDOUT. We look for
+                    // these at the start of lines (after trimming indentation).
+                    fn snippet_likely_prints(snippet: &str) -> bool {
+                        for line in snippet.lines() {
+                            let t = line.trim_start();
+                            if t.starts_with("print ")
+                                || t.starts_with("print(")
+                                || t.starts_with("printf ")
+                                || t.starts_with("printf(")
+                            {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+
+                    if has_output_redirect && !snippet_likely_prints(&generated_snippet) {
+                        // Capture expression-valued snippet result and print it
+                        result.push_str(&generator.indent());
+                        result.push_str("my $tmp = do {\n");
+                        // Increase indentation temporarily for nicer formatting
+                        generator.indent_level += 1;
+                        result.push_str(&generated_snippet);
+                        generator.indent_level -= 1;
+                        result.push_str(&generator.indent());
+                        result.push_str("};\n");
+                        result.push_str(&generator.indent());
+                        result.push_str("print $tmp;\n");
+                    } else {
+                        // Either not redirecting output, or the snippet already prints
+                        result.push_str(&generated_snippet);
+                    }
                 }
                 Command::BuiltinCommand(cmd) => {
                     result.push_str(&generator.generate_builtin_command(cmd));

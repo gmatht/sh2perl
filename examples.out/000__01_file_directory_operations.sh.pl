@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 
 my $main_exit_code = 0;
@@ -40,9 +39,6 @@ my $found_files = do {
     sub find_files_2 {
         my $file_2 = $File::Find::name;
         if ( !( -f $file_2 ) ) {
-            return;
-        }
-        if ( !( basename($file_2) =~ m/^.*.sh$/xms ) ) {
             return;
         }
         push @files_2, $file_2;

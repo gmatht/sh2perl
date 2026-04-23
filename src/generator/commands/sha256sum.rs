@@ -108,11 +108,11 @@ pub fn generate_sha256sum_command(
                 output.push_str("}\n");
             }
 
-            // Return the joined results as the value of the do-block so
-            // callers may choose to assign it to a variable if needed.
-            // Ensure the joined string ends with a trailing newline so the
-            // command-substitution semantics (qx// or backticks) match the
-            // original shell behaviour which includes trailing newlines.
+            // Return the joined results as the expression value so callers can
+            // decide whether to print or assign the result. Callers that
+            // redirect STDOUT should explicitly print this value into the
+            // redirected handle. Keeping this expression-valued contract
+            // avoids breaking call-sites that expect a string result.
             output.push_str("    join(\"\\n\", @results) . \"\\n\";\n};");
         } else {
             // No checksum files specified; treat the input_var as the checksum content
