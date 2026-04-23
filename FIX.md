@@ -81,6 +81,29 @@ characters). This prevents accidental Perl interpolation of shell fragments
 containing "$" or "@" (for example awk programs with $0) when purify splices
 generated snippets back into the host document.
 
+Fix: Ensure builtin generators return expression-valued results where expected
+--------------------------------------------------------------------------
+Problem
+-------
+Some builtin command generators (notably `pwd`) emitted code that performed a
+`print` inside the generated fragment. When purify.pl wraps such fragments in a
+temporary-capturing do-block it captured the numeric return value of `print`
+(which is 1) and then printed that value into program output, producing spurious
+"1" lines in the purified scripts.
+
+Fix
+---
+Make the builtin generator for `pwd` return the path string (including a
+trailing newline) as the expression value instead of calling `print`. This
+ensures purify.pl's outer wrapper receives the intended textual output and not
+the numeric return value of `print`.
+
+Files changed
+-------------
+- src/generator/commands/pwd.rs: return the path string instead of printing it
+  so outer wrappers capture the intended output rather than print's numeric
+  return value.
+
 Fix: Locate 'system' tokens precisely in purify.pl
 -------------------------------------------------
 Problem

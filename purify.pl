@@ -730,12 +730,20 @@ sub generate_exec_do_block {
             # so debashc sees the original shell text. Separately build a
             # quoted form we can embed into exec('sh','-c', ...) when we
             # fall back to executing via the shell.
-            my $shell_cmd_raw = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); $t } @cmd_parts);
-            my $shell_cmd_for_exec = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); $t eq '|' ? '|' : _shell_quote_for_system($t) } @cmd_parts);
-            # Use a non-interpolating Perl literal for the shell -c argument
-            # so embedded awk/sed $n and @vars are preserved verbatim. This
-            # literal is used only in the fallback exec path.
-            my $cmd_lit = _perl_quote_literal_no_interp($shell_cmd_for_exec);
+            my $shell_cmd_raw = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); $q && $q eq 'double' ? decode_perl_double_quoted_string($t) : $t } @cmd_parts);
+            my $shell_cmd_for_exec = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); my $tt = $q && $q eq 'double' ? decode_perl_double_quoted_string($t) : $t; $tt eq '|' ? '|' : _shell_quote_for_system($tt) } @cmd_parts);
+            # Use the raw shell command text when constructing the Perl
+            # non-interpolating literal for exec('sh','-c', ...). Previously
+            # we passed a version where each token had been wrapped in
+            # shell-style single-quotes which then resulted in a q(...)
+            # literal containing embedded single-quote characters. When the
+            # spawned shell received that string it treated the single-quotes
+            # as literal characters and failed to parse the intended
+            # pipeline/grouping syntax. Passing the raw inner shell text
+            # (shell_cmd_raw) preserves the exact program string the shell
+            # expects while still letting _perl_quote_literal_no_interp
+            # choose a safe Perl delimiter.
+            my $cmd_lit = _perl_quote_literal_no_interp($shell_cmd_raw);
             # Try to convert the inner shell command to Perl first so we avoid
             # invoking external tools (notably sha256sum/sha512sum) which may be
             # missing in the test environment. convert_shell_to_perl delegates to
