@@ -28,22 +28,13 @@ waitpid $wc_pid_0, 0;
 print $wc_output;
 
 print "\nwc -l (line count only):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-l", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-l", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nwc -w (word count only):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-w", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-w", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nwc -c (character count only):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-c", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-c", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nwc with multiple files:\n";
 my $multi_wc = do {
@@ -61,10 +52,7 @@ waitpid $wc_pid_0, 0;
 print $multi_wc;
 
 print "\nwc from stdin (echo | wc):\n";
-do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use IPC::Open3;
-{
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);use IPC::Open3;{
     my $output_0;
     my $output_printed_0;
     my $pipeline_success_0 = 1;
@@ -91,8 +79,6 @@ $CHILD_ERROR = 0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     }
 
-};
-
 print "\nwc -c (bytes):\n";
 my $bytes = do {
 use IPC::Open3;
@@ -109,10 +95,7 @@ waitpid $wc_pid_0, 0;
 print $bytes;
 
 print "\nwc -L (maximum line length):\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-L", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "-L", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nwc -lwc (lines, words, characters):\n";
 my $all_wc = do {
@@ -130,10 +113,7 @@ waitpid $wc_pid_0, 0;
 print $all_wc;
 
 print "\nwc with totals on multiple files:\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "test_wc.txt", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("wc", "test_wc.txt", "test_wc.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 unlink('test_wc.txt') if -f 'test_wc.txt';
 

@@ -5,16 +5,10 @@ BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/001_echo_basic.pl" }
 print "=== Example 001: Basic echo command ===\n";
 
 print "Using " . "sys" . "tem" . "() to call echo:\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "Hello, World!"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "Hello, World!"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nEcho with multiple arguments:\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a test of the echo builtin"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a test of the echo builtin"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nEcho with special characters using backticks:\n";
 my $output = ("Line 1
@@ -31,19 +25,11 @@ my $var_output = ("Welcome to $name version $version") . "\n"
 print $var_output;
 
 print "\nEcho with quotes:\n";
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a 'quoted' string"); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
-do {
-my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", 'This is a "double quoted" string'); die "exec failed: " . $!; } else { waitpid($pid, 0); } $?;
-
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is a 'quoted' string"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", 'This is a "double quoted" string'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nEcho with redirection:\n";
-do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);do {
     open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $!\n";
     open STDOUT, '>', 'temp_echo.txt'
@@ -54,8 +40,6 @@ do {
       or die "Cannot restore STDOUT: $!\n";
     close $original_stdout
       or die "Close failed: $!\n";
-};
-
 };
 if (-f "temp_echo.txt") {
     open(my $fh, '<', 'temp_echo.txt') or die "Cannot open file: $!";
