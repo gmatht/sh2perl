@@ -142,7 +142,7 @@ print $yes_pipe;
 
 print "\nyes with output redirection:\n";
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);{
-    my $output_0;
+    my $output_0 = q{};
     my $output_printed_0;
     my $pipeline_success_0 = 1;
         my $string = 'Output to file';
@@ -150,6 +150,7 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
     for (my $i = 0; $i < 1000; $i++) {
     $output_0 .= "$string\n";
     }
+    $output_0;
 
         do {
     open my $original_stdout, '>&', STDOUT
@@ -157,20 +158,33 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
     open STDOUT, '>', 'yes_output.txt'
     or die "Cannot open file: $!\n";
     my $tmp = do {
-    do { my $head_cmd = 'head -5'; print qx{$head_cmd}; };
+    my $tmp_redirect_1 = q{};
+    my $num_lines       = 5;
+    my $head_line_count = 0;
+    my $result          = q{};
+    my $input           = $output_0;
+    my $pos             = 0;
+    while ( $pos < length $input && $head_line_count < $num_lines ) {
+    my $line_end = index $input, "\n", $pos;
+    if ( $line_end == -1 ) {
+    $line_end = length $input;
+    }
+    my $head_line = substr $input, $pos, $line_end - $pos;
+    $result .= $head_line . "\n";
+    $pos = $line_end + 1;
+    ++$head_line_count;
+    }
+    $output_0 = $result;
+    $tmp_redirect_1;
     };
     print $tmp;
+    if ($tmp eq q{}) { print $output_0; }
+    $output_printed_0 = 1;
     open STDOUT, '>&', $original_stdout
     or die "Cannot restore STDOUT: $!\n";
     close $original_stdout
     or die "Close failed: $!\n";
     };
-    if ($output_0 ne q{} && !defined $output_printed_0) {
-        print $output_0;
-        if (!($output_0 =~ m{\n\z}msx)) {
-            print "\n";
-        }
-    }
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     }
 
@@ -188,7 +202,7 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
     # Child process executes the background command
     # Original bash: yes 'Background' | head -n 3 > /dev/null &
 {
-        my $output_0;
+        my $output_0 = q{};
         my $output_printed_0;
         my $pipeline_success_0 = 1;
                 my $string = 'Background';
@@ -196,6 +210,7 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
         for (my $i = 0; $i < 1000; $i++) {
         $output_0 .= "$string\n";
         }
+        $output_0;
 
                 do {
         open my $original_stdout, '>&', STDOUT
@@ -203,20 +218,33 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
         open STDOUT, '>', '/dev/null'
         or die "Cannot open file: $!\n";
         my $tmp = do {
-        do { my $head_cmd = 'head -n 3'; print qx{$head_cmd}; };
+        my $tmp_redirect_1 = q{};
+        my $num_lines       = 3;
+        my $head_line_count = 0;
+        my $result          = q{};
+        my $input           = $output_0;
+        my $pos             = 0;
+        while ( $pos < length $input && $head_line_count < $num_lines ) {
+        my $line_end = index $input, "\n", $pos;
+        if ( $line_end == -1 ) {
+        $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+        }
+        $output_0 = $result;
+        $tmp_redirect_1;
         };
         print $tmp;
+        if ($tmp eq q{}) { print $output_0; }
+        $output_printed_0 = 1;
         open STDOUT, '>&', $original_stdout
         or die "Cannot restore STDOUT: $!\n";
         close $original_stdout
         or die "Close failed: $!\n";
         };
-        if ($output_0 ne q{} && !defined $output_printed_0) {
-            print $output_0;
-            if (!($output_0 =~ m{\n\z}msx)) {
-                print "\n";
-            }
-        }
         if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
         }
     exit(0);
@@ -261,8 +289,11 @@ my $yes_diff2 = do { my $pipeline_cmd = q{yes 'String 2' | head -2}; my $result 
 print $yes_diff2;
 
 print "\nyes with error handling:\n";
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);{
-    my $output_0;
+do {
+    my $__PURIFY_TMP = do {
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+{
+    my $output_0 = q{};
     my $output_printed_0;
     my $pipeline_success_0 = 1;
     my $string = 'Error test';
@@ -270,6 +301,7 @@ $output_0 = q{};
 for (my $i = 0; $i < 1000; $i++) {
     $output_0 .= "$string\n";
 }
+$output_0;
 
         my $num_lines       = 3;
     my $head_line_count = 0;
@@ -295,6 +327,13 @@ for (my $i = 0; $i < 1000; $i++) {
     }
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     }
+
+    };
+    if (defined $__PURIFY_TMP && $__PURIFY_TMP ne q{}) {
+        print $__PURIFY_TMP;
+        if (!($__PURIFY_TMP =~ m{\n\z}msx)) { print "\n"; }
+    }
+};
 
 print "\nyes with pipe to wc:\n";
 my $yes_wc = do { my $pipeline_cmd = q{yes 'Count me' | head -10 | wc -l}; my $result = qx{$pipeline_cmd}; $CHILD_ERROR = $? >> 8; $result; }

@@ -36,7 +36,7 @@ if (-f "combined.txt") {
 
 print "\ncat from stdin (echo | cat):\n";
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);{
-    my $output_0;
+    my $output_0 = q{};
     my $output_printed_0;
     my $pipeline_success_0 = 1;
     $output_0 .= 'This is from stdin' . "\n";

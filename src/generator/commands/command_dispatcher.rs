@@ -915,12 +915,18 @@ pub fn generate_command_impl_with_input(
                         result.push_str(&generator.indent());
                         result.push_str("print $tmp;\n");
 
-                        // Mark the current pipeline output as printed so the
-                        // pipeline generator will skip its final print. We use
-                        // the explicit pipeline id pushed by the pipeline
-                        // generator (see Generator::push_pipeline_output_id) to
-                        // avoid fragile string scanning of generated snippets.
+                        // If the generated snippet actually populated the pipeline
+                        // output buffer (eg. $output_<id>) but returned an empty
+                        // temporary, print the buffer as a fallback so redirects
+                        // receive the expected content. Only do this when a
+                        // pipeline id is active to avoid interfering with other
+                        // code paths.
                         if let Some(current_id) = generator.current_pipeline_output_id() {
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!(
+                                "if ($tmp eq q{{}}) {{ print $output_{}; }}\n",
+                                current_id
+                            ));
                             result.push_str(&generator.indent());
                             result.push_str(&format!("$output_printed_{} = 1;\n", current_id));
                         }

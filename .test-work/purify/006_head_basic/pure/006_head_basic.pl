@@ -11,7 +11,7 @@ for my $i (1..10) {
 close($fh);
 
 print "Using backticks to call head (default 10 lines):\n";
-my $head_output = do { my $head_cmd = 'head test_head.txt'; qx{$head_cmd}; }
+my $head_output = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head test_head.txt'; qx{$head_cmd}; }
 ;
 print $head_output;
 
@@ -19,7 +19,7 @@ print "\nhead -n 5 (first 5 lines):\n";
 my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-n", "5", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nhead -n 3 (first 3 lines):\n";
-my $head3 = do { my $head_cmd = 'head -n 3 test_head.txt'; qx{$head_cmd}; }
+my $head3 = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head -n 3 test_head.txt'; qx{$head_cmd}; }
 ;
 print $head3;
 
@@ -27,7 +27,7 @@ print "\nhead -n 1 (first line only):\n";
 my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-n", "1", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nhead -n 15 (more than available):\n";
-my $head15 = do { my $head_cmd = 'head -n 15 test_head.txt'; qx{$head_cmd}; }
+my $head15 = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head -n 15 test_head.txt'; qx{$head_cmd}; }
 ;
 print $head15;
 
@@ -35,13 +35,13 @@ print "\nhead -c 50 (first 50 characters):\n";
 my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-c", "50", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nhead -c 100 (first 100 characters):\n";
-my $head_bytes = do { my $head_cmd = 'head -c 100 test_head.txt'; qx{$head_cmd}; }
+my $head_bytes = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head -c 100 test_head.txt'; qx{$head_cmd}; }
 ;
 print $head_bytes;
 
 print "\nhead from stdin (echo | head):\n";
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);{
-    my $output_0;
+    my $output_0 = q{};
     my $output_printed_0;
     my $pipeline_success_0 = 1;
     $output_0 .= "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
@@ -74,7 +74,7 @@ $CHILD_ERROR = 0;
     }
 
 print "\nhead -q (quiet mode, no filename):\n";
-my $head_quiet = do { my $head_cmd = 'head -q test_head.txt'; qx{$head_cmd}; }
+my $head_quiet = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head -q test_head.txt'; qx{$head_cmd}; }
 ;
 print $head_quiet;
 

@@ -44,6 +44,11 @@ pub fn generate_yes_command_with_context(
         output.push_str("for (my $i = 0; $i < 1000; $i++) {\n");
         output.push_str(&format!("    ${} .= \"$string\\n\";\n", output_var));
         output.push_str("}\n");
+        // Make the do-block return the populated buffer so wrappers that capture
+        // the do { ... } value (eg. for redirected output) receive the
+        // generated contents. Without this the wrapper may print an empty
+        // temporary value and the redirected file would be empty.
+        output.push_str(&format!("${};\n", output_var));
     } else {
         // Standalone yes command - infinite loop
         output.push_str(&format!("my $string = {};\n", string_to_repeat));
