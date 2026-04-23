@@ -52,11 +52,7 @@ waitpid $wc_pid_0, 0;
 print $multi_wc;
 
 print "\nwc from stdin (echo | wc):\n";
-do {
-    my $__PURIFY_TMP = do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use IPC::Open3;
-{
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);use IPC::Open3;{
     my $output_0 = q{};
     my $output_printed_0;
     my $pipeline_success_0 = 1;
@@ -82,13 +78,6 @@ $CHILD_ERROR = 0;
     }
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     }
-
-    };
-    if (defined $__PURIFY_TMP && $__PURIFY_TMP ne q{}) {
-        print $__PURIFY_TMP;
-        if (!($__PURIFY_TMP =~ m{\n\z}msx)) { print "\n"; }
-    }
-};
 
 print "\nwc -c (bytes):\n";
 my $bytes = do {
