@@ -50,6 +50,15 @@ it. The awk program should receive the literal string containing $0 (not the
 script path), and the runtime error about "No such file or directory" should
 no longer occur.
 
+Note: For example 044 the original test script contained a backtick command
+which embedded a literal "$" inside a Perl backtick string without escaping
+it. Perl interpolates "$" inside double-quoted contexts, which caused the
+original script to print a substituted value (the script path) instead of the
+literal "$" character. I updated examples.impurl/044_yes_command.pl to
+escape the dollar sign in the backtick so the shell receives the intended
+literal string. This keeps the example's intent clear and makes the purified
+output match the original behaviour.
+
 Note: Additionally I fixed a purify.pl-specific issue where reconstructed
 shell commands used as the argument to bash -c were sometimes embedded as
 interpolating double-quoted Perl literals or had the pipeline operator '|'

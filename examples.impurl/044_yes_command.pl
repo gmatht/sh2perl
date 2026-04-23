@@ -25,7 +25,9 @@ system("sh", "-c", "yes '' | head -3");
 
 # yes with special characters using backticks
 print "\nyes with special characters:\n";
-my $yes_special = `yes "!@#$%^&*()" | head -3`;
+# Escape the dollar sign so Perl does not interpolate it inside the backtick
+# (the intent is to pass a literal "$" to the shell's yes command).
+my $yes_special = `yes "!@#\$%^&*()" | head -3`;
 print $yes_special;
 
 # yes with numbers using system()
