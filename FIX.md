@@ -17,6 +17,16 @@ perl_string_literal_no_interp so they become q{}-style or other safe Perl
 non-interpolating literals. This preserves byte-for-byte contents (including
 single quotes and $ sequences) and prevents accidental Perl interpolation.
 
+Update: generator-side fix
+-------------------------
+Instead of changing examples, we made a small generator-side change:
+src/generator/utils.rs: perl_string_literal_no_interp_impl now preserves
+the textual "$..." form when given non-literal Word nodes (for example
+Word::Variable or simple StringInterpolation). This ensures that when the
+generator is asked to emit a non-interpolating Perl literal the raw bytes
+(including $0) are preserved verbatim rather than being mapped to Perl
+variables such as $PROGRAM_NAME.
+
 Small purify.pl tweak
 ---------------------
 Also adjusted purify.pl so that when reconstructing list-form `system('sh','-c', ...)`
@@ -555,6 +565,26 @@ Files changed
   fallback detection. This prevents nested single-quote Perl source from being
   inserted into the final output.
 
+Fix: define missing helper in purify.pl
+--------------------------------------
+Problem
+-------
+purify.pl referenced a helper named _has_unescaped_ident_sigil but the
+function was not defined in the file. That produced a runtime failure when
+running purify on some examples (Undefined subroutine &main::_has_unescaped_ident_sigil).
+
+Fix
+---
+Add a small helper _has_unescaped_ident_sigil to purify.pl which detects
+whether a string contains an unescaped Perl sigil ($ or @) followed by an
+identifier-like token. This preserves the existing heuristic that prefers
+double-quoted Perl literals when actual Perl interpolation is likely.
+
+Why this is minimal and safe
+---------------------------
+This is a tiny, local fix that restores expected behaviour in the quoting
+heuristics without changing semantics elsewhere.
+
 Additional runtime tweak
 ------------------------
 While testing I observed debashc sometimes failed to parse reconstructed
@@ -594,3 +624,8 @@ This preserves the external tool's printed form while keeping the change
 localized to the generator serialization. It makes the purified output match
 the original shell behaviour for stdin/pipeline cases without altering other
 sha*sum behaviours.
+Example tweak
+-------------
+The earlier temporary example change (making the awk program single-quoted)
+was reverted; the root cause was fixed in the generator instead (see the
+"Update: generator-side fix" section above).
