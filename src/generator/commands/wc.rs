@@ -25,6 +25,13 @@ pub fn generate_wc_command_with_output(
 ) -> String {
     let mut output = String::new();
 
+    // Detect whether wc was called with -l so we can supply a default
+    // "0\n" in cases where the child produced no output (matching real wc)
+    let has_count_lines_flag = cmd.args.iter().any(|arg| match arg {
+        Word::Literal(s, _) => s == "-l",
+        _ => false,
+    });
+
     let wc_args = cmd
         .args
         .iter()
@@ -84,6 +91,16 @@ pub fn generate_wc_command_with_output(
             output_var_expr, command_index
         ));
         generator.declared_locals.insert(output_name.to_string());
+    }
+
+    // If wc was asked to count lines (-l) but produced an empty string, the
+    // real wc prints "0\n". Make the generated Perl mimic that behaviour so
+    // command-substitutions end up with the expected textual result.
+    if has_count_lines_flag {
+        output.push_str(&format!(
+            "if ({} eq q{{}}) {{ {} = \"0\\n\"; }}\n",
+            output_var_expr, output_var_expr
+        ));
     }
     output.push_str(&format!(
         "close $wc_out_{} or die \"Close failed: $!\\n\";\n",

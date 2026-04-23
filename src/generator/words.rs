@@ -390,6 +390,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 // Handle comm command with process substitution like paste command
                                 let mut process_sub_code = String::new();
                                 let mut process_sub_files = Vec::new();
+                                // Keep any pipeline-id guards alive until after we
+                                // generate the final comm invocation so nested
+                                // generators see the pipeline id. Store guards in a
+                                // vector so their Drop is deferred.
+                                let mut _process_sub_guards: Vec<
+                                    crate::generator::PipelineOutputIdGuard,
+                                > = Vec::new();
 
                                 for redirect in &simple_cmd.redirects {
                                     if let crate::ast::RedirectOperator::ProcessSubstitutionInput(
