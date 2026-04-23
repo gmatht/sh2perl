@@ -444,12 +444,18 @@ pub fn perl_string_literal_no_interp_impl(_generator: &mut Generator, word: &Wor
             }
 
             // If every candidate delimiter appears in the string (rare),
-            // fall back to a double-quoted literal with explicit escaping.
-            // Double-quoting is safe because we properly escape backslashes,
-            // quotes and control characters.
+            // we must still avoid emitting a Perl double-quoted literal
+            // that would allow Perl to interpolate "$" or "@" sequences
+            // from the embedded shell fragment. Instead of falling back to
+            // interpolation, escape $ and @ so the resulting double-quoted
+            // literal is effectively non-interpolating for those sigils.
+            // Also escape backslashes and quotes and encode control chars.
             let escaped = s
                 .replace("\\", "\\\\")
                 .replace("\"", "\\\"")
+                // Escape $ and @ so Perl won't interpolate them in the source
+                .replace("$", "\\$")
+                .replace("@", "\\@")
                 .replace("\n", "\\n")
                 .replace("\t", "\\t")
                 .replace("\r", "\\r");
