@@ -161,11 +161,16 @@ pub fn generate_sha256sum_command(
         // caller's variable. This ensures the generator can be inlined safely
         // into surrounding do { ... } expressions.
         if input_var.is_empty() {
-            // No input var: read from STDIN and return the hash as an expression
-            output.push_str("sha256_hex(do { local $/ = undef; <STDIN> })");
+            // No input var: read from STDIN and return the hash as an expression.
+            // The external sha256sum prints "<hash>  -" when reading from STDIN;
+            // emulate that by appending the literal marker so purified scripts
+            // which print the result match the host tool's output.
+            output.push_str("sha256_hex(do { local $/ = undef; <STDIN> }) . '  -'");
         } else {
             // Compute hash of the provided Perl variable and return it as an expression
-            output.push_str(&format!("sha256_hex({})", input_expr));
+            // When used in pipeline contexts the external tool prints the filename
+            // as '-', so append '  -' to match that form.
+            output.push_str(&format!("sha256_hex({}) . '  -'", input_expr));
         }
     } else {
         // Calculate hashes of specified files
