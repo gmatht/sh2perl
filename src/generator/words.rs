@@ -1180,22 +1180,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     }
                 }
                 Command::Pipeline(pipeline) => {
-                    // For command substitution pipelines, keep the shell pipeline intact
-                    // but emit it through qx{} so the purified script does not contain backticks.
-                    let pipeline_cmd = generator
-                        .generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
-                    // Debug: print the raw pipeline command and the Perl literal that will be
-                    // embedded into the generated source. This helps diagnose quoting/escaping
-                    // issues where Perl interpolation or escape sequences change the runtime
-                    // shell command semantics.
-                    // The pipeline is passed verbatim to qx{}, so ensure the
-                    // embedded shell program is preserved exactly (don't let
-                    // Perl interpolate $/@ tokens that belong to shell/awk).
-                    let pipeline_lit =
-                        generator.perl_string_literal_no_interp(&Word::literal(pipeline_cmd));
+                    // Use the centralized pipeline-for-substitution generator
+                    // which handles many special-cases (echo|tr, head/tail,
+                    // builtin optimizations) and ensures Perl-side
+                    // interpolation/quoting is preserved correctly.
                     format!(
-                        "do {{ my $pipeline_cmd = {}; my $result = qx{{$pipeline_cmd}}; $CHILD_ERROR = $? >> 8; $result; }}",
-                        pipeline_lit
+                        "do {{ {} }}",
+                        crate::generator::commands::pipeline_commands::
+                            generate_pipeline_for_substitution(generator, pipeline)
                     )
                 }
                 Command::And(left_cmd, right_cmd) => {
