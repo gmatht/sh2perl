@@ -625,9 +625,19 @@ sub get_system_call_tokens {
         if ($token->isa('PPI::Token::Quote::Single')) {
             $quote_type = 'single';
             $text = $token->string;
+            # Normalize accidental surrounding whitespace in quoted flag
+            # tokens like ' -c' -> '-c' since leading/trailing spaces are
+            # almost never significant for option flags and they break
+            # subsequent quoting logic.
+            if (defined $text && $text =~ /^\s*-\S/) {
+                $text =~ s/^\s+|\s+$//g;
+            }
         } elsif ($token->isa('PPI::Token::Quote::Double') || $token->isa('PPI::Token::Quote::Interpolate')) {
             $quote_type = 'double';
             $text = $token->string;
+            if (defined $text && $text =~ /^\s*-\S/) {
+                $text =~ s/^\s+|\s+$//g;
+            }
         } elsif ($token->isa('PPI::Token::Quote')) {
             # Fallback for other quote forms (q{}, qq{}, etc.) - use
             # the string() value and conservatively treat qq-like forms
@@ -679,6 +689,48 @@ sub generate_exec_do_block {
     my $first = shift @tokens; # program name
     my ($exe, $exe_q) = ref($first) eq 'ARRAY' ? @{$first} : ($first, 'bare');
     my $exe_quoted = _perl_quote_literal_with_pref($exe, $exe_q);
+
+    # Special-case: when the list-form system() is actually calling a shell
+    # like `sh` or `bash` with a `-c` flag, the remaining tokens collectively
+    # form the single shell command string. Reconstruct that command and
+    # exec the shell with a single non-interpolating Perl literal so that
+    # embedded awk/sed programs (containing $/@ and quotes) are preserved
+    # verbatim and we avoid producing broken nested quoting.
+    if (defined $exe && ($exe eq 'sh' || $exe eq 'bash') && @tokens >= 2) {
+        my ($flag_txt, $flag_q) = ref($tokens[0]) eq 'ARRAY' ? @{$tokens[0]} : ($tokens[0], 'bare');
+        my $normalized_flag = $flag_txt;
+        $normalized_flag =~ s/^\s+|\s+$//g;
+        # If the token was something like ' -c' (with surrounding whitespace)
+        # normalize it to '-c' for downstream processing so we don't emit
+        # a Perl literal that contains unexpected spaces.
+        if ($normalized_flag =~ /^-c$/) {
+            $flag_txt = '-c';
+            $flag_q = 'bare' if !$flag_q || $flag_q eq '';
+            $normalized_flag = '-c';
+        }
+        if ($normalized_flag eq '-c') {
+            # Build the shell command string from the remaining tokens (preserve pipeline '|' as raw pipe)
+            my @cmd_parts = @tokens[1..$#tokens];
+            my $shell_cmd = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); $t eq '|' ? '|' : _shell_quote_for_system($t) } @cmd_parts);
+            # Use a non-interpolating Perl literal for the shell -c
+            # argument so embedded awk/sed $n and @vars are preserved
+            # verbatim. _perl_quote_literal_no_interp will pick a q{}-style
+            # delimiter that does not appear in the contents when possible.
+            my $cmd_lit = _perl_quote_literal_no_interp($shell_cmd);
+            # Normalize the flag literal (trimmed) and prefer preserving the original
+            # quoting preference when emitting the Perl literal for the '-c' flag.
+            my $flag_literal = _perl_quote_literal_with_pref($normalized_flag, $flag_q);
+            # Use the already-computed $exe_quoted so the program name is emitted
+            # correctly (respecting original quoting preference).
+            if ($verbose) {
+                print "DEBUG: sh -c special-case: exe_quoted=$exe_quoted flag_literal=$flag_literal cmd_lit=$cmd_lit\n";
+            }
+            my $block = 'my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec (' . $exe_quoted . ', ' . $flag_literal . ', ' . $cmd_lit . '); die "exec failed: " . $!; } else { waitpid($pid, 0); }';
+            # Ensure the block returns the same value as system()
+            $block .= ' $?;';
+            return $block . "\n";
+        }
+    }
 
     # Scan remaining tokens for redirection operators. Build a list of
     # argv elements (without redirections) and a list of child-side
@@ -975,7 +1027,15 @@ sub strip_comments_ppi {
 sub replace_system_call_with_code {
     my ($system_call, $replacement_code) = @_;
     
-    $replacement_code = extract_core_perl_logic_ppi($replacement_code);
+    # If the replacement code is a hand-crafted exec/fork block or already a
+    # do{ ... } wrapper as emitted by debashc, avoid running it through
+    # extract_core_perl_logic_ppi which is intended to strip headers from
+    # full generated scripts and can mangle quoting for small code
+    # fragments. Detect common patterns for exec/fork/do-blocks and skip
+    # the extraction in those cases.
+    unless ($replacement_code =~ /(?:^do\s*\{|my\s+\$pid\s*=\s*fork\b|\bexec\s*\()/s) {
+        $replacement_code = extract_core_perl_logic_ppi($replacement_code);
+    }
 
     # The finder already returns the statement node.
     my $statement = $system_call;
