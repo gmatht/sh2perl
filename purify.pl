@@ -748,8 +748,20 @@ sub generate_exec_do_block {
     # If we couldn't safely translate redirects, fall back to executing via shell
     if ($fallback_to_shell) {
         # Reconstruct a shell command string and execute with bash -c
-        my $shell_cmd = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); _shell_quote_for_system($t) } ($first, @tokens));
-        my $cmd_lit = _perl_quote_literal_with_pref($shell_cmd, 'single');
+        # Preserve literal pipe operators as real pipes (do not quote them)
+        # so the shell sees pipelines instead of literal '|' filenames.
+        my $shell_cmd = join(' ', map {
+            my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare');
+            $t eq '|' ? '|' : _shell_quote_for_system($t);
+        } ($first, @tokens));
+
+        # Use a non-interpolating Perl literal for the bash -c argument so
+        # embedded shell fragments (notably awk/sed programs containing
+        # $0/$1 variables) are preserved verbatim and not expanded by Perl
+        # at parse time. Choose a q{}-style delimiter that does not appear
+        # in the contents when possible; fall back to an escaped double-quote
+        # form if necessary.
+        my $cmd_lit = _perl_quote_literal_no_interp($shell_cmd);
         my $block = 'my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec (\'bash\', \'-c\', ' . $cmd_lit . '); die "exec failed: " . $!; } else { waitpid($pid, 0); }';
         $block .= ' $?;';
         return $block . "\n";
@@ -858,6 +870,50 @@ sub _perl_quote_literal {
     # about avoiding shell-style escapes.
     $text =~ s/'/\\'/g; # escape single quotes as \'
     return "'$text'";
+}
+
+sub _perl_quote_literal_no_interp {
+    my ($text) = @_;
+    return "q{}" unless defined $text && length $text;
+
+    # Fast path: if there are no single-quotes or newlines, a simple
+    # single-quoted literal is the most readable and safe non-interpolating
+    # form.
+    my $contains_single_quote = $text =~ /'/;
+    my $contains_newline = $text =~ /\n/;
+
+    if (!$contains_single_quote && !$contains_newline) {
+        my $escaped = $text;
+        $escaped =~ s/\\/\\\\/g;
+        $escaped =~ s/'/\\'/g;
+        return "'$escaped'";
+    }
+
+    # Choose a q<delim>...<delim> form where possible so we can include
+    # single quotes and newlines verbatim without interpolation.
+    my @pairs = (
+        ['{', '}'], ['(', ')'], ['[', ']'], ['<', '>'], ['|', '|'], ['/', '/'],
+        ['#', '#'], ['%', '%'], ['@', '@'], ['!', '!'], ['~', '~'], ['^', '^'],
+        [':', ':'], [';', ';'],
+    );
+
+    for my $p (@pairs) {
+        my ($open, $close) = @$p;
+        next if index($text, $open) >= 0 || index($text, $close) >= 0;
+        return "q$open$text$close";
+    }
+
+    # If every delimiter candidate appears in the string (rare), fall back
+    # to a double-quoted literal with escaped control characters. This is a
+    # last-resort fallback; it may allow Perl interpolation of $/@ but such
+    # inputs are exceedingly uncommon.
+    my $escaped = $text;
+    $escaped =~ s/\\/\\\\/g;
+    $escaped =~ s/"/\\"/g;
+    $escaped =~ s/\n/\\n/g;
+    $escaped =~ s/\t/\\t/g;
+    $escaped =~ s/\r/\\r/g;
+    return "\"$escaped\"";
 }
 
 sub _shell_quote_for_system {
