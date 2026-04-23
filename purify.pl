@@ -639,20 +639,10 @@ sub get_system_call_tokens {
         # interpolation semantics when generating Perl literals later.
         if ($token->isa('PPI::Token::Quote::Single')) {
             $quote_type = 'single';
-            $text = $token->string;
-            # Normalize accidental surrounding whitespace in quoted flag
-            # tokens like ' -c' -> '-c' since leading/trailing spaces are
-            # almost never significant for option flags and they break
-            # subsequent quoting logic.
-            if (defined $text && $text =~ /^\s*-\S/) {
-                $text =~ s/^\s+|\s+$//g;
-            }
+            $text = $token->string; # preserve original inner text including whitespace
         } elsif ($token->isa('PPI::Token::Quote::Double') || $token->isa('PPI::Token::Quote::Interpolate')) {
             $quote_type = 'double';
-            $text = $token->string;
-            if (defined $text && $text =~ /^\s*-\S/) {
-                $text =~ s/^\s+|\s+$//g;
-            }
+            $text = $token->string; # preserve original inner text including whitespace
         } elsif ($token->isa('PPI::Token::Quote')) {
             # Fallback for other quote forms (q{}, qq{}, etc.) - use
             # the string() value and conservatively treat qq-like forms
@@ -715,51 +705,121 @@ sub generate_exec_do_block {
         my ($flag_txt, $flag_q) = ref($tokens[0]) eq 'ARRAY' ? @{$tokens[0]} : ($tokens[0], 'bare');
         my $normalized_flag = $flag_txt;
         $normalized_flag =~ s/^\s+|\s+$//g;
-        # If the token was something like ' -c' (with surrounding whitespace)
-        # normalize it to '-c' for downstream processing so we don't emit
-        # a Perl literal that contains unexpected spaces.
-        if ($normalized_flag =~ /^-c$/) {
-            $flag_txt = '-c';
+        # Determine if the original token was a clean '-c' (no surrounding
+        # whitespace). Only when the original token equals the normalized
+        # value do we consider attempting the special debashc conversion.
+        my $is_clean_flag = ($flag_txt eq $normalized_flag);
+        # If the token was exactly '-c' prefer a sane bare quoting
+        # preference; do not adjust quoting when the original token
+        # contained surrounding whitespace since we want to preserve
+        # the original semantics in that case.
+        if ($is_clean_flag && $normalized_flag =~ /^-c$/) {
             $flag_q = 'bare' if !$flag_q || $flag_q eq '';
-            $normalized_flag = '-c';
         }
-        if ($normalized_flag eq '-c') {
+        # If the normalized flag matches '-c' but the original token
+        # contained surrounding whitespace (not a clean '-c'), avoid any
+        # normalization and preserve the original argument text by using
+        # the perl-quoted tokens we captured earlier. This preserves the
+        # exact runtime behavior (including accidental/malformed flags)
+        # and avoids attempting debashc conversion which could change
+        # semantics.
+        if ($normalized_flag eq '-c' && !$is_clean_flag) {
+            # The original flag token contained surrounding whitespace;
+            # preserve the exact runtime behaviour by emitting an exec
+            # block that uses the original tokens but reconstructs safe
+            # Perl literals from their decoded inner text. This avoids
+            # double-escaping issues that can arise when reusing previously
+            # quoted fragments.
+            my @arg_literals = ();
+            for my $a (@tokens) {
+                my ($t,$q) = ref($a) eq 'ARRAY' ? @{$a} : ($a,'bare');
+                my $decoded = defined $q && $q eq 'double' ? decode_perl_double_quoted_string($t)
+                            : defined $q && $q eq 'single' ? decode_perl_single_quoted_string($t)
+                            : $t;
+                push @arg_literals, _perl_quote_literal_with_pref($decoded, $q);
+            }
+            my $args_list = @arg_literals ? join(', ', @arg_literals) : '';
+            my $block = 'my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) {';
+            $block .= ' exec (' . $exe_quoted;
+            if (length $args_list) { $block .= ', ' . $args_list; }
+            $block .= '); die "exec failed: " . $!; } else { waitpid($pid, 0); }';
+            $block .= ' $?;';
+            return $block . "\n";
+        }
+
+        if ($normalized_flag eq '-c' && $is_clean_flag) {
             # Build the shell command string from the remaining tokens (preserve pipeline '|' as raw pipe)
             my @cmd_parts = @tokens[1..$#tokens];
             # Build a raw shell command (no surrounding quoting) for conversion
             # so debashc sees the original shell text. Separately build a
             # quoted form we can embed into exec('sh','-c', ...) when we
             # fall back to executing via the shell.
-            my $shell_cmd_raw = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); $q && $q eq 'double' ? decode_perl_double_quoted_string($t) : $t } @cmd_parts);
-            my $shell_cmd_for_exec = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); my $tt = $q && $q eq 'double' ? decode_perl_double_quoted_string($t) : $t; $tt eq '|' ? '|' : _shell_quote_for_system($tt) } @cmd_parts);
-            # Use the raw shell command text when constructing the Perl
-            # non-interpolating literal for exec('sh','-c', ...). Previously
-            # we passed a version where each token had been wrapped in
-            # shell-style single-quotes which then resulted in a q(...)
-            # literal containing embedded single-quote characters. When the
-            # spawned shell received that string it treated the single-quotes
-            # as literal characters and failed to parse the intended
-            # pipeline/grouping syntax. Passing the raw inner shell text
-            # (shell_cmd_raw) preserves the exact program string the shell
-            # expects while still letting _perl_quote_literal_no_interp
-            # choose a safe Perl delimiter.
-            my $cmd_lit = _perl_quote_literal_no_interp($shell_cmd_raw);
-            # Try to convert the inner shell command to Perl first so we avoid
-            # invoking external tools (notably sha256sum/sha512sum) which may be
-            # missing in the test environment. convert_shell_to_perl delegates to
-            # debashc which can emit pure-Perl implementations for these tools.
-            # Pass the semantics-preserving quoted form to debashc so the
-            # converter sees the same shell quoting as the original source.
-            # Using the raw form here lost original single-quote characters
-            # in some multi-arg cases which prevented the defensive check
-            # below from detecting unsafe single-quoted fallbacks.
-            # Try conversion using the raw inner shell text first. Passing the
-            # raw command (without additional surrounding quotes) to debashc
-            # generally lets the parser see the intended shell syntax and
-            # enables generators (e.g. sha256sum/sha512sum) to emit pure-Perl
-            # implementations. If this fails we will fall back to the exec
-            #('sh','-c', ...) path below which uses the quoted form.
-            my $perl_inner = convert_shell_to_perl($shell_cmd_raw, 0);
+            # Build a raw shell command (no surrounding quoting) for conversion
+            # so debashc sees the original shell text. When tokens were
+            # single-quoted in the original Perl source they may contain
+            # Perl-level backslash escapes (for example '\' to represent a
+            # single quote inside a single-quoted Perl string). Decode those
+            # so the shell text passed to debashc matches what the shell
+            # would actually see at runtime.
+            my $shell_cmd_raw = join(' ', map {
+                my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare');
+                if ($q && $q eq 'double') {
+                    decode_perl_double_quoted_string($t)
+                } elsif ($q && $q eq 'single') {
+                    decode_perl_single_quoted_string($t)
+                } else {
+                    $t
+                }
+            } @cmd_parts);
+
+            # Build a quoted form suitable for exec(...) embedding. For the
+            # conservative exec path we normally prefer a safely shell-quoted
+            # tokenization so arguments with spaces remain intact. However when
+            # the original source intended Perl interpolation (skip flag)
+            # we must preserve the original contiguous inner command string
+            # exactly (do not reapply per-token shell quoting) so that
+            # interpolation happens as the original author expected.
+            my $shell_cmd_for_exec = join(' ', map {
+                my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare');
+                my $tt = ($q && $q eq 'double') ? decode_perl_double_quoted_string($t)
+                       : ($q && $q eq 'single') ? decode_perl_single_quoted_string($t)
+                       : $t;
+                $tt eq '|' ? '|' : _shell_quote_for_system($tt)
+            } @cmd_parts);
+
+            # If any original token was double-quoted and contains a Perl-style
+            # variable ($ or @) the original source intended Perl interpolation
+            # at the call site. In such cases avoid converting the inner shell
+            # command into pure-Perl via debashc (which may change semantics)
+            # and instead emit an exec('sh','-c', ...) where we preserve the
+            # original quoting preference so Perl interpolation still occurs.
+            my $skip_conversion_due_to_perl_interpolation = 0;
+            for my $p (@cmd_parts) {
+                my ($pt, $pq) = ref($p) eq 'ARRAY' ? @{$p} : ($p, 'bare');
+                # Only treat a double-quoted token as indicating intended Perl
+                # interpolation when it contains an unescaped $ or @. Previously
+                # we checked for the presence of $/@ without considering an
+                # escaping backslash which caused tokens like "\$VAR" (where
+                # the original source escaped the dollar) to be treated as if
+                # Perl interpolation was intended. That led to emitting
+                # double-quoted Perl literals which then interpolated and
+                # removed the desired literal '$' before the shell saw it.
+                # Check for an unescaped sigil using a negative lookbehind.
+                if ($pq && $pq eq 'double' && $pt =~ /(?<!\\)[\$\@]/) { $skip_conversion_due_to_perl_interpolation = 1; last; }
+            }
+
+            my $perl_inner;
+            if (!$skip_conversion_due_to_perl_interpolation) {
+                # Try conversion using the raw inner shell text first. Passing the
+                # raw command (without additional surrounding quotes) to debashc
+                # generally lets the parser see the intended shell syntax and
+                # enables generators (e.g. sha256sum/sha512sum) to emit pure-Perl
+                # implementations. If this fails we will fall back to the exec
+                #('sh','-c', ...) path below which uses the quoted form.
+                my $try_raw = $shell_cmd_raw;
+                $perl_inner = convert_shell_to_perl($try_raw, 0);
+            }
+
             if (defined $perl_inner) {
                 # Defensive: If debashc emitted a fallback that itself
                 # contains a single-quoted system(... ) invocation while the
@@ -773,20 +833,43 @@ sub generate_exec_do_block {
                 } else {
                     # If conversion succeeded and looks safe, return the
                     # generated Perl fragment so the caller can splice it in.
+                    # However, when the generated fragment is a complete
+                    # do{...} block that performs printing itself we should
+                    # avoid wrapping it in another printing wrapper later.
+                    # Indicate to the caller that this fragment is safe to
+                    # insert by returning it as-is.
                     return $perl_inner;
                 }
             }
 
-            # Normal fallback: emit an exec('sh','-c', ...) block using a
-            # non-interpolating Perl literal for the shell command argument.
-            # Normalize the flag literal (trimmed) and prefer preserving the original
-            # quoting preference when emitting the Perl literal for the '-c' flag.
-            my $flag_literal = _perl_quote_literal_with_pref($normalized_flag, $flag_q);
-            # Use the already-computed $exe_quoted so the program name is emitted
-            # correctly (respecting original quoting preference).
+            # Normal fallback: emit an exec('sh','-c', ...) block. Preserve the
+            # original flag token text (including any whitespace) when building
+            # the Perl literal so we match the original program's semantics.
+            my $flag_literal = _perl_quote_literal_with_pref($flag_txt, $flag_q);
+
+            # Choose an appropriate Perl literal for the inner shell command.
+            # If we skipped conversion due to intended Perl interpolation
+            # preserve that behaviour by emitting a double-quoted Perl
+            # literal so $/@ sequences are interpolated. Otherwise prefer a
+            # non-interpolating literal which is safer for awk/sed fragments.
+            my $cmd_lit;
+            if ($skip_conversion_due_to_perl_interpolation) {
+                # When the original call used double-quoted tokens with
+                # unescaped $/@ the author likely expected Perl interpolation
+                # at the call site. Preserve that by embedding the raw inner
+                # shell command in a double-quoted Perl literal (so Perl
+                # performs interpolation). Use the raw reconstructed shell
+                # text here rather than the per-token re-quoted form so we
+                # don't inadvertently change the original semantics.
+                $cmd_lit = _perl_quote_literal_with_pref($shell_cmd_raw, 'double');
+            } else {
+                $cmd_lit = _perl_quote_literal_no_interp($shell_cmd_raw);
+            }
+
             if ($verbose) {
                 print "DEBUG: sh -c special-case: exe_quoted=$exe_quoted flag_literal=$flag_literal cmd_lit=$cmd_lit\n";
             }
+
             my $block = 'my $pid = fork; if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec (' . $exe_quoted . ', ' . $flag_literal . ', ' . $cmd_lit . '); die "exec failed: " . $!; } else { waitpid($pid, 0); }';
             # Ensure the block returns the same value as system()
             $block .= ' $?;';
@@ -1071,6 +1154,19 @@ sub decode_perl_double_quoted_string {
     return $decoded;
 }
 
+# Decode a Perl single-quoted string literal's escape sequences so we
+# reconstruct the runtime string the shell would see. In Perl single-quoted
+# literals only \' and \\ are recognized as escapes; all other backslashes
+# are literal backslashes. This mirrors Perl's single-quote semantics.
+sub decode_perl_single_quoted_string {
+    my ($text) = @_;
+    return '' unless defined $text;
+    # Replace escaped single-quote and escaped backslash sequences.
+    $text =~ s/\\'/\'/g;
+    $text =~ s/\\\\/\\/g;
+    return $text;
+}
+
 sub strip_comments_ppi {
     my ($document) = @_;
 
@@ -1148,7 +1244,7 @@ sub replace_system_call_with_code {
         # output files incorrectly. Detect that specific case and
         # normalize it to an expression-valued form before deciding
         # whether to insert verbatim.
-        if ($replacement_code =~ /\$\?\s*;|\bmy\s+\$pid\s*=\s*fork\b|\bexec\s*\(|open\s+.*STDOUT|open\s*\(\s*STDOUT/s) {
+        if ($replacement_code =~ /\$\?\s*;|\bmy\s+\$pid\s*=\s*fork\b|\bexec\s*\(|open\s+.*STDOUT|open\s*\(\s*STDOUT|\bprintf\s*\(|\bprint\s*['"]/s) {
             # If the replacement already performs child-side printing or
             # restores STDOUT (redirection handling) then inserting the
             # extra printing wrapper would cause the numeric return value
