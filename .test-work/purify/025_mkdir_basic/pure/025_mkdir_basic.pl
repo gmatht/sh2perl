@@ -6,7 +6,7 @@ BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/025_mkdir_basic.pl" }
 print "=== Example 025: Basic mkdir command ===\n";
 
 print "Using " . "sys" . "tem" . "() to call mkdir (create directory):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "test_mkdir_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', 'test_mkdir_dir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 if (-d "test_mkdir_dir") {
     print "Directory created successfully\n";
 } else {
@@ -14,7 +14,7 @@ if (-d "test_mkdir_dir") {
 }
 
 print "\nmkdir with parents (-p):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_mkdir_parents/subdir1/subdir2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', '-p', 'test_mkdir_parents/subdir1/subdir2'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 if (-d "test_mkdir_parents/subdir1/subdir2") {
     print "Nested directories created successfully\n";
 }
@@ -49,7 +49,7 @@ if (-d "test_mkdir_mode") {
 }
 
 print "\nmkdir with verbose (-v):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-v", "test_mkdir_verbose"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', '-v', 'test_mkdir_verbose'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nmkdir with multiple directories:\n";
 my $mkdir_multi = do {
@@ -86,7 +86,7 @@ if (-d "test_mkdir_multi1" && -d "test_mkdir_multi2" && -d "test_mkdir_multi3") 
 }
 
 print "\nmkdir with parents and mode (-p -m 700):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "-m", "700", "test_mkdir_secure/subdir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', '-p', '-m', '700', 'test_mkdir_secure/subdir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 if (-d "test_mkdir_secure/subdir") {
     print "Secure directory created successfully\n";
 }
@@ -131,7 +131,7 @@ my $mkdir_pv = do {
 print $mkdir_pv;
 
 print "\nmkdir with ignore existing (-p):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_mkdir_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;  
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', '-p', 'test_mkdir_dir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;  
 print "Attempted to create existing directory (should not fail with -p)\n";
 
 print "\nmkdir with specific mode (777):\n";
@@ -164,7 +164,7 @@ if (-d "test_mkdir_777") {
 }
 
 print "\nmkdir with parents and multiple directories:\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("mkdir", "-p", "test_mkdir_batch1/subdir", "test_mkdir_batch2/subdir", "test_mkdir_batch3/subdir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('mkdir', '-p', 'test_mkdir_batch1/subdir', 'test_mkdir_batch2/subdir', 'test_mkdir_batch3/subdir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 if (-d "test_mkdir_batch1/subdir" && -d "test_mkdir_batch2/subdir" && -d "test_mkdir_batch3/subdir") {
     print "Batch directories created successfully\n";
 }
@@ -178,19 +178,19 @@ if (-d "test_mkdir_error") {
     print "Directory creation failed or already exists\n";
 }
 
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_dir"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_parents"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_mode"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_verbose"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_multi1"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_multi2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_multi3"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_secure"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_pv"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_777"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_batch1"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_batch2"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_batch3"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("rm", "-rf", "test_mkdir_error"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_dir'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_parents'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_mode'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_verbose'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_multi1'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_multi2'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_multi3'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_secure'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_pv'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_777'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_batch1'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_batch2'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_batch3'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('rm', '-rf', 'test_mkdir_error'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "=== Example 025 completed successfully ===\n";

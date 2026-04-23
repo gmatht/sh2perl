@@ -5,7 +5,7 @@ BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/002_printf_basic.pl" }
 print "=== Example 002: Basic printf command ===\n";
 
 print "Using " . "sys" . "tem" . "() to call printf:\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Hello, %s!\\n", "World"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('printf', "Hello, %s!\\n", 'World'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nprintf with multiple format specifiers:\n";
 my $output = do {
@@ -17,12 +17,12 @@ my $output = do {
 print $output;
 
 print "\nprintf with different format types:\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Integer: %d\\n", '42'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Float: %.2f\\n", '3.14159'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "String: %s\\n", "test"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Character: %c\\n", '65'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;  
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Hexadecimal: %x\\n", '255'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "Octal: %o\\n", '64'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('printf', "Integer: %d\\n", '42'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('printf', "Float: %.2f\\n", '3.14159'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('printf', "String: %s\\n", 'test'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('printf', "Character: %c\\n", '65'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;  
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('printf', "Hexadecimal: %x\\n", '255'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('printf', "Octal: %o\\n", '64'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nprintf with field width and padding:\n";
 my $table_output = do {
@@ -48,8 +48,8 @@ $table_output = do {
 print $table_output;
 
 print "\nprintf with precision:\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "%.3f\\n", '3.14159265359'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("printf", "%.2e\\n", '1234567.89'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('printf', "%.3f\\n", '3.14159265359'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('printf', "%.2e\\n", '1234567.89'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nprintf with zero padding:\n";
 my $padded = do {

@@ -16,7 +16,7 @@ my $head_output = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 
 print $head_output;
 
 print "\nhead -n 5 (first 5 lines):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-n", "5", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('head', '-n', '5', 'test_head.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nhead -n 3 (first 3 lines):\n";
 my $head3 = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head -n 3 test_head.txt'; qx{$head_cmd}; }
@@ -24,7 +24,7 @@ my $head3 = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head 
 print $head3;
 
 print "\nhead -n 1 (first line only):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-n", "1", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('head', '-n', '1', 'test_head.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nhead -n 15 (more than available):\n";
 my $head15 = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head -n 15 test_head.txt'; qx{$head_cmd}; }
@@ -32,7 +32,7 @@ my $head15 = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head
 print $head15;
 
 print "\nhead -c 50 (first 50 characters):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-c", "50", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('head', '-c', '50', 'test_head.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nhead -c 100 (first 100 characters):\n";
 my $head_bytes = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = 'head -c 100 test_head.txt'; qx{$head_cmd}; }
@@ -79,7 +79,7 @@ my $head_quiet = do { my $output_0 = q{}; my $output_printed_0; my $head_cmd = '
 print $head_quiet;
 
 print "\nhead -v (verbose mode, with filename):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("head", "-v", "test_head.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('head', '-v', 'test_head.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 unlink('test_head.txt') if -f 'test_head.txt';
 

@@ -22,7 +22,7 @@ my $cat_output = do { open my $fh, '<', 'test_file1.txt' or die 'cat: ' . 'test_
 print $cat_output;
 
 print "\ncat with multiple files using " . "sys" . "tem" . "():\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "test_file1.txt", "test_file2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('cat', 'test_file1.txt', 'test_file2.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ncat with redirection (cat file1 file2 > combined.txt):\n";
 my $combined = do { my $command = 'cat test_file1.txt test_file2.txt > combined.txt'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
@@ -58,7 +58,7 @@ my $numbered = do { my $cat_cmd = 'cat -n test_file1.txt'; qx{$cat_cmd}; }
 print $numbered;
 
 print "\ncat with non-printing characters (cat -v):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-v", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('cat', '-v', 'test_file1.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ncat with squeeze blank lines (cat -s):\n";
 my $squeezed = do { my $cat_cmd = 'cat -s test_file1.txt'; qx{$cat_cmd}; }
@@ -66,7 +66,7 @@ my $squeezed = do { my $cat_cmd = 'cat -s test_file1.txt'; qx{$cat_cmd}; }
 print $squeezed;
 
 print "\ncat with tabs (cat -T):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("cat", "-T", "test_file1.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('cat', '-T', 'test_file1.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 unlink('test_file1.txt') if -f 'test_file1.txt';
 unlink('test_file2.txt') if -f 'test_file2.txt';
