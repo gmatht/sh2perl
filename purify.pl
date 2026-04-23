@@ -1022,18 +1022,28 @@ sub _perl_quote_literal_with_pref {
     # control characters). Otherwise prefer a single-quoted literal so
     # "$" and "@" remain literal in the emitted Perl source.
     if (defined $pref && $pref eq 'double') {
-        # The original token was double-quoted in the source which means
-        # Perl interpolation (e.g. $0, @arr) was intended at the call site.
-        # Preserve that semantic by emitting a double-quoted Perl literal
-        # here. Escape backslashes and double-quotes and encode control
-        # characters so the generated Perl source remains valid.
-        my $escaped = $text;
-        $escaped =~ s/\\/\\\\/g;    # escape backslashes
-        $escaped =~ s/"/\\"/g;        # escape double quotes
-        $escaped =~ s/\n/\\n/g;
-        $escaped =~ s/\r/\\r/g;
-        $escaped =~ s/\t/\\t/g;
-        return "\"$escaped\"";
+        # The original token was double-quoted in the source. Preserve the
+        # author's intended interpolation semantics: if the original inner
+        # text contains an unescaped Perl sigil ($ or @) it likely was meant
+        # to be interpolated by Perl, so emit a double-quoted Perl literal
+        # which performs interpolation at runtime. Otherwise fall back to
+        # the previous heuristic that prefers single-quoted literals unless
+        # control characters or double-quote/backslash characters require
+        # a double-quoted form.
+        if ($text =~ /(?<!\\)[\$\@]/ || $text =~ /[\n\r\t"\\]/) {
+            my $escaped = $text;
+            # Escape backslashes and double-quotes for a double-quoted literal
+            $escaped =~ s/\\/\\\\/g;    # backslashes
+            $escaped =~ s/"/\\"/g;        # escaped double-quotes
+            $escaped =~ s/\n/\\n/g;
+            $escaped =~ s/\r/\\r/g;
+            $escaped =~ s/\t/\\t/g;
+            return "\"$escaped\"";
+        } else {
+            my $t = $text;
+            $t =~ s/'/\\'/g;
+            return "'$t'";
+        }
     }
 
     if (defined $pref && $pref eq 'single') {

@@ -154,6 +154,10 @@ pub fn generate_command_impl_with_input(
             let mut has_here_string = false;
             let mut here_string_content = String::new();
             let mut process_sub_files = Vec::new();
+            // Keep any pipeline-id guards alive until after process-sub files
+            // are generated and used (prevents them from being dropped too early
+            // which would cause nested generators to miss the active id).
+            let mut _process_sub_guards: Vec<crate::generator::PipelineOutputIdGuard> = Vec::new();
 
             for redirect in &all_redirects {
                 match &redirect.operator {
@@ -230,8 +234,9 @@ pub fn generate_command_impl_with_input(
                                     .declared_locals
                                     .insert(format!("output_{}", unique_id));
 
-                                let _pipeline_guard =
-                                    generator.push_pipeline_output_id_guard(unique_id.clone());
+                                _process_sub_guards.push(
+                                    generator.push_pipeline_output_id_guard(unique_id.clone()),
+                                );
 
                                 let perl_code = generator.generate_command(cmd);
                                 for line in perl_code.lines() {

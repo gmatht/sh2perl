@@ -220,6 +220,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 // We need to generate the proper paste command with process substitution
                                 let mut process_sub_files = Vec::new();
                                 let mut process_sub_code = String::new();
+                                // Keep any pipeline-id guards alive until after we
+                                // generate the final paste invocation so nested
+                                // generators see the pipeline id. Store guards in a
+                                // vector so their Drop is deferred.
+                                let mut _process_sub_guards: Vec<
+                                    crate::generator::PipelineOutputIdGuard,
+                                > = Vec::new();
 
                                 for redirect in &simple_cmd.redirects {
                                     if let crate::ast::RedirectOperator::ProcessSubstitutionInput(
@@ -252,8 +259,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                                 .declared_locals
                                                 .insert(format!("output_{}", nested_id));
                                             // Push guard so nested generators see the id while we generate the nested command
-                                            let _guard = generator
-                                                .push_pipeline_output_id_guard(nested_id.clone());
+                                            _process_sub_guards.push(
+                                                generator.push_pipeline_output_id_guard(
+                                                    nested_id.clone(),
+                                                ),
+                                            );
 
                                             if let crate::ast::Command::Simple(echo_cmd) = &**cmd {
                                                 if let crate::ast::Word::Literal(name, _) =
@@ -405,10 +415,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             generator
                                                 .declared_locals
                                                 .insert(format!("output_{}", nested_id));
-
                                             // Push a guard so nested generators see the id
-                                            let _guard = generator
-                                                .push_pipeline_output_id_guard(nested_id.clone());
+                                            _process_sub_guards.push(
+                                                generator.push_pipeline_output_id_guard(
+                                                    nested_id.clone(),
+                                                ),
+                                            );
 
                                             let result = match sub_cmd.as_ref() {
                                                 Command::Simple(simple_sub_cmd) => generator

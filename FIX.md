@@ -17,6 +17,18 @@ perl_string_literal_no_interp so they become q{}-style or other safe Perl
 non-interpolating literals. This preserves byte-for-byte contents (including
 single quotes and $ sequences) and prevents accidental Perl interpolation.
 
+Small purify.pl tweak
+---------------------
+Also adjusted purify.pl so that when reconstructing list-form `system('sh','-c', ...)`
+we always first attempt to convert the raw inner shell text using debashc. If
+that conversion fails we fall back to exec('sh','-c', q{...}) using a
+non-interpolating Perl literal. Additionally, purify.pl's helper that
+selects single- vs double-quoted Perl literals now prefers single-quoted
+forms unless the text contains characters that truly require double-quoting
+(newlines, double quotes, backslashes or control characters). This prevents
+Perl from accidentally interpolating awk/sed `$` or `@` variables when the
+generated snippets are spliced back into documents.
+
 Files changed
 -------------
 - src/generator/utils.rs: ensure command strings used in open3('bash','-c', ...)
