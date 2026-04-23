@@ -50,6 +50,20 @@ it. The awk program should receive the literal string containing $0 (not the
 script path), and the runtime error about "No such file or directory" should
 no longer occur.
 
+Note: Additionally I fixed a purify.pl-specific issue where reconstructed
+shell commands used as the argument to bash -c were sometimes embedded as
+interpolating double-quoted Perl literals or had the pipeline operator '|'
+quoted. That caused two failures: (1) Perl interpolation replaced awk-style
+variables like $0 with the Perl $0 (the script path), and (2) quoted '|' tokens
+were passed as literal arguments instead of acting as shell pipe operators
+which made programs like cat receive the awk program as a filename. The
+purify.pl change now: (a) leaves '|' unquoted when rebuilding pipeline
+strings so the shell sees real pipelines, and (b) embeds the bash -c argument
+using a non-interpolating Perl literal (q{}-style where possible) so '$' and
+'@' inside awk/sed programs are preserved verbatim. This keeps purify.pl as a
+thin wrapper and fixes the observed output_mismatch for
+examples.impurl/035_pipeline_basic.pl.
+
 Note: In addition to the Rust-side fixes described above, I adjusted purify.pl's
 literal-quoting helper so it no longer forces double-quoted Perl literals when
 the original token was double-quoted but does not contain characters that
