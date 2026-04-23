@@ -136,20 +136,56 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             perl_code
                         } else if name == "head" {
                             // Use the shell command directly so file and flag handling stays faithful
-                            let head_cmd = generator.generate_command_string_for_system(cmd);
-                            // Preserve literal shell program content (do not let Perl
-                            // interpolate $/@ inside awk/sed snippets).
-                            let head_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(head_cmd));
-                            format!("do {{ my $head_cmd = {}; qx{{$head_cmd}}; }}", head_lit)
+                            if generator.current_pipeline_output_id().is_none() {
+                                let nested_id = generator.get_unique_id();
+                                // Record the declared local to avoid duplicate declarations
+                                generator
+                                    .declared_locals
+                                    .insert(format!("output_{}", nested_id));
+                                // Push guard so nested generators see the id while we generate the nested command
+                                let _guard =
+                                    generator.push_pipeline_output_id_guard(nested_id.clone());
+
+                                let head_cmd = generator.generate_command_string_for_system(cmd);
+                                // Preserve literal shell program content (do not let Perl
+                                // interpolate $/@ inside awk/sed snippets).
+                                let head_lit = generator
+                                    .perl_string_literal_no_interp(&Word::literal(head_cmd));
+                                format!(
+                                    "do {{ my $output_{} = q{{}}; my $output_printed_{}; my $head_cmd = {}; qx{{$head_cmd}}; }}",
+                                    nested_id, nested_id, head_lit
+                                )
+                            } else {
+                                let head_cmd = generator.generate_command_string_for_system(cmd);
+                                // Preserve literal shell program content (do not let Perl
+                                // interpolate $/@ inside awk/sed snippets).
+                                let head_lit = generator
+                                    .perl_string_literal_no_interp(&Word::literal(head_cmd));
+                                format!("do {{ my $head_cmd = {}; qx{{$head_cmd}}; }}", head_lit)
+                            }
                         } else if name == "tail" {
                             // Use the shell command directly so file and flag handling stays faithful
-                            let tail_cmd = generator.generate_command_string_for_system(cmd);
-                            // Preserve literal shell program content (do not let Perl
-                            // interpolate $/@ inside awk/sed snippets).
-                            let tail_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(tail_cmd));
-                            format!("do {{ my $tail_cmd = {}; qx{{$tail_cmd}}; }}", tail_lit)
+                            if generator.current_pipeline_output_id().is_none() {
+                                let nested_id = generator.get_unique_id();
+                                generator
+                                    .declared_locals
+                                    .insert(format!("output_{}", nested_id));
+                                let _guard =
+                                    generator.push_pipeline_output_id_guard(nested_id.clone());
+
+                                let tail_cmd = generator.generate_command_string_for_system(cmd);
+                                let tail_lit = generator
+                                    .perl_string_literal_no_interp(&Word::literal(tail_cmd));
+                                format!(
+                                    "do {{ my $output_{} = q{{}}; my $output_printed_{}; my $tail_cmd = {}; qx{{$tail_cmd}}; }}",
+                                    nested_id, nested_id, tail_lit
+                                )
+                            } else {
+                                let tail_cmd = generator.generate_command_string_for_system(cmd);
+                                let tail_lit = generator
+                                    .perl_string_literal_no_interp(&Word::literal(tail_cmd));
+                                format!("do {{ my $tail_cmd = {}; qx{{$tail_cmd}}; }}", tail_lit)
+                            }
                         } else if name == "cat" {
                             crate::generator::commands::cat::generate_cat_command_for_substitution(
                                 generator, simple_cmd,
@@ -194,14 +230,36 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         let temp_file_id = generator.get_unique_id();
                                         let temp_file = format!("temp_file_ps_{}", temp_file_id);
 
-                                        // Check if this is an echo command and use the dedicated echo generator
-                                        let process_sub_output =
+                                        // Check if this is an echo command. If no pipeline id is
+                                        // currently active, create a nested id and push an
+                                        // RAII guard so nested generation can see the id. Also
+                                        // emit minimal Perl declarations immediately so the
+                                        // nested generated snippet can reference $output_<id>.
+                                        let process_sub_output = if generator
+                                            .current_pipeline_output_id()
+                                            .is_none()
+                                        {
+                                            let nested_id = generator.get_unique_id();
+                                            process_sub_code.push_str(&format!(
+                                                "    my $output_{} = q{{}};\n",
+                                                nested_id
+                                            ));
+                                            process_sub_code.push_str(&format!(
+                                                "    my $output_printed_{};\n",
+                                                nested_id
+                                            ));
+                                            generator
+                                                .declared_locals
+                                                .insert(format!("output_{}", nested_id));
+                                            // Push guard so nested generators see the id while we generate the nested command
+                                            let _guard = generator
+                                                .push_pipeline_output_id_guard(nested_id.clone());
+
                                             if let crate::ast::Command::Simple(echo_cmd) = &**cmd {
                                                 if let crate::ast::Word::Literal(name, _) =
                                                     &echo_cmd.name
                                                 {
                                                     if name == "echo" {
-                                                        // Use the dedicated echo command generator
                                                         crate::generator::commands::echo::generate_echo_command(generator, echo_cmd, "", "temp_output")
                                                     } else {
                                                         generator.generate_command(cmd)
@@ -211,7 +269,25 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                                 }
                                             } else {
                                                 generator.generate_command(cmd)
-                                            };
+                                            }
+                                        } else {
+                                            // Existing pipeline id active - generate normally
+                                            if let crate::ast::Command::Simple(echo_cmd) = &**cmd {
+                                                if let crate::ast::Word::Literal(name, _) =
+                                                    &echo_cmd.name
+                                                {
+                                                    if name == "echo" {
+                                                        crate::generator::commands::echo::generate_echo_command(generator, echo_cmd, "", "temp_output")
+                                                    } else {
+                                                        generator.generate_command(cmd)
+                                                    }
+                                                } else {
+                                                    generator.generate_command(cmd)
+                                                }
+                                            } else {
+                                                generator.generate_command(cmd)
+                                            }
+                                        };
 
                                         // Generate code to execute the process substitution and save to temp file
                                         process_sub_code.push_str(&format!(
@@ -313,14 +389,44 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         let temp_file_id = generator.get_unique_id();
                                         let temp_file = format!("temp_file_ps_{}", temp_file_id);
 
-                                        let process_sub_output = match sub_cmd.as_ref() {
-                                            Command::Simple(simple_sub_cmd) => {
-                                                generator.generate_simple_command(simple_sub_cmd)
-                                            }
-                                            _ => {
-                                                // For non-simple commands, we need to generate the command differently
-                                                // This is a placeholder - we may need to implement this properly
-                                                format!("\"Command not supported in process substitution\"")
+                                        let process_sub_output = if generator
+                                            .current_pipeline_output_id()
+                                            .is_none()
+                                        {
+                                            let nested_id = generator.get_unique_id();
+                                            process_sub_code.push_str(&format!(
+                                                "    my $output_{} = q{{}};\n",
+                                                nested_id
+                                            ));
+                                            process_sub_code.push_str(&format!(
+                                                "    my $output_printed_{};\n",
+                                                nested_id
+                                            ));
+                                            generator
+                                                .declared_locals
+                                                .insert(format!("output_{}", nested_id));
+
+                                            // Push a guard so nested generators see the id
+                                            let _guard = generator
+                                                .push_pipeline_output_id_guard(nested_id.clone());
+
+                                            let result = match sub_cmd.as_ref() {
+                                                Command::Simple(simple_sub_cmd) => generator
+                                                    .generate_simple_command(simple_sub_cmd),
+                                                _ => {
+                                                    // For non-simple commands, we need to generate the command differently
+                                                    // This is a placeholder - we may need to implement this properly
+                                                    format!("\"Command not supported in process substitution\"")
+                                                }
+                                            };
+                                            result
+                                        } else {
+                                            match sub_cmd.as_ref() {
+                                                Command::Simple(simple_sub_cmd) => generator
+                                                    .generate_simple_command(simple_sub_cmd),
+                                                _ => {
+                                                    format!("\"Command not supported in process substitution\"")
+                                                }
                                             }
                                         };
 

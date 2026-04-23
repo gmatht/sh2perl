@@ -1115,21 +1115,32 @@ sub replace_system_call_with_code {
         $wrapped_code = $lhs . " do {\n" . $replacement_code . "\n};";
     } else {
         # When replacing a bare system() statement (no LHS assignment)
-        # the converted Rust/debashc snippet often returns the captured
-        # command output as the last expression (for example "$output_0").
-        # The original system() call would have printed that output to
-        # STDOUT. If we simply splice in a do{ ... } block that evaluates
-        # to the string it will not be printed. To preserve semantics,
-        # wrap the converted fragment so its return value is printed when
-        # non-empty. If the inner fragment already prints to STDOUT the
-        # extra guard avoids duplicating output.
-        $wrapped_code = "do {\n";
-        $wrapped_code .= "    my \$__PURIFY_TMP = do {\n" . $replacement_code . "\n    };\n";
-        $wrapped_code .= "    if (defined \$__PURIFY_TMP && \$__PURIFY_TMP ne q{}) {\n";
-        $wrapped_code .= "        print \$__PURIFY_TMP;\n";
-        $wrapped_code .= "        if (!(\$__PURIFY_TMP =~ m{\\n\\z}msx)) { print \"\\n\"; }\n";
-        $wrapped_code .= "    }\n";
-        $wrapped_code .= "};";
+        # we must not print the return value when the replacement is a
+        # fork/exec style block that returns an exit-status ($?). The
+        # original system() prints its child-side output directly to
+        # STDOUT; printing the replacement's return value here would
+        # incorrectly emit the numeric exit code (0/1) into program
+        # output. Detect common patterns (exec/fork or an appended $?)
+        # and insert the replacement as-is in those cases. For other
+        # replacements (notably those produced for backtick/command
+        # substitution which return strings) preserve the previous
+        # behaviour of printing non-empty returned strings.
+        if ($replacement_code =~ /\$\?\s*;|\bmy\s+\$pid\s*=\s*fork\b|\bexec\s*\(|\bprint\s*\(|\bprint\s+|open\s+.*STDOUT|open\s*\(\s*STDOUT/s) {
+            # If the replacement already performs child-side printing or
+            # restores STDOUT (redirection handling) then inserting the
+            # extra printing wrapper would cause the numeric return value
+            # (for example the return of `close`) to be printed. In those
+            # cases insert the replacement verbatim.
+            $wrapped_code = $replacement_code;
+        } else {
+            $wrapped_code = "do {\n";
+            $wrapped_code .= "    my \$__PURIFY_TMP = do {\n" . $replacement_code . "\n    };\n";
+            $wrapped_code .= "    if (defined \$__PURIFY_TMP && \$__PURIFY_TMP ne q{}) {\n";
+            $wrapped_code .= "        print \$__PURIFY_TMP;\n";
+            $wrapped_code .= "        if (!(\$__PURIFY_TMP =~ m{\\n\\z}msx)) { print \"\\n\"; }\n";
+            $wrapped_code .= "    }\n";
+            $wrapped_code .= "};";
+        }
     }
 
     print "DEBUG: replace_system_call_with_code - lhs=[" . (defined $lhs ? $lhs : '') . "]\n" if $verbose;

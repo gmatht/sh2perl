@@ -891,6 +891,8 @@ fn generate_streaming_pipeline(
                 // Handle 'seq' command by executing it and processing its output
 
                 let unique_id = generator.get_unique_id();
+                // Make current pipeline id visible to nested generators (redirect wrappers)
+                let _pipeline_guard = generator.push_pipeline_output_id_guard(unique_id.clone());
                 output.push_str(&generator.indent());
                 output.push_str(&format!("do {{\n"));
                 generator.indent_level += 1;
@@ -1083,6 +1085,7 @@ fn generate_streaming_pipeline(
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
 
+                // Done generating this seq-based pipeline. Guard will pop the id when it goes out of scope.
                 return output; // Return early since we've handled everything
             } else if name == "yes" {
                 // Handle 'yes' command by generating a loop that processes the line
@@ -1128,11 +1131,18 @@ fn generate_streaming_pipeline(
                 }
 
                 // Generate an infinite loop that gets terminated by head command
+                // Make pipeline id visible so nested redirect wrappers can mark
+                // $output_printed_<id> when they consume the pipeline output.
+                // Use the pipeline's unique id instead of a hard-coded "0" so
+                // nested generators see the correct variable names.
+                let _pipeline_guard = generator.push_pipeline_output_id_guard(unique_id.clone());
                 output.push_str(&generator.indent());
                 output.push_str("my $head_line_count = 0;\n");
                 output.push_str(&generator.indent());
-                output.push_str("my $output_0 = q{};\n");
-                generator.declared_locals.insert("output_0".to_string());
+                output.push_str(&format!("my $output_{} = q{{}};\n", unique_id));
+                generator
+                    .declared_locals
+                    .insert(format!("output_{}", unique_id));
                 output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
                 generator.indent_level += 1;
@@ -1146,8 +1156,13 @@ fn generate_streaming_pipeline(
                     match command {
                         Command::Simple(cmd) => {
                             // Generate line-by-line version of each command
-                            let command_output =
+                            let mut command_output =
                                 generate_linebyline_command(generator, cmd, "line", 0);
+                            // Replace canonical $output_0 references produced by
+                            // line-by-line generators with this pipeline's unique
+                            // output variable so names don't collide.
+                            command_output = command_output
+                                .replace("$output_0", &format!("$output_{}", unique_id));
                             // Add indentation to all lines in the command output
                             for line in command_output.lines() {
                                 output.push_str(&generator.indent());
@@ -1161,8 +1176,13 @@ fn generate_streaming_pipeline(
                                 match nested_command {
                                     Command::Simple(cmd) => {
                                         // Generate line-by-line version of each command
-                                        let command_output =
+                                        let mut command_output =
                                             generate_linebyline_command(generator, cmd, "line", 0);
+                                        // Same replacement as above for nested pipelines
+                                        command_output = command_output.replace(
+                                            "$output_0",
+                                            &format!("$output_{}", unique_id),
+                                        );
                                         // Add indentation to all lines in the command output
                                         for line in command_output.lines() {
                                             output.push_str(&generator.indent());
@@ -1186,6 +1206,7 @@ fn generate_streaming_pipeline(
                 output.push_str(&generator.indent());
                 output.push_str("$output_0\n");
 
+                // Pipeline id guard will pop when it goes out of scope.
                 return output; // Return early since we've handled everything
             } else if name == "cat" && !first_cmd.args.is_empty() {
                 // First command is 'cat filename', so read from the file instead of STDIN
@@ -1312,6 +1333,8 @@ fn generate_streaming_pipeline(
 
         // Declare output variable for pipeline commands that need it
         let unique_id = generator.get_unique_id();
+        // Make current pipeline id visible to nested generators (redirect wrappers)
+        let _pipeline_guard = generator.push_pipeline_output_id_guard(unique_id.clone());
         output.push_str(&generator.indent());
         output.push_str(&format!("my $output_{} = q{{}};\n", unique_id));
 
@@ -1435,6 +1458,7 @@ fn generate_streaming_pipeline(
             output.push_str(&generator.indent());
             output.push_str(&format!("$output_{} = \"$line_count\\n\";\n", unique_id));
         }
+        // Done generating this streaming pipeline - the guard will pop the id when it is dropped.
     } else if start_index == 1 {
         // For echo or cat commands, we need to add the command processing
         // No variable declarations needed for streaming pipeline - we process each line directly
@@ -1970,14 +1994,50 @@ fn generate_buffered_pipeline(
         generator.indent_level += 1;
 
         // For printing pipelines, use proper command chaining
-        let unique_id = generator.get_unique_id();
-        output.push_str(&generator.indent());
-        output.push_str(&format!("my $output_{};\n", unique_id));
-        generator
-            .declared_locals
-            .insert(format!("output_{}", unique_id));
-        output.push_str(&generator.indent());
-        output.push_str(&format!("my $output_printed_{};\n", unique_id));
+        // Use an RAII guard when creating a new pipeline id so it's popped
+        // automatically even on early returns or panics. Only create a new
+        // id when none is already active.
+        let mut _pipeline_guard: Option<crate::generator::PipelineOutputIdGuard> = None;
+        let unique_id = if generator.current_pipeline_output_id().is_none() {
+            let id = generator.get_unique_id();
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my $output_{} = q{{}};\n", id));
+            generator.declared_locals.insert(format!("output_{}", id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my $output_printed_{};\n", id));
+            _pipeline_guard = Some(generator.push_pipeline_output_id_guard(id.clone()));
+            id
+        } else {
+            generator.current_pipeline_output_id().unwrap().clone()
+        };
+
+        // If any command in the pipeline redirects its stdout to a file
+        // (" > file" or ">> file"), the pipeline's resulting output is
+        // intended to go to that file rather than to program STDOUT. In
+        // that case we must not emit the extra final print of
+        // $output_<id> below because the redirect-handling code already
+        // writes the content to the file (and may explicitly print a
+        // temporary value). Skipping the final print avoids duplicate
+        // output when purify splices generated snippets into the caller.
+        let has_output_redirect = pipeline.commands.iter().any(|cmd| {
+            if let Command::Redirect(redirect_cmd) = cmd {
+                return redirect_cmd.redirects.iter().any(|r| {
+                    matches!(
+                        r.operator,
+                        RedirectOperator::Output | RedirectOperator::Append
+                    )
+                });
+            }
+            if let Command::Simple(simple_cmd) = cmd {
+                return simple_cmd.redirects.iter().any(|r| {
+                    matches!(
+                        r.operator,
+                        RedirectOperator::Output | RedirectOperator::Append
+                    )
+                });
+            }
+            false
+        });
 
         // Individual commands will declare their own result variables as needed
         // No need to pre-declare them here to avoid variable masking
@@ -2264,8 +2324,11 @@ fn generate_buffered_pipeline(
             }
         }
 
-        // Output the final result
-        if should_print {
+        // Output the final result. Avoid emitting the final print when the
+        // pipeline contains an explicit output redirection; that case is
+        // handled by redirect-handling code (which already printed to the
+        // redirected file), and printing here would duplicate output.
+        if should_print && !has_output_redirect {
             output.push_str(&generator.indent());
             output.push_str(&format!(
                 "if ($output_{} ne q{{}} && !defined $output_printed_{}) {{\n",
@@ -2303,6 +2366,11 @@ fn generate_buffered_pipeline(
 
         generator.indent_level -= 1;
         output.push_str("}\n");
+        // Done generating this pipeline - drop the guard if we created one so
+        // it pops the id. We move the Option out here to ensure Drop runs now.
+        if let Some(_g) = _pipeline_guard {
+            std::mem::drop(_g);
+        }
     } else {
         // For command substitution, use streaming approach
         // Wrap in do block scope to prevent variable contamination
@@ -2323,12 +2391,22 @@ fn generate_buffered_pipeline(
 
             if cmd1_name == "ls" && cmd2_name == "grep" {
                 // Use the builtins registry for ls+grep combination
-                let unique_id = generator.get_unique_id();
-                output.push_str(&generator.indent());
-                output.push_str(&format!("my $output_{};\n", unique_id));
-                generator
-                    .declared_locals
-                    .insert(format!("output_{}", unique_id));
+                // Only create a new pipeline id if one is not already active.
+                let unique_id = if generator.current_pipeline_output_id().is_none() {
+                    let id = generator.get_unique_id();
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my $output_{} = q{{}};\n", id));
+                    generator.declared_locals.insert(format!("output_{}", id));
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my $output_printed_{};\n", id));
+                    // Push guard so nested generators can see the id and it's popped automatically
+                    let _guard = generator.push_pipeline_output_id_guard(id.clone());
+                    // Keep guard alive for the remainder of this branch by shadowing it into the output generation
+                    // We purposely do not store it beyond this block scope.
+                    id
+                } else {
+                    generator.current_pipeline_output_id().unwrap().clone()
+                };
 
                 // Track pipeline success for proper exit code handling
                 output.push_str(&generator.indent());
@@ -2397,12 +2475,19 @@ fn generate_buffered_pipeline(
                 output.push_str(&format!("$output_{};\n", unique_id));
             } else {
                 // Generic 2-command pipeline
-                let unique_id = generator.get_unique_id();
-                output.push_str(&generator.indent());
-                output.push_str(&format!("my $output_{};\n", unique_id));
-                generator
-                    .declared_locals
-                    .insert(format!("output_{}", unique_id));
+                // Only create a new pipeline id if one is not already active.
+                let unique_id = if generator.current_pipeline_output_id().is_none() {
+                    let id = generator.get_unique_id();
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my $output_{} = q{{}};\n", id));
+                    generator.declared_locals.insert(format!("output_{}", id));
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my $output_printed_{};\n", id));
+                    let _guard = generator.push_pipeline_output_id_guard(id.clone());
+                    id
+                } else {
+                    generator.current_pipeline_output_id().unwrap().clone()
+                };
 
                 // Track pipeline success for proper exit code handling
                 output.push_str(&generator.indent());
@@ -2521,6 +2606,8 @@ fn generate_buffered_pipeline(
 
         generator.indent_level -= 1;
         output.push_str("}\n");
+        // Done generating this pipeline. Any pipeline id pushed above used a
+        // guard and will be popped when the guard goes out of scope.
     }
 
     output

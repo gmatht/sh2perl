@@ -335,6 +335,24 @@ list when translating multi-argument system() calls into fork/exec blocks. It
 does not change the Rust generator and keeps purify.pl as a thin integration
 layer.
 
+Additional tiny fix
+-------------------
+Problem
+-------
+When replacing a bare `system(...)` statement (no assignment) purify.pl would
+wrap the replacement in a do{ ... } block and print its return value when
+non-empty. That was fine for backtick-style conversions which return strings,
+but for fork/exec-style replacements the last expression is often `$?` (the
+numeric child exit status). Printing that number inserted spurious "0"/"1"
+lines into example output.
+
+Fix
+---
+Detect common exec/fork patterns in the replacement code and, in those cases,
+insert the replacement verbatim instead of wrapping it with the printing
+guard. This prevents printing the numeric exit status while preserving the
+correct behaviour for string-producing replacements.
+
 
 Fix: Ensure Digest::SHA is imported for generated sha*_hex usages
 ----------------------------------------------------------------
