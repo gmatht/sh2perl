@@ -12,6 +12,8 @@ my $verbose = 0;
 my $inplace = 0;
 my $output_file;
 my $debashc_path = -x 'target/debug/debashc' ? 'target/debug/debashc' : 'target/debug/debashc.exe';
+# Counter used to generate unique temp vars when normalizing print qx{...} patterns
+my $PURIFY_PRINT_QX_COUNTER = 0;
 
 GetOptions(
     'help|h' => \$help,
@@ -1125,12 +1127,29 @@ sub replace_system_call_with_code {
         # replacements (notably those produced for backtick/command
         # substitution which return strings) preserve the previous
         # behaviour of printing non-empty returned strings.
-        if ($replacement_code =~ /\$\?\s*;|\bmy\s+\$pid\s*=\s*fork\b|\bexec\s*\(|\bprint\s*\(|\bprint\s+|open\s+.*STDOUT|open\s*\(\s*STDOUT/s) {
+        # If the replacement already performs child-side printing or
+        # restores STDOUT (redirection handling) then inserting the
+        # extra printing wrapper would cause the numeric return value
+        # (for example the return of `close`) to be printed. In those
+        # cases insert the replacement verbatim. However, there is a
+        # recurring pattern where the generator emits a do-block whose
+        # final statement is an explicit `print qx{...};`. When that
+        # do-block is later captured into a temp variable by the outer
+        # wrapper the do-block returns the numeric return value of
+        # `print` (usually 1) which then gets printed into redirected
+        # output files incorrectly. Detect that specific case and
+        # normalize it to an expression-valued form before deciding
+        # whether to insert verbatim.
+        if ($replacement_code =~ /\$\?\s*;|\bmy\s+\$pid\s*=\s*fork\b|\bexec\s*\(|open\s+.*STDOUT|open\s*\(\s*STDOUT/s) {
             # If the replacement already performs child-side printing or
             # restores STDOUT (redirection handling) then inserting the
             # extra printing wrapper would cause the numeric return value
             # (for example the return of `close`) to be printed. In those
             # cases insert the replacement verbatim.
+            # But first: normalize the special-case print qx{...}; pattern
+            # into a safe expression-valued form so nested wrappers don't
+            # accidentally capture the numeric return of print.
+            $replacement_code = normalize_print_qx_patterns($replacement_code);
             $wrapped_code = $replacement_code;
         } else {
             $wrapped_code = "do {\n";
@@ -1165,16 +1184,30 @@ sub replace_system_call_with_code {
         my $replacement_doc = PPI::Document->new(\$wrapped_code);
         return unless $replacement_doc;
 
-        # Collect top-level statements from the replacement document
-        my $found_stmts = $replacement_doc->find('PPI::Statement');
-        my @stmts = $found_stmts ? grep { $_->parent && $_->parent->isa('PPI::Document') } @{$found_stmts} : ();
+        # Collect top-level nodes from the replacement document. The
+        # previous implementation filtered only PPI::Statement nodes which
+        # could drop legitimate top-level constructs (for example an if
+        # block parsed as a non-Statement node). Use the document's
+        # children and skip purely-whitespace nodes so we preserve the
+        # generator-emitted fallback and other non-statement top-level
+        # nodes.
+        my @children = $replacement_doc->children;
+        my @nodes = ();
+        for my $n (@children) {
+            next unless defined $n;
+            my $ser = '';
+            eval { $ser = $n->serialize }; # fall back gracefully
+            $ser = $n->content unless length($ser);
+            next unless defined $ser && $ser =~ /\S/;
+            push @nodes, $n;
+        }
 
-        print "DEBUG: Parsed replacement document contains " . scalar(@stmts) . " top-level statements\n" if $verbose;
-        if ($verbose && @stmts) {
-            my $first = $stmts[0]->content;
-            my $last = $stmts[-1]->content;
-            print "DEBUG: First stmt preview: " . substr($first,0,200) . "\n";
-            print "DEBUG: Last stmt preview: " . substr($last,0,200) . "\n";
+        print "DEBUG: Parsed replacement document contains " . scalar(@nodes) . " top-level nodes\n" if $verbose;
+        if ($verbose && @nodes) {
+            my $first = eval { $nodes[0]->serialize } || $nodes[0]->content || '';
+            my $last  = eval { $nodes[-1]->serialize } || $nodes[-1]->content || '';
+            print "DEBUG: First node preview: " . substr($first,0,200) . "\n";
+            print "DEBUG: Last node preview: " . substr($last,0,200) . "\n";
         }
 
         # Additional targeted diagnostics: when the replacement contains
@@ -1186,9 +1219,9 @@ sub replace_system_call_with_code {
             print "DEBUG: replacement_doc->serialize:\n" . $replacement_doc->serialize . "\n";
         }
 
-        # If there are no top-level statements, fall back to child(0)
+        # If there are no useful top-level nodes, fall back to child(0)
         # replacement to preserve previous behavior.
-        unless (@stmts) {
+        unless (@nodes) {
             my $replacement_stmt = $replacement_doc->child(0);
             return unless $replacement_stmt;
             $statement->replace($replacement_stmt->clone);
@@ -1197,10 +1230,10 @@ sub replace_system_call_with_code {
 
         # Insert clones after the original statement in reverse order
         # to maintain ordering. Use insert_after on the statement node.
-        for my $stmt (reverse @stmts) {
-            my $clone = $stmt->clone;
+        for my $node (reverse @nodes) {
+            my $clone = $node->clone;
             if ($verbose && $is_sha_related) {
-                # Show the cloned statement serialization before insertion
+                # Show the cloned node serialization before insertion
                 print "DEBUG: clone serialized (pre-insert): [" . $clone->serialize . "]\n";
             }
             $statement->insert_after($clone);
@@ -1222,6 +1255,181 @@ sub replace_system_call_with_code {
             my $preview = length($doc_ser) > 8000 ? substr($doc_ser,0,8000) . "\n...(truncated)" : $doc_ser;
             print "DEBUG: Parent document serialization after insertion (preview):\n" . $preview . "\n";
         }
+    }
+}
+
+# Normalize occurrences where a replacement do-block ends with `print qx{...};`
+# into an expression-valued form so wrappers that capture the do-block receive
+# the actual string result instead of print's numeric return value. This
+# handles common qx{} delimiter styles: qx{...}, qx(...), qx`...` and friends.
+sub normalize_print_qx_patterns {
+    my ($code) = @_;
+    return $code unless defined $code && length $code;
+
+    # Quick check: if no 'print' or 'qx' present, nothing to do.
+    return $code unless $code =~ /\bprint\b/ && ($code =~ /qx/ || $code =~ /`/);
+
+    # Try a conservative PPI-based rewrite first. This inspects `do { ... }`
+    # blocks and replaces cases where the final statement is `print qx{...};`
+    # or `print $var;` (when $var was assigned from qx earlier in the same
+    # block) with an expression-valued sequence so outer capture-wrappers
+    # receive the string result rather than print's numeric return value.
+    my $doc = PPI::Document->new(\$code);
+    unless ($doc) {
+        # Fall back to the simple regex-based approach when parsing fails
+        goto REGEX_FALLBACK;
+    }
+
+    my $changed = 0;
+
+    # Find all `do` tokens and process their following block. Iterate in
+    # reverse document order so inner/nested blocks are handled before
+    # their enclosing parents which avoids invalidating node references.
+    my $find_do = PPI::Find->new(sub {
+        my $n = shift;
+        return ($n->isa('PPI::Token::Word') && $n->content eq 'do') ? 1 : 0;
+    });
+
+    my @do_tokens = reverse $find_do->in($doc);
+
+    for my $do_token (@do_tokens) {
+        my $block = $do_token->snext_sibling;
+        next unless $block && $block->isa('PPI::Structure::Block');
+
+        # Collect only the top-level statements inside the block (ignore
+        # nested statements from inner blocks).
+        my @children = $block->children;
+        my @stmts = grep { $_ && $_->isa('PPI::Statement') } @children;
+        next unless @stmts;
+
+        # Map variable names that were assigned from qx/... earlier in the block
+        my %qx_assigned;
+        for my $stmt (@stmts[0 .. $#stmts - 1]) {
+            next unless defined $stmt;
+            my $text = $stmt->content || '';
+            if ($text =~ /\b(?:my\s+)?\$(\w+)\s*=\s*(?:qx\b|`)/s) {
+                $qx_assigned{$1} = 1;
+            }
+        }
+
+        my $last_stmt = $stmts[-1];
+        next unless $last_stmt;
+        my $last_text = $last_stmt->content || '';
+
+        # Case A: print qx{...};  (also handles print(qx{...}); and backticks)
+        if ($last_text =~ /^\s*print\s*(?:\(\s*)?(?:qx\b|`)/s) {
+            # Avoid two-arg print/filehandle forms since they don't start
+            # with qx/backtick as the first argument (conservative check).
+            # Extract the qx/backtick operand using the parsed Quote token
+            my $quotes = $last_stmt->find('PPI::Token::Quote');
+            my $qx_operand;
+            if ($quotes && @$quotes) {
+                for my $q (@$quotes) {
+                    my $c = $q->content || '';
+                    if ($c =~ /^(?:qx|`)/) { $qx_operand = $c; last; }
+                }
+            }
+            # If PPI didn't expose a Quote token, fall back to a conservative
+            # regex capture of the operand from the statement text.
+            unless (defined $qx_operand) {
+                if ($last_text =~ /^\s*print\s*(?:\(\s*)?((?:qx\b|`)[^;]+?)\s*(?:\)\s*)?;\s*$/s) {
+                    $qx_operand = $1;
+                }
+            }
+
+            next unless defined $qx_operand;
+
+            $PURIFY_PRINT_QX_COUNTER++;
+            my $tmp = "__PURIFY_PRINT_QX_" . $PURIFY_PRINT_QX_COUNTER;
+            my $replacement = "my \$$tmp = $qx_operand; print \$$tmp; \$$tmp;";
+
+            # Parse the replacement and insert its top-level nodes in place
+            # of the original last statement.
+            my $replacement_doc = PPI::Document->new(\$replacement);
+            next unless $replacement_doc;
+            my @rep_children = $replacement_doc->children;
+            my @rep_nodes = ();
+            for my $n (@rep_children) {
+                next unless defined $n;
+                my $ser = '';
+                eval { $ser = $n->serialize }; # fall back gracefully
+                $ser = $n->content unless length($ser);
+                next unless defined $ser && $ser =~ /\S/;
+                push @rep_nodes, $n;
+            }
+
+            for my $node (reverse @rep_nodes) {
+                $last_stmt->insert_after($node->clone);
+            }
+            $last_stmt->remove;
+            $changed = 1;
+            next;
+        }
+
+        # Case B: print $var; where $var was assigned from qx earlier in this block
+        if ($last_text =~ /^\s*print\s*(?:\(\s*)?\$(\w+)\s*(?:\)\s*)?;\s*$/s) {
+            my $var = $1;
+            if ($qx_assigned{$var}) {
+                my $replacement = "print \$$var; \$$var;";
+                my $replacement_doc = PPI::Document->new(\$replacement);
+                next unless $replacement_doc;
+                my @rep_children = $replacement_doc->children;
+                my @rep_nodes = ();
+                for my $n (@rep_children) {
+                    next unless defined $n;
+                    my $ser = '';
+                    eval { $ser = $n->serialize };
+                    $ser = $n->content unless length($ser);
+                    next unless defined $ser && $ser =~ /\S/;
+                    push @rep_nodes, $n;
+                }
+                for my $node (reverse @rep_nodes) {
+                    $last_stmt->insert_after($node->clone);
+                }
+                $last_stmt->remove;
+                $changed = 1;
+                next;
+            }
+        }
+    }
+
+    return $doc->serialize if $changed;
+
+    # If no PPI-based changes occurred fall back to the original
+    # conservative regex approach so we still handle trivial cases.
+    REGEX_FALLBACK: {
+        my $rewritten = $code;
+        my $changed = 0;
+
+        while ($rewritten =~ /(print)\s*(qx)(\s*)([\{\(\`\[<])(.*?)([\}\)\`\]>])\s*;/s) {
+            my $full = $&;
+            my $qx_open = $4;
+            my $inner = $5;
+            my $qx_close = $6;
+
+            # Ensure parentheses/delimiters balance roughly by checking no unmatched
+            # closing delimiter appears inside inner (best-effort). Skip if inner
+            # contains the closing delimiter which likely means nested constructs.
+            if (index($inner, $qx_close) != -1) {
+                # Avoid rewriting nested qx constructs
+                last;
+            }
+
+            # Build unique temp var name
+            $PURIFY_PRINT_QX_COUNTER++;
+            my $tmp = "__PURIFY_PRINT_QX_" . $PURIFY_PRINT_QX_COUNTER;
+
+            # Construct replacement: assign the qx to temp, print temp, then return temp
+            my $qx_operand = "qx" . $qx_open . $inner . $qx_close;
+            my $replacement = "my \$$tmp = $qx_operand; print \$$tmp; \$$tmp;";
+
+            # Replace only the first occurrence to avoid accidental multi-rewrites
+            $rewritten =~ s/\Q$full\E/$replacement/;
+            $changed = 1;
+            # Continue scanning in case there are more occurrences later
+        }
+
+        return $rewritten;
     }
 }
 

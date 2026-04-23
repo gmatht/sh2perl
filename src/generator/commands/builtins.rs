@@ -493,10 +493,9 @@ pub fn generate_generic_builtin(
                     let command_lit =
                         generator.perl_string_literal_no_interp(&Word::literal(command_str));
                     if output_var.is_empty() {
-                        format!(
-                            "do {{ my $cat_cmd = {}; print qx{{$cat_cmd}}; }};\n",
-                            command_lit
-                        )
+                        // Return the command output as the last expression so callers
+                        // (including the purify wrapper) can decide how to print it.
+                        format!("do {{ my $cat_cmd = {}; qx{{$cat_cmd}}; }};\n", command_lit)
                     } else {
                         format!(
                             "${} = do {{ my $cat_cmd = {}; qx{{$cat_cmd}}; }};\n",
@@ -550,8 +549,11 @@ pub fn generate_generic_builtin(
                 let command_lit =
                     generator.perl_string_literal_no_interp(&Word::literal(command_str));
                 if output_var.is_empty() {
+                    // Return the head output rather than printing it so the
+                    // surrounding context (for example a redirect wrapper)
+                    // can decide how to handle the returned string.
                     format!(
-                        "do {{ my $head_cmd = {}; print qx{{$head_cmd}}; }};\n",
+                        "do {{ my $head_cmd = {}; qx{{$head_cmd}}; }};\n",
                         command_lit
                     )
                 } else {
@@ -588,8 +590,10 @@ pub fn generate_generic_builtin(
                 let command_lit =
                     generator.perl_string_literal_no_interp(&Word::literal(command_str));
                 if output_var.is_empty() {
+                    // Return the tail output rather than printing it so callers
+                    // can choose how to consume the value.
                     format!(
-                        "do {{ my $tail_cmd = {}; print qx{{$tail_cmd}}; }};\n",
+                        "do {{ my $tail_cmd = {}; qx{{$tail_cmd}}; }};\n",
                         command_lit
                     )
                 } else {
