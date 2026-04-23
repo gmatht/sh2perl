@@ -1732,11 +1732,12 @@ fn generate_linebyline_command(
             // Generate line-by-line head command
             // Note: The caller will add base indentation, so we generate unindented output
             // The $head_line_count variable is already declared at the pipeline level
+            // Append each line including its terminating newline so that
+            // empty-line inputs produce the correct number of newline
+            // characters. Previously we inserted newlines between lines
+            // which caused an off-by-one when the line content was empty.
             output.push_str(&format!("if ($head_line_count < {}) {{\n", num_lines));
-            output.push_str(&format!(
-                "    if ($head_line_count > 0) {{ $output_0 .= \"\\n\"; }}\n"
-            ));
-            output.push_str(&format!("    $output_0 .= $line;\n"));
+            output.push_str(&format!("    $output_0 .= $line . \"\\n\";\n"));
             output.push_str("    ++$head_line_count;\n");
             output.push_str("} else {\n");
             output.push_str("    $line = q{}; # Clear line to prevent printing\n");
