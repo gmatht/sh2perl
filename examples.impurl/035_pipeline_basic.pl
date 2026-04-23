@@ -32,6 +32,8 @@ print $pipeline_head_tail;
 
 # Pipeline with sed and awk using system()
 print "\nPipeline with sed and awk:\n";
+# Pipeline uses a double-quoted awk program (generator should preserve $0 as
+# a literal when emitting a non-interpolating Perl literal during purification).
 system("cat", "test_pipeline.txt", "|", "sed", "s/a/A/g", "|", "awk", "{print toupper($0)}");
 
 # Pipeline with cut and paste using backticks

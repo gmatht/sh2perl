@@ -461,6 +461,132 @@ pub fn perl_string_literal_no_interp_impl(_generator: &mut Generator, word: &Wor
                 .replace("\r", "\\r");
             format!("\"{}\"", escaped)
         }
+        // If we're given a simple variable (e.g. $0) asked to be emitted as
+        // a non-interpolating literal, preserve the textual "$..." form
+        // rather than delegating to perl_string_literal_impl which maps
+        // special variables (like $0) to Perl expressions such as
+        // $PROGRAM_NAME. The intent of the "no_interp" path is to emit
+        // the raw bytes that will later be passed to the shell/awk/etc.
+        Word::Variable(var, _, _) => {
+            let s = format!("${}", var);
+
+            // Reuse the same quoting heuristics as for literal strings.
+            if s.is_empty() {
+                return "q{}".to_string();
+            }
+
+            let contains_single_quote = s.contains('\'');
+            let contains_newline = s.contains('\n');
+
+            if !contains_single_quote && !contains_newline {
+                let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
+                return format!("'{}'", escaped);
+            }
+
+            let delimiters = vec![
+                ('{', '}'),
+                ('(', ')'),
+                ('[', ']'),
+                ('<', '>'),
+                ('|', '|'),
+                ('/', '/'),
+                ('#', '#'),
+                ('%', '%'),
+                ('@', '@'),
+                ('!', '!'),
+                ('~', '~'),
+                ('^', '^'),
+                (':', ':'),
+                (';', ';'),
+            ];
+
+            for (open, close) in delimiters {
+                let open_s = open.to_string();
+                let close_s = close.to_string();
+                if !s.contains(&open_s) && !s.contains(&close_s) {
+                    return format!("q{}{}{}", open, s, close);
+                }
+            }
+
+            let escaped = s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("$", "\\$")
+                .replace("@", "\\@")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t")
+                .replace("\r", "\\r");
+            return format!("\"{}\"", escaped);
+        }
+
+        // For simple string interpolations composed only of literal and
+        // variable parts (common when parsing embedded awk/sed snippets)
+        // reconstruct the textual content (e.g. "foo$0bar") and emit it
+        // as a non-interpolating literal. For complex parts, fall back to
+        // the general implementation.
+        Word::StringInterpolation(interp, _) => {
+            let mut reconstructed = String::new();
+            for part in &interp.parts {
+                match part {
+                    StringPart::Literal(s) => reconstructed.push_str(s),
+                    StringPart::Variable(var) => {
+                        reconstructed.push('$');
+                        reconstructed.push_str(var);
+                    }
+                    _ => return perl_string_literal_impl(_generator, word),
+                }
+            }
+
+            // Now quote the reconstructed string the same way as literals.
+            let s = reconstructed;
+            if s.is_empty() {
+                return "q{}".to_string();
+            }
+
+            let contains_single_quote = s.contains('\'');
+            let contains_newline = s.contains('\n');
+
+            if !contains_single_quote && !contains_newline {
+                let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
+                return format!("'{}'", escaped);
+            }
+
+            let delimiters = vec![
+                ('{', '}'),
+                ('(', ')'),
+                ('[', ']'),
+                ('<', '>'),
+                ('|', '|'),
+                ('/', '/'),
+                ('#', '#'),
+                ('%', '%'),
+                ('@', '@'),
+                ('!', '!'),
+                ('~', '~'),
+                ('^', '^'),
+                (':', ':'),
+                (';', ';'),
+            ];
+
+            for (open, close) in delimiters {
+                let open_s = open.to_string();
+                let close_s = close.to_string();
+                if !s.contains(&open_s) && !s.contains(&close_s) {
+                    return format!("q{}{}{}", open, s, close);
+                }
+            }
+
+            let escaped = s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("$", "\\$")
+                .replace("@", "\\@")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t")
+                .replace("\r", "\\r");
+            return format!("\"{}\"", escaped);
+        }
+
         _ => perl_string_literal_impl(_generator, word),
     }
 }

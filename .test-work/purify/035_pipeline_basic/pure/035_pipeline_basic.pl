@@ -89,7 +89,7 @@ my $pipeline_head_tail = do { do {
 print $pipeline_head_tail;
 
 print "\nPipeline with sed and awk:\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('cat', 'test_pipeline.txt', '|', 'sed', 's/a/A/g', '|', 'awk', "{print toupper($0)}"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('cat', 'test_pipeline.txt', '|', 'sed', 's/a/A/g', '|', 'awk', '{print toupper($0)}'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\nPipeline with cut and paste:\n";
 my $pipeline_cut_paste = do { do {
