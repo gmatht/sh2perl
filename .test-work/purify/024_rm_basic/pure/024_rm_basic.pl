@@ -123,7 +123,7 @@ $?;
 };
 
 print "\nrm with preserve root (--preserve-root):\n";
-my $rm_preserve = do { my $command = 'rm -rf / 2> /dev/null || echo \'Protected from removing root\''; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
+my $rm_preserve = do { my $command = q{rm -rf / 2> /dev/null || echo 'Protected from removing root'}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print $rm_preserve;
 
@@ -142,7 +142,7 @@ $?;
 };
 
 print "\nrm with no dereference (-P):\n";
-my $rm_no_deref = do { my $command = 'rm -P test_rm_xfs 2> /dev/null || echo \'No files to remove\''; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
+my $rm_no_deref = do { my $command = q{rm -P test_rm_xfs 2> /dev/null || echo 'No files to remove'}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; }
 ;
 print $rm_no_deref;
 
