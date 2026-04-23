@@ -18,14 +18,14 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
             if s.is_empty() {
                 return "''".to_string();
             }
-            // Keep common shell operator tokens verbatim so generated shell command
-            // strings can contain real operators (like pipes) instead of quoted
-            // literal arguments. This is important for reconstructing
-            // list-form `system("cat", "file", "|", "grep", ... )`
-            // into a proper shell pipeline string.
-            else if s == "|" {
-                s.clone()
-            }
+            // Previously we treated the pipe token "|" as a special-case and
+            // emitted it verbatim (unquoted). That made list-form system()
+            // calls that contained a literal "|" turn into real shell
+            // pipelines when the generated string was executed under
+            // `bash -c`, changing semantics. Instead, let the general quoting
+            // logic below handle "|" so that a literal pipe passed as an
+            // argument remains quoted (and thus preserved) when we reconstruct
+            // a shell string for list-form system()/qx{} conversions.
             // Always quote literals that contain spaces, quotes, or special characters to ensure proper shell parsing
             else if s.contains(' ')
                 || s.contains('\n')

@@ -411,3 +411,39 @@ This merely corrects a small omission in the emitted Perl code (a missing
 avoids producing invalid Perl when the verifier is placed inside expression
 contexts (backticks) and preserves purify.pl as a thin wrapper around the
 generator output.
+
+Fix: Preserve literal '|' in list-form system() serialization
+-----------------------------------------------------------
+Problem
+-------
+Previously word_to_bash_string_for_system special-cased the pipe token "|"
+and emitted it verbatim (unquoted). When a Perl list-form system() call
+contained a literal "|" in its argument list (for example
+system("echo", "a", "|", "tee", "-a", "file")), the generated bash
+string would contain an unquoted | and thus be interpreted by the shell as a
+pipeline operator. That changed the semantics: the original list-form intended
+the pipe as a literal argument to echo, while the generated shell pipeline
+executed a real pipeline and altered stdout / file side-effects.
+
+Fix
+---
+Remove the special-case that unquoted the pipe token in
+src/generator/commands/system_commands.rs (word_to_bash_string_for_system).
+Let the general quoting logic handle "|" so that when a literal pipe is
+present in a list-form system() argument it will be quoted (e.g. "'|'") and
+preserved as a literal when executed via `bash -c`. True shell pipelines are
+still emitted for Command::Pipeline AST nodes by the existing pipeline
+serialization paths.
+
+Files changed
+-------------
+- src/generator/commands/system_commands.rs: remove special-case for unquoted
+  "|" so list-form system() calls that include a literal pipe remain literal.
+
+Why this is minimal and safe
+---------------------------
+This keeps list-form semantics intact (literal '|' stays a literal) while
+retaining correct pipeline emission for AST-based pipeline commands. It is a
+localized change to the serialization helper and should fix spurious
+output_mismatch cases like examples.impurl/030_tee_basic.pl without broader
+regressions.
