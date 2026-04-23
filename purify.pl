@@ -4,6 +4,7 @@ use warnings;
 use Getopt::Long;
 use IPC::Open3;
 use Symbol 'gensym';
+use IO::Select;
 
 # Command line options
 my $help = 0;
@@ -711,23 +712,41 @@ sub generate_exec_do_block {
         if ($normalized_flag eq '-c') {
             # Build the shell command string from the remaining tokens (preserve pipeline '|' as raw pipe)
             my @cmd_parts = @tokens[1..$#tokens];
-            my $shell_cmd = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); $t eq '|' ? '|' : _shell_quote_for_system($t) } @cmd_parts);
-            # Use a non-interpolating Perl literal for the shell -c
-            # argument so embedded awk/sed $n and @vars are preserved
-            # verbatim. _perl_quote_literal_no_interp will pick a q{}-style
-            # delimiter that does not appear in the contents when possible.
-            my $cmd_lit = _perl_quote_literal_no_interp($shell_cmd);
+            # Build a raw shell command (no surrounding quoting) for conversion
+            # so debashc sees the original shell text. Separately build a
+            # quoted form we can embed into exec('sh','-c', ...) when we
+            # fall back to executing via the shell.
+            my $shell_cmd_raw = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); $t } @cmd_parts);
+            my $shell_cmd_for_exec = join(' ', map { my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare'); $t eq '|' ? '|' : _shell_quote_for_system($t) } @cmd_parts);
+            # Use a non-interpolating Perl literal for the shell -c argument
+            # so embedded awk/sed $n and @vars are preserved verbatim. This
+            # literal is used only in the fallback exec path.
+            my $cmd_lit = _perl_quote_literal_no_interp($shell_cmd_for_exec);
             # Try to convert the inner shell command to Perl first so we avoid
             # invoking external tools (notably sha256sum/sha512sum) which may be
             # missing in the test environment. convert_shell_to_perl delegates to
             # debashc which can emit pure-Perl implementations for these tools.
-            my $perl_inner = convert_shell_to_perl($shell_cmd, 0);
+            # Pass the semantics-preserving quoted form to debashc so the
+            # converter sees the same shell quoting as the original source.
+            # Using the raw form here lost original single-quote characters
+            # in some multi-arg cases which prevented the defensive check
+            # below from detecting unsafe single-quoted fallbacks.
+            my $perl_inner = convert_shell_to_perl($shell_cmd_for_exec, 0);
             if (defined $perl_inner) {
-                # If conversion succeeded return the generated Perl fragment so
-                # the caller can splice it into the AST. The replacement logic
-                # will wrap it in a do { ... } when necessary to preserve
-                # expression/value semantics expected from system().
-                return $perl_inner;
+                # Defensive: If debashc emitted a fallback that itself
+                # contains a single-quoted system(... ) invocation while the
+                # original shell command contains single-quotes, the emitted
+                # Perl will be syntactically invalid (nested single-quotes).
+                # Treat such cases as conversion failures so we fall back to
+                # exec('sh','-c', ...) using a safe non-interpolating Perl
+                # literal instead of splicing the broken snippet.
+                if ($perl_inner =~ /system\s*'/ && $shell_cmd_for_exec =~ /'/) {
+                    warn "DEBUG: debashc produced single-quoted system fallback; falling back to exec/sh path\n" if $verbose;
+                } else {
+                    # If conversion succeeded and looks safe, return the
+                    # generated Perl fragment so the caller can splice it in.
+                    return $perl_inner;
+                }
             }
 
             # Normal fallback: emit an exec('sh','-c', ...) block using a
@@ -1168,34 +1187,57 @@ sub convert_shell_to_perl {
     # Use debashc to convert the shell command to Perl
     # Backticks need inline expressions; system() calls should use the system path
     my $mode = $is_backticks ? "--inline" : "--system";
-    my $quoted_shell_command = $shell_command;
-    $quoted_shell_command =~ s/'/'"'"'/g;
-    $quoted_shell_command = "'$quoted_shell_command'";
-    print "DEBUG: Running command: $debashc_path parse $mode $quoted_shell_command\n" if $verbose;
-    
-    # Use a simple approach without alarm conflicts
-    my $temp_file = "temp_debashc_output_$$.txt";
-    my $command = qq{"$debashc_path" parse $mode $quoted_shell_command > "$temp_file" 2>&1};
-    
-    my $exit_code = system($command);
-    $exit_code = $exit_code >> 8;
-    
+    # Invoke debashc directly without going through an intermediate shell so
+    # we don't have to shoehorn the shell snippet into a quoted shell
+    # string. This avoids nested-quoting/escaping issues where embedded
+    # single-quotes or other characters would be corrupted by an extra
+    # shell parsing layer. Capture both stdout and stderr from debashc and
+    # combine them for downstream extraction.
+    print "DEBUG: Running command: $debashc_path parse $mode <shell_command>\n" if $verbose;
+
     my $stdout = '';
-    if (-f $temp_file) {
-        open my $fh, '<', $temp_file or warn "Cannot read temp file: $!\n";
-        if ($fh) {
-            local $/;
-            $stdout = <$fh>;
-            close $fh;
+    my $err = gensym;
+    my $out;
+    my $pid;
+    eval {
+        $pid = open3(undef, $out, $err, $debashc_path, 'parse', $mode, $shell_command);
+        1;
+    } or do {
+        warn "Failed to invoke debashc via open3: $@\n";
+        return undef;
+    };
+
+    # Read both stdout and stderr until EOF to avoid deadlocks on large output
+    my $sel = IO::Select->new();
+    $sel->add($out) if defined $out;
+    $sel->add($err);
+    while ($sel->count) {
+        for my $fh ($sel->can_read) {
+            my $buf;
+            my $bytes = sysread($fh, $buf, 8192);
+            if (defined $bytes) {
+                if ($bytes == 0) {
+                    $sel->remove($fh);
+                    close $fh;
+                } else {
+                    $stdout .= $buf;
+                }
+            } else {
+                # On error just remove the handle and continue
+                $sel->remove($fh);
+                close $fh;
+            }
         }
-        unlink $temp_file;
     }
+
+    waitpid($pid, 0);
+    my $exit_code = $? >> 8;
 
     # Strip debashc debug chatter so the returned Perl is valid code.
     $stdout =~ s/^DEBUG:.*(?:\n|\z)//mg;
-    
+
     print "DEBUG: Command output length: " . length($stdout) . "\n" if $verbose;
-    
+
     if ($exit_code != 0) {
         warn "debashc failed with exit code $exit_code: $stdout\n";
         return undef;
@@ -1206,6 +1248,19 @@ sub convert_shell_to_perl {
 
     if ($perl_result && !$is_backticks) {
         $perl_result = extract_core_perl_logic_ppi($perl_result);
+    }
+
+    # Defensive check: if debashc fell back to emitting a single-quoted
+    # system(...) invocation but the original shell command contains
+    # single-quote characters, the emitted Perl will be syntactically
+    # invalid (nested unescaped single-quotes). Treat this as a failed
+    # conversion so callers can fall back to a safe exec('sh','-c', ...) path
+    # which we construct using a non-interpolating Perl literal.
+    if (defined $perl_result && !$is_backticks) {
+        if ($perl_result =~ /system\s*'/ && $shell_command =~ /'/) {
+            warn "DEBUG: debashc emitted single-quoted system fallback while original command contains single-quotes; treating as conversion failure\n" if $verbose;
+            return undef;
+        }
     }
 
     if (!$perl_result) {
