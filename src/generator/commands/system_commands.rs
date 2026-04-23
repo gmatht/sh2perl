@@ -173,10 +173,16 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
         Command::Subshell(subshell_cmd) => {
             match &**subshell_cmd {
                 Command::Simple(simple_cmd) => {
+                    // When serializing a subshell simple command into a bash
+                    // string we must preserve literal shell fragments (like
+                    // awk/sed programs containing "$0"). Use
+                    // word_to_bash_string_for_system which keeps such
+                    // sequences verbatim instead of converting shell
+                    // variables into Perl values via generator.word_to_perl.
                     let args: Vec<String> = simple_cmd
                         .args
                         .iter()
-                        .map(|arg| generator.word_to_perl(arg))
+                        .map(|arg| word_to_bash_string_for_system(arg))
                         .collect();
                     if args.is_empty() {
                         simple_cmd.name.to_string()
@@ -193,7 +199,7 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                                 let args: Vec<String> = simple_cmd
                                     .args
                                     .iter()
-                                    .map(|arg| generator.word_to_perl(arg))
+                                    .map(|arg| word_to_bash_string_for_system(arg))
                                     .collect();
                                 Some(format!("{} {}", simple_cmd.name, args.join(" ")))
                             } else {
