@@ -196,7 +196,13 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     );
     commands.insert(
         "strings",
-        BuiltinCommand::new("strings", "Extract printable strings", false),
+        // strings can be safely applied line-by-line: printable sequences
+        // (ASCII range \x20-\x7E) do not span newlines, so extracting
+        // substrings from each input line produces equivalent results and
+        // allows streaming pipeline generation. Marking this true fixes
+        // cases like `cat file | strings` where the buffered fallback
+        // previously emitted a naive length-based filter.
+        BuiltinCommand::new("strings", "Extract printable strings", true),
     );
 
     // I/O redirection
