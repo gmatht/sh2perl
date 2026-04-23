@@ -99,7 +99,22 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
             if let Word::Literal(name, _) = &simple_cmd.name {
                 if (name == "sh" || name == "bash") && simple_cmd.args.len() >= 2 {
                     if let Word::Literal(flag, _) = &simple_cmd.args[0] {
-                        if flag == "-c" {
+                        // Normalize the flag token so we tolerate small variations
+                        // coming from the parser (for example tokens like " -c"
+                        // or strings that include surrounding single/double quotes).
+                        // Trim whitespace and strip outer quotes before comparison.
+                        let mut normalized_flag = flag.trim().to_string();
+                        if (normalized_flag.starts_with('\'') && normalized_flag.ends_with('\''))
+                            || (normalized_flag.starts_with('"') && normalized_flag.ends_with('"'))
+                        {
+                            if normalized_flag.len() >= 2 {
+                                normalized_flag = normalized_flag[1..normalized_flag.len() - 1]
+                                    .trim()
+                                    .to_string();
+                            }
+                        }
+
+                        if normalized_flag == "-c" {
                             if let Word::Literal(inner_cmd, _) = &simple_cmd.args[1] {
                                 let inner_lit = generator.perl_string_literal_no_interp(
                                     &Word::literal(inner_cmd.clone()),
