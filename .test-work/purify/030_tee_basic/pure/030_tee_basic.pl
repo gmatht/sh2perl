@@ -35,7 +35,7 @@ if (-f "test_tee_output.txt") {
 }
 
 print "\ntee with append (-a):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This is another line", "|", "tee", "-a", "test_tee_output.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('echo', 'This is another line', '|', 'tee', '-a', 'test_tee_output.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ntee with multiple files:\n";
 my $tee_multi = do { do {
@@ -79,7 +79,7 @@ if (-f "test_tee1.txt" && -f "test_tee2.txt" && -f "test_tee3.txt") {
 }
 
 print "\ntee with ignore interrupts (-i):\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This line ignores interrupts", "|", "tee", "-i", "test_tee_interrupt.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('echo', 'This line ignores interrupts', '|', 'tee', '-i', 'test_tee_interrupt.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ntee with pipe fail (-p):\n";
 my $tee_pipe = do { do {
@@ -105,7 +105,7 @@ my $tee_pipe = do { do {
 print "Output: $tee_pipe";
 
 print "\ntee with append and multiple files:\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "Appended line", "|", "tee", "-a", "test_tee1.txt", "test_tee2.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('echo', 'Appended line', '|', 'tee', '-a', 'test_tee1.txt', 'test_tee2.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ntee with output to stderr:\n";
 my $tee_stderr = do { do {
@@ -133,7 +133,7 @@ my $tee_stderr = do { do {
 print "Output: $tee_stderr";
 
 print "\ntee with null output:\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "This goes to null", "|", "tee", "/dev/null"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('echo', 'This goes to null', '|', 'tee', '/dev/null'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ntee with multiple outputs:\n";
 my $tee_multi_out = do { do {
@@ -166,7 +166,7 @@ my $tee_multi_out = do { do {
 print "Output: $tee_multi_out";
 
 print "\ntee with append and ignore interrupts:\n";
-my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ("echo", "Appended with ignore interrupts", "|", "tee", "-a", "-i", "test_tee_append_interrupt.txt"); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec ('echo', 'Appended with ignore interrupts', '|', 'tee', '-a', '-i', 'test_tee_append_interrupt.txt'); die "exec failed: " . $!; } else { waitpid($pid, 0); }$?;
 
 print "\ntee with pipe fail and multiple files:\n";
 my $tee_pipe_multi = do { do {
