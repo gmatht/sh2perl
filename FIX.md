@@ -501,3 +501,15 @@ Files changed
   quoted shell command ($shell_cmd_for_exec) and uses that variable in the
   fallback detection. This prevents nested single-quote Perl source from being
   inserted into the final output.
+
+Additional runtime tweak
+------------------------
+While testing I observed debashc sometimes failed to parse reconstructed
+shell snippets when the inner command had been reassembled into a quoted
+form. To improve the converter's success rate (and allow it to emit pure-Perl
+implementations such as for sha256sum/sha512sum when available) purify.pl now
+prefers to pass the raw inner shell text (shell_cmd_raw) to
+convert_shell_to_perl. If that conversion fails we still fall back to the
+safe exec('sh','-c', q{...}) path using a non-interpolating Perl literal.
+This prevents spurious "not found" errors in test environments lacking the
+external hashing binaries.
