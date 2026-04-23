@@ -1613,6 +1613,29 @@ fn generate_linebyline_command(
     };
 
     match cmd_name {
+        "sha256sum" => {
+            // sha256sum isn't naturally a line-by-line filter. Emit a
+            // simple assignment that computes the SHA256 of the current
+            // pipeline data. Many line-by-line generators use $output_0 as
+            // the canonical intermediate variable; the surrounding
+            // pipeline generator will replace $output_0 with the actual
+            // pipeline-scoped variable as needed.
+            let input_ref = if line_var == "line" || line_var == "L" || line_var == "input_data" {
+                format!("${}", line_var)
+            } else {
+                "$output_0".to_string()
+            };
+            return format!("$output_0 = sha256_hex({});\n", input_ref);
+        }
+        "sha512sum" => {
+            // Same approach for SHA512
+            let input_ref = if line_var == "line" || line_var == "L" || line_var == "input_data" {
+                format!("${}", line_var)
+            } else {
+                "$output_0".to_string()
+            };
+            return format!("$output_0 = sha512_hex({});\n", input_ref);
+        }
         "tr" => crate::generator::commands::tr::generate_tr_command(
             generator,
             cmd,
