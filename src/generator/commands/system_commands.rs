@@ -179,16 +179,36 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                     // word_to_bash_string_for_system which keeps such
                     // sequences verbatim instead of converting shell
                     // variables into Perl values via generator.word_to_perl.
+                    //
+                    // Also include any environment variable assignments that
+                    // were attached to the SimpleCommand (e.g. VAR=val cmd)
+                    // so that when this string is later executed under
+                    // `bash -c` the env assignments take effect. Sort the
+                    // env keys for deterministic output.
+                    let mut parts: Vec<String> = Vec::new();
+
+                    if !simple_cmd.env_vars.is_empty() {
+                        let mut env_keys: Vec<&String> = simple_cmd.env_vars.keys().collect();
+                        env_keys.sort();
+                        for k in env_keys {
+                            if let Some(v) = simple_cmd.env_vars.get(k) {
+                                parts.push(format!("{}={}", k, word_to_bash_string_for_system(v)));
+                            }
+                        }
+                    }
+
+                    // Command name and args
+                    parts.push(simple_cmd.name.to_string());
                     let args: Vec<String> = simple_cmd
                         .args
                         .iter()
                         .map(|arg| word_to_bash_string_for_system(arg))
                         .collect();
-                    if args.is_empty() {
-                        simple_cmd.name.to_string()
-                    } else {
-                        format!("{} {}", simple_cmd.name, args.join(" "))
+                    if !args.is_empty() {
+                        parts.push(args.join(" "));
                     }
+
+                    parts.join(" ")
                 }
                 Command::Pipeline(pipeline) => {
                     let commands: Vec<String> = pipeline

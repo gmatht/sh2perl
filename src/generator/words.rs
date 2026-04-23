@@ -1202,7 +1202,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             }
                         }
 
-                        // Fallback: run the combined command via the shell
+                        // Fallback: run the combined command via the shell. Use a
+                        // non-interpolating Perl literal so that embedded shell
+                        // "$" and "@" sequences (common in awk/sed) are
+                        // preserved verbatim and we avoid producing fragile
+                        // double-quoted literals that later post-processing could
+                        // accidentally re-escape.
                         let command_str =
                             crate::generator::redirects::generate_bash_command_string(cmd);
                         let command_lit =
@@ -1332,7 +1337,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     // control operators and redirections keep working.
                     let command_str =
                         crate::generator::redirects::generate_bash_command_string(cmd);
-                    let command_lit = generator.perl_string_literal(&Word::literal(command_str));
+                    // Use a non-interpolating Perl literal so that shell-side
+                    // "$"/"@" sequences are preserved verbatim when later
+                    // executed under qx{}. This avoids fragile double-quoted
+                    // forms that need extra escaping.
+                    let command_lit =
+                        generator.perl_string_literal_no_interp(&Word::literal(command_str));
                     format!(
                         "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
                         command_lit
