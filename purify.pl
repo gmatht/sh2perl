@@ -809,7 +809,13 @@ sub generate_exec_do_block {
                 # double-quoted Perl literals which then interpolated and
                 # removed the desired literal '$' before the shell saw it.
                 # Check for an unescaped sigil using a negative lookbehind.
-                if ($pq && $pq eq 'double' && $pt =~ /(?<!\\)[\$\@]/) { $skip_conversion_due_to_perl_interpolation = 1; last; }
+                # Treat an unescaped Perl sigil followed by an identifier or
+                # brace-based identifier as an indication the original author
+                # likely intended Perl interpolation (e.g. "$var" or "${var}").
+                # Do NOT treat numeric-only sigils like "$0" (common in awk)
+                # as evidence of Perl interpolation so awk/sed programs are not
+                # accidentally interpolated by Perl.
+                if ($pq && $pq eq 'double' && $pt =~ /(?<!\\)(?:\$\{?[A-Za-z_]|@\{?[A-Za-z_])/) { $skip_conversion_due_to_perl_interpolation = 1; last; }
             }
 
             my $perl_inner;
@@ -1030,7 +1036,12 @@ sub _perl_quote_literal_with_pref {
         # the previous heuristic that prefers single-quoted literals unless
         # control characters or double-quote/backslash characters require
         # a double-quoted form.
-        if ($text =~ /(?<!\\)[\$\@]/ || $text =~ /[\n\r\t"\\]/) {
+        # Only treat an unescaped $/@ followed by an identifier (or a brace
+        # form like ${var}) as a reason to emit a double-quoted Perl literal.
+        # This avoids accidental interpolation of shell/awk fragments that
+        # commonly use numeric references like $0/$1 which are not Perl
+        # identifiers and should be preserved verbatim.
+        if (_has_unescaped_ident_sigil($text) || $text =~ /[\n\r\t"\\]/) {
             my $escaped = $text;
             # Escape backslashes and double-quotes for a double-quoted literal
             $escaped =~ s/\\/\\\\/g;    # backslashes
