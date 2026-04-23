@@ -717,6 +717,21 @@ sub generate_exec_do_block {
             # verbatim. _perl_quote_literal_no_interp will pick a q{}-style
             # delimiter that does not appear in the contents when possible.
             my $cmd_lit = _perl_quote_literal_no_interp($shell_cmd);
+            # Try to convert the inner shell command to Perl first so we avoid
+            # invoking external tools (notably sha256sum/sha512sum) which may be
+            # missing in the test environment. convert_shell_to_perl delegates to
+            # debashc which can emit pure-Perl implementations for these tools.
+            my $perl_inner = convert_shell_to_perl($shell_cmd, 0);
+            if (defined $perl_inner) {
+                # If conversion succeeded return the generated Perl fragment so
+                # the caller can splice it into the AST. The replacement logic
+                # will wrap it in a do { ... } when necessary to preserve
+                # expression/value semantics expected from system().
+                return $perl_inner;
+            }
+
+            # Normal fallback: emit an exec('sh','-c', ...) block using a
+            # non-interpolating Perl literal for the shell command argument.
             # Normalize the flag literal (trimmed) and prefer preserving the original
             # quoting preference when emitting the Perl literal for the '-c' flag.
             my $flag_literal = _perl_quote_literal_with_pref($normalized_flag, $flag_q);
