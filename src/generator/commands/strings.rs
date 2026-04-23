@@ -15,20 +15,34 @@ pub fn generate_strings_command(
     let mut filename = String::new();
 
     // Parse strings options and find the filename
-    for arg in &cmd.args {
-        if let Word::Literal(arg_str, _) = arg {
-            if arg_str.starts_with("-n") {
-                // Parse minimum length option
+    // Support both '-n5' and '-n', '5' forms
+    let args_len = cmd.args.len();
+    let mut i = 0;
+    while i < args_len {
+        if let Word::Literal(arg_str, _) = &cmd.args[i] {
+            if arg_str == "-n" {
+                // Next token should be the length if present
+                if i + 1 < args_len {
+                    if let Word::Literal(next, _) = &cmd.args[i + 1] {
+                        if let Ok(length) = next.parse::<usize>() {
+                            _min_length = length;
+                            i += 1; // skip next token
+                        }
+                    }
+                }
+            } else if arg_str.starts_with("-n") {
+                // Parse minimum length option like '-n5'
                 if let Some(length_str) = arg_str.strip_prefix("-n") {
                     if let Ok(length) = length_str.parse::<usize>() {
                         _min_length = length;
                     }
                 }
-            } else if !arg_str.starts_with("-") {
+            } else if !arg_str.starts_with('-') {
                 // This is the filename argument
                 filename = arg_str.clone();
             }
         }
+        i += 1;
     }
 
     // If we have a filename, always read from file (even in pipeline context)
@@ -58,12 +72,12 @@ pub fn generate_strings_command(
         output.push_str(&format!("my $input_data = {};\n", var_name));
     }
 
+    // Extract printable ASCII sequences of length >= _min_length (similar to GNU strings)
     output.push_str("my @result;\n");
-    output.push_str("my @lines = split /\\n/msx, $input_data;\n");
-    output.push_str("for my $line (@lines) {\n");
-    output.push_str("    if ( length $line >= 4 ) {\n");
-    output.push_str("        push @result, $line;\n");
-    output.push_str("    }\n");
+    output.push_str("while ($input_data =~ /([\\x20-\\x7E]{");
+    output.push_str(&_min_length.to_string());
+    output.push_str(",})/g) {\n");
+    output.push_str("    push @result, $1;\n");
     output.push_str("}\n");
     output.push_str("my $line = join \"\\n\", @result;\n");
     if !output_var.is_empty() {

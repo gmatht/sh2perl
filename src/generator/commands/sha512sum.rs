@@ -161,11 +161,16 @@ pub fn generate_sha512sum_command(
         // caller's variable. This makes the generator safe to inline into
         // surrounding do { ... } expressions.
         if input_var.is_empty() {
-            // No input var: read from STDIN and return the hash as an expression
-            output.push_str("sha512_hex(do { local $/ = undef; <STDIN> })");
+            // No input var: read from STDIN and return the hash as an expression.
+            // When sha512sum reads from stdin the external tool prints "<hash>  -".
+            // Preserve that behavior by appending the literal "  -" so purified
+            // scripts that print the result match the host tool's output.
+            output.push_str("sha512_hex(do { local $/ = undef; <STDIN> }) . '  -'");
         } else {
             // Compute hash of the provided Perl variable and return it as an expression
-            output.push_str(&format!("sha512_hex({})", input_expr));
+            // When hashing a pipeline/stdin input, emulate the external tool's
+            // printed form by appending the literal "  -".
+            output.push_str(&format!("sha512_hex({}) . '  -'", input_expr));
         }
     } else {
         // Calculate hashes of specified files
