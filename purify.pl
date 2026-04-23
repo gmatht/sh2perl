@@ -173,12 +173,24 @@ sub purify_perl_code {
         }
     }
 
-    # If the converted code uses Carp's helpers (croak/confess) but the
-    # final document does not contain a 'use Carp' import, prepend one so
-    # the helper functions are available. Prepending is the simplest and
-    # most robust approach after we've finished all other transformations.
-    if ($serialized =~ /\b(?:croak|confess)\b/ && $serialized !~ /\buse\s+Carp\b/) {
-        $serialized = "use Carp;\n" . $serialized;
+    # If the converted code uses Carp's helpers (croak/confess) ensure a
+    # 'use Carp' import appears before their first use. Previously we only
+    # added the import when it was completely absent which could leave a
+    # 'use Carp' that appears later in the document (for example emitted by
+    # a converted snippet) but still after an earlier croak/confess usage.
+    # That resulted in runtime "String found where operator expected" when
+    # croak was used before the import. To be robust, insert 'use Carp;'
+    # at the top whenever the first occurrence of croak/confess is before
+    # the first 'use Carp' (or when no 'use Carp' exists at all).
+    if ($serialized =~ /\b(?:croak|confess)\b/) {
+        my $first_helper_pos = $-[0];
+        my $first_use_pos = -1;
+        if ($serialized =~ /\buse\s+Carp\b/) {
+            $first_use_pos = $-[0];
+        }
+        if ($first_use_pos == -1 || $first_use_pos > $first_helper_pos) {
+            $serialized = "use Carp;\n" . $serialized;
+        }
     }
 
     # If the converted code uses Digest::SHA helpers (sha256_hex/sha512_hex)
@@ -731,7 +743,13 @@ sub generate_exec_do_block {
             # Using the raw form here lost original single-quote characters
             # in some multi-arg cases which prevented the defensive check
             # below from detecting unsafe single-quoted fallbacks.
-            my $perl_inner = convert_shell_to_perl($shell_cmd_for_exec, 0);
+            # Try conversion using the raw inner shell text first. Passing the
+            # raw command (without additional surrounding quotes) to debashc
+            # generally lets the parser see the intended shell syntax and
+            # enables generators (e.g. sha256sum/sha512sum) to emit pure-Perl
+            # implementations. If this fails we will fall back to the exec
+            #('sh','-c', ...) path below which uses the quoted form.
+            my $perl_inner = convert_shell_to_perl($shell_cmd_raw, 0);
             if (defined $perl_inner) {
                 # Defensive: If debashc emitted a fallback that itself
                 # contains a single-quoted system(... ) invocation while the
@@ -1095,64 +1113,85 @@ sub replace_system_call_with_code {
     my $wrapped_code = defined $lhs
         ? ($lhs . " do {\n" . $replacement_code . "\n};")
         : ("do {\n" . $replacement_code . "\n};");
+
+    print "DEBUG: replace_system_call_with_code - lhs=[" . (defined $lhs ? $lhs : '') . "]\n" if $verbose;
+    print "DEBUG: replace_system_call_with_code - replacement_code=[" . substr($replacement_code,0,400) . "]\n" if $verbose;
+    print "DEBUG: replace_system_call_with_code - wrapped_code=[" . substr($wrapped_code,0,400) . "]\n" if $verbose;
     # Attempt to atomically set the statement content if supported. This
     # is the simplest and safest approach because PPI will reparse the
     # statement content in-place, avoiding partial-clone issues seen when
     # parsing into a separate document and extracting child(0).
-    if ($statement->can('set_content')) {
-        print "DEBUG: Attempting set_content replacement; replacement length=" . length($wrapped_code) . "\n" if $verbose;
-        eval {
-            $statement->set_content($wrapped_code);
-            1;
-        } or do {
-            # If set_content dies for any reason, fall back to the
-            # multi-statement insertion approach below which is more
-            # explicit about cloning all top-level statements from the
-            # parsed replacement document.
-            warn "DEBUG: set_content failed, falling back to explicit insertion: $@\n" if $verbose;
-            goto FALLBACK_INSERT;
-        };
-    } else {
-        FALLBACK_INSERT: {
-            print "DEBUG: Falling back to explicit insertion; replacement length=" . length($wrapped_code) . "\n" if $verbose;
-            # Parse the wrapped replacement into a document and insert all
-            # top-level statements after the original statement. We insert
-            # in reverse order so the final order in the tree matches the
-            # replacement document.
-            my $replacement_doc = PPI::Document->new(\$wrapped_code);
-            return unless $replacement_doc;
+    # Use explicit insertion of parsed replacement statements instead of
+    # PPI::Statement->set_content(). set_content can sometimes reparse and
+    # normalize the replacement in unexpected ways (losing sigils or
+    # altering statement boundaries). The explicit-insert path parses the
+    # replacement into a temporary PPI document and clones its top-level
+    # statements into the current document which is more robust.
+    {
+        print "DEBUG: Using explicit insertion; replacement length=" . length($wrapped_code) . "\n" if $verbose;
+        # Parse the wrapped replacement into a document and insert all
+        # top-level statements after the original statement. We insert
+        # in reverse order so the final order in the tree matches the
+        # replacement document.
+        my $replacement_doc = PPI::Document->new(\$wrapped_code);
+        return unless $replacement_doc;
 
-            # Collect top-level statements from the replacement document
-            my $found_stmts = $replacement_doc->find('PPI::Statement');
-            my @stmts = $found_stmts ? grep { $_->parent && $_->parent->isa('PPI::Document') } @{$found_stmts} : ();
+        # Collect top-level statements from the replacement document
+        my $found_stmts = $replacement_doc->find('PPI::Statement');
+        my @stmts = $found_stmts ? grep { $_->parent && $_->parent->isa('PPI::Document') } @{$found_stmts} : ();
 
-            print "DEBUG: Parsed replacement document contains " . scalar(@stmts) . " top-level statements\n" if $verbose;
-            if ($verbose && @stmts) {
-                my $first = $stmts[0]->content;
-                my $last = $stmts[-1]->content;
-                print "DEBUG: First stmt preview: " . substr($first,0,200) . "\n";
-                print "DEBUG: Last stmt preview: " . substr($last,0,200) . "\n";
+        print "DEBUG: Parsed replacement document contains " . scalar(@stmts) . " top-level statements\n" if $verbose;
+        if ($verbose && @stmts) {
+            my $first = $stmts[0]->content;
+            my $last = $stmts[-1]->content;
+            print "DEBUG: First stmt preview: " . substr($first,0,200) . "\n";
+            print "DEBUG: Last stmt preview: " . substr($last,0,200) . "\n";
+        }
+
+        # Additional targeted diagnostics: when the replacement contains
+        # sha256_hex/sha512_hex emit richer information about the parsed
+        # replacement document and the cloned statements so we can track
+        # any token-level mangling that happens during insertion.
+        my $is_sha_related = ($wrapped_code =~ /sha256_hex|sha512_hex/);
+        if ($verbose && $is_sha_related) {
+            print "DEBUG: replacement_doc->serialize:\n" . $replacement_doc->serialize . "\n";
+        }
+
+        # If there are no top-level statements, fall back to child(0)
+        # replacement to preserve previous behavior.
+        unless (@stmts) {
+            my $replacement_stmt = $replacement_doc->child(0);
+            return unless $replacement_stmt;
+            $statement->replace($replacement_stmt->clone);
+            return;
+        }
+
+        # Insert clones after the original statement in reverse order
+        # to maintain ordering. Use insert_after on the statement node.
+        for my $stmt (reverse @stmts) {
+            my $clone = $stmt->clone;
+            if ($verbose && $is_sha_related) {
+                # Show the cloned statement serialization before insertion
+                print "DEBUG: clone serialized (pre-insert): [" . $clone->serialize . "]\n";
             }
+            $statement->insert_after($clone);
+        }
 
-            # If there are no top-level statements, fall back to child(0)
-            # replacement to preserve previous behavior.
-            unless (@stmts) {
-                my $replacement_stmt = $replacement_doc->child(0);
-                return unless $replacement_stmt;
-                $statement->replace($replacement_stmt->clone);
-                return;
-            }
+        # Remove the original statement now that the replacements are
+        # in place.
+        # Capture the root document for post-insert diagnostics before
+        # removing the statement so we can inspect the document state.
+        my $root_doc = $statement;
+        $root_doc = $root_doc->parent while $root_doc && !$root_doc->isa('PPI::Document');
+        $statement->remove;
 
-            # Insert clones after the original statement in reverse order
-            # to maintain ordering. Use insert_after on the statement node.
-            for my $stmt (reverse @stmts) {
-                my $clone = $stmt->clone;
-                $statement->insert_after($clone);
-            }
-
-            # Remove the original statement now that the replacements are
-            # in place.
-            $statement->remove;
+        if ($verbose && $is_sha_related && $root_doc) {
+            # Print a focused slice of the parent document around the
+            # insertion site to see how PPI serialized the newly-inserted
+            # content in the context of the full file. Limit output size.
+            my $doc_ser = $root_doc->serialize;
+            my $preview = length($doc_ser) > 8000 ? substr($doc_ser,0,8000) . "\n...(truncated)" : $doc_ser;
+            print "DEBUG: Parent document serialization after insertion (preview):\n" . $preview . "\n";
         }
     }
 }

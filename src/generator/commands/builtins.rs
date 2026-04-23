@@ -181,13 +181,18 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
     );
 
     // Checksums and verification
+    // These builtins currently don't have a safe line-by-line streaming
+    // implementation in the pipeline generator. Mark them as not supporting
+    // line-by-line processing so the buffered pipeline path is chosen
+    // (which uses the builtin generator that returns properly-assigned
+    // expressions).
     commands.insert(
         "sha256sum",
-        BuiltinCommand::new("sha256sum", "Compute SHA256 checksums", true),
+        BuiltinCommand::new("sha256sum", "Compute SHA256 checksums", false),
     );
     commands.insert(
         "sha512sum",
-        BuiltinCommand::new("sha512sum", "Compute SHA512 checksums", true),
+        BuiltinCommand::new("sha512sum", "Compute SHA512 checksums", false),
     );
     commands.insert(
         "strings",
@@ -723,15 +728,33 @@ pub fn generate_generic_builtin(
         }
         "sha256sum" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::sha256sum::generate_sha256sum_command(
+            let sha_code = crate::generator::commands::sha256sum::generate_sha256sum_command(
                 generator, cmd, input_var,
-            )
+            );
+            // If an output_var was requested, ensure the generated snippet
+            // assigns into that variable. Many callers (pipeline code) pass
+            // a bare output_var like "output_0" expecting the builtin to
+            // populate it. The sha generators typically return expression
+            // snippets; wrap them into an assignment when needed.
+            if !output_var.is_empty() {
+                // Trim trailing semicolons to avoid double-termination
+                let trimmed = sha_code.trim_end_matches('\n').trim_end_matches(';');
+                format!("${} = {};;\n", output_var, trimmed)
+            } else {
+                sha_code
+            }
         }
         "sha512sum" => {
             // For now, use the existing signature but we should standardize this
-            crate::generator::commands::sha512sum::generate_sha512sum_command(
+            let sha_code = crate::generator::commands::sha512sum::generate_sha512sum_command(
                 generator, cmd, input_var,
-            )
+            );
+            if !output_var.is_empty() {
+                let trimmed = sha_code.trim_end_matches('\n').trim_end_matches(';');
+                format!("${} = {};;\n", output_var, trimmed)
+            } else {
+                sha_code
+            }
         }
         "strings" => {
             // For now, use the existing signature but we should standardize this

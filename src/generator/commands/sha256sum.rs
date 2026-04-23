@@ -7,6 +7,29 @@ pub fn generate_sha256sum_command(
     input_var: &str,
 ) -> String {
     let mut output = String::new();
+    // Normalize input_var into a Perl expression when used in emitted code.
+    // The rest of the generator logic uses input_var.is_empty() to decide
+    // behaviour, so keep that check. When inserting into Perl snippets we
+    // need a valid Perl variable or expression; callers sometimes pass bare
+    // identifiers like "output_0" (without a leading '$'). To be defensive
+    // add a leading '$' only for simple identifier-like names.
+    let input_expr = if input_var.is_empty() {
+        String::new()
+    } else if input_var.starts_with('$') {
+        input_var.to_string()
+    } else {
+        // If the input_var looks like a simple identifier (alnum or underscore)
+        // then prefix with '$'. Otherwise assume it's already an expression
+        // (e.g. a do-block) and emit as-is.
+        if input_var
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            format!("${}", input_var)
+        } else {
+            input_var.to_string()
+        }
+    };
 
     // sha256sum command syntax: sha256sum [options] [file]
     let mut check_mode = false;
@@ -105,7 +128,7 @@ pub fn generate_sha256sum_command(
                 // Read lines from the provided input variable and run verifier
                 output.push_str(&format!(
                     "do {{\n    my @lines = split /\\n/msx, {};\n    my @results;\n",
-                    input_var
+                    input_expr
                 ));
             }
             output.push_str("    foreach my $line (@lines) {\n        chomp $line;\n");
@@ -142,7 +165,7 @@ pub fn generate_sha256sum_command(
             output.push_str("sha256_hex(do { local $/ = undef; <STDIN> })");
         } else {
             // Compute hash of the provided Perl variable and return it as an expression
-            output.push_str(&format!("sha256_hex({})", input_var));
+            output.push_str(&format!("sha256_hex({})", input_expr));
         }
     } else {
         // Calculate hashes of specified files
