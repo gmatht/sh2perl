@@ -27,7 +27,14 @@ pub fn generate_tee_command(
             if arg_str == "-a" {
                 append_mode = true;
             } else if !arg_str.starts_with('-') {
+                // If the caller explicitly included /dev/stdout as one of the
+                // tee targets, that means tee will write an extra copy to
+                // stdout in addition to its default stdout output. Track the
+                // number of stdout copies requested so we can reproduce the
+                // behaviour exactly in generated Perl (e.g. echo | tee file /dev/stdout
+                // should print the input twice).
                 if arg_str == "/dev/stdout" {
+                    stdout_copies = stdout_copies.saturating_add(1);
                     continue;
                 }
                 let special_stderr = arg_str == "/dev/stderr";

@@ -158,7 +158,7 @@ my $tee_multi_out = do { do {
     else {
         carp "tee: Cannot open 'test_tee_multi2.txt': $!";
     }
-    $output_0 = $output_0;
+    $output_0 = $output_0 . $output_0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     $output_0;
 } }

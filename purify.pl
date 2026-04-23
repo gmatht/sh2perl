@@ -784,7 +784,11 @@ sub generate_exec_do_block {
                 my $tt = ($q && $q eq 'double') ? decode_perl_double_quoted_string($t)
                        : ($q && $q eq 'single') ? decode_perl_single_quoted_string($t)
                        : $t;
-                $tt eq '|' ? '|' : _shell_quote_for_system($tt)
+                # Do not special-case the pipe token '|' here. Let the general
+                # quoting logic (_shell_quote_for_system) decide whether to quote
+                # it so that a literal '|' passed as an argv element remains a
+                # quoted literal when reconstructed into a bash -c argument.
+                _shell_quote_for_system($tt)
             } @cmd_parts);
 
             # If any original token was double-quoted and contains a Perl-style
@@ -948,7 +952,11 @@ sub generate_exec_do_block {
         # so the shell sees pipelines instead of literal '|' filenames.
         my $shell_cmd = join(' ', map {
             my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare');
-            $t eq '|' ? '|' : _shell_quote_for_system($t);
+            # Preserve literal tokens by letting the general quoting helper
+            # decide how to represent each token. Do NOT treat '|' as a
+            # special pipeline operator here because list-form system() calls
+            # may include a literal '|' argument which must be preserved.
+            _shell_quote_for_system($t);
         } ($first, @tokens));
 
         # Use a non-interpolating Perl literal for the bash -c argument so
