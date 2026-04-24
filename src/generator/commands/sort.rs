@@ -104,15 +104,26 @@ pub fn generate_sort_command_with_output(
         output.push_str(&format!("    my @b_fields = split {}, $b;\n", split_pat));
         output.push_str("    my $a_num = 0;\n");
         output.push_str("    my $b_num = 0;\n");
-        // Accept integer or decimal numbers for numeric comparison
+        // Accept integer or decimal numbers for numeric comparison. Trim
+        // surrounding whitespace from the selected key field so values like
+        // " 95.5" or "95.5 \t" are recognised as numbers.
         let num_re = generator.format_regex_pattern(r"^\d+(?:\.\d+)?$");
+        // Extract and trim the key fields conservatively.
         output.push_str(&format!(
-            "    if ( scalar @a_fields > {} && $a_fields[{}] =~ {} ) {{ $a_num = $a_fields[{}]; }}\n",
-            key_idx, key_idx, num_re, key_idx
+            "    my $a_key = ( scalar @a_fields > {} ) ? $a_fields[{}] : q{{}}; $a_key =~ s/^\\s+|\\s+$//g;\n",
+            key_idx, key_idx
         ));
         output.push_str(&format!(
-            "    if ( scalar @b_fields > {} && $b_fields[{}] =~ {} ) {{ $b_num = $b_fields[{}]; }}\n",
-            key_idx, key_idx, num_re, key_idx
+            "    my $b_key = ( scalar @b_fields > {} ) ? $b_fields[{}] : q{{}}; $b_key =~ s/^\\s+|\\s+$//g;\n",
+            key_idx, key_idx
+        ));
+        output.push_str(&format!(
+            "    if ( $a_key =~ {} ) {{ $a_num = $a_key; }}\n",
+            num_re
+        ));
+        output.push_str(&format!(
+            "    if ( $b_key =~ {} ) {{ $b_num = $b_key; }}\n",
+            num_re
         ));
         output.push_str("    return $a_num <=> $b_num || $a cmp $b;\n");
         output.push_str("}\n");

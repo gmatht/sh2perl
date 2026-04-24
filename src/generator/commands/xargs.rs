@@ -131,8 +131,9 @@ pub fn generate_xargs_command_with_output(
         output.push_str("}\n");
     } else {
         // Handle xargs with command execution
+        // Split input on newlines to preserve filenames that may contain spaces.
         output.push_str(&format!(
-            "my @xargs_input_{} = split /\\s+/msx, ${};\n",
+            "my @xargs_input_{} = split /\\n/msx, ${};\n",
             command_index, input_var
         ));
         output.push_str(&format!("my @xargs_output_{};\n", command_index));
