@@ -99,47 +99,116 @@ while (1) {
         $passed = $count if $count > 0;
     }
 
-    # File that records the previous maximum passed tests
+    # Load previous max tests + matching lines from file
     my $max_file = '.max_tests_passed';
     my $old_max = 0;
+    my $old_matching = 0;
     if (-e $max_file) {
         if (open my $mf, '<', $max_file) {
             my $txt = <$mf>;
             close $mf;
             chomp $txt if defined $txt;
-            $old_max = $txt =~ /^(\d+)$/ ? $1 : 0;
+            if ($txt =~ /^(\d+):(\d+)$/) {
+                $old_max = $1;
+                $old_matching = $2;
+            } elsif ($txt =~ /^(\d+)$/) {
+                $old_max = $1;
+                $old_matching = 0;
+            }
         }
     }
 
+    # Read matching-first-lines value written by the test harness
+    sub read_matching_lines_from_first_file {
+        my $file = 'first_n_tests_passed.txt';
+        my $matching = 0;
+        if (-e $file) {
+            if (open my $fh, '<', $file) {
+                my $c = <$fh>;
+                close $fh;
+                if (defined $c && $c =~ /:y0*([0-9]+)/) {
+                    $matching = $1 + 0;
+                }
+            }
+        }
+        return $matching;
+    }
+
     if ($passed > $old_max) {
-        # Update the recorded max and commit the working tree
+        # More tests passed: record and commit
+        my $new_matching = read_matching_lines_from_first_file();
         if (open my $mf, '>', $max_file) {
-            print $mf $passed;
+            print $mf "$passed:$new_matching";
             close $mf;
             system('git', 'add', $max_file);
         }
         my $msg = "More tests pass (${old_max}->${passed})";
+        $msg .= " and matching lines (${old_matching}->${new_matching})" if $new_matching > 0;
         print "\nDetected improvement: $msg\n";
         system('git', 'commit', '.', '-m', $msg);
-    } else {
-        # No improvement (equal or regression). Ask opencode whether to keep or stash.
-        my $prompt;
-        if ($passed == $old_max) {
-            $prompt = "No new tests pass, should the git diff in progress be accepted into the main branch. The final line of your answer should contain 'KEEP' or 'STASH'";
+    } elsif ($passed == $old_max) {
+        # Same number of passed tests — prefer greater number of matching first lines
+        my $new_matching = read_matching_lines_from_first_file();
+        if ($new_matching > $old_matching) {
+            if (open my $mf, '>', $max_file) {
+                print $mf "$passed:$new_matching";
+                close $mf;
+                system('git', 'add', $max_file);
+            }
+            my $msg = "More matching stdout lines with same tests (${old_matching}->${new_matching})";
+            print "\nDetected improvement: $msg\n";
+            system('git', 'commit', '.', '-m', $msg);
         } else {
-            $prompt = "The git diff results in a regression of tests passing. Is this the result of important refactoring that is worth keeping in and building on? In the final line of your answer say KEEP or STASH";
-        }
+            # No improvement (equal or regression). Ask opencode whether to keep or stash.
+            my $prompt = "No new tests pass, should the git diff in progress be accepted into the main branch. The final line of your answer should contain 'KEEP' or 'STASH'";
+            $prompt .= "\n\nTest output:\n" . $output . "\n";
 
-        # Include the failing output to provide context
+            print "\nInvoking opencode to ask whether to keep or stash changes...\n";
+
+            my $oc_out = '';
+            if (open my $oc, '-|', 'opencode', 'run',  '-m', 'github-copilot/gpt-5-mini', '--variant', 'high', $prompt) {
+                local $/;
+                $oc_out = <$oc>;
+                close $oc;
+            } else {
+                warn "Could not run opencode: $!\n";
+            }
+
+            print "opencode response:\n" . ($oc_out // '') . "\n";
+
+            # Determine final non-empty line from opencode output
+            my $decision = 'DEBUG';
+            if (defined $oc_out && $oc_out ne '') {
+                my @lines = split /\n/, $oc_out;
+                for (my $i = $#lines; $i >= 0; $i--) {
+                    my $ln = $lines[$i];
+                    next unless defined $ln && $ln =~ /\S/;
+                    if ($ln =~ /KEEP/i) { $decision = 'KEEP'; last; }
+                    if ($ln =~ /STASH/i) { $decision = 'STASH'; last; }
+                }
+            }
+
+            if ($decision eq 'KEEP') {
+                print "Keeping changes (committing)...\n";
+                my $msg = "WIP accepted (tests: ${passed})";
+                system('git', 'commit', '.', '-m', $msg);
+            } else {
+                if ($decision eq 'STASH') {
+                    print "Stashing changes...\n";
+                    system('git', 'stash', 'push', '-m', "auto-stash: tests ${old_max}->${passed}");
+                } else {
+                    print "No Decision made! ($decision)";
+                }
+            }
+        }
+    } else {
+        # Regression: fewer tests passed than before.
+        my $prompt = "The git diff results in a regression of tests passing. Is this the result of important refactoring that is worth keeping in and building on? In the final line of your answer say KEEP or STASH";
         $prompt .= "\n\nTest output:\n" . $output . "\n";
 
         print "\nInvoking opencode to ask whether to keep or stash changes...\n";
 
         my $oc_out = '';
-        # The opencode CLI accepts the prompt as a positional argument for `run`.
-        # Passing a `--prompt` option causes the CLI to print its usage and exit,
-        # so pass the prompt string as the final positional argument (same as
-        # the earlier system() call above).
         if (open my $oc, '-|', 'opencode', 'run',  '-m', 'github-copilot/gpt-5-mini', '--variant', 'high', $prompt) {
             local $/;
             $oc_out = <$oc>;
@@ -150,7 +219,6 @@ while (1) {
 
         print "opencode response:\n" . ($oc_out // '') . "\n";
 
-        # Determine final non-empty line from opencode output
         my $decision = 'DEBUG';
         if (defined $oc_out && $oc_out ne '') {
             my @lines = split /\n/, $oc_out;
@@ -159,27 +227,19 @@ while (1) {
                 next unless defined $ln && $ln =~ /\S/;
                 if ($ln =~ /KEEP/i) { $decision = 'KEEP'; last; }
                 if ($ln =~ /STASH/i) { $decision = 'STASH'; last; }
-                # If this non-empty line doesn't contain a decision token,
-                # continue scanning earlier non-empty lines instead of
-                # stopping immediately. This ensures we find KEEP/STASH
-                # anywhere in the output rather than only in the last
-                # non-empty line.
             }
         }
 
         if ($decision eq 'KEEP') {
             print "Keeping changes (committing)...\n";
-            my $msg = $passed == $old_max ? "WIP accepted (tests: ${passed})" : "Keep changes (tests: ${old_max}->${passed})";
+            my $msg = "Keep changes (tests: ${old_max}->${passed})";
             system('git', 'commit', '.', '-m', $msg);
+        } elsif ($decision eq 'STASH') {
+            print "Stashing changes...\n";
+            system('git', 'stash', 'push', '-m', "auto-stash: tests ${old_max}->${passed}");
         } else {
-        	if ($decision eq 'STASH') {
-			print "Stashing changes...\n";
-			system('git', 'stash', 'push', '-m', "auto-stash: tests ${old_max}->${passed}");
-		} else {
-			print "No Decision made! ($decision)";
-			#die;
-		}
+            print "No Decision made! ($decision)";
         }
-
     }
+
 }
