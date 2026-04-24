@@ -654,5 +654,31 @@ Additionally, the generator now strips a single layer of surrounding single or
 double quotes when examining SimpleCommand arguments for awk program text. That
 allows awk programs passed as quoted shell arguments (for example
 '{print toupper($0)}') to be recognized correctly instead of being ignored.
-This change is minimal and safe: it only adjusts the detection heuristics in
-src/generator/commands/awk.rs and doesn't alter other parsing behaviour.
+    This change is minimal and safe: it only adjusts the detection heuristics in
+    src/generator/commands/awk.rs and doesn't alter other parsing behaviour.
+
+Fix: Numeric sort key and delimiter handling in sort generator
+------------------------------------------------------------
+Problem
+-------
+The sort generator only recognised integer-valued keys and always split fields
+on whitespace. This made numeric sorts on decimal scores (for example
+"95.5") or sorts using a field delimiter (for example "-t',' -k2 -nr") fall
+back to lexicographic ordering and produce incorrect ordering in purified
+examples (notably examples.impurl/037_complex_pipeline.pl).
+
+Fix
+---
+Update src/generator/commands/sort.rs so that:
+- The numeric detection accepts decimal numbers (e.g. 95.5) rather than only
+  integers.
+- The generator respects common -t (field delimiter) and -k (key) options so
+  the key field is selected correctly when performing numeric comparisons.
+
+Why this is minimal and safe
+---------------------------
+The change only affects the small sort code-generator used when emitting Perl
+implementations for pipelines that use sort. It makes the numeric comparator
+robust to decimal values and honours the delimiter/key options commonly used
+in examples. This fixes the ordering mismatch observed in Example 037 without
+changing other generator behaviour.

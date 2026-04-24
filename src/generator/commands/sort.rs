@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
+use regex::escape;
 
 pub fn generate_sort_command(
     generator: &mut Generator,
@@ -22,19 +23,61 @@ pub fn generate_sort_command_with_output(
 
     let mut numeric = false;
     let mut reverse = false;
+    // Optional delimiter (-t CHAR) and key index (-k N)
+    let mut delim_opt: Option<String> = None;
+    let mut key_index_opt: Option<usize> = None;
 
-    // Check for flags
-    for arg in &cmd.args {
-        if let Word::Literal(arg_str, _) = arg {
+    // Parse arguments conservatively. Accept combined shortopts (-nr) and separated forms.
+    let mut i = 0usize;
+    while i < cmd.args.len() {
+        if let Word::Literal(arg_str, _) = &cmd.args[i] {
             if arg_str == "-n" {
                 numeric = true;
-            } else if arg_str == "r" || arg_str == "-r" {
+            } else if arg_str == "-r" || arg_str == "r" {
                 reverse = true;
             } else if arg_str == "-nr" || arg_str == "-rn" {
                 numeric = true;
                 reverse = true;
+            } else if arg_str.starts_with("-t") {
+                // -tCHAR or -t CHAR: capture CHAR possibly quoted
+                let mut delim = arg_str[2..].to_string();
+                if delim.is_empty() && i + 1 < cmd.args.len() {
+                    if let Word::Literal(next_str, _) = &cmd.args[i + 1] {
+                        delim = next_str.clone();
+                        i += 1; // consume next
+                    }
+                }
+                // Strip surrounding single or double quotes if present
+                if delim.len() >= 2
+                    && ((delim.starts_with('\'') && delim.ends_with('\''))
+                        || (delim.starts_with('"') && delim.ends_with('"')))
+                {
+                    delim = delim[1..delim.len() - 1].to_string();
+                }
+                if !delim.is_empty() {
+                    delim_opt = Some(delim);
+                }
+            } else if arg_str.starts_with("-k") {
+                // -kN or -k N or -kN,M: take the leading N as key field
+                let mut rest = arg_str[2..].to_string();
+                if rest.is_empty() && i + 1 < cmd.args.len() {
+                    if let Word::Literal(next_str, _) = &cmd.args[i + 1] {
+                        rest = next_str.clone();
+                        i += 1; // consume next
+                    }
+                }
+                // Extract leading digits
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !digits.is_empty() {
+                    if let Ok(n) = digits.parse::<usize>() {
+                        if n > 0 {
+                            key_index_opt = Some(n - 1);
+                        }
+                    }
+                }
             }
         }
+        i += 1;
     }
 
     let input_ref = if input_var.starts_with('$') {
@@ -49,17 +92,27 @@ pub fn generate_sort_command_with_output(
     if numeric {
         // For numeric sort, use a separate function to avoid complex sort blocks
         output.push_str(&format!("sub sort_numeric_{} {{\n", command_index));
-        output.push_str("    my @a_fields = split /\\s+/msx, $a;\n");
-        output.push_str("    my @b_fields = split /\\s+/msx, $b;\n");
+        // Choose split pattern based on -t delimiter if present
+        let split_pat = if let Some(d) = &delim_opt {
+            let esc = escape(d);
+            generator.format_regex_pattern(&esc)
+        } else {
+            generator.format_regex_pattern(r"\s+")
+        };
+        let key_idx = key_index_opt.unwrap_or(0);
+        output.push_str(&format!("    my @a_fields = split {}, $a;\n", split_pat));
+        output.push_str(&format!("    my @b_fields = split {}, $b;\n", split_pat));
         output.push_str("    my $a_num = 0;\n");
         output.push_str("    my $b_num = 0;\n");
+        // Accept integer or decimal numbers for numeric comparison
+        let num_re = generator.format_regex_pattern(r"^\d+(?:\.\d+)?$");
         output.push_str(&format!(
-            "    if ( scalar @a_fields > 0 && $a_fields[0] =~ {} ) {{ $a_num = $a_fields[0]; }}\n",
-            generator.format_regex_pattern(r"^\d+$")
+            "    if ( scalar @a_fields > {} && $a_fields[{}] =~ {} ) {{ $a_num = $a_fields[{}]; }}\n",
+            key_idx, key_idx, num_re, key_idx
         ));
         output.push_str(&format!(
-            "    if ( scalar @b_fields > 0 && $b_fields[0] =~ {} ) {{ $b_num = $b_fields[0]; }}\n",
-            generator.format_regex_pattern(r"^\d+$")
+            "    if ( scalar @b_fields > {} && $b_fields[{}] =~ {} ) {{ $b_num = $b_fields[{}]; }}\n",
+            key_idx, key_idx, num_re, key_idx
         ));
         output.push_str("    return $a_num <=> $b_num || $a cmp $b;\n");
         output.push_str("}\n");
