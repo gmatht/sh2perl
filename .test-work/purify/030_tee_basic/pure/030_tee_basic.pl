@@ -22,6 +22,9 @@ my $tee_output = do { do {
     }
     $output_0 = $output_0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -69,6 +72,9 @@ my $tee_multi = do { do {
     }
     $output_0 = $output_0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -99,6 +105,9 @@ my $tee_pipe = do { do {
     }
     $output_0 = $output_0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -127,6 +136,9 @@ my $tee_stderr = do { do {
     }
     $output_0 = $output_0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -160,6 +172,9 @@ my $tee_multi_out = do { do {
     }
     $output_0 = $output_0 . $output_0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -193,6 +208,9 @@ my $tee_pipe_multi = do { do {
     }
     $output_0 = $output_0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;

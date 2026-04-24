@@ -39,6 +39,9 @@ my $pipeline_output = do { do {
             $output_0 .= "\n";
         }
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -123,6 +126,9 @@ my $pipeline_head_tail = do { do {
     $output_0 = join "\n", @result;
 
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -151,13 +157,11 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
     my @result;
     foreach my $line (@lines) {
     chomp $line;
-    if ($line =~ /^\\s*$/msx) { next; }
+    if ($line =~ /^\s*$/msx) { next; }
     my @fields = split /\s+/msx, $line;
-    if (@fields > 0) {
-    push @result, uc($line);
+    push @result, ('toupper($0)' . "\n");
     }
-    }
-    $output_0 = join "\n", @result;
+    $output_0 = join "", @result;
     if ($output_0 ne q{} && !defined $output_printed_0) {
         print $output_0;
         if (!($output_0 =~ m{\n\z}msx)) {
@@ -206,6 +210,9 @@ my $pipeline_cut_paste = do { do {
     $paste_output
         };
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -255,6 +262,7 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
     if (!($tr_result_0_1 =~ m{\n\z}msx || $tr_result_0_1 eq q{})) {
     $tr_result_0_1 .= "\n";
     }
+    $output_0 = $tr_result_0_1;
     $output_0 = $tr_result_0_1;
 
         my @sort_lines_0_2 = split /\n/msx, $output_0;
@@ -308,6 +316,9 @@ my $pipeline_uniq_wc = do { do {
     close $wc_out_0_3 or die "Close failed: $!\n";
     waitpid $wc_pid_0_3, 0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -391,6 +402,9 @@ my $pipeline_tail_grep = do { do {
         $pipeline_success_0 = 0;
     }
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;
@@ -483,6 +497,9 @@ my $pipeline_error = do { do {
     close $wc_out_0_2 or die "Close failed: $!\n";
     waitpid $wc_pid_0_2, 0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
     $output_0;
 } }
 ;

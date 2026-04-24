@@ -44,7 +44,7 @@ if [ -e "$OUTDIR" ]; then
 fi
 
 echo "Cloning a mirrored copy of the current repository..."
-git clone --mirror "$REPO_ROOT" "$OUTDIR"
+git clone --mirror --no-local "$REPO_ROOT" "$OUTDIR"
 
 echo "Running git-filter-repo to remove the listed paths from history..."
 cd "$OUTDIR"
