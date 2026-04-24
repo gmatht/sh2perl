@@ -310,6 +310,10 @@ and fixes a concrete syntax-error observed in an example. It does not change
 the broader generator logic and keeps purify.pl as a thin wrapper around the
 Rust debashc output.
 
+Note: The regex replacement is now skipped when the statement being normalized
+is itself a `use Carp` import line. This prevents producing invalid import
+forms like `use Carp qw(carp Carp::croak);` which caused runtime failures.
+
 Fix: Serialize Command::Block in bash string generation
 ------------------------------------------------------
 Problem
