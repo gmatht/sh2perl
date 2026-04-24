@@ -2518,7 +2518,26 @@ fn generate_buffered_pipeline(
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
 
-                // Return the output variable as the last statement
+                // Ensure returned substitution string ends with a newline when
+                // non-empty and not already newline-terminated. Some code paths
+                // build the substitution result via join("\n", @lines) and do
+                // not append a trailing newline; that produced a one-byte/
+                // one-newline mismatch in purified output. Restrict this to the
+                // command-substitution return site so other branches that
+                // intentionally chomp/strip trailing newlines are unaffected.
+                output.push_str(&generator.indent());
+                output.push_str(&format!(
+                    "if ($output_{} ne q{{}} && !($output_{} =~ {})) {{\n",
+                    unique_id,
+                    unique_id,
+                    generator.newline_end_regex()
+                ));
+                generator.indent_level += 1;
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$output_{} .= \"\\n\";\n", unique_id));
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}\n");
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
             } else {
@@ -2583,58 +2602,58 @@ fn generate_buffered_pipeline(
 
                 // Process remaining commands in the pipeline
                 for (i, command) in pipeline.commands[1..].iter().enumerate() {
-                    if let Command::Simple(cmd) = command {
-                        let cmd_name = match &cmd.name {
-                            Word::Literal(s, _) => s,
-                            _ => "unknown_command",
-                        };
+                    // Use the builtins registry for all commands, including Redirect
+                    let command_output = generate_command_using_builtins(
+                        generator,
+                        command,
+                        &format!("output_{}", unique_id),
+                        &format!("output_{}", unique_id),
+                        &format!("{}_{}", unique_id, i + 1),
+                        false,
+                    );
 
-                        // Use the builtins registry for all commands
-                        let command_output = generate_command_using_builtins(
-                            generator,
-                            command,
-                            &format!("output_{}", unique_id),
-                            &format!("output_{}", unique_id),
-                            &format!("{}_{}", unique_id, i + 1),
-                            false,
-                        );
-
-                        // Split the output into lines and apply indentation
-                        for line in command_output.lines() {
-                            if line.trim().is_empty() {
-                                // Preserve blank lines - just output a newline
-                                output.push_str("\n");
+                    // Split the output into lines and apply indentation
+                    for line in command_output.lines() {
+                        if line.trim().is_empty() {
+                            // Preserve blank lines - just output a newline
+                            output.push_str("\n");
+                        } else {
+                            // Preserve relative indentation: if line has leading spaces, keep them and add base indent
+                            // If line has no leading spaces, it's a top-level statement - add base indent only
+                            let leading_spaces = line.len() - line.trim_start().len();
+                            if leading_spaces > 0 {
+                                // Line has relative indentation - add base indent and preserve relative
+                                output.push_str(&generator.indent());
+                                output.push_str(line); // Keep original line with its indentation
                             } else {
-                                // Preserve relative indentation: if line has leading spaces, keep them and add base indent
-                                // If line has no leading spaces, it's a top-level statement - add base indent only
-                                let leading_spaces = line.len() - line.trim_start().len();
-                                if leading_spaces > 0 {
-                                    // Line has relative indentation - add base indent and preserve relative
-                                    output.push_str(&generator.indent());
-                                    output.push_str(line); // Keep original line with its indentation
-                                } else {
-                                    // Line has no indentation - add base indent only
-                                    output.push_str(&generator.indent());
-                                    output.push_str(line.trim_start());
-                                }
-                                if !line.ends_with('\n') {
-                                    output.push_str("\n");
-                                }
+                                // Line has no indentation - add base indent only
+                                output.push_str(&generator.indent());
+                                output.push_str(line.trim_start());
+                            }
+                            if !line.ends_with('\n') {
+                                output.push_str("\n");
                             }
                         }
+                    }
 
-                        // Track exit code for grep commands (exit 1 if no matches found)
-                        if cmd_name == "grep" {
-                            output.push_str(&generator.indent());
-                            output.push_str(&format!(
-                                "if ((scalar @grep_filtered_{}_{}) == 0) {{\n",
-                                unique_id,
-                                i + 1
-                            ));
-                            output.push_str(&generator.indent());
-                            output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
-                            output.push_str(&generator.indent());
-                            output.push_str("}\n");
+                    // If this was a simple grep command, track its exit behaviour
+                    if let Command::Simple(cmd) = command {
+                        if let Word::Literal(cmd_name, _) = &cmd.name {
+                            if cmd_name == "grep" {
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!(
+                                    "if ((scalar @grep_filtered_{}_{}) == 0) {{\n",
+                                    unique_id,
+                                    i + 1
+                                ));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!(
+                                    "    $pipeline_success_{} = 0;\n",
+                                    unique_id
+                                ));
+                                output.push_str(&generator.indent());
+                                output.push_str("}\n");
+                            }
                         }
                     }
                 }
