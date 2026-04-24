@@ -8,37 +8,71 @@ pub fn generate_cut_command(
     _command_index: usize,
 ) -> String {
     let mut output = String::new();
+    // (debug logging removed)
 
-    // cut command syntax: cut -d delimiter -f fields
-    let mut delimiter = "\\t".to_string(); // Default tab delimiter
-    let mut fields = "1".to_string(); // Default to first field
+    // Support both attached (-d, -f1,3) and separated (-d , -f 1,3) forms.
+    let mut delimiter_word: Option<Word> = None;
+    let mut field_num: usize = 1; // default to first field (1-based)
+    let mut selected_fields: Option<Vec<usize>> = None;
 
-    // Parse cut options
+    // Parse options
     let mut i = 0;
     while i < cmd.args.len() {
         if let Word::Literal(arg, _) = &cmd.args[i] {
-            if arg == "-d" && i + 1 < cmd.args.len() {
-                if let Some(next_arg) = cmd.args.get(i + 1) {
-                    if let Word::Literal(s, _) = next_arg {
-                        delimiter = s.clone();
-                    } else {
-                        delimiter = generator.word_to_perl(next_arg);
-                    }
-                    i += 1; // Skip the delimiter argument
+            if arg.starts_with("-d") {
+                let rest = &arg[2..];
+                if !rest.is_empty() {
+                    // attached form: -d,
+                    delimiter_word = Some(Word::literal(rest.to_string()));
+                } else if i + 1 < cmd.args.len() {
+                    delimiter_word = Some(cmd.args[i + 1].clone());
+                    i += 1; // skip delimiter token
                 }
-            } else if arg == "-f" && i + 1 < cmd.args.len() {
-                if let Some(next_arg) = cmd.args.get(i + 1) {
-                    if let Word::Literal(s, _) = next_arg {
-                        fields = s.clone();
-                    } else {
-                        fields = generator.word_to_perl(next_arg);
+            } else if arg.starts_with("-f") {
+                let rest = &arg[2..];
+                let mut parsed: Vec<usize> = Vec::new();
+                if !rest.is_empty() {
+                    // attached form -f1,3
+                    for p in rest.split(',') {
+                        if let Ok(n) = p.parse::<usize>() {
+                            parsed.push(n);
+                        }
                     }
-                    i += 1; // Skip the fields argument
+                } else if i + 1 < cmd.args.len() {
+                    // separated form -f 1,3
+                    let field_token = &cmd.args[i + 1];
+                    let field_str = generator.strip_shell_quotes_for_regex(field_token);
+                    for p in field_str.split(',') {
+                        if let Ok(n) = p.parse::<usize>() {
+                            parsed.push(n);
+                        }
+                    }
+                    i += 1; // skip field token
+                }
+
+                if !parsed.is_empty() {
+                    if parsed.len() == 1 {
+                        field_num = parsed[0];
+                    } else {
+                        selected_fields = Some(parsed);
+                    }
                 }
             }
         }
         i += 1;
     }
+
+    // Build regex pattern for split; default is tab
+    let delim_for_regex = if let Some(ref w) = delimiter_word {
+        generator.strip_shell_quotes_for_regex(w)
+    } else {
+        "\\t".to_string()
+    };
+
+    // Build a Perl literal for joining selected fields. Decode common shell escapes
+    // (eg "\\t" -> actual tab) so join emits the intended character.
+    let delim_for_join_raw = crate::generator::utils::decode_shell_escapes_impl(&delim_for_regex);
+    let join_lit = generator.perl_string_literal(&Word::literal(delim_for_join_raw));
 
     let unique_id = generator.get_unique_id();
     output.push_str(&format!(
@@ -48,50 +82,42 @@ pub fn generate_cut_command(
     output.push_str(&format!("my @result_{};\n", unique_id));
     output.push_str(&format!("foreach my $line (@lines_{}) {{\n", unique_id));
     output.push_str("chomp $line;\n");
-    // Escape special regex characters in delimiter
-    let escaped_delimiter = delimiter
-        .replace(":", "\\:")
-        .replace("|", "\\|")
-        .replace("(", "\\(")
-        .replace(")", "\\)")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-        .replace("{", "\\{")
-        .replace("}", "\\}")
-        .replace("^", "\\^")
-        .replace("$", "\\$")
-        .replace("*", "\\*")
-        .replace("+", "\\+")
-        .replace("?", "\\?")
-        .replace(".", "\\.");
+
+    // Split into fields using a properly formatted regex
     output.push_str(&format!(
-        "my @fields = split /{}/msx, $line;\n",
-        escaped_delimiter
+        "my @fields = split {}, $line;\n",
+        generator.format_regex_pattern(&delim_for_regex)
     ));
 
-    // Handle field selection - convert field number from 1-based to 0-based indexing
-    let field_index = if fields
-        .trim_matches('"')
-        .trim_matches('\'')
-        .parse::<usize>()
-        .unwrap_or(1)
-        > 0
-    {
-        fields
-            .trim_matches('"')
-            .trim_matches('\'')
-            .parse::<usize>()
-            .unwrap_or(1)
-            - 1
+    if let Some(fields_vec) = selected_fields {
+        // Multiple fields: select and join with original delimiter
+        let zero_based: Vec<usize> = fields_vec
+            .into_iter()
+            .map(|n| if n > 0 { n - 1 } else { 0 })
+            .collect();
+
+        output.push_str("my @sel = ();\n");
+        for idx in zero_based.iter() {
+            output.push_str(&format!(
+                "if (@fields > {}) {{ push @sel, $fields[{}]; }}\n",
+                idx, idx
+            ));
+        }
+        output.push_str(&format!(
+            "push @result_{}, join({}, @sel);\n",
+            unique_id, join_lit
+        ));
     } else {
-        0
-    };
-    output.push_str(&format!("if (@fields > {}) {{\n", field_index));
-    output.push_str(&format!(
-        "push @result_{}, $fields[{}];\n",
-        unique_id, field_index
-    ));
-    output.push_str("}\n");
+        // Single field selection
+        let field_index = if field_num > 0 { field_num - 1 } else { 0 };
+        output.push_str(&format!("if (@fields > {}) {{\n", field_index));
+        output.push_str(&format!(
+            "    push @result_{}, $fields[{}];\n",
+            unique_id, field_index
+        ));
+        output.push_str("}\n");
+    }
+
     output.push_str("}\n");
     output.push_str(&format!(
         "${} = join \"\\n\", @result_{};\n",
