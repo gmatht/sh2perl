@@ -480,6 +480,16 @@ my $pipeline_error = do { do {
     if ((scalar @grep_filtered_0_1) == 0) {
         $pipeline_success_0 = 0;
     }
+    use IPC::Open3;
+    my @wc_args_0_2 = ('-l');
+    my ($wc_in_0_2, $wc_out_0_2, $wc_err_0_2);
+    my $wc_pid_0_2 = open3($wc_in_0_2, $wc_out_0_2, $wc_err_0_2, 'wc', @wc_args_0_2);
+    print {$wc_in_0_2} $output_0;
+    close $wc_in_0_2 or die "Close failed: $!\n";
+    $output_0 = do { local $/ = undef; <$wc_out_0_2> };
+    if ($output_0 eq q{}) { $output_0 = "0\n"; }
+    close $wc_out_0_2 or die "Close failed: $!\n";
+    waitpid $wc_pid_0_2, 0;
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     $output_0;
 } }
