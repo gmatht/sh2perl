@@ -308,6 +308,25 @@ fn generate_tr_buffered_impl_with_output(
         output.push_str(&format!("${} = ${};\n", output_var, input_var));
     }
 
+    // If this tr invocation is part of a pipeline (the caller passed a
+    // different input variable), assign the computed result back into the
+    // pipeline input variable so downstream stages see the transformed data.
+    if input_var != output_var {
+        let output_name = output_var.trim_start_matches('$');
+        let output_ref = if output_var.starts_with('$') {
+            output_var.to_string()
+        } else {
+            format!("${}", output_name)
+        };
+        let input_ref = if input_var.starts_with('$') {
+            input_var.to_string()
+        } else {
+            format!("${}", input_var)
+        };
+        output.push_str(&generator.indent());
+        output.push_str(&format!("{} = {};\n", input_ref, output_ref));
+    }
+
     output
 }
 
