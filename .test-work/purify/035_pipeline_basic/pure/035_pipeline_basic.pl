@@ -1,4 +1,3 @@
-use Carp;
 #!/usr/bin/perl
 BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/035_pipeline_basic.pl" }
 
@@ -180,38 +179,31 @@ my $pipeline_cut_paste = do { do {
     my @result_1;
     foreach my $line (@lines_1) {
     chomp $line;
-    my @fields = split /\t/msx, $line;
-    if (@fields > 0) {
-    push @result_1, $fields[0];
-    }
+    my @fields = split /,/msx, $line;
+    my @sel = ();
+    if (@fields > 0) { push @sel, $fields[0]; }
+    if (@fields > 2) { push @sel, $fields[2]; }
+    push @result_1, join(q{,}, @sel);
     }
     $output_0 = join "\n", @result_1;
 
     $output_0 = do {
-        my @paste_file1_lines_fh_1;
-        my @paste_file2_lines_fh_1;
-        if (open my $fh1, '<', q{-}) {
-            while (my $line = <$fh1>) {
-                chomp $line;
-                push @paste_file1_lines_fh_1, $line;
-            }
-            close $fh1 or croak "Close failed: $!";
-        }
-        if (open my $fh2, '<', q{-}) {
-            while (my $line = <$fh2>) {
-                chomp $line;
-                push @paste_file2_lines_fh_1, $line;
-            }
-            close $fh2 or croak "Close failed: $!";
-        }
-        my $max_lines = scalar @paste_file1_lines_fh_1 > scalar @paste_file2_lines_fh_1 ? scalar @paste_file1_lines_fh_1 : scalar @paste_file2_lines_fh_1;
+        my @paste_stdin_lines_fh_1 = split /\n/msx, $output_0;
         my $paste_output = q{};
-        for my $i (0..$max_lines-1) {
-            my $line1 = $i < scalar @paste_file1_lines_fh_1 ? $paste_file1_lines_fh_1[$i] : q{};
-            my $line2 = $i < scalar @paste_file2_lines_fh_1 ? $paste_file2_lines_fh_1[$i] : q{};
-            $paste_output .= "$line1\t$line2\n";
+        my $stdin_pos_fh_1 = 0;
+        for (my $i = 0; ; $i++) {
+            my @parts = ();
+            my $row_has_data = 0;
+            my $val_0_fh_1 = $stdin_pos_fh_1 < scalar @paste_stdin_lines_fh_1 ? $paste_stdin_lines_fh_1[$stdin_pos_fh_1] : q{};
+            if ($val_0_fh_1 ne q{}) { $row_has_data = 1; $stdin_pos_fh_1++; }
+            push @parts, $val_0_fh_1;
+            my $val_1_fh_1 = $stdin_pos_fh_1 < scalar @paste_stdin_lines_fh_1 ? $paste_stdin_lines_fh_1[$stdin_pos_fh_1] : q{};
+            if ($val_1_fh_1 ne q{}) { $row_has_data = 1; $stdin_pos_fh_1++; }
+            push @parts, $val_1_fh_1;
+            last unless $row_has_data;
+            $paste_output .= join("\t", @parts) . "\n";
         }
-        $paste_output
+    $paste_output
         };
     if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     $output_0;
