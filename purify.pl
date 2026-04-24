@@ -1849,8 +1849,60 @@ sub extract_core_perl_logic_ppi {
         # Replace unqualified Carp helpers with fully-qualified names so we
         # don't rely on 'use Carp;' being present when the snippet is spliced
         # into the original file. Avoid touching occurrences like $croak and
-        # already-qualified names like Carp::croak.
-        $s =~ s/(?<!\$)(?<!::)\b(croak|confess)\b/Carp::$1/g;
+        # already-qualified names like Carp::croak. Also avoid qualifying
+        # identifiers that appear inside a 'use Carp' import list (for
+        # example "use Carp qw(carp croak);") since turning that into
+        # "use Carp qw(carp Carp::croak);" is invalid and causes a runtime
+        # import error. To do this robustly, scan the statement and qualify
+        # only those helper tokens that are not inside any nearby 'use Carp'
+        # import range and are not already namespace-qualified or preceded by
+        # a sigil.
+        {
+            # Collect ranges corresponding to 'use Carp ... ;' imports
+            my @carp_ranges;
+            while ($s =~ /use\s+Carp\b/g) {
+                my $use_start = $-[0];
+                my $after = $+[0];
+                my $semi = index($s, ';', $after);
+                my $range_end = $semi == -1 ? length($s) : $semi + 1;
+                push @carp_ranges, [$use_start, $range_end];
+            }
+
+            # Walk matches and rebuild the string, qualifying only safe
+            # occurrences.
+            my $out = '';
+            my $last = 0;
+            while ($s =~ /\b(croak|confess)\b/g) {
+                my $mstart = $-[0];
+                my $mend = $+[0];
+                my $tok = $1;
+                # Append text before the match
+                $out .= substr($s, $last, $mstart - $last);
+
+                # Skip if preceded by sigil or namespace qualifier
+                if ($mstart >= 1 && substr($s, $mstart-1, 1) eq '$') {
+                    $out .= $tok;
+                } elsif ($mstart >= 2 && substr($s, $mstart-2, 2) eq '::') {
+                    $out .= $tok;
+                } else {
+                    # Skip if inside a 'use Carp' import range
+                    my $inside = 0;
+                    for my $r (@carp_ranges) {
+                        if ($mstart >= $r->[0] && $mstart < $r->[1]) { $inside = 1; last; }
+                    }
+                    if ($inside) {
+                        $out .= $tok;
+                    } else {
+                        $out .= "Carp::" . $tok;
+                    }
+                }
+
+                $last = $mend;
+            }
+            # Append remainder
+            $out .= substr($s, $last) if $last < length($s);
+            $s = $out;
+        }
 
         push @normalized, $s;
     }
