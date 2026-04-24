@@ -473,14 +473,39 @@ fn generate_command_using_builtins(
             output.push_str("}\n");
             output
         }
-        Command::Redirect(_redirect_cmd) => {
-            // Handle Redirect commands in pipeline context
-            if input_var.is_empty() {
-                // First command in pipeline - generate the redirect command normally
-                generator.generate_command(command)
+        Command::Redirect(redirect_cmd) => {
+            // Handle Redirect commands in pipeline context.
+            // If the redirect only affects stderr (for example `2>/dev/null`),
+            // prefer to generate the inner command using the builtin-path so the
+            // input_var/output_var context is preserved for builtins like `wc`.
+            // For other redirect types (stdout->file, process substitution, etc.)
+            // fall back to the normal generator which emits explicit redirection
+            // handling.
+            let has_stderr_redirect = redirect_cmd.redirects.iter().any(|r| {
+                matches!(
+                    r.operator,
+                    RedirectOperator::StderrOutput
+                        | RedirectOperator::StderrAppend
+                        | RedirectOperator::StderrInput
+                )
+            });
+
+            if has_stderr_redirect {
+                // Recurse into the inner command using the builtin-aware generator
+                // so that builtin implementations receive the pipeline input and
+                // produce the expected output variable. This preserves semantics
+                // for cases like `... | wc -l 2>/dev/null` which otherwise could
+                // be dropped in command-substitution contexts.
+                generate_command_using_builtins(
+                    generator,
+                    redirect_cmd.command.as_ref(),
+                    input_var,
+                    output_var,
+                    command_index,
+                    linebyline,
+                )
             } else {
-                // Subsequent command - pass the pipeline input to the redirect command
-                // The redirect command should receive the pipeline input and generate its output
+                // Default behaviour: let the normal generator handle redirects
                 generator.generate_command(command)
             }
         }

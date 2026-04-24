@@ -155,7 +155,7 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
     if ($line =~ /^\\s*$/msx) { next; }
     my @fields = split /\s+/msx, $line;
     if (@fields > 0) {
-    push @result, $line;
+    push @result, uc($line);
     }
     }
     $output_0 = join "\n", @result;
