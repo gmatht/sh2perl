@@ -633,3 +633,26 @@ Example tweak
 The earlier temporary example change (making the awk program single-quoted)
 was reverted; the root cause was fixed in the generator instead (see the
 "Update: generator-side fix" section above).
+
+Fix: Handle awk toupper/tolower in generator
+-------------------------------------------
+Problem
+-------
+Some examples used awk programs like '{ print toupper($0) }' or '{ print tolower($1) }'.
+The generator did not recognize these forms and emitted the wrong casing in the
+purified output.
+
+Fix
+---
+The awk builtin generator now recognizes common uses of toupper() and tolower()
+and maps them to Perl's uc()/lc() on the appropriate field or whole line. This
+produces the expected capitalisation in purified examples like 035_pipeline_basic.
+
+Update: quoted-arg detection
+---------------------------
+Additionally, the generator now strips a single layer of surrounding single or
+double quotes when examining SimpleCommand arguments for awk program text. That
+allows awk programs passed as quoted shell arguments (for example
+'{print toupper($0)}') to be recognized correctly instead of being ignored.
+This change is minimal and safe: it only adjusts the detection heuristics in
+src/generator/commands/awk.rs and doesn't alter other parsing behaviour.

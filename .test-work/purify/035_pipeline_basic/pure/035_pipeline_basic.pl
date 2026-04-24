@@ -1,6 +1,6 @@
 use Carp;
 #!/usr/bin/perl
-BEGIN { $0 = "examples.impurl/035_pipeline_basic.pl" }
+BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/035_pipeline_basic.pl" }
 
 
 print "=== Example 035: Basic pipeline ===\n";
