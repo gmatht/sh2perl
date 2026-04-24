@@ -930,6 +930,25 @@ fn generate_streaming_pipeline(
         output.push_str(&format!("# Original bash: {}\n", first_line));
     }
 
+    // Ensure a pipeline id is visible early so nested builtins (paste, cut, etc.)
+    // can detect and consume the in-memory buffer during generation. Only
+    // create a new id when none is already active. Use an RAII guard so the
+    // id is popped automatically when this function returns or a branch
+    // returns early.
+    let mut _early_pipeline_guard: Option<crate::generator::PipelineOutputIdGuard> = None;
+    if generator.current_pipeline_output_id().is_none() {
+        // Declare the output variable early so heuristics that scan
+        // declared_locals (fallbacks) will see it during nested generation.
+        output.push_str(&generator.indent());
+        output.push_str(&format!("my $output_{} = q{{}};\n", unique_id));
+        generator
+            .declared_locals
+            .insert(format!("output_{}", unique_id));
+        output.push_str(&generator.indent());
+        output.push_str(&format!("my $output_printed_{};\n", unique_id));
+        _early_pipeline_guard = Some(generator.push_pipeline_output_id_guard(unique_id.clone()));
+    }
+
     // Check if the first command is 'cat filename' or an output-generating command and handle it specially
     let mut start_index = 0;
     if let Command::Simple(first_cmd) = &pipeline.commands[0] {
@@ -1508,7 +1527,21 @@ fn generate_streaming_pipeline(
         // Done generating this streaming pipeline - the guard will pop the id when it is dropped.
     } else if start_index == 1 {
         // For echo or cat commands, we need to add the command processing
-        // No variable declarations needed for streaming pipeline - we process each line directly
+        // Make pipeline id visible to nested generators so builtins like paste
+        // can detect and consume the in-memory buffer when '-' is used.
+        let unique_id = if generator.current_pipeline_output_id().is_none() {
+            let id = generator.get_unique_id();
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my $output_{} = q{{}};\n", id));
+            generator.declared_locals.insert(format!("output_{}", id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my $output_printed_{};\n", id));
+            // Push guard so nested generators can see the id and it's popped automatically
+            let _guard = generator.push_pipeline_output_id_guard(id.clone());
+            id
+        } else {
+            generator.current_pipeline_output_id().unwrap().clone()
+        };
 
         // Process each line through the remaining pipeline commands
         for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
@@ -1865,62 +1898,116 @@ fn generate_linebyline_command(
             output
         }
         "cut" => {
-            // For cut, extract specific fields
+            // For cut, extract specific fields (supports -d<delim> and -f<list>)
             let mut output = String::new();
-            let mut delimiter = "\\t".to_string(); // Default tab delimiter
-            let mut field_num = 1; // Default to first field
 
-            // Parse cut options
+            // Keep the parsed delimiter as an optional Word so we can
+            // correctly strip shell quotes when building regex and Perl
+            // literals. If absent, default to a tab represented as "\\t"
+            // which the regex formatter will convert to an actual tab.
+            let mut delimiter_word: Option<Word> = None;
+
+            // Support selecting either a single field or multiple fields (e.g. 1,3)
+            let mut field_num = 1usize; // Default to first field (1-based)
+            let mut selected_fields: Option<Vec<usize>> = None;
+
+            // Parse cut options. Accept both separated (-d ,) and combined forms (-d,)
+            // Also accept quoted delimiters like -d',' or -d"\n" which appear as a
+            // single literal token from the parser.
             let mut i = 0;
             while i < cmd.args.len() {
                 if let Word::Literal(arg, _) = &cmd.args[i] {
-                    if arg == "-d" && i + 1 < cmd.args.len() {
-                        if let Some(next_arg) = cmd.args.get(i + 1) {
-                            if let Word::Literal(s, _) = next_arg {
-                                delimiter = s.clone();
-                            } else {
-                                delimiter = generator.word_to_perl(next_arg);
-                            }
+                    if arg.starts_with("-d") {
+                        let rest = &arg[2..];
+                        if !rest.is_empty() {
+                            // Create a literal word from the attached value so we can
+                            // reuse the generator's helpers for stripping quotes.
+                            delimiter_word = Some(Word::literal(rest.to_string()));
+                        } else if i + 1 < cmd.args.len() {
+                            // Use the next token as the delimiter value
+                            delimiter_word = Some(cmd.args[i + 1].clone());
                             i += 1; // Skip the delimiter argument
                         }
-                    } else if arg == "-f" && i + 1 < cmd.args.len() {
-                        if let Some(next_arg) = cmd.args.get(i + 1) {
-                            if let Word::Literal(field_str, _) = next_arg {
-                                if let Ok(field) = field_str.parse::<usize>() {
-                                    field_num = field;
+                    } else if arg.starts_with("-f") {
+                        let rest = &arg[2..];
+                        let mut parsed: Vec<usize> = Vec::new();
+                        if !rest.is_empty() {
+                            // Attached form -f1,3
+                            for p in rest.split(',') {
+                                if let Ok(n) = p.parse::<usize>() {
+                                    parsed.push(n);
+                                }
+                            }
+                        } else if i + 1 < cmd.args.len() {
+                            // Separated form -f 1,3
+                            let field_token = &cmd.args[i + 1];
+                            let field_str = generator.strip_shell_quotes_for_regex(field_token);
+                            for p in field_str.split(',') {
+                                if let Ok(n) = p.parse::<usize>() {
+                                    parsed.push(n);
                                 }
                             }
                             i += 1; // Skip the field argument
+                        }
+
+                        if !parsed.is_empty() {
+                            if parsed.len() == 1 {
+                                field_num = parsed[0];
+                            } else {
+                                selected_fields = Some(parsed);
+                            }
                         }
                     }
                 }
                 i += 1;
             }
 
-            // Generate cut logic for the current line
-            // Escape special regex characters in delimiter
-            let escaped_delimiter = delimiter
-                .replace(":", "\\:")
-                .replace("|", "\\|")
-                .replace("(", "\\(")
-                .replace(")", "\\)")
-                .replace("[", "\\[")
-                .replace("]", "\\]")
-                .replace("{", "\\{")
-                .replace("}", "\\}")
-                .replace("^", "\\^")
-                .replace("$", "\\$")
-                .replace("*", "\\*")
-                .replace("+", "\\+")
-                .replace("?", "\\?")
-                .replace(".", "\\.");
+            // Determine regex pattern for splitting. Keep default as "\\t"
+            // (escaped tab) so format_regex_pattern will convert it correctly.
+            let delim_for_regex = if let Some(ref w) = delimiter_word {
+                generator.strip_shell_quotes_for_regex(w)
+            } else {
+                "\\t".to_string()
+            };
+
+            // Determine a Perl literal for joining selected fields. Decode
+            // common shell escapes (eg "\\t" -> actual tab) so the join
+            // produces the expected character sequence.
+            let delim_for_join_raw =
+                crate::generator::utils::decode_shell_escapes_impl(&delim_for_regex);
+            let join_lit = generator.perl_string_literal(&Word::literal(delim_for_join_raw));
+
+            // Split into fields using a properly formatted regex
             output.push_str(&format!(
-                "my @fields = split /{}/msx, $line;\n",
-                escaped_delimiter
+                "my @fields = split {}, $line;\n",
+                generator.format_regex_pattern(&delim_for_regex)
             ));
-            output.push_str(&format!("if (@fields > {}) {{\n", field_num - 1));
-            output.push_str(&format!("    $line = $fields[{}];\n", field_num - 1));
-            output.push_str("}\n");
+
+            // If multiple fields were requested, collect them and join with the original delimiter
+            if let Some(fields_vec) = selected_fields {
+                // Convert to 0-based indices and emit code that safely selects
+                // only existing fields.
+                let zero_based: Vec<usize> = fields_vec
+                    .into_iter()
+                    .map(|n| if n > 0 { n - 1 } else { 0 })
+                    .collect();
+
+                output.push_str("my @sel = ();\n");
+                for idx in zero_based.iter() {
+                    output.push_str(&format!(
+                        "if (@fields > {}) {{ push @sel, $fields[{}]; }}\n",
+                        idx, idx
+                    ));
+                }
+                output.push_str(&format!("$line = join({}, @sel);\n", join_lit));
+            } else {
+                // Single field selection - convert 1-based to 0-based index
+                let field_index = if field_num > 0 { field_num - 1 } else { 0 };
+                output.push_str(&format!("if (@fields > {}) {{\n", field_index));
+                output.push_str(&format!("    $line = $fields[{}];\n", field_index));
+                output.push_str("}\n");
+            }
+
             output
         }
         "tail" => {

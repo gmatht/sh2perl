@@ -81,6 +81,7 @@ pub fn generate_paste_command(
             result.push_str(&format!("\n{}}}", generator.indent()));
         }
     } else {
+        // pipeline-state debug removed
         // Handle regular paste command with file arguments
         // Detect '-' arguments and, when a pipeline buffer is active, read
         // the in-memory pipeline variable instead of opening the literal
@@ -117,8 +118,13 @@ pub fn generate_paste_command(
                 for name in &generator.declared_locals {
                     if let Some(rest) = name.strip_prefix("output_") {
                         if let Ok(n) = rest.parse::<usize>() {
-                            if best_id.as_ref().map(|(bn, _)| *bn).unwrap_or(0) < n {
-                                best_id = Some((n, name.clone()));
+                            match &best_id {
+                                Some((bn, _)) => {
+                                    if n > *bn {
+                                        best_id = Some((n, name.clone()));
+                                    }
+                                }
+                                None => best_id = Some((n, name.clone())),
                             }
                         }
                     }
