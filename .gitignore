@@ -2,7 +2,8 @@
 purify.out
 
 # Rust/Cargo build artifacts
-/target/
+target/
+logs/
 
 # Test work directories and temporary outputs
 .test-work/
@@ -10,6 +11,7 @@ purify.out
 # Logs and temporary files
 *.log
 *.tmp
+*.tmplog
 *.out
 
 # Editor swap/backup files
