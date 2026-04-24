@@ -159,7 +159,7 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
     chomp $line;
     if ($line =~ /^\s*$/msx) { next; }
     my @fields = split /\s+/msx, $line;
-    push @result, ('toupper($0)' . "\n");
+    push @result, (uc($line) . "\n");
     }
     $output_0 = join "", @result;
     if ($output_0 ne q{} && !defined $output_printed_0) {
