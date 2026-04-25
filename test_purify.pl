@@ -452,7 +452,7 @@ PERL_SCRIPT
                         my ($diff_output, $diff_result) = run_backticks_with_timeout($diff_command, 'diff_comparison', "diff comparison");
                         # Store the failing test and the diff into the workspace for main_loop.pl to consume
                         write_failure_report($perl_file, $pure_file, 'output_mismatch', $diff_output);
-                        print_output_excerpt("Diff excerpt", $diff_output, 8);
+                        print_output_excerpt("Diff excerpt", $diff_output, 16);
                         die "FAILED - Output mismatch for $perl_file -> $pure_file (diff exit code: $diff_result)\n";
                     }
                 }
