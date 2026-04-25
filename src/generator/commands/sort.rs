@@ -91,7 +91,14 @@ pub fn generate_sort_command_with_output(
     ));
     if numeric {
         // For numeric sort, use a separate function to avoid complex sort blocks
-        output.push_str(&format!("sub sort_numeric_{} {{\n", command_index));
+        // Use a uniquifier to avoid accidental sub name collisions across
+        // multiple generated pipelines/commands. Some pipelines reuse the
+        // same command_index string which can lead to Perl sub redefinition
+        // and surprising behaviour. Append a get_unique_id() value to the
+        // generated sub name so each comparator is unique.
+        let uid = generator.get_unique_id();
+        let sub_name = format!("sort_numeric_{}_{}", command_index, uid);
+        output.push_str(&format!("sub {} {{\n", sub_name));
         // Choose split pattern based on -t delimiter if present
         let split_pat = if let Some(d) = &delim_opt {
             let esc = escape(d);
@@ -128,8 +135,8 @@ pub fn generate_sort_command_with_output(
         output.push_str("    return $a_num <=> $b_num || $a cmp $b;\n");
         output.push_str("}\n");
         output.push_str(&format!(
-            "my @sort_sorted_{} = sort sort_numeric_{} @sort_lines_{};\n",
-            command_index, command_index, command_index
+            "my @sort_sorted_{} = sort {} @sort_lines_{};\n",
+            command_index, sub_name, command_index
         ));
     } else {
         output.push_str(&format!(
