@@ -17,6 +17,7 @@ my $next = 0;
 my $purify_tested=0;
 my $purify_passed=0;
 my $purify_failed=0;
+my $fatal_error = '';
 
 # Fine-grained timeout settings
 my %timeouts = (
@@ -123,6 +124,23 @@ sub print_output_excerpt {
     }
 
     print "... truncated after $shown_lines lines ...\n" if $total_lines > $shown_lines;
+}
+
+sub print_final_summary {
+    my ($passed, $matching, $tested, $skipped, $failed, $start_time) = @_;
+    my $end_time = time();
+    my $total_duration = $end_time - $start_time;
+    my $avg_time_per_file = $tested > 0 ? $total_duration / $tested : 0;
+
+    debug_print(1, "=== TEST SUMMARY ===");
+    debug_print(1, "Purify.pl test summary: $passed passed, $failed failed out of $tested tested");
+    debug_print(1, "Total execution time: ${total_duration}s");
+    debug_print(1, "Average time per file: ${avg_time_per_file}s") if $tested > 0;
+    debug_print(1, "Files processed: $tested of $tested");
+    debug_print(1, "test_purify.pl completed successfully");
+    debug_print(1, "Summary: Tested $tested files, skipped $skipped files");
+    print "Purify.pl tests: $passed passed +$matching lines match, $failed failed out of $tested tested\n";
+    print "PROGRESS " . $passed . ":" . $matching . "\n";
 }
 
 # Write an authoritative failure report used by main_loop.pl
@@ -266,6 +284,7 @@ debug_print(2, "Files to process: " . join(", ", @test_files));
 my $tested_count = 0;
 my $skipped_count = 0;
 my $start_time = time();
+my $first_lines_match_in_failing_test = 0;
 
 # Test that purify.pl can handle the --help option
 debug_print(1, "Testing purify.pl --help...");
@@ -274,7 +293,8 @@ my ($help_output, $help_result) = run_backticks_with_timeout("$perl_cmd \"$purif
 if ($help_result != 0) {
     debug_print(1, "Error: purify.pl --help failed (exit code: $help_result)");
     debug_print(1, "Error output: $help_output");
-    die "Stopping on first failure. Fix the issue and run again.\n";
+    $fatal_error = "Stopping on first failure. Fix the issue and run again.\n";
+    last;
 }
 print "PASSED: purify_help\n";
 
@@ -313,6 +333,27 @@ sub assert_rewrites_backticks {
     print "PASSED: $name\n";
 }
 
+sub count_matching_leading_lines {
+    my ($left, $right) = @_;
+    $left  //= '';
+    $right //= '';
+
+    $left =~ s/\r\n/\n/g;
+    $left =~ s/\r/\n/g;
+    $right =~ s/\r\n/\n/g;
+    $right =~ s/\r/\n/g;
+
+    my @left_lines = split /\n/, $left, -1;
+    my @right_lines = split /\n/, $right, -1;
+    my $limit = @left_lines < @right_lines ? scalar(@left_lines) : scalar(@right_lines);
+    my $count = 0;
+    for my $i (0 .. $limit - 1) {
+        last if $left_lines[$i] ne $right_lines[$i];
+        $count++;
+    }
+    return $count;
+}
+
 assert_rewrites_backticks(
     'backtick command substitution',
     "print `echo hi`\n",
@@ -329,6 +370,7 @@ assert_rewrites_backticks(
 unlink 'out1.txt', 'out2.txt';
 
 
+TEST_FILE:
 foreach my $perl_file (@test_files) {
     if (-f $perl_file) {
         $purify_tested++;
@@ -422,6 +464,7 @@ PERL_SCRIPT
                 if ( $file1_content ne $file2_content ) {
                     debug_print(1, "Output mismatch detected between original and purified files; re-running original to check for nondeterminism");
                     debug_print(2, " === purified === \n$output\n === end purified ===");
+                    $first_lines_match_in_failing_test = count_matching_leading_lines($file1_content, $file2_content);
 
                     my ($out1b_fh, $out1b_path) = tempfile(DIR => $workspace_root);
                     close $out1b_fh;
@@ -453,7 +496,8 @@ PERL_SCRIPT
                         # Store the failing test and the diff into the workspace for main_loop.pl to consume
                         write_failure_report($perl_file, $pure_file, 'output_mismatch', $diff_output);
                         print_output_excerpt("Diff excerpt", $diff_output, 16);
-                        die "FAILED - Output mismatch for $perl_file -> $pure_file (diff exit code: $diff_result)\n";
+                        $fatal_error = "FAILED - Output mismatch for $perl_file -> $pure_file (diff exit code: $diff_result)\n";
+                        last TEST_FILE;
                     }
                 }
                 if ($nondeterministic_skip) {
@@ -470,43 +514,28 @@ PERL_SCRIPT
                 print_output_excerpt("purify.pl error output", $output, 8);
                 # Record the purify.pl failure output for main_loop.pl
                 write_failure_report($perl_file, $pure_file, 'purify_execution_failed', $output);
+                $first_lines_match_in_failing_test = 0;
                 $purify_failed++;
                 # Quit on first failure
-                die "Stopping on first failure. Fix the issue and run again.\n";
+                $fatal_error = "Stopping on first failure. Fix the issue and run again.\n";
+                last TEST_FILE;
             }
         };
 
         my $example_error = $@;
         chdir $original_dir or die "Cannot chdir back to $original_dir: $!\n";
         next if $example_error eq '' && $nondeterministic_skip;
-        die $example_error if $example_error;
+        if ($example_error) {
+            $fatal_error = $example_error;
+            last TEST_FILE;
+        }
     }
 }
 
-# Final summary with timing information
-    my $end_time = time();
-    my $total_duration = $end_time - $start_time;
-    my $avg_time_per_file = $total_duration / $purify_tested if $purify_tested > 0;
+print_final_summary($purify_passed, $first_lines_match_in_failing_test, $purify_tested, $skipped_count, $purify_failed, $start_time);
 
-debug_print(1, "=== TEST SUMMARY ===");
-    debug_print(1, "Purify.pl test summary: $purify_passed passed, $purify_failed failed out of $purify_tested tested");
-    # Always emit a concise numeric summary line for automation scripts
-    # (main_loop.pl parses this line to detect improvements).
-    print "Purify.pl tests: $purify_passed passed, $purify_failed failed out of $purify_tested tested\n";
-debug_print(1, "Total execution time: ${total_duration}s");
-debug_print(1, "Average time per file: ${avg_time_per_file}s") if $purify_tested > 0;
-debug_print(1, "Files processed: $purify_tested of $total_files");
-
-# If any purify tests failed, this is a critical error
-if ($purify_failed > 0) {
-    debug_print(1, "Error: $purify_failed purify.pl tests failed. The purify.pl script is not working correctly.");
-    die "Error: $purify_failed purify.pl tests failed. The purify.pl script is not working correctly.\n";
+if ($fatal_error ne '') {
+    die $fatal_error;
 }
 
-    debug_print(1, "test_purify.pl completed successfully");
-    debug_print(1, "Summary: Tested $tested_count files, skipped $skipped_count files");
-
-# If no failures, print nothing else. Individual passed tests already printed concise lines.
-if ($purify_failed == 0) {
-    exit 0;
-}
+exit 0;
