@@ -28,12 +28,24 @@ pub fn generate_xargs_command_with_output(
     let mut command = "echo";
     let mut args = Vec::new();
     let mut max_args = 1; // Default to 1 argument per command
+                          // Optional placeholder value for -I
+    let mut replace_placeholder: Option<String> = None;
 
     // Parse xargs arguments
     let mut i = 0;
     while i < cmd.args.len() {
         if let Word::Literal(arg_str, _) = &cmd.args[i] {
-            if arg_str == "grep" {
+            // Detect -I and -I<placeholder> forms
+            if arg_str == "-I" {
+                if i + 1 < cmd.args.len() {
+                    if let Word::Literal(ph, _) = &cmd.args[i + 1] {
+                        replace_placeholder = Some(ph.clone());
+                        i += 1; // consume placeholder
+                    }
+                }
+            } else if arg_str.starts_with("-I") && arg_str.len() > 2 {
+                replace_placeholder = Some(arg_str[2..].to_string());
+            } else if arg_str == "grep" {
                 command = "grep";
             } else if arg_str == "-l" {
                 // This will be handled in the grep logic
@@ -130,6 +142,38 @@ pub fn generate_xargs_command_with_output(
         output.push_str(&generator.indent());
         output.push_str("}\n");
     } else {
+        // If -I was provided, build a reusable template of the command's
+        // arguments (everything after the command name). We'll emit a
+        // non-interpolating Perl literal for each template element so we can
+        // safely substitute the placeholder at runtime.
+        let mut xargs_template_literals: Vec<String> = Vec::new();
+        if let Some(_) = &replace_placeholder {
+            // Find the position of the command name (first non-flag word)
+            let mut cmd_pos: Option<usize> = None;
+            for (idx, arg) in cmd.args.iter().enumerate() {
+                match arg {
+                    Word::Literal(s, _) => {
+                        if !s.starts_with('-') {
+                            cmd_pos = Some(idx);
+                            break;
+                        }
+                    }
+                    Word::StringInterpolation(_, _) => {
+                        // Treat an interpolation as a potential command name
+                        cmd_pos = Some(idx);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(pos) = cmd_pos {
+                for arg in cmd.args.iter().skip(pos + 1) {
+                    // Emit each template element as a non-interpolating Perl literal
+                    xargs_template_literals.push(generator.perl_string_literal_no_interp(arg));
+                }
+            }
+        }
         // Handle xargs with command execution
         // Split input on newlines to preserve filenames that may contain spaces.
         output.push_str(&format!(
@@ -151,56 +195,155 @@ pub fn generate_xargs_command_with_output(
 
         if command == "echo" {
             // Handle echo command
-            output.push_str(&format!("    my $xargs_line_{} = q{{}};\n", command_index));
+            if let Some(ph) = &replace_placeholder {
+                // Build a simple runtime template from provided args (joined with spaces)
+                let joined = if args.is_empty() {
+                    String::new()
+                } else {
+                    args.join(" ")
+                };
 
-            // Add the echo prefix if we have args
-            if !args.is_empty() {
+                let template_literal = if joined.is_empty() {
+                    "q{}".to_string()
+                } else {
+                    format!("q{{{}}}", joined)
+                };
+
                 output.push_str(&format!(
-                    "    $xargs_line_{} .= \"{}\";\n",
-                    command_index, args[0]
+                    "    my $xargs_template_{} = {};\n",
+                    command_index, template_literal
+                ));
+                output.push_str(&format!(
+                    "    foreach my $arg (@xargs_args_{}) {{\n",
+                    command_index
+                ));
+                output.push_str(&format!(
+                    "        my $xargs_line_{} = $xargs_template_{};\n",
+                    command_index, command_index
+                ));
+                output.push_str(&format!(
+                    "        my $ph_{} = q{{{}}};\n",
+                    command_index, ph
+                ));
+                output.push_str(&format!(
+                    "        $xargs_line_{} =~ s/\\Q$ph_{}\\E/$arg/g;\n",
+                    command_index, command_index
+                ));
+                output.push_str(&format!(
+                    "        push @xargs_output_{}, $xargs_line_{};\n",
+                    command_index, command_index
+                ));
+                output.push_str("    }\n");
+            } else {
+                output.push_str(&format!("    my $xargs_line_{} = q{{}};\n", command_index));
+
+                // Add the echo prefix if we have args
+                if !args.is_empty() {
+                    output.push_str(&format!(
+                        "    $xargs_line_{} .= \"{}\";\n",
+                        command_index, args[0]
+                    ));
+                }
+
+                // Add the input arguments
+                output.push_str(&format!(
+                    "    foreach my $arg (@xargs_args_{}) {{\n",
+                    command_index
+                ));
+                output.push_str(&format!(
+                    "        $xargs_line_{} .= q{{ }} . $arg;\n",
+                    command_index
+                ));
+                output.push_str("    }\n");
+
+                output.push_str(&format!(
+                    "    push @xargs_output_{}, $xargs_line_{};\n",
+                    command_index, command_index
                 ));
             }
-
-            // Add the input arguments
-            output.push_str(&format!(
-                "    foreach my $arg (@xargs_args_{}) {{\n",
-                command_index
-            ));
-            output.push_str(&format!(
-                "        $xargs_line_{} .= q{{ }} . $arg;\n",
-                command_index
-            ));
-            output.push_str("    }\n");
-
-            output.push_str(&format!(
-                "    push @xargs_output_{}, $xargs_line_{};\n",
-                command_index, command_index
-            ));
         } else {
             // Handle other commands
             output.push_str(&format!(
                 "    my ($in_{}, $out_{}, $err_{});\n",
                 command_index, command_index, command_index
             ));
-            output.push_str(&format!(
-                "    my $pid_{} = open3($in_{}, $out_{}, $err_{}, '{}', @xargs_args_{});\n",
-                command_index, command_index, command_index, command_index, command, command_index
-            ));
-            output.push_str(&format!(
-                "    close $in_{} or croak 'Close failed: $OS_ERROR';\n",
-                command_index
-            ));
-            output.push_str(&format!("    my $xargs_result_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out_{}> }};\n", command_index, command_index));
-            output.push_str(&format!(
-                "    close $out_{} or croak 'Close failed: $OS_ERROR';\n",
-                command_index
-            ));
-            output.push_str(&format!("    waitpid $pid_{}, 0;\n", command_index));
-            output.push_str(&format!("    chomp $xargs_result_{};\n", command_index));
-            output.push_str(&format!(
-                "    push @xargs_output_{}, $xargs_result_{};\n",
-                command_index, command_index
-            ));
+
+            if replace_placeholder.is_some() && !xargs_template_literals.is_empty() {
+                // Emit a template array and build per-invocation args with placeholder substitution
+                output.push_str(&format!(
+                    "    my @xargs_template_{} = ({});\n",
+                    command_index,
+                    xargs_template_literals.join(", ")
+                ));
+
+                output.push_str(&format!(
+                    "    foreach my $item (@xargs_args_{}) {{\n",
+                    command_index
+                ));
+                output.push_str(&format!(
+                    "        my @args_for_invocation_{} = @xargs_template_{};\n",
+                    command_index, command_index
+                ));
+                output.push_str(&format!(
+                    "        my $ph_{} = q{{{}}};\n",
+                    command_index,
+                    replace_placeholder.as_ref().unwrap()
+                ));
+                output.push_str(&format!(
+                    "        for my $k (0..$#args_for_invocation_{}) {{ $args_for_invocation_{}[$k] =~ s/\\Q$ph_{}\\E/$item/g; }}\n",
+                    command_index, command_index, command_index
+                ));
+                // Call open3 with the substituted args
+                output.push_str(&format!(
+                    "        my $pid_{} = open3($in_{}, $out_{}, $err_{}, '{}', @args_for_invocation_{});\n",
+                    command_index, command_index, command_index, command_index, command, command_index
+                ));
+                output.push_str(&format!(
+                    "        close $in_{} or croak 'Close failed: $OS_ERROR';\n",
+                    command_index
+                ));
+                output.push_str(&format!(
+                    "        my $xargs_result_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out_{}> }};\n",
+                    command_index, command_index
+                ));
+                output.push_str(&format!(
+                    "        close $out_{} or croak 'Close failed: $OS_ERROR';\n",
+                    command_index
+                ));
+                output.push_str(&format!("        waitpid $pid_{}, 0;\n", command_index));
+                output.push_str(&format!("        chomp $xargs_result_{};\n", command_index));
+                output.push_str(&format!(
+                    "        push @xargs_output_{}, $xargs_result_{};\n",
+                    command_index, command_index
+                ));
+                output.push_str("    }\n");
+            } else {
+                // No placeholder templates - fall back to previous behaviour
+                output.push_str(&format!(
+                    "    my $pid_{} = open3($in_{}, $out_{}, $err_{}, '{}', @xargs_args_{});\n",
+                    command_index,
+                    command_index,
+                    command_index,
+                    command_index,
+                    command,
+                    command_index
+                ));
+                output.push_str(&format!(
+                    "    close $in_{} or croak 'Close failed: $OS_ERROR';\n",
+                    command_index
+                ));
+                output.push_str(&format!("    my $xargs_result_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out_{}> }};\n", command_index, command_index));
+                output.push_str(&format!(
+                    "    close $out_{} or croak 'Close failed: $OS_ERROR';\n",
+                    command_index
+                ));
+                output.push_str(&format!("    waitpid $pid_{}, 0;\n", command_index));
+                output.push_str(&format!("    chomp $xargs_result_{};\n", command_index));
+                output.push_str(&format!(
+                    "    push @xargs_output_{}, $xargs_result_{};\n",
+                    command_index, command_index
+                ));
+            }
         }
 
         output.push_str("}\n");

@@ -9,6 +9,7 @@ fn generate_ls_helper(
     add_slash_to_dirs: bool,
     sort_by_time: bool,
     show_hidden: bool,
+    long_format: bool,
 ) -> String {
     let mut output = String::new();
 
@@ -115,6 +116,24 @@ fn generate_ls_helper(
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
+    }
+
+    // If long format (-l) was requested, prefix each entry with a leading
+    // character similar to `ls -l`: '-' for regular files and 'd' for
+    // directories. We conservatively check both the entry as-is and the
+    // entry under the listed directory path so both glob and readdir
+    // results are handled.
+    if long_format {
+        let dir_literal = if dir == "." {
+            "q{.}".to_string()
+        } else {
+            generator.perl_string_literal_no_interp(&Word::literal(dir.to_string()))
+        };
+        output.push_str(&generator.indent());
+        output.push_str(&format!(
+            "@{} = map {{ my $isdir = (-d $_ || -d ( {} . q{{/}} . $_ )); ($isdir ? 'd ' : '- ') . $_ }} @{};\n",
+            array_name, dir_literal, array_name
+        ));
     }
 
     output
@@ -540,6 +559,7 @@ pub fn generate_ls_command(
                 add_slash_to_dirs,
                 sort_by_time,
                 show_hidden,
+                _long_format,
             ));
         }
 
@@ -654,6 +674,7 @@ pub fn generate_ls_command(
                 add_slash_to_dirs,
                 sort_by_time,
                 show_hidden,
+                _long_format,
             ));
         }
 
@@ -795,6 +816,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
             add_slash_to_dirs,
             false,
             show_hidden,
+            _long_format,
         ));
     }
 
