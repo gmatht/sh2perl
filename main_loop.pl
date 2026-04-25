@@ -99,7 +99,7 @@ while (1) {
         $passed = $count if $count > 0;
     }
 
-    # Load previous max tests + matching lines from file
+    # Load previous max tests + matching lines from the summary line printed by test_purify.pl
     my $max_file = '.max_tests_passed';
     my $old_max = 0;
     my $old_matching = 0;
@@ -118,25 +118,29 @@ while (1) {
         }
     }
 
-    # Read matching-first-lines value written by the test harness
-    sub read_matching_lines_from_first_file {
-        my $file = 'first_n_tests_passed.txt';
-        my $matching = 0;
-        if (-e $file) {
-            if (open my $fh, '<', $file) {
-                my $c = <$fh>;
-                close $fh;
-                if (defined $c && $c =~ /:y0*([0-9]+)/) {
-                    $matching = $1 + 0;
+    sub read_summary_metrics_from_output {
+        my ($text) = @_;
+        my ($passed_tests, $matching_lines) = (0, 0);
+        if (defined $text) {
+            my @lines = split /\n/, $text;
+            for (my $i = $#lines; $i >= 0; $i--) {
+                my $line = $lines[$i];
+                next unless defined $line && $line =~ /\S/;
+                if ($line =~ /^PROGRESS (\d+):(\d+)$/) {
+                    ($passed_tests, $matching_lines) = ($1 + 0, $2 + 0);
                 }
+                last;
             }
         }
-        return $matching;
+        return ($passed_tests, $matching_lines);
     }
+
+    my ($summary_passed, $summary_matching) = read_summary_metrics_from_output($output);
+    $passed = $summary_passed if $summary_passed > 0;
 
     if ($passed > $old_max) {
         # More tests passed: record and commit
-        my $new_matching = read_matching_lines_from_first_file();
+        my $new_matching = $summary_matching;
         if (open my $mf, '>', $max_file) {
             print $mf "$passed:$new_matching";
             close $mf;
@@ -148,7 +152,7 @@ while (1) {
         system('git', 'commit', '.', '-m', $msg);
     } elsif ($passed == $old_max) {
         # Same number of passed tests — prefer greater number of matching first lines
-        my $new_matching = read_matching_lines_from_first_file();
+        my $new_matching = $summary_matching;
         if ($new_matching > $old_matching) {
             if (open my $mf, '>', $max_file) {
                 print $mf "$passed:$new_matching";
