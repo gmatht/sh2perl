@@ -79,6 +79,7 @@ while (1) {
     if ($exit_code == 0) {
         print $output;
         print "\nAll errors are fixed.\n";
+        system('perl', './main_loop_rust.pl');
         last;
     }
 
