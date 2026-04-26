@@ -864,7 +864,7 @@ fn generate_system_call_fallback(
     if input_var.is_empty() {
         // First command in pipeline - pass program name and args directly to open3
         format!(
-            "\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
+            "\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
             in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var
         )
     } else {
@@ -880,7 +880,7 @@ fn generate_system_call_fallback(
         // text is preserved exactly.
         let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
         format!(
-            "\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
+            "\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
             in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_lit, in_var, output_var, out_var, out_var, pid_var
         )
     }
