@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/026_touch_basic.pl" }
+BEGIN { $0 = "/home/runner/work/sh2perl/sh2perl/examples.impurl/026_touch_basic.pl" }
 
 
 print "=== Example 026: Basic touch command ===\n";
