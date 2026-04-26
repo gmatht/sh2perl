@@ -1,6 +1,6 @@
 use Carp;
 #!/usr/bin/perl
-BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/025_mkdir_basic.pl" }
+BEGIN { $0 = "/home/runner/work/sh2perl/sh2perl/examples.impurl/025_mkdir_basic.pl" }
 
 
 print "=== Example 025: Basic mkdir command ===\n";

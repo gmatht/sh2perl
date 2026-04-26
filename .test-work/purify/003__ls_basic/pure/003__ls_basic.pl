@@ -1,4 +1,4 @@
-BEGIN { $0 = "/home/llm/src/sh2perl/examples.impurl/003__ls_basic.pl" }
+BEGIN { $0 = "/home/runner/work/sh2perl/sh2perl/examples.impurl/003__ls_basic.pl" }
 print 'Working Directory:';
 do {
     my $__PURIFY_TMP = do {
