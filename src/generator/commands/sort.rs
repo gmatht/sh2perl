@@ -135,6 +135,30 @@ pub fn generate_sort_command_with_output(
         ));
         output.push_str("    $a_num <=> $b_num || $a cmp $b\n");
         output.push_str(&format!("}} @sort_lines_{};\n", command_index));
+    } else if let Some(key_idx) = key_index_opt {
+        // Non-numeric sort with a specific key field (-kN)
+        let split_pat = if let Some(d) = &delim_opt {
+            let esc = escape(d);
+            generator.format_regex_pattern(&esc)
+        } else {
+            generator.format_regex_pattern(r"\s+")
+        };
+        output.push_str(&format!(
+            "my @sort_sorted_{} = sort {{\n",
+            command_index
+        ));
+        output.push_str(&format!("    my @a_fields = split {}, $a;\n", split_pat));
+        output.push_str(&format!("    my @b_fields = split {}, $b;\n", split_pat));
+        output.push_str(&format!(
+            "    my $a_key = (scalar @a_fields > {}) ? $a_fields[{}] : q{{}};\n",
+            key_idx, key_idx
+        ));
+        output.push_str(&format!(
+            "    my $b_key = (scalar @b_fields > {}) ? $b_fields[{}] : q{{}};\n",
+            key_idx, key_idx
+        ));
+        output.push_str("    $a_key cmp $b_key || $a cmp $b\n");
+        output.push_str(&format!("}} @sort_lines_{};\n", command_index));
     } else {
         output.push_str(&format!(
             "my @sort_sorted_{} = sort @sort_lines_{};\n",

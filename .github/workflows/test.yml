@@ -25,6 +25,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Install Perl dependencies
+        run: sudo apt-get install -y libppi-perl
+
       - name: Build debashc
         run: cargo build
 
