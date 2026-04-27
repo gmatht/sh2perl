@@ -638,6 +638,18 @@ sub process_single_backtick_string {
         #    declared in the do-block context. Remove those assignment lines.
         $perl_result =~ s/[ \t]*if\s*\(\s*!\s*\$pipeline_success_\d+\s*\)\s*\{\s*\$main_exit_code\s*=\s*1;\s*\}[ \t]*\n?//g;
 
+        # 3. Debashc generates open3($in_N, $out_N, $err_N, ...) where $err_N
+        #    is an uninitialized scalar.  IPC::Open3 treats a false/undef
+        #    CHLD_ERR as "merge child stderr into the stdout pipe", which
+        #    differs from backtick semantics (child stderr goes to the
+        #    parent's stderr).  Replace the uninitialized err variable with
+        #    ">&STDERR" so the child inherits the parent's stderr fd,
+        #    matching backtick behaviour.  Also remove the now-unused $err_N
+        #    from the my() declaration immediately above it.
+        $perl_result =~ s/\bopen3\s*\((\s*\$\w+\s*,\s*\$\w+\s*),\s*\$\w+\s*,/open3($1, ">&STDERR",/g;
+        # Remove trailing $err_N from a 3-variable my() declaration.
+        $perl_result =~ s/(my\s*\(\s*\$\w+\s*,\s*\$\w+\s*),\s*\$\w+(\s*\);)/$1$2/g;
+
         # If debashc generated pure Perl without any shell execution (no
         # qx{}/exec/open3/system) for a `yes ... | head/tail` pipeline, the
         # conversion omits shell-level side effects: specifically, the
@@ -656,7 +668,7 @@ sub process_single_backtick_string {
             my $open3_inner = "do {\n"
                 . "    require IPC::Open3;\n"
                 . "    my \$__bt_out;\n"
-                . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, \\*STDERR, 'sh', '-c', $cmd_lit);\n"
+                . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, '>&STDERR', 'sh', '-c', $cmd_lit);\n"
                 . "    close \$__bt_in;\n"
                 . "    local \$/ = undef;\n"
                 . "    my \$__bt_result = <\$__bt_out>;\n"
@@ -751,7 +763,7 @@ sub process_single_backtick_string {
         # Fallback: capture command output via open3 (avoids keeping a backtick
         # that would fail the purification check and avoids running a shell).
         my $cmd_lit = _perl_quote_literal_no_interp($command);
-        # Use \*STDERR so child stderr is inherited from the parent (not
+        # Use ">&STDERR" so child stderr is inherited from the parent (not
         # captured into the stdout pipe). Passing '' is false, which on some
         # IPC::Open3 versions redirects child stderr to the stdout pipe and
         # causes stderr messages to appear inside the captured result instead
@@ -759,7 +771,7 @@ sub process_single_backtick_string {
         my $open3_inner = "do {\n"
             . "    require IPC::Open3;\n"
             . "    my \$__bt_out;\n"
-            . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, \\*STDERR, 'sh', '-c', $cmd_lit);\n"
+            . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, '>&STDERR', 'sh', '-c', $cmd_lit);\n"
             . "    close \$__bt_in;\n"
             . "    local \$/ = undef;\n"
             . "    my \$__bt_result = <\$__bt_out>;\n"
