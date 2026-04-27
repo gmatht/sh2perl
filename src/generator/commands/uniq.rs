@@ -40,15 +40,20 @@ pub fn generate_uniq_command_with_output(
     ));
     if count {
         output.push_str(&format!("my %uniq_counts_{};\n", command_index));
+        output.push_str(&format!("my @uniq_order_{};\n", command_index));
         output.push_str(&format!(
             "foreach my $line (@uniq_lines_{}) {{\n",
             command_index
+        ));
+        output.push_str(&format!(
+            "if (!exists $uniq_counts_{}{{$line}}) {{ push @uniq_order_{}, $line; }}\n",
+            command_index, command_index
         ));
         output.push_str(&format!("$uniq_counts_{}{{$line}}++;\n", command_index));
         output.push_str("}\n");
         output.push_str(&format!("my @uniq_result_{};\n", command_index));
         output.push_str(&format!(
-            "foreach my $line (keys %uniq_counts_{}) {{\n",
+            "foreach my $line (@uniq_order_{}) {{\n",
             command_index
         ));
         output.push_str(&format!(
