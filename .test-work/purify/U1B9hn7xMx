@@ -1,3 +1,0 @@
-String found where operator expected (Do you need to predeclare "carp"?) at /mnt/d/GitHub/sh2perl/.test-work/purify/020_diff_basic/pure/020_diff_basic.pl line 35, near "carp "Cannot execute diff command: $OS_ERROR""
-syntax error at /mnt/d/GitHub/sh2perl/.test-work/purify/020_diff_basic/pure/020_diff_basic.pl line 35, near "carp "Cannot execute diff command: $OS_ERROR""
-Execution of /mnt/d/GitHub/sh2perl/.test-work/purify/020_diff_basic/pure/020_diff_basic.pl aborted due to compilation errors.
