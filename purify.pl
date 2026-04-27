@@ -650,17 +650,21 @@ sub process_single_backtick_string {
         # Remove trailing $err_N from a 3-variable my() declaration.
         $perl_result =~ s/(my\s*\(\s*\$\w+\s*,\s*\$\w+\s*),\s*\$\w+(\s*\);)/$1$2/g;
 
-        # If debashc generated pure Perl without any shell execution (no
-        # qx{}/exec/open3/system) for a `yes ... | head/tail` pipeline, the
+        # If debashc converted a `yes ... | head/tail` pipeline to pure Perl
+        # (possibly with open3 for a later stage such as `wc`), the
         # conversion omits shell-level side effects: specifically, the
         # "yes: standard output: Broken pipe" message that GNU yes writes to
-        # stderr when head/tail closes the pipe early.  Return an IPC::Open3
-        # shell-execution block which preserves all shell-level behaviors
-        # including stderr.
+        # stderr when head/tail closes the pipe early.  Fall back to
+        # IPC::Open3 shell execution unconditionally for any yes-with-pipe
+        # backtick, which preserves all shell-level behaviours including
+        # stderr.  We intentionally do NOT filter on whether the debashc
+        # result already contains open3 calls: debashc may include open3
+        # only for a downstream stage (e.g. wc) while still converting the
+        # yes loop to bounded pure-Perl, which would miss the broken-pipe
+        # signal.
         if (defined $perl_result
             && $command =~ /\byes\b.*\|/
             && $perl_result !~ /\bqx\b/
-            && $perl_result !~ /\bopen3\b/
             && $perl_result !~ /\bexec\b/
             && $perl_result !~ /\bsystem\b/) {
             print "DEBUG: debashc generated pure-Perl for 'yes' pipeline; falling back to IPC::Open3\n" if $verbose;
