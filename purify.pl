@@ -349,7 +349,9 @@ sub _build_fork_exec_for_expr {
         my ($exe, $exe_q) = ref($tokens[0]) eq 'ARRAY' ? @{$tokens[0]} : ($tokens[0], 'bare');
         if ($exe eq 'sh' || $exe eq 'bash') {
             my ($flag, $flag_q) = ref($tokens[1]) eq 'ARRAY' ? @{$tokens[1]} : ($tokens[1], 'bare');
-            if ($flag =~ /^-c$/ && @tokens >= 3) {
+            # Normalize surrounding whitespace before matching (handles e.g. ' -c' with a leading space)
+            (my $normalized_flag = $flag) =~ s/^\s+|\s+$//g;
+            if ($normalized_flag eq '-c' && @tokens >= 3) {
                 my $exe_lit  = _perl_quote_literal_with_pref($exe,  $exe_q);
                 my $flag_lit = _perl_quote_literal_with_pref($flag, $flag_q);
                 my @cmd_parts = @tokens[2..$#tokens];
@@ -388,11 +390,17 @@ sub _build_fork_exec_for_expr {
         return "my \$pid = fork; if (!defined \$pid) { die \"fork failed: \" . \$!; } elsif (\$pid == 0) { exec('sh', '-c', $cmd_lit); die \"exec failed: \" . \$!; } else { waitpid(\$pid, 0); }\n\$?";
     }
 
-    # General multi-arg: exec directly with the args
+    # General multi-arg: exec directly with the args.
+    # Decode single- and double-quoted token content before re-quoting to
+    # avoid double-escaping (PPI's string() returns raw inner text with e.g.
+    # \' not yet decoded, so decoding first ensures a clean round-trip).
     my @perl_args;
     for my $t (@tokens) {
         my ($txt, $q) = ref($t) eq 'ARRAY' ? @{$t} : ($t, 'bare');
-        push @perl_args, _perl_quote_literal_with_pref($txt, $q);
+        my $decoded = ($q && $q eq 'single') ? decode_perl_single_quoted_string($txt)
+                    : ($q && $q eq 'double') ? decode_perl_double_quoted_string($txt)
+                    : $txt;
+        push @perl_args, _perl_quote_literal_with_pref($decoded, $q);
     }
     my $args_str = join(', ', @perl_args);
     return "my \$pid = fork; if (!defined \$pid) { die \"fork failed: \" . \$!; } elsif (\$pid == 0) { exec($args_str); die \"exec failed: \" . \$!; } else { waitpid(\$pid, 0); }\n\$?";
@@ -630,6 +638,36 @@ sub process_single_backtick_string {
         #    declared in the do-block context. Remove those assignment lines.
         $perl_result =~ s/[ \t]*if\s*\(\s*!\s*\$pipeline_success_\d+\s*\)\s*\{\s*\$main_exit_code\s*=\s*1;\s*\}[ \t]*\n?//g;
 
+        # If debashc generated pure Perl without any shell execution (no
+        # qx{}/exec/open3/system) for a `yes ... | head/tail` pipeline, the
+        # conversion omits shell-level side effects: specifically, the
+        # "yes: standard output: Broken pipe" message that GNU yes writes to
+        # stderr when head/tail closes the pipe early.  Return an IPC::Open3
+        # shell-execution block which preserves all shell-level behaviors
+        # including stderr.
+        if (defined $perl_result
+            && $command =~ /\byes\b.*\|/
+            && $perl_result !~ /\bqx\b/
+            && $perl_result !~ /\bopen3\b/
+            && $perl_result !~ /\bexec\b/
+            && $perl_result !~ /\bsystem\b/) {
+            print "DEBUG: debashc generated pure-Perl for 'yes' pipeline; falling back to IPC::Open3\n" if $verbose;
+            my $cmd_lit = _perl_quote_literal_no_interp($command);
+            my $open3_inner = "do {\n"
+                . "    require IPC::Open3;\n"
+                . "    my \$__bt_out;\n"
+                . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, '', 'sh', '-c', $cmd_lit);\n"
+                . "    close \$__bt_in;\n"
+                . "    local \$/ = undef;\n"
+                . "    my \$__bt_result = <\$__bt_out>;\n"
+                . "    close \$__bt_out;\n"
+                . "    waitpid(-1, 0);\n"
+                . "    \$__bt_result\n"
+                . "}";
+            my $open3_code = defined $var_name ? $open3_inner : "__bt($open3_inner)";
+            return defined $var_name ? "$prefix$var_name = $open3_inner;" : $open3_code;
+        }
+
         print "DEBUG: Got perl result for backtick: [$perl_result]\n" if $verbose;
         # Sanitize debashc inline backtick snippets: debashc sometimes emits
         # a Perl assignment where the assigned command string contains
@@ -717,8 +755,8 @@ sub process_single_backtick_string {
         # them as filehandles without needing Symbol::gensym().
         my $open3_inner = "do {\n"
             . "    require IPC::Open3;\n"
-            . "    my (\$__bt_out, \$__bt_err);\n"
-            . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, \$__bt_err, 'sh', '-c', $cmd_lit);\n"
+            . "    my \$__bt_out;\n"
+            . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, '', 'sh', '-c', $cmd_lit);\n"
             . "    close \$__bt_in;\n"
             . "    local \$/ = undef;\n"
             . "    my \$__bt_result = <\$__bt_out>;\n"
