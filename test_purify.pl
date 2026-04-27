@@ -436,64 +436,91 @@ PERL_SCRIPT
                 }
                 debug_print(2, "Purification check passed - no system calls or backticks found");
 
-                # Run original file
+                # Run original file — capture stdout and stderr to separate files
                 debug_print(2, "Running original file: $perl_file");
-                my ($out1_fh, $out1_path) = tempfile(DIR => $workspace_root);
-                close $out1_fh;
-                my ($out1, $perl1_result) = run_backticks_with_timeout("$perl_cmd \"$perl_file\" > \"$out1_path\" 2>&1", 'perl_execution', "original file execution");
+                my ($out1_stdout_fh, $out1_stdout) = tempfile(DIR => $workspace_root);
+                close $out1_stdout_fh;
+                my ($out1_stderr_fh, $out1_stderr) = tempfile(DIR => $workspace_root);
+                close $out1_stderr_fh;
+                my ($out1, $perl1_result) = run_backticks_with_timeout(
+                    "$perl_cmd \"$perl_file\" > \"$out1_stdout\" 2> \"$out1_stderr\"",
+                    'perl_execution', "original file execution");
                 debug_print(2, "Original file execution result: $perl1_result");
 
-                # Run purified file
+                # Run purified file — separate stdout and stderr
                 debug_print(2, "Running purified file: $pure_file");
-                my ($out2_fh, $out2_path) = tempfile(DIR => $workspace_root);
-                close $out2_fh;
-                my ($out2, $perl2_result) = run_backticks_with_timeout("$perl_cmd \"$pure_file\" > \"$out2_path\" 2>&1", 'perl_execution', "purified file execution");
+                my ($out2_stdout_fh, $out2_stdout) = tempfile(DIR => $workspace_root);
+                close $out2_stdout_fh;
+                my ($out2_stderr_fh, $out2_stderr) = tempfile(DIR => $workspace_root);
+                close $out2_stderr_fh;
+                my ($out2, $perl2_result) = run_backticks_with_timeout(
+                    "$perl_cmd \"$pure_file\" > \"$out2_stdout\" 2> \"$out2_stderr\"",
+                    'perl_execution', "purified file execution");
                 debug_print(2, "Purified file execution result: $perl2_result");
 
-                # Compare outputs by reading the actual files
-                my $file1_content = do {
+                # Helper to slurp a file
+                my $slurp = sub {
+                    my ($path) = @_;
                     local $/;
-                    open my $fh, '<', $out1_path or die "Cannot open $out1_path: $!";
-                    <$fh>;
-                };
-                my $file2_content = do {
-                    local $/;
-                    open my $fh, '<', $out2_path or die "Cannot open $out2_path: $!";
-                    <$fh>;
+                    open my $fh, '<', $path or die "Cannot open $path: $!";
+                    scalar <$fh>;
                 };
 
-                if ( $file1_content ne $file2_content ) {
+                my $file1_stdout = $slurp->($out1_stdout);
+                my $file1_stderr = $slurp->($out1_stderr);
+                my $file2_stdout = $slurp->($out2_stdout);
+                my $file2_stderr = $slurp->($out2_stderr);
+
+                my $stdout_match = ($file1_stdout eq $file2_stdout);
+                my $stderr_match = ($file1_stderr eq $file2_stderr);
+
+                if ( !$stdout_match || !$stderr_match ) {
                     debug_print(1, "Output mismatch detected between original and purified files; re-running original to check for nondeterminism");
                     debug_print(2, " === purified === \n$output\n === end purified ===");
-                    $first_lines_match_in_failing_test = count_matching_leading_lines($file1_content, $file2_content);
+                    $first_lines_match_in_failing_test = count_matching_leading_lines($file1_stdout, $file2_stdout);
 
-                    my ($out1b_fh, $out1b_path) = tempfile(DIR => $workspace_root);
-                    close $out1b_fh;
-                    my ($out1b, $perl1b_result) = run_backticks_with_timeout("$perl_cmd \"$perl_file\" > \"$out1b_path\" 2>&1", 'perl_execution', "original file re-run");
-                    my $file1b_content = do {
-                        local $/;
-                        open my $fh, '<', $out1b_path or die "Cannot open $out1b_path: $!";
-                        <$fh>;
-                    };
+                    # Re-run original to detect nondeterminism
+                    my ($out1b_stdout_fh, $out1b_stdout) = tempfile(DIR => $workspace_root);
+                    close $out1b_stdout_fh;
+                    my ($out1b_stderr_fh, $out1b_stderr) = tempfile(DIR => $workspace_root);
+                    close $out1b_stderr_fh;
+                    my ($out1b, $perl1b_result) = run_backticks_with_timeout(
+                        "$perl_cmd \"$perl_file\" > \"$out1b_stdout\" 2> \"$out1b_stderr\"",
+                        'perl_execution', "original file re-run");
+                    my $file1b_stdout = $slurp->($out1b_stdout);
+                    my $file1b_stderr = $slurp->($out1b_stderr);
 
-                    if ($perl1_result != $perl1b_result || $file1_content ne $file1b_content) {
+                    if ($perl1_result != $perl1b_result
+                            || $file1_stdout ne $file1b_stdout
+                            || $file1_stderr ne $file1b_stderr) {
                         debug_print(1, "Nondeterministic test detected for $perl_file; skipping");
                         $skipped_count++;
                         $nondeterministic_skip = 1;
-                        unlink $out1_path, $out2_path, $out1b_path;
+                        unlink $out1_stdout, $out1_stderr, $out2_stdout, $out2_stderr, $out1b_stdout, $out1b_stderr;
                         # Remove any prior failure report for this workspace since the test is nondeterministic
                         my $maybe_failure = File::Spec->catfile($workspace_root, 'failure_report.txt');
                         unlink $maybe_failure if -e $maybe_failure;
                     } else {
-                        my $diff_command;
-                        if ($^O eq 'MSWin32') {
-                            # Use fc on Windows
-                            $diff_command = "fc \"$out1_path\" \"$out2_path\" 2>&1";
-                        } else {
-                            # Use diff on Unix systems
-                            $diff_command = "diff -u \"$out1_path\" \"$out2_path\" 2>&1";
+                        # Build combined diff for reporting (stdout diff + stderr diff)
+                        my $diff_output = '';
+                        if (!$stdout_match) {
+                            if ($^O eq 'MSWin32') {
+                                my ($d, undef) = run_backticks_with_timeout("fc \"$out1_stdout\" \"$out2_stdout\" 2>&1", 'diff_comparison', "stdout diff");
+                                $diff_output .= "=== stdout diff ===\n$d";
+                            } else {
+                                my ($d, undef) = run_backticks_with_timeout("diff -u \"$out1_stdout\" \"$out2_stdout\" 2>&1", 'diff_comparison', "stdout diff");
+                                $diff_output .= "=== stdout diff ===\n$d";
+                            }
                         }
-                        my ($diff_output, $diff_result) = run_backticks_with_timeout($diff_command, 'diff_comparison', "diff comparison");
+                        if (!$stderr_match) {
+                            if ($^O eq 'MSWin32') {
+                                my ($d, undef) = run_backticks_with_timeout("fc \"$out1_stderr\" \"$out2_stderr\" 2>&1", 'diff_comparison', "stderr diff");
+                                $diff_output .= "=== stderr diff ===\n$d";
+                            } else {
+                                my ($d, undef) = run_backticks_with_timeout("diff -u \"$out1_stderr\" \"$out2_stderr\" 2>&1", 'diff_comparison', "stderr diff");
+                                $diff_output .= "=== stderr diff ===\n$d";
+                            }
+                        }
                         # Store the failing test and the diff into the workspace for main_loop.pl to consume
                         write_failure_report($perl_file, $pure_file, 'output_mismatch', $diff_output);
                         print "FAILED: $example_name\n";
@@ -506,7 +533,7 @@ PERL_SCRIPT
                 if ($nondeterministic_skip) {
                     debug_print(1, "Skipping $perl_file after nondeterminism check");
                 } else {
-                    unlink $out1_path, $out2_path;
+                    unlink $out1_stdout, $out1_stderr, $out2_stdout, $out2_stderr;
                     $purify_passed++;
                     # Only print concise pass line for successful tests
                     print "PASSED: $example_name\n";
