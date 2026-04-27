@@ -40,7 +40,7 @@ print $error_handling;
 
 # Example 056: Advanced data validation
 print "\nExample 056: Advanced data validation\n";
-my $validation = `cat test_052.txt | awk 'NF != 2 {print "Invalid line: " $0}' | wc -l`;
+my $validation = `cat test_052.txt | awk 'NF != 2 {print "Invalid line: " \$0}' | wc -l`;
 chomp $validation;
 print "Invalid lines: $validation\n";
 
@@ -66,7 +66,7 @@ print "Lines with 'test': $counting";
 
 # Example 061: Advanced data formatting
 print "\nExample 061: Advanced data formatting\n";
-my $formatting = `cat test_052.txt | awk '{printf "%-10s %s\\n", $1, $2}'`;
+my $formatting = `cat test_052.txt | awk '{printf "%-10s %s\\n", \$1, \$2}'`;
 print $formatting;
 
 # Example 062: Advanced data extraction
@@ -81,23 +81,23 @@ print $manipulation;
 
 # Example 064: Advanced data processing
 print "\nExample 064: Advanced data processing\n";
-my $processing = `cat test_052.txt | awk '{print toupper($0)}' | sort -r`;
+my $processing = `cat test_052.txt | awk '{print toupper(\$0)}' | sort -r`;
 print $processing;
 
 # Example 065: Advanced data analysis
 print "\nExample 065: Advanced data analysis\n";
-my $analysis = `cat test_052.txt | awk '{sum += length($0)} END {print "Total characters: " sum}'`;
+my $analysis = `cat test_052.txt | awk '{sum += length(\$0)} END {print "Total characters: " sum}'`;
 print $analysis;
 
 # Example 066: Advanced data validation
 print "\nExample 066: Advanced data validation\n";
-my $validation2 = `cat test_052.txt | awk 'length($0) < 10 {print "Short line: " $0}' | wc -l`;
+my $validation2 = `cat test_052.txt | awk 'length(\$0) < 10 {print "Short line: " \$0}' | wc -l`;
 chomp $validation2;
 print "Short lines: $validation2\n";
 
 # Example 067: Advanced data transformation
 print "\nExample 067: Advanced data transformation\n";
-my $transformation2 = `cat test_052.txt | sed 's/Line/ITEM/g' | awk '{print "Processed: " $0}'`;
+my $transformation2 = `cat test_052.txt | sed 's/Line/ITEM/g' | awk '{print "Processed: " \$0}'`;
 print $transformation2;
 
 # Example 068: Advanced data filtering
@@ -117,7 +117,7 @@ print $counting2;
 
 # Example 071: Advanced data formatting
 print "\nExample 071: Advanced data formatting\n";
-my $formatting2 = `cat test_052.txt | awk '{printf "%-5s %s\\n", NR, $0}'`;
+my $formatting2 = `cat test_052.txt | awk '{printf "%-5s %s\\n", NR, \$0}'`;
 print $formatting2;
 
 # Example 072: Advanced data extraction
@@ -132,7 +132,7 @@ print $manipulation2;
 
 # Example 074: Advanced data processing
 print "\nExample 074: Advanced data processing\n";
-my $processing2 = `cat test_052.txt | awk '{print length($0) " " $0}' | sort -n`;
+my $processing2 = `cat test_052.txt | awk '{print length(\$0) " " \$0}' | sort -n`;
 print $processing2;
 
 # Example 075: Advanced data analysis
@@ -142,13 +142,13 @@ print $analysis2;
 
 # Example 076: Advanced data validation
 print "\nExample 076: Advanced data validation\n";
-my $validation3 = `cat test_052.txt | awk 'NF < 3 {print "Incomplete line: " $0}' | wc -l`;
+my $validation3 = `cat test_052.txt | awk 'NF < 3 {print "Incomplete line: " \$0}' | wc -l`;
 chomp $validation3;
 print "Incomplete lines: $validation3\n";
 
 # Example 077: Advanced data transformation
 print "\nExample 077: Advanced data transformation\n";
-my $transformation3 = `cat test_052.txt | sed 's/Line/ITEM/g' | awk '{print "Item " NR ": " $0}'`;
+my $transformation3 = `cat test_052.txt | sed 's/Line/ITEM/g' | awk '{print "Item " NR ": " \$0}'`;
 print $transformation3;
 
 # Example 078: Advanced data filtering
@@ -163,12 +163,12 @@ print $sorting3;
 
 # Example 080: Advanced data counting
 print "\nExample 080: Advanced data counting\n";
-my $counting3 = `cat test_052.txt | awk '{print $1}' | sort | uniq -c`;
+my $counting3 = `cat test_052.txt | awk '{print \$1}' | sort | uniq -c`;
 print $counting3;
 
 # Example 081: Advanced data formatting
 print "\nExample 081: Advanced data formatting\n";
-my $formatting3 = `cat test_052.txt | awk '{printf "%-10s %-10s %s\\n", $1, $2, $3}'`;
+my $formatting3 = `cat test_052.txt | awk '{printf "%-10s %-10s %s\\n", \$1, \$2, \$3}'`;
 print $formatting3;
 
 # Example 082: Advanced data extraction
@@ -183,23 +183,23 @@ print $manipulation3;
 
 # Example 084: Advanced data processing
 print "\nExample 084: Advanced data processing\n";
-my $processing3 = `cat test_052.txt | awk '{print toupper($0)}' | sort -r | head -2`;
+my $processing3 = `cat test_052.txt | awk '{print toupper(\$0)}' | sort -r | head -2`;
 print $processing3;
 
 # Example 085: Advanced data analysis
 print "\nExample 085: Advanced data analysis\n";
-my $analysis3 = `cat test_052.txt | awk '{sum += length($0)} END {print "Average line length: " sum/NR}'`;
+my $analysis3 = `cat test_052.txt | awk '{sum += length(\$0)} END {print "Average line length: " sum/NR}'`;
 print $analysis3;
 
 # Example 086: Advanced data validation
 print "\nExample 086: Advanced data validation\n";
-my $validation4 = `cat test_052.txt | awk 'length($0) > 20 {print "Long line: " $0}' | wc -l`;
+my $validation4 = `cat test_052.txt | awk 'length(\$0) > 20 {print "Long line: " \$0}' | wc -l`;
 chomp $validation4;
 print "Long lines: $validation4\n";
 
 # Example 087: Advanced data transformation
 print "\nExample 087: Advanced data transformation\n";
-my $transformation4 = `cat test_052.txt | sed 's/Line/ITEM/g' | awk '{print "Processed " NR ": " $0}'`;
+my $transformation4 = `cat test_052.txt | sed 's/Line/ITEM/g' | awk '{print "Processed " NR ": " \$0}'`;
 print $transformation4;
 
 # Example 088: Advanced data filtering
@@ -214,12 +214,12 @@ print $sorting4;
 
 # Example 090: Advanced data counting
 print "\nExample 090: Advanced data counting\n";
-my $counting4 = `cat test_052.txt | awk '{print $2}' | sort | uniq -c`;
+my $counting4 = `cat test_052.txt | awk '{print \$2}' | sort | uniq -c`;
 print $counting4;
 
 # Example 091: Advanced data formatting
 print "\nExample 091: Advanced data formatting\n";
-my $formatting4 = `cat test_052.txt | awk '{printf "%-5s %-10s %s\\n", NR, $1, $2}'`;
+my $formatting4 = `cat test_052.txt | awk '{printf "%-5s %-10s %s\\n", NR, \$1, \$2}'`;
 print $formatting4;
 
 # Example 092: Advanced data extraction
@@ -234,7 +234,7 @@ print $manipulation4;
 
 # Example 094: Advanced data processing
 print "\nExample 094: Advanced data processing\n";
-my $processing4 = `cat test_052.txt | awk '{print toupper($0)}' | sort | head -2`;
+my $processing4 = `cat test_052.txt | awk '{print toupper(\$0)}' | sort | head -2`;
 print $processing4;
 
 # Example 095: Advanced data analysis
@@ -244,13 +244,13 @@ print $analysis4;
 
 # Example 096: Advanced data validation
 print "\nExample 096: Advanced data validation\n";
-my $validation5 = `cat test_052.txt | awk 'NF < 2 {print "Too few fields: " $0}' | wc -l`;
+my $validation5 = `cat test_052.txt | awk 'NF < 2 {print "Too few fields: " \$0}' | wc -l`;
 chomp $validation5;
 print "Lines with too few fields: $validation5\n";
 
 # Example 097: Advanced data transformation
 print "\nExample 097: Advanced data transformation\n";
-my $transformation5 = `cat test_052.txt | sed 's/Line/ITEM/g' | awk '{print "Item " NR ": " $0}' | sort`;
+my $transformation5 = `cat test_052.txt | sed 's/Line/ITEM/g' | awk '{print "Item " NR ": " \$0}' | sort`;
 print $transformation5;
 
 # Example 098: Advanced data filtering
@@ -260,7 +260,7 @@ print $filtering5;
 
 # Example 099: Final advanced example
 print "\nExample 099: Final advanced example\n";
-my $final_example = `cat test_052.txt | awk '{print toupper($0)}' | tr ' ' '|' | sort -r | head -3`;
+my $final_example = `cat test_052.txt | awk '{print toupper(\$0)}' | tr ' ' '|' | sort -r | head -3`;
 print $final_example;
 
 # Clean up
