@@ -18,6 +18,7 @@ my $purify_tested=0;
 my $purify_passed=0;
 my $purify_failed=0;
 my $fatal_error = '';
+my @test_failures = ();  # collect all failures so tests continue past the first
 
 # Fine-grained timeout settings
 my %timeouts = (
@@ -495,9 +496,11 @@ PERL_SCRIPT
                         my ($diff_output, $diff_result) = run_backticks_with_timeout($diff_command, 'diff_comparison', "diff comparison");
                         # Store the failing test and the diff into the workspace for main_loop.pl to consume
                         write_failure_report($perl_file, $pure_file, 'output_mismatch', $diff_output);
-                        print_output_excerpt("Diff excerpt", $diff_output, 16);
-                        $fatal_error = "FAILED - Output mismatch for $perl_file -> $pure_file (diff exit code: $diff_result)\n";
-                        last TEST_FILE;
+                        print "FAILED: $example_name\n";
+                        print "Full diff for $perl_file -> $pure_file:\n$diff_output\n";
+                        push @test_failures, "FAILED - Output mismatch for $perl_file -> $pure_file";
+                        $purify_failed++;
+                        die "NEXT_TEST\n";
                     }
                 }
                 if ($nondeterministic_skip) {
@@ -511,28 +514,37 @@ PERL_SCRIPT
             } else {
                 debug_print(1, "✗ $perl_file: purify.pl failed (exit code: $purify_result)");
                 debug_print(1, "Error output: $output");
-                print_output_excerpt("purify.pl error output", $output, 8);
+                print "FAILED: $example_name\n";
+                print "purify.pl error output for $perl_file:\n$output\n";
                 # Record the purify.pl failure output for main_loop.pl
                 write_failure_report($perl_file, $pure_file, 'purify_execution_failed', $output);
                 $first_lines_match_in_failing_test = 0;
                 $purify_failed++;
-                # Quit on first failure
-                $fatal_error = "Stopping on first failure. Fix the issue and run again.\n";
-                last TEST_FILE;
+                push @test_failures, "FAILED - purify.pl failed for $perl_file";
+                die "NEXT_TEST\n";
             }
         };
 
         my $example_error = $@;
         chdir $original_dir or die "Cannot chdir back to $original_dir: $!\n";
+        next if $example_error eq "NEXT_TEST\n";  # test failed, already recorded above
         next if $example_error eq '' && $nondeterministic_skip;
         if ($example_error) {
-            $fatal_error = $example_error;
-            last TEST_FILE;
+            $purify_failed++;
+            push @test_failures, "ERROR in $perl_file: $example_error";
+            print "ERROR: $example_name ($example_error)";
+            next;
         }
     }
 }
 
 print_final_summary($purify_passed, $first_lines_match_in_failing_test, $purify_tested, $skipped_count, $purify_failed, $start_time);
+
+if (@test_failures) {
+    print "\n=== FAILED TESTS (" . scalar(@test_failures) . ") ===\n";
+    print "$_\n" for @test_failures;
+    die scalar(@test_failures) . " test(s) failed\n";
+}
 
 if ($fatal_error ne '') {
     die $fatal_error;

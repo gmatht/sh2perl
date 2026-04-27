@@ -656,7 +656,7 @@ sub process_single_backtick_string {
             my $open3_inner = "do {\n"
                 . "    require IPC::Open3;\n"
                 . "    my \$__bt_out;\n"
-                . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, '', 'sh', '-c', $cmd_lit);\n"
+                . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, \\*STDERR, 'sh', '-c', $cmd_lit);\n"
                 . "    close \$__bt_in;\n"
                 . "    local \$/ = undef;\n"
                 . "    my \$__bt_result = <\$__bt_out>;\n"
@@ -751,12 +751,15 @@ sub process_single_backtick_string {
         # Fallback: capture command output via open3 (avoids keeping a backtick
         # that would fail the purification check and avoids running a shell).
         my $cmd_lit = _perl_quote_literal_no_interp($command);
-        # Use plain scalars for open3 handles - IPC::Open3 will autovivify
-        # them as filehandles without needing Symbol::gensym().
+        # Use \*STDERR so child stderr is inherited from the parent (not
+        # captured into the stdout pipe). Passing '' is false, which on some
+        # IPC::Open3 versions redirects child stderr to the stdout pipe and
+        # causes stderr messages to appear inside the captured result instead
+        # of being written to the real STDERR at the correct time.
         my $open3_inner = "do {\n"
             . "    require IPC::Open3;\n"
             . "    my \$__bt_out;\n"
-            . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, '', 'sh', '-c', $cmd_lit);\n"
+            . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, \\*STDERR, 'sh', '-c', $cmd_lit);\n"
             . "    close \$__bt_in;\n"
             . "    local \$/ = undef;\n"
             . "    my \$__bt_result = <\$__bt_out>;\n"
