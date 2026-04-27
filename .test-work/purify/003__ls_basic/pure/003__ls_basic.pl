@@ -1,21 +1,10 @@
+sub __bt { my $s = join('', @_); wantarray ? (split /^/, $s, -1) : $s }
 BEGIN { $0 = "/home/runner/work/sh2perl/sh2perl/examples.impurl/003__ls_basic.pl" }
 print 'Working Directory:';
-do {
-    my $__PURIFY_TMP = do {
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use Cwd;
-my $pwd = getcwd();
-$pwd . "\n";
-
-    };
-    if (defined $__PURIFY_TMP && $__PURIFY_TMP ne q{}) {
-        print $__PURIFY_TMP;
-        if (!($__PURIFY_TMP =~ m{\n\z}msx)) { print "\n"; }
-    }
-};
+my $pid = fork;if (!defined $pid) { die "fork failed: " . $!; } elsif ($pid == 0) { exec('sh', '-c', 'pwd'); die "exec failed: " . $!; } else { waitpid($pid, 0); }
 
 print 'Files: ';
-my $ls_output = do {
+my $ls_output = __bt(do {
     my @ls_files_0 = ();
     if ( -f q{.} ) {
         push @ls_files_0, q{.};
@@ -32,5 +21,5 @@ my $ls_output = do {
     }
     (@ls_files_0 ? join("\n", @ls_files_0) . "\n" : q{});
 }
-;
+);
 print $ls_output;
