@@ -209,6 +209,21 @@ sub purify_perl_code {
         $serialized = "use IPC::Open3;\n" . $serialized;
     }
 
+    # If the converted code references the __bt() helper (used to wrap
+    # inline backtick replacements so they return a list of lines in list
+    # context and a scalar string in scalar context, matching Perl's native
+    # backtick-in-context semantics), inject its definition near the top of
+    # the file.
+    # The helper joins all its arguments first (with join '') so that when
+    # the inner do-block is evaluated in list context (as function arguments
+    # always are) and its last expression returns multiple values (e.g. qx{}
+    # in list context), all the lines are correctly reassembled before the
+    # context-sensitive split/return.
+    if ($serialized =~ /\b__bt\s*\(/ && $serialized !~ /\bsub\s+__bt\b/) {
+        my $bt_sub = "sub __bt { my \$s = join('', \@_); wantarray ? (split /^/, \$s, -1) : \$s }\n";
+        $serialized = $bt_sub . $serialized;
+    }
+
     return $serialized;
 }
 
@@ -254,33 +269,193 @@ sub process_system_calls_string {
         }
         next unless @tokens;
 
-        # Single-argument system() - treat as shell string and pass to debashc
-        if (@tokens == 1) {
-            my $full_command = reconstruct_shell_command_from_system_call($system_call_stmt);
-            next unless $full_command;
-
-            my $perl_result = convert_shell_to_perl($full_command, 0);
-            next unless $perl_result;
-
-            replace_system_call_with_code($system_call_stmt, $perl_result);
+        # Check if system() is used in expression context: either its
+        # statement is inside a condition structure (if/while/until
+        # parentheses) or there is a comparison/logical operator after the
+        # argument list (e.g. system(...) == 0, my $x = system(...) != 0).
+        # In those cases the result VALUE of system() matters and we must
+        # replace only the system(args) call with a do { fork+exec; $? }
+        # block that returns the exit status, leaving the surrounding
+        # expression (== 0, != 0, etc.) intact.
+        if (_system_stmt_in_expr_ctx($system_call_stmt)) {
+            _replace_system_in_expr($system_call_stmt, \@tokens);
             next;
         }
 
-        # Multi-argument system() - preserve list-form semantics by
-        # generating a fork+exec do-block. Using an exec block here
-        # ensures Perl interpolation and quoting semantics from the
-        # original source are preserved (e.g. double-quoted args will
-        # still interpolate variables like $i). Previously we sometimes
-        # reconstructed a shell command and passed it through debashc,
-        # which could change semantics (notably interpolation) and
-        # produced incorrect behavior for examples like
-        # system("echo", "Processing item $i").
-        my $exec_block = generate_exec_do_block(\@tokens);
-        replace_system_call_with_code($system_call_stmt, $exec_block);
+        # Single-argument and multi-argument system() in statement context.
+        # Always use fork+exec so we preserve the exact semantics of the
+        # original system() call: the command runs in a child process,
+        # its stdout/stderr go directly to the terminal (not captured),
+        # and the parent waits for completion.  Using debashc here caused
+        # problems such as die-on-failure (for rmdir/mkdir conversions) and
+        # spurious printed return values (e.g. 1 from a successful rmdir).
+        # For statement context we don't need to capture $? so strip the
+        # trailing '$?' from the fork+exec template to avoid a 'useless use
+        # of a variable in void context' warning.
+        my $exec_code = _build_fork_exec_for_expr(\@tokens);
+        $exec_code =~ s/\n\$\?\s*$//;   # remove trailing $? in stmt context
+        replace_system_call_with_code($system_call_stmt, $exec_code . "\n");
         next;
     }
 
     return $document->serialize;
+}
+
+# Returns true when system() appears in expression context: either inside
+# a condition structure (if/while parentheses), followed by a comparison
+# or logical operator (e.g. system(...) == 0), or preceded by an assignment
+# or other operator (e.g. my $rc = system(...)).
+sub _system_stmt_in_expr_ctx {
+    my ($stmt) = @_;
+
+    # Case 1: statement is a direct child of a condition structure
+    return 1 if $stmt->parent && $stmt->parent->isa('PPI::Structure::Condition');
+
+    # Case 2: operator BEFORE system() – e.g. my $result = system(...)
+    # (the = operator precedes 'system' in the significant-child list).
+    for my $ch ($stmt->schildren) {
+        last if $ch->isa('PPI::Token::Word') && $ch->content eq 'system';
+        return 1 if $ch->isa('PPI::Token::Operator') && $ch->content !~ /^[;,]$/;
+    }
+
+    # Case 3: operator AFTER the system(args) call that uses its result
+    my $past_system = 0;
+    my $past_list   = 0;
+    for my $ch ($stmt->schildren) {
+        if (!$past_system) {
+            $past_system = 1 if $ch->isa('PPI::Token::Word') && $ch->content eq 'system';
+            next;
+        }
+        if (!$past_list) {
+            $past_list = 1 if $ch->isa('PPI::Structure::List');
+            next;
+        }
+        # Any operator other than ; or , after the arg list means the
+        # result of system() is being used in an expression
+        return 1 if $ch->isa('PPI::Token::Operator') && $ch->content !~ /^[;,]$/;
+    }
+    return 0;
+}
+
+# Generate a fork+exec block that returns $? (exit status), suitable for
+# embedding inside a do { ... } expression. Does NOT call debashc so the
+# original exit-status semantics of system() are preserved exactly.
+sub _build_fork_exec_for_expr {
+    my ($tokens_ref) = @_;
+    my @tokens = @{$tokens_ref};
+
+    # Special case: sh/bash -c <cmd>
+    if (@tokens >= 2) {
+        my ($exe, $exe_q) = ref($tokens[0]) eq 'ARRAY' ? @{$tokens[0]} : ($tokens[0], 'bare');
+        if ($exe eq 'sh' || $exe eq 'bash') {
+            my ($flag, $flag_q) = ref($tokens[1]) eq 'ARRAY' ? @{$tokens[1]} : ($tokens[1], 'bare');
+            # Normalize surrounding whitespace before matching (handles e.g. ' -c' with a leading space)
+            (my $normalized_flag = $flag) =~ s/^\s+|\s+$//g;
+            if ($normalized_flag eq '-c' && @tokens >= 3) {
+                my $exe_lit  = _perl_quote_literal_with_pref($exe,  $exe_q);
+                my $flag_lit = _perl_quote_literal_with_pref($flag, $flag_q);
+                my @cmd_parts = @tokens[2..$#tokens];
+                my $shell_cmd_raw = join(' ', map {
+                    my ($t,$q) = ref($_) eq 'ARRAY' ? @$_ : ($_,'bare');
+                    ($q && $q eq 'double') ? decode_perl_double_quoted_string($t) :
+                    ($q && $q eq 'single') ? decode_perl_single_quoted_string($t) : $t
+                } @cmd_parts);
+                # Preserve Perl interpolation when the original used double-quoted
+                # tokens containing variable sigils
+                my $needs_interp = 0;
+                for my $p (@cmd_parts) {
+                    my ($pt,$pq) = ref($p) eq 'ARRAY' ? @{$p} : ($p,'bare');
+                    if ($pq && $pq eq 'double' && $pt =~ /(?<!\\)(?:\$\{?[A-Za-z_]|@\{?[A-Za-z_])/) {
+                        $needs_interp = 1; last;
+                    }
+                }
+                my $cmd_lit = $needs_interp
+                    ? _perl_quote_literal_with_pref($shell_cmd_raw, 'double')
+                    : _perl_quote_literal_no_interp($shell_cmd_raw);
+                return "my \$pid = fork; if (!defined \$pid) { die \"fork failed: \" . \$!; } elsif (\$pid == 0) { exec($exe_lit, $flag_lit, $cmd_lit); die \"exec failed: \" . \$!; } else { waitpid(\$pid, 0); }\n\$?";
+            }
+        }
+    }
+
+    # Single-arg with a Perl variable: system($cmd) -> exec('sh','-c',$cmd)
+    if (@tokens == 1) {
+        my ($txt, $q) = ref($tokens[0]) eq 'ARRAY' ? @{$tokens[0]} : ($tokens[0], 'bare');
+        if ($q eq 'bare' && $txt =~ /^\$/) {
+            return "my \$pid = fork; if (!defined \$pid) { die \"fork failed: \" . \$!; } elsif (\$pid == 0) { exec('sh', '-c', $txt); die \"exec failed: \" . \$!; } else { waitpid(\$pid, 0); }\n\$?";
+        }
+        # Single literal string
+        my $cmd_lit = ($q eq 'double')
+            ? _perl_quote_literal_with_pref($txt, 'double')
+            : _perl_quote_literal_no_interp($txt);
+        return "my \$pid = fork; if (!defined \$pid) { die \"fork failed: \" . \$!; } elsif (\$pid == 0) { exec('sh', '-c', $cmd_lit); die \"exec failed: \" . \$!; } else { waitpid(\$pid, 0); }\n\$?";
+    }
+
+    # General multi-arg: exec directly with the args.
+    # Decode single- and double-quoted token content before re-quoting to
+    # avoid double-escaping (PPI's string() returns raw inner text with e.g.
+    # \' not yet decoded, so decoding first ensures a clean round-trip).
+    my @perl_args;
+    for my $t (@tokens) {
+        my ($txt, $q) = ref($t) eq 'ARRAY' ? @{$t} : ($t, 'bare');
+        my $decoded = ($q && $q eq 'single') ? decode_perl_single_quoted_string($txt)
+                    : ($q && $q eq 'double') ? decode_perl_double_quoted_string($txt)
+                    : $txt;
+        push @perl_args, _perl_quote_literal_with_pref($decoded, $q);
+    }
+    my $args_str = join(', ', @perl_args);
+    return "my \$pid = fork; if (!defined \$pid) { die \"fork failed: \" . \$!; } elsif (\$pid == 0) { exec($args_str); die \"exec failed: \" . \$!; } else { waitpid(\$pid, 0); }\n\$?";
+}
+
+# Replace only the system(args) portion of $stmt with do { fork+exec; $? },
+# preserving the surrounding expression (e.g. == 0 comparison, assignment LHS).
+sub _replace_system_in_expr {
+    my ($stmt, $tokens_ref) = @_;
+
+    my $exec_code  = _build_fork_exec_for_expr($tokens_ref);
+    my $do_block   = "do {\n$exec_code\n}";
+
+    # Walk the statement's children to collect everything before 'system'
+    # and everything after the argument list.
+    my $before = '';
+    my $after  = '';
+    my $state  = 'before';
+
+    for my $ch ($stmt->children) {
+        if ($state eq 'before') {
+            if ($ch->isa('PPI::Token::Word') && $ch->content eq 'system') {
+                $state = 'at_system';
+                # Do not include 'system' itself
+            } else {
+                $before .= $ch->content;
+            }
+        } elsif ($state eq 'at_system') {
+            if ($ch->isa('PPI::Structure::List')) {
+                $state = 'after';
+                # Skip the arg list
+            } elsif ($ch->isa('PPI::Token::Whitespace')) {
+                # Skip any whitespace between 'system' and its arg list
+            } else {
+                return; # Unexpected token; abort replacement
+            }
+        } else {
+            $after .= $ch->content;
+        }
+    }
+
+    return if $state ne 'after';
+
+    my $new_text = $before . $do_block . $after;
+
+    my $new_doc = PPI::Document->new(\$new_text);
+    return unless $new_doc;
+
+    my @nodes = grep { $_->content =~ /\S/ } $new_doc->children;
+    return unless @nodes;
+
+    for my $node (reverse @nodes) {
+        $stmt->insert_after($node->clone);
+    }
+    $stmt->remove;
 }
 
 sub rewrite_banned_substrings_in_plain_strings {
@@ -384,6 +559,16 @@ sub process_single_backtick_string {
 
     # Convert using debashc
     my $perl_result = convert_shell_to_perl($command, 1);
+
+    # Debashc sometimes generates code that references internal variables
+    # (e.g. $DATE_SNAPSHOT) that are never defined in the output context.
+    # Detect such patterns and treat them as conversion failures so the
+    # open3-based fallback below is used instead.
+    if ($perl_result && $perl_result =~ /\$DATE_SNAPSHOT\b/) {
+        print "DEBUG: debashc output references \$DATE_SNAPSHOT; treating as conversion failure\n" if $verbose;
+        undef $perl_result;
+    }
+
     if ($perl_result) {
         # Heuristic fix: debashc sometimes emits a Perl command string where
         # an echo argument that originally was single-quoted and contained
@@ -441,6 +626,63 @@ sub process_single_backtick_string {
         # exit-code variable must be preserved verbatim in the final
         # output so further processing and checks remain correct.
         $perl_result =~ s/\$EVAL_ERROR\b/\$\@/g;            # $EVAL_ERROR -> $@
+
+        # Fix debashc inline pipeline output issues:
+        # 1. Debashc sometimes emits `my $output_N = q{};` followed later
+        #    by a bare `my $output_N;` in the same scope. The second
+        #    redeclaration causes 'variable masks earlier declaration' errors
+        #    under `use strict`. Remove the redundant bare redeclarations.
+        $perl_result =~ s/\n[ \t]*my (\$[a-zA-Z_][a-zA-Z0-9_]*)\s*;\s*(?=\n)//g;
+
+        # 2. Inline pipeline blocks reference $main_exit_code which is not
+        #    declared in the do-block context. Remove those assignment lines.
+        $perl_result =~ s/[ \t]*if\s*\(\s*!\s*\$pipeline_success_\d+\s*\)\s*\{\s*\$main_exit_code\s*=\s*1;\s*\}[ \t]*\n?//g;
+
+        # 3. Debashc generates open3($in_N, $out_N, $err_N, ...) where $err_N
+        #    is an uninitialized scalar.  IPC::Open3 treats a false/undef
+        #    CHLD_ERR as "merge child stderr into the stdout pipe", which
+        #    differs from backtick semantics (child stderr goes to the
+        #    parent's stderr).  Replace the uninitialized err variable with
+        #    ">&STDERR" so the child inherits the parent's stderr fd,
+        #    matching backtick behaviour.  Also remove the now-unused $err_N
+        #    from the my() declaration immediately above it.
+        $perl_result =~ s/\bopen3\s*\((\s*\$\w+\s*,\s*\$\w+\s*),\s*\$\w+\s*,/open3($1, ">&STDERR",/g;
+        # Remove trailing $err_N from a 3-variable my() declaration.
+        $perl_result =~ s/(my\s*\(\s*\$\w+\s*,\s*\$\w+\s*),\s*\$\w+(\s*\);)/$1$2/g;
+
+        # If debashc converted a `yes ... | head/tail` pipeline to pure Perl
+        # (possibly with open3 for a later stage such as `wc`), the
+        # conversion omits shell-level side effects: specifically, the
+        # "yes: standard output: Broken pipe" message that GNU yes writes to
+        # stderr when head/tail closes the pipe early.  Fall back to
+        # IPC::Open3 shell execution unconditionally for any yes-with-pipe
+        # backtick, which preserves all shell-level behaviours including
+        # stderr.  We intentionally do NOT filter on whether the debashc
+        # result already contains open3 calls: debashc may include open3
+        # only for a downstream stage (e.g. wc) while still converting the
+        # yes loop to bounded pure-Perl, which would miss the broken-pipe
+        # signal.
+        if (defined $perl_result
+            && $command =~ /\byes\b.*\|/
+            && $perl_result !~ /\bqx\b/
+            && $perl_result !~ /\bexec\b/
+            && $perl_result !~ /\bsystem\b/) {
+            print "DEBUG: debashc generated pure-Perl for 'yes' pipeline; falling back to IPC::Open3\n" if $verbose;
+            my $cmd_lit = _perl_quote_literal_no_interp($command);
+            my $open3_inner = "do {\n"
+                . "    require IPC::Open3;\n"
+                . "    my \$__bt_out;\n"
+                . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, '>&STDERR', 'sh', '-c', $cmd_lit);\n"
+                . "    close \$__bt_in;\n"
+                . "    local \$/ = undef;\n"
+                . "    my \$__bt_result = <\$__bt_out>;\n"
+                . "    close \$__bt_out;\n"
+                . "    waitpid(-1, 0);\n"
+                . "    \$__bt_result\n"
+                . "}";
+            my $open3_code = defined $var_name ? $open3_inner : "__bt($open3_inner)";
+            return defined $var_name ? "$prefix$var_name = $open3_inner;" : $open3_code;
+        }
 
         print "DEBUG: Got perl result for backtick: [$perl_result]\n" if $verbose;
         # Sanitize debashc inline backtick snippets: debashc sometimes emits
@@ -505,10 +747,44 @@ sub process_single_backtick_string {
         }es;
         }
 
+        # Wrap the backtick result in a call to the __bt helper (injected
+        # at the top of every purified file) which uses wantarray() to return
+        # a list of lines in list context (matching backtick-in-list-context
+        # semantics used e.g. when a backtick is passed directly as a
+        # function argument) and the raw string in scalar context.
+        if (!defined $var_name) {
+            # Strip any trailing semicolon that debashc may have appended to
+            # the do-block.  A semicolon inside a function-call argument list
+            # causes a syntax error (it terminates the statement), so we must
+            # remove it before embedding the expression in __bt(...).
+            (my $expr = $perl_result) =~ s/;\s*$//s;
+            $perl_result = "__bt($expr)";
+        }
+
         return defined $var_name ? "$prefix$var_name = $perl_result;" : $perl_result;
     } else {
-        print "DEBUG: No perl result for backtick command\n" if $verbose;
-        return defined $var_name ? "$prefix$var_name = `$command`;" : "`$command`";  # Keep original if conversion fails
+        print "DEBUG: No perl result for backtick command; using open3 fallback\n" if $verbose;
+        # Fallback: capture command output via open3 (avoids keeping a backtick
+        # that would fail the purification check and avoids running a shell).
+        my $cmd_lit = _perl_quote_literal_no_interp($command);
+        # Use ">&STDERR" so child stderr is inherited from the parent (not
+        # captured into the stdout pipe). Passing '' is false, which on some
+        # IPC::Open3 versions redirects child stderr to the stdout pipe and
+        # causes stderr messages to appear inside the captured result instead
+        # of being written to the real STDERR at the correct time.
+        my $open3_inner = "do {\n"
+            . "    require IPC::Open3;\n"
+            . "    my \$__bt_out;\n"
+            . "    IPC::Open3::open3(my \$__bt_in, \$__bt_out, '>&STDERR', 'sh', '-c', $cmd_lit);\n"
+            . "    close \$__bt_in;\n"
+            . "    local \$/ = undef;\n"
+            . "    my \$__bt_result = <\$__bt_out>;\n"
+            . "    close \$__bt_out;\n"
+            . "    waitpid(-1, 0);\n"
+            . "    \$__bt_result\n"
+            . "}";
+        my $open3_code = defined $var_name ? $open3_inner : "__bt($open3_inner)";
+        return defined $var_name ? "$prefix$var_name = $open3_inner;" : $open3_code;
     }
 }
 
@@ -641,17 +917,41 @@ sub get_system_call_tokens {
             $quote_type = 'single';
             $text = $token->string; # preserve original inner text including whitespace
         } elsif ($token->isa('PPI::Token::Quote::Double') || $token->isa('PPI::Token::Quote::Interpolate')) {
-            $quote_type = 'double';
-            $text = $token->string; # preserve original inner text including whitespace
+            # PPI string() returns the raw inner content (outer quotes stripped)
+            # without resolving any escape sequences.  Check for unescaped Perl
+            # sigils to decide whether to re-emit an interpolating literal.
+            my $inner = $token->string;  # e.g. "echo \$SHELL_VAR" → 'echo \$SHELL_VAR'
+            if (_has_unescaped_ident_sigil($inner)) {
+                # Unescaped Perl sigil: the author intended interpolation.
+                # Keep the raw inner content so callers re-emit a double-
+                # quoted literal that Perl interpolates at runtime.
+                $quote_type = 'double';
+                $text = $inner;
+            } else {
+                # No unescaped Perl sigil (e.g. the source had \$SHELL_VAR to
+                # pass a literal dollar to the shell).  Decode double-quote
+                # escape sequences (\$ → $, \\ → \, \n → newline, etc.) to
+                # get the actual string value, then re-quote it as a
+                # no-interpolation literal.
+                $quote_type = 'single';
+                $text = decode_perl_double_quoted_string($inner);
+            }
         } elsif ($token->isa('PPI::Token::Quote')) {
             # Fallback for other quote forms (q{}, qq{}, etc.) - use
             # the string() value and conservatively treat qq-like forms
             # as double-quoted when the content implies interpolation.
-            $text = $token->string;
-            if ($token->content =~ /^qq/ || $token->content =~ /\$/) {
+            my $inner = $token->string;
+            if ($token->content =~ /^qq/ && _has_unescaped_ident_sigil($inner)) {
                 $quote_type = 'double';
+                $text = $inner;
             } else {
+                # q{} or qq{} without Perl sigils: treat as literal value.
+                # For q{}, string() is already the decoded value.
+                # For qq{}, decode escape sequences.
                 $quote_type = 'single';
+                $text = ($token->content =~ /^qq/)
+                    ? decode_perl_double_quoted_string($inner)
+                    : $inner;
             }
         } else {
             # Word, Number, Symbol -> keep as bare

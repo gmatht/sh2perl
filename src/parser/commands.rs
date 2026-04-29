@@ -442,32 +442,88 @@ impl Parser {
                 Token::And => {
                     self.lexer.next();
                     self.lexer.skip_whitespace_and_comments();
-                    let right_command = self.parse_simple_command()?;
-                    let right_command_with_redirects =
-                        self.parse_command_redirects(right_command)?;
 
-                    // Create Command::And(left, right)
-                    let left_command = commands.pop().unwrap();
-                    let and_command = Command::And(
-                        Box::new(left_command),
-                        Box::new(right_command_with_redirects),
-                    );
-                    commands.push(and_command);
+                    // `&&` has lower precedence than `|`.  Collect everything
+                    // parsed so far as the left pipeline, then parse the
+                    // remainder (which may itself contain `|` and `&&`) as the
+                    // right side and return an And node.  This means we exit
+                    // the loop here rather than pushing back onto `commands`.
+                    let left = if commands.len() == 1 {
+                        commands.remove(0)
+                    } else {
+                        let end_span = self.lexer.get_span();
+                        let end_byte_pos =
+                            end_span.map(|(_, end)| end).unwrap_or(start_byte_pos);
+                        let source_text = if start_byte_pos < end_byte_pos {
+                            Some(
+                                self.lexer
+                                    .get_text(start_byte_pos, end_byte_pos)
+                                    .trim()
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        };
+                        Command::Pipeline(Pipeline {
+                            commands,
+                            source_text,
+                            stdout_used: true,
+                            stderr_used: true,
+                        })
+                    };
+
+                    // Parse the right side as a full pipeline so that any
+                    // subsequent `|` operators bind more tightly.
+                    let right_start_span = self.lexer.get_span();
+                    let right_start_pos =
+                        right_start_span.map(|(s, _)| s).unwrap_or(0);
+                    let right_simple = self.parse_simple_command()?;
+                    let right_with_redirects =
+                        self.parse_command_redirects(right_simple)?;
+                    let right = self
+                        .parse_pipeline_from_command(right_with_redirects, right_start_pos)?;
+
+                    return Ok(Command::And(Box::new(left), Box::new(right)));
                 }
                 Token::Or => {
                     self.lexer.next();
                     self.lexer.skip_whitespace_and_comments();
-                    let right_command = self.parse_simple_command()?;
-                    let right_command_with_redirects =
-                        self.parse_command_redirects(right_command)?;
 
-                    // Create Command::Or(left, right)
-                    let left_command = commands.pop().unwrap();
-                    let or_command = Command::Or(
-                        Box::new(left_command),
-                        Box::new(right_command_with_redirects),
-                    );
-                    commands.push(or_command);
+                    // Same precedence fix as for `&&` above.
+                    let left = if commands.len() == 1 {
+                        commands.remove(0)
+                    } else {
+                        let end_span = self.lexer.get_span();
+                        let end_byte_pos =
+                            end_span.map(|(_, end)| end).unwrap_or(start_byte_pos);
+                        let source_text = if start_byte_pos < end_byte_pos {
+                            Some(
+                                self.lexer
+                                    .get_text(start_byte_pos, end_byte_pos)
+                                    .trim()
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        };
+                        Command::Pipeline(Pipeline {
+                            commands,
+                            source_text,
+                            stdout_used: true,
+                            stderr_used: true,
+                        })
+                    };
+
+                    let right_start_span = self.lexer.get_span();
+                    let right_start_pos =
+                        right_start_span.map(|(s, _)| s).unwrap_or(0);
+                    let right_simple = self.parse_simple_command()?;
+                    let right_with_redirects =
+                        self.parse_command_redirects(right_simple)?;
+                    let right = self
+                        .parse_pipeline_from_command(right_with_redirects, right_start_pos)?;
+
+                    return Ok(Command::Or(Box::new(left), Box::new(right)));
                 }
                 Token::If => {
                     // If we encounter an 'if' token in the middle of a pipeline,
