@@ -90,23 +90,8 @@ jobs:
           if [ "${purify_failed:-0}" -ne 0 ]; then color_purify=red; elif [ "$purify_tested" -eq 0 ]; then color_purify=lightgrey; else color_purify=brightgreen; fi
 
           mkdir -p .github/badges
-          cat > .github/badges/main-tests.json <<EOF
-          {
-            "schemaVersion": 1,
-            "label": "main tests",
-            "message": "${main_passed}/${main_total} passed",
-            "color": "${color_main}"
-          }
-          EOF
-
-          cat > .github/badges/purify.json <<EOF
-          {
-            "schemaVersion": 1,
-            "label": "purify tests",
-            "message": "${purify_passed}/${purify_tested} passed",
-            "color": "${color_purify}"
-          }
-          EOF
+          printf '%s\n' "{\"schemaVersion\": 1, \"label\": \"main tests\", \"message\": \"${main_passed}/${main_total} passed\", \"color\": \"${color_main}\"}" > .github/badges/main-tests.json
+          printf '%s\n' "{\"schemaVersion\": 1, \"label\": \"purify tests\", \"message\": \"${purify_passed}/${purify_tested} passed\", \"color\": \"${color_purify}\"}" > .github/badges/purify.json
 
       - name: Commit badges to gh-pages
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
