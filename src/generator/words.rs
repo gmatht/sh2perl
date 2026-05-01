@@ -780,9 +780,52 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         })
                                         .collect::<Vec<_>>()
                                         .join(", ");
-                                    format!("do {{\n    my $result = sprintf \"{}\", {};\n    $result;\n}}", 
-                                        format_string.replace("\"", "\\\"").replace("\\\\", "\\"),
-                                        formatted_args)
+                                    // Count the number of non-%% format specifiers.
+                                    // In bash, printf repeats the format string until all
+                                    // arguments are consumed.  If there are more args than
+                                    // specifiers we must generate a loop so the output
+                                    // matches bash behaviour.
+                                    let escaped_fmt = format_string.replace("\"", "\\\"").replace("\\\\", "\\");
+                                    let specifier_count = {
+                                        let fmt = &format_string;
+                                        let mut count = 0usize;
+                                        let chars: Vec<char> = fmt.chars().collect();
+                                        let mut i = 0;
+                                        while i < chars.len() {
+                                            if chars[i] == '%' {
+                                                i += 1;
+                                                if i < chars.len() && chars[i] != '%' {
+                                                    count += 1;
+                                                }
+                                            }
+                                            i += 1;
+                                        }
+                                        count
+                                    };
+                                    if specifier_count > 0 && args.len() > specifier_count {
+                                        // More args than specifiers: loop over args in batches
+                                        // matching the number of specifiers per iteration.
+                                        if specifier_count == 1 {
+                                            // Common case: one specifier, iterate over all args
+                                            format!(
+                                                "do {{\n    my $result = join('', map {{ sprintf \"{}\", $_ }} ({}));\n    $result;\n}}",
+                                                escaped_fmt,
+                                                formatted_args
+                                            )
+                                        } else {
+                                            // Multiple specifiers per iteration: use splice loop
+                                            format!(
+                                                "do {{\n    my @__args = ({});\n    my $result = '';\n    while (@__args) {{\n        $result .= sprintf \"{}\", splice(@__args, 0, {});\n    }}\n    $result;\n}}",
+                                                formatted_args,
+                                                escaped_fmt,
+                                                specifier_count
+                                            )
+                                        }
+                                    } else {
+                                        format!("do {{\n    my $result = sprintf \"{}\", {};\n    $result;\n}}",
+                                            escaped_fmt,
+                                            formatted_args)
+                                    }
                                 }
                             }
                         } else if name == "date" {

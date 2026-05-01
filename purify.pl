@@ -766,7 +766,25 @@ sub process_single_backtick_string {
         print "DEBUG: No perl result for backtick command; using open3 fallback\n" if $verbose;
         # Fallback: capture command output via open3 (avoids keeping a backtick
         # that would fail the purification check and avoids running a shell).
-        my $cmd_lit = _perl_quote_literal_no_interp($command);
+        # When the command contains Perl variable references (e.g. `$cmd`), we
+        # must use an interpolating Perl expression rather than a non-interpolating
+        # literal so the variable's value is passed to the shell at runtime.
+        my $cmd_lit;
+        if ($command =~ /^\$[A-Za-z_]\w*$/) {
+            # Pure Perl scalar variable: pass directly (no quoting needed)
+            $cmd_lit = $command;
+        } elsif ($command =~ /\$[A-Za-z_]\w*/) {
+            # Command contains embedded Perl variable(s): use a double-quoted
+            # interpolating string so the variables expand at runtime.
+            my $escaped = $command;
+            $escaped =~ s/\\/\\\\/g;
+            $escaped =~ s/"/\\"/g;
+            $escaped =~ s/\n/\\n/g;
+            $escaped =~ s/\t/\\t/g;
+            $cmd_lit = "\"$escaped\"";
+        } else {
+            $cmd_lit = _perl_quote_literal_no_interp($command);
+        }
         # Use ">&STDERR" so child stderr is inherited from the parent (not
         # captured into the stdout pipe). Passing '' is false, which on some
         # IPC::Open3 versions redirects child stderr to the stdout pipe and
@@ -2061,6 +2079,9 @@ sub extract_perl_from_debashc_output {
     
     # Pattern 3: If the output is just Perl code
     if ($output =~ /^[^=]/ && $output !~ /Error|Failed|Parse error|Unexpected token/) {
+        # Reject whitespace-only output (e.g. debashc returns "\n\n" for variable commands)
+        return undef if $output !~ /\S/;
+
         # Check if the code contains undefined variables or invalid syntax
         if ($output =~ /undefined|undefined variable/i) {
             return undef;
