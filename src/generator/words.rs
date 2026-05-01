@@ -812,9 +812,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                                 formatted_args
                                             )
                                         } else {
-                                            // Multiple specifiers per iteration: use splice loop
+                                            // Multiple specifiers per iteration: use splice loop.
+                                            // Pad the final batch with empty strings if it is
+                                            // shorter than specifier_count so sprintf never
+                                            // receives fewer arguments than format specifiers
+                                            // (bash treats missing printf args as empty/zero).
                                             format!(
-                                                "do {{\n    my @__args = ({});\n    my $result = '';\n    while (@__args) {{\n        $result .= sprintf \"{}\", splice(@__args, 0, {});\n    }}\n    $result;\n}}",
+                                                "do {{\n    my @__args = ({0});\n    my $result = '';\n    while (@__args) {{\n        my @__batch = splice(@__args, 0, {2});\n        push @__batch, ('') x ({2} - scalar @__batch) if @__batch < {2};\n        $result .= sprintf \"{1}\", @__batch;\n    }}\n    $result;\n}}",
                                                 formatted_args,
                                                 escaped_fmt,
                                                 specifier_count
