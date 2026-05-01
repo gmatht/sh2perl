@@ -479,7 +479,8 @@ PERL_SCRIPT
                 # semantically identical.
                 my $normalize_perl_warnings = sub {
                     my ($s) = @_;
-                    $s =~ s{ at \S+ line \d+\.}{ at <source> line N.}g;
+                    # Normalize "at FILE line N." (FILE may contain spaces on some OSes)
+                    $s =~ s{ at .+? line \d+\.}{ at <source> line N.}mg;
                     return $s;
                 };
                 my $norm1_stderr = $normalize_perl_warnings->($file1_stderr);

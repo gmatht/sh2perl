@@ -769,15 +769,18 @@ sub process_single_backtick_string {
         # When the command contains Perl variable references (e.g. `$cmd`), we
         # must use an interpolating Perl expression rather than a non-interpolating
         # literal so the variable's value is passed to the shell at runtime.
-        # Regex matching a bare Perl scalar variable (e.g. "$cmd", "$file")
-        my $PERL_VAR_RE = qr/\$[A-Za-z_]\w*/;
+        # Regex matching an unescaped bare Perl scalar variable (e.g. "$cmd").
+        # The negative lookbehind prevents matching escaped sigils like "\$cmd".
+        my $PERL_VAR_RE = qr/(?<!\\)\$[A-Za-z_]\w*/;
         my $cmd_lit;
         if ($command =~ /^${PERL_VAR_RE}$/) {
             # Pure Perl scalar variable: pass directly (no quoting needed)
             $cmd_lit = $command;
         } elsif ($command =~ /$PERL_VAR_RE/) {
-            # Command contains embedded Perl variable(s): use a double-quoted
-            # interpolating string so the variables expand at runtime.
+            # Command contains embedded Perl variable(s): build a Perl
+            # concatenation expression so only named scalar variables
+            # interpolate at runtime (shell/awk sigils like $1 or @array
+            # in static parts are wrapped in non-interpolating literals).
             $cmd_lit = _perl_quote_interpolating($command);
         } else {
             $cmd_lit = _perl_quote_literal_no_interp($command);
@@ -1423,20 +1426,33 @@ sub _perl_quote_literal {
     return "'$text'";
 }
 
-# Return a Perl double-quoted string literal that interpolates Perl variables
-# at runtime.  Backslashes, double-quotes and common control characters are
-# escaped; Perl sigils ($, @) and existing backslash-variable sequences are
-# left intact so variable expansion happens when the string is evaluated.
+# Build a Perl expression that, when evaluated, yields the command string
+# with only named scalar variables ($identifier) interpolated at runtime.
+# The static parts are wrapped in non-interpolating literals so that
+# shell/awk positional vars like $1, $NF and array sigils like @fields
+# are passed through to the shell verbatim.
 sub _perl_quote_interpolating {
     my ($text) = @_;
-    return '""' unless defined $text && length $text;
-    my $escaped = $text;
-    $escaped =~ s/\\/\\\\/g;   # backslashes
-    $escaped =~ s/"/\\"/g;     # double-quotes
-    $escaped =~ s/\n/\\n/g;    # literal newline -> \n
-    $escaped =~ s/\r/\\r/g;
-    $escaped =~ s/\t/\\t/g;
-    return "\"$escaped\"";
+    return "''" unless defined $text && length $text;
+
+    my @parts;
+    my $remaining = $text;
+    while (length $remaining) {
+        # Find the next unescaped named scalar variable ($identifier).
+        # (?<!\\) prevents matching escaped sigils like \$cmd.
+        if ($remaining =~ /\A(.*?)(?<!\\)(\$[A-Za-z_]\w*)/s) {
+            my ($before, $var) = ($1, $2);
+            push @parts, _perl_quote_literal_no_interp($before) if length $before;
+            push @parts, $var;  # bare scalar reference; interpolates at runtime
+            $remaining = substr($remaining, length($before) + length($var));
+        } else {
+            # No more scalar variables; quote the remainder as a static literal.
+            push @parts, _perl_quote_literal_no_interp($remaining);
+            last;
+        }
+    }
+
+    return @parts ? join(' . ', @parts) : "''";
 }
 
 sub _perl_quote_literal_no_interp {
