@@ -2,7 +2,12 @@ name: Test
 
 on:
   push:
+    branches: [ main ]
   pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
 
 jobs:
   test:
@@ -26,13 +31,99 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install Perl dependencies
-        run: sudo apt-get install -y libppi-perl
+        run: sudo apt-get update && sudo apt-get install -y libppi-perl
 
       - name: Build debashc
         run: cargo build
 
-      - name: Run Rust tests
-        run: cargo test
+      - name: Run main (cargo) tests
+        run: |
+          set -o pipefail
+          cargo test 2>&1 | tee cargo_test_output.txt || true
 
-      - name: Run tests
-        run: perl test_purify.pl
+      - name: Run purify tests
+        run: |
+          perl test_purify.pl 2>&1 | tee purify_output.txt || true
+
+      - name: Generate badge JSON
+        run: |
+          set -eu
+
+          # Parse cargo test output for passed/failed/ignored/measured
+          main_passed=0
+          main_failed=0
+          main_ignored=0
+          main_measured=0
+          main_total=0
+          if [ -f cargo_test_output.txt ]; then
+            result_line=$(grep -E 'test result:' cargo_test_output.txt | tail -n1 || true)
+            if [ -n "$result_line" ]; then
+              main_passed=$(echo "$result_line" | perl -nle 'print $1 if /([0-9]+)\s+passed/') || true
+              main_failed=$(echo "$result_line" | perl -nle 'print $1 if /([0-9]+)\s+failed/') || true
+              main_ignored=$(echo "$result_line" | perl -nle 'print $1 if /([0-9]+)\s+ignored/') || true
+              main_measured=$(echo "$result_line" | perl -nle 'print $1 if /([0-9]+)\s+measured/') || true
+              main_passed=${main_passed:-0}
+              main_failed=${main_failed:-0}
+              main_ignored=${main_ignored:-0}
+              main_measured=${main_measured:-0}
+              main_total=$((main_passed + main_failed + main_ignored + main_measured))
+            fi
+          fi
+          main_passed=${main_passed:-0}
+          main_total=${main_total:-0}
+          if [ "${main_failed:-0}" -ne 0 ]; then color_main=red; elif [ "$main_total" -eq 0 ]; then color_main=lightgrey; else color_main=brightgreen; fi
+
+          # Parse purify output
+          purify_passed=0
+          purify_failed=0
+          purify_tested=0
+          if [ -f purify_output.txt ]; then
+            line=$(grep -E '^Purify.pl tests:' purify_output.txt | tail -n1 || true)
+            if [ -n "$line" ]; then
+              purify_passed=$(echo "$line" | perl -nle 'print $1 if /Purify.pl tests: (\d+) passed/') || true
+              purify_failed=$(echo "$line" | perl -nle 'print $1 if /, (\d+) failed/') || true
+              purify_tested=$(echo "$line" | perl -nle 'print $1 if /, (\d+) tested$/') || true
+            fi
+          fi
+          purify_passed=${purify_passed:-0}
+          purify_tested=${purify_tested:-0}
+          if [ "${purify_failed:-0}" -ne 0 ]; then color_purify=red; elif [ "$purify_tested" -eq 0 ]; then color_purify=lightgrey; else color_purify=brightgreen; fi
+
+          mkdir -p .github/badges
+          cat > .github/badges/main-tests.json <<EOF
+          {
+            "schemaVersion": 1,
+            "label": "main tests",
+            "message": "${main_passed}/${main_total} passed",
+            "color": "${color_main}"
+          }
+          EOF
+
+          cat > .github/badges/purify.json <<EOF
+          {
+            "schemaVersion": 1,
+            "label": "purify tests",
+            "message": "${purify_passed}/${purify_tested} passed",
+            "color": "${color_purify}"
+          }
+          EOF
+
+      - name: Commit badges to gh-pages
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Fetch remote gh-pages if it exists and create/update local branch
+          git fetch origin gh-pages || true
+          if git rev-parse --verify origin/gh-pages >/dev/null 2>&1; then
+            git checkout -B gh-pages origin/gh-pages
+          else
+            git checkout -B gh-pages
+          fi
+          git add .github/badges/*.json
+          if git diff --cached --quiet; then
+            echo "No changes to badges, nothing to commit"
+          else
+            git commit -m "Update test badges"
+            git push --set-upstream origin gh-pages
+          fi
