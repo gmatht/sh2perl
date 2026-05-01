@@ -91,22 +91,22 @@ jobs:
 
           mkdir -p .github/badges
           cat > .github/badges/main-tests.json <<EOF
-{
-  "schemaVersion": 1,
-  "label": "main tests",
-  "message": "${main_passed}/${main_total} passed",
-  "color": "${color_main}"
-}
-EOF
+          {
+            "schemaVersion": 1,
+            "label": "main tests",
+            "message": "${main_passed}/${main_total} passed",
+            "color": "${color_main}"
+          }
+          EOF
 
           cat > .github/badges/purify.json <<EOF
-{
-  "schemaVersion": 1,
-  "label": "purify tests",
-  "message": "${purify_passed}/${purify_tested} passed",
-  "color": "${color_purify}"
-}
-EOF
+          {
+            "schemaVersion": 1,
+            "label": "purify tests",
+            "message": "${purify_passed}/${purify_tested} passed",
+            "color": "${color_purify}"
+          }
+          EOF
 
       - name: Commit badges to gh-pages
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
