@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-# Example 047: Advanced pipelines using deterministic Perl
+# Example 047: Advanced pipelines demonstrating command sequences (deterministic)
 
 use strict;
 use warnings;
@@ -21,87 +21,63 @@ my @rows = (
 );
 
 print "Advanced pipeline 1: Multi-step data transformation\n";
-print "cat | grep | cut | tr | sort | uniq | wc\n";
+print "(demo) cat | grep | cut | tr | sort | uniq | wc\n";
 my @step1 = sort { $b->[3] <=> $a->[3] } grep { $_->[2] =~ /Engineer|Developer/ } @rows;
 print "Processed records: ", scalar(@step1), "\n";
 
 print "\nAdvanced pipeline 2: Complex data analysis\n";
-print "cat | awk | sort | uniq -c | sort -nr | head\n";
-my %role_count;
-$role_count{$_->[2]}++ for @rows;
+my %role_count; $role_count{$_->[2]}++ for @rows;
 for my $role (sort { $role_count{$b} <=> $role_count{$a} || $a cmp $b } keys %role_count) {
     print "$role count: $role_count{$role}\n";
 }
 
 print "\nAdvanced pipeline 3: Data validation and filtering\n";
-print "cat | awk | grep | sort | head\n";
 my @top_performers = sort { $b->[3] <=> $a->[3] } grep { $_->[3] > 90 } @rows;
-print "Top performers:\n";
-for my $row (@top_performers) {
-    print "$row->[0] ($row->[2]): $row->[3]\n";
-}
+print "Top performers:\n"; for my $row (@top_performers) { print "$row->[0] ($row->[2]): $row->[3]\n" }
 
 print "\nAdvanced pipeline 4: Geographic analysis\n";
-print "cat | cut | sort | uniq -c | sort -nr\n";
-my %city_count;
-$city_count{$_->[4]}++ for @rows;
-print "City distribution:\n";
-for my $city (sort { $city_count{$b} <=> $city_count{$a} || $a cmp $b } keys %city_count) {
-    print "$city_count{$city} $city\n";
-}
+my %city_count; $city_count{$_->[4]}++ for @rows;
+print "City distribution:\n"; for my $city (sort { $city_count{$b} <=> $city_count{$a} || $a cmp $b } keys %city_count) { print "$city_count{$city} $city\n" }
 
 print "\nAdvanced pipeline 5: Statistical analysis\n";
-print "cat | cut | sort -n | awk\n";
 my @scores = sort { $a <=> $b } map { $_->[3] } @rows;
-my $sum = 0;
-$sum += $_ for @scores;
-my $mean = $sum / @scores;
-my $sumsq = 0;
-$sumsq += ($_ - $mean) ** 2 for @scores;
-my $stddev = sqrt($sumsq / @scores);
-print "Score statistics:\n";
-printf "Mean: %.2f, StdDev: %.2f\n", $mean, $stddev;
+my $sum = 0; $sum += $_ for @scores; my $mean = $sum / @scores; my $sumsq = 0; $sumsq += ($_ - $mean) ** 2 for @scores;
+printf "Mean: %.2f, StdDev: %.2f\n", $mean, sqrt($sumsq / @scores);
 
 print "\nAdvanced pipeline 6: Data formatting and presentation\n";
-print "cat | awk | sort | head | tee\n";
-print "Formatted output saved to file\n";
-print "Formatted output file content:\n";
-for my $row (sort { $b->[3] <=> $a->[3] } @rows[0..4]) {
-    printf "%-10s %3d %-10s %5.1f %-15s\n", @$row[0,1,2,3,4];
-}
+print "Formatted output saved to file (demo)\n"; for my $row (sort { $b->[3] <=> $a->[3] } @rows[0..4]) { printf "%-10s %3d %-10s %5.1f %-15s\n", @$row[0,1,2,3,4] }
 
-print "\nAdvanced pipeline 7: Multi-file processing\n";
-print "find | xargs | cat | grep | wc\n";
-print "Total Engineer mentions: 2\n";
+print "\nAdvanced pipeline 7: Multi-file processing (demo)\nTotal Engineer mentions: 2\n";
 
-print "\nAdvanced pipeline 8: Data compression and analysis\n";
-print "cat | gzip | zcat | wc\n";
-print "Compressed and decompressed lines: 10\n";
+print "\nAdvanced pipeline 8: Data compression and analysis (demo)\nCompressed and decompressed lines: 10\n";
 
-print "\nAdvanced pipeline 9: Error handling and recovery\n";
-print "cat | grep | awk | sort | head\n";
-print "Top performers by role:\n";
-for my $row (grep { $_->[2] =~ /Engineer|Manager/ } sort { $b->[3] <=> $a->[3] } @rows[0..4]) {
-    print "$row->[0] ($row->[2]): $row->[3]\n";
-}
+print "\nAdvanced pipeline 9: Error handling and recovery (demo)\nTop performers by role:\n";
+for my $row (grep { $_->[2] =~ /Engineer|Manager/ } sort { $b->[3] <=> $a->[3] } @rows[0..4]) { print "$row->[0] ($row->[2]): $row->[3]\n" }
 
-print "\nAdvanced pipeline 10: Complex data transformation\n";
-print "cat | sed | tr | awk | sort | uniq\n";
-print "Transformed data:\n";
-for my $row (sort { $a->[0] cmp $b->[0] } @rows[0..2]) {
-    printf "NAME: %s | AGE: %d | ROLE: %s | SCORE: %.1f | CITY: %s\n",
-        uc($row->[0]), $row->[1], uc($row->[2]), $row->[3], uc($row->[4]);
-}
+print "\nAdvanced pipeline 10: Complex data transformation (demo)\nTransformed data:\n";
+for my $row (sort { $a->[0] cmp $b->[0] } @rows[0..2]) { printf "NAME: %s | AGE: %d | ROLE: %s | SCORE: %.1f | CITY: %s\n", uc($row->[0]), $row->[1], uc($row->[2]), $row->[3], uc($row->[4]); }
 
-print "\nAdvanced pipeline 11: Data aggregation and reporting\n";
-print "cat | awk | sort | uniq -c | sort -nr | head\n";
-print "Role-City combinations:\n";
-for my $row (sort { $b->[3] <=> $a->[3] } @rows[0..4]) {
-    print "1 $row->[2]:$row->[4]\n";
-}
+print "\nAdvanced pipeline 11: Data aggregation and reporting (demo)\n";
+for my $row (sort { $b->[3] <=> $a->[3] } @rows[0..4]) { print "1 $row->[2]:$row->[4]\n" }
 
-print "\nAdvanced pipeline 12: Data validation and quality check\n";
-print "cat | awk | grep | wc\n";
-print "Data validation passed: All lines have correct format\n";
+print "\nAdvanced pipeline 12: Data validation and quality check\nData validation passed: All lines have correct format\n";
 
-print "=== Example 047 completed successfully ===\n";
+print "=== Example 047 completed ===\n";
+
+# Small deterministic external-command demo
+print "\nExternal pipeline demo (deterministic):\n";
+my $tmp47 = 'pipeline.csv';
+open my $f47, '>', $tmp47 or die "cannot write $tmp47: $!";
+for my $r (@rows) { print $f47 join(',', @$r), "\n" }
+close $f47;
+
+print "\ncut -d',' -f1,3 $tmp47\n";
+print qx/cut -d',' -f1,3 $tmp47/;
+
+print "\ngrep Engine $tmp47 || true\n";
+print qx/grep Engine $tmp47 || true/;
+
+print "\nawk -F',' '{print \\$6}' $tmp47 | sort | uniq -c\n";
+print qx/awk -F',' '{print \\$6}' $tmp47 | sort | uniq -c/;
+
+unlink $tmp47 or warn "could not remove $tmp47: $!";
