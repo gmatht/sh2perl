@@ -797,6 +797,77 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
 
     if !file_args.is_empty() {
+        if _long_format {
+            // Generate stat()-based long listing for specific file arguments
+            let files_array = format!("ls_files_{}", generator.get_unique_id());
+            let long_array = format!("ls_long_{}", generator.get_unique_id());
+            let months_var = format!("months_{}", generator.get_unique_id());
+            let file_var = format!("f_{}", generator.get_unique_id());
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my @{} = ();\n", files_array));
+            for file_arg in &file_args {
+                let literal = generator
+                    .perl_string_literal_no_interp(&Word::literal((*file_arg).to_string()));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("push @{}, {};\n", files_array, literal));
+            }
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my @{} = ();\n", long_array));
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "my @{} = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);\n",
+                months_var
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("for my ${} (@{}) {{\n", file_var, files_array));
+            generator.indent_level += 1;
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my @_s = stat(${}); next unless @_s;\n", file_var));
+            output.push_str(&generator.indent());
+            output.push_str("my $mode = $_s[2];\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "my $perm = (-d ${} ? 'd' : (-l ${} ? 'l' : '-'));\n",
+                file_var, file_var
+            ));
+            for &(mask, label) in &[
+                (0o400u32, "r"), (0o200, "w"), (0o100, "x"),
+                (0o040, "r"), (0o020, "w"), (0o010, "x"),
+                (0o004, "r"), (0o002, "w"), (0o001, "x"),
+            ] {
+                output.push_str(&generator.indent());
+                output.push_str(&format!(
+                    "$perm .= (($mode & {}) ? '{}' : '-');\n",
+                    mask, label
+                ));
+            }
+            output.push_str(&generator.indent());
+            output.push_str("my @_t = localtime($_s[9]);\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "my $date = sprintf('%s %2d %02d:%02d', ${}[$_t[4]], $_t[3], $_t[2], $_t[1]);\n",
+                months_var
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "push @{}, sprintf('%s %d %d %d %d %s %s', $perm, $_s[3], $_s[4], $_s[5], $_s[7], $date, ${});\n",
+                long_array, file_var
+            ));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+            // Produce the final output
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "(@{} ? join(\"\\n\", @{}) . \"\\n\" : q{{}});\n",
+                long_array, long_array
+            ));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}");
+            generator.indent_level = saved_indent;
+            return output;
+        }
         output.push_str(&generate_ls_sections_helper(
             generator,
             &file_args,

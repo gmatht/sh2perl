@@ -21,3 +21,4 @@ logs/
 # IDE settings
 .idea/
 .vscode/
+__tmp_direct_exec.pl

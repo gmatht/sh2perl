@@ -32,14 +32,47 @@ pub fn generate_xargs_command_with_output(
     let mut replace_placeholder: Option<String> = None;
 
     // Parse xargs arguments
+    // We use a two-phase approach:
+    //   Phase 1: parse xargs-level flags (-I, -n1, …) until the sub-command name is found.
+    //   Phase 2: once the sub-command has been identified, every remaining argument
+    //            (including flags starting with '-') belongs to that sub-command and is
+    //            pushed into `args`. This prevents flags like `wc -l` from being silently
+    //            dropped when xargs passes them through to its sub-command.
+    let mut command_found = false;
     let mut i = 0;
     while i < cmd.args.len() {
         if let Word::Literal(arg_str, _) = &cmd.args[i] {
+            if command_found {
+                // We already know the sub-command; all remaining literals are its args.
+                args.push(arg_str.clone());
+                i += 1;
+                continue;
+            }
             // Detect -I and -I<placeholder> forms
             if arg_str == "-I" {
                 if i + 1 < cmd.args.len() {
-                    if let Word::Literal(ph, _) = &cmd.args[i + 1] {
-                        replace_placeholder = Some(ph.clone());
+                    // The placeholder may be a Literal ("{}", REPLACEME, etc.) or a
+                    // BraceExpansion that the shell parser produced for bare "{}".
+                    let ph: Option<String> = match &cmd.args[i + 1] {
+                        Word::Literal(ph, _) => Some(ph.clone()),
+                        Word::BraceExpansion(be, _) => {
+                            // Empty brace expansion {} → use the literal string "{}"
+                            if be.items.is_empty() {
+                                Some("{}".to_string())
+                            } else {
+                                // Non-empty expansion – stringify as {item1,item2}
+                                Some(format!("{{{}}}", be.items.iter().map(|item| {
+                                    match item {
+                                        crate::ast_words::BraceItem::Literal(s) => s.clone(),
+                                        _ => String::new(),
+                                    }
+                                }).collect::<Vec<_>>().join(",")))
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(ph) = ph {
+                        replace_placeholder = Some(ph);
                         i += 1; // consume placeholder
                     }
                 }
@@ -47,8 +80,7 @@ pub fn generate_xargs_command_with_output(
                 replace_placeholder = Some(arg_str[2..].to_string());
             } else if arg_str == "grep" {
                 command = "grep";
-            } else if arg_str == "-l" {
-                // This will be handled in the grep logic
+                command_found = true;
             } else if arg_str == "-n1" {
                 max_args = 1;
             } else if arg_str == "function" {
@@ -56,6 +88,7 @@ pub fn generate_xargs_command_with_output(
             } else if !arg_str.starts_with('-') {
                 // This is likely the command to execute
                 command = arg_str;
+                command_found = true;
 
                 // Check if the next argument is a string interpolation (like "Number:")
                 if i + 1 < cmd.args.len() {
@@ -318,14 +351,27 @@ pub fn generate_xargs_command_with_output(
                 ));
                 output.push_str("    }\n");
             } else {
-                // No placeholder templates - fall back to previous behaviour
+                // No placeholder templates - fall back to previous behaviour.
+                // Any extra args collected for the sub-command (e.g. flags like
+                // `-l` in `xargs wc -l`) are prepended before the xargs input
+                // items so the sub-command receives them correctly.
+                let extra_args = if args.is_empty() {
+                    String::new()
+                } else {
+                    args.iter()
+                        .map(|a| format!("'{}'", a))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                        + ", "
+                };
                 output.push_str(&format!(
-                    "    my $pid_{} = open3($in_{}, $out_{}, $err_{}, '{}', @xargs_args_{});\n",
+                    "    my $pid_{} = open3($in_{}, $out_{}, $err_{}, '{}', {}@xargs_args_{});\n",
                     command_index,
                     command_index,
                     command_index,
                     command_index,
                     command,
+                    extra_args,
                     command_index
                 ));
                 output.push_str(&format!(
@@ -350,6 +396,15 @@ pub fn generate_xargs_command_with_output(
         output.push_str(&format!(
             "my ${} = join \"\\n\", @xargs_output_{};\n",
             output_var, command_index
+        ));
+        // Ensure the output ends with a newline when non-empty.  In the real
+        // shell, each xargs invocation of 'echo' appends a newline to its
+        // output; downstream commands such as 'wc -l' rely on this.  Using
+        // join("\n", …) above produces inter-element separators but no
+        // trailing newline, so we add one here when necessary.
+        output.push_str(&format!(
+            "if (${} ne q{{}} && !( ${} =~ m{{\\n\\z}}msx )) {{ ${} .= \"\\n\"; }}\n",
+            output_var, output_var, output_var
         ));
 
         // For pipeline context, also assign to the expected pipeline output variable
