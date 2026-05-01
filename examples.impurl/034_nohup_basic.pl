@@ -1,39 +1,30 @@
 #!/usr/bin/perl
 
-# Example 034: Basic nohup command using deterministic Perl
+# Example 034: Demonstrate external nohup invocation (deterministic)
 
 use strict;
 use warnings;
 
-print "=== Example 034: Basic nohup command ===\n";
+print "=== Example 034: External nohup demonstration ===\n";
 
-print "Using backticks to call nohup with a fixed command:\n";
-print "This is a nohup command\n";
+# Show invocation; avoid starting long-lived background processes in examples.
+{
+    my $c = "nohup sh -c 'echo nohup-demo' 2>/dev/null || true";
+    print "\n$c\n";
+    print qx/$c/;
+}
+{
+    my $c = "nohup sh -c 'echo redirected' > nohup.out 2>&1 || true";
+    print "\n$c\n";
+    print qx/$c/;
+}
+{
+    my $c = "cat nohup.out 2>/dev/null || echo '(no output file)'";
+    print "\n$c\n";
+    print qx/$c/;
+}
+unlink 'nohup.out' if -f 'nohup.out';
 
-print "\nnohup with output redirection:\n";
-print "Output file created successfully\n";
-print "File content: Output to file\n";
+print "\nNote: This demonstrates safe, short nohup usage without persistent background jobs.\n";
 
-print "\nnohup with different command:\n";
-print "LS output file created\n";
-print "LS content: hello\n";
-
-print "\nnohup with error handling:\n";
-print "Error result: exit 1\n";
-
-print "\nnohup with pipe:\n";
-print "Hello World\n";
-
-print "\nnohup with background and output:\n";
-print "Background process with output started\n";
-
-print "\nnohup with multiple commands:\n";
-print "Command 1\n";
-print "Command 2\n";
-
-print "\nnohup with different working directory:\n";
-print ".\n";
-
-print "\nnohup with output to null:\n";
-
-print "=== Example 034 completed successfully ===\n";
+print "\n=== Example 034 completed ===\n";
