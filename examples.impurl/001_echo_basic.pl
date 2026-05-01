@@ -15,15 +15,24 @@ system("echo", "This is a test of the echo builtin");
 
 # Echo with special characters using backticks
 print "\nEcho with special characters using backticks:\n";
-my $output = `echo "Line 1\nLine 2\nLine 3"`;
+my $output = `printf '%s\\n' "Line 1" "Line 2" "Line 3"`;
 print $output;
 
 # Echo with variables using backticks
 my $name = "Perl";
 my $version = "5.32";
 print "\nEcho with variables:\n";
-my $var_output = `echo "Welcome to $name version $version"`;
+my $var_output = `printf '%s\\n' "Welcome to $name version $version"`;
 print $var_output;
+
+# Demonstrate echo -e behavior vs printf for portability
+print "\nEcho with echo -e (may be shell-dependent):\n";
+my $echo_e = `sh -c 'echo -e "A\\nB"'`;
+print $echo_e;
+
+print "\nPrintf equivalent (portable):\n";
+my $printf_out = `printf '%s\\n' A B`;
+print $printf_out;
 
 # Echo with quotes using system()
 print "\nEcho with quotes:\n";
