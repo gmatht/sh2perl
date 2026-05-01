@@ -769,19 +769,16 @@ sub process_single_backtick_string {
         # When the command contains Perl variable references (e.g. `$cmd`), we
         # must use an interpolating Perl expression rather than a non-interpolating
         # literal so the variable's value is passed to the shell at runtime.
+        # Regex matching a bare Perl scalar variable (e.g. "$cmd", "$file")
+        my $PERL_VAR_RE = qr/\$[A-Za-z_]\w*/;
         my $cmd_lit;
-        if ($command =~ /^\$[A-Za-z_]\w*$/) {
+        if ($command =~ /^${PERL_VAR_RE}$/) {
             # Pure Perl scalar variable: pass directly (no quoting needed)
             $cmd_lit = $command;
-        } elsif ($command =~ /\$[A-Za-z_]\w*/) {
+        } elsif ($command =~ /$PERL_VAR_RE/) {
             # Command contains embedded Perl variable(s): use a double-quoted
             # interpolating string so the variables expand at runtime.
-            my $escaped = $command;
-            $escaped =~ s/\\/\\\\/g;
-            $escaped =~ s/"/\\"/g;
-            $escaped =~ s/\n/\\n/g;
-            $escaped =~ s/\t/\\t/g;
-            $cmd_lit = "\"$escaped\"";
+            $cmd_lit = _perl_quote_interpolating($command);
         } else {
             $cmd_lit = _perl_quote_literal_no_interp($command);
         }
@@ -1424,6 +1421,22 @@ sub _perl_quote_literal {
     # about avoiding shell-style escapes.
     $text =~ s/'/\\'/g; # escape single quotes as \'
     return "'$text'";
+}
+
+# Return a Perl double-quoted string literal that interpolates Perl variables
+# at runtime.  Backslashes, double-quotes and common control characters are
+# escaped; Perl sigils ($, @) and existing backslash-variable sequences are
+# left intact so variable expansion happens when the string is evaluated.
+sub _perl_quote_interpolating {
+    my ($text) = @_;
+    return '""' unless defined $text && length $text;
+    my $escaped = $text;
+    $escaped =~ s/\\/\\\\/g;   # backslashes
+    $escaped =~ s/"/\\"/g;     # double-quotes
+    $escaped =~ s/\n/\\n/g;    # literal newline -> \n
+    $escaped =~ s/\r/\\r/g;
+    $escaped =~ s/\t/\\t/g;
+    return "\"$escaped\"";
 }
 
 sub _perl_quote_literal_no_interp {

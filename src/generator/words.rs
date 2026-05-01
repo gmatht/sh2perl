@@ -787,18 +787,17 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     // matches bash behaviour.
                                     let escaped_fmt = format_string.replace("\"", "\\\"").replace("\\\\", "\\");
                                     let specifier_count = {
-                                        let fmt = &format_string;
+                                        let mut chars = format_string.chars().peekable();
                                         let mut count = 0usize;
-                                        let chars: Vec<char> = fmt.chars().collect();
-                                        let mut i = 0;
-                                        while i < chars.len() {
-                                            if chars[i] == '%' {
-                                                i += 1;
-                                                if i < chars.len() && chars[i] != '%' {
+                                        while let Some(ch) = chars.next() {
+                                            if ch == '%' {
+                                                if chars.peek().map_or(false, |&n| n != '%') {
                                                     count += 1;
+                                                } else {
+                                                    // consume the second '%' of '%%'
+                                                    chars.next();
                                                 }
                                             }
-                                            i += 1;
                                         }
                                         count
                                     };
