@@ -1,5 +1,11 @@
 # Debashc - Shell Script Converter
 
+[![Tests](https://github.com/gmatht/sh2perl/actions/workflows/test.yml/badge.svg)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+
+<!-- Dynamic badges for test counts served from gh-pages branch -->
+[![Purify tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/purify.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+[![Main tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/main-tests.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+
 A comprehensive Rust library and command-line tool for parsing and converting shell/bash scripts to other programming languages. This project provides a robust foundation for analyzing shell scripts, converting them to Perl, Rust, Python, and more, or building shell script analysis tools.
 
 **🌐 [Try the Live Demo](https://dansted.org/Debashc8/) - Convert shell scripts to Perl, Rust, and other languages in your browser!**
