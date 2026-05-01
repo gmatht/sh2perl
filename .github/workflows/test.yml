@@ -31,5 +31,8 @@ jobs:
       - name: Build debashc
         run: cargo build
 
+      - name: Run Rust tests
+        run: cargo test
+
       - name: Run tests
         run: perl test_purify.pl
