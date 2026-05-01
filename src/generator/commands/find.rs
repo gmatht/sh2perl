@@ -148,19 +148,55 @@ pub fn generate_find_for_substitution(
     _input_var: &str,
 ) -> String {
     // For simple find commands, use a much simpler approach
-    let mut start_path = ".";
+    let mut start_path = String::from(".");
     let mut name_pattern = None;
     let mut file_type = None;
 
     // Simple argument parsing
     let mut i = 0;
     while i < cmd.args.len() {
-        if let Word::Literal(s, _) = &cmd.args[i] {
+        // Helper: extract a plain string from either a Literal or a
+        // StringInterpolation that contains only a single Literal part.
+        let plain_str: Option<String> = match &cmd.args[i] {
+            Word::Literal(s, _) => Some(s.clone()),
+            Word::StringInterpolation(interp, _) => {
+                if interp.parts.len() == 1 {
+                    if let crate::ast_words::StringPart::Literal(s) = &interp.parts[0] {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(s) = plain_str {
             match s.as_str() {
                 "-name" => {
                     if i + 1 < cmd.args.len() {
-                        if let Word::Literal(pattern, _) = &cmd.args[i + 1] {
-                            name_pattern = Some(pattern.clone());
+                        // Accept Literal or single-literal StringInterpolation for the pattern.
+                        let pat: Option<String> = match &cmd.args[i + 1] {
+                            Word::Literal(p, _) => Some(p.clone()),
+                            Word::StringInterpolation(interp, _) => {
+                                if interp.parts.len() == 1 {
+                                    if let crate::ast_words::StringPart::Literal(p) =
+                                        &interp.parts[0]
+                                    {
+                                        Some(p.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(p) = pat {
+                            name_pattern = Some(p);
                         }
                         i += 1;
                     }
@@ -183,7 +219,13 @@ pub fn generate_find_for_substitution(
         i += 1;
     }
 
-    // Generate recursive Perl code using File::Find
+    // Generate recursive Perl code using File::Find.
+    // Use an *anonymous* sub passed directly to File::Find::find() instead of
+    // a named sub.  Named subs are compiled into the package namespace at
+    // compile time, so two pipelines in the same file that both call find()
+    // would end up with colliding names (e.g. `find_files_1`) because each
+    // debashc invocation restarts its counter at 0.  An anonymous sub has no
+    // name and therefore never collides.
     let unique_id = generator.get_unique_id();
     let mut result = format!(
         "do {{\n    use File::Find;\n    use File::Basename;\n    my @files_{} = ();\n",
@@ -194,8 +236,8 @@ pub fn generate_find_for_substitution(
         unique_id, start_path
     ));
 
-    // Create a recursive find function
-    result.push_str(&format!("\n    sub find_files_{} {{\n", unique_id));
+    // Open the anonymous sub
+    result.push_str("\n    find( sub {\n");
     result.push_str(&format!(
         "        my $file_{} = $File::Find::name;\n",
         unique_id
@@ -204,12 +246,12 @@ pub fn generate_find_for_substitution(
     if let Some(ftype) = &file_type {
         if ftype == "f" {
             result.push_str(&format!("        if ( !( -f $file_{} ) ) {{\n", unique_id));
-            result.push_str(&format!("            return;\n"));
-            result.push_str(&format!("        }}\n"));
+            result.push_str("            return;\n");
+            result.push_str("        }\n");
         } else if ftype == "d" {
             result.push_str(&format!("        if ( !( -d $file_{} ) ) {{\n", unique_id));
-            result.push_str(&format!("            return;\n"));
-            result.push_str(&format!("        }}\n"));
+            result.push_str("            return;\n");
+            result.push_str("        }\n");
         }
     }
 
@@ -226,21 +268,16 @@ pub fn generate_find_for_substitution(
             "        if ( !( {} =~ m/^{}$/xms ) ) {{\n",
             filename, glob_pattern
         ));
-        result.push_str(&format!("            return;\n"));
-        result.push_str(&format!("        }}\n"));
+        result.push_str("            return;\n");
+        result.push_str("        }\n");
     }
 
     result.push_str(&format!(
         "        push @files_{}, $file_{};\n",
         unique_id, unique_id
     ));
-    result.push_str(&format!("        return;\n"));
-
-    result.push_str("    }\n");
-    result.push_str(&format!(
-        "    find( \\&find_files_{}, $start_{} );\n",
-        unique_id, unique_id
-    ));
+    result.push_str("    },\n");
+    result.push_str(&format!("    $start_{} );\n", unique_id));
     result.push_str(&format!("    join \"\\n\", @files_{};\n}}", unique_id));
     result
 }
