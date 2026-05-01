@@ -471,8 +471,23 @@ PERL_SCRIPT
                 my $file2_stdout = $slurp->($out2_stdout);
                 my $file2_stderr = $slurp->($out2_stderr);
 
+                # Normalize Perl runtime warnings that include the source file
+                # path and line number (e.g. "at /abs/path/to/file.pl line 42.")
+                # before comparing, since the original and purified scripts live
+                # in different directories and will naturally produce different
+                # paths/line numbers in such messages even when the behaviour is
+                # semantically identical.
+                my $normalize_perl_warnings = sub {
+                    my ($s) = @_;
+                    # Normalize "at FILE line N." (FILE may contain spaces on some OSes)
+                    $s =~ s{ at .+? line \d+\.}{ at <source> line N.}mg;
+                    return $s;
+                };
+                my $norm1_stderr = $normalize_perl_warnings->($file1_stderr);
+                my $norm2_stderr = $normalize_perl_warnings->($file2_stderr);
+
                 my $stdout_match = ($file1_stdout eq $file2_stdout);
-                my $stderr_match = ($file1_stderr eq $file2_stderr);
+                my $stderr_match = ($norm1_stderr eq $norm2_stderr);
 
                 if ( !$stdout_match || !$stderr_match ) {
                     debug_print(1, "Output mismatch detected between original and purified files; re-running original to check for nondeterminism");
