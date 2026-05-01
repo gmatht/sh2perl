@@ -554,13 +554,21 @@ PERL_SCRIPT
 
         my $example_error = $@;
         chdir $original_dir or die "Cannot chdir back to $original_dir: $!\n";
-        next if $example_error eq "NEXT_TEST\n";  # test failed, already recorded above
+        # If the test was skipped due to nondeterminism, continue silently
         next if $example_error eq '' && $nondeterministic_skip;
+
+        # If there was an error during the test, decide whether to stop
+        # immediately (default) or continue to the next test when --next
+        # is specified.
         if ($example_error) {
-            $purify_failed++;
-            push @test_failures, "ERROR in $perl_file: $example_error";
-            print "ERROR: $example_name ($example_error)";
-            next;
+            if ($next) {
+                $purify_failed++;
+                push @test_failures, "ERROR in $perl_file: $example_error";
+                print "ERROR: $example_name ($example_error)";
+                next;
+            } else {
+                die $example_error;
+            }
         }
     }
 }
