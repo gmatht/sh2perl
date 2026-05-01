@@ -1,3 +1,0 @@
-Bareword found where operator expected (Missing operator before "test_cp_source"?) at /mnt/d/GitHub/sh2perl/.test-work/purify/022_cp_basic/pure/022_cp_basic.pl line 36, near ""$dest/"test_cp_source"
-syntax error at /mnt/d/GitHub/sh2perl/.test-work/purify/022_cp_basic/pure/022_cp_basic.pl line 36, near ""$dest/"test_cp_source"
-Execution of /mnt/d/GitHub/sh2perl/.test-work/purify/022_cp_basic/pure/022_cp_basic.pl aborted due to compilation errors.

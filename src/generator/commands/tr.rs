@@ -114,6 +114,11 @@ fn generate_tr_linebyline_impl_with_output(
             output.push_str(&format!("${} = ${};\n", output_var, input_var));
         }
         output.push_str(&format!("${} =~ tr/{}/ /d;\n", output_var, set1));
+        // Keep the original line variable in sync so subsequent line-by-line
+        // commands see the transformed value.
+        if input_var != output_var {
+            output.push_str(&format!("${} = ${};\n", input_var, output_var));
+        }
     } else if args.len() >= 2 {
         // tr SET1 SET2: translate characters
         let set1 = generator.strip_shell_quotes_for_regex(&args[0]);
@@ -124,6 +129,11 @@ fn generate_tr_linebyline_impl_with_output(
             output.push_str(&format!("${} = ${};\n", output_var, input_var));
         }
         output.push_str(&format!("${} =~ tr/{}/{}/;\n", output_var, set1, set2));
+        // Keep the original line variable in sync so subsequent line-by-line
+        // commands see the transformed value.
+        if input_var != output_var {
+            output.push_str(&format!("${} = ${};\n", input_var, output_var));
+        }
     }
     // No valid arguments - line passes through unchanged
 
