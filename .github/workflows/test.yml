@@ -98,6 +98,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Move generated badges out of the way so checkout won't fail due to
+          # untracked files that would be overwritten by switching branches.
+          TMPDIR=$(mktemp -d)
+          mv .github/badges/*.json "$TMPDIR/" || true
+
           # Fetch remote gh-pages if it exists and create/update local branch
           git fetch origin gh-pages || true
           if git rev-parse --verify origin/gh-pages >/dev/null 2>&1; then
@@ -105,6 +110,12 @@ jobs:
           else
             git checkout -B gh-pages
           fi
+
+          # Restore badges and commit if they changed
+          mkdir -p .github/badges
+          mv "$TMPDIR"/*.json .github/badges/ || true
+          rm -rf "$TMPDIR" || true
+
           git add .github/badges/*.json
           if git diff --cached --quiet; then
             echo "No changes to badges, nothing to commit"
