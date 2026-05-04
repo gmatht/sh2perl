@@ -43,7 +43,7 @@ jobs:
 
       - name: Run purify tests
         run: |
-          perl test_purify.pl 2>&1 | tee purify_output.txt || true
+          perl test_purify.pl --all 2>&1 | tee purify_output.txt || true
 
       - name: Generate badge JSON
         run: |
@@ -59,7 +59,7 @@ jobs:
           fi
           if [ ! -f purify_output.txt ]; then
             echo "purify_output.txt missing — running purify tests (fallback)"
-            perl test_purify.pl 2>&1 | tee purify_output.txt || true
+            perl test_purify.pl --all 2>&1 | tee purify_output.txt || true
           fi
 
           # Parse cargo test output for passed/failed/ignored/measured
@@ -69,12 +69,23 @@ jobs:
           main_measured=0
           main_total=0
           if [ -f cargo_test_output.txt ]; then
-            result_line=$(grep -E 'test result:' cargo_test_output.txt | tail -n1 || true)
-            if [ -n "$result_line" ]; then
-              main_passed=$(echo "$result_line" | perl -nle 'print $1 if /([0-9]+)\s+passed/') || true
-              main_failed=$(echo "$result_line" | perl -nle 'print $1 if /([0-9]+)\s+failed/') || true
-              main_ignored=$(echo "$result_line" | perl -nle 'print $1 if /([0-9]+)\s+ignored/') || true
-              main_measured=$(echo "$result_line" | perl -nle 'print $1 if /([0-9]+)\s+measured/') || true
+            # Sum numbers across all "test result:" lines because cargo prints
+            # one per test target. We want totals for the whole run, not a
+            # single target's summary.
+            summed=$(perl -nle '
+              $p=$f=$i=$m=0;
+              while (<>) {
+                if (/test result:.*?([0-9]+)\s+passed.*?([0-9]+)\s+failed.*?([0-9]+)\s+ignored.*?([0-9]+)\s+measured/) {
+                  $p += $1; $f += $2; $i += $3; $m += $4;
+                }
+              }
+              print join(" ", $p, $f, $i, $m);
+            ' cargo_test_output.txt || true)
+            if [ -n "$summed" ]; then
+              # Read summed values into variables
+              read main_passed main_failed main_ignored main_measured <<EOF
+${summed}
+EOF
               main_passed=${main_passed:-0}
               main_failed=${main_failed:-0}
               main_ignored=${main_ignored:-0}
@@ -102,6 +113,12 @@ jobs:
               purify_passed=$(echo "$line" | perl -nle 'print $1 if /Purify.pl tests: (\d+) passed/') || true
               purify_failed=$(echo "$line" | perl -nle 'print $1 if /, (\d+) failed/') || true
               purify_tested=$(echo "$line" | perl -nle 'print $1 if /, (\d+) tested$/') || true
+            else
+              # Fallback: if the final summary wasn't printed (the script died on
+              # the first failure), estimate counts from PASSED:/FAILED: lines.
+              purify_passed=$(grep -c '^PASSED:' purify_output.txt || true)
+              purify_failed=$(grep -c '^FAILED:' purify_output.txt || true)
+              purify_tested=$((purify_passed + purify_failed))
             fi
           fi
           purify_passed=${purify_passed:-0}
