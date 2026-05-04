@@ -222,6 +222,7 @@ The head command was generating internal structure without proper relative inden
 2. **Caller Level**: Apply base indentation to all lines
 
 **Implementation:**
+{% raw %}
 ```rust
 // In head command generation
 output.push_str(&format!("if ($head_count_0 < {}) {{\n", cmd_index, num_lines));
@@ -237,6 +238,7 @@ for line in command_output.lines() {
     output.push_str("\n");
 }
 ```
+{% endraw %}
 
 **Result:**
 ```perl

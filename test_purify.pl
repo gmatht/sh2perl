@@ -37,8 +37,11 @@ my %timeouts = (
 my $debug_level = 0;  # 0=none, 1=basic, 2=detailed, 3=verbose
 
 GetOptions(
-	'verbose|v' => \$verbose,
-    'next' => \$next,
+    'verbose|v' => \$verbose,
+    # "next" historically continued past failures. Add an alias "all"
+    # which is clearer (run all tests). Keep the $next variable for
+    # backwards-compatibility with existing invocations.
+    'next|all' => \$next,
 ) or die "Error in command line arguments\n";
 
 if ($verbose) {
@@ -46,7 +49,7 @@ if ($verbose) {
 }
 
 if ($next) {
-    print "Running test_purify.pl with next option\n";
+    print "Running test_purify.pl continuing past failures (flag: --next / --all)\n";
 }
 
 $ENV{TZ} = 'UTC';
