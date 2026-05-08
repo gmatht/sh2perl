@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 
 my $main_exit_code = 0;
@@ -37,7 +36,7 @@ my $found_files = do {
     my @files_50 = ();
     my $start_50 = q{.};
 
-    sub find_files_50 {
+    find( sub {
         my $file_50 = $File::Find::name;
         if ( !( -f $file_50 ) ) {
             return;
@@ -46,9 +45,8 @@ my $found_files = do {
             return;
         }
         push @files_50, $file_50;
-        return;
-    }
-    find( \&find_files_50, $start_50 );
+    },
+    $start_50 );
     join "\n", @files_50;
 };
 print "Found shell scripts:\n";

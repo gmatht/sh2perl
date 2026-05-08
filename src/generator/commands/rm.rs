@@ -275,7 +275,6 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     // Silent operation - no output unless error
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
-                    output.push_str("$main_exit_code = 0;\n");
                     if verbose {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("print \"removed '\" . {} . \"'\\n\";\n", file));
@@ -294,7 +293,6 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     output.push_str(&format!("if ( unlink {} ) {{\n", quoted_file));
                     generator.indent_level += 1;
                     output.push_str(&generator.indent());
-                    output.push_str("$main_exit_code = 0;\n");
                     if verbose {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("print \"removed '\" . {} . \"'\\n\";\n", file));
@@ -360,7 +358,6 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     generator.indent_level += 1;
                     // Silent operation - no output unless error
                     output.push_str(&generator.indent());
-                    output.push_str("$main_exit_code = 0;\n");
                     if verbose {
                         output.push_str(&generator.indent());
                         output.push_str(&format!("print \"removed '\" . {} . \"'\\n\";\n", file));

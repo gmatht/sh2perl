@@ -2008,7 +2008,7 @@ sub convert_shell_to_perl {
     print "DEBUG: Command output length: " . length($stdout) . "\n" if $verbose;
 
     if ($exit_code != 0) {
-        warn "debashc failed with exit code $exit_code: $stdout\n";
+        warn "debashc failed with exit code $exit_code: $stdout\n" if $verbose;
         return undef;
     }
     

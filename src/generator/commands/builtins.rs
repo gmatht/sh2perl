@@ -233,11 +233,36 @@ pub fn is_builtin(command_name: &str) -> bool {
 
 /// Check if all commands in a pipeline support line-by-line processing
 pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
+    let strings_uses_filename = |cmd: &SimpleCommand| -> bool {
+        let mut i = 0;
+        while i < cmd.args.len() {
+            if let Word::Literal(arg_str, _) = &cmd.args[i] {
+                if arg_str == "-n" {
+                    if i + 1 < cmd.args.len() {
+                        if let Word::Literal(next, _) = &cmd.args[i + 1] {
+                            if next.parse::<usize>().is_ok() {
+                                i += 1;
+                            }
+                        }
+                    }
+                } else if arg_str.starts_with("-n") {
+                    // Attached form like `-n5` is still an option.
+                } else if !arg_str.starts_with('-') {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    };
+
     // First check if all commands support line-by-line processing
     let all_support_linebyline = pipeline.commands.iter().all(|cmd| {
         if let Command::Simple(simple_cmd) = cmd {
             if let Word::Literal(name, _) = &simple_cmd.name {
-                if let Some(builtin) = get_builtin_commands().get(name.as_str()) {
+                if name == "strings" && strings_uses_filename(simple_cmd) {
+                    false
+                } else if let Some(builtin) = get_builtin_commands().get(name.as_str()) {
                     builtin.supports_linebyline
                 } else {
                     false // Non-builtin commands can't do line-by-line
@@ -314,6 +339,11 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
                 "cat" => {
                     // If cat has arguments, it's reading from files, not STDIN
                     if !first_cmd.args.is_empty() {
+                        return false;
+                    }
+                }
+                "strings" => {
+                    if strings_uses_filename(first_cmd) {
                         return false;
                     }
                 }

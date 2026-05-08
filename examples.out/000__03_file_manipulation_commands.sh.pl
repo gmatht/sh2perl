@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 use File::Copy qw(copy move);
@@ -17,6 +16,7 @@ our $CHILD_ERROR;
 print "=== File Manipulation Commands ===\n";
 print "=== cp command ===\n";
 print "\n";
+$CHILD_ERROR = 0;
 do {
     open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $!\n";
@@ -30,36 +30,26 @@ do {
 };
 my $cp_result = do {
     my $left_result_5 = do {
-            local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-                my $err;
-                if ( -e 'test_file.txt' ) {
-                    my $dest = 'test_file_copy.txt';
-                    if ( -d $dest ) {
-                        $dest = "$dest/'test_file.txt'";
-                    }
-                    if ( copy( 'test_file.txt', $dest ) ) {
-                    }
-                    else {
-                        croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";
-                    }
-                }
-                else {
-                    croak "cp: 'test_file.txt': No such file or directory\n";
-                }
-                local $CHILD_ERROR = 0;
-                1;
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            do {
+                my $cp_cmd = 'cp test_file.txt test_file_copy.txt';
+                my $cp_output = qx{$cp_cmd};
+                # print $cp_output;
+                $cp_output;
             };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
-            }
-            q{};
-    };
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_5 = ("Copy successful");
+        my $right_result_5 = do { ("Copy successful") };
         $left_result_5 . $right_result_5;
-    }
-    else {
+    } else {
         q{};
     }
 };
@@ -70,6 +60,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
 my @ls_files_6 = ();
 my $ls_all_found_7 = 1;
@@ -136,54 +127,57 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "No test files found\n";
 }
 print "\n";
+$CHILD_ERROR = 0;
 print "=== mv command ===\n";
 my $mv_result = do {
     my $left_result_15 = do {
-            local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-                my $force = 0;
-                if ( -e 'test_file_copy.txt' ) {
-                    my $dest = 'test_file_moved.txt';
-                    if ( -e $dest && -d $dest ) {
-                        $dest = "$dest/'test_file_copy.txt'";
-                    }
-                    if ( -e $dest && !$force ) {
-                        croak "mv: $dest: File exists (use -f to force overwrite)\n";
-                    }
-                    my $dest_dir = $dest;
-                    $dest_dir =~ s/\/[^\/]*$//msx;
-                    if ( $dest_dir eq $dest ) {
-                        $dest_dir = q{};
-                    }
-                    if ( $dest_dir ne q{} && !-d $dest_dir ) {
-                        my $err;
-                        make_path( $dest_dir, { error => \$err } );
-                        if ( @{$err} ) {
-                            croak "mv: cannot create directory $dest_dir: $err->[0]\n";
-                        }
-                    }
-                    if ( move( 'test_file_copy.txt', $dest ) ) {
-                        # # print "mv: moved 'test_file_copy.txt' to $dest\n";
-                    } else {
-                        croak
-                  "mv: cannot move 'test_file_copy.txt' to $dest: $ERRNO\n";
-                    }
-                } else {
-                    croak "mv: 'test_file_copy.txt': No such file or directory\n";
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            my $force = 0;
+            if ( -e 'test_file_copy.txt' ) {
+                my $dest = 'test_file_moved.txt';
+                if ( -e $dest && -d $dest ) {
+                    my $source_name = 'test_file_copy.txt';
+                    $source_name =~ s{^.*[\/]}{};
+                    $dest = "$dest/$source_name";
                 }
-                local $CHILD_ERROR = 0;
-                1;
-            };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
+                if ( -e $dest && !$force ) {
+                    croak "mv: $dest: File exists (use -f to force overwrite)\n";
+                }
+                my $dest_dir = $dest;
+                $dest_dir =~ s/\/[^\/]*$//msx;
+                if ( $dest_dir eq $dest ) {
+                    $dest_dir = q{};
+                }
+                if ( $dest_dir ne q{} && !-d $dest_dir ) {
+                    my $err;
+                    make_path( $dest_dir, { error => \$err } );
+                    if ( @{$err} ) {
+                        croak "mv: cannot create directory $dest_dir: $err->[0]\n";
+                    }
+                }
+                require File::Copy;
+                if ( File::Copy::move( 'test_file_copy.txt', $dest ) ) {
+                } else {
+                    croak
+              "mv: cannot move 'test_file_copy.txt' to $dest: $ERRNO\n";
+                }
+            } else {
+                croak "mv: 'test_file_copy.txt': No such file or directory\n";
             }
-            q{};
-    };
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_15 = ("Move successful");
+        my $right_result_15 = do { ("Move successful") };
         $left_result_15 . $right_result_15;
-    }
-    else {
+    } else {
         q{};
     }
 };
@@ -194,6 +188,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
 my @ls_files_16 = ();
 my $ls_all_found_17 = 1;
@@ -260,62 +255,60 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "No test files found\n";
 }
 print "\n";
+$CHILD_ERROR = 0;
 print "=== rm command ===\n";
 my $rm_result = do {
     my $left_result_25 = do {
-            local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-                if ( -e "test_file.txt" ) {
-                    if ( -d "test_file.txt" ) {
-                        croak "rm: ", "test_file.txt",
-                          " is a directory (use -r to remove recursively)\n";
-                    }
-                    else {
-                        if ( unlink "test_file.txt" ) {
-                            $main_exit_code = 0;
-                        }
-                        else {
-                            croak "rm: cannot remove ", "test_file.txt",
-                              ": $OS_ERROR\n";
-                        }
-                    }
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            if ( -e "test_file.txt" ) {
+                if ( -d "test_file.txt" ) {
+                    croak "rm: ", "test_file.txt",
+                      " is a directory (use -r to remove recursively)\n";
                 }
                 else {
-                    local $CHILD_ERROR = 1;
-                    croak "rm: ", "test_file.txt", ": No such file or directory\n";
-                }
-                if ( -e "test_file_moved.txt" ) {
-                    if ( -d "test_file_moved.txt" ) {
-                        croak "rm: ", "test_file_moved.txt",
-                          " is a directory (use -r to remove recursively)\n";
-                    }
+                    if ( unlink "test_file.txt" ) {
+                                }
                     else {
-                        if ( unlink "test_file_moved.txt" ) {
-                            $main_exit_code = 0;
-                        }
-                        else {
-                            croak "rm: cannot remove ", "test_file_moved.txt",
-                              ": $OS_ERROR\n";
-                        }
+                        croak "rm: cannot remove ", "test_file.txt",
+                          ": $OS_ERROR\n";
                     }
                 }
-                else {
-                    local $CHILD_ERROR = 1;
-                    croak "rm: ", "test_file_moved.txt", ": No such file or directory\n";
-                }
-                local $CHILD_ERROR = 0;
-                1;
-            };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
             }
-            q{};
-    };
+            else {
+                local $CHILD_ERROR = 1;
+                croak "rm: ", "test_file.txt", ": No such file or directory\n";
+            }
+            if ( -e "test_file_moved.txt" ) {
+                if ( -d "test_file_moved.txt" ) {
+                    croak "rm: ", "test_file_moved.txt",
+                      " is a directory (use -r to remove recursively)\n";
+                }
+                else {
+                    if ( unlink "test_file_moved.txt" ) {
+                                }
+                    else {
+                        croak "rm: cannot remove ", "test_file_moved.txt",
+                          ": $OS_ERROR\n";
+                    }
+                }
+            }
+            else {
+                local $CHILD_ERROR = 1;
+                croak "rm: ", "test_file_moved.txt", ": No such file or directory\n";
+            }
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_25 = ("Remove successful");
+        my $right_result_25 = do { ("Remove successful") };
         $left_result_25 . $right_result_25;
-    }
-    else {
+    } else {
         q{};
     }
 };
@@ -326,6 +319,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
 my @ls_files_26 = ();
 my $ls_all_found_27 = 1;
@@ -392,30 +386,30 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "No test files found\n";
 }
 print "\n";
+$CHILD_ERROR = 0;
 print "=== mkdir command ===\n";
 my $mkdir_result = do {
     my $left_result_35 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+        use File::Path qw(make_path);
+        if ( mkdir 'test_dir' ) {
+            }
+        else {
+            croak "mkdir: cannot create directory " . 'test_dir' . ": File exists\n";
+        }
             local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-            use File::Path qw(make_path);
-            if ( mkdir 'test_dir' ) {
-                }
-            else {
-                croak "mkdir: cannot create directory 'test_dir': File exists\n";
-            }
-                local $CHILD_ERROR = 0;
-                1;
-            };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
-            }
-            q{};
-    };
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_35 = ("Directory created");
+        my $right_result_35 = do { ("Directory created") };
         $left_result_35 . $right_result_35;
-    }
-    else {
+    } else {
         q{};
     }
 };
@@ -426,6 +420,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 if ( -e "test_dir/file" ) {
     my $current_time = time;
     utime $current_time, $current_time, "test_dir/file";
@@ -509,8 +504,7 @@ if ( -e "test_dir/file" ) {
     }
     else {
         if ( unlink "test_dir/file" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             croak "rm: cannot remove ", "test_dir/file",
               ": $OS_ERROR\n";
@@ -532,37 +526,37 @@ else {
     croak "rmdir: 'test_dir': No such file or directory\n";
 }
 print "\n";
+$CHILD_ERROR = 0;
 print "=== touch command ===\n";
 my $touch_result = do {
     my $left_result_46 = do {
-            local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-                if ( -e "test_file.txt" ) {
-                    my $current_time = time;
-                    utime $current_time, $current_time, "test_file.txt";
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            if ( -e "test_file.txt" ) {
+                my $current_time = time;
+                utime $current_time, $current_time, "test_file.txt";
+            }
+            else {
+                if ( open my $fh, '>', "test_file.txt" ) {
+                    close $fh or croak "Close failed: $ERRNO";
                 }
                 else {
-                    if ( open my $fh, '>', "test_file.txt" ) {
-                        close $fh or croak "Close failed: $ERRNO";
-                    }
-                    else {
-                        croak "touch: cannot create ", "test_file.txt",
-                          ": $ERRNO\n";
-                    }
+                    croak "touch: cannot create ", "test_file.txt",
+                      ": $ERRNO\n";
                 }
-                local $CHILD_ERROR = 0;
-                1;
-            };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
             }
-            q{};
-    };
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_46 = ("File touched");
+        my $right_result_46 = do { ("File touched") };
         $left_result_46 . $right_result_46;
-    }
-    else {
+    } else {
         q{};
     }
 };
@@ -573,7 +567,9 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 print "\n";
+$CHILD_ERROR = 0;
 if ( -e "test_file.txt" ) {
     if ( -d "test_file.txt" ) {
         carp "rm: carping: ", "test_file.txt",
@@ -581,8 +577,7 @@ if ( -e "test_file.txt" ) {
     }
     else {
         if ( unlink "test_file.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "test_file.txt",
               ": $OS_ERROR\n";
@@ -591,7 +586,6 @@ if ( -e "test_file.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_file.txt", ": No such file or directory\n";
 }
 if ( -e "test_file_copy.txt" ) {
     if ( -d "test_file_copy.txt" ) {
@@ -600,8 +594,7 @@ if ( -e "test_file_copy.txt" ) {
     }
     else {
         if ( unlink "test_file_copy.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "test_file_copy.txt",
               ": $OS_ERROR\n";
@@ -610,7 +603,6 @@ if ( -e "test_file_copy.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_file_copy.txt", ": No such file or directory\n";
 }
 if ( -e "test_file_moved.txt" ) {
     if ( -d "test_file_moved.txt" ) {
@@ -619,8 +611,7 @@ if ( -e "test_file_moved.txt" ) {
     }
     else {
         if ( unlink "test_file_moved.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "test_file_moved.txt",
               ": $OS_ERROR\n";
@@ -629,24 +620,22 @@ if ( -e "test_file_moved.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_file_moved.txt", ": No such file or directory\n";
 }
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
 if ( -e "test_dir" ) {
     if ( -d "test_dir" ) {
         my $err;
-        remove_tree("test_dir", {error => \$err});
+        require File::Path;
+        File::Path::remove_tree("test_dir", {error => \$err});
         if (@{$err}) {
             carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";
         }
         else {
-            $main_exit_code = 0;
-        }
+                    }
     }
     else {
         if ( unlink "test_dir" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "test_dir",
               ": $OS_ERROR\n";
@@ -655,7 +644,6 @@ if ( -e "test_dir" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_dir", ": No such file or directory\n";
 }
 if ($CHILD_ERROR != 0) {
     1;

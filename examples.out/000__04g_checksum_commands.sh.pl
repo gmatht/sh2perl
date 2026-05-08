@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 use Digest::SHA   qw(sha256_hex sha512_hex);
 use File::Path    qw(make_path remove_tree);
@@ -45,7 +44,7 @@ my $sha256_result = do {
         push @results,
 "0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
     }
-    join "\n", @results;
+    join("\n", @results) . "\n";
 };
 do {
     my $output = "SHA256 result: $sha256_result";
@@ -54,6 +53,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 my $sha512_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
@@ -74,7 +74,7 @@ my $sha512_result = do {
         push @results,
 "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
     }
-    join "\n", @results;
+    join("\n", @results) . "\n";
 };
 do {
     my $output = "SHA512 result: $sha512_result";
@@ -83,9 +83,11 @@ do {
         print "\n";
     }
 };
-my $strings_result = do {
-    my $output_114;
-    my $pipeline_success_114 = 1;
+$CHILD_ERROR = 0;
+my $strings_result = do { do {
+    my $output_0 = q{};
+    my $output_printed_0;
+    my $pipeline_success_0 = 1;
     my $input_data;
     if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
         local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
@@ -98,18 +100,15 @@ my $strings_result = do {
         $input_data = q{};
     }
     my @result;
-    my @lines = split /\n/msx, $input_data;
-    for my $line (@lines) {
-        if ( length $line >= 4 ) {
-            push @result, $line;
-        }
+    while ($input_data =~ /([\x20-\x7E]{4,})/g) {
+        push @result, $1;
     }
     my $line = join "\n", @result;
-    $output_114 = $line;
+    $output_0 = $line;
     my $num_lines       = 3;
     my $head_line_count = 0;
     my $result          = q{};
-    my $input           = $output_114;
+    my $input           = $output_0;
     my $pos             = 0;
 
     while ( $pos < length $input && $head_line_count < $num_lines ) {
@@ -122,12 +121,14 @@ my $strings_result = do {
         $pos = $line_end + 1;
         ++$head_line_count;
     }
-    $output_114 = $result;
+    $output_0 = $result;
 
-    if ( !$pipeline_success_114 ) { $main_exit_code = 1; }
-    $output_114 =~ s/\n+\z//msx;
-    $output_114;
-};
+    if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    if ($output_0 ne q{} && !($output_0 =~ m{\n\z}msx)) {
+        $output_0 .= "\n";
+    }
+    $output_0;
+} };
 print "Strings result:\n";
 print $strings_result;
 if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
@@ -138,8 +139,7 @@ if ( -e "test_checksum.txt" ) {
     }
     else {
         if ( unlink "test_checksum.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "test_checksum.txt",
               ": $OS_ERROR\n";
@@ -148,7 +148,6 @@ if ( -e "test_checksum.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_checksum.txt", ": No such file or directory\n";
 }
 print "=== Checksum Commands Complete ===\n";
 

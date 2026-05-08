@@ -452,8 +452,7 @@ impl Parser {
                         commands.remove(0)
                     } else {
                         let end_span = self.lexer.get_span();
-                        let end_byte_pos =
-                            end_span.map(|(_, end)| end).unwrap_or(start_byte_pos);
+                        let end_byte_pos = end_span.map(|(_, end)| end).unwrap_or(start_byte_pos);
                         let source_text = if start_byte_pos < end_byte_pos {
                             Some(
                                 self.lexer
@@ -475,15 +474,16 @@ impl Parser {
                     // Parse the right side as a full pipeline so that any
                     // subsequent `|` operators bind more tightly.
                     let right_start_span = self.lexer.get_span();
-                    let right_start_pos =
-                        right_start_span.map(|(s, _)| s).unwrap_or(0);
+                    let right_start_pos = right_start_span.map(|(s, _)| s).unwrap_or(0);
                     let right_simple = self.parse_simple_command()?;
-                    let right_with_redirects =
-                        self.parse_command_redirects(right_simple)?;
-                    let right = self
-                        .parse_pipeline_from_command(right_with_redirects, right_start_pos)?;
+                    let right_with_redirects = self.parse_command_redirects(right_simple)?;
+                    let right =
+                        self.parse_pipeline_from_command(right_with_redirects, right_start_pos)?;
 
-                    return Ok(Command::And(Box::new(left), Box::new(right)));
+                    return Ok(Self::rebalance_logical_chain(Command::And(
+                        Box::new(left),
+                        Box::new(right),
+                    )));
                 }
                 Token::Or => {
                     self.lexer.next();
@@ -494,8 +494,7 @@ impl Parser {
                         commands.remove(0)
                     } else {
                         let end_span = self.lexer.get_span();
-                        let end_byte_pos =
-                            end_span.map(|(_, end)| end).unwrap_or(start_byte_pos);
+                        let end_byte_pos = end_span.map(|(_, end)| end).unwrap_or(start_byte_pos);
                         let source_text = if start_byte_pos < end_byte_pos {
                             Some(
                                 self.lexer
@@ -515,15 +514,16 @@ impl Parser {
                     };
 
                     let right_start_span = self.lexer.get_span();
-                    let right_start_pos =
-                        right_start_span.map(|(s, _)| s).unwrap_or(0);
+                    let right_start_pos = right_start_span.map(|(s, _)| s).unwrap_or(0);
                     let right_simple = self.parse_simple_command()?;
-                    let right_with_redirects =
-                        self.parse_command_redirects(right_simple)?;
-                    let right = self
-                        .parse_pipeline_from_command(right_with_redirects, right_start_pos)?;
+                    let right_with_redirects = self.parse_command_redirects(right_simple)?;
+                    let right =
+                        self.parse_pipeline_from_command(right_with_redirects, right_start_pos)?;
 
-                    return Ok(Command::Or(Box::new(left), Box::new(right)));
+                    return Ok(Self::rebalance_logical_chain(Command::Or(
+                        Box::new(left),
+                        Box::new(right),
+                    )));
                 }
                 Token::If => {
                     // If we encounter an 'if' token in the middle of a pipeline,
@@ -566,6 +566,43 @@ impl Parser {
             //             eprintln!("DEBUG: parse_pipeline_from_command returning pipeline: {:?}", result);
             Ok(result)
         }
+    }
+
+    fn rebalance_logical_chain(command: Command) -> Command {
+        fn collect(command: Command, operands: &mut Vec<Command>, operators: &mut Vec<bool>) {
+            match command {
+                Command::And(left, right) => {
+                    collect(*left, operands, operators);
+                    operators.push(true);
+                    collect(*right, operands, operators);
+                }
+                Command::Or(left, right) => {
+                    collect(*left, operands, operators);
+                    operators.push(false);
+                    collect(*right, operands, operators);
+                }
+                other => operands.push(other),
+            }
+        }
+
+        let mut operands = Vec::new();
+        let mut operators = Vec::new();
+        collect(command, &mut operands, &mut operators);
+
+        let mut operands = operands.into_iter();
+        let mut expr = operands
+            .next()
+            .expect("logical chain should contain at least one operand");
+
+        for (is_and, operand) in operators.into_iter().zip(operands) {
+            expr = if is_and {
+                Command::And(Box::new(expr), Box::new(operand))
+            } else {
+                Command::Or(Box::new(expr), Box::new(operand))
+            };
+        }
+
+        expr
     }
 
     pub fn parse_simple_command(&mut self) -> Result<Command, ParserError> {
