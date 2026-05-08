@@ -709,6 +709,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 );
                             format!("do {{ {} $grep_result_{}; }}", grep_output, unique_id)
                         } else if name == "printf" {
+                            // Delegate printf in command-substitution contexts to the
+                            // dedicated printf generator so we correctly emulate the
+                            // shell's repeating-format behaviour (e.g. printf "%s\\n" A B)
+                            crate::generator::commands::printf::generate_printf_command(
+                                generator, simple_cmd, "", 0, None,
+                            )
+                        } else if name == "printf" && false {
+                            // (disabled) old ad-hoc printf handling - now delegated to dedicated printf generator
                             // Special handling for printf in command substitution
                             let mut format_string = String::new();
                             let mut args = Vec::new();
@@ -785,7 +793,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     // arguments are consumed.  If there are more args than
                                     // specifiers we must generate a loop so the output
                                     // matches bash behaviour.
-                                    let escaped_fmt = format_string.replace("\"", "\\\"").replace("\\\\", "\\");
+                                    let escaped_fmt =
+                                        format_string.replace("\"", "\\\"").replace("\\\\", "\\");
                                     let specifier_count = {
                                         let mut chars = format_string.chars().peekable();
                                         let mut count = 0usize;
