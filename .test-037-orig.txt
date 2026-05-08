@@ -1,0 +1,198 @@
+=== Example 037: Complex pipeline ===
+Complex pipeline 1: Data processing and filtering
+cat | grep | cut | sort | head
+Alice,95.5
+Frank,89.7
+
+Complex pipeline 2: Text transformation and analysis
+cat | tr | sed | awk | wc
+Total processed lines: 8
+
+Complex pipeline 3: Multi-step data analysis
+cat | cut | sort | uniq -c | sort -nr
+      2 Manager
+      2 Engineer
+      2 Developer
+      1 Designer
+      1 Analyst
+
+Complex pipeline 4: File operations and filtering
+find | grep | xargs | wc
+    20 ./.test-037-orig.txt
+     2 ./highest_tests_and_lines.txt
+     0 ./test_mv_preserve.txt
+     0 ./.test-037-pure-err.txt
+     0 ./first_n_tests_passed.MAX.txt
+    62 ./.test-037-pure-run.txt
+     2 ./clean/filtered/highest_tests_and_lines.txt
+     0 ./clean/filtered/first_n_tests_passed.MAX.txt
+   136 ./clean/filtered/after_test.txt
+     3 ./clean/filtered/test2.txt
+     3 ./clean/filtered/.tmp/examples_test_all/work/064_hard_to_generate.sh_2/config.txt
+     5 ./clean/filtered/.tmp/examples_test_all/work/064_hard_to_generate.sh_2/users.txt
+     3 ./clean/filtered/.tmp/examples_test_all/work/064_08_heredocs_with_variable_interpolation.sh_2/config.txt
+     5 ./clean/filtered/.tmp/examples_test_all/work/064_15_complex_pipeline_multiple_redirects.sh_2/users.txt
+     5 ./clean/filtered/.tmp/examples_test_all/work/064_15_complex_pipeline_multiple_redirects.sh_1/users.txt
+     1 ./clean/filtered/.tmp/examples_test_all/work/018_grep_params.sh_1/test_dir/file1.txt
+     1 ./clean/filtered/.tmp/examples_test_all/work/018_grep_params.sh_1/test_dir/file2.txt
+     1 ./clean/filtered/.tmp/examples_test_all/work/018_grep_params.sh_1/temp_file.txt
+     3 ./clean/filtered/.tmp/examples_test_all/work/064_hard_to_generate.sh_1/config.txt
+     5 ./clean/filtered/.tmp/examples_test_all/work/064_hard_to_generate.sh_1/users.txt
+     1 ./clean/filtered/.tmp/examples_test_all/work/018_grep_params.sh_2/test_dir/file1.txt
+     1 ./clean/filtered/.tmp/examples_test_all/work/018_grep_params.sh_2/test_dir/file2.txt
+     1 ./clean/filtered/.tmp/examples_test_all/work/018_grep_params.sh_2/temp_file.txt
+     3 ./clean/filtered/.tmp/examples_test_all/work/064_08_heredocs_with_variable_interpolation.sh_1/config.txt
+   144 ./clean/filtered/.tmp/examples_test_all/summary.txt
+   144 ./clean/filtered/.tmp/examples_test_same/list.txt
+   664 ./clean/filtered/.tmp/examples_test_same/summary.txt
+     1 ./clean/filtered/.tmp/examples_test/work/018_grep_params.sh_1/test_dir/file1.txt
+     1 ./clean/filtered/.tmp/examples_test/work/018_grep_params.sh_1/test_dir/file2.txt
+     1 ./clean/filtered/.tmp/examples_test/work/018_grep_params.sh_1/temp_file.txt
+     1 ./clean/filtered/.tmp/examples_test/work/018_grep_params.sh_2/test_dir/file1.txt
+     1 ./clean/filtered/.tmp/examples_test/work/018_grep_params.sh_2/test_dir/file2.txt
+     1 ./clean/filtered/.tmp/examples_test/work/018_grep_params.sh_2/temp_file.txt
+    35 ./clean/filtered/.tmp/examples_test/list.txt
+    35 ./clean/filtered/.tmp/examples_test/results/summary.txt
+   237 ./clean/filtered/.test-work/purify-run-1.txt
+     1 ./clean/filtered/test_dir/file1.txt
+     1 ./clean/filtered/test_dir/file2.txt
+    51 ./clean/filtered/test_output2.txt
+  1178 ./clean/filtered/full_test_output.txt
+  1178 ./clean/filtered/test_run.txt
+    25 ./clean/filtered/test_perl_output.txt
+   348 ./clean/filtered/test_000_01_output.txt
+     3 ./clean/filtered/test1.txt
+   355 ./clean/filtered/test_full.txt
+    51 ./clean/filtered/test_output3.txt
+    57 ./clean/filtered/test_tidied_output.txt
+     3 ./clean/filtered/examples/test_binary.txt
+  1162 ./clean/filtered/test_details.txt
+   347 ./clean/filtered/test_000_01_debug.txt
+     3 ./clean/filtered/test_binary.txt
+  1162 ./clean/filtered/test_output.txt
+     0 ./clean/filtered/first_n_tests_passed.txt
+   136 ./after_test.txt
+     3 ./test2.txt
+     0 ./.tmp/examples_test_all/work/063_hard_to_parse.sh_2/comparison.txt
+     3 ./.tmp/examples_test_all/work/064_hard_to_generate.sh_2/config.txt
+     5 ./.tmp/examples_test_all/work/064_hard_to_generate.sh_2/users.txt
+     0 ./.tmp/examples_test_all/work/063_20_final_complex_construct.sh_2/final_result.txt
+     0 ./.tmp/examples_test_all/work/063_14_complex_redirects.sh_2/comparison.txt
+     3 ./.tmp/examples_test_all/work/064_08_heredocs_with_variable_interpolation.sh_2/config.txt
+     0 ./.tmp/examples_test_all/work/063_20_final_complex_construct.sh_1/final_result.txt
+     5 ./.tmp/examples_test_all/work/064_15_complex_pipeline_multiple_redirects.sh_2/users.txt
+     5 ./.tmp/examples_test_all/work/064_15_complex_pipeline_multiple_redirects.sh_1/users.txt
+     1 ./.tmp/examples_test_all/work/018_grep_params.sh_1/test_dir/file1.txt
+     1 ./.tmp/examples_test_all/work/018_grep_params.sh_1/test_dir/file2.txt
+     1 ./.tmp/examples_test_all/work/018_grep_params.sh_1/temp_file.txt
+     0 ./.tmp/examples_test_all/work/063_14_complex_redirects.sh_1/comparison.txt
+     3 ./.tmp/examples_test_all/work/064_hard_to_generate.sh_1/config.txt
+     5 ./.tmp/examples_test_all/work/064_hard_to_generate.sh_1/users.txt
+     1 ./.tmp/examples_test_all/work/018_grep_params.sh_2/test_dir/file1.txt
+     1 ./.tmp/examples_test_all/work/018_grep_params.sh_2/test_dir/file2.txt
+     1 ./.tmp/examples_test_all/work/018_grep_params.sh_2/temp_file.txt
+     0 ./.tmp/examples_test_all/work/063_hard_to_parse.sh_1/comparison.txt
+     3 ./.tmp/examples_test_all/work/064_08_heredocs_with_variable_interpolation.sh_1/config.txt
+   144 ./.tmp/examples_test_all/summary.txt
+   144 ./.tmp/examples_test_same/list.txt
+   664 ./.tmp/examples_test_same/summary.txt
+     1 ./.tmp/examples_test/work/018_grep_params.sh_1/test_dir/file1.txt
+     1 ./.tmp/examples_test/work/018_grep_params.sh_1/test_dir/file2.txt
+     1 ./.tmp/examples_test/work/018_grep_params.sh_1/temp_file.txt
+     1 ./.tmp/examples_test/work/018_grep_params.sh_2/test_dir/file1.txt
+     1 ./.tmp/examples_test/work/018_grep_params.sh_2/test_dir/file2.txt
+     1 ./.tmp/examples_test/work/018_grep_params.sh_2/temp_file.txt
+    35 ./.tmp/examples_test/list.txt
+    35 ./.tmp/examples_test/results/summary.txt
+   937 ./.test-work/035_verbose_log.txt
+     2 ./.test-work/035_pure_run.txt
+    84 ./.test-work/035_pure_run2.txt
+   237 ./.test-work/purify-run-1.txt
+    83 ./.test-work/035_pure_after_fix_run.txt
+    55 ./.test-work/035_diff.txt
+     0 ./.test-work/035_pure2_run.txt
+    83 ./.test-work/035_orig_run.txt
+  2073 ./.test-work/purify/044_run_output.txt
+    50 ./.test-work/purify/failure_report.txt
+    79 ./.test-work/purify/actual_output.txt
+   850 ./.test-work/purify/test_purify_run.txt
+     0 ./.test-work/purify/023_mv_basic/test_mv_preserve.txt
+     1 ./test_dir/file1.txt
+     1 ./test_dir/file2.txt
+    51 ./test_output2.txt
+  1178 ./full_test_output.txt
+    79 ./.test-037-run-pure2.txt
+   142 ./.test-037-run-pure.txt
+  1178 ./test_run.txt
+    25 ./test_perl_output.txt
+   348 ./test_000_01_output.txt
+     3 ./test1.txt
+   355 ./test_full.txt
+    51 ./test_output3.txt
+    57 ./test_tidied_output.txt
+     0 ./.test-037-pure-err2.txt
+     3 ./examples/test_binary.txt
+     8 ./test_data.txt
+    62 ./.test-037-pure-run2.txt
+  1162 ./test_details.txt
+   347 ./test_000_01_debug.txt
+     3 ./test_binary.txt
+     0 ./.test-err.txt
+  1162 ./test_output.txt
+     0 ./first_n_tests_passed.txt
+   138 ./.test-037-run-orig.txt
+ 19545 total
+
+Complex pipeline 5: Data aggregation and formatting
+cat | awk | sort | head
+25,95.5
+31,93.1
+35,92.8
+
+Complex pipeline 6: Text processing with multiple filters
+cat | grep | sed | tr | sort | uniq
+ALICE 25 ENGINEER 95.5
+CHARLIE 35 DEVELOPER 92.8
+DIANA 28 DESIGNER 88.9
+EVE 32 ANALYST 91.3
+FRANK 29 ENGINEER 89.7
+HENRY 27 DEVELOPER 86.4
+
+Complex pipeline 7: Data validation and reporting
+cat | awk | grep | wc
+High performers: 4
+
+Complex pipeline 8: File system operations
+ls | grep | xargs | wc
+Regular files: 218
+
+Complex pipeline 9: Data transformation and output
+cat | cut | sort | uniq | tee
+Roles saved to file
+Roles file content:
+Analyst
+Designer
+Developer
+Engineer
+Manager
+
+Complex pipeline 10: Error handling and conditional processing
+cat | grep | awk | sort | head
+Alice (Engineer): 95.5
+Charlie (Developer): 92.8
+Frank (Engineer): 89.7
+
+Complex pipeline 11: Multi-file processing
+find | xargs | cat | grep | wc
+Total Engineer mentions: 37
+
+Complex pipeline 12: Data formatting and presentation
+cat | awk | sort | head | tee
+Top performers saved to file
+Top performers file content:
+Alice       25 Engineer    95.5
+Grace       31 Manager     93.1
+Charlie     35 Developer   92.8
+Eve         32 Analyst     91.3
+Frank       29 Engineer    89.7
+=== Example 037 completed successfully ===
