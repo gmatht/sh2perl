@@ -183,70 +183,16 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 );
                             sha_code
                         } else if name == "printf" {
-                            // Special handling for printf in command substitution
-                            let mut format_string = String::new();
-                            let mut args = Vec::new();
-
-                            for (i, arg) in simple_cmd.args.iter().enumerate() {
-                                if i == 0 {
-                                    // For printf format strings, handle string interpolation specially
-                                    match arg {
-                                        Word::StringInterpolation(interp, _) => {
-                                            // For printf format strings, we want the raw string without escape processing
-                                            // Reconstruct the original string from the interpolation parts
-                                            format_string = interp
-                                                .parts
-                                                .iter()
-                                                .map(|part| match part {
-                                                    StringPart::Literal(s) => s.clone(),
-                                                    _ => "".to_string(), // Skip variables in format strings for now
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join("");
-                                        }
-                                        Word::Literal(s, _) => {
-                                            format_string = s.clone();
-                                        }
-                                        _ => {
-                                            format_string = generator.word_to_perl(arg);
-                                        }
-                                    }
-                                    // Remove quotes if they exist around the format string
-                                    if format_string.starts_with('\'')
-                                        && format_string.ends_with('\'')
-                                    {
-                                        format_string =
-                                            format_string[1..format_string.len() - 1].to_string();
-                                    } else if format_string.starts_with('"')
-                                        && format_string.ends_with('"')
-                                    {
-                                        format_string =
-                                            format_string[1..format_string.len() - 1].to_string();
-                                    }
-                                } else {
-                                    args.push(generator.word_to_perl(arg));
-                                }
-                            }
-
-                            if format_string.is_empty() {
-                                "\"\"".to_string()
-                            } else {
-                                let formatted_args = args
-                                    .iter()
-                                    .map(|arg| {
-                                        generator.perl_string_literal(&Word::Literal(
-                                            arg.clone(),
-                                            Default::default(),
-                                        ))
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                format!(
-                                    "sprintf \"{}\", {}",
-                                    format_string.replace("\"", "\\\"").replace("\\\\", "\\"),
-                                    formatted_args
-                                )
-                            }
+                            // Delegate printf in command-substitution contexts to the
+                            // dedicated printf generator so we correctly emulate the
+                            // shell's repeating-format behaviour (e.g. printf "%s\n" A B
+                            // should produce two lines). The standalone generator
+                            // already emits expression-valued code suitable for
+                            // command-substitution.
+                            crate::generator::commands::printf::generate_printf_command(
+                                generator, simple_cmd, "", 0, None,
+                            )
+                        } else if name == "date" {
                         } else if name == "date" {
                             format!(
                                 "do {{\n{}\n}}",
@@ -771,9 +717,7 @@ pub fn format_regex_pattern(pattern: &str) -> String {
     // Under Perl's /x modifier, unescaped whitespace in the pattern is ignored
     // (it is treated as formatting space, not a literal character). Escape any
     // literal space or tab characters so they remain significant after /x is applied.
-    let escaped_pattern = converted_pattern
-        .replace('\t', "\\t")
-        .replace(' ', "\\ ");
+    let escaped_pattern = converted_pattern.replace('\t', "\\t").replace(' ', "\\ ");
     // Add common flags: /s for dot matching newlines, /x for extended formatting, /m for multiline
     format!("/{}/msx", escaped_pattern)
 }

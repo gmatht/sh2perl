@@ -1,0 +1,73 @@
+=== Example 044: yes command ===
+Using backticks to call yes (limited output):
+Hello World
+Hello World
+Hello World
+Hello World
+Hello World
+
+yes with specific string:
+Test String
+Test String
+Test String
+
+yes with default string:
+y
+y
+y
+
+yes with empty string:
+
+
+
+yes with special characters:
+!@#$%^&*()
+!@#$%^&*()
+!@#$%^&*()
+
+yes with numbers:
+12345
+12345
+12345
+
+yes with newlines:
+Line with\nnewline
+Line with\nnewline
+Line with\nnewline
+
+yes with pipe to other commands:
+test
+test
+test
+
+yes with pipe to other commands:
+DATA
+DATA
+DATA
+
+yes with output redirection:
+Output file created successfully
+File content:
+1
+yes with background process (bounded):
+Background process started (will exit shortly)
+
+yes with timeout (bounded):
+Timeout test
+Timeout test
+Timeout test
+
+yes with different strings:
+String 1
+String 1
+String 2
+String 2
+
+yes with error handling:
+Error test
+Error test
+Error test
+
+yes with pipe to wc:
+Count: 10
+=== Example 044 completed successfully ===

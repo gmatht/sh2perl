@@ -1,0 +1,278 @@
+=== Example 037: Complex pipeline ===
+Complex pipeline 1: Data processing and filtering
+cat | grep | cut | sort | head
+Frank,89.7
+Alice,95.5
+
+Complex pipeline 2: Text transformation and analysis
+cat | tr | sed | awk | wc
+Total processed lines: 8
+
+Complex pipeline 3: Multi-step data analysis
+cat | cut | sort | uniq -c | sort -nr
+      2 Manager
+      2 Engineer
+      2 Developer
+      1 Designer
+      1 Analyst
+
+Complex pipeline 4: File operations and filtering
+find | grep | xargs | wc
+
+Complex pipeline 5: Data aggregation and formatting
+cat | awk | sort | head
+35,92.8
+32,91.3
+31,93.1
+
+Complex pipeline 6: Text processing with multiple filters
+cat | grep | sed | tr | sort | uniq
+ALICE 25 ENGINEER 95.5
+CHARLIE 35 DEVELOPER 92.8
+DIANA 28 DESIGNER 88.9
+EVE 32 ANALYST 91.3
+FRANK 29 ENGINEER 89.7
+HENRY 27 DEVELOPER 86.4
+
+Complex pipeline 7: Data validation and reporting
+cat | awk | grep | wc
+High performers: 4
+
+Complex pipeline 8: File system operations
+ls | grep | xargs | wc
+Regular files: ---version
+-.cursorrules
+-.dockerignore
+-.gitignore
+-.test-037-orig.err
+-.test-037-orig.out
+-.test-037-orig.txt
+-.test-037-pure-err.txt
+-.test-037-pure-err2.txt
+-.test-037-pure-run.err
+-.test-037-pure-run.txt
+-.test-037-pure-run2.txt
+-.test-037-pure.err
+-.test-037-pure.err2
+-.test-037-pure.out
+-.test-037-pure.pl
+-.test-037-purify.log
+-.test-037-run-orig.txt
+-.test-037-run-pure.txt
+-.test-037-run-pure2.txt
+-.test-err.txt
+-.test-out.pl
+-.test-purify-044.output
+-.test-purify-044.pure.pl
+-.test_purify_out.pl
+-.tmp_orig.out
+-.tmp_pure.out
+-.tmp_purified_037.pl.out
+-.tmp_purified_output.txt
+-000__04_basic_backtick_usage.sh
+-000__04_basic_backtick_usage.sh.ORIGINAL
+-000__04_basic_backtick_usage.sh.complex
+-000__04_basic_backtick_usage_simple.sh
+-1
+-20
+-30
+-90
+-BENCHMARK_README.md
+-Cargo.lock
+-Cargo.toml
+-DOCKER.md
+-Dockerfile
+-FIX.md
+-INSTALL.md
+-LICENSE
+-README-WASM.md
+-README.md
+-TODO.txt
+-after_test.txt
+-benchmark.bat
+-benchmark.ps1
+-benchmark_system.pl
+-build-wasm.sh
+-check_diffs.pl
+-clean.pl
+-clean.pl.ERR
+-clean_dead_code.sh
+-clean_dead_code_safe.sh
+-clean_perl.pl
+-clean_perl.pl.ERR
+-clean_perl.pl.tdy
+-command_cache.json
+-comment_debug.sh
+-compare_code.pl
+-compare_perl_bash.pl
+-complete_perl.pl
+-complex_script.sh
+-complex_test.sh
+-create_test_data.pl
+-current_perl.pl
+-current_perl.pl.ERR
+-debug_comparison.pdb
+-debug_comparison_test.exe
+-debug_comparison_test.pdb
+-debug_file_check.pl
+-debug_find_comprehensive.pl
+-debug_find_simple.pl
+-debug_function.sh
+-debug_lines.txt
+-debug_output.txt
+-debug_path_issue.pl
+-debug_perl.pl
+-debug_perl_code.pl
+-debug_pipeline1.pl
+-debug_purify.pl
+-debug_wc_redirect.sh
+-docker-compose.yml
+-docker-quickstart.sh
+-echo_if_test.sh
+-extracted_perl.pl
+-extracted_perl.pl.tdy
+-fail
+-fail-fast
+-fail.bat
+-final_perl.pl
+-final_perl.pl.tdy
+-find_perl_chunks.py
+-find_perl_specific_code.py
+-first_n_tests_passed.MAX.txt
+-first_n_tests_passed.txt
+-fixed_perl.pl
+-full_output.txt
+-full_perl.pl
+-full_test_output.txt
+-generated_code.pl
+-generated_code.txt
+-generated_perl.pl
+-generated_perl_debug.pl
+-generated_perl_fixed.pl
+-git_commit_sizes.pl
+-git_filter_repo_generator.pl
+-highest_tests_and_lines.txt
+-install-deps.bat
+-install-deps.ps1
+-ls
+-ls_clean.pl
+-ls_test.pl
+-main_loop.pl
+-main_loop_rust.pl
+-minimal_test.sh
+-mytest.pl
+-nul
+-orig.out
+-orig_combined
+-orig_out
+-orig_xxd
+-out_original.txt
+-out_purified.txt
+-output.txt
+-paths-to-remove.txt
+-perl_code.pl
+-perl_code.txt
+-perl_functions.txt
+-perl_output.txt
+-perl_result.txt
+-perl_specific_results.txt
+-perlcritic_wrapper.pl
+-perltidy_output.txt
+-ps_timeout.ps1
+-pure.out
+-pure_combined
+-pure_out
+-pure_perl.pl
+-pure_perl.pl.ERR
+-pure_xxd
+-purify.out
+-purify.pl
+-purify_bloated.pl
+-purify_run.log
+-regen.out
+-regen.run.out
+-regen_exec.out
+-rename_files.sh
+-restore_debug.sh
+-rm
+-roles.txt
+-run-next-test.bat
+-run_benchmarks.bat
+-run_benchmarks.sh
+-shell_output.txt
+-simple_benchmark.pl
+-simple_benchmark_no_color.pl
+-simple_if_test.sh
+-strip_debug.sh
+-temp*.txt;
+-temp1.txt;
+-temp2.txt;
+-temp_test.pl
+-temp_test.sh
+-temp_test_output.pl
+-temp_words.rs
+-test-docker.sh
+-test.pl
+-test1.txt
+-test2.txt
+-test_000_01_debug.txt
+-test_000_01_output.txt
+-test_000_06.pl.tdy
+-test_binary.txt
+-test_connection.bat
+-test_cp_backup.txt~
+-test_cp_suffix.txt.bak
+-test_data.txt
+-test_details.txt
+-test_echo.sh
+-test_for_loop.sh
+-test_full.txt
+-test_gen.pl.tdy
+-test_get_file_size.sh
+-test_minimal_glob.sh
+-test_mv_preserve.txt
+-test_output.pl
+-test_output.pl.ERR
+-test_output.txt
+-test_output2.txt
+-test_output3.txt
+-test_output_tidied.pl
+-test_paste.sh
+-test_paste_simple.sh
+-test_paste_with_print.sh
+-test_perl.sh
+-test_perl_env.sh
+-test_perl_output.txt
+-test_purify.pl
+-test_run.txt
+-test_simple_function.sh
+-test_system_builtin_check.rs
+-test_system_check.rs
+-test_test_purify.pl
+-test_tidied_output.txt
+-test_yes.sh
+-tidied_code.txt
+-tidy.pl
+-tooltip_monitor.ps1
+-touch
+-validate_profile.pl
+-wasm.ps1
+
+Complex pipeline 9: Data transformation and output
+cat | cut | sort | uniq | tee
+Roles saved to file
+Roles file content:
+Analyst
+Designer
+Developer
+Engineer
+Manager
+
+Complex pipeline 10: Error handling and conditional processing
+cat | grep | awk | sort | head
+Alice (Engineer): 95.5
+Charlie (Developer): 92.8
+Frank (Engineer): 89.7
+
+Complex pipeline 11: Multi-file processing
+find | xargs | cat | grep | wc
