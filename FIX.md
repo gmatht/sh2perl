@@ -43,11 +43,29 @@ Files changed
 -------------
 - src/generator/utils.rs: ensure command strings used in open3('bash','-c', ...)
   are wrapped with perl_string_literal_no_interp before embedding.
- - src/generator/commands/system_commands.rs: when serializing
-   Command::Subshell simple commands into bash strings use
-   word_to_bash_string_for_system (which preserves literal shell
-   fragments like awk programs containing "$0") instead of
-   generator.word_to_perl which could convert $0 -> $PROGRAM_NAME.
+- src/generator/commands/system_commands.rs: when serializing
+  Command::Subshell simple commands into bash strings use
+  word_to_bash_string_for_system (which preserves literal shell
+  fragments like awk programs containing "$0") instead of
+  generator.word_to_perl which could convert $0 -> $PROGRAM_NAME.
+
+Fix: Delegate printf in command-substitution to printf generator
+-----------------------------------------------------------------
+Problem
+-------
+The previous ad-hoc handling of printf inside command-substitution in
+utils.rs attempted to reconstruct format strings and arguments inline. It
+didn't fully emulate the generator's printf semantics (notably repeating the
+format across multiple arguments), which led to missing or merged output
+lines in purified examples like 001_echo_basic where `printf '%s\n' A B`
+should produce two separate lines.
+
+Fix
+---
+Call the dedicated printf generator (src/generator/commands/printf.rs) when
+encountering printf in command-substitution contexts. That generator emits
+expression-valued Perl code that correctly reproduces shell printf behaviour
+and suits being embedded in backtick/substitution contexts.
 
 Also changed purify.pl: do not force double-quoting when a shell snippet
 contains "$" or "@". These characters are common in awk/sed programs and

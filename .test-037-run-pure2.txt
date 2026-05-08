@@ -1,0 +1,79 @@
+=== Example 037: Complex pipeline ===
+Complex pipeline 1: Data processing and filtering
+cat | grep | cut | sort | head
+Alice,95.5
+Frank,89.7
+
+Complex pipeline 2: Text transformation and analysis
+cat | tr | sed | awk | wc
+Total processed lines: 8
+
+Complex pipeline 3: Multi-step data analysis
+cat | cut | sort | uniq -c | sort -nr
+      2 Manager
+      2 Engineer
+      2 Developer
+      1 Designer
+      1 Analyst
+
+Complex pipeline 4: File operations and filtering
+find | grep | xargs | wc
+find: paths must precede expression: `after_test.txt'
+find: possible unquoted pattern after predicate `-name'?
+0
+
+Complex pipeline 5: Data aggregation and formatting
+cat | awk | sort | head
+25,95.5
+31,93.1
+35,92.8
+
+Complex pipeline 6: Text processing with multiple filters
+cat | grep | sed | tr | sort | uniq
+ALICE 25 ENGINEER 95.5
+CHARLIE 35 DEVELOPER 92.8
+DIANA 28 DESIGNER 88.9
+EVE 32 ANALYST 91.3
+FRANK 29 ENGINEER 89.7
+HENRY 27 DEVELOPER 86.4
+
+Complex pipeline 7: Data validation and reporting
+cat | awk | grep | wc
+High performers: 4
+
+Complex pipeline 8: File system operations
+ls | grep | xargs | wc
+Regular files: 197
+
+Complex pipeline 9: Data transformation and output
+cat | cut | sort | uniq | tee
+Roles saved to file
+Roles file content:
+Analyst
+Designer
+Developer
+Engineer
+Manager
+
+Complex pipeline 10: Error handling and conditional processing
+cat | grep | awk | sort | head
+Alice (Engineer): 95.5
+Charlie (Developer): 92.8
+Frank (Engineer): 89.7
+
+Complex pipeline 11: Multi-file processing
+find | xargs | cat | grep | wc
+find: paths must precede expression: `after_test.txt'
+find: possible unquoted pattern after predicate `-name'?
+Total Engineer mentions: 0
+
+Complex pipeline 12: Data formatting and presentation
+cat | awk | sort | head | tee
+Top performers saved to file
+Top performers file content:
+Alice       25 Engineer    95.5
+Grace       31 Manager     93.1
+Charlie     35 Developer   92.8
+Eve         32 Analyst     91.3
+Frank       29 Engineer    89.7
+=== Example 037 completed successfully ===

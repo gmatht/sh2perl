@@ -1,0 +1,39 @@
+=== Example 030: Basic tee command ===
+Using backticks to call tee (write to file and stdout):
+Output: This is a test line
+File created successfully
+File content: This is a test line
+
+tee with append (-a):
+This is another line
+
+tee with multiple files:
+Output: Line for multiple files
+Multiple files created successfully
+
+tee with ignore interrupts (-i):
+This line ignores interrupts
+
+tee with pipe fail (-p):
+Output: This line has pipe fail
+
+tee with append and multiple files:
+Appended line
+
+tee with output to stderr:
+Output: This goes to stderr
+
+tee with null output:
+This goes to null
+
+tee with multiple outputs:
+Output: Multiple outputs
+Multiple outputs
+
+tee with append and ignore interrupts:
+Appended with ignore interrupts
+
+tee with pipe fail and multiple files:
+Output: Pipe fail with multiple files
+=== Example 030 completed successfully ===
+This goes to stderr
