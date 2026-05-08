@@ -705,12 +705,7 @@ pub fn generate_grep_command(
                 command_index, command_index
             ));
             output.push_str("}\n");
-            output.push_str(&format!(
-                "$grep_result_{} =~ s{}{}; # Remove trailing newline\n",
-                command_index,
-                generator.format_regex_pattern(r"\\n$"),
-                ""
-            ));
+            output.push_str(&format!("chomp $grep_result_{};\n", command_index));
         } else {
             output.push_str(&format!(
                 "$grep_result_{} = scalar @grep_filtered_{};\n",
@@ -1098,6 +1093,10 @@ pub fn generate_grep_command(
         if should_print && !quiet_mode {
             output.push_str(&format!("print $grep_result_{};\n", command_index));
         }
+    }
+
+    if quiet_mode {
+        output.push_str(&format!("$grep_result_{} = q{{}};\n", command_index));
     }
 
     // Set exit status for all grep commands

@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 
@@ -18,200 +17,206 @@ $SIG{__DIE__} = sub { exit 1 };
 print "== Basic grep parameters ==\n";
 # Original bash: echo "text with pattern" | grep -i "PATTERN"
 {
-    my $output_202;
-    my $output_printed_202;
-    my $pipeline_success_202 = 1;
-    $output_202 .= "text with pattern\n";
-if ( !($output_202 =~ m{\n\z}msx) ) { $output_202 .= "\n"; }
+    my $output_0 = q{};
+    my $output_printed_0;
+    my $pipeline_success_0 = 1;
+    $output_0 .= 'text with pattern' . "\n";
+if ( !($output_0 =~ m{\n\z}msx) ) { $output_0 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_202_1;
-    my @grep_lines_202_1 = split /\n/msx, $output_202;
-    my @grep_filtered_202_1 = grep { /PATTERN/msxi } @grep_lines_202_1;
-    $grep_result_202_1 = join "\n", @grep_filtered_202_1;
-    if (!($grep_result_202_1 =~ m{\n\z}msx || $grep_result_202_1 eq q{})) {
-    $grep_result_202_1 .= "\n";
+        my $grep_result_0_1;
+    my @grep_lines_0_1 = split /\n/msx, $output_0;
+    my @grep_filtered_0_1 = grep { /PATTERN/msxi } @grep_lines_0_1;
+    $grep_result_0_1 = join "\n", @grep_filtered_0_1;
+    if (!($grep_result_0_1 =~ m{\n\z}msx || $grep_result_0_1 eq q{})) {
+    $grep_result_0_1 .= "\n";
     }
-    $CHILD_ERROR = scalar @grep_filtered_202_1 > 0 ? 0 : 1;
-    $output_202 = $grep_result_202_1;
-    $output_202 = $grep_result_202_1;
-    if ((scalar @grep_filtered_202_1) == 0) {
-        $pipeline_success_202 = 0;
+    $CHILD_ERROR = scalar @grep_filtered_0_1 > 0 ? 0 : 1;
+    $output_0 = $grep_result_0_1;
+    $output_0 = $grep_result_0_1;
+    if ((scalar @grep_filtered_0_1) == 0) {
+        $pipeline_success_0 = 0;
     }
-    if ($output_202 ne q{} && !defined $output_printed_202) {
-        print $output_202;
-        if (!($output_202 =~ m{\n\z}msx)) {
+    if ($output_0 ne q{} && !defined $output_printed_0) {
+        print $output_0;
+        if (!($output_0 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_202 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
     }
 # Original bash: echo -e "line1\nline2\nline3" | grep -v "line2"
 {
-    my $output_203;
-    my $output_printed_203;
-    my $pipeline_success_203 = 1;
-    $output_203 .= "line1\nline2\nline3";
-if ( !($output_203 =~ m{\n\z}msx) ) { $output_203 .= "\n"; }
+    my $output_1 = q{};
+    my $output_printed_1;
+    my $pipeline_success_1 = 1;
+    $output_1 .= "line1\nline2\nline3";
+if ( !($output_1 =~ m{\n\z}msx) ) { $output_1 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_203_1;
-    my @grep_lines_203_1 = split /\n/msx, $output_203;
-    my @grep_filtered_203_1 = grep { !/line2/msx } @grep_lines_203_1;
-    $grep_result_203_1 = join "\n", @grep_filtered_203_1;
-    if (!($grep_result_203_1 =~ m{\n\z}msx || $grep_result_203_1 eq q{})) {
-    $grep_result_203_1 .= "\n";
+        my $grep_result_1_1;
+    my @grep_lines_1_1 = split /\n/msx, $output_1;
+    my @grep_filtered_1_1 = grep { !/line2/msx } @grep_lines_1_1;
+    $grep_result_1_1 = join "\n", @grep_filtered_1_1;
+    if (!($grep_result_1_1 =~ m{\n\z}msx || $grep_result_1_1 eq q{})) {
+    $grep_result_1_1 .= "\n";
     }
-    $CHILD_ERROR = scalar @grep_filtered_203_1 > 0 ? 0 : 1;
-    $output_203 = $grep_result_203_1;
-    $output_203 = $grep_result_203_1;
-    if ((scalar @grep_filtered_203_1) == 0) {
-        $pipeline_success_203 = 0;
+    $CHILD_ERROR = scalar @grep_filtered_1_1 > 0 ? 0 : 1;
+    $output_1 = $grep_result_1_1;
+    $output_1 = $grep_result_1_1;
+    if ((scalar @grep_filtered_1_1) == 0) {
+        $pipeline_success_1 = 0;
     }
-    if ($output_203 ne q{} && !defined $output_printed_203) {
-        print $output_203;
-        if (!($output_203 =~ m{\n\z}msx)) {
+    if ($output_1 ne q{} && !defined $output_printed_1) {
+        print $output_1;
+        if (!($output_1 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_203 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_1 ) { $main_exit_code = 1; }
     }
 # Original bash: echo -e "match\nno match\nmatch again" | grep -c "match"
 {
-    my $output_204;
-    my $output_printed_204;
-    my $pipeline_success_204 = 1;
-    $output_204 .= "match\nno match\nmatch again";
-if ( !($output_204 =~ m{\n\z}msx) ) { $output_204 .= "\n"; }
+    my $output_2 = q{};
+    my $output_printed_2;
+    my $pipeline_success_2 = 1;
+    $output_2 .= "match\nno match\nmatch again";
+if ( !($output_2 =~ m{\n\z}msx) ) { $output_2 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_204_1;
-    my @grep_lines_204_1 = split /\n/msx, $output_204;
-    my @grep_filtered_204_1 = grep { /match/msx } @grep_lines_204_1;
-    $grep_result_204_1 = scalar @grep_filtered_204_1;
-    $CHILD_ERROR = scalar @grep_filtered_204_1 > 0 ? 0 : 1;
-    $output_204 = $grep_result_204_1;
-    $output_204 = $grep_result_204_1;
-    if ((scalar @grep_filtered_204_1) == 0) {
-        $pipeline_success_204 = 0;
+        my $grep_result_2_1;
+    my @grep_lines_2_1 = split /\n/msx, $output_2;
+    my @grep_filtered_2_1 = grep { /match/msx } @grep_lines_2_1;
+    $grep_result_2_1 = scalar @grep_filtered_2_1;
+    $CHILD_ERROR = scalar @grep_filtered_2_1 > 0 ? 0 : 1;
+    $output_2 = $grep_result_2_1;
+    $output_2 = $grep_result_2_1;
+    if ((scalar @grep_filtered_2_1) == 0) {
+        $pipeline_success_2 = 0;
     }
-    if ($output_204 ne q{} && !defined $output_printed_204) {
-        print $output_204;
-        if (!($output_204 =~ m{\n\z}msx)) {
+    if ($output_2 ne q{} && !defined $output_printed_2) {
+        print $output_2;
+        if (!($output_2 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_204 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_2 ) { $main_exit_code = 1; }
     }
 print "== Context parameters ==\n";
 # Original bash: echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -A 2 "TARGET"
 {
-    my $output_205;
-    my $output_printed_205;
-    my $pipeline_success_205 = 1;
-    $output_205 .= "line1\nline2\nTARGET\nline4\nline5";
-if ( !($output_205 =~ m{\n\z}msx) ) { $output_205 .= "\n"; }
+    my $output_3 = q{};
+    my $output_printed_3;
+    my $pipeline_success_3 = 1;
+    $output_3 .= "line1\nline2\nTARGET\nline4\nline5";
+if ( !($output_3 =~ m{\n\z}msx) ) { $output_3 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_205_1;
-    my @grep_lines_205_1 = split /\n/msx, $output_205;
-    my @grep_filtered_205_1 = grep { /TARGET/msx } @grep_lines_205_1;
-    my @grep_with_context_205_1;
-    for my $i (0..@grep_lines_205_1-1) {
-    if (scalar grep { $_ eq $grep_lines_205_1[$i] } @grep_filtered_205_1) {
-    push @grep_with_context_205_1, $grep_lines_205_1[$i];
+        my $grep_result_3_1;
+    my @grep_lines_3_1 = split /\n/msx, $output_3;
+    my @grep_filtered_3_1 = grep { /TARGET/msx } @grep_lines_3_1;
+    my @grep_with_context_3_1;
+    for my $i (0..@grep_lines_3_1-1) {
+    if (scalar grep { $_ eq $grep_lines_3_1[$i] } @grep_filtered_3_1) {
+    push @grep_with_context_3_1, $grep_lines_3_1[$i];
     for my $j (($i + 1)..($i + 2)) {
-    push @grep_with_context_205_1, $grep_lines_205_1[$j];
+    push @grep_with_context_3_1, $grep_lines_3_1[$j];
     }
     }
     }
-    $grep_result_205_1 = join "\n", @grep_with_context_205_1;
-    $CHILD_ERROR = scalar @grep_filtered_205_1 > 0 ? 0 : 1;
-    $output_205 = $grep_result_205_1;
-    $output_205 = $grep_result_205_1;
-    if ((scalar @grep_filtered_205_1) == 0) {
-        $pipeline_success_205 = 0;
+    $grep_result_3_1 = join "\n", @grep_with_context_3_1;
+    $CHILD_ERROR = scalar @grep_filtered_3_1 > 0 ? 0 : 1;
+    $output_3 = $grep_result_3_1;
+    $output_3 = $grep_result_3_1;
+    if ((scalar @grep_filtered_3_1) == 0) {
+        $pipeline_success_3 = 0;
     }
-    if ($output_205 ne q{} && !defined $output_printed_205) {
-        print $output_205;
-        if (!($output_205 =~ m{\n\z}msx)) {
+    if ($output_3 ne q{} && !defined $output_printed_3) {
+        print $output_3;
+        if (!($output_3 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_205 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_3 ) { $main_exit_code = 1; }
     }
 # Original bash: echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -B 2 "TARGET"
 {
-    my $output_206;
-    my $output_printed_206;
-    my $pipeline_success_206 = 1;
-    $output_206 .= "line1\nline2\nTARGET\nline4\nline5";
-if ( !($output_206 =~ m{\n\z}msx) ) { $output_206 .= "\n"; }
+    my $output_4 = q{};
+    my $output_printed_4;
+    my $pipeline_success_4 = 1;
+    $output_4 .= "line1\nline2\nTARGET\nline4\nline5";
+if ( !($output_4 =~ m{\n\z}msx) ) { $output_4 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_206_1;
-    my @grep_lines_206_1 = split /\n/msx, $output_206;
-    my @grep_filtered_206_1 = grep { /TARGET/msx } @grep_lines_206_1;
-    my @grep_with_context_206_1;
-    for my $i (0..@grep_lines_206_1-1) {
-    if (scalar grep { $_ eq $grep_lines_206_1[$i] } @grep_filtered_206_1) {
+        my $grep_result_4_1;
+    my @grep_lines_4_1 = split /\n/msx, $output_4;
+    my @grep_filtered_4_1 = grep { /TARGET/msx } @grep_lines_4_1;
+    my @grep_with_context_4_1;
+    for my $i (0..@grep_lines_4_1-1) {
+    if (scalar grep { $_ eq $grep_lines_4_1[$i] } @grep_filtered_4_1) {
     for my $j (($i - 2)..($i-1)) {
     if ($j >= 0) {
-    push @grep_with_context_206_1, $grep_lines_206_1[$j];
+    push @grep_with_context_4_1, $grep_lines_4_1[$j];
     }
     }
-    push @grep_with_context_206_1, $grep_lines_206_1[$i];
+    push @grep_with_context_4_1, $grep_lines_4_1[$i];
     }
     }
-    $grep_result_206_1 = join "\n", @grep_with_context_206_1;
-    $CHILD_ERROR = scalar @grep_filtered_206_1 > 0 ? 0 : 1;
-    $output_206 = $grep_result_206_1;
-    $output_206 = $grep_result_206_1;
-    if ((scalar @grep_filtered_206_1) == 0) {
-        $pipeline_success_206 = 0;
+    $grep_result_4_1 = join "\n", @grep_with_context_4_1;
+    $CHILD_ERROR = scalar @grep_filtered_4_1 > 0 ? 0 : 1;
+    $output_4 = $grep_result_4_1;
+    $output_4 = $grep_result_4_1;
+    if ((scalar @grep_filtered_4_1) == 0) {
+        $pipeline_success_4 = 0;
     }
-    if ($output_206 ne q{} && !defined $output_printed_206) {
-        print $output_206;
-        if (!($output_206 =~ m{\n\z}msx)) {
+    if ($output_4 ne q{} && !defined $output_printed_4) {
+        print $output_4;
+        if (!($output_4 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_206 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_4 ) { $main_exit_code = 1; }
     }
 # Original bash: echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -C 1 "TARGET"
 {
-    my $output_207;
-    my $output_printed_207;
-    my $pipeline_success_207 = 1;
-    $output_207 .= "line1\nline2\nTARGET\nline4\nline5";
-if ( !($output_207 =~ m{\n\z}msx) ) { $output_207 .= "\n"; }
+    my $output_5 = q{};
+    my $output_printed_5;
+    my $pipeline_success_5 = 1;
+    $output_5 .= "line1\nline2\nTARGET\nline4\nline5";
+if ( !($output_5 =~ m{\n\z}msx) ) { $output_5 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_207_1;
-    my @grep_lines_207_1 = split /\n/msx, $output_207;
-    my @grep_filtered_207_1 = grep { /TARGET/msx } @grep_lines_207_1;
-    my @grep_with_context_207_1;
-    for my $i (0..@grep_lines_207_1-1) {
-    if (scalar grep { $_ eq $grep_lines_207_1[$i] } @grep_filtered_207_1) {
+        my $grep_result_5_1;
+    my @grep_lines_5_1 = split /\n/msx, $output_5;
+    my @grep_filtered_5_1 = grep { /TARGET/msx } @grep_lines_5_1;
+    my @grep_with_context_5_1;
+    for my $i (0..@grep_lines_5_1-1) {
+    if (scalar grep { $_ eq $grep_lines_5_1[$i] } @grep_filtered_5_1) {
     for my $j (($i - 1)..($i-1)) {
     if ($j >= 0) {
-    push @grep_with_context_207_1, $grep_lines_207_1[$j];
+    push @grep_with_context_5_1, $grep_lines_5_1[$j];
     }
     }
-    push @grep_with_context_207_1, $grep_lines_207_1[$i];
+    push @grep_with_context_5_1, $grep_lines_5_1[$i];
     for my $j (($i + 1)..($i + 1)) {
-    push @grep_with_context_207_1, $grep_lines_207_1[$j];
+    push @grep_with_context_5_1, $grep_lines_5_1[$j];
     }
     }
     }
-    $grep_result_207_1 = join "\n", @grep_with_context_207_1;
-    $CHILD_ERROR = scalar @grep_filtered_207_1 > 0 ? 0 : 1;
-    $output_207 = $grep_result_207_1;
-    $output_207 = $grep_result_207_1;
-    if ((scalar @grep_filtered_207_1) == 0) {
-        $pipeline_success_207 = 0;
+    $grep_result_5_1 = join "\n", @grep_with_context_5_1;
+    $CHILD_ERROR = scalar @grep_filtered_5_1 > 0 ? 0 : 1;
+    $output_5 = $grep_result_5_1;
+    $output_5 = $grep_result_5_1;
+    if ((scalar @grep_filtered_5_1) == 0) {
+        $pipeline_success_5 = 0;
     }
-    if ($output_207 ne q{} && !defined $output_printed_207) {
-        print $output_207;
-        if (!($output_207 =~ m{\n\z}msx)) {
+    if ($output_5 ne q{} && !defined $output_printed_5) {
+        print $output_5;
+        if (!($output_5 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_207 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_5 ) { $main_exit_code = 1; }
     }
 print "== File handling parameters ==\n";
 do {
@@ -225,194 +230,197 @@ do {
     close $original_stdout
       or die "Close failed: $!\n";
 };
-my $grep_result_208;
-my @grep_lines_208 = ();
-my @grep_filenames_208 = ();
+my $grep_result_6;
+my @grep_lines_6 = ();
+my @grep_filenames_6 = ();
 if (-e "temp_file.txt") {
     open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
     while (my $line = <$fh>) {
         chomp $line;
-        push @grep_lines_208, $line;
-        push @grep_filenames_208, "temp_file.txt";
+        push @grep_lines_6, $line;
+        push @grep_filenames_6, "temp_file.txt";
     }
     close $fh
         or croak "Close failed: $OS_ERROR";
 }
 else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
-my @grep_filtered_208 = grep { /content/msx } @grep_lines_208;
-my @grep_with_filename_208;
-for my $line (@grep_filtered_208) {
-    push @grep_with_filename_208, "temp_file.txt:$line";
+my @grep_filtered_6 = grep { /content/msx } @grep_lines_6;
+my @grep_with_filename_6;
+for my $line (@grep_filtered_6) {
+    push @grep_with_filename_6, "temp_file.txt:$line";
 }
-$grep_result_208 = join "\n", @grep_with_filename_208;
-if (!($grep_result_208 =~ m{\n\z}msx || $grep_result_208 eq q{})) {
-    $grep_result_208 .= "\n";
+$grep_result_6 = join "\n", @grep_with_filename_6;
+if (!($grep_result_6 =~ m{\n\z}msx || $grep_result_6 eq q{})) {
+    $grep_result_6 .= "\n";
 }
-print $grep_result_208;
-$CHILD_ERROR = scalar @grep_filtered_208 > 0 ? 0 : 1;
-my $grep_result_209;
-my @grep_lines_209 = ();
-my @grep_filenames_209 = ();
+print $grep_result_6;
+$CHILD_ERROR = scalar @grep_filtered_6 > 0 ? 0 : 1;
+my $grep_result_7;
+my @grep_lines_7 = ();
+my @grep_filenames_7 = ();
 if (-e "temp_file.txt") {
     open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
     while (my $line = <$fh>) {
         chomp $line;
-        push @grep_lines_209, $line;
-        push @grep_filenames_209, "temp_file.txt";
+        push @grep_lines_7, $line;
+        push @grep_filenames_7, "temp_file.txt";
     }
     close $fh
         or croak "Close failed: $OS_ERROR";
 }
 else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
-my @grep_filtered_209 = grep { /content/msx } @grep_lines_209;
-$grep_result_209 = join "\n", @grep_filtered_209;
-if (!($grep_result_209 =~ m{\n\z}msx || $grep_result_209 eq q{})) {
-    $grep_result_209 .= "\n";
+my @grep_filtered_7 = grep { /content/msx } @grep_lines_7;
+$grep_result_7 = join "\n", @grep_filtered_7;
+if (!($grep_result_7 =~ m{\n\z}msx || $grep_result_7 eq q{})) {
+    $grep_result_7 .= "\n";
 }
-print $grep_result_209;
-$CHILD_ERROR = scalar @grep_filtered_209 > 0 ? 0 : 1;
-my $grep_result_210;
-my @grep_lines_210 = ();
-my @grep_filenames_210 = ();
+print $grep_result_7;
+$CHILD_ERROR = scalar @grep_filtered_7 > 0 ? 0 : 1;
+my $grep_result_8;
+my @grep_lines_8 = ();
+my @grep_filenames_8 = ();
 if (-e "temp_file.txt") {
     open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
     while (my $line = <$fh>) {
         chomp $line;
-        push @grep_lines_210, $line;
-        push @grep_filenames_210, "temp_file.txt";
+        push @grep_lines_8, $line;
+        push @grep_filenames_8, "temp_file.txt";
     }
     close $fh
         or croak "Close failed: $OS_ERROR";
 }
 else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
-my @grep_filtered_210 = grep { /content/msx } @grep_lines_210;
-$grep_result_210 = @grep_filtered_210 > 0 ? "temp_file.txt" : "";
-print $grep_result_210;
+my @grep_filtered_8 = grep { /content/msx } @grep_lines_8;
+$grep_result_8 = @grep_filtered_8 > 0 ? "temp_file.txt" : "";
+print $grep_result_8;
 print "\n";
-$CHILD_ERROR = scalar @grep_filtered_210 > 0 ? 0 : 1;
-my $grep_result_211;
-my @grep_lines_211 = ();
-my @grep_filenames_211 = ();
+$CHILD_ERROR = scalar @grep_filtered_8 > 0 ? 0 : 1;
+my $grep_result_9;
+my @grep_lines_9 = ();
+my @grep_filenames_9 = ();
 if (-e "temp_file.txt") {
     open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
     while (my $line = <$fh>) {
         chomp $line;
-        push @grep_lines_211, $line;
-        push @grep_filenames_211, "temp_file.txt";
+        push @grep_lines_9, $line;
+        push @grep_filenames_9, "temp_file.txt";
     }
     close $fh
         or croak "Close failed: $OS_ERROR";
 }
 else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
-my @grep_filtered_211 = grep { /nonexistent/msx } @grep_lines_211;
-$grep_result_211 = @grep_filtered_211 == 0 ? "temp_file.txt" : "";
-print $grep_result_211;
+my @grep_filtered_9 = grep { /nonexistent/msx } @grep_lines_9;
+$grep_result_9 = @grep_filtered_9 == 0 ? "temp_file.txt" : "";
+print $grep_result_9;
 print "\n";
-$CHILD_ERROR = scalar @grep_filtered_211 > 0 ? 0 : 1;
+$CHILD_ERROR = scalar @grep_filtered_9 > 0 ? 0 : 1;
 if ($CHILD_ERROR != 0) {
     1;
 }
 print "== Output formatting parameters ==\n";
 # Original bash: echo "text with pattern in it" | grep -o "pattern"
 {
-    my $output_213;
-    my $output_printed_213;
-    my $pipeline_success_213 = 1;
-    $output_213 .= "text with pattern in it\n";
-if ( !($output_213 =~ m{\n\z}msx) ) { $output_213 .= "\n"; }
+    my $output_11 = q{};
+    my $output_printed_11;
+    my $pipeline_success_11 = 1;
+    $output_11 .= 'text with pattern in it' . "\n";
+if ( !($output_11 =~ m{\n\z}msx) ) { $output_11 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_213_1;
-    my @grep_lines_213_1 = split /\n/msx, $output_213;
-    my @grep_filtered_213_1 = grep { /pattern/msx } @grep_lines_213_1;
-    my @grep_matches_213_1;
-    foreach my $line (@grep_filtered_213_1) {
+        my $grep_result_11_1;
+    my @grep_lines_11_1 = split /\n/msx, $output_11;
+    my @grep_filtered_11_1 = grep { /pattern/msx } @grep_lines_11_1;
+    my @grep_matches_11_1;
+    foreach my $line (@grep_filtered_11_1) {
     if ($line =~ /(pattern)/msx) {
-    push @grep_matches_213_1, $1;
+    push @grep_matches_11_1, $1;
     }
     }
-    $grep_result_213_1 = join "\n", @grep_matches_213_1;
-    $CHILD_ERROR = scalar @grep_filtered_213_1 > 0 ? 0 : 1;
-    $output_213 = $grep_result_213_1;
-    $output_213 = $grep_result_213_1;
-    if ((scalar @grep_filtered_213_1) == 0) {
-        $pipeline_success_213 = 0;
+    $grep_result_11_1 = join "\n", @grep_matches_11_1;
+    $CHILD_ERROR = scalar @grep_filtered_11_1 > 0 ? 0 : 1;
+    $output_11 = $grep_result_11_1;
+    $output_11 = $grep_result_11_1;
+    if ((scalar @grep_filtered_11_1) == 0) {
+        $pipeline_success_11 = 0;
     }
-    if ($output_213 ne q{} && !defined $output_printed_213) {
-        print $output_213;
-        if (!($output_213 =~ m{\n\z}msx)) {
+    if ($output_11 ne q{} && !defined $output_printed_11) {
+        print $output_11;
+        if (!($output_11 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_213 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_11 ) { $main_exit_code = 1; }
     }
 # Original bash: echo "text with pattern in it" | grep -b "pattern"
 {
-    my $output_214;
-    my $output_printed_214;
-    my $pipeline_success_214 = 1;
-    $output_214 .= "text with pattern in it\n";
-if ( !($output_214 =~ m{\n\z}msx) ) { $output_214 .= "\n"; }
+    my $output_12 = q{};
+    my $output_printed_12;
+    my $pipeline_success_12 = 1;
+    $output_12 .= 'text with pattern in it' . "\n";
+if ( !($output_12 =~ m{\n\z}msx) ) { $output_12 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_214_1;
-    my @grep_lines_214_1 = split /\n/msx, $output_214;
-    my @grep_filtered_214_1 = grep { /pattern/msx } @grep_lines_214_1;
-    my @grep_with_offset_214_1;
-    my $offset_214_1 = 0;
-    for my $line (@grep_lines_214_1) {
-    if (grep { $_ eq $line } @grep_filtered_214_1) {
-    push @grep_with_offset_214_1, sprintf "%d:%s", $offset_214_1, $line;
+        my $grep_result_12_1;
+    my @grep_lines_12_1 = split /\n/msx, $output_12;
+    my @grep_filtered_12_1 = grep { /pattern/msx } @grep_lines_12_1;
+    my @grep_with_offset_12_1;
+    my $offset_12_1 = 0;
+    for my $line (@grep_lines_12_1) {
+    if (grep { $_ eq $line } @grep_filtered_12_1) {
+    push @grep_with_offset_12_1, sprintf "%d:%s", $offset_12_1, $line;
     }
-    $offset_214_1 += length($line) + 1; # +1 for newline
+    $offset_12_1 += length($line) + 1; # +1 for newline
     }
-    $grep_result_214_1 = join "\n", @grep_with_offset_214_1;
-    if (!($grep_result_214_1 =~ m{\n\z}msx || $grep_result_214_1 eq q{})) {
-    $grep_result_214_1 .= "\n";
+    $grep_result_12_1 = join "\n", @grep_with_offset_12_1;
+    if (!($grep_result_12_1 =~ m{\n\z}msx || $grep_result_12_1 eq q{})) {
+    $grep_result_12_1 .= "\n";
     }
-    $CHILD_ERROR = scalar @grep_filtered_214_1 > 0 ? 0 : 1;
-    $output_214 = $grep_result_214_1;
-    $output_214 = $grep_result_214_1;
-    if ((scalar @grep_filtered_214_1) == 0) {
-        $pipeline_success_214 = 0;
+    $CHILD_ERROR = scalar @grep_filtered_12_1 > 0 ? 0 : 1;
+    $output_12 = $grep_result_12_1;
+    $output_12 = $grep_result_12_1;
+    if ((scalar @grep_filtered_12_1) == 0) {
+        $pipeline_success_12 = 0;
     }
-    if ($output_214 ne q{} && !defined $output_printed_214) {
-        print $output_214;
-        if (!($output_214 =~ m{\n\z}msx)) {
+    if ($output_12 ne q{} && !defined $output_printed_12) {
+        print $output_12;
+        if (!($output_12 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_214 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_12 ) { $main_exit_code = 1; }
     }
 # Original bash: echo "text with pattern in it" | grep -n "pattern"
 {
-    my $output_215;
-    my $output_printed_215;
-    my $pipeline_success_215 = 1;
-    $output_215 .= "text with pattern in it\n";
-if ( !($output_215 =~ m{\n\z}msx) ) { $output_215 .= "\n"; }
+    my $output_13 = q{};
+    my $output_printed_13;
+    my $pipeline_success_13 = 1;
+    $output_13 .= 'text with pattern in it' . "\n";
+if ( !($output_13 =~ m{\n\z}msx) ) { $output_13 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_215_1;
-    my @grep_lines_215_1 = split /\n/msx, $output_215;
-    my @grep_filtered_215_1 = grep { /pattern/msx } @grep_lines_215_1;
-    my @grep_numbered_215_1;
-    for my $i (0..@grep_lines_215_1-1) {
-    if (scalar grep { $_ eq $grep_lines_215_1[$i] } @grep_filtered_215_1) {
-    push @grep_numbered_215_1, sprintf "%d:%s", $i + 1, $grep_lines_215_1[$i];
+        my $grep_result_13_1;
+    my @grep_lines_13_1 = split /\n/msx, $output_13;
+    my @grep_filtered_13_1 = grep { /pattern/msx } @grep_lines_13_1;
+    my @grep_numbered_13_1;
+    for my $i (0..@grep_lines_13_1-1) {
+    if (scalar grep { $_ eq $grep_lines_13_1[$i] } @grep_filtered_13_1) {
+    push @grep_numbered_13_1, sprintf "%d:%s", $i + 1, $grep_lines_13_1[$i];
     }
     }
-    $grep_result_215_1 = join "\n", @grep_numbered_215_1;
-    $CHILD_ERROR = scalar @grep_filtered_215_1 > 0 ? 0 : 1;
-    $output_215 = $grep_result_215_1;
-    $output_215 = $grep_result_215_1;
-    if ((scalar @grep_filtered_215_1) == 0) {
-        $pipeline_success_215 = 0;
+    $grep_result_13_1 = join "\n", @grep_numbered_13_1;
+    $CHILD_ERROR = scalar @grep_filtered_13_1 > 0 ? 0 : 1;
+    $output_13 = $grep_result_13_1;
+    $output_13 = $grep_result_13_1;
+    if ((scalar @grep_filtered_13_1) == 0) {
+        $pipeline_success_13 = 0;
     }
-    if ($output_215 ne q{} && !defined $output_printed_215) {
-        print $output_215;
-        if (!($output_215 =~ m{\n\z}msx)) {
+    if ($output_13 ne q{} && !defined $output_printed_13) {
+        print $output_13;
+        if (!($output_13 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_215 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_13 ) { $main_exit_code = 1; }
     }
 print "== Recursive and include/exclude parameters ==\n";
 use File::Path qw(make_path);
@@ -420,7 +428,7 @@ my $err;
 if ( !-d 'test_dir' ) {
     make_path( 'test_dir', { error => \$err } );
     if ( @{$err} ) {
-        croak "mkdir: cannot create directory 'test_dir': $err->[0]\n";
+        croak "mkdir: cannot create directory " . 'test_dir' . ": $err->[0]\n";
     }
 }
 do {
@@ -445,10 +453,10 @@ do {
     close $original_stdout
       or die "Close failed: $!\n";
 };
-my $grep_result_217;
-my @grep_lines_217 = ();
-my @grep_filenames_217 = ();
-sub find_files_recursive_217 {
+my $grep_result_15;
+my @grep_lines_15 = ();
+my @grep_filenames_15 = ();
+sub find_files_recursive_15 {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -456,7 +464,7 @@ sub find_files_recursive_217 {
             next if $file eq '.' || $file eq '..';
             my $path = "$dir/$file";
             if (-d $path) {
-                @files = (@files, find_files_recursive_217($path, $pattern));
+                @files = (@files, find_files_recursive_15($path, $pattern));
             } elsif (-f $path) {
                 if ($file =~ /[.]txt$/msx) {
                     push @files, $path;
@@ -467,36 +475,36 @@ sub find_files_recursive_217 {
     }
     return @files;
 }
-my @files_217 = find_files_recursive_217('test_dir', '*');
-for my $file (@files_217) {
+my @files_15 = find_files_recursive_15('test_dir', '*');
+for my $file (@files_15) {
     if (-f $file) {
         open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
         while (my $line = <$fh>) {
             chomp $line;
-            push @grep_lines_217, $line;
-            push @grep_filenames_217, $file;
+            push @grep_lines_15, $line;
+            push @grep_filenames_15, $file;
         }
         close $fh
             or croak "Close failed: $OS_ERROR";
     }
 }
-my @grep_filtered_217 = grep { /pattern/msx } @grep_lines_217;
-my @grep_with_filename_217;
-for my $i (0..@grep_lines_217-1) {
-    if (scalar grep { $_ eq $grep_lines_217[$i] } @grep_filtered_217) {
-        push @grep_with_filename_217, "$grep_filenames_217[$i]:$grep_lines_217[$i]";
+my @grep_filtered_15 = grep { /pattern/msx } @grep_lines_15;
+my @grep_with_filename_15;
+for my $i (0..@grep_lines_15-1) {
+    if (scalar grep { $_ eq $grep_lines_15[$i] } @grep_filtered_15) {
+        push @grep_with_filename_15, "$grep_filenames_15[$i]:$grep_lines_15[$i]";
     }
 }
-$grep_result_217 = join "\n", @grep_with_filename_217;
-if (!($grep_result_217 =~ m{\n\z}msx || $grep_result_217 eq q{})) {
-    $grep_result_217 .= "\n";
+$grep_result_15 = join "\n", @grep_with_filename_15;
+if (!($grep_result_15 =~ m{\n\z}msx || $grep_result_15 eq q{})) {
+    $grep_result_15 .= "\n";
 }
-print $grep_result_217;
-$CHILD_ERROR = scalar @grep_filtered_217 > 0 ? 0 : 1;
-my $grep_result_218;
-my @grep_lines_218 = ();
-my @grep_filenames_218 = ();
-sub find_files_recursive_218 {
+print $grep_result_15;
+$CHILD_ERROR = scalar @grep_filtered_15 > 0 ? 0 : 1;
+my $grep_result_16;
+my @grep_lines_16 = ();
+my @grep_filenames_16 = ();
+sub find_files_recursive_16 {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -504,7 +512,7 @@ sub find_files_recursive_218 {
             next if $file eq '.' || $file eq '..';
             my $path = "$dir/$file";
             if (-d $path) {
-                @files = (@files, find_files_recursive_218($path, $pattern));
+                @files = (@files, find_files_recursive_16($path, $pattern));
             } elsif (-f $path) {
                 if ($file =~ /.*[.]txt$/msx) {
                     push @files, $path;
@@ -515,36 +523,36 @@ sub find_files_recursive_218 {
     }
     return @files;
 }
-my @files_218 = find_files_recursive_218('test_dir', '*.txt');
-for my $file (@files_218) {
+my @files_16 = find_files_recursive_16('test_dir', '*.txt');
+for my $file (@files_16) {
     if (-f $file) {
         open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
         while (my $line = <$fh>) {
             chomp $line;
-            push @grep_lines_218, $line;
-            push @grep_filenames_218, $file;
+            push @grep_lines_16, $line;
+            push @grep_filenames_16, $file;
         }
         close $fh
             or croak "Close failed: $OS_ERROR";
     }
 }
-my @grep_filtered_218 = grep { /pattern/msx } @grep_lines_218;
-my @grep_with_filename_218;
-for my $i (0..@grep_lines_218-1) {
-    if (scalar grep { $_ eq $grep_lines_218[$i] } @grep_filtered_218) {
-        push @grep_with_filename_218, "$grep_filenames_218[$i]:$grep_lines_218[$i]";
+my @grep_filtered_16 = grep { /pattern/msx } @grep_lines_16;
+my @grep_with_filename_16;
+for my $i (0..@grep_lines_16-1) {
+    if (scalar grep { $_ eq $grep_lines_16[$i] } @grep_filtered_16) {
+        push @grep_with_filename_16, "$grep_filenames_16[$i]:$grep_lines_16[$i]";
     }
 }
-$grep_result_218 = join "\n", @grep_with_filename_218;
-if (!($grep_result_218 =~ m{\n\z}msx || $grep_result_218 eq q{})) {
-    $grep_result_218 .= "\n";
+$grep_result_16 = join "\n", @grep_with_filename_16;
+if (!($grep_result_16 =~ m{\n\z}msx || $grep_result_16 eq q{})) {
+    $grep_result_16 .= "\n";
 }
-print $grep_result_218;
-$CHILD_ERROR = scalar @grep_filtered_218 > 0 ? 0 : 1;
-my $grep_result_219;
-my @grep_lines_219 = ();
-my @grep_filenames_219 = ();
-sub find_files_recursive_219 {
+print $grep_result_16;
+$CHILD_ERROR = scalar @grep_filtered_16 > 0 ? 0 : 1;
+my $grep_result_17;
+my @grep_lines_17 = ();
+my @grep_filenames_17 = ();
+sub find_files_recursive_17 {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -552,7 +560,7 @@ sub find_files_recursive_219 {
             next if $file eq '.' || $file eq '..';
             my $path = "$dir/$file";
             if (-d $path) {
-                @files = (@files, find_files_recursive_219($path, $pattern));
+                @files = (@files, find_files_recursive_17($path, $pattern));
             } elsif (-f $path) {
                 if ($file =~ /[.]txt$/msx && $file !~ /.*[.]bak$/msx) {
                     push @files, $path;
@@ -563,36 +571,36 @@ sub find_files_recursive_219 {
     }
     return @files;
 }
-my @files_219 = find_files_recursive_219('test_dir', '*');
-for my $file (@files_219) {
+my @files_17 = find_files_recursive_17('test_dir', '*');
+for my $file (@files_17) {
     if (-f $file) {
         open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
         while (my $line = <$fh>) {
             chomp $line;
-            push @grep_lines_219, $line;
-            push @grep_filenames_219, $file;
+            push @grep_lines_17, $line;
+            push @grep_filenames_17, $file;
         }
         close $fh
             or croak "Close failed: $OS_ERROR";
     }
 }
-my @grep_filtered_219 = grep { /pattern/msx } @grep_lines_219;
-my @grep_with_filename_219;
-for my $i (0..@grep_lines_219-1) {
-    if (scalar grep { $_ eq $grep_lines_219[$i] } @grep_filtered_219) {
-        push @grep_with_filename_219, "$grep_filenames_219[$i]:$grep_lines_219[$i]";
+my @grep_filtered_17 = grep { /pattern/msx } @grep_lines_17;
+my @grep_with_filename_17;
+for my $i (0..@grep_lines_17-1) {
+    if (scalar grep { $_ eq $grep_lines_17[$i] } @grep_filtered_17) {
+        push @grep_with_filename_17, "$grep_filenames_17[$i]:$grep_lines_17[$i]";
     }
 }
-$grep_result_219 = join "\n", @grep_with_filename_219;
-if (!($grep_result_219 =~ m{\n\z}msx || $grep_result_219 eq q{})) {
-    $grep_result_219 .= "\n";
+$grep_result_17 = join "\n", @grep_with_filename_17;
+if (!($grep_result_17 =~ m{\n\z}msx || $grep_result_17 eq q{})) {
+    $grep_result_17 .= "\n";
 }
-print $grep_result_219;
-$CHILD_ERROR = scalar @grep_filtered_219 > 0 ? 0 : 1;
-my $grep_result_220;
-my @grep_lines_220 = ();
-my @grep_filenames_220 = ();
-sub find_files_recursive_220 {
+print $grep_result_17;
+$CHILD_ERROR = scalar @grep_filtered_17 > 0 ? 0 : 1;
+my $grep_result_18;
+my @grep_lines_18 = ();
+my @grep_filenames_18 = ();
+sub find_files_recursive_18 {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -600,7 +608,7 @@ sub find_files_recursive_220 {
             next if $file eq '.' || $file eq '..';
             my $path = "$dir/$file";
             if (-d $path) {
-                @files = (@files, find_files_recursive_220($path, $pattern));
+                @files = (@files, find_files_recursive_18($path, $pattern));
             } elsif (-f $path) {
                 if ($file =~ /.*[.]txt$/msx) {
                     push @files, $path;
@@ -611,43 +619,43 @@ sub find_files_recursive_220 {
     }
     return @files;
 }
-my @files_220 = find_files_recursive_220('test_dir', '*.txt');
-for my $file (@files_220) {
+my @files_18 = find_files_recursive_18('test_dir', '*.txt');
+for my $file (@files_18) {
     if (-f $file) {
         open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
         while (my $line = <$fh>) {
             chomp $line;
-            push @grep_lines_220, $line;
-            push @grep_filenames_220, $file;
+            push @grep_lines_18, $line;
+            push @grep_filenames_18, $file;
         }
         close $fh
             or croak "Close failed: $OS_ERROR";
     }
 }
-my @grep_filtered_220 = grep { /pattern/msx } @grep_lines_220;
-my %file_counts_220;
-for my $i (0..@grep_lines_220-1) {
-    if (scalar grep { $_ eq $grep_lines_220[$i] } @grep_filtered_220) {
-        $file_counts_220{$grep_filenames_220[$i]}++;
+my @grep_filtered_18 = grep { /pattern/msx } @grep_lines_18;
+my %file_counts_18;
+for my $i (0..@grep_lines_18-1) {
+    if (scalar grep { $_ eq $grep_lines_18[$i] } @grep_filtered_18) {
+        $file_counts_18{$grep_filenames_18[$i]}++;
     }
 }
-$grep_result_220 = q{};
-for my $file (sort keys %file_counts_220) {
-    $grep_result_220 .= "$file:$file_counts_220{$file}\n";
+$grep_result_18 = q{};
+for my $file (sort keys %file_counts_18) {
+    $grep_result_18 .= "$file:$file_counts_18{$file}\n";
 }
-$grep_result_220 =~ s/\\n$/msx; # Remove trailing newline
-print $grep_result_220;
+chomp $grep_result_18;
+print $grep_result_18;
 print "\n";
-$CHILD_ERROR = scalar @grep_filtered_220 > 0 ? 0 : 1;
+$CHILD_ERROR = scalar @grep_filtered_18 > 0 ? 0 : 1;
 # Original bash: grep -r "pattern" test_dir --include="*.txt" | wc -l
 {
-    my $output_221;
-    my $output_printed_221;
-    my $pipeline_success_221 = 1;
-        my $grep_result_221_0;
-    my @grep_lines_221_0 = ();
-    my @grep_filenames_221_0 = ();
-    sub find_files_recursive_221_0 {
+    my $output_19 = q{};
+    my $output_printed_19;
+    my $pipeline_success_19 = 1;
+        my $grep_result_19_0;
+    my @grep_lines_19_0 = ();
+    my @grep_filenames_19_0 = ();
+    sub find_files_recursive_19_0 {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -655,7 +663,7 @@ $CHILD_ERROR = scalar @grep_filtered_220 > 0 ? 0 : 1;
     next if $file eq '.' || $file eq '..';
     my $path = "$dir/$file";
     if (-d $path) {
-    @files = (@files, find_files_recursive_221_0($path, $pattern));
+    @files = (@files, find_files_recursive_19_0($path, $pattern));
     } elsif (-f $path) {
     if ($file =~ /.*[.]txt$/msx) {
     push @files, $path;
@@ -666,192 +674,198 @@ $CHILD_ERROR = scalar @grep_filtered_220 > 0 ? 0 : 1;
     }
     return @files;
     }
-    my @files_221_0 = find_files_recursive_221_0('test_dir', '*.txt');
-    for my $file (@files_221_0) {
+    my @files_19_0 = find_files_recursive_19_0('test_dir', '*.txt');
+    for my $file (@files_19_0) {
     if (-f $file) {
     open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
     while (my $line = <$fh>) {
     chomp $line;
-    push @grep_lines_221_0, $line;
-    push @grep_filenames_221_0, $file;
+    push @grep_lines_19_0, $line;
+    push @grep_filenames_19_0, $file;
     }
     close $fh
     or croak "Close failed: $OS_ERROR";
     }
     }
-    my @grep_filtered_221_0 = grep { /pattern/msx } @grep_lines_221_0;
-    my @grep_with_filename_221_0;
-    for my $i (0..@grep_lines_221_0-1) {
-    if (scalar grep { $_ eq $grep_lines_221_0[$i] } @grep_filtered_221_0) {
-    push @grep_with_filename_221_0, "$grep_filenames_221_0[$i]:$grep_lines_221_0[$i]";
+    my @grep_filtered_19_0 = grep { /pattern/msx } @grep_lines_19_0;
+    my @grep_with_filename_19_0;
+    for my $i (0..@grep_lines_19_0-1) {
+    if (scalar grep { $_ eq $grep_lines_19_0[$i] } @grep_filtered_19_0) {
+    push @grep_with_filename_19_0, "$grep_filenames_19_0[$i]:$grep_lines_19_0[$i]";
     }
     }
-    $grep_result_221_0 = join "\n", @grep_with_filename_221_0;
-    if (!($grep_result_221_0 =~ m{\n\z}msx || $grep_result_221_0 eq q{})) {
-    $grep_result_221_0 .= "\n";
+    $grep_result_19_0 = join "\n", @grep_with_filename_19_0;
+    if (!($grep_result_19_0 =~ m{\n\z}msx || $grep_result_19_0 eq q{})) {
+    $grep_result_19_0 .= "\n";
     }
-    $CHILD_ERROR = scalar @grep_filtered_221_0 > 0 ? 0 : 1;
-    $output_221 = $grep_result_221_0;
-    $output_221 = $grep_result_221_0;
-    if ((scalar @grep_filtered_221_0) == 0) {
-        $pipeline_success_221 = 0;
+    $CHILD_ERROR = scalar @grep_filtered_19_0 > 0 ? 0 : 1;
+    $output_19 = $grep_result_19_0;
+    $output_19 = $grep_result_19_0;
+    if ((scalar @grep_filtered_19_0) == 0) {
+        $pipeline_success_19 = 0;
     }
 
         use IPC::Open3;
-    my @wc_args_221_1 = ("-l");
-    my ($wc_in_221_1, $wc_out_221_1, $wc_err_221_1);
-    my $wc_pid_221_1 = open3($wc_in_221_1, $wc_out_221_1, $wc_err_221_1, 'wc', @wc_args_221_1);
-    print {$wc_in_221_1} $output_221;
-    close $wc_in_221_1 or die "Close failed: $!\n";
-    my $output_221_1 = do { local $/ = undef; <$wc_out_221_1> };
-    close $wc_out_221_1 or die "Close failed: $!\n";
-    waitpid $wc_pid_221_1, 0;
-    $output_221 = $output_221_1;
-    if ($output_221 ne q{} && !defined $output_printed_221) {
-        print $output_221;
-        if (!($output_221 =~ m{\n\z}msx)) {
+    my @wc_args_19_1 = ('-l');
+    my ($wc_in_19_1, $wc_out_19_1, $wc_err_19_1);
+    my $wc_pid_19_1 = open3($wc_in_19_1, $wc_out_19_1, $wc_err_19_1, 'wc', @wc_args_19_1);
+    print {$wc_in_19_1} $output_19;
+    close $wc_in_19_1 or die "Close failed: $!\n";
+    my $output_19_1 = do { local $/ = undef; <$wc_out_19_1> };
+    if ($output_19_1 eq q{}) { $output_19_1 = "0\n"; }
+    close $wc_out_19_1 or die "Close failed: $!\n";
+    waitpid $wc_pid_19_1, 0;
+    $output_19 = $output_19_1;
+    if ($output_19 ne q{} && !defined $output_printed_19) {
+        print $output_19;
+        if (!($output_19 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_221 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_19 ) { $main_exit_code = 1; }
     }
 print "== Advanced parameters ==\n";
 # Original bash: echo -e "match1\nmatch2\nmatch3\nmatch4" | grep -m 2 "match"
 {
-    my $output_222;
-    my $output_printed_222;
-    my $pipeline_success_222 = 1;
-    $output_222 .= "match1\nmatch2\nmatch3\nmatch4";
-if ( !($output_222 =~ m{\n\z}msx) ) { $output_222 .= "\n"; }
+    my $output_20 = q{};
+    my $output_printed_20;
+    my $pipeline_success_20 = 1;
+    $output_20 .= "match1\nmatch2\nmatch3\nmatch4";
+if ( !($output_20 =~ m{\n\z}msx) ) { $output_20 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_result_222_1;
-    my @grep_lines_222_1 = split /\n/msx, $output_222;
-    my @grep_filtered_222_1 = grep { /match/msx } @grep_lines_222_1;
-    @grep_filtered_222_1 = @grep_filtered_222_1[0..1];
-    $grep_result_222_1 = join "\n", @grep_filtered_222_1;
-    if (!($grep_result_222_1 =~ m{\n\z}msx || $grep_result_222_1 eq q{})) {
-    $grep_result_222_1 .= "\n";
+        my $grep_result_20_1;
+    my @grep_lines_20_1 = split /\n/msx, $output_20;
+    my @grep_filtered_20_1 = grep { /match/msx } @grep_lines_20_1;
+    @grep_filtered_20_1 = @grep_filtered_20_1[0..1];
+    $grep_result_20_1 = join "\n", @grep_filtered_20_1;
+    if (!($grep_result_20_1 =~ m{\n\z}msx || $grep_result_20_1 eq q{})) {
+    $grep_result_20_1 .= "\n";
     }
-    $CHILD_ERROR = scalar @grep_filtered_222_1 > 0 ? 0 : 1;
-    $output_222 = $grep_result_222_1;
-    $output_222 = $grep_result_222_1;
-    if ((scalar @grep_filtered_222_1) == 0) {
-        $pipeline_success_222 = 0;
+    $CHILD_ERROR = scalar @grep_filtered_20_1 > 0 ? 0 : 1;
+    $output_20 = $grep_result_20_1;
+    $output_20 = $grep_result_20_1;
+    if ((scalar @grep_filtered_20_1) == 0) {
+        $pipeline_success_20 = 0;
     }
-    if ($output_222 ne q{} && !defined $output_printed_222) {
-        print $output_222;
-        if (!($output_222 =~ m{\n\z}msx)) {
+    if ($output_20 ne q{} && !defined $output_printed_20) {
+        print $output_20;
+        if (!($output_20 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_222 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_20 ) { $main_exit_code = 1; }
     }
-# Original bash: echo "text with pattern in it" | grep -q "pattern" && echo "found" || echo "not found"
+if (do {
+# Original bash: echo "text with pattern in it" | grep -q "pattern" && echo
 {
-    my $output_223;
-    my $output_printed_223;
-    my $pipeline_success_223 = 1;
-    $output_223 .= "text with pattern in it\n";
-if ( !($output_223 =~ m{\n\z}msx) ) { $output_223 .= "\n"; }
+    my $output_21 = q{};
+    my $output_printed_21;
+    my $pipeline_success_21 = 1;
+    $output_21 .= 'text with pattern in it' . "\n";
+if ( !($output_21 =~ m{\n\z}msx) ) { $output_21 .= "\n"; }
+$CHILD_ERROR = 0;
 
-        my $grep_exit_code_224;
-    {
-    my $grep_result_223_1;
-    my @grep_lines_223_1 = split /\n/msx, $output_223;
-    my @grep_filtered_223_1 = grep { /pattern/msx } @grep_lines_223_1;
-    $grep_result_223_1 = join "\n", @grep_filtered_223_1;
-    if (!($grep_result_223_1 =~ m{\n\z}msx || $grep_result_223_1 eq q{})) {
-    $grep_result_223_1 .= "\n";
+        my $grep_result_21_1;
+    my @grep_lines_21_1 = split /\n/msx, $output_21;
+    my @grep_filtered_21_1 = grep { /pattern/msx } @grep_lines_21_1;
+    $grep_result_21_1 = join "\n", @grep_filtered_21_1;
+    if (!($grep_result_21_1 =~ m{\n\z}msx || $grep_result_21_1 eq q{})) {
+    $grep_result_21_1 .= "\n";
     }
-    $CHILD_ERROR = scalar @grep_filtered_223_1 > 0 ? 0 : 1;
-    $output_223 = $grep_result_223_1;
-    $grep_exit_code_224 = scalar @grep_filtered_223_1 > 0 ? 0 : 1;
-    if ($grep_exit_code_224 == 0) {
-    print "found\n";
-    } else {
-    print "not found\n";
+    $grep_result_21_1 = q{};
+    $CHILD_ERROR = scalar @grep_filtered_21_1 > 0 ? 0 : 1;
+    $output_21 = $grep_result_21_1;
+    $output_21 = $grep_result_21_1;
+    if ((scalar @grep_filtered_21_1) == 0) {
+        $pipeline_success_21 = 0;
     }
-    }
-    $pipeline_success_223 = 1;
-    $output_223 = q{};
-    if ($output_223 ne q{} && !defined $output_printed_223) {
-        print $output_223;
-        if (!($output_223 =~ m{\n\z}msx)) {
+    if ($output_21 ne q{} && !defined $output_printed_21) {
+        print $output_21;
+        if (!($output_21 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_223 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_21 ) { $main_exit_code = 1; }
     }
+    $CHILD_ERROR == 0
+}) {
+        print "found\n";
+}
+if ($CHILD_ERROR != 0) {
+        print "not found\n";
+}
 # Original bash: grep -Z -l "pattern" temp_file.txt | tr '\0' '\n'
 {
-    my $output_225;
-    my $output_printed_225;
-    my $pipeline_success_225 = 1;
-        my $grep_result_225_0;
-    my @grep_lines_225_0 = ();
-    my @grep_filenames_225_0 = ();
+    my $output_22 = q{};
+    my $output_printed_22;
+    my $pipeline_success_22 = 1;
+        my $grep_result_22_0;
+    my @grep_lines_22_0 = ();
+    my @grep_filenames_22_0 = ();
     if (-e "temp_file.txt") {
     open my $fh, '<', "temp_file.txt" or croak "Cannot open file: $ERRNO";
     while (my $line = <$fh>) {
     chomp $line;
-    push @grep_lines_225_0, $line;
-    push @grep_filenames_225_0, "temp_file.txt";
+    push @grep_lines_22_0, $line;
+    push @grep_filenames_22_0, "temp_file.txt";
     }
     close $fh
     or croak "Close failed: $OS_ERROR";
     }
     else { print STDERR "grep: temp_file.txt: No such file or directory\n"; }
-    my @grep_filtered_225_0 = grep { /pattern/msx } @grep_lines_225_0;
-    $grep_result_225_0 = @grep_filtered_225_0 > 0 ? "temp_file.txt" : "";
-    $CHILD_ERROR = scalar @grep_filtered_225_0 > 0 ? 0 : 1;
-    $output_225 = $grep_result_225_0;
-    $output_225 = $grep_result_225_0;
-    if ((scalar @grep_filtered_225_0) == 0) {
-        $pipeline_success_225 = 0;
+    my @grep_filtered_22_0 = grep { /pattern/msx } @grep_lines_22_0;
+    $grep_result_22_0 = @grep_filtered_22_0 > 0 ? "temp_file.txt" : "";
+    $CHILD_ERROR = scalar @grep_filtered_22_0 > 0 ? 0 : 1;
+    $output_22 = $grep_result_22_0;
+    $output_22 = $grep_result_22_0;
+    if ((scalar @grep_filtered_22_0) == 0) {
+        $pipeline_success_22 = 0;
     }
 
-        my $set1_226 = "\\0";
-    my $set2_226 = "\\n";
-    my $input_226 = $output_225;
+        my $set1_23 = "\\0";
+    my $set2_23 = "\\n";
+    my $input_23 = $output_22;
     # Expand character ranges for tr command
-    my $expanded_set1_226 = $set1_226;
-    my $expanded_set2_226 = $set2_226;
+    my $expanded_set1_23 = $set1_23;
+    my $expanded_set2_23 = $set2_23;
     # Handle a-z range in set1
-    if ($expanded_set1_226 =~ /a-z/msx) {
-    $expanded_set1_226 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+    if ($expanded_set1_23 =~ /a-z/msx) {
+    $expanded_set1_23 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
     }
     # Handle A-Z range in set1
-    if ($expanded_set1_226 =~ /A-Z/msx) {
-    $expanded_set1_226 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    if ($expanded_set1_23 =~ /A-Z/msx) {
+    $expanded_set1_23 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
     }
     # Handle a-z range in set2
-    if ($expanded_set2_226 =~ /a-z/msx) {
-    $expanded_set2_226 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+    if ($expanded_set2_23 =~ /a-z/msx) {
+    $expanded_set2_23 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
     }
     # Handle A-Z range in set2
-    if ($expanded_set2_226 =~ /A-Z/msx) {
-    $expanded_set2_226 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    if ($expanded_set2_23 =~ /A-Z/msx) {
+    $expanded_set2_23 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
     }
-    my $tr_result_225_1 = q{};
-    for my $char ( split //msx, $input_226 ) {
-    my $pos_226 = index $expanded_set1_226, $char;
-    if ( $pos_226 >= 0 && $pos_226 < length $expanded_set2_226 ) {
-    $tr_result_225_1 .= substr $expanded_set2_226, $pos_226, 1;
+    my $tr_result_22_1 = q{};
+    for my $char ( split //msx, $input_23 ) {
+    my $pos_23 = index $expanded_set1_23, $char;
+    if ( $pos_23 >= 0 && $pos_23 < length $expanded_set2_23 ) {
+    $tr_result_22_1 .= substr $expanded_set2_23, $pos_23, 1;
     } else {
-    $tr_result_225_1 .= $char;
+    $tr_result_22_1 .= $char;
     }
     }
-    if (!($tr_result_225_1 =~ m{\n\z}msx || $tr_result_225_1 eq q{})) {
-    $tr_result_225_1 .= "\n";
+    if (!($tr_result_22_1 =~ m{\n\z}msx || $tr_result_22_1 eq q{})) {
+    $tr_result_22_1 .= "\n";
     }
-    $output_225 = $tr_result_225_1;
-    if ($output_225 ne q{} && !defined $output_printed_225) {
-        print $output_225;
-        if (!($output_225 =~ m{\n\z}msx)) {
+    $output_22 = $tr_result_22_1;
+    $output_22 = $tr_result_22_1;
+    if ($output_22 ne q{} && !defined $output_printed_22) {
+        print $output_22;
+        if (!($output_22 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_225 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_22 ) { $main_exit_code = 1; }
     }
 if ( -e "temp_file.txt" ) {
     if ( -d "temp_file.txt" ) {
@@ -860,8 +874,7 @@ if ( -e "temp_file.txt" ) {
     }
     else {
         if ( unlink "temp_file.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "temp_file.txt",
               ": $OS_ERROR\n";
@@ -870,23 +883,21 @@ if ( -e "temp_file.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "temp_file.txt", ": No such file or directory\n";
 }
 if ( -e "test_dir" ) {
     if ( -d "test_dir" ) {
         my $err;
-        remove_tree("test_dir", {error => \$err});
+        require File::Path;
+        File::Path::remove_tree("test_dir", {error => \$err});
         if (@{$err}) {
             carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";
         }
         else {
-            $main_exit_code = 0;
-        }
+                    }
     }
     else {
         if ( unlink "test_dir" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "test_dir",
               ": $OS_ERROR\n";
@@ -895,7 +906,6 @@ if ( -e "test_dir" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_dir", ": No such file or directory\n";
 }
 
 exit $main_exit_code;

@@ -2,7 +2,7 @@ use crate::ast::*;
 use crate::generator::Generator;
 
 // Helper function to convert Word to bash string representation for system commands
-pub fn word_to_bash_string_for_system(word: &Word) -> String {
+pub fn word_to_bash_string_for_system(generator: &mut Generator, word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
             // Preserve existing shell single quotes verbatim
@@ -107,9 +107,8 @@ pub fn word_to_bash_string_for_system(word: &Word) -> String {
             }
         }
         Word::CommandSubstitution(cmd, _) => {
-            // For command substitutions in system commands, we need to generate the actual bash command
-            // This is a complex case - for now, generate a placeholder that won't break bash
-            format!("\"$(echo 'command substitution not supported in system command context')\"")
+            let command = generator.generate_command_string_for_system(cmd);
+            format!("$({})", command)
         }
         _ => {
             // For other word types, convert to string and quote if needed
@@ -135,7 +134,7 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
             let args: Vec<String> = simple_cmd
                 .args
                 .iter()
-                .map(|arg| word_to_bash_string_for_system(arg))
+                .map(|arg| word_to_bash_string_for_system(generator, arg))
                 .collect();
             // Merge short-option fragments like ["-n", "r"] -> ["-nr"] to avoid
             // producing strings like "-n r" which would be interpreted as a filename
@@ -192,7 +191,11 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                         env_keys.sort();
                         for k in env_keys {
                             if let Some(v) = simple_cmd.env_vars.get(k) {
-                                parts.push(format!("{}={}", k, word_to_bash_string_for_system(v)));
+                                parts.push(format!(
+                                    "{}={}",
+                                    k,
+                                    word_to_bash_string_for_system(generator, v)
+                                ));
                             }
                         }
                     }
@@ -202,7 +205,7 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                     let args: Vec<String> = simple_cmd
                         .args
                         .iter()
-                        .map(|arg| word_to_bash_string_for_system(arg))
+                        .map(|arg| word_to_bash_string_for_system(generator, arg))
                         .collect();
                     if !args.is_empty() {
                         parts.push(args.join(" "));
@@ -219,7 +222,7 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                                 let args: Vec<String> = simple_cmd
                                     .args
                                     .iter()
-                                    .map(|arg| word_to_bash_string_for_system(arg))
+                                    .map(|arg| word_to_bash_string_for_system(generator, arg))
                                     .collect();
                                 Some(format!("{} {}", simple_cmd.name, args.join(" ")))
                             } else {

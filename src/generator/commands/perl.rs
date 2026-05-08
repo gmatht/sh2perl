@@ -127,7 +127,10 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         .args
         .iter()
         .map(|arg| {
-            let word = Word::Literal(word_to_bash_string_for_system(arg), Default::default());
+            let word = Word::Literal(
+                word_to_bash_string_for_system(generator, arg),
+                Default::default(),
+            );
             generator.perl_string_literal(&word)
         })
         .collect::<Vec<_>>();
@@ -309,7 +312,10 @@ pub fn generate_perl_pipeline_command(
             .args
             .iter()
             .map(|arg| {
-                let word = Word::Literal(word_to_bash_string_for_system(arg), Default::default());
+                let word = Word::Literal(
+                    word_to_bash_string_for_system(generator, arg),
+                    Default::default(),
+                );
                 generator.perl_string_literal(&word)
             })
             .collect::<Vec<_>>();

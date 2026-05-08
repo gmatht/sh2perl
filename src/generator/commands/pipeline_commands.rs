@@ -537,10 +537,7 @@ fn generate_command_using_builtins(
                     if cmd_name == "echo" {
                         // Capture echo output into the output variable
                         let echo_out = crate::generator::commands::echo::generate_echo_command(
-                            generator,
-                            simple,
-                            "",
-                            output_var,
+                            generator, simple, "", output_var,
                         );
                         result.push_str(&echo_out);
                         continue;
@@ -548,8 +545,7 @@ fn generate_command_using_builtins(
                 }
                 // Fall back to sh -c for other commands
                 let cmd_str = generator.generate_command_string_for_system(sub_cmd);
-                let perl_str =
-                    generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+                let perl_str = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                 let (in_v, out_v, err_v, pid_v, _) = generator.get_unique_ipc_vars();
                 result.push_str(&format!(
                     "my ({in_v}, {out_v}, {err_v});\nmy {pid_v} = open3({in_v}, {out_v}, {err_v}, 'sh', '-c', {perl_str});\nclose {in_v} or croak 'Close failed: $OS_ERROR';\n${output_var} .= do {{ local $INPUT_RECORD_SEPARATOR = undef; <{out_v}> }};\nclose {out_v} or croak 'Close failed: $OS_ERROR';\nwaitpid {pid_v}, 0;\n"
@@ -1869,8 +1865,15 @@ fn generate_linebyline_command(
             // empty-line inputs produce the correct number of newline
             // characters. Previously we inserted newlines between lines
             // which caused an off-by-one when the line content was empty.
+            let output_name = generator
+                .current_pipeline_output_id()
+                .cloned()
+                .unwrap_or_else(|| "0".to_string());
             output.push_str(&format!("if ($head_line_count < {}) {{\n", num_lines));
-            output.push_str(&format!("    $output_0 .= $line . \"\\n\";\n"));
+            output.push_str(&format!(
+                "    $output_{} .= $line . \"\\n\";\n",
+                output_name
+            ));
             output.push_str("    ++$head_line_count;\n");
             output.push_str("} else {\n");
             output.push_str("    $line = q{}; # Clear line to prevent printing\n");
@@ -2689,10 +2692,7 @@ fn generate_buffered_pipeline(
                     // If we used a temp output variable, copy back to the main pipeline var.
                     if cmd_output_var != format!("output_{}", unique_id) {
                         output.push_str(&generator.indent());
-                        output.push_str(&format!(
-                            "$output_{} = ${};\n",
-                            unique_id, cmd_output_var
-                        ));
+                        output.push_str(&format!("$output_{} = ${};\n", unique_id, cmd_output_var));
                     }
 
                     // For xargs/grep/tr, also look for their dedicated result var.
@@ -2979,21 +2979,14 @@ fn generate_buffered_pipeline(
                 }
                 if cmd_output_var != format!("output_{}", unique_id) {
                     output.push_str(&generator.indent());
-                    output.push_str(&format!(
-                        "$output_{} = ${};\n",
-                        unique_id, cmd_output_var
-                    ));
+                    output.push_str(&format!("$output_{} = ${};\n", unique_id, cmd_output_var));
                 }
                 if let Command::Simple(scmd) = command {
                     if let Word::Literal(cmd_name, _) = &scmd.name {
                         if matches!(cmd_name.as_str(), "grep" | "xargs" | "tr") {
-                            let result_var =
-                                format!("{}_result_{}_{}", cmd_name, unique_id, i + 1);
+                            let result_var = format!("{}_result_{}_{}", cmd_name, unique_id, i + 1);
                             output.push_str(&generator.indent());
-                            output.push_str(&format!(
-                                "$output_{} = ${};\n",
-                                unique_id, result_var
-                            ));
+                            output.push_str(&format!("$output_{} = ${};\n", unique_id, result_var));
                         }
                         if cmd_name == "grep" {
                             output.push_str(&generator.indent());
@@ -3003,10 +2996,7 @@ fn generate_buffered_pipeline(
                                 i + 1
                             ));
                             output.push_str(&generator.indent());
-                            output.push_str(&format!(
-                                "    $pipeline_success_{} = 0;\n",
-                                unique_id
-                            ));
+                            output.push_str(&format!("    $pipeline_success_{} = 0;\n", unique_id));
                             output.push_str(&generator.indent());
                             output.push_str("}\n");
                         }

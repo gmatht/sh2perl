@@ -2,10 +2,10 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
+my $DATE_SNAPSHOT = time;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
@@ -14,44 +14,26 @@ our $CHILD_ERROR;
 print "=== Basic Command Substitution ===\n";
 do {
     my $output = "Current date: " . (do { my $_chomp_temp = do {
-require POSIX; POSIX::strftime('%Y', localtime(time)) . "\n"
+require POSIX; POSIX::strftime('%Y', localtime($DATE_SNAPSHOT)) . "\n"
 }; chomp $_chomp_temp; $_chomp_temp; });
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 do {
-    my $output = "Current directory: " . (do { my $_chomp_temp = do {
-    my $basename_path;
-    my $basename_suffix;
-    $basename_path = do { use Cwd; getcwd(); };
-    $basename_suffix = q{};
-    if ($basename_suffix ne q{}) {
-        $basename_path =~ s/\Q$basename_suffix\E$//msx;
-    }
-    $basename_path =~ s/.*\///msx;
-    $basename_path;
-}; chomp $_chomp_temp; $_chomp_temp; });
+    my $output = "Current directory: " . (do { my $_chomp_temp = do { my $basename_cmd = 'basename $(pwd)'; my $basename_output = qx{$basename_cmd}; $CHILD_ERROR = $? >> 8; $basename_output; }; chomp $_chomp_temp; $_chomp_temp; });
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
         print "\n";
     }
 };
-my $current_dir = do {
-    my $basename_path;
-    my $basename_suffix;
-    $basename_path = do { use Cwd; getcwd(); };
-    $basename_suffix = q{};
-    if ($basename_suffix ne q{}) {
-        $basename_path =~ s/\Q$basename_suffix\E$//msx;
-    }
-    $basename_path =~ s/.*\///msx;
-    $basename_path;
-};
+$CHILD_ERROR = 0;
 my $current_date = do {
-require POSIX; POSIX::strftime('%Y%m', localtime(time)) . "\n"
+require POSIX; POSIX::strftime('%Y%m', localtime($DATE_SNAPSHOT)) . "\n"
 };
+my $current_dir = do { my $basename_cmd = 'basename $(pwd)'; my $basename_output = qx{$basename_cmd}; $CHILD_ERROR = $? >> 8; $basename_output; };
 do {
     my $output = "Stored date: $current_date";
     print $output;
@@ -59,6 +41,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 do {
     my $output = "Stored directory: $current_dir";
     print $output;
@@ -66,6 +49,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 print "=== Basic Command Substitution Complete ===\n";
 
 exit $main_exit_code;

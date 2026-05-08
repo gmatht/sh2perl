@@ -9,6 +9,7 @@ pub fn generate_printf_command(
     output_var: Option<&str>,
 ) -> String {
     let mut output = String::new();
+    let is_expression = output_var.is_none();
 
     // Parse printf format string and arguments
     let mut format_string = String::new();
@@ -127,10 +128,17 @@ pub fn generate_printf_command(
             }
 
             // Generate Perl code to print array elements with the format
-            output.push_str(&format!("foreach my $item (@{}) {{\n", array_var));
-            // format_string already includes Perl quoting; emit it directly.
-            output.push_str(&format!("    printf({}, $item);\n", format_string));
-            output.push_str("}\n");
+            if is_expression {
+                output.push_str(&format!(
+                    "join('', map {{ sprintf({}, $_) }} @{})",
+                    format_string, array_var
+                ));
+            } else {
+                output.push_str(&format!("foreach my $item (@{}) {{\n", array_var));
+                // format_string already includes Perl quoting; emit it directly.
+                output.push_str(&format!("    printf({}, $item);\n", format_string));
+                output.push_str("}\n");
+            }
         } else {
             // Regular printf with individual arguments
             // For printf, format string and arguments should be separate
@@ -148,8 +156,8 @@ pub fn generate_printf_command(
                     output.push_str(&format!("    printf({});\n", format_string));
                     output.push_str(&format!("}}\n"));
                 } else {
-                    // Emit printf using the Perl-quoted format string directly
-                    output.push_str(&format!("printf({});\n", format_string));
+                    // In command-substitution contexts, return the formatted text.
+                    output.push_str(&format!("sprintf({});\n", format_string));
                 }
             } else {
                 // When args are present, decide whether to emulate shell printf's
@@ -212,7 +220,11 @@ pub fn generate_printf_command(
                     }
                 } else {
                     // Emit a simple printf(format, args...)
-                    let mut printf_call = format!("printf({}", format_string);
+                    let mut printf_call = format!(
+                        "{}({}",
+                        if is_expression { "sprintf" } else { "printf" },
+                        format_string
+                    );
                     for (_i, arg) in args.iter().enumerate() {
                         let raw_arg = arg.trim_matches(|c| c == '"' || c == '\'');
                         if raw_arg.chars().all(|c| c.is_ascii_digit() || c == '.')
