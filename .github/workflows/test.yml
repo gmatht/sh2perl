@@ -83,9 +83,11 @@ jobs:
             ' cargo_test_output.txt || true)
             if [ -n "$summed" ]; then
               # Read summed values into variables
-              read main_passed main_failed main_ignored main_measured <<EOF
-              ${summed}
-              EOF
+              set -- $summed
+              main_passed=${1:-0}
+              main_failed=${2:-0}
+              main_ignored=${3:-0}
+              main_measured=${4:-0}
               main_passed=${main_passed:-0}
               main_failed=${main_failed:-0}
               main_ignored=${main_ignored:-0}
