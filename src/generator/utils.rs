@@ -193,7 +193,6 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 generator, simple_cmd, "", 0, None,
                             )
                         } else if name == "date" {
-                        } else if name == "date" {
                             format!(
                                 "do {{\n{}\n}}",
                                 crate::generator::commands::date::generate_date_expression(
