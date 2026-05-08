@@ -780,9 +780,55 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         })
                                         .collect::<Vec<_>>()
                                         .join(", ");
-                                    format!("do {{\n    my $result = sprintf \"{}\", {};\n    $result;\n}}", 
-                                        format_string.replace("\"", "\\\"").replace("\\\\", "\\"),
-                                        formatted_args)
+                                    // Count the number of non-%% format specifiers.
+                                    // In bash, printf repeats the format string until all
+                                    // arguments are consumed.  If there are more args than
+                                    // specifiers we must generate a loop so the output
+                                    // matches bash behaviour.
+                                    let escaped_fmt = format_string.replace("\"", "\\\"").replace("\\\\", "\\");
+                                    let specifier_count = {
+                                        let mut chars = format_string.chars().peekable();
+                                        let mut count = 0usize;
+                                        while let Some(ch) = chars.next() {
+                                            if ch == '%' {
+                                                if chars.peek().map_or(false, |&n| n != '%') {
+                                                    count += 1;
+                                                } else {
+                                                    // consume the second '%' of '%%'
+                                                    chars.next();
+                                                }
+                                            }
+                                        }
+                                        count
+                                    };
+                                    if specifier_count > 0 && args.len() > specifier_count {
+                                        // More args than specifiers: loop over args in batches
+                                        // matching the number of specifiers per iteration.
+                                        if specifier_count == 1 {
+                                            // Common case: one specifier, iterate over all args
+                                            format!(
+                                                "do {{\n    my $result = join('', map {{ sprintf \"{}\", $_ }} ({}));\n    $result;\n}}",
+                                                escaped_fmt,
+                                                formatted_args
+                                            )
+                                        } else {
+                                            // Multiple specifiers per iteration: use splice loop.
+                                            // Pad the final batch with empty strings if it is
+                                            // shorter than specifier_count so sprintf never
+                                            // receives fewer arguments than format specifiers
+                                            // (bash treats missing printf args as empty/zero).
+                                            format!(
+                                                "do {{\n    my @__args = ({0});\n    my $result = '';\n    while (@__args) {{\n        my @__batch = splice(@__args, 0, {2});\n        push @__batch, ('') x ({2} - scalar @__batch) if @__batch < {2};\n        $result .= sprintf \"{1}\", @__batch;\n    }}\n    $result;\n}}",
+                                                formatted_args,
+                                                escaped_fmt,
+                                                specifier_count
+                                            )
+                                        }
+                                    } else {
+                                        format!("do {{\n    my $result = sprintf \"{}\", {};\n    $result;\n}}",
+                                            escaped_fmt,
+                                            formatted_args)
+                                    }
                                 }
                             }
                         } else if name == "date" {
