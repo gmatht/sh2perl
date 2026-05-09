@@ -831,9 +831,15 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
                 file_var, file_var
             ));
             for &(mask, label) in &[
-                (0o400u32, "r"), (0o200, "w"), (0o100, "x"),
-                (0o040, "r"), (0o020, "w"), (0o010, "x"),
-                (0o004, "r"), (0o002, "w"), (0o001, "x"),
+                (0o400u32, "r"),
+                (0o200, "w"),
+                (0o100, "x"),
+                (0o040, "r"),
+                (0o020, "w"),
+                (0o010, "x"),
+                (0o004, "r"),
+                (0o002, "w"),
+                (0o001, "x"),
             ] {
                 output.push_str(&generator.indent());
                 output.push_str(&format!(
@@ -864,7 +870,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
             ));
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
-            output.push_str("}");
+            output.push_str("};\n");
             generator.indent_level = saved_indent;
             return output;
         }
@@ -904,7 +910,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     ));
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
-    output.push_str("}");
+    output.push_str("};\n");
 
     // Restore the saved indent level
     generator.indent_level = saved_indent;

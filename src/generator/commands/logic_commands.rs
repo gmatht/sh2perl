@@ -79,13 +79,21 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
                 output.push_str(&generator.indent());
                 output.push_str("}");
             } else {
-                // For other simple commands, generate the command and check exit code
+                // For other command types, generate the command and check exit code
                 output.push_str("do {\n");
                 generator.indent_level += 1;
                 // Temporarily save the current indent level and reset it for command generation
                 let saved_indent_level = generator.indent_level;
                 generator.indent_level = 0;
-                let command = generator.generate_command(left);
+                let command = if let Command::Pipeline(pipeline) = left {
+                    crate::generator::commands::pipeline_commands::generate_pipeline_with_print_option(
+                        generator,
+                        pipeline,
+                        false,
+                    )
+                } else {
+                    generator.generate_command(left)
+                };
                 // Restore the indent level
                 generator.indent_level = saved_indent_level;
                 // The command generator already handles indentation, so we don't need to add extra indentation

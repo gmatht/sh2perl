@@ -7,9 +7,10 @@ pub fn generate_printf_command(
     _input_var: &str,
     _command_index: usize,
     output_var: Option<&str>,
+    as_expression: bool,
 ) -> String {
     let mut output = String::new();
-    let is_expression = output_var.is_none();
+    let is_expression = output_var.is_none() && as_expression;
 
     // Parse printf format string and arguments
     let mut format_string = String::new();

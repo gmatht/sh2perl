@@ -572,6 +572,7 @@ pub fn test_file_equivalence_with_critic(
                 // Run Perl from the same directory as shell (examples directory)
                 let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
                 cmd.current_dir(&examples_dir);
+                cmd.env("TZ", "UTC");
                 // Replace TEMP_FILE placeholder with actual file path
                 for a in &run_cmd[1..] {
                     if *a == "TEMP_FILE" {
@@ -798,6 +799,8 @@ pub fn test_file_equivalence_detailed_with_critic(
                 status: create_exit_status(0),
             });
         } else {
+            examples_snapshot.restore()?;
+
             // Clean up any temporary files in examples directory before running shell script
             let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
             if let Ok(entries) = std::fs::read_dir(&examples_dir) {
@@ -1203,6 +1206,7 @@ pub fn test_file_equivalence_detailed_with_critic(
                 // Run Perl from the same directory as shell (examples directory)
                 let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
                 cmd.current_dir(&examples_dir);
+                cmd.env("TZ", "UTC");
                 // Replace TEMP_FILE placeholder with actual file path
                 for a in &run_cmd[1..] {
                     if *a == "TEMP_FILE" {

@@ -270,7 +270,11 @@ pub fn generate_grep_command(
 
         if recursive {
             // Recursive search
-            output.push_str(&format!("sub find_files_recursive_{} {{\n", command_index));
+            output.push_str(&format!("my $find_files_recursive_{};\n", command_index));
+            output.push_str(&format!(
+                "$find_files_recursive_{} = sub {{\n",
+                command_index
+            ));
             output.push_str(&format!("    my ($dir, $pattern) = @_;\n"));
             output.push_str(&format!("    my @files;\n"));
             output.push_str(&format!("    if ( opendir my $dh, $dir ) {{\n"));
@@ -281,7 +285,7 @@ pub fn generate_grep_command(
             output.push_str(&format!("            my $path = \"$dir/$file\";\n"));
             output.push_str(&format!("            if (-d $path) {{\n"));
             output.push_str(&format!(
-                "                @files = (@files, find_files_recursive_{}($path, $pattern));\n",
+                "                @files = (@files, $find_files_recursive_{}->($path, $pattern));\n",
                 command_index
             ));
             output.push_str(&format!("            }} elsif (-f $path) {{\n"));
@@ -347,11 +351,11 @@ pub fn generate_grep_command(
             output.push_str(&format!("        closedir $dh;\n"));
             output.push_str(&format!("    }}\n"));
             output.push_str(&format!("    return @files;\n"));
-            output.push_str(&format!("}}\n"));
+            output.push_str(&format!("}};\n"));
 
             for file in &file_args {
                 output.push_str(&format!(
-                    "my @files_{} = find_files_recursive_{}('{}', '{}');\n",
+                    "my @files_{} = $find_files_recursive_{}->('{}', '{}');\n",
                     command_index,
                     command_index,
                     file,
@@ -1003,7 +1007,7 @@ pub fn generate_grep_command(
                     "    if (scalar grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n",
                     command_index, command_index
                 ));
-                output.push_str(&format!("        push @grep_with_filename_{}, \"$grep_filenames_{}[$i]:$grep_lines_{}[$i]\";\n", command_index, command_index, command_index));
+                output.push_str(&format!("        push @grep_with_filename_{}, $grep_filenames_{}[$i] . ':' . $grep_lines_{}[$i];\n", command_index, command_index, command_index));
                 output.push_str("    }\n");
                 output.push_str("}\n");
             } else {
@@ -1034,7 +1038,7 @@ pub fn generate_grep_command(
                     "    if (scalar grep {{ $_ eq $grep_lines_{}[$i] }} @grep_filtered_{}) {{\n",
                     command_index, command_index
                 ));
-                output.push_str(&format!("        push @grep_with_filename_{}, \"$grep_filenames_{}[$i]:$grep_lines_{}[$i]\";\n", command_index, command_index, command_index));
+                output.push_str(&format!("        push @grep_with_filename_{}, $grep_filenames_{}[$i] . ':' . $grep_lines_{}[$i];\n", command_index, command_index, command_index));
                 output.push_str("    }\n");
                 output.push_str("}\n");
                 output.push_str(&format!(
@@ -1095,16 +1099,18 @@ pub fn generate_grep_command(
         }
     }
 
+    // Set exit status for all grep commands
+    // For quiet mode, set exit code based on whether matches were found
+    let exit_condition = if files_without_match {
+        format!("$grep_result_{} ne q{{}}", command_index)
+    } else {
+        format!("scalar @grep_filtered_{} > 0", command_index)
+    };
+    output.push_str(&format!("$CHILD_ERROR = {} ? 0 : 1;\n", exit_condition));
+
     if quiet_mode {
         output.push_str(&format!("$grep_result_{} = q{{}};\n", command_index));
     }
-
-    // Set exit status for all grep commands
-    // For quiet mode, set exit code based on whether matches were found
-    output.push_str(&format!(
-        "$CHILD_ERROR = scalar @grep_filtered_{} > 0 ? 0 : 1;\n",
-        command_index
-    ));
 
     output
 }
