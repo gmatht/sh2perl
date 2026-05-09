@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 use POSIX qw(time);
@@ -37,6 +36,7 @@ for my $combo (@combinations) {
 push @all_combinations, join("", @$combo);
 }
 print join(" ", @all_combinations) . "\n";
+$CHILD_ERROR = 0;
 print "1 3 5 7 9\n";
 print "a d g j m p s v y\n";
 print "== Practical examples ==\n";
@@ -105,64 +105,64 @@ else {
           ": $ERRNO\n";
     }
 }
-my @ls_files_166 = ();
-my $ls_all_found_167 = 1;
-my @ls_inputs_168 = ();
-my @ls_glob_ls_inputs_168_0 = glob('file_*.txt');
-if ( !@ls_glob_ls_inputs_168_0 ) {
-    push @ls_inputs_168, 'file_*.txt';
-    $ls_all_found_167 = 0;
+my @ls_files_158 = ();
+my $ls_all_found_159 = 1;
+my @ls_inputs_160 = ();
+my @ls_glob_ls_inputs_160_0 = glob('file_*.txt');
+if ( !@ls_glob_ls_inputs_160_0 ) {
+    push @ls_inputs_160, 'file_*.txt';
+    $ls_all_found_159 = 0;
 } else {
-    push @ls_inputs_168, @ls_glob_ls_inputs_168_0;
+    push @ls_inputs_160, @ls_glob_ls_inputs_160_0;
 }
-my @ls_files_169 = ();
-my @ls_dirs_170 = ();
-my $ls_show_headers_171 = scalar(@ls_inputs_168) > 1;
-for my $ls_item_172 (@ls_inputs_168) {
-    if ( -f $ls_item_172 ) {
-        push @ls_files_169, $ls_item_172;
+my @ls_files_161 = ();
+my @ls_dirs_162 = ();
+my $ls_show_headers_163 = scalar(@ls_inputs_160) > 1;
+for my $ls_item_164 (@ls_inputs_160) {
+    if ( -f $ls_item_164 ) {
+        push @ls_files_161, $ls_item_164;
     }
-    elsif ( -d $ls_item_172 ) {
-        push @ls_dirs_170, $ls_item_172;
+    elsif ( -d $ls_item_164 ) {
+        push @ls_dirs_162, $ls_item_164;
     }
     else {
-        $ls_all_found_167 = 0;
+        $ls_all_found_159 = 0;
     }
 }
-@ls_files_169 = sort { $a cmp $b } @ls_files_169;
-@ls_dirs_170 = sort { $a cmp $b } @ls_dirs_170;
-if (@ls_files_169) {
-    push @ls_files_166, join("\n", @ls_files_169);
+@ls_files_161 = sort { $a cmp $b } @ls_files_161;
+@ls_dirs_162 = sort { $a cmp $b } @ls_dirs_162;
+if (@ls_files_161) {
+    push @ls_files_158, join("\n", @ls_files_161);
 }
-for my $ls_dir_173 (@ls_dirs_170) {
-    my @ls_dir_entries_174 = ();
-    if ( opendir my $dh, $ls_dir_173 ) {
+for my $ls_dir_165 (@ls_dirs_162) {
+    my @ls_dir_entries_166 = ();
+    if ( opendir my $dh, $ls_dir_165 ) {
         while ( my $file = readdir $dh ) {
             next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-            push @ls_dir_entries_174, $file;
+            push @ls_dir_entries_166, $file;
         }
         closedir $dh;
-        @ls_dir_entries_174 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_dir_entries_174;
-        if ( $ls_show_headers_171 ) {
-            if ( @ls_dir_entries_174 ) {
-                push @ls_files_166, $ls_dir_173 . ":\n" . join("\n", @ls_dir_entries_174);
+        @ls_dir_entries_166 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_dir_entries_166;
+        if ( $ls_show_headers_163 ) {
+            if ( @ls_dir_entries_166 ) {
+                push @ls_files_158, $ls_dir_165 . ":\n" . join("\n", @ls_dir_entries_166);
             } else {
-                push @ls_files_166, $ls_dir_173 . ':';
+                push @ls_files_158, $ls_dir_165 . ':';
             }
         }
-        elsif ( @ls_dir_entries_174 ) {
-            push @ls_files_166, join("\n", @ls_dir_entries_174);
+        elsif ( @ls_dir_entries_166 ) {
+            push @ls_files_158, join("\n", @ls_dir_entries_166);
         }
     }
     else {
-        $ls_all_found_167 = 0;
+        $ls_all_found_159 = 0;
     }
 }
-if (@ls_files_166) {
-    print join "\n", @ls_files_166;
+if (@ls_files_158) {
+    print join "\n", @ls_files_158;
     print "\n";
 }
-if ( $ls_all_found_167 ) {
+if ( $ls_all_found_159 ) {
     local $CHILD_ERROR = 0;
     $ls_success = 1;
 }

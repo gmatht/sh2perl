@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use File::Basename;
 use IPC::Open3;
 
@@ -24,6 +23,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 do {
     my $output = lc(${name});
     print $output;
@@ -31,6 +31,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 do {
     my $output = ucfirst(${name});
     print $output;
@@ -38,6 +39,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 print "== Advanced parameter expansion ==\n";
 my $path = "/tmp/file.txt";
 do {
@@ -47,6 +49,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 do {
     my $output = dirname(${path});
     print $output;
@@ -54,6 +57,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 my $s2;
 $s2 = "abba";
 print $s2 =~ s/b/X/grs;
@@ -77,6 +81,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 do {
     my $output = defined ${maybe} && ${maybe} ne q{} ? ${maybe} : do { ${maybe} = 'default'; ${maybe} };
     print $output;
@@ -84,6 +89,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 do {
     my $output = defined ${maybe} && ${maybe} ne q{} ? ${maybe} : die('error');
     print $output;
@@ -91,5 +97,6 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 
 exit $main_exit_code;

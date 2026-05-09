@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 
 my $main_exit_code = 0;
@@ -19,6 +18,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 print "== Arguments ==\n";
 my $a;
 for my $a (@ARGV) {
@@ -29,6 +29,7 @@ for my $a (@ARGV) {
         print "\n";
     }
 };
+    $CHILD_ERROR = 0;
 }
 
 exit $main_exit_code;

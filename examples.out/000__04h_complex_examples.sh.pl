@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 sub capture_stdout {
@@ -25,25 +24,22 @@ my $ls_success     = 0;
 our $CHILD_ERROR;
 
 print "=== Complex Backtick Examples ===\n";
-my $nested_result = ("Three wells: " . (do { my $_chomp_temp = do {
-    my $_chomp_result = do { my $head_line_count = 0;
-my $output_0 = q{};
+my $nested_result = ("Three wells: " . (do { my $_chomp_temp = do { my $_pipeline_result = do {
+    do { my $output_113 = q{};
+my $output_printed_113;
+my $head_line_count = 0;
 while (1) {
     my $line = 'well';
-    # yes doesn't support line-by-line processing
     if ($head_line_count < 3) {
-    if ($head_line_count > 0) { $output_0 .= "\n"; }
-    $output_0 .= $line;
+    $output_113 .= $line . "\n";
     ++$head_line_count;
     } else {
     $line = q{}; # Clear line to prevent printing
     last; # Break out of the yes loop when head limit is reached
     }
 }
-$output_0 };
-    chomp $_chomp_result;
-    $_chomp_result;
-}; chomp $_chomp_temp; $_chomp_temp; }));
+$output_113; };
+}; $_pipeline_result =~ s/\n+\z//msx; $_pipeline_result; }; chomp $_chomp_temp; $_chomp_temp; }));
 do {
     my $output = "Nested backticks: $nested_result";
     print $output;
@@ -51,39 +47,43 @@ do {
         print "\n";
     }
 };
-my $count = do {
-    my $output_116;
-    my $pipeline_success_116 = 1;
-    $output_116 = do {
-        my @ls_files_117 = ();
+$CHILD_ERROR = 0;
+my $count = do { my $_pipeline_result = do {
+    my $output_114 = q{};
+    my $output_printed_114;
+    my $pipeline_success_114 = 1;
+    $output_114 = do {
+        my @ls_files_115 = ();
         if ( -f q{.} ) {
-            push @ls_files_117, q{.};
+            push @ls_files_115, q{.};
         }
         elsif ( -d q{.} ) {
             if ( opendir my $dh, q{.} ) {
                 while ( my $file = readdir $dh ) {
                     next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-                    push @ls_files_117, $file;
+                    push @ls_files_115, $file;
                 }
                 closedir $dh;
-                @ls_files_117 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_files_117;
+                @ls_files_115 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_files_115;
             }
         }
-        (@ls_files_117 ? join("\n", @ls_files_117) . "\n" : q{});
+        (@ls_files_115 ? join("\n", @ls_files_115) . "\n" : q{});
     };
+    ;
+    if ($CHILD_ERROR != 0) { $pipeline_success_114 = 0; }
     use IPC::Open3;
-    my @wc_args_116_1 = ("-l");
-    my ($wc_in_116_1, $wc_out_116_1, $wc_err_116_1);
-    my $wc_pid_116_1 = open3($wc_in_116_1, $wc_out_116_1, $wc_err_116_1, 'wc', @wc_args_116_1);
-    print {$wc_in_116_1} $output_116;
-    close $wc_in_116_1 or die "Close failed: $!\n";
-    $output_116 = do { local $/ = undef; <$wc_out_116_1> };
-    close $wc_out_116_1 or die "Close failed: $!\n";
-    waitpid $wc_pid_116_1, 0;
-    if ( !$pipeline_success_116 ) { $main_exit_code = 1; }
-    $output_116 =~ s/\n+\z//msx;
-    $output_116;
-};
+    my @wc_args_114_1 = ('-l');
+    my ($wc_in_114_1, $wc_out_114_1, $wc_err_114_1);
+    my $wc_pid_114_1 = open3($wc_in_114_1, $wc_out_114_1, $wc_err_114_1, 'wc', @wc_args_114_1);
+    print {$wc_in_114_1} $output_114;
+    close $wc_in_114_1 or die "Close failed: $!\n";
+    $output_114 = do { local $/ = undef; <$wc_out_114_1> };
+    if ($output_114 eq q{}) { $output_114 = "0\n"; }
+    close $wc_out_114_1 or die "Close failed: $!\n";
+    waitpid $wc_pid_114_1, 0;
+    if ( !$pipeline_success_114 ) { $main_exit_code = 1; }
+    $output_114;
+}; $_pipeline_result =~ s/\n+\z//msx; $_pipeline_result; };
 do {
     my $output = "File count: $count";
     print $output;
@@ -91,6 +91,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 my $current_user;
 $current_user = ('root');
 if ("$current_user" eq "root") {
@@ -100,7 +101,7 @@ else {
     print "Not running as root\n";
 }
 my $system_name;
-$system_name = "Darwin";
+$system_name = 'Darwin';
 if ($system_name =~ /^Linux$/msx) {
         print "Running on Linux\n";
 } elsif ($system_name =~ /^Darwin$/msx) {
@@ -112,26 +113,16 @@ if ($system_name =~ /^Linux$/msx) {
 sub get_file_size {
     my ($file) = @_;
     my $size = do {
-my $wc_input_119 = do {
-    local $INPUT_RECORD_SEPARATOR = undef;
-    open my $fh, '<', "$file"
-        or croak "Cannot open file: $OS_ERROR";
-    my $content = <$fh>;
-    close $fh
-        or croak "Close failed: $OS_ERROR";
-    $content
-};
-use IPC::Open3;
-my @wc_args_119 = ("-c");
-my ($wc_in_119, $wc_out_119, $wc_err_119);
-my $wc_pid_119 = open3($wc_in_119, $wc_out_119, $wc_err_119, 'wc', @wc_args_119);
-print {$wc_in_119} $wc_input_119;
-close $wc_in_119 or die "Close failed: $!\n";
-my $wc_output_119 = do { local $/ = undef; <$wc_out_119> };
-close $wc_out_119 or die "Close failed: $!\n";
-waitpid $wc_pid_119, 0;
-    chomp $wc_output_119;
-    $wc_output_119;
+    local $ENV{file} = $file;
+    my ($in_117, $out_117, $err_117);
+    my $pid = open3($in_117, $out_117, $err_117, 'bash', '-c', 'wc -c < "$file"');
+    close $in_117 or croak 'Close failed: $OS_ERROR';
+    my $result = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_117> };
+    close $out_117 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid, 0;
+    $CHILD_ERROR = $? >> 8;
+    $result =~ s/\n+\z//msx;
+    $result;
 };
     do {
     my $output = "File $file has $size bytes";
@@ -140,11 +131,13 @@ waitpid $wc_pid_119, 0;
         print "\n";
     }
 };
+    $CHILD_ERROR = 0;
     return;
 }
 get_file_size('000__01_file_directory_operations.sh');
 my @files = ((grep { !/\//msx } glob '*.sh'), (glob 'examples/*.sh'));
 print "Shell scripts found: " . scalar(@files) . "\n";
+$CHILD_ERROR = 0;
 my $file;
 for my $file (@files) {
     do {
@@ -154,6 +147,7 @@ for my $file (@files) {
         print "\n";
     }
 };
+    $CHILD_ERROR = 0;
 }
 do {
     open my $original_stdout, '>&', STDOUT
@@ -181,123 +175,31 @@ date\n";
     close $original_stdout
       or die "Close failed: $!\n";
 };
-my $process_result = do { my $temp_file_ps_120 = q{/tmp} . '/process_sub_120.tmp';
-{
-    open my $fh, '>', $temp_file_ps_120 or croak "Cannot create temp file: $OS_ERROR\n";
-    my $temp_output = q{};
-    $temp_output .= my $file_content_121 = do {
-    local $INPUT_RECORD_SEPARATOR = undef;
-    open my $fh, '<', 'file1.txt'
-        or croak "Cannot open file: $OS_ERROR";
-    my $content = <$fh>;
-    close $fh
-        or croak "Close failed: $OS_ERROR";
-    $content
+my $process_result = do {
+    my ($in_118, $out_118, $err_118);
+    my $pid = open3($in_118, $out_118, $err_118, 'bash', '-c', 'comm -23 <(sort file1.txt) <(sort file2.txt)');
+    close $in_118 or croak 'Close failed: $OS_ERROR';
+    my $result = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_118> };
+    close $out_118 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid, 0;
+    $CHILD_ERROR = $? >> 8;
+    $result =~ s/\n+\z//msx;
+    $result;
 };
-my @sort_lines_121 = split /\n/msx, $file_content_121;
-my @sort_sorted_121 = sort @sort_lines_121;
-my $sort_output_121 = join "\n", @sort_sorted_121;
-if ($sort_output_121 ne q{} && !($sort_output_121 =~ m{\n\z}msx)) {
-    $sort_output_121 .= "\n";
-}
-$file_content_121 = $sort_output_121;
-;
-    print {$fh} $temp_output;
-    close $fh
-        or croak "Close failed: $OS_ERROR\n";
-}
-my $temp_file_ps_122 = q{/tmp} . '/process_sub_122.tmp';
-{
-    open my $fh, '>', $temp_file_ps_122 or croak "Cannot create temp file: $OS_ERROR\n";
-    my $temp_output = q{};
-    $temp_output .= my $file_content_123 = do {
-    local $INPUT_RECORD_SEPARATOR = undef;
-    open my $fh, '<', 'file2.txt'
-        or croak "Cannot open file: $OS_ERROR";
-    my $content = <$fh>;
-    close $fh
-        or croak "Close failed: $OS_ERROR";
-    $content
-};
-my @sort_lines_123 = split /\n/msx, $file_content_123;
-my @sort_sorted_123 = sort @sort_lines_123;
-my $sort_output_123 = join "\n", @sort_sorted_123;
-if ($sort_output_123 ne q{} && !($sort_output_123 =~ m{\n\z}msx)) {
-    $sort_output_123 .= "\n";
-}
-$file_content_123 = $sort_output_123;
-;
-    print {$fh} $temp_output;
-    close $fh
-        or croak "Close failed: $OS_ERROR\n";
-}
- my @file1_lines;
-my @file2_lines;
-if (open my $fh1, '<', $temp_file_ps_120) {
-    while (my $line = <$fh1>) {
-        chomp $line;
-        push @file1_lines, $line;
-    }
-    close $fh1 or croak "Close failed: $OS_ERROR";
-}
-if (open my $fh2, '<', $temp_file_ps_122) {
-    while (my $line = <$fh2>) {
-        chomp $line;
-        push @file2_lines, $line;
-    }
-    close $fh2 or croak "Close failed: $OS_ERROR";
-}
-my %file1_set = map { $_ => 1 } @file1_lines;
-my %file2_set = map { $_ => 1 } @file2_lines;
-my @common_lines;
-foreach my $line (@file1_lines) {
-    if (exists $file2_set{$line}) {
-        push @common_lines, $line;
-    }
-}
-my $comm_output = q{};
-foreach my $line (@file1_lines) {
-    if (!exists $file2_set{$line}) {
-        $comm_output .= $line . "\n";
-    }
-}
-$comm_output =~ s/\n$//msx;
-$comm_output };
 print "Process substitution result:\n";
 print $process_result;
 if ( !( $process_result =~ m{\n\z}msx ) ) { print "\n"; }
-my $here_string_result = do { my $input_data = "hello world"; my $set1_125 = 'a-z';
-my $set2_125 = 'A-Z';
-my $input_125 = $input_data;
-# Expand character ranges for tr command
-my $expanded_set1_125 = $set1_125;
-my $expanded_set2_125 = $set2_125;
-# Handle a-z range in set1
-if ($expanded_set1_125 =~ /a-z/msx) {
-    $expanded_set1_125 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
-}
-# Handle A-Z range in set1
-if ($expanded_set1_125 =~ /A-Z/msx) {
-    $expanded_set1_125 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
-}
-# Handle a-z range in set2
-if ($expanded_set2_125 =~ /a-z/msx) {
-    $expanded_set2_125 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
-}
-# Handle A-Z range in set2
-if ($expanded_set2_125 =~ /A-Z/msx) {
-    $expanded_set2_125 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
-}
-my $tr_result_124 = q{};
-for my $char ( split //msx, $input_125 ) {
-    my $pos_125 = index $expanded_set1_125, $char;
-    if ( $pos_125 >= 0 && $pos_125 < length $expanded_set2_125 ) {
-        $tr_result_124 .= substr $expanded_set2_125, $pos_125, 1;
-    } else {
-        $tr_result_124 .= $char;
-    }
-}
-$tr_result_124 };
+my $here_string_result = do {
+    my ($in_119, $out_119, $err_119);
+    my $pid = open3($in_119, $out_119, $err_119, 'bash', '-c', q{tr a-z A-Z <<< 'hello world'});
+    close $in_119 or croak 'Close failed: $OS_ERROR';
+    my $result = do { local $INPUT_RECORD_SEPARATOR = undef; <$out_119> };
+    close $out_119 or croak 'Close failed: $OS_ERROR';
+    waitpid $pid, 0;
+    $CHILD_ERROR = $? >> 8;
+    $result =~ s/\n+\z//msx;
+    $result;
+};
 do {
     my $output = "Here string result: $here_string_result";
     print $output;
@@ -305,6 +207,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 my $perl_result = do {
     my $result;
     my $eval_success = eval {
@@ -323,6 +226,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 if ( -e "file1.txt" ) {
     if ( -d "file1.txt" ) {
         carp "rm: carping: ", "file1.txt",
@@ -330,8 +234,7 @@ if ( -e "file1.txt" ) {
     }
     else {
         if ( unlink "file1.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "file1.txt",
               ": $OS_ERROR\n";
@@ -340,7 +243,6 @@ if ( -e "file1.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "file1.txt", ": No such file or directory\n";
 }
 if ( -e "file2.txt" ) {
     if ( -d "file2.txt" ) {
@@ -349,8 +251,7 @@ if ( -e "file2.txt" ) {
     }
     else {
         if ( unlink "file2.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "file2.txt",
               ": $OS_ERROR\n";
@@ -359,7 +260,6 @@ if ( -e "file2.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "file2.txt", ": No such file or directory\n";
 }
 print "=== Complex Backtick Examples Complete ===\n";
 

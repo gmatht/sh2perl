@@ -313,7 +313,7 @@ my @grep_filtered_9 = grep { /nonexistent/msx } @grep_lines_9;
 $grep_result_9 = @grep_filtered_9 == 0 ? "temp_file.txt" : "";
 print $grep_result_9;
 print "\n";
-$CHILD_ERROR = scalar @grep_filtered_9 > 0 ? 0 : 1;
+$CHILD_ERROR = $grep_result_9 ne q{} ? 0 : 1;
 if ($CHILD_ERROR != 0) {
     1;
 }
@@ -456,7 +456,8 @@ do {
 my $grep_result_15;
 my @grep_lines_15 = ();
 my @grep_filenames_15 = ();
-sub find_files_recursive_15 {
+my $find_files_recursive_15;
+$find_files_recursive_15 = sub {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -464,7 +465,7 @@ sub find_files_recursive_15 {
             next if $file eq '.' || $file eq '..';
             my $path = "$dir/$file";
             if (-d $path) {
-                @files = (@files, find_files_recursive_15($path, $pattern));
+                @files = (@files, $find_files_recursive_15->($path, $pattern));
             } elsif (-f $path) {
                 if ($file =~ /[.]txt$/msx) {
                     push @files, $path;
@@ -474,8 +475,8 @@ sub find_files_recursive_15 {
         closedir $dh;
     }
     return @files;
-}
-my @files_15 = find_files_recursive_15('test_dir', '*');
+};
+my @files_15 = $find_files_recursive_15->('test_dir', '*');
 for my $file (@files_15) {
     if (-f $file) {
         open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
@@ -492,7 +493,7 @@ my @grep_filtered_15 = grep { /pattern/msx } @grep_lines_15;
 my @grep_with_filename_15;
 for my $i (0..@grep_lines_15-1) {
     if (scalar grep { $_ eq $grep_lines_15[$i] } @grep_filtered_15) {
-        push @grep_with_filename_15, "$grep_filenames_15[$i]:$grep_lines_15[$i]";
+        push @grep_with_filename_15, $grep_filenames_15[$i] . ':' . $grep_lines_15[$i];
     }
 }
 $grep_result_15 = join "\n", @grep_with_filename_15;
@@ -504,7 +505,8 @@ $CHILD_ERROR = scalar @grep_filtered_15 > 0 ? 0 : 1;
 my $grep_result_16;
 my @grep_lines_16 = ();
 my @grep_filenames_16 = ();
-sub find_files_recursive_16 {
+my $find_files_recursive_16;
+$find_files_recursive_16 = sub {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -512,7 +514,7 @@ sub find_files_recursive_16 {
             next if $file eq '.' || $file eq '..';
             my $path = "$dir/$file";
             if (-d $path) {
-                @files = (@files, find_files_recursive_16($path, $pattern));
+                @files = (@files, $find_files_recursive_16->($path, $pattern));
             } elsif (-f $path) {
                 if ($file =~ /.*[.]txt$/msx) {
                     push @files, $path;
@@ -522,8 +524,8 @@ sub find_files_recursive_16 {
         closedir $dh;
     }
     return @files;
-}
-my @files_16 = find_files_recursive_16('test_dir', '*.txt');
+};
+my @files_16 = $find_files_recursive_16->('test_dir', '*.txt');
 for my $file (@files_16) {
     if (-f $file) {
         open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
@@ -540,7 +542,7 @@ my @grep_filtered_16 = grep { /pattern/msx } @grep_lines_16;
 my @grep_with_filename_16;
 for my $i (0..@grep_lines_16-1) {
     if (scalar grep { $_ eq $grep_lines_16[$i] } @grep_filtered_16) {
-        push @grep_with_filename_16, "$grep_filenames_16[$i]:$grep_lines_16[$i]";
+        push @grep_with_filename_16, $grep_filenames_16[$i] . ':' . $grep_lines_16[$i];
     }
 }
 $grep_result_16 = join "\n", @grep_with_filename_16;
@@ -552,7 +554,8 @@ $CHILD_ERROR = scalar @grep_filtered_16 > 0 ? 0 : 1;
 my $grep_result_17;
 my @grep_lines_17 = ();
 my @grep_filenames_17 = ();
-sub find_files_recursive_17 {
+my $find_files_recursive_17;
+$find_files_recursive_17 = sub {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -560,7 +563,7 @@ sub find_files_recursive_17 {
             next if $file eq '.' || $file eq '..';
             my $path = "$dir/$file";
             if (-d $path) {
-                @files = (@files, find_files_recursive_17($path, $pattern));
+                @files = (@files, $find_files_recursive_17->($path, $pattern));
             } elsif (-f $path) {
                 if ($file =~ /[.]txt$/msx && $file !~ /.*[.]bak$/msx) {
                     push @files, $path;
@@ -570,8 +573,8 @@ sub find_files_recursive_17 {
         closedir $dh;
     }
     return @files;
-}
-my @files_17 = find_files_recursive_17('test_dir', '*');
+};
+my @files_17 = $find_files_recursive_17->('test_dir', '*');
 for my $file (@files_17) {
     if (-f $file) {
         open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
@@ -588,7 +591,7 @@ my @grep_filtered_17 = grep { /pattern/msx } @grep_lines_17;
 my @grep_with_filename_17;
 for my $i (0..@grep_lines_17-1) {
     if (scalar grep { $_ eq $grep_lines_17[$i] } @grep_filtered_17) {
-        push @grep_with_filename_17, "$grep_filenames_17[$i]:$grep_lines_17[$i]";
+        push @grep_with_filename_17, $grep_filenames_17[$i] . ':' . $grep_lines_17[$i];
     }
 }
 $grep_result_17 = join "\n", @grep_with_filename_17;
@@ -600,7 +603,8 @@ $CHILD_ERROR = scalar @grep_filtered_17 > 0 ? 0 : 1;
 my $grep_result_18;
 my @grep_lines_18 = ();
 my @grep_filenames_18 = ();
-sub find_files_recursive_18 {
+my $find_files_recursive_18;
+$find_files_recursive_18 = sub {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -608,7 +612,7 @@ sub find_files_recursive_18 {
             next if $file eq '.' || $file eq '..';
             my $path = "$dir/$file";
             if (-d $path) {
-                @files = (@files, find_files_recursive_18($path, $pattern));
+                @files = (@files, $find_files_recursive_18->($path, $pattern));
             } elsif (-f $path) {
                 if ($file =~ /.*[.]txt$/msx) {
                     push @files, $path;
@@ -618,8 +622,8 @@ sub find_files_recursive_18 {
         closedir $dh;
     }
     return @files;
-}
-my @files_18 = find_files_recursive_18('test_dir', '*.txt');
+};
+my @files_18 = $find_files_recursive_18->('test_dir', '*.txt');
 for my $file (@files_18) {
     if (-f $file) {
         open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
@@ -655,7 +659,8 @@ $CHILD_ERROR = scalar @grep_filtered_18 > 0 ? 0 : 1;
         my $grep_result_19_0;
     my @grep_lines_19_0 = ();
     my @grep_filenames_19_0 = ();
-    sub find_files_recursive_19_0 {
+    my $find_files_recursive_19_0;
+    $find_files_recursive_19_0 = sub {
     my ($dir, $pattern) = @_;
     my @files;
     if ( opendir my $dh, $dir ) {
@@ -663,7 +668,7 @@ $CHILD_ERROR = scalar @grep_filtered_18 > 0 ? 0 : 1;
     next if $file eq '.' || $file eq '..';
     my $path = "$dir/$file";
     if (-d $path) {
-    @files = (@files, find_files_recursive_19_0($path, $pattern));
+    @files = (@files, $find_files_recursive_19_0->($path, $pattern));
     } elsif (-f $path) {
     if ($file =~ /.*[.]txt$/msx) {
     push @files, $path;
@@ -673,8 +678,8 @@ $CHILD_ERROR = scalar @grep_filtered_18 > 0 ? 0 : 1;
     closedir $dh;
     }
     return @files;
-    }
-    my @files_19_0 = find_files_recursive_19_0('test_dir', '*.txt');
+    };
+    my @files_19_0 = $find_files_recursive_19_0->('test_dir', '*.txt');
     for my $file (@files_19_0) {
     if (-f $file) {
     open my $fh, '<', $file or die "Cannot open $file: $ERRNO";
@@ -691,7 +696,7 @@ $CHILD_ERROR = scalar @grep_filtered_18 > 0 ? 0 : 1;
     my @grep_with_filename_19_0;
     for my $i (0..@grep_lines_19_0-1) {
     if (scalar grep { $_ eq $grep_lines_19_0[$i] } @grep_filtered_19_0) {
-    push @grep_with_filename_19_0, "$grep_filenames_19_0[$i]:$grep_lines_19_0[$i]";
+    push @grep_with_filename_19_0, $grep_filenames_19_0[$i] . ':' . $grep_lines_19_0[$i];
     }
     }
     $grep_result_19_0 = join "\n", @grep_with_filename_19_0;
@@ -773,8 +778,8 @@ $CHILD_ERROR = 0;
     if (!($grep_result_21_1 =~ m{\n\z}msx || $grep_result_21_1 eq q{})) {
     $grep_result_21_1 .= "\n";
     }
-    $grep_result_21_1 = q{};
     $CHILD_ERROR = scalar @grep_filtered_21_1 > 0 ? 0 : 1;
+    $grep_result_21_1 = q{};
     $output_21 = $grep_result_21_1;
     $output_21 = $grep_result_21_1;
     if ((scalar @grep_filtered_21_1) == 0) {
