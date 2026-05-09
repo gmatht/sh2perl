@@ -72,14 +72,15 @@ jobs:
             # Sum numbers across all "test result:" lines because cargo prints
             # one per test target. We want totals for the whole run, not a
             # single target's summary.
-            summed=$(perl -nle '
-              $p=$f=$i=$m=0;
-              while (<>) {
-                if (/test result:.*?([0-9]+)\s+passed.*?([0-9]+)\s+failed.*?([0-9]+)\s+ignored.*?([0-9]+)\s+measured/) {
-                  $p += $1; $f += $2; $i += $3; $m += $4;
-                }
+            # Use -0777 (slurp) so the entire file is in $_ and a global /g
+            # match collects every "test result:" line without any nested
+            # while-loop / stdin-fallback issues.
+            summed=$(perl -0777 -ne '
+              my ($p,$f,$i,$m) = (0,0,0,0);
+              while (/test result:.*?(\d+)\s+passed.*?(\d+)\s+failed.*?(\d+)\s+ignored.*?(\d+)\s+measured/g) {
+                $p += $1; $f += $2; $i += $3; $m += $4;
               }
-              print join(" ", $p, $f, $i, $m);
+              print "$p $f $i $m\n";
             ' cargo_test_output.txt || true)
             if [ -n "$summed" ]; then
               # Read summed values into variables
@@ -110,7 +111,7 @@ jobs:
             if [ -n "$line" ]; then
               purify_passed=$(echo "$line" | perl -nle 'print $1 if /Purify.pl tests: (\d+) passed/') || true
               purify_failed=$(echo "$line" | perl -nle 'print $1 if /, (\d+) failed/') || true
-              purify_tested=$(echo "$line" | perl -nle 'print $1 if /, (\d+) tested$/') || true
+              purify_tested=$(echo "$line" | perl -nle 'print $1 if /(\d+) tested$/') || true
             else
               # Fallback: if the final summary wasn't printed (the script died on
               # the first failure), estimate counts from PASSED:/FAILED: lines.
