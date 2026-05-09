@@ -981,8 +981,9 @@ fn generate_streaming_pipeline(
     // create a new id when none is already active. Use an RAII guard so the
     // id is popped automatically when this function returns or a branch
     // returns early.
+    let has_outer_pipeline_id = generator.current_pipeline_output_id().is_some();
     let mut _early_pipeline_guard: Option<crate::generator::PipelineOutputIdGuard> = None;
-    if generator.current_pipeline_output_id().is_none() {
+    if !has_outer_pipeline_id {
         // Declare the output variable early so heuristics that scan
         // declared_locals (fallbacks) will see it during nested generation.
         output.push_str(&generator.indent());
@@ -1175,10 +1176,9 @@ fn generate_streaming_pipeline(
                     output.push_str("}\n");
                 }
 
-                // Set the final output variable for command substitution
-                // Bash strips all trailing newlines from command substitution results.
-                output.push_str(&generator.indent());
-                output.push_str(&format!("{} =~ s/\\n+\\z//msx;\n", output_var));
+                // Set the final output variable for command substitution.
+                // Preserve the captured output as-is so backtick semantics
+                // keep the final newline when the source command prints one.
                 output.push_str(&generator.indent());
                 output.push_str(&format!("{};\n", output_var));
 
@@ -1251,13 +1251,15 @@ fn generate_streaming_pipeline(
                 // Use the pipeline's unique id instead of a hard-coded "0" so
                 // nested generators see the correct variable names.
                 let _pipeline_guard = generator.push_pipeline_output_id_guard(unique_id.clone());
+                start_index = 1; // Skip the yes command since it is handled here
                 output.push_str(&generator.indent());
                 output.push_str("my $head_line_count = 0;\n");
-                output.push_str(&generator.indent());
-                output.push_str(&format!("my $output_{} = q{{}};\n", unique_id));
-                generator
-                    .declared_locals
-                    .insert(format!("output_{}", unique_id));
+                let output_name = format!("output_{}", unique_id);
+                if has_outer_pipeline_id && !generator.declared_locals.contains(&output_name) {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my $output_{} = q{{}};\n", unique_id));
+                    generator.declared_locals.insert(output_name);
+                }
                 output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
                 generator.indent_level += 1;
@@ -1319,7 +1321,8 @@ fn generate_streaming_pipeline(
 
                 // Return the output directly for command substitution
                 output.push_str(&generator.indent());
-                output.push_str("$output_0\n");
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$output_{};\n", unique_id));
 
                 // Pipeline id guard will pop when it goes out of scope.
                 return output; // Return early since we've handled everything
@@ -1573,6 +1576,9 @@ fn generate_streaming_pipeline(
             output.push_str(&generator.indent());
             output.push_str(&format!("$output_{} = \"$line_count\\n\";\n", unique_id));
         }
+
+        output.push_str(&generator.indent());
+        output.push_str(&format!("$output_{};\n", unique_id));
         // Done generating this streaming pipeline - the guard will pop the id when it is dropped.
     } else if start_index == 1 {
         // For echo or cat commands, we need to add the command processing
@@ -1865,10 +1871,9 @@ fn generate_linebyline_command(
             // empty-line inputs produce the correct number of newline
             // characters. Previously we inserted newlines between lines
             // which caused an off-by-one when the line content was empty.
-            let output_name = generator
-                .current_pipeline_output_id()
-                .cloned()
-                .unwrap_or_else(|| "0".to_string());
+            // Emit the canonical placeholder so the caller's replacement logic
+            // can substitute the active pipeline id exactly once.
+            let output_name = "0".to_string();
             output.push_str(&format!("if ($head_line_count < {}) {{\n", num_lines));
             output.push_str(&format!(
                 "    $output_{} .= $line . \"\\n\";\n",
@@ -2363,25 +2368,6 @@ fn generate_buffered_pipeline(
                             }
                         }
                     }
-
-                    // Check if the first command failed (e.g., cat with non-existent file)
-                    // If the output is empty, the command likely failed
-                    if let Command::Simple(cmd) = command {
-                        if let Word::Literal(cmd_name, _) = &cmd.name {
-                            if cmd_name == "cat" {
-                                output.push_str(&generator.indent());
-                                output
-                                    .push_str(&format!("if ($output_{} eq q{{}}) {{\n", unique_id));
-                                output.push_str(&generator.indent());
-                                output.push_str(&format!(
-                                    "    $pipeline_success_{} = 0;\n",
-                                    unique_id
-                                ));
-                                output.push_str(&generator.indent());
-                                output.push_str("}\n");
-                            }
-                        }
-                    }
                 }
             } else {
                 // Handle subsequent commands - they should use the previous command's output
@@ -2734,26 +2720,9 @@ fn generate_buffered_pipeline(
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
 
-                // Ensure returned substitution string ends with a newline when
-                // non-empty and not already newline-terminated. Some code paths
-                // build the substitution result via join("\n", @lines) and do
-                // not append a trailing newline; that produced a one-byte/
-                // one-newline mismatch in purified output. Restrict this to the
-                // command-substitution return site so other branches that
-                // intentionally chomp/strip trailing newlines are unaffected.
+                // Strip trailing newlines to match command substitution semantics.
                 output.push_str(&generator.indent());
-                output.push_str(&format!(
-                    "if ($output_{} ne q{{}} && !($output_{} =~ {})) {{\n",
-                    unique_id,
-                    unique_id,
-                    generator.newline_end_regex()
-                ));
-                generator.indent_level += 1;
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{} .= \"\\n\";\n", unique_id));
-                generator.indent_level -= 1;
-                output.push_str(&generator.indent());
-                output.push_str("}\n");
+                output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
             } else {
@@ -2815,6 +2784,12 @@ fn generate_buffered_pipeline(
                         }
                     }
                 }
+
+                output.push_str(&generator.indent());
+                output.push_str(&format!(
+                    "if ($CHILD_ERROR != 0) {{ $pipeline_success_{} = 0; }}\n",
+                    unique_id
+                ));
 
                 // Process remaining commands in the pipeline
                 for (i, command) in pipeline.commands[1..].iter().enumerate() {
@@ -2881,27 +2856,7 @@ fn generate_buffered_pipeline(
                     unique_id
                 ));
 
-                // Return the output variable as the last statement.
-                // Ensure the returned substitution string ends with a newline when
-                // non-empty and not already newline-terminated. Some code paths
-                // build the substitution result via join("\n", @lines) and do
-                // not append a trailing newline; that produced a one-newline
-                // mismatch in purified output. Restrict this to the
-                // command-substitution return site so other branches that
-                // intentionally chomp/strip trailing newlines are unaffected.
-                output.push_str(&generator.indent());
-                output.push_str(&format!(
-                    "if ($output_{} ne q{{}} && !($output_{} =~ {})) {{\n",
-                    unique_id,
-                    unique_id,
-                    generator.newline_end_regex()
-                ));
-                generator.indent_level += 1;
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{} .= \"\\n\";\n", unique_id));
-                generator.indent_level -= 1;
-                output.push_str(&generator.indent());
-                output.push_str("}\n");
+                // Preserve backtick output exactly as captured.
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
             }
@@ -3010,18 +2965,7 @@ fn generate_buffered_pipeline(
                 unique_id
             ));
             output.push_str(&generator.indent());
-            output.push_str(&format!(
-                "if ($output_{} ne q{{}} && !($output_{} =~ {})) {{\n",
-                unique_id,
-                unique_id,
-                generator.newline_end_regex()
-            ));
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str(&format!("$output_{} .= \"\\n\";\n", unique_id));
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
+            output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
             output.push_str(&generator.indent());
             output.push_str(&format!("$output_{};\n", unique_id));
         }

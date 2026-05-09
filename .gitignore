@@ -1,3 +1,8 @@
+command_cache.json
+examples.out
+test_data.txt
+clean/
+
 # Ignore local build/test artifacts
 purify.out
 

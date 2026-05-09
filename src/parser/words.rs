@@ -490,6 +490,11 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         return Ok(word);
     }
 
+    // When parsing command arguments, preserve token boundaries between
+    // whitespace-separated words. Adjacent quoted fragments are only merged
+    // by parse_word(), which is used in contexts that need that behavior.
+    let start_pos = lexer.current_position();
+
     // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
     // and also handles find arguments like "+1M" by combining Plus + Number + Identifier
@@ -801,7 +806,9 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
     };
 
     let mut result = result?;
-    merge_contiguous_quoted_fragments(lexer, &mut result)?;
+    if lexer.current_position() == start_pos {
+        merge_contiguous_quoted_fragments(lexer, &mut result)?;
+    }
 
     // Don't skip inline whitespace after consuming the word - this preserves newlines
     // for argument parsing context
@@ -2065,9 +2072,6 @@ fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
             result.push(ch);
         }
     }
-
-    // Consume the token
-    lexer.next();
 
     Ok(Word::Literal(result, None))
 }
