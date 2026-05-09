@@ -477,6 +477,7 @@ pub fn generate_generic_builtin(
                 input_var,
                 index_num,
                 output_var_option,
+                false,
             )
         }
         "cat" => {

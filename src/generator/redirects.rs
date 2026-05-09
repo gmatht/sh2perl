@@ -172,6 +172,7 @@ waitpid $pid, 0;\n",
         RedirectOperator::StderrOutput => {
             // Stderr redirection: command 2> file
             let target = generator.perl_string_literal(&redirect.target);
+            output.push_str("local *STDERR;\n");
             output.push_str(&format!(
                 "open STDERR, '>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
                 target

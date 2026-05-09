@@ -190,7 +190,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             // already emits expression-valued code suitable for
                             // command-substitution.
                             crate::generator::commands::printf::generate_printf_command(
-                                generator, simple_cmd, "", 0, None,
+                                generator, simple_cmd, "", 0, None, true,
                             )
                         } else if name == "date" {
                             format!(

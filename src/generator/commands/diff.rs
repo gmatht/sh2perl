@@ -41,11 +41,9 @@ pub fn generate_diff_command(
         output.push_str(&generator.indent());
         output.push_str("$diff_output = <$diff_fh>;\n");
         output.push_str(&generator.indent());
-        output.push_str(
-            "my $close_result = close $diff_fh; # Capture but ignore close result for diff\n",
-        );
+        output.push_str("my $close_result = close $diff_fh; # Capture diff success/failure\n");
         output.push_str(&generator.indent());
-        output.push_str("$diff_exit_code = $CHILD_ERROR >> 8;\n");
+        output.push_str("$diff_exit_code = $close_result ? 0 : 1;\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("} else {\n");

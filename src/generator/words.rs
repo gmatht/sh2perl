@@ -1,6 +1,7 @@
 use super::Generator;
 use crate::ast::*;
 use regex::Regex;
+use std::collections::HashSet;
 
 fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
     if current_string.is_empty() {
@@ -15,6 +16,248 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
 
     parts.push(rendered);
     current_string.clear();
+}
+
+fn is_exportable_shell_var(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {
+            chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        }
+        _ => false,
+    }
+}
+
+fn collect_shell_vars_from_word(word: &Word, vars: &mut HashSet<String>) {
+    match word {
+        Word::Variable(var, _, _) => {
+            if is_exportable_shell_var(var) {
+                vars.insert(var.clone());
+            }
+        }
+        Word::ParameterExpansion(pe, _) => {
+            let var_name = pe.variable.trim_start_matches('#').trim_start_matches('!');
+            if is_exportable_shell_var(var_name) {
+                vars.insert(var_name.to_string());
+            }
+        }
+        Word::StringInterpolation(interp, _) => {
+            for part in &interp.parts {
+                match part {
+                    StringPart::Literal(_) => {}
+                    StringPart::Variable(var) => {
+                        if is_exportable_shell_var(var) {
+                            vars.insert(var.clone());
+                        }
+                    }
+                    StringPart::ParameterExpansion(pe) => {
+                        let var_name = pe.variable.trim_start_matches('#').trim_start_matches('!');
+                        if is_exportable_shell_var(var_name) {
+                            vars.insert(var_name.to_string());
+                        }
+                    }
+                    StringPart::MapAccess(map_name, _)
+                    | StringPart::MapKeys(map_name)
+                    | StringPart::MapLength(map_name)
+                    | StringPart::ArraySlice(map_name, _, _) => {
+                        if is_exportable_shell_var(map_name) {
+                            vars.insert(map_name.clone());
+                        }
+                    }
+                    StringPart::CommandSubstitution(cmd) => {
+                        collect_shell_vars_from_command(cmd, vars);
+                    }
+                    StringPart::Arithmetic(expr) => {
+                        let re = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\b").unwrap();
+                        for cap in re.captures_iter(&expr.expression) {
+                            let var_name = &cap[1];
+                            if is_exportable_shell_var(var_name) {
+                                vars.insert(var_name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Word::CommandSubstitution(cmd, _) => collect_shell_vars_from_command(cmd, vars),
+        Word::MapAccess(map_name, _, _)
+        | Word::MapKeys(map_name, _)
+        | Word::MapLength(map_name, _) => {
+            if is_exportable_shell_var(map_name) {
+                vars.insert(map_name.clone());
+            }
+        }
+        Word::ArraySlice(array_name, _, _, _) => {
+            if is_exportable_shell_var(array_name) {
+                vars.insert(array_name.clone());
+            }
+        }
+        Word::Arithmetic(expr, _) => {
+            let re = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\b").unwrap();
+            for cap in re.captures_iter(&expr.expression) {
+                let var_name = &cap[1];
+                if is_exportable_shell_var(var_name) {
+                    vars.insert(var_name.to_string());
+                }
+            }
+        }
+        Word::Array(_, _, _) | Word::BraceExpansion(_, _) | Word::Literal(_, _) => {}
+    }
+}
+
+fn collect_shell_vars_from_command(command: &Command, vars: &mut HashSet<String>) {
+    match command {
+        Command::Simple(cmd) => {
+            collect_shell_vars_from_word(&cmd.name, vars);
+            for arg in &cmd.args {
+                collect_shell_vars_from_word(arg, vars);
+            }
+            for value in cmd.env_vars.values() {
+                collect_shell_vars_from_word(value, vars);
+            }
+            for redirect in &cmd.redirects {
+                collect_shell_vars_from_word(&redirect.target, vars);
+                match &redirect.operator {
+                    RedirectOperator::ProcessSubstitutionInput(sub_cmd)
+                    | RedirectOperator::ProcessSubstitutionOutput(sub_cmd) => {
+                        collect_shell_vars_from_command(sub_cmd, vars);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Command::BuiltinCommand(cmd) => {
+            collect_shell_vars_from_word(&Word::Literal(cmd.name.clone(), None), vars);
+            for arg in &cmd.args {
+                collect_shell_vars_from_word(arg, vars);
+            }
+            for value in cmd.env_vars.values() {
+                collect_shell_vars_from_word(value, vars);
+            }
+            for redirect in &cmd.redirects {
+                collect_shell_vars_from_word(&redirect.target, vars);
+                match &redirect.operator {
+                    RedirectOperator::ProcessSubstitutionInput(sub_cmd)
+                    | RedirectOperator::ProcessSubstitutionOutput(sub_cmd) => {
+                        collect_shell_vars_from_command(sub_cmd, vars);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Command::Redirect(redirect_cmd) => {
+            collect_shell_vars_from_command(&redirect_cmd.command, vars);
+            for redirect in &redirect_cmd.redirects {
+                collect_shell_vars_from_word(&redirect.target, vars);
+                match &redirect.operator {
+                    RedirectOperator::ProcessSubstitutionInput(sub_cmd)
+                    | RedirectOperator::ProcessSubstitutionOutput(sub_cmd) => {
+                        collect_shell_vars_from_command(sub_cmd, vars);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Command::Pipeline(pipeline) => {
+            for cmd in &pipeline.commands {
+                collect_shell_vars_from_command(cmd, vars);
+            }
+        }
+        Command::And(left, right) | Command::Or(left, right) => {
+            collect_shell_vars_from_command(left, vars);
+            collect_shell_vars_from_command(right, vars);
+        }
+        Command::If(if_stmt) => {
+            collect_shell_vars_from_command(&if_stmt.condition, vars);
+            collect_shell_vars_from_command(&if_stmt.then_branch, vars);
+            if let Some(else_branch) = &if_stmt.else_branch {
+                collect_shell_vars_from_command(else_branch, vars);
+            }
+        }
+        Command::Case(case_stmt) => {
+            collect_shell_vars_from_word(&case_stmt.word, vars);
+            for case_clause in &case_stmt.cases {
+                for pattern in &case_clause.patterns {
+                    collect_shell_vars_from_word(pattern, vars);
+                }
+                for cmd in &case_clause.body {
+                    collect_shell_vars_from_command(cmd, vars);
+                }
+            }
+        }
+        Command::While(while_loop) => {
+            collect_shell_vars_from_command(&while_loop.condition, vars);
+            for cmd in &while_loop.body.commands {
+                collect_shell_vars_from_command(cmd, vars);
+            }
+        }
+        Command::For(for_loop) => {
+            for item in &for_loop.items {
+                collect_shell_vars_from_word(item, vars);
+            }
+            for cmd in &for_loop.body.commands {
+                collect_shell_vars_from_command(cmd, vars);
+            }
+        }
+        Command::Function(func) => {
+            for cmd in &func.body.commands {
+                collect_shell_vars_from_command(cmd, vars);
+            }
+        }
+        Command::Subshell(sub_cmd) | Command::Background(sub_cmd) => {
+            collect_shell_vars_from_command(sub_cmd, vars);
+        }
+        Command::Block(block) => {
+            for cmd in &block.commands {
+                collect_shell_vars_from_command(cmd, vars);
+            }
+        }
+        Command::Assignment(assign) => {
+            collect_shell_vars_from_word(&assign.value, vars);
+        }
+        Command::TestExpression(test_expr) => {
+            let re = Regex::new(r"\$([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+            for cap in re.captures_iter(&test_expr.expression) {
+                vars.insert(cap[1].to_string());
+            }
+        }
+        Command::ShoptCommand(_)
+        | Command::Break(_)
+        | Command::Continue(_)
+        | Command::Return(_)
+        | Command::BlankLine => {}
+    }
+}
+
+fn generate_shell_command_substitution(generator: &mut Generator, cmd: &Command) -> String {
+    let command_str = crate::generator::redirects::generate_bash_command_string(cmd);
+    let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+
+    let mut shell_vars = HashSet::new();
+    collect_shell_vars_from_command(cmd, &mut shell_vars);
+    let mut shell_vars: Vec<String> = shell_vars.into_iter().collect();
+    shell_vars.sort();
+
+    let mut env_setup = String::new();
+    for var in shell_vars {
+        env_setup.push_str(&format!("    local $ENV{{{}}} = ${};\n", var, var));
+    }
+
+    let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+    format!(
+        "do {{\n{}    my ({}, {}, {});\n    my $pid = open3({}, {}, {}, 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    $result =~ s/\\n+\\z//msx;\n    $result;\n}}",
+        env_setup,
+        in_var,
+        out_var,
+        err_var,
+        in_var,
+        out_var,
+        err_var,
+        command_lit,
+        in_var,
+        out_var,
+        out_var
+    )
 }
 
 pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
@@ -96,17 +339,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         Word::CommandSubstitution(cmd, _) => {
             // Handle command substitution
             let result = match cmd.as_ref() {
-                Command::Redirect(_) => {
-                    let command_str =
-                        crate::generator::redirects::generate_bash_command_string(cmd);
-                    let command_lit =
-                        generator.perl_string_literal_no_interp(&Word::literal(command_str));
-
-                    format!(
-                        "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
-                        command_lit
-                    )
-                }
+                Command::Redirect(_) => generate_shell_command_substitution(generator, cmd),
                 Command::Simple(simple_cmd) => {
                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
 
@@ -713,7 +946,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // dedicated printf generator so we correctly emulate the
                             // shell's repeating-format behaviour (e.g. printf "%s\\n" A B)
                             crate::generator::commands::printf::generate_printf_command(
-                                generator, simple_cmd, "", 0, None,
+                                generator, simple_cmd, "", 0, None, true,
                             )
                         } else if name == "printf" && false {
                             // (disabled) old ad-hoc printf handling - now delegated to dedicated printf generator
@@ -1023,9 +1256,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let indent1 = "    ".to_string(); // 4 spaces for outer do block
                             let indent1_do = "        ".to_string(); // 8 spaces for inner do block
                             let indent2 = "            ".to_string(); // 12 spaces for eval block
-                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                            format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
                                 indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
-                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
+                                indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "mv" {
                             // Use native Perl mv implementation for command substitution
 
@@ -1064,9 +1297,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let indent1 = "    ".to_string();
                             let indent1_do = "        ".to_string();
                             let indent2 = "            ".to_string();
-                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                            format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
                                 indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
-                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
+                                indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "rm" {
                             // Use native Perl rm implementation for command substitution
 
@@ -1105,46 +1338,21 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let indent1 = "    ".to_string();
                             let indent1_do = "        ".to_string();
                             let indent2 = "            ".to_string();
-                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                            format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
                                 indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
-                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
+                                indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "mkdir" {
-                            // Use native Perl mkdir implementation for command substitution
-
-                            let mkdir_code =
-                                crate::generator::commands::mkdir::generate_mkdir_command(
-                                    generator, simple_cmd,
-                                );
-                            let lines: Vec<&str> =
-                                mkdir_code.trim_end_matches('\n').lines().collect();
-                            let min_indent = lines
-                                .iter()
-                                .filter(|line| !line.trim().is_empty())
-                                .map(|line| line.len() - line.trim_start().len())
-                                .min()
-                                .unwrap_or(0);
-                            let mut formatted_lines = Vec::new();
-                            let base_indent = 8;
-                            for line in lines {
-                                let trimmed = line.trim_start();
-                                if !trimmed.is_empty() {
-                                    let orig_indent = line.len() - trimmed.len();
-                                    let relative_indent = orig_indent.saturating_sub(min_indent);
-                                    formatted_lines.push(format!(
-                                        "{}{}",
-                                        " ".repeat(base_indent + relative_indent),
-                                        trimmed
-                                    ));
-                                }
-                            }
-                            let formatted_code =
-                                formatted_lines.join("\n").replace("die ", "croak ");
-                            let indent1 = "    ".to_string();
-                            let indent1_do = "        ".to_string();
-                            let indent2 = "            ".to_string();
-                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
-                                indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
-                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
+                            // `mkdir` is shell-sensitive here because the command
+                            // substitution must preserve the real exit code and stderr.
+                            let mkdir_cmd = generator.generate_command_string_for_system(
+                                &Command::Simple(simple_cmd.clone()),
+                            );
+                            let mkdir_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(mkdir_cmd));
+                            format!(
+                                "do {{ my $mkdir_cmd = {}; my $mkdir_output = qx{{$mkdir_cmd}}; $CHILD_ERROR = $? >> 8; $mkdir_output; }}",
+                                mkdir_lit
+                            )
                         } else if name == "touch" {
                             // Use native Perl touch implementation for command substitution
 
@@ -1181,7 +1389,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let indent1 = "    ".to_string();
                             let indent1_do = "        ".to_string();
                             let indent2 = "            ".to_string();
-                            format!("do {{\n{}local $CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}local $CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    local $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                            format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}$CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
                                 indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
                                 indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "time" {
@@ -1258,10 +1466,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     // which handles many special-cases (echo|tr, head/tail,
                     // builtin optimizations) and ensures Perl-side
                     // interpolation/quoting is preserved correctly.
+                    let pipeline_code = crate::generator::commands::pipeline_commands::
+                        generate_pipeline_for_substitution(generator, pipeline);
                     format!(
-                        "do {{ {} }}",
-                        crate::generator::commands::pipeline_commands::
-                            generate_pipeline_for_substitution(generator, pipeline)
+                        "do {{ my $_pipeline_result = {}; $_pipeline_result =~ s/\\n+\\z//msx; $_pipeline_result; }}",
+                        pipeline_code
                     )
                 }
                 Command::And(left_cmd, right_cmd) => {
@@ -1509,15 +1718,27 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     // control operators and redirections keep working.
                     let command_str =
                         crate::generator::redirects::generate_bash_command_string(cmd);
-                    // Use a non-interpolating Perl literal so that shell-side
-                    // "$"/"@" sequences are preserved verbatim when later
-                    // executed under qx{}. This avoids fragile double-quoted
-                    // forms that need extra escaping.
                     let command_lit =
                         generator.perl_string_literal_no_interp(&Word::literal(command_str));
+                    let mut env_setup = String::new();
+                    for var in &generator.declared_locals {
+                        if var != "file" {
+                            env_setup.push_str(&format!("    local $ENV{{{}}} = ${};\n", var, var));
+                        }
+                    }
                     format!(
-                        "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
-                        command_lit
+                        "do {{\n{}    my $command = {};\n    my ({}, {}, {});\n    my $pid = open3({}, {}, {}, 'bash', '-c', $command);\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    $result;\n}}",
+                        env_setup,
+                        command_lit,
+                        "$in",
+                        "$out",
+                        "$err",
+                        "$in",
+                        "$out",
+                        "$err",
+                        "$in",
+                        "$out",
+                        "$out"
                     )
                 }
             };

@@ -576,13 +576,14 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     eprintln!("DEBUG: Generating function body for {}", func.name);
     eprintln!("DEBUG: Function body commands: {:?}", func.body.commands);
 
-    // Filter out the first local command that declares the first parameter
-    // when using modern function signature
+    // Filter out only the parameter declaration from the first local command
+    // when using modern function signatures. Keep any remaining locals so
+    // assignments like `local size=...` still generate.
     let filtered_commands = if generator.use_function_signatures
         && uses_positional_params
         && func.parameters.is_empty()
     {
-        // Skip the first local command that declares the first parameter
+        // Skip only the first local parameter assignment.
         let mut filtered = Vec::new();
         let mut skipped_first_local = false;
 
@@ -593,6 +594,22 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
                         if let Some(Word::Literal(arg, _)) = builtin.args.first() {
                             if arg.starts_with("file=") {
                                 skipped_first_local = true;
+
+                                let mut filtered_builtin = builtin.clone();
+                                filtered_builtin.args = builtin
+                                    .args
+                                    .iter()
+                                    .skip(1)
+                                    .filter(
+                                        |arg| !matches!(arg, Word::Literal(s, _) if s == "local"),
+                                    )
+                                    .cloned()
+                                    .collect();
+
+                                if !filtered_builtin.args.is_empty() {
+                                    filtered.push(Command::BuiltinCommand(filtered_builtin));
+                                }
+
                                 continue;
                             }
                         }

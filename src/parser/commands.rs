@@ -366,11 +366,14 @@ impl Parser {
         // Check if there are redirects following the command
         let mut redirects = Vec::new();
 
-        // Skip whitespace and comments
-        self.lexer.skip_whitespace_and_comments();
-
-        // Parse redirects until we hit a command separator or other non-redirect token
-        while let Some(token) = self.lexer.peek() {
+        // Parse redirects until we hit a command separator or other non-redirect token.
+        // Skip inline whitespace between redirects so sequences like `cmd <(a) <(b)`
+        // keep both operands.
+        loop {
+            self.lexer.skip_whitespace_and_comments();
+            let Some(token) = self.lexer.peek() else {
+                break;
+            };
             match token {
                 Token::Number
                 | Token::RedirectIn
@@ -386,6 +389,7 @@ impl Parser {
                 | Token::RedirectAll
                 | Token::RedirectAllAppend => {
                     redirects.push(parse_redirect(&mut self.lexer)?);
+                    self.lexer.skip_inline_whitespace_and_comments();
                 }
                 _ => break,
             }

@@ -42,13 +42,15 @@ fn translate_awk_expr(expr: &str, acc_vars: &HashSet<String>) -> String {
     }
     // Replace $N (N > 0) with $fields[N-1] using a closure
     if let Ok(re) = regex::Regex::new(r"\$([1-9][0-9]*)") {
-        result = re.replace_all(&result, |caps: &regex::Captures| {
-            if let Ok(n) = caps[1].parse::<usize>() {
-                format!("$fields[{}]", n - 1)
-            } else {
-                caps[0].to_string()
-            }
-        }).to_string();
+        result = re
+            .replace_all(&result, |caps: &regex::Captures| {
+                if let Ok(n) = caps[1].parse::<usize>() {
+                    format!("$fields[{}]", n - 1)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .to_string();
     }
     // Replace accumulation variables (whole word)
     for var in acc_vars {
@@ -56,7 +58,9 @@ fn translate_awk_expr(expr: &str, acc_vars: &HashSet<String>) -> String {
         if let Ok(re) = regex::Regex::new(&pattern) {
             // Use $$ in replacement to produce a literal $ in the output
             // (the regex crate treats $name as a capture group reference)
-            result = re.replace_all(&result, format!("$${}", var).as_str()).to_string();
+            result = re
+                .replace_all(&result, format!("$${}", var).as_str())
+                .to_string();
         }
     }
     // Replace NR and NF in expressions
@@ -71,7 +75,11 @@ fn translate_awk_expr(expr: &str, acc_vars: &HashSet<String>) -> String {
 
 /// Parse the "print" tokens from an awk print statement body and translate
 /// each token to its Perl equivalent.
-fn translate_awk_print_args(rem: &str, acc_vars: &HashSet<String>, generator: &mut Generator) -> Vec<String> {
+fn translate_awk_print_args(
+    rem: &str,
+    acc_vars: &HashSet<String>,
+    generator: &mut Generator,
+) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     let chars: Vec<char> = rem.chars().collect();
     let mut i = 0usize;
@@ -92,7 +100,12 @@ fn translate_awk_print_args(rem: &str, acc_vars: &HashSet<String>, generator: &m
             }
             let s = rem[start..i].to_string();
             parts.push(generator.perl_string_literal(&Word::literal(s)));
-            if i < chars.len() { i += 1; } // skip closing quote
+            if i < chars.len() {
+                i += 1;
+            } // skip closing quote
+        } else if c == '+' {
+            parts.push("+".to_string());
+            i += 1;
         } else if c == '$' {
             // $N variable
             i += 1;
@@ -113,10 +126,16 @@ fn translate_awk_print_args(rem: &str, acc_vars: &HashSet<String>, generator: &m
         } else {
             // Bare token: could be NR, NF, a variable name, or a literal
             let start = i;
-            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '"' && chars[i] != '\'' && chars[i] != ',' {
+            while i < chars.len()
+                && !chars[i].is_whitespace()
+                && chars[i] != '"'
+                && chars[i] != '\''
+                && chars[i] != ','
+            {
                 i += 1;
             }
-            let tok = rem[start..i].trim_end_matches(|c: char| !c.is_alphanumeric() && c != ')' && c != '_');
+            let tok = rem[start..i]
+                .trim_end_matches(|c: char| !c.is_alphanumeric() && c != ')' && c != '_');
             if !tok.is_empty() {
                 parts.push(translate_awk_expr(tok, acc_vars));
             }
@@ -160,7 +179,7 @@ pub fn generate_awk_command(
     // Find the awk program text (the argument that contains a { ... } block).
     let mut action_block = String::new();
     let mut condition_str = String::new();
-    let mut end_block = String::new();  // END { ... } block
+    let mut end_block = String::new(); // END { ... } block
     for arg in &cmd.args {
         if let Word::Literal(s, _) = arg {
             // Strip one layer of surrounding quotes if present and decode
@@ -278,7 +297,10 @@ pub fn generate_awk_command(
     let action = action_block.trim();
 
     // Check for accumulation statement like "sum += length($0)" or "sum += NF"
-    if acc_vars.iter().any(|v| action.contains(&format!("{} +=", v)) || action.contains(&format!("{}+=", v))) {
+    if acc_vars
+        .iter()
+        .any(|v| action.contains(&format!("{} +=", v)) || action.contains(&format!("{}+=", v)))
+    {
         // Generate accumulation code
         for var in &acc_vars {
             let pat1 = format!("{} +=", var);
@@ -377,6 +399,11 @@ pub fn generate_awk_command(
             if parts.is_empty() {
                 // AWK `print` appends ORS (usually a newline).
                 output.push_str("    push @result, ($line . \"\\n\");\n");
+            } else if parts.len() == 3 && parts[1] == "+" {
+                output.push_str(&format!(
+                    "    push @result, (({} + {}) . \"\\n\");\n",
+                    parts[0], parts[2]
+                ));
             } else {
                 // Join concatenated tokens with Perl concatenation and append a newline
                 output.push_str(&format!(
@@ -408,14 +435,17 @@ pub fn generate_awk_command(
             } else {
                 // Wrap numeric expressions (those containing division) with
                 // sprintf("%.6g", ...) to match AWK's default OFMT formatting.
-                let formatted_parts: Vec<String> = parts.iter().map(|p| {
-                    let is_quoted = p.starts_with('\'') || p.starts_with('"');
-                    if !is_quoted && p.contains('/') {
-                        format!("sprintf(\"%.6g\", {})", p)
-                    } else {
-                        p.clone()
-                    }
-                }).collect();
+                let formatted_parts: Vec<String> = parts
+                    .iter()
+                    .map(|p| {
+                        let is_quoted = p.starts_with('\'') || p.starts_with('"');
+                        if !is_quoted && p.contains('/') {
+                            format!("sprintf(\"%.6g\", {})", p)
+                        } else {
+                            p.clone()
+                        }
+                    })
+                    .collect();
                 output.push_str(&format!(
                     "push @result, ({} . \"\\n\");\n",
                     formatted_parts.join(" . ")

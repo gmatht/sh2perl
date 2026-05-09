@@ -59,22 +59,20 @@ pub fn generate_find_command(
         return generate_system_find_fallback(generator, cmd, generate_output, input_var);
     }
 
-    // For command substitution, use a simpler approach that doesn't define subroutines
     eprintln!(
         "DEBUG: generate_find_command called with generate_output: {}, input_var: '{}'",
         generate_output, input_var
     );
-    if generate_output && input_var != "" {
+    if generate_output && !input_var.is_empty() {
         eprintln!(
             "DEBUG: Using generate_find_for_substitution with input_var: '{}'",
             input_var
         );
         return generate_find_for_substitution(generator, cmd, input_var);
     }
-    eprintln!("DEBUG: Using complex find generation instead");
 
-    // For now, use the simple substitution for all cases to avoid complexity
-    generate_find_for_substitution(generator, cmd, input_var)
+    eprintln!("DEBUG: Using system find fallback instead");
+    generate_system_find_fallback(generator, cmd, generate_output, input_var)
 }
 
 fn generate_system_find_fallback(
@@ -147,6 +145,17 @@ pub fn generate_find_for_substitution(
     cmd: &SimpleCommand,
     _input_var: &str,
 ) -> String {
+    // For command substitution, defer to the real `find` command so its
+    // traversal order and filtering match the shell exactly.
+    let command = Command::Simple(cmd.clone());
+    let command_str = generator.generate_command_string_for_system(&command);
+    let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+    format!(
+        "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
+        command_lit
+    )
+
+    /*
     // For simple find commands, use a much simpler approach
     let mut start_path = String::from(".");
     let mut name_pattern = None;
@@ -219,67 +228,9 @@ pub fn generate_find_for_substitution(
         i += 1;
     }
 
-    // Generate recursive Perl code using File::Find.
-    // Use an *anonymous* sub passed directly to File::Find::find() instead of
-    // a named sub.  Named subs are compiled into the package namespace at
-    // compile time, so two pipelines in the same file that both call find()
-    // would end up with colliding names (e.g. `find_files_1`) because each
-    // debashc invocation restarts its counter at 0.  An anonymous sub has no
-    // name and therefore never collides.
-    let unique_id = generator.get_unique_id();
-    let mut result = format!(
-        "do {{\n    use File::Find;\n    use File::Basename;\n    my @files_{} = ();\n",
-        unique_id
-    );
-    result.push_str(&format!(
-        "    my $start_{} = q{{{}}};\n",
-        unique_id, start_path
-    ));
-
-    // Open the anonymous sub
-    result.push_str("\n    find( sub {\n");
-    result.push_str(&format!(
-        "        my $file_{} = $File::Find::name;\n",
-        unique_id
-    ));
-
-    if let Some(ftype) = &file_type {
-        if ftype == "f" {
-            result.push_str(&format!("        if ( !( -f $file_{} ) ) {{\n", unique_id));
-            result.push_str("            return;\n");
-            result.push_str("        }\n");
-        } else if ftype == "d" {
-            result.push_str(&format!("        if ( !( -d $file_{} ) ) {{\n", unique_id));
-            result.push_str("            return;\n");
-            result.push_str("        }\n");
-        }
-    }
-
-    if let Some(pattern) = &name_pattern {
-        let glob_pattern = pattern.replace("*", ".*");
-        let filename = if pattern.contains('/') {
-            // If pattern contains path separators, match against full path
-            format!("$file_{}", unique_id)
-        } else {
-            // If pattern doesn't contain path separators, match against basename
-            format!("basename($file_{})", unique_id)
-        };
-        result.push_str(&format!(
-            "        if ( !( {} =~ m/^{}$/xms ) ) {{\n",
-            filename, glob_pattern
-        ));
-        result.push_str("            return;\n");
-        result.push_str("        }\n");
-    }
-
-    result.push_str(&format!(
-        "        push @files_{}, $file_{};\n",
-        unique_id, unique_id
-    ));
-    result.push_str("    },\n");
-    result.push_str(&format!("    $start_{} );\n", unique_id));
-    result.push_str(&format!("    join \"\\n\", @files_{};\n}}", unique_id));
-    result
+    let command = Command::Simple(cmd.clone());
+    generator.generate_command_string_for_system(&command)
+    */
 }
 
 fn parse_size_to_bytes(size_str: &str) -> u64 {

@@ -61,12 +61,21 @@ pub fn generate_xargs_command_with_output(
                                 Some("{}".to_string())
                             } else {
                                 // Non-empty expansion – stringify as {item1,item2}
-                                Some(format!("{{{}}}", be.items.iter().map(|item| {
-                                    match item {
-                                        crate::ast_words::BraceItem::Literal(s) => s.clone(),
-                                        _ => String::new(),
-                                    }
-                                }).collect::<Vec<_>>().join(",")))
+                                Some(format!(
+                                    "{{{}}}",
+                                    be.items
+                                        .iter()
+                                        .map(|item| {
+                                            match item {
+                                                crate::ast_words::BraceItem::Literal(s) => {
+                                                    s.clone()
+                                                }
+                                                _ => String::new(),
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                ))
                             }
                         }
                         _ => None,
@@ -76,13 +85,24 @@ pub fn generate_xargs_command_with_output(
                         i += 1; // consume placeholder
                     }
                 }
+            } else if arg_str == "-n" {
+                if i + 1 < cmd.args.len() {
+                    if let Word::Literal(count, _) = &cmd.args[i + 1] {
+                        if let Ok(num) = count.parse::<usize>() {
+                            max_args = num;
+                            i += 1; // consume count
+                        }
+                    }
+                }
             } else if arg_str.starts_with("-I") && arg_str.len() > 2 {
                 replace_placeholder = Some(arg_str[2..].to_string());
+            } else if let Some(count) = arg_str.strip_prefix("-n") {
+                if let Ok(num) = count.parse::<usize>() {
+                    max_args = num;
+                }
             } else if arg_str == "grep" {
                 command = "grep";
                 command_found = true;
-            } else if arg_str == "-n1" {
-                max_args = 1;
             } else if arg_str == "function" {
                 args.push("function".to_string());
             } else if !arg_str.starts_with('-') {
@@ -207,11 +227,17 @@ pub fn generate_xargs_command_with_output(
                 }
             }
         }
-        // Handle xargs with command execution
-        // Split input on newlines to preserve filenames that may contain spaces.
+        // Handle xargs with command execution.
+        // `-I` consumes one input line at a time, while the default mode
+        // keeps the shell-style whitespace split for simple cases.
+        let xargs_input_split = if replace_placeholder.is_some() {
+            "\\n"
+        } else {
+            "\\s+"
+        };
         output.push_str(&format!(
-            "my @xargs_input_{} = split /\\n/msx, ${};\n",
-            command_index, input_var
+            "my @xargs_input_{} = grep {{ $_ ne q{{}} }} split /{}/msx, ${};\n",
+            command_index, xargs_input_split, input_var
         ));
         output.push_str(&format!("my @xargs_output_{};\n", command_index));
         output.push_str(&format!(

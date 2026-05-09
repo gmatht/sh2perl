@@ -52,7 +52,7 @@ pub fn generate_cat_command_for_substitution(
     for arg in &cmd.args {
         let path = generator.perl_string_literal(arg);
         parts.push(format!(
-            "do {{ open my $fh, '<', {} or die 'cat: ' . {} . ': ' . $OS_ERROR . \"\\n\"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . \"\\n\"; $chunk; }}",
+            "do {{ if (open my $fh, '<', {}) {{ local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or print STDERR 'cat: close failed: ' . $OS_ERROR . \"\\n\"; $chunk; }} else {{ print STDERR 'cat: ' . {} . ': ' . $OS_ERROR . \"\\n\"; $CHILD_ERROR = 1; q{{}}; }} }}",
             path, path
         ));
     }
