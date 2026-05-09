@@ -1,8 +1,0 @@
-Alice,25,Engineer,95.5
-Bob,30,Manager,87.2
-Charlie,35,Developer,92.8
-Diana,28,Designer,88.9
-Eve,32,Analyst,91.3
-Frank,29,Engineer,89.7
-Grace,31,Manager,93.1
-Henry,27,Developer,86.4
