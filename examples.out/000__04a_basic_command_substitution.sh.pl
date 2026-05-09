@@ -30,10 +30,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
+my $current_dir = do { my $basename_cmd = 'basename $(pwd)'; my $basename_output = qx{$basename_cmd}; $CHILD_ERROR = $? >> 8; $basename_output; };
 my $current_date = do {
 require POSIX; POSIX::strftime('%Y%m', localtime($DATE_SNAPSHOT)) . "\n"
 };
-my $current_dir = do { my $basename_cmd = 'basename $(pwd)'; my $basename_output = qx{$basename_cmd}; $CHILD_ERROR = $? >> 8; $basename_output; };
 do {
     my $output = "Stored date: $current_date";
     print $output;

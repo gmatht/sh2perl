@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 
 my $main_exit_code = 0;
@@ -20,11 +19,13 @@ $s = "file.txt";
 if ($s =~ /^.*[.]txt$/msx) {
         print 'pattern-match' . "\n";
     $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
 } else {
     $CHILD_ERROR = 1;
 }
 if ($s =~ /^file[.][a-z]+$/msx) {
         print 'regex-match' . "\n";
+    $CHILD_ERROR = 0;
     $CHILD_ERROR = 0;
 } else {
     $CHILD_ERROR = 1;
@@ -38,11 +39,13 @@ $f2 = "thing.min.js";
 if ($f1 =~ /^(?!.*[.]min).*[.]js$/msx) {
         print 'f1-ok' . "\n";
     $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
 } else {
     $CHILD_ERROR = 1;
 }
 if (!($f2 =~ /^(?!.*[.]min).*[.]js$/msx)) {
         print 'f2-filtered' . "\n";
+    $CHILD_ERROR = 0;
 }
 print "== nocasematch ==\n";
 # nocasematch option enabled
@@ -50,6 +53,7 @@ my $word;
 $word = "Foo";
 if ($word =~ /foo/msxi) {
         print 'ci-match' . "\n";
+    $CHILD_ERROR = 0;
     $CHILD_ERROR = 0;
 } else {
     $CHILD_ERROR = 1;
