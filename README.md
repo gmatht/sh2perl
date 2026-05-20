@@ -3,10 +3,10 @@
 [![Tests](https://github.com/gmatht/sh2perl/actions/workflows/test.yml/badge.svg)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
 
 <!-- Dynamic badges for test counts served from gh-pages branch -->
-[![Purify tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/purify.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
-[![Purify progress](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/purify-progress.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
-[![Main tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/main-tests.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
-[![Fail progress](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/fail-progress.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+[![Purify tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/branches/main/purify.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+[![Purify progress](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/branches/main/purify-progress.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+[![Main tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/branches/main/main-tests.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+[![Fail progress](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/branches/main/fail-progress.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
 
 A comprehensive Rust library and command-line tool for parsing and converting shell/bash scripts to other programming languages. This project provides a robust foundation for analyzing shell scripts, converting them to Perl, Rust, Python, and more, or building shell script analysis tools.
 

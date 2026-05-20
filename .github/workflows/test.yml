@@ -2,7 +2,8 @@ name: Test
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - "**"
   pull_request:
     branches: [ main ]
 
@@ -212,7 +213,7 @@ jobs:
           printf '%s\n' "{\"schemaVersion\": 1, \"label\": \"fail progress\", \"message\": \"${fail_progress_message}\", \"color\": \"${color_fail_progress}\"}" > .github/badges/fail-progress.json
 
       - name: Commit badges to gh-pages
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -230,14 +231,28 @@ jobs:
           fi
 
           # Restore badges and commit if they changed
-          mkdir -p .github/badges
-          mv "$TMPDIR"/*.json .github/badges/ || true
+          BRANCH_BADGE_DIR=$(printf '%s' "$GITHUB_REF_NAME" | perl -pe 's#/#__#g; s#[^A-Za-z0-9._-]#-#g; s#^\.+##; s#\.\.+#-#g')
+          if [ -z "$BRANCH_BADGE_DIR" ]; then
+            BRANCH_BADGE_DIR="unknown-branch"
+          fi
+
+          mkdir -p ".github/badges/branches/$BRANCH_BADGE_DIR"
+          mv "$TMPDIR"/*.json ".github/badges/branches/$BRANCH_BADGE_DIR/" || true
+
+          # Keep legacy root badge paths updated for main.
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            mkdir -p .github/badges
+            cp ".github/badges/branches/$BRANCH_BADGE_DIR/"*.json .github/badges/ || true
+          fi
           rm -rf "$TMPDIR" || true
 
-          git add .github/badges/*.json
+          git add ".github/badges/branches/$BRANCH_BADGE_DIR"/*.json
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            git add .github/badges/*.json
+          fi
           if git diff --cached --quiet; then
             echo "No changes to badges, nothing to commit"
           else
-            git commit -m "Update test badges"
+            git commit -m "Update test badges for $GITHUB_REF_NAME"
             git push --set-upstream origin gh-pages
           fi
