@@ -434,7 +434,7 @@ pub fn generate_grep_command(
                     output.push_str("        or croak \"Close failed: $OS_ERROR\";\n");
                     output.push_str("}\n");
                     output.push_str(&format!(
-                        "else {{ print STDERR \"grep: {}: No such file or directory\\n\"; }}\n",
+                        "else {{ print {{*STDERR}} \"grep: {}: No such file or directory\\n\"; }}\n",
                         file
                     ));
                 }

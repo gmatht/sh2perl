@@ -729,7 +729,7 @@ pub fn generate_pipeline_for_substitution(
                         output.push_str("    my $end_time = [gettimeofday];\n");
                         output.push_str("    my $elapsed = tv_interval($start_time, $end_time);\n");
                         output.push_str("    my $time_output = sprintf \"real\\t0m%.3fs\\nuser\\t0m0.000s\\nsys\\t0m0.000s\\n\", $elapsed;\n");
-                        output.push_str("    print STDERR $time_output;\n");
+                        output.push_str("    print {*STDERR} $time_output;\n");
 
                         // The shell script has a bug where time command output is not captured
                         // by command substitution. Keep the existing empty result.
