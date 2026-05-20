@@ -2,25 +2,23 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $MAX_LOOP_5 = 5;
-
-print "Hello, World!\n";
-if ((-f"test.txt")) {
-    print "File exists\n";
-}
-my $i;
-for my $i ( 1 .. $MAX_LOOP_5 ) {
-    print $i;
-if ( !( $i =~ m{\n\z}msx ) ) { print "\n"; }
-}
+my $perl_output_0 = do {
+            my $result = qx{perl };
+            chomp $result;
+            $result;
+        };
+print $perl_output_0;
 
 exit $main_exit_code;
+
+
+Exit code: exit status: 2
+

@@ -31,7 +31,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install Perl dependencies
-        run: sudo apt-get update && sudo apt-get install -y libppi-perl
+        run: sudo apt-get update && sudo apt-get install -y libppi-perl libperl-critic-perl
 
       - name: Build debashc
         run: cargo build
@@ -44,6 +44,11 @@ jobs:
       - name: Run purify tests
         run: |
           perl test_purify.pl --all 2>&1 | tee purify_output.txt || true
+
+      - name: Run perl-critic checks on generated code
+        run: |
+          set -o pipefail
+          ./target/debug/debashc fail --perl-critic 2>&1 | tee perlcritic_output.txt
 
       - name: Generate badge JSON
         run: |

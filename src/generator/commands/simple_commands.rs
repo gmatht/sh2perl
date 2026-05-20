@@ -372,7 +372,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 ));
                 output.push_str(&generator.indent());
                 output.push_str(&format!(
-                    "print ${} $output_ps_{};\n",
+                    "print {{${}}} $output_ps_{};\n",
                     fh_var, global_counter
                 ));
                 output.push_str(&generator.indent());
@@ -433,7 +433,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     ));
                     output.push_str(&generator.indent());
                     output.push_str(&format!(
-                        "print ${} {};\n",
+                        "print {{${}}} {};\n",
                         fh_var,
                         // Here-string content is written verbatim into a temp file. Use a
                         // non-interpolating Perl literal so $-sequences and backslashes

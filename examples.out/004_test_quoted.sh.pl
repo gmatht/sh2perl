@@ -2,18 +2,23 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-print "Hello, World!\n";
-print 'Single quoted' . "\n";
-print "String with \"escaped\" quotes\n";
-print "String with 'single' quotes\n";
+my $perl_output_0 = do {
+            my $result = qx{perl };
+            chomp $result;
+            $result;
+        };
+print $perl_output_0;
 
 exit $main_exit_code;
+
+
+Exit code: exit status: 2
+

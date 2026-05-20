@@ -22,7 +22,7 @@ my $file_list = do {
                 push @ls_files_0, $file;
             }
             closedir $dh;
-            @ls_files_0 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_files_0;
+            @ls_files_0 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_0;
         }
     }
     (@ls_files_0 ? join("\n", @ls_files_0) . "\n" : q{});

@@ -301,7 +301,7 @@ pub fn generate_command_impl_with_input(
                         result.push_str(&format!("open my ${}, '>', ${} or croak \"Cannot create temp file: $ERRNO\\n\";\n", fh_var, temp_var));
                         result.push_str(&generator.indent());
                         result.push_str(&format!(
-                            "print ${} $output_ps_{};\n",
+                            "print {{${}}} $output_ps_{};\n",
                             fh_var, global_counter
                         ));
                         result.push_str(&generator.indent());
@@ -687,7 +687,7 @@ pub fn generate_command_impl_with_input(
                 generator.indent_level += 1;
                 result.push_str(&generator.indent());
                 result.push_str("open my $original_stdout, '>&', STDOUT\n");
-                result.push_str("      or die \"Cannot save STDOUT: $!\\n\";\n");
+                result.push_str("      or die \"Cannot save STDOUT: $OS_ERROR\\n\";\n");
 
                 // Find the output redirect target
                 let output_redirect = all_redirects.iter().find(|r| {
@@ -706,11 +706,11 @@ pub fn generate_command_impl_with_input(
                     };
                     result.push_str(&generator.indent());
                     result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                    result.push_str("      or die \"Cannot open file: $!\\n\";\n");
+                    result.push_str("      or die \"Cannot open file: $OS_ERROR\\n\";\n");
                 } else {
                     result.push_str(&generator.indent());
                     result.push_str("open STDOUT, '>', 'temp_file.txt'\n");
-                    result.push_str("      or die \"Cannot open file: $!\\n\";\n");
+                    result.push_str("      or die \"Cannot open file: $OS_ERROR\\n\";\n");
                 }
             }
 
@@ -966,10 +966,10 @@ pub fn generate_command_impl_with_input(
             if has_output_redirect {
                 result.push_str(&generator.indent());
                 result.push_str("open STDOUT, '>&', $original_stdout\n");
-                result.push_str("      or die \"Cannot restore STDOUT: $!\\n\";\n");
+                result.push_str("      or die \"Cannot restore STDOUT: $OS_ERROR\\n\";\n");
                 result.push_str(&generator.indent());
                 result.push_str("close $original_stdout\n");
-                result.push_str("      or die \"Close failed: $!\\n\";\n");
+                result.push_str("      or die \"Close failed: $OS_ERROR\\n\";\n");
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());
                 result.push_str("};\n");
