@@ -239,17 +239,13 @@ jobs:
           mkdir -p ".github/badges/branches/$BRANCH_BADGE_DIR"
           mv "$TMPDIR"/*.json ".github/badges/branches/$BRANCH_BADGE_DIR/" || true
 
-          # Keep legacy root badge paths updated for main.
-          if [ "$GITHUB_REF_NAME" = "main" ]; then
-            mkdir -p .github/badges
-            cp ".github/badges/branches/$BRANCH_BADGE_DIR/"*.json .github/badges/ || true
-          fi
+          # Keep legacy root badge paths updated for compatibility.
+          mkdir -p .github/badges
+          cp ".github/badges/branches/$BRANCH_BADGE_DIR/"*.json .github/badges/ || true
           rm -rf "$TMPDIR" || true
 
           git add ".github/badges/branches/$BRANCH_BADGE_DIR"/*.json
-          if [ "$GITHUB_REF_NAME" = "main" ]; then
-            git add .github/badges/*.json
-          fi
+          git add .github/badges/*.json
           if git diff --cached --quiet; then
             echo "No changes to badges, nothing to commit"
           else
