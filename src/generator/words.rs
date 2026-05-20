@@ -327,19 +327,19 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                                     );
                                                 } else {
                                                     process_sub_code.push_str(&format!(
-                                                        "    print $fh {};\n",
+                                                        "    print {{$fh}} {};\n",
                                                         process_sub_output
                                                     ));
                                                 }
                                             } else {
                                                 process_sub_code.push_str(&format!(
-                                                    "    print $fh {};\n",
+                                                    "    print {{$fh}} {};\n",
                                                     process_sub_output
                                                 ));
                                             }
                                         } else {
                                             process_sub_code.push_str(&format!(
-                                                "    print $fh {};\n",
+                                                "    print {{$fh}} {};\n",
                                                 process_sub_output
                                             ));
                                         }
@@ -1199,7 +1199,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             time_output
                                 .push_str("my $elapsed = tv_interval($start_time, $end_time);\n");
                             time_output.push_str("my $time_output = sprintf \"real\\t0m%.3fs\\nuser\\t0m0.000s\\nsys\\t0m0.000s\\n\", $elapsed;\n");
-                            time_output.push_str("print STDERR $time_output;\n");
+                            time_output.push_str("print {*STDERR} $time_output;\n");
                             time_output.push_str("q{};\n");
 
                             format!("do {{ {} }}", time_output)
@@ -1355,7 +1355,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                                 // Compose a do-block: compute checksum string, write it to
                                                 // the checksum file, then run verifier and return its output.
                                                 return format!(
-                                                    "do {{\n    my $checksum_content = {}\n    open my $fh, '>', {} or croak \"Cannot create {}: $OS_ERROR\\n\";\n    print $fh $checksum_content;\n    close $fh or croak \"Close failed: $OS_ERROR\\n\";\n    {}\n}}",
+                                                    "do {{\n    my $checksum_content = {}\n    open my $fh, '>', {} or croak \"Cannot create {}: $OS_ERROR\\n\";\n    print {{$fh}} $checksum_content;\n    close $fh or croak \"Close failed: $OS_ERROR\\n\";\n    {}\n}}",
                                                     compute_expr, target_lit, target_lit, check_expr
                                                 );
                                             }

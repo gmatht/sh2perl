@@ -273,7 +273,7 @@ impl Generator {
     {
         local *STDOUT;
         open STDOUT, '>', \$captured
-          or die "Cannot capture stdout: $!\n";
+          or die "Cannot capture stdout: $OS_ERROR\n";
         $code->();
     }
     return $captured;

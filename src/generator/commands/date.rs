@@ -59,7 +59,7 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
         [flag_word, arg, ..] if simple_word_text(flag_word).as_deref() == Some("-d") => {
             let source_expr = generator.word_to_perl(arg);
             format!(
-                "my $date_source = {};\nrequire POSIX;\nif ($date_source =~ /^@([0-9]+)$/) {{\n    my $date_epoch = $1;\n    POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime($date_epoch)) . \"\\n\"\n}}\nelse {{\n    select((select(STDOUT), $| = 1)[0]);\n    print STDERR \"date: option requires an argument -- 'd'\\nTry 'date --help' for more information.\\n\";\n    q{{}};\n}}",
+                "my $date_source = {};\nrequire POSIX;\nif ($date_source =~ /^@([0-9]+)$/) {{\n    my $date_epoch = $1;\n    POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime($date_epoch)) . \"\\n\"\n}}\nelse {{\n    select((select(STDOUT), $| = 1)[0]);\n    print {{*STDERR}} \"date: option requires an argument -- 'd'\\nTry 'date --help' for more information.\\n\";\n    q{{}};\n}}",
                 source_expr
             )
         }
