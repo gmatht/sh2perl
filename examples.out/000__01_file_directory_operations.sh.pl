@@ -36,17 +36,15 @@ my $found_files = do {
     my @files_2 = ();
     my $start_2 = q{.};
 
-    find( sub {
+    sub find_files_2 {
         my $file_2 = $File::Find::name;
         if ( !( -f $file_2 ) ) {
             return;
         }
-        if ( !( basename($file_2) =~ m/^.*.sh$/xms ) ) {
-            return;
-        }
         push @files_2, $file_2;
-    },
-    $start_2 );
+        return;
+    }
+    find( \&find_files_2, $start_2 );
     join "\n", @files_2;
 };
 print "Found shell scripts:\n";
