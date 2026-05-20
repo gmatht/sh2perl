@@ -4,6 +4,7 @@
 
 <!-- Dynamic badges for test counts served from gh-pages branch -->
 [![Purify tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/purify.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
+[![Purify progress](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/purify-progress.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
 [![Main tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/main-tests.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
 [![Fail progress](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/fail-progress.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
 

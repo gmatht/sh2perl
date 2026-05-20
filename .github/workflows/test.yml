@@ -115,8 +115,11 @@ jobs:
           purify_passed=0
           purify_failed=0
           purify_tested=0
+          purify_progress_passed=""
+          purify_progress_matching=""
           if [ -f purify_output.txt ]; then
             line=$(grep -E '^Purify.pl tests:' purify_output.txt | tail -n1 || true)
+            progress_line=$(grep -E '^PROGRESS ' purify_output.txt | tail -n1 || true)
             if [ -n "$line" ]; then
               purify_passed=$(echo "$line" | perl -nle 'print $1 if /Purify.pl tests: (\d+) passed/') || true
               purify_failed=$(echo "$line" | perl -nle 'print $1 if /, (\d+) failed/') || true
@@ -127,6 +130,10 @@ jobs:
               purify_passed=$(grep -c '^PASSED:' purify_output.txt || true)
               purify_failed=$(grep -c '^FAILED:' purify_output.txt || true)
               purify_tested=$((purify_passed + purify_failed))
+            fi
+            if [ -n "$progress_line" ]; then
+              purify_progress_passed=$(echo "$progress_line" | perl -nle 'print $1 if /^PROGRESS (\d+):(\d+)$/') || true
+              purify_progress_matching=$(echo "$progress_line" | perl -nle 'print $2 if /^PROGRESS (\d+):(\d+)$/') || true
             fi
           fi
           purify_passed=${purify_passed:-0}
@@ -151,6 +158,21 @@ jobs:
           else
             printf '%s\n' "{\"schemaVersion\": 1, \"label\": \"purify tests\", \"message\": \"${purify_passed}/${purify_tested} passed\", \"color\": \"${color_purify}\"}" > .github/badges/purify.json
           fi
+
+          # Purify progress badge: reports how far purify got and line-match quality
+          color_purify_progress=lightgrey
+          purify_progress_message="no progress data"
+          if [ -n "$purify_progress_passed" ] && [ -n "$purify_progress_matching" ]; then
+            color_purify_progress=orange
+            purify_progress_message="${purify_progress_passed} passed, +${purify_progress_matching} lines"
+          elif [ "$purify_tested" -gt 0 ]; then
+            color_purify_progress=orange
+            purify_progress_message="${purify_passed} passed"
+          fi
+          if [ "${purify_failed:-0}" -eq 0 ] && [ "$purify_tested" -gt 0 ]; then
+            color_purify_progress=brightgreen
+          fi
+          printf '%s\n' "{\"schemaVersion\": 1, \"label\": \"purify progress\", \"message\": \"${purify_progress_message}\", \"color\": \"${color_purify_progress}\"}" > .github/badges/purify-progress.json
 
           # Parse fail-progress output ("how far before first failure")
           fail_progress_raw=""
