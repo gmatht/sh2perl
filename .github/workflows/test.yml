@@ -45,6 +45,11 @@ jobs:
         run: |
           perl test_purify.pl --all 2>&1 | tee purify_output.txt || true
 
+      - name: Run fail script tests
+        run: |
+          chmod +x ./fail
+          ./fail 2>&1 | tee fail_output.txt || true
+
       - name: Generate badge JSON
         run: |
           set -eu
