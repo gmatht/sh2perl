@@ -66,6 +66,11 @@ jobs:
             echo "purify_output.txt missing — running purify tests (fallback)"
             perl test_purify.pl --all 2>&1 | tee purify_output.txt || true
           fi
+          if [ ! -f fail_output.txt ]; then
+            echo "fail_output.txt missing — running fail script tests (fallback)"
+            chmod +x ./fail
+            ./fail 2>&1 | tee fail_output.txt || true
+          fi
 
           # Parse cargo test output for passed/failed/ignored/measured
           main_passed=0
@@ -146,6 +151,43 @@ jobs:
           else
             printf '%s\n' "{\"schemaVersion\": 1, \"label\": \"purify tests\", \"message\": \"${purify_passed}/${purify_tested} passed\", \"color\": \"${color_purify}\"}" > .github/badges/purify.json
           fi
+
+          # Parse fail-progress output ("how far before first failure")
+          fail_progress_raw=""
+          fail_progress_count=""
+          fail_progress_complete=0
+
+          if [ -f first_n_tests_passed.txt ]; then
+            fail_progress_raw=$(head -n1 first_n_tests_passed.txt || true)
+          fi
+
+          if [ -n "$fail_progress_raw" ]; then
+            fail_progress_count=$(echo "$fail_progress_raw" | perl -nle 'print $1 if /:[yn](\d+)/') || true
+            if echo "$fail_progress_raw" | grep -Eq ':[y]99999$'; then
+              fail_progress_complete=1
+            fi
+          fi
+
+          if [ -z "$fail_progress_count" ] && [ -f fail_output.txt ]; then
+            fail_progress_count=$(perl -nle 'if (/Successfully wrote (?:total )?test count (\d+)/) { $v = $1 } END { print $v if defined $v }' fail_output.txt || true)
+          fi
+
+          if [ -n "$fail_progress_count" ]; then
+            fail_progress_count=$((10#$fail_progress_count))
+          fi
+
+          if [ "$fail_progress_complete" -eq 1 ]; then
+            color_fail_progress=brightgreen
+            fail_progress_message="complete"
+          elif [ -n "$fail_progress_count" ]; then
+            color_fail_progress=orange
+            fail_progress_message="${fail_progress_count} before fail"
+          else
+            color_fail_progress=lightgrey
+            fail_progress_message="no progress data"
+          fi
+
+          printf '%s\n' "{\"schemaVersion\": 1, \"label\": \"fail progress\", \"message\": \"${fail_progress_message}\", \"color\": \"${color_fail_progress}\"}" > .github/badges/fail-progress.json
 
       - name: Commit badges to gh-pages
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
