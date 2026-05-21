@@ -631,12 +631,14 @@ pub fn generate_command_impl_with_input(
 
                             // Generate the actual diff command
                             let mut modified_diff_cmd = cmd.clone();
+                            // Use Word::Variable so perl_string_literal emits `$varname`
+                            // (not single-quoted `'$varname'` which prevents interpolation).
                             modified_diff_cmd
                                 .args
-                                .push(Word::literal(format!("${}", file1.0)));
+                                .push(Word::Variable(file1.0.clone(), false, None));
                             modified_diff_cmd
                                 .args
-                                .push(Word::literal(format!("${}", file2.0)));
+                                .push(Word::Variable(file2.0.clone(), false, None));
                             let diff_output = super::diff::generate_diff_command(
                                 generator,
                                 &modified_diff_cmd,
@@ -660,7 +662,12 @@ pub fn generate_command_impl_with_input(
                             // Use the paste generator for proper output handling
                             let paste_output =
                                 generate_paste_command(generator, cmd, &process_sub_files);
+                            // The do-block returns the paste result as a string;
+                            // wrap with print so it actually goes to stdout.
+                            result.push_str(&generator.indent());
+                            result.push_str("print ");
                             result.push_str(&paste_output);
+                            result.push_str(";\n");
 
                             return result;
                         }
