@@ -12,8 +12,8 @@ our $CHILD_ERROR;
 
 my $i = 0;
 
-my $MAX_LOOP_5 = 5;
 my $MAGIC_10   = 10;
+my $MAX_LOOP_5 = 5;
 
 if ((-f"file.txt")) {
     print "File exists\n";
