@@ -28,9 +28,9 @@ $CHILD_ERROR = 0;
 print "== Associative arrays ==\n";
 my %map = ();
 # declare map not implemented
-$map{"two"} = "1 + 1";
 $map{"foo"} = 'bar';
 $map{"answer"} = '42';
+$map{"two"} = "1 + 1";
 print $map{foo};
 if ( !( $map{foo} =~ m{\n\z}msx ) ) { print "\n"; }
 print $map{answer};

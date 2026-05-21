@@ -41,11 +41,12 @@ pub fn generate_diff_command(
         output.push_str(&generator.indent());
         output.push_str("$diff_output = <$diff_fh>;\n");
         output.push_str(&generator.indent());
+        // close on a pipe filehandle reaps the child; $? holds the exit status.
         output.push_str(
-            "my $close_result = close $diff_fh; # Capture but ignore close result for diff\n",
+            "close $diff_fh;\n",
         );
         output.push_str(&generator.indent());
-        output.push_str("$diff_exit_code = $CHILD_ERROR >> 8;\n");
+        output.push_str("$diff_exit_code = $? >> 8;\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("} else {\n");
