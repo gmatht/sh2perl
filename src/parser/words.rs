@@ -2066,9 +2066,6 @@ fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
         }
     }
 
-    // Consume the token
-    lexer.next();
-
     Ok(Word::Literal(result, None))
 }
 

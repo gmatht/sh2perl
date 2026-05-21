@@ -201,13 +201,13 @@ my $diff_exit_code = 0;
 my $diff_output = q{};
 {
     my $diff_cmd = 'diff';
-    my @diff_args = ('$temp_file_ps_fh_5', '$temp_file_ps_fh_6');
+    my @diff_args = ($temp_file_ps_fh_5, $temp_file_ps_fh_6);
     my $diff_pid = open my $diff_fh, q{-|}, $diff_cmd, @diff_args;
     if ($diff_pid) {
         local $INPUT_RECORD_SEPARATOR = undef;
         $diff_output = <$diff_fh>;
-        my $close_result = close $diff_fh; # Capture but ignore close result for diff
-        $diff_exit_code = $CHILD_ERROR >> 8;
+        close $diff_fh;
+        $diff_exit_code = $? >> 8;
     } else {
         carp "Cannot execute diff command: $OS_ERROR";
         $diff_output = q{};
@@ -252,7 +252,7 @@ if (!-d $temp_dir_fh_8) { make_path($temp_dir_fh_8); }
 open my $fh_ps_fh_8, '>', $temp_file_ps_fh_8 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_8} $output_ps_fh_8;
 close $fh_ps_fh_8 or croak "Close failed: $ERRNO\n";
-do {
+print do {
 my @paste_file1_lines_fh_9;
 my @paste_file2_lines_fh_9;
 if (open my $fh1, '<', $temp_file_ps_fh_7) {
@@ -277,6 +277,6 @@ for my $i (0..$max_lines-1) {
     $paste_output .= "$line1\t$line2\n";
 }
 $paste_output
-}
+};
 
 exit $main_exit_code;
