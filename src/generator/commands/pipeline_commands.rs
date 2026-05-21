@@ -1257,11 +1257,14 @@ fn generate_streaming_pipeline(
                 let _pipeline_guard = generator.push_pipeline_output_id_guard(unique_id.clone());
                 output.push_str(&generator.indent());
                 output.push_str("my $head_line_count = 0;\n");
-                output.push_str(&generator.indent());
-                output.push_str(&format!("my $output_{} = q{{}};\n", unique_id));
-                generator
-                    .declared_locals
-                    .insert(format!("output_{}", unique_id));
+                // Only declare $output_{unique_id} if the early pipeline guard hasn't already done so.
+                if !generator.declared_locals.contains(&format!("output_{}", unique_id)) {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my $output_{} = q{{}};\n", unique_id));
+                    generator
+                        .declared_locals
+                        .insert(format!("output_{}", unique_id));
+                }
                 output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
                 generator.indent_level += 1;
