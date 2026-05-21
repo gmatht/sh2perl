@@ -126,10 +126,10 @@ do {
 };
 $CHILD_ERROR = 0;
 my $strings_result = do { do {
-    do { my $output_3 = q{};
-my $output_printed_3;
+    do { my $output_0 = q{};
+my $output_printed_0;
 my $head_line_count = 0;
-my $output_4 = q{};
+my $output_1 = q{};
 while (my $line = <>) {
     chomp $line;
     my $input_data;
@@ -148,9 +148,9 @@ while ($input_data =~ /([\x20-\x7E]{4,})/g) {
     push @result, $1;
 }
 my $line = join "\n", @result;
-$output_4 = $line;
+$output_1 = $line;
     if ($head_line_count < 3) {
-    $output_0 .= $line . "\n";
+    $output_1 .= $line . "\n";
     ++$head_line_count;
 } else {
     $line = q{}; # Clear line to prevent printing
@@ -163,26 +163,26 @@ print $strings_result;
 if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
 print "=== I/O Redirection Commands ===\n";
 my $tee_result = do { do {
-    my $output_5 = q{};
-    my $output_printed_5;
-    my $pipeline_success_5 = 1;
-    $output_5 .= 'test output' . "\n";
-    if ( !($output_5 =~ m{\n\z}msx) ) { $output_5 .= "\n"; }
+    my $output_2 = q{};
+    my $output_printed_2;
+    my $pipeline_success_2 = 1;
+    $output_2 .= 'test output' . "\n";
+    if ( !($output_2 =~ m{\n\z}msx) ) { $output_2 .= "\n"; }
     $CHILD_ERROR = 0;
     use Carp qw(carp croak);
     if ( open my $fh, '>', 'test_tee.txt' ) {
-        print {$fh} $output_5;
+        print {$fh} $output_2;
         close $fh or croak "Close failed: $ERRNO";
     }
     else {
         carp "tee: Cannot open 'test_tee.txt': $ERRNO";
     }
-    $output_5 = $output_5;
-    if ( !$pipeline_success_5 ) { $main_exit_code = 1; }
-    if ($output_5 ne q{} && !($output_5 =~ m{\n\z}msx)) {
-        $output_5 .= "\n";
+    $output_2 = $output_2;
+    if ( !$pipeline_success_2 ) { $main_exit_code = 1; }
+    if ($output_2 ne q{} && !($output_2 =~ m{\n\z}msx)) {
+        $output_2 .= "\n";
     }
-    $output_5;
+    $output_2;
 } };
 do {
     my $output = "Tee result: $tee_result";
@@ -250,3 +250,4 @@ else {
 }
 
 exit $main_exit_code;
+
