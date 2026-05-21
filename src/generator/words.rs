@@ -96,16 +96,71 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         Word::CommandSubstitution(cmd, _) => {
             // Handle command substitution
             let result = match cmd.as_ref() {
-                Command::Redirect(_) => {
-                    let command_str =
-                        crate::generator::redirects::generate_bash_command_string(cmd);
-                    let command_lit =
-                        generator.perl_string_literal_no_interp(&Word::literal(command_str));
+                Command::Redirect(redirect_cmd) => {
+                    // Check if any redirect uses bash-specific features not available in
+                    // POSIX /bin/sh (dash): here-strings (<<<) or process substitutions (<(...)).
+                    // For here-strings we convert to the POSIX-compatible `echo ... | cmd` form.
+                    // For process substitutions we fall through to bash -c.
+                    let has_here_string = redirect_cmd
+                        .redirects
+                        .iter()
+                        .any(|r| matches!(r.operator, RedirectOperator::HereString));
+                    let has_process_sub = redirect_cmd.redirects.iter().any(|r| {
+                        matches!(
+                            r.operator,
+                            RedirectOperator::ProcessSubstitutionInput(_)
+                                | RedirectOperator::ProcessSubstitutionOutput(_)
+                        )
+                    });
 
-                    format!(
-                        "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
-                        command_lit
-                    )
+                    if has_here_string && !has_process_sub {
+                        // Convert `cmd <<< "string"` → `echo 'string' | cmd`.
+                        // Build the base command without the here-string redirect.
+                        let base_cmd_str = crate::generator::redirects::generate_bash_command_string(
+                            &redirect_cmd.command,
+                        );
+                        // Find the first here-string redirect target.
+                        let here_target = redirect_cmd
+                            .redirects
+                            .iter()
+                            .find(|r| matches!(r.operator, RedirectOperator::HereString))
+                            .map(|r| generator.perl_string_literal(&r.target))
+                            .unwrap_or_else(|| "''".to_string());
+                        // Emit: echo <string> | <cmd>
+                        format!(
+                            "do {{ my $here_input = {}; chomp(my $result = qx{{echo \"$here_input\" | {}}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                            here_target,
+                            base_cmd_str
+                        )
+                    } else if has_process_sub {
+                        // Process substitutions (<(cmd) / >(cmd)) require bash, not /bin/sh.
+                        // Run the entire command under `bash -c '...'`, using single-quote
+                        // escaping (replace ' with '\'' ) to safely embed the command string.
+                        let command_str =
+                            crate::generator::redirects::generate_bash_command_string(cmd);
+                        let escaped = command_str.replace('\'', "'\\''");
+                        let bash_cmd = format!("bash -c '{}'", escaped);
+                        let command_lit = generator
+                            .perl_string_literal_force_interp(&Word::literal(bash_cmd));
+                        format!(
+                            "do {{ my $command = {}; chomp(my $result = qx{{$command}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                            command_lit
+                        )
+                    } else {
+                        let command_str =
+                            crate::generator::redirects::generate_bash_command_string(cmd);
+                        // Use force_interp so that Perl variables (e.g. $file) in the
+                        // redirect target are interpolated before the command is passed
+                        // to the shell.  This mirrors how bash expands $var in
+                        // `cmd < "$var"`.
+                        let command_lit = generator
+                            .perl_string_literal_force_interp(&Word::literal(command_str));
+
+                        format!(
+                            "do {{ my $command = {}; chomp(my $result = qx{{$command}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                            command_lit
+                        )
+                    }
                 }
                 Command::Simple(simple_cmd) => {
                     let cmd_name = generator.word_to_perl(&simple_cmd.name);

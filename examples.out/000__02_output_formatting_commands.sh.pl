@@ -165,9 +165,7 @@ my $strings_result = do { do {
     $output_3 = $result;
 
     if ( !$pipeline_success_3 ) { $main_exit_code = 1; }
-    if ($output_3 ne q{} && !($output_3 =~ m{\n\z}msx)) {
-        $output_3 .= "\n";
-    }
+    $output_3 =~ s/\n+\z//msx;
     $output_3;
 } };
 print "Strings result:\n";
@@ -191,9 +189,7 @@ my $tee_result = do { do {
     }
     $output_4 = $output_4;
     if ( !$pipeline_success_4 ) { $main_exit_code = 1; }
-    if ($output_4 ne q{} && !($output_4 =~ m{\n\z}msx)) {
-        $output_4 .= "\n";
-    }
+    $output_4 =~ s/\n+\z//msx;
     $output_4;
 } };
 do {

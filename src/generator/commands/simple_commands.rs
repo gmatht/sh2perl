@@ -453,8 +453,14 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     // Generate the actual command
     if let Word::Literal(ref name, _) = cmd.name {
         if name == "local" {
-            // Handle local command - convert to my declarations
-            for arg in &cmd.args {
+            // Handle local command - convert to my declarations.
+            // Use an index-based loop so we can look ahead when the parser
+            // emits a (Literal("var="), CommandSubstitution) pair for
+            // `local var=$(cmd)` / `local var=\`cmd\`` assignments.
+            let args = &cmd.args;
+            let mut i = 0;
+            while i < args.len() {
+                let arg = &args[i];
                 match arg {
                     Word::Literal(var_name, _) => {
                         // Check if it's an assignment (var=value)
@@ -464,14 +470,27 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 let var = parts[0];
                                 let value = parts[1];
                                 if !generator.declared_locals.contains(var) {
-                                    // Check if the value contains command substitution
+                                    // Case 1: value is empty and next arg is a CommandSubstitution
+                                    // This is how the parser encodes `local var=$(cmd)`
+                                    if value.is_empty()
+                                        && i + 1 < args.len()
+                                        && matches!(args[i + 1], Word::CommandSubstitution(_, _))
+                                    {
+                                        let perl_cmd = generator.word_to_perl(&args[i + 1]);
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&format!(
+                                            "my ${} = {};\n",
+                                            var, perl_cmd
+                                        ));
+                                        generator.declared_locals.insert(var.to_string());
+                                        i += 2; // consume Literal("var=") AND CommandSubstitution
+                                        continue;
+                                    }
+
+                                    // Case 2: value contains a backtick (inline `cmd`)
                                     if value.contains('`') {
-                                        // Handle command substitution in local assignment
-                                        // Parse the command substitution and convert to Perl
                                         let command_substitution =
                                             value.trim_start_matches('`').trim_end_matches('`');
-
-                                        // Try to parse the command properly instead of wrapping in bash -c
 
                                         if let Ok(parsed_commands) =
                                             Parser::new(command_substitution).parse()
@@ -483,14 +502,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                         None,
                                                     ),
                                                 );
-
                                                 output.push_str(&generator.indent());
                                                 output.push_str(&format!(
                                                     "my ${} = {};\n",
                                                     var, perl_command
                                                 ));
                                             } else {
-                                                // Fallback to bash -c if parsing fails
                                                 let perl_command = generator.word_to_perl(
                                                     &Word::CommandSubstitution(
                                                         Box::new(Command::Simple(SimpleCommand {
@@ -524,9 +541,8 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                 ));
                                             }
                                         } else {
-                                            // Fallback to bash -c if parsing fails
-                                            let perl_command =
-                                                generator.word_to_perl(&Word::CommandSubstitution(
+                                            let perl_command = generator.word_to_perl(
+                                                &Word::CommandSubstitution(
                                                     Box::new(Command::Simple(SimpleCommand {
                                                         name: Word::Literal(
                                                             "bash".to_string(),
@@ -545,18 +561,27 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                         stdout_used: false,
                                                     })),
                                                     None,
-                                                ));
+                                                ),
+                                            );
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!(
                                                 "my ${} = {};\n",
                                                 var, perl_command
                                             ));
                                         }
-                                    } else {
+                                        generator.declared_locals.insert(var.to_string());
+                                    } else if !value.is_empty() {
+                                        // Case 3: plain literal value
                                         output.push_str(&generator.indent());
                                         output.push_str(&format!("my ${} = {};\n", var, value));
+                                        generator.declared_locals.insert(var.to_string());
+                                    } else {
+                                        // Case 4: empty value with no following CommandSubstitution
+                                        // (just declare the variable without a value)
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&format!("my ${};\n", var));
+                                        generator.declared_locals.insert(var.to_string());
                                     }
-                                    generator.declared_locals.insert(var.to_string());
                                 }
                             }
                         } else {
@@ -567,6 +592,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 generator.declared_locals.insert(var_name.clone());
                             }
                         }
+                        i += 1;
+                    }
+                    Word::CommandSubstitution(_, _) => {
+                        // A bare CommandSubstitution here means it was NOT consumed as part
+                        // of a "var=" pair above (e.g. the variable name was already declared).
+                        // Skip it silently.
+                        i += 1;
                     }
                     _ => {
                         // For other word types, try to extract variable name and value
@@ -576,6 +608,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             output.push_str(&format!("my {};\n", var_expr));
                             generator.declared_locals.insert(var_expr);
                         }
+                        i += 1;
                     }
                 }
             }
