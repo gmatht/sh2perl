@@ -19,7 +19,7 @@ my $file_content = do { do {
     my $output_120 = q{};
     my $output_printed_120;
     my $pipeline_success_120 = 1;
-    $output_120 = do { open my $fh, '<', 'src/main.rs' or die 'cat: ' . 'src/main.rs' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; };
+    $output_120 = do { my $cat_chunk = q{}; if ( open my $fh, '<', 'src/main.rs' ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . 'src/main.rs' . ': ' . $OS_ERROR . "\n"; } $cat_chunk; };
     my $num_lines       = 5;
     my $head_line_count = 0;
     my $result          = q{};
@@ -174,41 +174,41 @@ my $uniq_result = do { do {
 print "Unique words:\n";
 print $uniq_result;
 if ( !( $uniq_result =~ m{\n\z}msx ) ) { print "\n"; }
-my $line_count = do { do {
+my $word_count = do { do {
     my $output_126 = q{};
     my $output_printed_126;
     my $pipeline_success_126 = 1;
-    $output_126 .= "line1\nline2\nline3";
+    $output_126 .= 'Hello World' . "\n";
     if ( !($output_126 =~ m{\n\z}msx) ) { $output_126 .= "\n"; }
     $CHILD_ERROR = 0;
     use IPC::Open3;
-    my @wc_args_126_1 = ('-l');
+    my @wc_args_126_1 = ('-w');
     my ($wc_in_126_1, $wc_out_126_1, $wc_err_126_1);
     my $wc_pid_126_1 = open3($wc_in_126_1, $wc_out_126_1, $wc_err_126_1, 'wc', @wc_args_126_1);
     print {$wc_in_126_1} $output_126;
     close $wc_in_126_1 or die "Close failed: $OS_ERROR\n";
     $output_126 = do { local $/ = undef; <$wc_out_126_1> };
-    if ($output_126 eq q{}) { $output_126 = "0\n"; }
     close $wc_out_126_1 or die "Close failed: $OS_ERROR\n";
     waitpid $wc_pid_126_1, 0;
     if ( !$pipeline_success_126 ) { $main_exit_code = 1; }
     $output_126 =~ s/\n+\z//msx;
     $output_126;
 } };
-my $word_count = do { do {
+my $line_count = do { do {
     my $output_127 = q{};
     my $output_printed_127;
     my $pipeline_success_127 = 1;
-    $output_127 .= 'Hello World' . "\n";
+    $output_127 .= "line1\nline2\nline3";
     if ( !($output_127 =~ m{\n\z}msx) ) { $output_127 .= "\n"; }
     $CHILD_ERROR = 0;
     use IPC::Open3;
-    my @wc_args_127_1 = ('-w');
+    my @wc_args_127_1 = ('-l');
     my ($wc_in_127_1, $wc_out_127_1, $wc_err_127_1);
     my $wc_pid_127_1 = open3($wc_in_127_1, $wc_out_127_1, $wc_err_127_1, 'wc', @wc_args_127_1);
     print {$wc_in_127_1} $output_127;
     close $wc_in_127_1 or die "Close failed: $OS_ERROR\n";
     $output_127 = do { local $/ = undef; <$wc_out_127_1> };
+    if ($output_127 eq q{}) { $output_127 = "0\n"; }
     close $wc_out_127_1 or die "Close failed: $OS_ERROR\n";
     waitpid $wc_pid_127_1, 0;
     if ( !$pipeline_success_127 ) { $main_exit_code = 1; }

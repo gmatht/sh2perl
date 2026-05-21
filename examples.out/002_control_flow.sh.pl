@@ -10,15 +10,52 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $perl_output_0 = do {
-            my $result = qx{perl };
-            chomp $result;
-            $result;
-        };
-print $perl_output_0;
+my $i = 0;
+
+my $MAX_LOOP_5 = 5;
+my $MAGIC_10   = 10;
+
+if ((-f"file.txt")) {
+    print "File exists\n";
+}
+else {
+    print "File does not exist\n";
+}
+for my $i ( 1 .. $MAX_LOOP_5 ) {
+    do {
+    my $output = "Number: $i";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+    $CHILD_ERROR = 0;
+}
+$i = 5;
+while ( $i < $MAGIC_10 ) {
+    do {
+    my $output = "Counter: $i";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+    $CHILD_ERROR = 0;
+    $i = $i + 1;
+}
+
+sub greet {
+    my ($file) = @_;
+    do {
+    my $output = "Hello, $_[0]!";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+    $CHILD_ERROR = 0;
+    return;
+}
+greet("World");
 
 exit $main_exit_code;
-
-
-Exit code: exit status: 2
-
