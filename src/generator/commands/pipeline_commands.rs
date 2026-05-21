@@ -1323,7 +1323,7 @@ fn generate_streaming_pipeline(
 
                 // Return the output directly for command substitution
                 output.push_str(&generator.indent());
-                output.push_str("$output_0\n");
+                output.push_str(&format!("$output_{}\n", unique_id));
 
                 // Pipeline id guard will pop when it goes out of scope.
                 return output; // Return early since we've handled everything
@@ -1481,6 +1481,12 @@ fn generate_streaming_pipeline(
                         &format!("$output_{}", start_index + i),
                         &format!("$output_{}", unique_id),
                     );
+                    // Also replace the canonical $output_0 placeholder used by head/sha256sum/sha512sum
+                    // line-by-line generators. When the global counter has advanced (e.g. when
+                    // running multiple tests in the same process), unique_id != 0, so this
+                    // replacement is required to avoid referencing an undeclared variable.
+                    linebyline_output = linebyline_output
+                        .replace("$output_0", &format!("$output_{}", unique_id));
                     output.push_str(&linebyline_output);
                 }
                 Command::While(while_loop) => {
