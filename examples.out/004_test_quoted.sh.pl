@@ -10,15 +10,10 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $perl_output_0 = do {
-            my $result = qx{perl };
-            chomp $result;
-            $result;
-        };
-print $perl_output_0;
+print "Hello, World!\n";
+print 'Single quoted' . "\n";
+$CHILD_ERROR = 0;
+print "String with \"escaped\" quotes\n";
+print "String with 'single' quotes\n";
 
 exit $main_exit_code;
-
-
-Exit code: exit status: 2
-
