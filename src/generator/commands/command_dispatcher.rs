@@ -219,10 +219,14 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&generator.indent());
                             result.push_str(&format!("    open STDOUT, '>', \\$output_ps_{} or croak \"Cannot redirect STDOUT\";\n", global_counter));
                             // Ensure nested generators can see the pipeline id so they can
-                            // mark the pipeline buffer as printed. If no pipeline id is
-                            // active, create one, declare minimal Perl vars, and push a guard
-                            // for the duration of nested generation.
-                            if generator.current_pipeline_output_id().is_none() {
+                            // Always create a fresh unique_id for each process-substitution
+                            // block so that every <(…) gets its own $output_N / $output_printed_N
+                            // variables in its own scope.  Re-using the id from a sibling
+                            // process substitution (which happens when its guard is still live
+                            // in _process_sub_guards) causes the second block to skip the `my`
+                            // declarations and produces "Global symbol requires package name"
+                            // compile errors under strict.
+                            {
                                 let unique_id = generator.get_unique_id();
                                 result.push_str(&generator.indent());
                                 result
@@ -234,9 +238,11 @@ pub fn generate_command_impl_with_input(
                                     .declared_locals
                                     .insert(format!("output_{}", unique_id));
 
-                                _process_sub_guards.push(
-                                    generator.push_pipeline_output_id_guard(unique_id.clone()),
-                                );
+                                // The guard is scoped to this inner block: it will be dropped
+                                // (and the id popped) once we exit the block, so the next
+                                // sibling process substitution starts fresh.
+                                let _ps_guard =
+                                    generator.push_pipeline_output_id_guard(unique_id.clone());
 
                                 let perl_code = generator.generate_command(cmd);
                                 for line in perl_code.lines() {
@@ -244,14 +250,7 @@ pub fn generate_command_impl_with_input(
                                         result.push_str(&format!("    {}\n", line));
                                     }
                                 }
-                                // _pipeline_guard drops here and pops the id
-                            } else {
-                                let perl_code = generator.generate_command(cmd);
-                                for line in perl_code.lines() {
-                                    if !line.trim().is_empty() {
-                                        result.push_str(&format!("    {}\n", line));
-                                    }
-                                }
+                                // _ps_guard drops here, popping the pipeline id
                             }
                             result.push_str(&generator.indent());
                             result.push_str(&format!("}}\n"));
