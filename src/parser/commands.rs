@@ -424,10 +424,30 @@ impl Parser {
         first_command: Command,
         start_byte_pos: usize,
     ) -> Result<Command, ParserError> {
-        let mut commands = Vec::new();
-        let mut pipe_operators = Vec::new();
+        // Helper: flush a pipe-commands vec into a Pipeline or a single Command.
+        fn flush_pipe_sequence(
+            commands: Vec<Command>,
+            start_byte_pos: usize,
+            parser: &Parser,
+        ) -> Command {
+            if commands.len() == 1 {
+                commands.into_iter().next().unwrap()
+            } else {
+                let source_text = None; // source_text computed lazily if needed
+                Command::Pipeline(Pipeline {
+                    commands,
+                    source_text,
+                    stdout_used: true,
+                    stderr_used: true,
+                })
+            }
+        }
 
-        commands.push(first_command);
+        // `pipe_commands` accumulates the current pipe-sequence (connected by `|`).
+        let mut pipe_commands = vec![first_command];
+        // `result` holds the accumulated logical chain accumulated so far
+        // (an And/Or tree), or None if we haven't seen any `&&`/`||` yet.
+        let mut result: Option<Command> = None;
 
         while let Some(_) = self.lexer.peek() {
             // Skip any whitespace/comments before checking for an operator
@@ -438,98 +458,68 @@ impl Parser {
             match token {
                 Token::Pipe => {
                     self.lexer.next();
-                    pipe_operators.push(());
                     self.lexer.skip_whitespace_and_comments();
                     let command = self.parse_simple_command()?;
                     // Parse redirects for this command
                     let command_with_redirects = self.parse_command_redirects(command)?;
-                    commands.push(command_with_redirects);
+                    pipe_commands.push(command_with_redirects);
                 }
-                Token::And => {
+                Token::And | Token::Or => {
+                    let is_and = matches!(token, Token::And);
                     self.lexer.next();
                     self.lexer.skip_whitespace_and_comments();
 
-                    // `&&` has lower precedence than `|`.  Collect everything
-                    // parsed so far as the left pipeline, then parse the
-                    // remainder (which may itself contain `|` and `&&`) as the
-                    // right side and return an And node.  This means we exit
-                    // the loop here rather than pushing back onto `commands`.
-                    let left = if commands.len() == 1 {
-                        commands.remove(0)
+                    // Build the left side for this operator:
+                    // - If pipe_commands is non-empty, flush it (and optionally wrap
+                    //   the previously accumulated result around it).
+                    // - If pipe_commands is empty we had a previous `&&`/`||`, so
+                    //   the accumulated result IS the left side.
+                    let left = if pipe_commands.is_empty() {
+                        // result must be Some — the previous `&&`/`||` stored it
+                        result.take().expect("unexpected empty state in pipeline parsing")
                     } else {
-                        let end_span = self.lexer.get_span();
-                        let end_byte_pos =
-                            end_span.map(|(_, end)| end).unwrap_or(start_byte_pos);
-                        let source_text = if start_byte_pos < end_byte_pos {
-                            Some(
-                                self.lexer
-                                    .get_text(start_byte_pos, end_byte_pos)
-                                    .trim()
-                                    .to_string(),
-                            )
+                        let left_pipe = flush_pipe_sequence(pipe_commands, start_byte_pos, self);
+                        // Combine with any previously accumulated logical chain
+                        if let Some(prev) = result.take() {
+                            if is_and {
+                                Command::And(Box::new(prev), Box::new(left_pipe))
+                            } else {
+                                Command::Or(Box::new(prev), Box::new(left_pipe))
+                            }
                         } else {
-                            None
-                        };
-                        Command::Pipeline(Pipeline {
-                            commands,
-                            source_text,
-                            stdout_used: true,
-                            stderr_used: true,
-                        })
+                            left_pipe
+                        }
                     };
 
-                    // Parse the right side as a full pipeline so that any
-                    // subsequent `|` operators bind more tightly.
+                    // Parse the right side as a single pipe-sequence (NOT consuming
+                    // further `&&`/`||` — those are handled by the outer loop to
+                    // ensure left-associativity).
                     let right_start_span = self.lexer.get_span();
-                    let right_start_pos =
-                        right_start_span.map(|(s, _)| s).unwrap_or(0);
+                    let right_start_pos = right_start_span.map(|(s, _)| s).unwrap_or(0);
                     let right_simple = self.parse_simple_command()?;
-                    let right_with_redirects =
-                        self.parse_command_redirects(right_simple)?;
-                    let right = self
-                        .parse_pipeline_from_command(right_with_redirects, right_start_pos)?;
+                    let right_with_redirects = self.parse_command_redirects(right_simple)?;
+                    // Only consume `|` here — stop before `&&`/`||`.
+                    let mut right_pipe_cmds = vec![right_with_redirects];
+                    loop {
+                        self.lexer.skip_whitespace_and_comments();
+                        if !matches!(self.lexer.peek(), Some(Token::Pipe)) {
+                            break;
+                        }
+                        self.lexer.next(); // consume `|`
+                        self.lexer.skip_whitespace_and_comments();
+                        let next_simple = self.parse_simple_command()?;
+                        let next_with_redirects = self.parse_command_redirects(next_simple)?;
+                        right_pipe_cmds.push(next_with_redirects);
+                    }
+                    let right = flush_pipe_sequence(right_pipe_cmds, right_start_pos, self);
 
-                    return Ok(Command::And(Box::new(left), Box::new(right)));
-                }
-                Token::Or => {
-                    self.lexer.next();
-                    self.lexer.skip_whitespace_and_comments();
-
-                    // Same precedence fix as for `&&` above.
-                    let left = if commands.len() == 1 {
-                        commands.remove(0)
+                    // Build the node for THIS operator and store as new result.
+                    result = Some(if is_and {
+                        Command::And(Box::new(left), Box::new(right))
                     } else {
-                        let end_span = self.lexer.get_span();
-                        let end_byte_pos =
-                            end_span.map(|(_, end)| end).unwrap_or(start_byte_pos);
-                        let source_text = if start_byte_pos < end_byte_pos {
-                            Some(
-                                self.lexer
-                                    .get_text(start_byte_pos, end_byte_pos)
-                                    .trim()
-                                    .to_string(),
-                            )
-                        } else {
-                            None
-                        };
-                        Command::Pipeline(Pipeline {
-                            commands,
-                            source_text,
-                            stdout_used: true,
-                            stderr_used: true,
-                        })
-                    };
-
-                    let right_start_span = self.lexer.get_span();
-                    let right_start_pos =
-                        right_start_span.map(|(s, _)| s).unwrap_or(0);
-                    let right_simple = self.parse_simple_command()?;
-                    let right_with_redirects =
-                        self.parse_command_redirects(right_simple)?;
-                    let right = self
-                        .parse_pipeline_from_command(right_with_redirects, right_start_pos)?;
-
-                    return Ok(Command::Or(Box::new(left), Box::new(right)));
+                        Command::Or(Box::new(left), Box::new(right))
+                    });
+                    pipe_commands = Vec::new();
                 }
                 Token::If => {
                     // If we encounter an 'if' token in the middle of a pipeline,
@@ -547,9 +537,26 @@ impl Parser {
             }
         }
 
-        if commands.len() == 1 {
-            let result = commands.remove(0);
-            //             eprintln!("DEBUG: parse_pipeline_from_command returning single command: {:?}", result);
+        // If we have accumulated logical chain, combine with any remaining pipe_commands.
+        if let Some(accumulated) = result {
+            // pipe_commands should be empty at this point (since the loop always
+            // clears pipe_commands after building a logical node), but guard anyway.
+            if pipe_commands.is_empty() {
+                return Ok(accumulated);
+            }
+            let remaining = flush_pipe_sequence(pipe_commands, start_byte_pos, self);
+            // The remaining pipe_commands appear after the last `&&`/`||` — this
+            // shouldn't normally happen, but if it does, combine as a pipeline.
+            return Ok(Command::Pipeline(Pipeline {
+                commands: vec![accumulated, remaining],
+                source_text: None,
+                stdout_used: true,
+                stderr_used: true,
+            }));
+        }
+
+        if pipe_commands.len() == 1 {
+            let result = pipe_commands.remove(0);
             Ok(result)
         } else {
             // Capture the source text from start to current position
@@ -564,12 +571,11 @@ impl Parser {
             };
 
             let result = Command::Pipeline(Pipeline {
-                commands,
+                commands: pipe_commands,
                 source_text,
                 stdout_used: true,
                 stderr_used: true,
             });
-            //             eprintln!("DEBUG: parse_pipeline_from_command returning pipeline: {:?}", result);
             Ok(result)
         }
     }

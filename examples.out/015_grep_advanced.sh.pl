@@ -209,7 +209,6 @@ $CHILD_ERROR = scalar @grep_filtered_177 > 0 ? 0 : 1;
     }
     if ( !$pipeline_success_178 ) { $main_exit_code = 1; }
     }
-# Original bash: echo "text with pattern in it" | grep --color=always "pattern" || echo
 {
     my $output_180 = q{};
     my $output_printed_180;
@@ -271,10 +270,10 @@ if (do {
     $CHILD_ERROR = scalar @grep_filtered_181 > 0 ? 0 : 1;
     $CHILD_ERROR == 0
 }) {
-            print "found\n";
-    if ($CHILD_ERROR != 0) {
-                print "not found\n";
-    }
+        print "found\n";
+}
+if ($CHILD_ERROR != 0) {
+        print "not found\n";
 }
 if ( -e "temp_file.txt" ) {
     if ( -d "temp_file.txt" ) {
