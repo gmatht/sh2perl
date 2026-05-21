@@ -36,7 +36,8 @@ my $found_files = do {
     my $start_2 = q{.};
     my $_find_2;
     $_find_2 = sub {
-        my ($dir_2) = @_;
+        my ($dir_2, $depth_2) = @_;
+        return if $depth_2 > 1;
         opendir(my $dh_2, $dir_2) or return;
         my @entries_2 = readdir($dh_2);
         closedir($dh_2);
@@ -44,7 +45,7 @@ my $found_files = do {
             next if $entry_2 eq q{.} || $entry_2 eq q{..};
             my $file_2 = "$dir_2/$entry_2";
             if (-d $file_2) {
-                $_find_2->($file_2);
+                $_find_2->($file_2, $depth_2 + 1);
             }
             elsif (-f $file_2) {
                 next if !( basename($file_2) =~ m/^.*.sh$/xms );
@@ -52,7 +53,7 @@ my $found_files = do {
             }
         }
     };
-    $_find_2->($start_2);
+    $_find_2->($start_2, 0);
     join "\n", @files_2;
 };
 print "Found shell scripts:\n";

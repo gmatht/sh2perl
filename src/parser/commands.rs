@@ -372,6 +372,12 @@ impl Parser {
         // Parse redirects until we hit a command separator or other non-redirect token
         while let Some(token) = self.lexer.peek() {
             match token {
+                Token::Space => {
+                    // Skip whitespace between consecutive redirects (e.g. the space
+                    // between `<(sort a.txt)` and `<(sort b.txt)` in
+                    // `comm -23 <(sort a.txt) <(sort b.txt)`).
+                    self.lexer.skip_whitespace_and_comments();
+                }
                 Token::Number
                 | Token::RedirectIn
                 | Token::RedirectOut
@@ -719,14 +725,14 @@ impl Parser {
                                             self.lexer.next(); // consume $
                                             match self.lexer.peek() {
                                                 Some(Token::Number) => {
+                                                    // get_number_text already advances the lexer
                                                     let num = self.lexer.get_number_text()?;
-                                                    self.lexer.next(); // consume number
                                                     Word::Literal(format!("${}", num), None)
                                                 }
                                                 Some(Token::Identifier) => {
+                                                    // get_identifier_text already advances the lexer
                                                     let var_name =
                                                         self.lexer.get_identifier_text()?;
-                                                    self.lexer.next(); // consume identifier
                                                     Word::Literal(format!("${}", var_name), None)
                                                 }
                                                 _ => {
@@ -765,7 +771,14 @@ impl Parser {
                                         args.push(Word::CommandSubstitution(cmd, None));
                                     }
                                 } else {
-                                    // If not an assignment, treat as regular argument
+                                    // If not an assignment, check if this is the start of a
+                                    // new local/builtin command (e.g. a second `local` on the
+                                    // next line whose leading newline was already consumed).
+                                    if let Some(text) = self.lexer.get_current_text() {
+                                        if text == "local" || text == "declare" || text == "export" {
+                                            break;
+                                        }
+                                    }
                                     args.push(parse_word_no_newline_skip(&mut self.lexer)?);
                                 }
                             }

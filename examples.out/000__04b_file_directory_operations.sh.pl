@@ -31,22 +31,28 @@ print "File listing:\n";
 print $file_list;
 if ( !( $file_list =~ m{\n\z}msx ) ) { print "\n"; }
 my $found_files = do {
-    use File::Find;
     use File::Basename;
     my @files_50 = ();
     my $start_50 = q{.};
-
-    find( sub {
-        my $file_50 = $File::Find::name;
-        if ( !( -f $file_50 ) ) {
-            return;
+    my $_find_50;
+    $_find_50 = sub {
+        my ($dir_50, $depth_50) = @_;
+        opendir(my $dh_50, $dir_50) or return;
+        my @entries_50 = readdir($dh_50);
+        closedir($dh_50);
+        for my $entry_50 (@entries_50) {
+            next if $entry_50 eq q{.} || $entry_50 eq q{..};
+            my $file_50 = "$dir_50/$entry_50";
+            if (-d $file_50) {
+                $_find_50->($file_50, $depth_50 + 1);
+            }
+            elsif (-f $file_50) {
+                next if !( basename($file_50) =~ m/^.*.sh$/xms );
+                push @files_50, $file_50;
+            }
         }
-        if ( !( basename($file_50) =~ m/^.*.sh$/xms ) ) {
-            return;
-        }
-        push @files_50, $file_50;
-    },
-    $start_50 );
+    };
+    $_find_50->($start_50, 0);
     join "\n", @files_50;
 };
 print "Found shell scripts:\n";
