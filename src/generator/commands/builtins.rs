@@ -317,6 +317,20 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
                         return false;
                     }
                 }
+                "strings" => {
+                    // If strings has a filename argument, it reads from the file,
+                    // not from STDIN, so streaming (line-by-line) is inappropriate.
+                    let has_filename = first_cmd.args.iter().any(|arg| {
+                        if let Word::Literal(s, _) = arg {
+                            !s.starts_with('-')
+                        } else {
+                            true // non-literal args are treated as filenames
+                        }
+                    });
+                    if has_filename {
+                        return false;
+                    }
+                }
                 _ => {}
             }
         }

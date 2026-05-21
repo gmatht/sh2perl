@@ -842,19 +842,51 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // Special handling for pwd in command substitution
                             "do { use Cwd; getcwd(); }".to_string()
                         } else if name == "basename" {
-                            // Run basename via the host command so output and edge cases match.
-                            let basename_cmd = generator.generate_command_string_for_system(
-                                &Command::Simple(simple_cmd.clone()),
-                            );
-                            // Run basename via the host command; ensure the embedded
-                            // command string is a non-interpolating Perl literal so
-                            // shell-special characters are preserved.
-                            let basename_lit = generator
-                                .perl_string_literal_no_interp(&Word::literal(basename_cmd));
-                            format!(
-                                "do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}",
-                                basename_lit
-                            )
+                            // When any argument is a CommandSubstitution,
+                            // generate_command_string_for_system emits a placeholder
+                            // error message.  Implement basename natively in Perl
+                            // so nested command substitutions like $(pwd) are handled.
+                            let has_cmd_sub = simple_cmd
+                                .args
+                                .iter()
+                                .any(|a| matches!(a, Word::CommandSubstitution(_, _)));
+                            if has_cmd_sub {
+                                let path_expr = if !simple_cmd.args.is_empty() {
+                                    generator.word_to_perl(&simple_cmd.args[0])
+                                } else {
+                                    "q{}".to_string()
+                                };
+                                let mut code = format!(
+                                    "do {{\n    my $basename_path = {};\n",
+                                    path_expr
+                                );
+                                if simple_cmd.args.len() > 1 {
+                                    let suf = generator.word_to_perl(&simple_cmd.args[1]);
+                                    code.push_str(&format!(
+                                        "    my $basename_suffix = {};\n",
+                                        suf
+                                    ));
+                                    code.push_str("    if ($basename_suffix ne q{}) {\n        $basename_path =~ s/\\Q$basename_suffix\\E$//msx;\n    }\n");
+                                }
+                                code.push_str("    $basename_path =~ s{.*/}{}msx;\n");
+                                code.push_str("    chomp $basename_path;\n");
+                                code.push_str("    $basename_path;\n}");
+                                code
+                            } else {
+                                // Run basename via the host command so output and edge cases match.
+                                let basename_cmd = generator.generate_command_string_for_system(
+                                    &Command::Simple(simple_cmd.clone()),
+                                );
+                                // Run basename via the host command; ensure the embedded
+                                // command string is a non-interpolating Perl literal so
+                                // shell-special characters are preserved.
+                                let basename_lit = generator
+                                    .perl_string_literal_no_interp(&Word::literal(basename_cmd));
+                                format!(
+                                    "do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}",
+                                    basename_lit
+                                )
+                            }
                         } else if name == "dirname" {
                             let dirname_cmd = generator.generate_command_string_for_system(
                                 &Command::Simple(simple_cmd.clone()),
