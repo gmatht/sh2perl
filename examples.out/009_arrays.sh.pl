@@ -10,15 +10,56 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $perl_output_0 = do {
-            my $result = qx{perl };
-            chomp $result;
-            $result;
-        };
-print $perl_output_0;
+$SIG{__DIE__} = sub { exit 1 };
+# set uo not implemented
+# set pipefail not implemented
+print "== Indexed arrays ==\n";
+my @arr = ("one", "two", "three");
+print $arr[1];
+if ( !( $arr[1] =~ m{\n\z}msx ) ) { print "\n"; }
+print scalar(@arr) . "\n";
+$CHILD_ERROR = 0;
+my $x;
+for my $x (@arr) {
+printf('%s ', "$x");
+}
+print "\n";
+$CHILD_ERROR = 0;
+print "== Associative arrays ==\n";
+my %map = ();
+# declare map not implemented
+$map{"foo"} = 'bar';
+$map{"answer"} = '42';
+$map{"two"} = "1 + 1";
+print $map{foo};
+if ( !( $map{foo} =~ m{\n\z}msx ) ) { print "\n"; }
+print $map{answer};
+if ( !( $map{answer} =~ m{\n\z}msx ) ) { print "\n"; }
+{
+    my $output_157 = q{};
+    my $output_printed_157;
+    my $pipeline_success_157 = 1;
+        $output_157 = q{};
+    my @output_157_items = (keys %map);
+    for my $k (@output_157_items) {
+    $output_157 .= "$k => " . $map{$k}. "\n";
+    }
+
+        my @sort_lines_157_1 = split /\n/msx, $output_157;
+    my @sort_sorted_157_1 = sort @sort_lines_157_1;
+    my $output_157_1 = join "\n", @sort_sorted_157_1;
+    if ($output_157_1 ne q{} && !($output_157_1 =~ m{\n\z}msx)) {
+    $output_157_1 .= "\n";
+    }
+    $output_157 = $output_157_1;
+    $output_157 = $output_157_1;
+    if ($output_157 ne q{} && !defined $output_printed_157) {
+        print $output_157;
+        if (!($output_157 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_157 ) { $main_exit_code = 1; }
+    }
 
 exit $main_exit_code;
-
-
-Exit code: exit status: 2
-

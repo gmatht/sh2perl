@@ -10,15 +10,16 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $perl_output_0 = do {
-            my $result = qx{perl };
-            chomp $result;
-            $result;
-        };
-print $perl_output_0;
+my $MAX_LOOP_5 = 5;
+
+print "Hello, World!\n";
+if ((-f"test.txt")) {
+    print "File exists\n";
+}
+my $i;
+for my $i ( 1 .. $MAX_LOOP_5 ) {
+    print $i;
+if ( !( $i =~ m{\n\z}msx ) ) { print "\n"; }
+}
 
 exit $main_exit_code;
-
-
-Exit code: exit status: 2
-
