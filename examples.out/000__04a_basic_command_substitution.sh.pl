@@ -35,14 +35,14 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $current_date = do {
-require POSIX; POSIX::strftime('%Y%m', localtime($DATE_SNAPSHOT)) . "\n"
-};
 my $current_dir = do {
     my $basename_path = do { use Cwd; getcwd(); };
     $basename_path =~ s{.*/}{}msx;
     chomp $basename_path;
     $basename_path;
+};
+my $current_date = do {
+require POSIX; POSIX::strftime('%Y%m', localtime($DATE_SNAPSHOT)) . "\n"
 };
 do {
     my $output = "Stored date: $current_date";

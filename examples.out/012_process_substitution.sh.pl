@@ -130,28 +130,28 @@ my $output_ps_fh_5;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_5 or croak "Cannot redirect STDOUT";
-    my $output_1 = q{};
-    my $output_printed_1;
+    my $output_169 = q{};
+    my $output_printed_169;
     {
-        my $pipeline_success_1 = 1;
-        $output_1 .= "a\nc\nb";
-    if ( !($output_1 =~ m{\n\z}msx) ) { $output_1 .= "\n"; }
+        my $pipeline_success_169 = 1;
+        $output_169 .= "a\nc\nb";
+    if ( !($output_169 =~ m{\n\z}msx) ) { $output_169 .= "\n"; }
     $CHILD_ERROR = 0;
-            my @sort_lines_1_1 = split /\n/msx, $output_1;
-        my @sort_sorted_1_1 = sort @sort_lines_1_1;
-        my $output_1_1 = join "\n", @sort_sorted_1_1;
-        if ($output_1_1 ne q{} && !($output_1_1 =~ m{\n\z}msx)) {
-        $output_1_1 .= "\n";
+            my @sort_lines_169_1 = split /\n/msx, $output_169;
+        my @sort_sorted_169_1 = sort @sort_lines_169_1;
+        my $output_169_1 = join "\n", @sort_sorted_169_1;
+        if ($output_169_1 ne q{} && !($output_169_1 =~ m{\n\z}msx)) {
+        $output_169_1 .= "\n";
         }
-        $output_1 = $output_1_1;
-        $output_1 = $output_1_1;
-        if ($output_1 ne q{} && !defined $output_printed_1) {
-            print $output_1;
-            if (!($output_1 =~ m{\n\z}msx)) {
+        $output_169 = $output_169_1;
+        $output_169 = $output_169_1;
+        if ($output_169 ne q{} && !defined $output_printed_169) {
+            print $output_169;
+            if (!($output_169 =~ m{\n\z}msx)) {
                 print "\n";
             }
         }
-        if ( !$pipeline_success_1 ) { $main_exit_code = 1; }
+        if ( !$pipeline_success_169 ) { $main_exit_code = 1; }
         }
 }
 use File::Path qw(make_path);
@@ -165,28 +165,28 @@ my $output_ps_fh_6;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_6 or croak "Cannot redirect STDOUT";
-    my $output_2 = q{};
-    my $output_printed_2;
+    my $output_170 = q{};
+    my $output_printed_170;
     {
-        my $pipeline_success_2 = 1;
-        $output_2 .= "a\nb\nd";
-    if ( !($output_2 =~ m{\n\z}msx) ) { $output_2 .= "\n"; }
+        my $pipeline_success_170 = 1;
+        $output_170 .= "a\nb\nd";
+    if ( !($output_170 =~ m{\n\z}msx) ) { $output_170 .= "\n"; }
     $CHILD_ERROR = 0;
-            my @sort_lines_2_1 = split /\n/msx, $output_2;
-        my @sort_sorted_2_1 = sort @sort_lines_2_1;
-        my $output_2_1 = join "\n", @sort_sorted_2_1;
-        if ($output_2_1 ne q{} && !($output_2_1 =~ m{\n\z}msx)) {
-        $output_2_1 .= "\n";
+            my @sort_lines_170_1 = split /\n/msx, $output_170;
+        my @sort_sorted_170_1 = sort @sort_lines_170_1;
+        my $output_170_1 = join "\n", @sort_sorted_170_1;
+        if ($output_170_1 ne q{} && !($output_170_1 =~ m{\n\z}msx)) {
+        $output_170_1 .= "\n";
         }
-        $output_2 = $output_2_1;
-        $output_2 = $output_2_1;
-        if ($output_2 ne q{} && !defined $output_printed_2) {
-            print $output_2;
-            if (!($output_2 =~ m{\n\z}msx)) {
+        $output_170 = $output_170_1;
+        $output_170 = $output_170_1;
+        if ($output_170 ne q{} && !defined $output_printed_170) {
+            print $output_170;
+            if (!($output_170 =~ m{\n\z}msx)) {
                 print "\n";
             }
         }
-        if ( !$pipeline_success_2 ) { $main_exit_code = 1; }
+        if ( !$pipeline_success_170 ) { $main_exit_code = 1; }
         }
 }
 use File::Path qw(make_path);
