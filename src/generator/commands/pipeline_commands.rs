@@ -2743,26 +2743,10 @@ fn generate_buffered_pipeline(
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
 
-                // Ensure returned substitution string ends with a newline when
-                // non-empty and not already newline-terminated. Some code paths
-                // build the substitution result via join("\n", @lines) and do
-                // not append a trailing newline; that produced a one-byte/
-                // one-newline mismatch in purified output. Restrict this to the
-                // command-substitution return site so other branches that
-                // intentionally chomp/strip trailing newlines are unaffected.
+                // Bash command substitution strips all trailing newlines from
+                // the captured output before assigning to the variable.
                 output.push_str(&generator.indent());
-                output.push_str(&format!(
-                    "if ($output_{} ne q{{}} && !($output_{} =~ {})) {{\n",
-                    unique_id,
-                    unique_id,
-                    generator.newline_end_regex()
-                ));
-                generator.indent_level += 1;
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{} .= \"\\n\";\n", unique_id));
-                generator.indent_level -= 1;
-                output.push_str(&generator.indent());
-                output.push_str("}\n");
+                output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
             } else {
@@ -2891,26 +2875,9 @@ fn generate_buffered_pipeline(
                 ));
 
                 // Return the output variable as the last statement.
-                // Ensure the returned substitution string ends with a newline when
-                // non-empty and not already newline-terminated. Some code paths
-                // build the substitution result via join("\n", @lines) and do
-                // not append a trailing newline; that produced a one-newline
-                // mismatch in purified output. Restrict this to the
-                // command-substitution return site so other branches that
-                // intentionally chomp/strip trailing newlines are unaffected.
+                // Bash command substitution strips all trailing newlines.
                 output.push_str(&generator.indent());
-                output.push_str(&format!(
-                    "if ($output_{} ne q{{}} && !($output_{} =~ {})) {{\n",
-                    unique_id,
-                    unique_id,
-                    generator.newline_end_regex()
-                ));
-                generator.indent_level += 1;
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{} .= \"\\n\";\n", unique_id));
-                generator.indent_level -= 1;
-                output.push_str(&generator.indent());
-                output.push_str("}\n");
+                output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
             }
@@ -3028,19 +2995,9 @@ fn generate_buffered_pipeline(
                 "if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n",
                 unique_id
             ));
+            // Bash command substitution strips all trailing newlines.
             output.push_str(&generator.indent());
-            output.push_str(&format!(
-                "if ($output_{} ne q{{}} && !($output_{} =~ {})) {{\n",
-                unique_id,
-                unique_id,
-                generator.newline_end_regex()
-            ));
-            generator.indent_level += 1;
-            output.push_str(&generator.indent());
-            output.push_str(&format!("$output_{} .= \"\\n\";\n", unique_id));
-            generator.indent_level -= 1;
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
+            output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
             output.push_str(&generator.indent());
             output.push_str(&format!("$output_{};\n", unique_id));
         }

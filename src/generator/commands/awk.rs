@@ -72,59 +72,42 @@ fn translate_awk_expr(expr: &str, acc_vars: &HashSet<String>) -> String {
 /// Parse the "print" tokens from an awk print statement body and translate
 /// each token to its Perl equivalent.
 fn translate_awk_print_args(rem: &str, acc_vars: &HashSet<String>, generator: &mut Generator) -> Vec<String> {
+    // Split on commas while respecting quoted strings, then translate each
+    // argument as a complete expression (handles arithmetic like $1 + $2).
     let mut parts: Vec<String> = Vec::new();
     let chars: Vec<char> = rem.chars().collect();
+    let mut arg_start = 0usize;
     let mut i = 0usize;
-    while i < chars.len() {
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() {
-            break;
-        }
-        let c = chars[i];
+
+    while i <= chars.len() {
+        let at_end = i == chars.len();
+        let c = if at_end { '\0' } else { chars[i] };
+
+        // Track quoted strings to avoid splitting on commas inside them.
         if c == '"' || c == '\'' {
             let quote = c;
             i += 1;
-            let start = i;
             while i < chars.len() && chars[i] != quote {
                 i += 1;
             }
-            let s = rem[start..i].to_string();
-            parts.push(generator.perl_string_literal(&Word::literal(s)));
             if i < chars.len() { i += 1; } // skip closing quote
-        } else if c == '$' {
-            // $N variable
-            i += 1;
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-            let num_str = &rem[start..i];
-            if let Ok(n) = num_str.parse::<usize>() {
-                if n == 0 {
-                    parts.push("$line".to_string());
+            continue;
+        }
+
+        if c == ',' || at_end {
+            let arg = rem[arg_start..i].trim();
+            if !arg.is_empty() {
+                if (arg.starts_with('"') && arg.ends_with('"')) ||
+                   (arg.starts_with('\'') && arg.ends_with('\'')) {
+                    let inner = &arg[1..arg.len()-1];
+                    parts.push(generator.perl_string_literal(&Word::literal(inner.to_string())));
                 } else {
-                    parts.push(format!("$fields[{}]", n - 1));
+                    parts.push(translate_awk_expr(arg, acc_vars));
                 }
-            } else {
-                parts.push(format!("${}", num_str));
             }
-        } else {
-            // Bare token: could be NR, NF, a variable name, or a literal
-            let start = i;
-            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '"' && chars[i] != '\'' && chars[i] != ',' {
-                i += 1;
-            }
-            let tok = rem[start..i].trim_end_matches(|c: char| !c.is_alphanumeric() && c != ')' && c != '_');
-            if !tok.is_empty() {
-                parts.push(translate_awk_expr(tok, acc_vars));
-            }
+            arg_start = i + 1;
         }
-        // Skip optional commas/spaces
-        while i < chars.len() && (chars[i].is_whitespace() || chars[i] == ',') {
-            i += 1;
-        }
+        i += 1;
     }
     parts
 }
