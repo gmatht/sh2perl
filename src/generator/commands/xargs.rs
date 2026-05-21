@@ -83,6 +83,17 @@ pub fn generate_xargs_command_with_output(
                 command_found = true;
             } else if arg_str == "-n1" {
                 max_args = 1;
+            } else if arg_str == "-n" {
+                // -n can be followed by a number as the next argument (the
+                // debashl parser tokenises `-n1` as ["-n", "1"]).
+                if i + 1 < cmd.args.len() {
+                    if let Word::Literal(n_str, _) = &cmd.args[i + 1] {
+                        if let Ok(n) = n_str.parse::<usize>() {
+                            max_args = n;
+                            i += 1; // consume the number
+                        }
+                    }
+                }
             } else if arg_str == "function" {
                 args.push("function".to_string());
             } else if !arg_str.starts_with('-') {
@@ -208,9 +219,9 @@ pub fn generate_xargs_command_with_output(
             }
         }
         // Handle xargs with command execution
-        // Split input on newlines to preserve filenames that may contain spaces.
+        // Split input on whitespace (spaces, tabs, newlines) as xargs does by default.
         output.push_str(&format!(
-            "my @xargs_input_{} = split /\\n/msx, ${};\n",
+            "my @xargs_input_{} = grep {{ $_ ne q{{}} }} split /\\s+/msx, ${};\n",
             command_index, input_var
         ));
         output.push_str(&format!("my @xargs_output_{};\n", command_index));
