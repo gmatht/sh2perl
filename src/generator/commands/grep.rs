@@ -706,10 +706,8 @@ pub fn generate_grep_command(
             ));
             output.push_str("}\n");
             output.push_str(&format!(
-                "$grep_result_{} =~ s{}{}; # Remove trailing newline\n",
+                "$grep_result_{} =~ s/\\n$//msx; # Remove trailing newline\n",
                 command_index,
-                generator.format_regex_pattern(r"\\n$"),
-                ""
             ));
         } else {
             output.push_str(&format!(
