@@ -126,63 +126,75 @@ do {
 };
 $CHILD_ERROR = 0;
 my $strings_result = do { do {
-    do { my $output_0 = q{};
-my $output_printed_0;
-my $head_line_count = 0;
-my $output_1 = q{};
-while (my $line = <>) {
-    chomp $line;
+    my $output_3 = q{};
+    my $output_printed_3;
+    my $pipeline_success_3 = 1;
     my $input_data;
-if ( open my $fh, '<', 'test_binary.txt' ) {
-    local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
-    $input_data = <$fh>;
-    close $fh
-      or croak "Close failed: $ERRNO";
-}
-else {
-    print {*STDERR} "strings: 'test_binary.txt': No such file\n";
-    $input_data = q{};
-}
-my @result;
-while ($input_data =~ /([\x20-\x7E]{4,})/g) {
-    push @result, $1;
-}
-my $line = join "\n", @result;
-$output_1 = $line;
-    if ($head_line_count < 3) {
-    $output_1 .= $line . "\n";
-    ++$head_line_count;
-} else {
-    $line = q{}; # Clear line to prevent printing
-    last; # Break out of the yes loop when head limit is reached
-}
-} };
+    if ( open my $fh, '<', 'test_binary.txt' ) {
+        local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
+        $input_data = <$fh>;
+        close $fh
+          or croak "Close failed: $ERRNO";
+    }
+    else {
+        print {*STDERR} "strings: 'test_binary.txt': No such file\n";
+        $input_data = q{};
+    }
+    my @result;
+    while ($input_data =~ /([\x20-\x7E]{4,})/g) {
+        push @result, $1;
+    }
+    my $line = join "\n", @result;
+    $output_3 = $line;
+    my $num_lines       = 3;
+    my $head_line_count = 0;
+    my $result          = q{};
+    my $input           = $output_3;
+    my $pos             = 0;
+
+    while ( $pos < length $input && $head_line_count < $num_lines ) {
+        my $line_end = index $input, "\n", $pos;
+        if ( $line_end == -1 ) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_3 = $result;
+
+    if ( !$pipeline_success_3 ) { $main_exit_code = 1; }
+    if ($output_3 ne q{} && !($output_3 =~ m{\n\z}msx)) {
+        $output_3 .= "\n";
+    }
+    $output_3;
 } };
 print "Strings result:\n";
 print $strings_result;
 if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
 print "=== I/O Redirection Commands ===\n";
 my $tee_result = do { do {
-    my $output_2 = q{};
-    my $output_printed_2;
-    my $pipeline_success_2 = 1;
-    $output_2 .= 'test output' . "\n";
-    if ( !($output_2 =~ m{\n\z}msx) ) { $output_2 .= "\n"; }
+    my $output_4 = q{};
+    my $output_printed_4;
+    my $pipeline_success_4 = 1;
+    $output_4 .= 'test output' . "\n";
+    if ( !($output_4 =~ m{\n\z}msx) ) { $output_4 .= "\n"; }
     $CHILD_ERROR = 0;
     use Carp qw(carp croak);
     if ( open my $fh, '>', 'test_tee.txt' ) {
-        print {$fh} $output_2;
+        print {$fh} $output_4;
         close $fh or croak "Close failed: $ERRNO";
     }
     else {
         carp "tee: Cannot open 'test_tee.txt': $ERRNO";
     }
-    $output_2 = $output_2;
-    if ( !$pipeline_success_2 ) { $main_exit_code = 1; }
-    if ($output_2 ne q{} && !($output_2 =~ m{\n\z}msx)) {
-        $output_2 .= "\n";
+    $output_4 = $output_4;
+    if ( !$pipeline_success_4 ) { $main_exit_code = 1; }
+    if ($output_4 ne q{} && !($output_4 =~ m{\n\z}msx)) {
+        $output_4 .= "\n";
     }
-    $output_2;
+    $output_4;
 } };
 do {
     my $output = "Tee result: $tee_result";
@@ -250,4 +262,3 @@ else {
 }
 
 exit $main_exit_code;
-
