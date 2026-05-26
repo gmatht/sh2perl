@@ -679,8 +679,9 @@ pub fn generate_grep_command(
     // Generate output based on options
     if count_only {
         if has_file_args && recursive {
-            // For recursive grep with -c, generate per-file counts
+            // For recursive grep with -c, generate per-file counts preserving traversal order
             output.push_str(&format!("my %file_counts_{};\n", command_index));
+            output.push_str(&format!("my @file_order_{};\n", command_index));
             output.push_str(&format!(
                 "for my $i (0..@grep_lines_{}-1) {{\n",
                 command_index
@@ -690,14 +691,22 @@ pub fn generate_grep_command(
                 command_index, command_index
             ));
             output.push_str(&format!(
-                "        $file_counts_{}{{$grep_filenames_{}[$i]}}++;\n",
+                "        my $f_{} = $grep_filenames_{}[$i];\n",
+                command_index, command_index
+            ));
+            output.push_str(&format!(
+                "        push @file_order_{}, $f_{} unless exists $file_counts_{}{{$f_{}}};\n",
+                command_index, command_index, command_index, command_index
+            ));
+            output.push_str(&format!(
+                "        $file_counts_{}{{$f_{}}}++;\n",
                 command_index, command_index
             ));
             output.push_str("    }\n");
             output.push_str("}\n");
             output.push_str(&format!("$grep_result_{} = q{{}};\n", command_index));
             output.push_str(&format!(
-                "for my $file (sort keys %file_counts_{}) {{\n",
+                "for my $file (@file_order_{}) {{\n",
                 command_index
             ));
             output.push_str(&format!(
