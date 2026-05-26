@@ -12,28 +12,28 @@ our $CHILD_ERROR;
 
 my $found_files = do {
     use File::Basename;
-    my @files_138 = ();
-    my $start_138 = q{.};
-    my $_find_138;
-    $_find_138 = sub {
-        my ($dir_138, $depth_138) = @_;
-        opendir(my $dh_138, $dir_138) or return;
-        my @entries_138 = readdir($dh_138);
-        closedir($dh_138);
-        for my $entry_138 (@entries_138) {
-            next if $entry_138 eq q{.} || $entry_138 eq q{..};
-            my $file_138 = "$dir_138/$entry_138";
-            if (-d $file_138) {
-                $_find_138->($file_138, $depth_138 + 1);
+    my @files_0 = ();
+    my $start_0 = q{.};
+    my $_find_0;
+    $_find_0 = sub {
+        my ($dir_0, $depth_0) = @_;
+        opendir(my $dh_0, $dir_0) or return;
+        my @entries_0 = readdir($dh_0);
+        closedir($dh_0);
+        for my $entry_0 (@entries_0) {
+            next if $entry_0 eq q{.} || $entry_0 eq q{..};
+            my $file_0 = "$dir_0/$entry_0";
+            if (-d $file_0) {
+                $_find_0->($file_0, $depth_0 + 1);
             }
-            elsif (-f $file_138) {
-                next if !( basename($file_138) =~ m/^.*.sh$/xms );
-                push @files_138, $file_138;
+            elsif (-f $file_0) {
+                next if !( basename($file_0) =~ m/^.*.sh$/xms );
+                push @files_0, $file_0;
             }
         }
     };
-    $_find_138->($start_138, 0);
-    join "\n", @files_138;
+    $_find_0->($start_0, 0);
+    join "\n", @files_0;
 };
 print "Found shell scripts:\n";
 print $found_files;
