@@ -38,21 +38,21 @@ do {
 $CHILD_ERROR = 0;
 require Time::HiRes; Time::HiRes::sleep($sleep_duration);
 my $yes_result = do { do {
-    do { my $output_69 = q{};
-my $output_printed_69;
+    do { my $output_1 = q{};
+my $output_printed_1;
 my $head_line_count = 0;
 while (1) {
     my $line = 'Hello';
     # yes doesn't support line-by-line processing
     if ($head_line_count < 3) {
-    $output_69 .= $line . "\n";
+    $output_1 .= $line . "\n";
     ++$head_line_count;
     } else {
     $line = q{}; # Clear line to prevent printing
     last; # Break out of the yes loop when head limit is reached
     }
 }
-$output_69 };
+$output_1 };
 } };
 print "Yes command result:\n";
 print $yes_result;

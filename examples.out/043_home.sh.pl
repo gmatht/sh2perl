@@ -10,15 +10,38 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $perl_output_0 = do {
-            my $result = qx{perl };
-            chomp $result;
-            $result;
-        };
-print $perl_output_0;
+if ($ENV{'HOME'} eq $ENV{'HOME'}) {
+        print q{1} . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+if ($CHILD_ERROR != 0) {
+        print q{-} . "\n";
+    $CHILD_ERROR = 0;
+}
+if (($ENV{'HOME'} . '/Documents') eq $ENV{'HOME'}) {
+        print q{2} . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+if ($CHILD_ERROR != 0) {
+        print q{-} . "\n";
+    $CHILD_ERROR = 0;
+}
+if (($ENV{'HOME'} . '/Documents') eq ($ENV{'HOME'} . '/Documents')) {
+        print q{3} . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+if ($CHILD_ERROR != 0) {
+        print q{-} . "\n";
+    $CHILD_ERROR = 0;
+}
 
 exit $main_exit_code;
-
-
-Exit code: exit status: 2
-

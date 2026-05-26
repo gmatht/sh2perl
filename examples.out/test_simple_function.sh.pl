@@ -10,15 +10,20 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $perl_output_0 = do {
-            my $result = qx{perl };
-            chomp $result;
-            $result;
-        };
-print $perl_output_0;
+
+sub get_file_size {
+    my ($file) = @_;
+    my $size = do { my $command = "wc -c < \"$file\""; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
+    do {
+    my $output = "File $file has $size bytes";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+    $CHILD_ERROR = 0;
+    return;
+}
+get_file_size('test_simple_function.sh');
 
 exit $main_exit_code;
-
-
-Exit code: exit status: 2
-

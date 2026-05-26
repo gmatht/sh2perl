@@ -1354,6 +1354,18 @@ impl Parser {
                     expression_parts.push("\\".to_string());
                     self.lexer.next();
                 }
+                Some(Token::DollarHashSimple) => {
+                    expression_parts.push("$#".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::DollarAtSimple) => {
+                    expression_parts.push("$@".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::DollarStarSimple) => {
+                    expression_parts.push("$*".to_string());
+                    self.lexer.next();
+                }
                 Some(Token::Dollar) => {
                     // Handle variable reference: $variable or regex anchor: $
                     //                     eprintln!("DEBUG: Found $ token, checking if followed by identifier");
@@ -1404,6 +1416,55 @@ impl Parser {
                     // Handle assignment operator in test expressions
                     expression_parts.push("=".to_string());
                     self.lexer.next();
+                }
+                Some(Token::Lt) => {
+                    expression_parts.push(" -lt ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::Le) => {
+                    expression_parts.push(" -le ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::Gt) => {
+                    expression_parts.push(" -gt ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::Ge) => {
+                    expression_parts.push(" -ge ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::Eq) => {
+                    expression_parts.push(" -eq ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::Ne) => {
+                    expression_parts.push(" -ne ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::Number) => {
+                    let num = self.lexer.get_number_text()?;
+                    expression_parts.push(num);
+                    self.lexer.next();
+                }
+                Some(Token::NonZero) => {
+                    expression_parts.push(" -n ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::Zero) => {
+                    expression_parts.push(" -z ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::And) => {
+                    expression_parts.push(" -a ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::Or) => {
+                    expression_parts.push(" -o ".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::Newline) | Some(Token::CarriageReturn) => {
+                    // Should not appear inside test expression, treat as end
+                    break;
                 }
                 None => {
                     return Err(ParserError::InvalidSyntax(
