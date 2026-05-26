@@ -11,47 +11,47 @@ my $ls_success     = 0;
 our $CHILD_ERROR;
 
 print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
-my $result2 = do {
-    use File::Basename;
-    my @files_0 = ();
-    my $start_0 = q{.};
-    my $_find_0;
-    $_find_0 = sub {
-        my ($dir_0, $depth_0) = @_;
-        opendir(my $dh_0, $dir_0) or return;
-        my @entries_0 = readdir($dh_0);
-        closedir($dh_0);
-        for my $entry_0 (@entries_0) {
-            next if $entry_0 eq q{.} || $entry_0 eq q{..};
-            my $file_0 = "$dir_0/$entry_0";
-            if (-d $file_0) {
-                $_find_0->($file_0, $depth_0 + 1);
-            }
-            elsif (-f $file_0) {
-                next if !( basename($file_0) =~ m/^.*.txt$/xms );
-                push @files_0, $file_0;
-            }
-        }
-    };
-    $_find_0->($start_0, 0);
-    join "\n", @files_0;
-};
 my $result1 = do {
-    my @ls_files_1 = ();
+    my @ls_files_0 = ();
     if ( -f q{.} ) {
-        push @ls_files_1, q{.};
+        push @ls_files_0, q{.};
     }
     elsif ( -d q{.} ) {
         if ( opendir my $dh, q{.} ) {
             while ( my $file = readdir $dh ) {
-                push @ls_files_1, $file;
+                push @ls_files_0, $file;
             }
             closedir $dh;
-            @ls_files_1 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_1;
+            @ls_files_0 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_0;
         }
     }
-    @ls_files_1 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_1;
-    (@ls_files_1 ? join("\n", @ls_files_1) . "\n" : q{});
+    @ls_files_0 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_0;
+    (@ls_files_0 ? join("\n", @ls_files_0) . "\n" : q{});
+};
+my $result2 = do {
+    use File::Basename;
+    my @files_2 = ();
+    my $start_2 = q{.};
+    my $_find_2;
+    $_find_2 = sub {
+        my ($dir_2, $depth_2) = @_;
+        opendir(my $dh_2, $dir_2) or return;
+        my @entries_2 = readdir($dh_2);
+        closedir($dh_2);
+        for my $entry_2 (@entries_2) {
+            next if $entry_2 eq q{.} || $entry_2 eq q{..};
+            my $file_2 = "$dir_2/$entry_2";
+            if (-d $file_2) {
+                $_find_2->($file_2, $depth_2 + 1);
+            }
+            elsif (-f $file_2) {
+                next if !( basename($file_2) =~ m/^.*.txt$/xms );
+                push @files_2, $file_2;
+            }
+        }
+    };
+    $_find_2->($start_2, 0);
+    join "\n", @files_2;
 };
 print "Results:\n";
 print $result1;

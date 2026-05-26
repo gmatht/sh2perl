@@ -634,13 +634,16 @@ for my $file (@files_18) {
 }
 my @grep_filtered_18 = grep { /pattern/msx } @grep_lines_18;
 my %file_counts_18;
+my @file_order_18;
 for my $i (0..@grep_lines_18-1) {
     if (scalar grep { $_ eq $grep_lines_18[$i] } @grep_filtered_18) {
-        $file_counts_18{$grep_filenames_18[$i]}++;
+        my $f_18 = $grep_filenames_18[$i];
+        push @file_order_18, $f_18 unless exists $file_counts_18{$f_18};
+        $file_counts_18{$f_18}++;
     }
 }
 $grep_result_18 = q{};
-for my $file (sort keys %file_counts_18) {
+for my $file (@file_order_18) {
     $grep_result_18 .= "$file:$file_counts_18{$file}\n";
 }
 $grep_result_18 =~ s/\n$//msx; # Remove trailing newline
