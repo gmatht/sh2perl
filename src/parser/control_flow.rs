@@ -1255,6 +1255,37 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                 expression_parts.push("\\".to_string());
                 lexer.next();
             }
+            Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                // Handle $(( expr )) or (( expr )) arithmetic inside test expression
+                lexer.next(); // consume $(( or ((
+                let mut arith = String::new();
+                let mut depth = 1usize;
+                loop {
+                    match lexer.peek() {
+                        Some(Token::ArithmeticEvalClose) => {
+                            lexer.next();
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            arith.push_str("))");
+                        }
+                        Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                            lexer.next();
+                            depth += 1;
+                            arith.push_str("$((");
+                        }
+                        None => break,
+                        _ => {
+                            if let Some(text) = lexer.get_current_text() {
+                                arith.push_str(&text);
+                            }
+                            lexer.next();
+                        }
+                    }
+                }
+                expression_parts.push(format!("$(({}))", arith));
+            }
             Some(Token::Space) | Some(Token::Tab) => {
                 lexer.next(); // skip whitespace
             }

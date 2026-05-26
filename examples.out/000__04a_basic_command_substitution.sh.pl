@@ -14,7 +14,7 @@ our $CHILD_ERROR;
 print "=== Basic Command Substitution ===\n";
 do {
     my $output = "Current date: " . (do { my $_chomp_temp = do {
-require POSIX; POSIX::strftime('%Y', localtime($DATE_SNAPSHOT)) . "\n"
+require POSIX; POSIX::strftime('%Y', localtime(time())) . "\n"
 }; chomp $_chomp_temp; $_chomp_temp; });
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
@@ -42,7 +42,7 @@ my $current_dir = do {
     $basename_path;
 };
 my $current_date = do {
-require POSIX; POSIX::strftime('%Y%m', localtime($DATE_SNAPSHOT)) . "\n"
+require POSIX; POSIX::strftime('%Y%m', localtime(time())) . "\n"
 };
 do {
     my $output = "Stored date: $current_date";

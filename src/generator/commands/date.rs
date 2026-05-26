@@ -23,7 +23,7 @@ fn simple_word_text(word: &Word) -> Option<String> {
 }
 
 fn default_date_expr() -> String {
-    "require POSIX; POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime($DATE_SNAPSHOT)) . \"\\n\""
+    "require POSIX; POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime(time())) . \"\\n\""
         .to_string()
 }
 
@@ -32,7 +32,7 @@ fn format_date_expr(format: &str) -> String {
     let format_expr = perl_single_quoted(cleaned);
 
     format!(
-        "require POSIX; POSIX::strftime({}, localtime($DATE_SNAPSHOT)) . \"\\n\"",
+        "require POSIX; POSIX::strftime({}, localtime(time())) . \"\\n\"",
         format_expr
     )
 }
@@ -69,7 +69,7 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
             } else {
                 let format_expr = generator.word_to_perl(format_word);
                 format!(
-                    "my $date_now = $DATE_SNAPSHOT; my $date_format = {}; $date_format =~ s/^\\+//; require POSIX; POSIX::strftime($date_format, localtime($date_now)) . \"\\n\"",
+                    "my $date_now = time(); my $date_format = {}; $date_format =~ s/^\\+//; require POSIX; POSIX::strftime($date_format, localtime($date_now)) . \"\\n\"",
                     format_expr
                 )
             }
