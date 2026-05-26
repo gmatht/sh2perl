@@ -985,18 +985,9 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         ));
                     }
                     _ => {
-                        // For other word types, check if it's a command-related argument
-                        if let Word::Literal(s, _) = &cmd.args[i] {
-                            // Skip command-related arguments like "local", "size=", etc.
-                            if s == "local" || s.ends_with('=') {
-                                // Skip these arguments as they're part of the command structure
-                                continue;
-                            }
-                        }
-
-                        // Skip processing of command-related arguments
-                        // The local command parsing should handle assignments properly
-                        continue;
+                        // For other word types (Variable, StringInterpolation, etc.)
+                        // that appear as part of a local/declare assignment — skip them.
+                        // Do NOT use `continue` here: the i += 1 below must run.
                     }
                 }
                 i += 1;

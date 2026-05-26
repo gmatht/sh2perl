@@ -10,8 +10,8 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $MAGIC_25 = 25;
 my $MAGIC_30 = 30;
+my $MAGIC_25 = 25;
 
 $SIG{__DIE__} = sub { exit 1 };
 # set uo not implemented
