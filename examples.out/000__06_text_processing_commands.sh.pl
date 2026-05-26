@@ -16,14 +16,14 @@ my $MAGIC_5 = 5;
 
 print "=== Text Processing Commands ===\n";
 my $file_content = do { do {
-    my $output_0 = q{};
-    my $output_printed_0;
-    my $pipeline_success_0 = 1;
-    $output_0 = do { my $cat_chunk = q{}; if ( open my $fh, '<', 'src/main.rs' ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . 'src/main.rs' . ': ' . $OS_ERROR . "\n"; } $cat_chunk; };
+    my $output_120 = q{};
+    my $output_printed_120;
+    my $pipeline_success_120 = 1;
+    $output_120 = do { my $cat_chunk = q{}; if ( open my $fh, '<', 'src/main.rs' ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . 'src/main.rs' . ': ' . $OS_ERROR . "\n"; } $cat_chunk; };
     my $num_lines       = 5;
     my $head_line_count = 0;
     my $result          = q{};
-    my $input           = $output_0;
+    my $input           = $output_120;
     my $pos             = 0;
 
     while ( $pos < length $input && $head_line_count < $num_lines ) {
@@ -36,61 +36,61 @@ my $file_content = do { do {
         $pos = $line_end + 1;
         ++$head_line_count;
     }
-    $output_0 = $result;
+    $output_120 = $result;
 
-    if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
-    $output_0 =~ s/\n+\z//msx;
-    $output_0;
+    if ( !$pipeline_success_120 ) { $main_exit_code = 1; }
+    $output_120 =~ s/\n+\z//msx;
+    $output_120;
 } };
 print "First 5 lines of main.rs:\n";
 print $file_content;
 if ( !( $file_content =~ m{\n\z}msx ) ) { print "\n"; }
-my $grep_result = do { my $grep_result_1;
-my @grep_lines_1 = ();
-my @grep_filenames_1 = ();
+my $grep_result = do { my $grep_result_121;
+my @grep_lines_121 = ();
+my @grep_filenames_121 = ();
 if (-e "src/main.rs") {
     open my $fh, '<', "src/main.rs" or croak "Cannot open file: $ERRNO";
     while (my $line = <$fh>) {
         chomp $line;
-        push @grep_lines_1, $line;
-        push @grep_filenames_1, "src/main.rs";
+        push @grep_lines_121, $line;
+        push @grep_filenames_121, "src/main.rs";
     }
     close $fh
         or croak "Close failed: $OS_ERROR";
 }
 else { print {*STDERR} "grep: src/main.rs: No such file or directory\n"; }
-my @grep_filtered_1 = grep { /fn/msx } @grep_lines_1;
-my @grep_numbered_1;
-for my $i (0..@grep_lines_1-1) {
-    if (scalar grep { $_ eq $grep_lines_1[$i] } @grep_filtered_1) {
-        push @grep_numbered_1, sprintf "%d:%s", $i + 1, $grep_lines_1[$i];
+my @grep_filtered_121 = grep { /fn/msx } @grep_lines_121;
+my @grep_numbered_121;
+for my $i (0..@grep_lines_121-1) {
+    if (scalar grep { $_ eq $grep_lines_121[$i] } @grep_filtered_121) {
+        push @grep_numbered_121, sprintf "%d:%s", $i + 1, $grep_lines_121[$i];
     }
 }
-$grep_result_1 = join "\n", @grep_numbered_1;
-$CHILD_ERROR = scalar @grep_filtered_1 > 0 ? 0 : 1;
- $grep_result_1; };
+$grep_result_121 = join "\n", @grep_numbered_121;
+$CHILD_ERROR = scalar @grep_filtered_121 > 0 ? 0 : 1;
+ $grep_result_121; };
 print "Lines containing 'fn':\n";
 print $grep_result;
 if ( !( $grep_result =~ m{\n\z}msx ) ) { print "\n"; }
 my $sed_result = do { do {
-    my $output_2 = q{};
-    my $output_printed_2;
-    my $pipeline_success_2 = 1;
-    $output_2 .= 'Hello World' . "\n";
-    if ( !($output_2 =~ m{\n\z}msx) ) { $output_2 .= "\n"; }
+    my $output_122 = q{};
+    my $output_printed_122;
+    my $pipeline_success_122 = 1;
+    $output_122 .= 'Hello World' . "\n";
+    if ( !($output_122 =~ m{\n\z}msx) ) { $output_122 .= "\n"; }
     $CHILD_ERROR = 0;
-    my @sed_lines_2 = split /\n/msx, $output_2;
-    my @sed_result_2;
-    foreach my $line (@sed_lines_2) {
+    my @sed_lines_122 = split /\n/msx, $output_122;
+    my @sed_result_122;
+    foreach my $line (@sed_lines_122) {
     chomp $line;
     $line =~ s/World/Universe/gmsx;
-    push @sed_result_2, $line;
+    push @sed_result_122, $line;
     }
-    $output_2 = join "\n", @sed_result_2;
+    $output_122 = join "\n", @sed_result_122;
 
-    if ( !$pipeline_success_2 ) { $main_exit_code = 1; }
-    $output_2 =~ s/\n+\z//msx;
-    $output_2;
+    if ( !$pipeline_success_122 ) { $main_exit_code = 1; }
+    $output_122 =~ s/\n+\z//msx;
+    $output_122;
 } };
 do {
     my $output = "Sed result: $sed_result";
@@ -101,13 +101,13 @@ do {
 };
 $CHILD_ERROR = 0;
 my $awk_result = do { do {
-    my $output_3 = q{};
-    my $output_printed_3;
-    my $pipeline_success_3 = 1;
-    $output_3 .= '1 2 3 4 5' . "\n";
-    if ( !($output_3 =~ m{\n\z}msx) ) { $output_3 .= "\n"; }
+    my $output_123 = q{};
+    my $output_printed_123;
+    my $pipeline_success_123 = 1;
+    $output_123 .= '1 2 3 4 5' . "\n";
+    if ( !($output_123 =~ m{\n\z}msx) ) { $output_123 .= "\n"; }
     $CHILD_ERROR = 0;
-    my @lines = split /\n/msx, $output_3;
+    my @lines = split /\n/msx, $output_123;
     my @result;
     foreach my $line (@lines) {
         chomp $line;
@@ -115,11 +115,11 @@ my $awk_result = do { do {
         my @fields = split /\s+/msx, $line;
         push @result, ($fields[0] + $fields[1] . "\n");
     }
-    $output_3 = join "", @result;
+    $output_123 = join "", @result;
 
-    if ( !$pipeline_success_3 ) { $main_exit_code = 1; }
-    $output_3 =~ s/\n+\z//msx;
-    $output_3;
+    if ( !$pipeline_success_123 ) { $main_exit_code = 1; }
+    $output_123 =~ s/\n+\z//msx;
+    $output_123;
 } };
 do {
     my $output = "Awk sum result: $awk_result";
@@ -130,90 +130,90 @@ do {
 };
 $CHILD_ERROR = 0;
 my $sort_result = do { do {
-    my $output_4 = q{};
-    my $output_printed_4;
-    my $pipeline_success_4 = 1;
-    $output_4 .= "zebra\napple\nbanana";
-    if ( !($output_4 =~ m{\n\z}msx) ) { $output_4 .= "\n"; }
+    my $output_124 = q{};
+    my $output_printed_124;
+    my $pipeline_success_124 = 1;
+    $output_124 .= "zebra\napple\nbanana";
+    if ( !($output_124 =~ m{\n\z}msx) ) { $output_124 .= "\n"; }
     $CHILD_ERROR = 0;
-    my @sort_lines_4_1 = split /\n/msx, $output_4;
-    my @sort_sorted_4_1 = sort @sort_lines_4_1;
-    $output_4 = join "\n", @sort_sorted_4_1;
-        if ($output_4 ne q{} && !($output_4 =~ m{\n\z}msx)) {
-            $output_4 .= "\n";
+    my @sort_lines_124_1 = split /\n/msx, $output_124;
+    my @sort_sorted_124_1 = sort @sort_lines_124_1;
+    $output_124 = join "\n", @sort_sorted_124_1;
+        if ($output_124 ne q{} && !($output_124 =~ m{\n\z}msx)) {
+            $output_124 .= "\n";
         }
-    if ( !$pipeline_success_4 ) { $main_exit_code = 1; }
-    $output_4 =~ s/\n+\z//msx;
-    $output_4;
+    if ( !$pipeline_success_124 ) { $main_exit_code = 1; }
+    $output_124 =~ s/\n+\z//msx;
+    $output_124;
 } };
 print "Sorted words:\n";
 print $sort_result;
 if ( !( $sort_result =~ m{\n\z}msx ) ) { print "\n"; }
 my $uniq_result = do { do {
-    my $output_5 = q{};
-    my $output_printed_5;
-    my $pipeline_success_5 = 1;
-    $output_5 .= "apple\napple\nbanana\nbanana\ncherry";
-    if ( !($output_5 =~ m{\n\z}msx) ) { $output_5 .= "\n"; }
+    my $output_125 = q{};
+    my $output_printed_125;
+    my $pipeline_success_125 = 1;
+    $output_125 .= "apple\napple\nbanana\nbanana\ncherry";
+    if ( !($output_125 =~ m{\n\z}msx) ) { $output_125 .= "\n"; }
     $CHILD_ERROR = 0;
-    my @uniq_lines_5_1 = split /\n/msx, $output_5;
-    @uniq_lines_5_1 = grep { $_ ne q{} } @uniq_lines_5_1; # Filter out empty lines
-    my %uniq_seen_5_1;
-    my @uniq_result_5_1;
-    foreach my $line (@uniq_lines_5_1) {
-    if (!$uniq_seen_5_1{$line}++) { push @uniq_result_5_1, $line; }
+    my @uniq_lines_125_1 = split /\n/msx, $output_125;
+    @uniq_lines_125_1 = grep { $_ ne q{} } @uniq_lines_125_1; # Filter out empty lines
+    my %uniq_seen_125_1;
+    my @uniq_result_125_1;
+    foreach my $line (@uniq_lines_125_1) {
+    if (!$uniq_seen_125_1{$line}++) { push @uniq_result_125_1, $line; }
     }
-    $output_5 = join "\n", @uniq_result_5_1;
-        if ($output_5 ne q{} && !($output_5 =~ m{\n\z}msx)) {
-            $output_5 .= "\n";
+    $output_125 = join "\n", @uniq_result_125_1;
+        if ($output_125 ne q{} && !($output_125 =~ m{\n\z}msx)) {
+            $output_125 .= "\n";
         }
-    if ( !$pipeline_success_5 ) { $main_exit_code = 1; }
-    $output_5 =~ s/\n+\z//msx;
-    $output_5;
+    if ( !$pipeline_success_125 ) { $main_exit_code = 1; }
+    $output_125 =~ s/\n+\z//msx;
+    $output_125;
 } };
 print "Unique words:\n";
 print $uniq_result;
 if ( !( $uniq_result =~ m{\n\z}msx ) ) { print "\n"; }
-my $line_count = do { do {
-    my $output_6 = q{};
-    my $output_printed_6;
-    my $pipeline_success_6 = 1;
-    $output_6 .= "line1\nline2\nline3";
-    if ( !($output_6 =~ m{\n\z}msx) ) { $output_6 .= "\n"; }
-    $CHILD_ERROR = 0;
-    use IPC::Open3;
-    my @wc_args_6_1 = ('-l');
-    my ($wc_in_6_1, $wc_out_6_1, $wc_err_6_1);
-    my $wc_pid_6_1 = open3($wc_in_6_1, $wc_out_6_1, $wc_err_6_1, 'wc', @wc_args_6_1);
-    print {$wc_in_6_1} $output_6;
-    close $wc_in_6_1 or die "Close failed: $OS_ERROR\n";
-    $output_6 = do { local $/ = undef; <$wc_out_6_1> };
-    if ($output_6 eq q{}) { $output_6 = "0\n"; }
-    close $wc_out_6_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_6_1, 0;
-    if ( !$pipeline_success_6 ) { $main_exit_code = 1; }
-    $output_6 =~ s/\n+\z//msx;
-    $output_6;
-} };
 my $word_count = do { do {
-    my $output_7 = q{};
-    my $output_printed_7;
-    my $pipeline_success_7 = 1;
-    $output_7 .= 'Hello World' . "\n";
-    if ( !($output_7 =~ m{\n\z}msx) ) { $output_7 .= "\n"; }
+    my $output_126 = q{};
+    my $output_printed_126;
+    my $pipeline_success_126 = 1;
+    $output_126 .= 'Hello World' . "\n";
+    if ( !($output_126 =~ m{\n\z}msx) ) { $output_126 .= "\n"; }
     $CHILD_ERROR = 0;
     use IPC::Open3;
-    my @wc_args_7_1 = ('-w');
-    my ($wc_in_7_1, $wc_out_7_1, $wc_err_7_1);
-    my $wc_pid_7_1 = open3($wc_in_7_1, $wc_out_7_1, $wc_err_7_1, 'wc', @wc_args_7_1);
-    print {$wc_in_7_1} $output_7;
-    close $wc_in_7_1 or die "Close failed: $OS_ERROR\n";
-    $output_7 = do { local $/ = undef; <$wc_out_7_1> };
-    close $wc_out_7_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_7_1, 0;
-    if ( !$pipeline_success_7 ) { $main_exit_code = 1; }
-    $output_7 =~ s/\n+\z//msx;
-    $output_7;
+    my @wc_args_126_1 = ('-w');
+    my ($wc_in_126_1, $wc_out_126_1, $wc_err_126_1);
+    my $wc_pid_126_1 = open3($wc_in_126_1, $wc_out_126_1, $wc_err_126_1, 'wc', @wc_args_126_1);
+    print {$wc_in_126_1} $output_126;
+    close $wc_in_126_1 or die "Close failed: $OS_ERROR\n";
+    $output_126 = do { local $/ = undef; <$wc_out_126_1> };
+    close $wc_out_126_1 or die "Close failed: $OS_ERROR\n";
+    waitpid $wc_pid_126_1, 0;
+    if ( !$pipeline_success_126 ) { $main_exit_code = 1; }
+    $output_126 =~ s/\n+\z//msx;
+    $output_126;
+} };
+my $line_count = do { do {
+    my $output_127 = q{};
+    my $output_printed_127;
+    my $pipeline_success_127 = 1;
+    $output_127 .= "line1\nline2\nline3";
+    if ( !($output_127 =~ m{\n\z}msx) ) { $output_127 .= "\n"; }
+    $CHILD_ERROR = 0;
+    use IPC::Open3;
+    my @wc_args_127_1 = ('-l');
+    my ($wc_in_127_1, $wc_out_127_1, $wc_err_127_1);
+    my $wc_pid_127_1 = open3($wc_in_127_1, $wc_out_127_1, $wc_err_127_1, 'wc', @wc_args_127_1);
+    print {$wc_in_127_1} $output_127;
+    close $wc_in_127_1 or die "Close failed: $OS_ERROR\n";
+    $output_127 = do { local $/ = undef; <$wc_out_127_1> };
+    if ($output_127 eq q{}) { $output_127 = "0\n"; }
+    close $wc_out_127_1 or die "Close failed: $OS_ERROR\n";
+    waitpid $wc_pid_127_1, 0;
+    if ( !$pipeline_success_127 ) { $main_exit_code = 1; }
+    $output_127 =~ s/\n+\z//msx;
+    $output_127;
 } };
 do {
     my $output = "Word count: $word_count";
@@ -232,31 +232,31 @@ do {
 };
 $CHILD_ERROR = 0;
 my $head_result = do { do {
-    do { my $output_8 = q{};
-my $output_printed_8;
+    do { my $output_128 = q{};
+my $output_printed_128;
 do {
-    my $seq_output_9 = do {
+    my $seq_output_129 = do {
     my $result = q{};
     for my $i (1..10) {
         $result .= "$i\n";
     }
     $result;
 };
-    my @seq_lines_9 = split /\n/msx, $seq_output_9;
-    my $output_9 = q{};
+    my @seq_lines_129 = split /\n/msx, $seq_output_129;
+    my $output_129 = q{};
     my $head_line_count = 0;
-    foreach my $line (@seq_lines_9) {
+    foreach my $line (@seq_lines_129) {
         chomp $line;
         if ($head_line_count < 3) {
-    $output_9 .= $line . "\n";
+    $output_129 .= $line . "\n";
     ++$head_line_count;
 } else {
     $line = q{}; # Clear line to prevent printing
     last; # Break out of the yes loop when head limit is reached
 }
     }
-    $output_9 =~ s/\n+\z//msx;
-    $output_9;
+    $output_129 =~ s/\n+\z//msx;
+    $output_129;
 } };
 } };
 do {
@@ -268,20 +268,20 @@ do {
 };
 $CHILD_ERROR = 0;
 my $tail_result = do { do {
-    do { my $output_10 = q{};
-my $output_printed_10;
+    do { my $output_130 = q{};
+my $output_printed_130;
 do {
-    my $seq_output_11 = do {
+    my $seq_output_131 = do {
     my $result = q{};
     for my $i (1..10) {
         $result .= "$i\n";
     }
     $result;
 };
-    my @seq_lines_11 = split /\n/msx, $seq_output_11;
-    my $output_11 = q{};
+    my @seq_lines_131 = split /\n/msx, $seq_output_131;
+    my $output_131 = q{};
     my @tail_lines = ();
-    foreach my $line (@seq_lines_11) {
+    foreach my $line (@seq_lines_131) {
         chomp $line;
         # tail -3: collecting all lines first (pipeline limitation)
         push @tail_lines, $line;
@@ -289,13 +289,13 @@ do {
     }
     if (@tail_lines > 0) {
         my @last_lines = @tail_lines[-3..-1];
-        $output_11 = join "\n", @last_lines;
-        if ($output_11 ne q{}) {
-            $output_11 .= "\n";
+        $output_131 = join "\n", @last_lines;
+        if ($output_131 ne q{}) {
+            $output_131 .= "\n";
         }
     }
-    $output_11 =~ s/\n+\z//msx;
-    $output_11;
+    $output_131 =~ s/\n+\z//msx;
+    $output_131;
 } };
 } };
 do {
@@ -307,26 +307,26 @@ do {
 };
 $CHILD_ERROR = 0;
 my $cut_result = do { do {
-    my $output_12 = q{};
-    my $output_printed_12;
-    my $pipeline_success_12 = 1;
-    $output_12 .= 'apple:banana:cherry' . "\n";
-    if ( !($output_12 =~ m{\n\z}msx) ) { $output_12 .= "\n"; }
+    my $output_132 = q{};
+    my $output_printed_132;
+    my $pipeline_success_132 = 1;
+    $output_132 .= 'apple:banana:cherry' . "\n";
+    if ( !($output_132 =~ m{\n\z}msx) ) { $output_132 .= "\n"; }
     $CHILD_ERROR = 0;
-    my @lines_13 = split /\n/msx, $output_12;
-    my @result_13;
-    foreach my $line (@lines_13) {
+    my @lines_133 = split /\n/msx, $output_132;
+    my @result_133;
+    foreach my $line (@lines_133) {
     chomp $line;
     my @fields = split /:/msx, $line;
     if (@fields > 1) {
-        push @result_13, $fields[1];
+        push @result_133, $fields[1];
     }
     }
-    $output_12 = join "\n", @result_13;
+    $output_132 = join "\n", @result_133;
 
-    if ( !$pipeline_success_12 ) { $main_exit_code = 1; }
-    $output_12 =~ s/\n+\z//msx;
-    $output_12;
+    if ( !$pipeline_success_132 ) { $main_exit_code = 1; }
+    $output_132 =~ s/\n+\z//msx;
+    $output_132;
 } };
 do {
     my $output = "Second field: $cut_result";
@@ -363,10 +363,10 @@ c\n";
       or die "Close failed: $OS_ERROR\n";
 };
 my $paste_result = do { do {
-    my $output_14 = q{};
-    my $output_printed_14;
-    my $pipeline_success_14 = 1;
-    $output_14 = do {
+    my $output_134 = q{};
+    my $output_printed_134;
+    my $pipeline_success_134 = 1;
+    $output_134 = do {
         my @paste_file1_lines_fh_1;
         my @paste_file2_lines_fh_1;
         if (open my $fh1, '<', 'temp1.txt') {
@@ -392,18 +392,18 @@ my $paste_result = do { do {
         }
         $paste_output
         };
-    my @sed_lines_14 = split /\n/msx, $output_14;
-    my @sed_result_14;
-    foreach my $line (@sed_lines_14) {
+    my @sed_lines_134 = split /\n/msx, $output_134;
+    my @sed_result_134;
+    foreach my $line (@sed_lines_134) {
     chomp $line;
     $line =~ s/\t/ /gmsx;
-    push @sed_result_14, $line;
+    push @sed_result_134, $line;
     }
-    $output_14 = join "\n", @sed_result_14;
+    $output_134 = join "\n", @sed_result_134;
 
-    if ( !$pipeline_success_14 ) { $main_exit_code = 1; }
-    $output_14 =~ s/\n+\z//msx;
-    $output_14;
+    if ( !$pipeline_success_134 ) { $main_exit_code = 1; }
+    $output_134 =~ s/\n+\z//msx;
+    $output_134;
 } };
 print "Pasted columns:\n";
 print $paste_result;
@@ -527,38 +527,38 @@ print $diff_result;
 if ( !( $diff_result =~ m{\n\z}msx ) ) { print "\n"; }
 my $tr_result = do { do {
     my $input_data = ("HELLO WORLD") . "\n";
-    my $set1_16 = 'A-Z';
-my $set2_16 = 'a-z';
-my $input_16 = $input_data;
+    my $set1_136 = 'A-Z';
+my $set2_136 = 'a-z';
+my $input_136 = $input_data;
 # Expand character ranges for tr command
-my $expanded_set1_16 = $set1_16;
-my $expanded_set2_16 = $set2_16;
+my $expanded_set1_136 = $set1_136;
+my $expanded_set2_136 = $set2_136;
 # Handle a-z range in set1
-if ($expanded_set1_16 =~ /a-z/msx) {
-    $expanded_set1_16 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+if ($expanded_set1_136 =~ /a-z/msx) {
+    $expanded_set1_136 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
 }
 # Handle A-Z range in set1
-if ($expanded_set1_16 =~ /A-Z/msx) {
-    $expanded_set1_16 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+if ($expanded_set1_136 =~ /A-Z/msx) {
+    $expanded_set1_136 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
 }
 # Handle a-z range in set2
-if ($expanded_set2_16 =~ /a-z/msx) {
-    $expanded_set2_16 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+if ($expanded_set2_136 =~ /a-z/msx) {
+    $expanded_set2_136 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
 }
 # Handle A-Z range in set2
-if ($expanded_set2_16 =~ /A-Z/msx) {
-    $expanded_set2_16 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+if ($expanded_set2_136 =~ /A-Z/msx) {
+    $expanded_set2_136 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
 }
-my $tr_result_15 = q{};
-for my $char ( split //msx, $input_16 ) {
-    my $pos_16 = index $expanded_set1_16, $char;
-    if ( $pos_16 >= 0 && $pos_16 < length $expanded_set2_16 ) {
-        $tr_result_15 .= substr $expanded_set2_16, $pos_16, 1;
+my $tr_result_135 = q{};
+for my $char ( split //msx, $input_136 ) {
+    my $pos_136 = index $expanded_set1_136, $char;
+    if ( $pos_136 >= 0 && $pos_136 < length $expanded_set2_136 ) {
+        $tr_result_135 .= substr $expanded_set2_136, $pos_136, 1;
     } else {
-        $tr_result_15 .= $char;
+        $tr_result_135 .= $char;
     }
 }
-$tr_result_15
+$tr_result_135
 } };
 do {
     my $output = "Lowercase: $tr_result";
@@ -569,33 +569,33 @@ do {
 };
 $CHILD_ERROR = 0;
 my $xargs_result = do { do {
-    my $output_17 = q{};
-    my $output_printed_17;
-    my $pipeline_success_17 = 1;
-    $output_17 .= '1 2 3' . "\n";
-    if ( !($output_17 =~ m{\n\z}msx) ) { $output_17 .= "\n"; }
+    my $output_137 = q{};
+    my $output_printed_137;
+    my $pipeline_success_137 = 1;
+    $output_137 .= '1 2 3' . "\n";
+    if ( !($output_137 =~ m{\n\z}msx) ) { $output_137 .= "\n"; }
     $CHILD_ERROR = 0;
-    my @xargs_input_17_1 = grep { $_ ne q{} } split /\s+/msx, $output_17;
-    my @xargs_output_17_1;
-    for my $i (0..scalar @xargs_input_17_1-1) {
-        my @xargs_args_17_1;
+    my @xargs_input_137_1 = grep { $_ ne q{} } split /\s+/msx, $output_137;
+    my @xargs_output_137_1;
+    for my $i (0..scalar @xargs_input_137_1-1) {
+        my @xargs_args_137_1;
         for my $j (0..1-1) {
-            push @xargs_args_17_1, $xargs_input_17_1[$i + $j];
+            push @xargs_args_137_1, $xargs_input_137_1[$i + $j];
         }
-        my $xargs_line_17_1 = q{};
-        $xargs_line_17_1 .= "Number:";
-        foreach my $arg (@xargs_args_17_1) {
-            $xargs_line_17_1 .= q{ } . $arg;
+        my $xargs_line_137_1 = q{};
+        $xargs_line_137_1 .= "Number:";
+        foreach my $arg (@xargs_args_137_1) {
+            $xargs_line_137_1 .= q{ } . $arg;
         }
-        push @xargs_output_17_1, $xargs_line_17_1;
+        push @xargs_output_137_1, $xargs_line_137_1;
     }
-    my $xargs_result_17_1 = join "\n", @xargs_output_17_1;
-    if ($xargs_result_17_1 ne q{} && !( $xargs_result_17_1 =~ m{\n\z}msx )) { $xargs_result_17_1 .= "\n"; }
-    $output_17 = $xargs_result_17_1;
+    my $xargs_result_137_1 = join "\n", @xargs_output_137_1;
+    if ($xargs_result_137_1 ne q{} && !( $xargs_result_137_1 =~ m{\n\z}msx )) { $xargs_result_137_1 .= "\n"; }
+    $output_137 = $xargs_result_137_1;
 
-    if ( !$pipeline_success_17 ) { $main_exit_code = 1; }
-    $output_17 =~ s/\n+\z//msx;
-    $output_17;
+    if ( !$pipeline_success_137 ) { $main_exit_code = 1; }
+    $output_137 =~ s/\n+\z//msx;
+    $output_137;
 } };
 print "Xargs result:\n";
 print $xargs_result;

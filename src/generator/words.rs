@@ -1868,11 +1868,16 @@ pub fn convert_string_interpolation_to_perl_impl(
                     "@" => current_string.push_str("@ARGV"), // Arrays don't need $ in interpolation
                     "*" => current_string.push_str("@ARGV"), // Arrays don't need $ in interpolation
                     _ => {
-                        // Check if this is a shell positional parameter ($1, $2, etc.)
+                        // Check if this is a shell positional parameter ($0, $1, $2, etc.)
                         if var.chars().all(|c| c.is_digit(10)) {
-                            // Convert $1 to $_[0], $2 to $_[1], etc.
                             let index = var.parse::<usize>().unwrap_or(0);
-                            current_string.push_str(&format!("$_[{}]", index - 1));
+                            if index == 0 {
+                                // $0 is the script name
+                                current_string.push_str("$PROGRAM_NAME");
+                            } else {
+                                // Convert $1 to $_[0], $2 to $_[1], etc.
+                                current_string.push_str(&format!("$_[{}]", index - 1));
+                            }
                         // Perl arrays are 0-indexed
                         } else {
                             // Regular variable - add directly for interpolation
