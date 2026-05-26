@@ -12,48 +12,48 @@ our $CHILD_ERROR;
 
 print "=== File and Directory Operations ===\n";
 my $file_list = do {
-    my @ls_files_48 = ();
+    my @ls_files_45 = ();
     if ( -f q{.} ) {
-        push @ls_files_48, q{.};
+        push @ls_files_45, q{.};
     }
     elsif ( -d q{.} ) {
         if ( opendir my $dh, q{.} ) {
             while ( my $file = readdir $dh ) {
-                push @ls_files_48, $file;
+                push @ls_files_45, $file;
             }
             closedir $dh;
-            @ls_files_48 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_48;
+            @ls_files_45 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_45;
         }
     }
-    (@ls_files_48 ? join("\n", @ls_files_48) . "\n" : q{});
+    (@ls_files_45 ? join("\n", @ls_files_45) . "\n" : q{});
 };
 print "File listing:\n";
 print $file_list;
 if ( !( $file_list =~ m{\n\z}msx ) ) { print "\n"; }
 my $found_files = do {
     use File::Basename;
-    my @files_50 = ();
-    my $start_50 = q{.};
-    my $_find_50;
-    $_find_50 = sub {
-        my ($dir_50, $depth_50) = @_;
-        opendir(my $dh_50, $dir_50) or return;
-        my @entries_50 = readdir($dh_50);
-        closedir($dh_50);
-        for my $entry_50 (@entries_50) {
-            next if $entry_50 eq q{.} || $entry_50 eq q{..};
-            my $file_50 = "$dir_50/$entry_50";
-            if (-d $file_50) {
-                $_find_50->($file_50, $depth_50 + 1);
+    my @files_47 = ();
+    my $start_47 = q{.};
+    my $_find_47;
+    $_find_47 = sub {
+        my ($dir_47, $depth_47) = @_;
+        opendir(my $dh_47, $dir_47) or return;
+        my @entries_47 = readdir($dh_47);
+        closedir($dh_47);
+        for my $entry_47 (@entries_47) {
+            next if $entry_47 eq q{.} || $entry_47 eq q{..};
+            my $file_47 = "$dir_47/$entry_47";
+            if (-d $file_47) {
+                $_find_47->($file_47, $depth_47 + 1);
             }
-            elsif (-f $file_50) {
-                next if !( basename($file_50) =~ m/^.*.sh$/xms );
-                push @files_50, $file_50;
+            elsif (-f $file_47) {
+                next if !( basename($file_47) =~ m/^.*.sh$/xms );
+                push @files_47, $file_47;
             }
         }
     };
-    $_find_50->($start_50, 0);
-    join "\n", @files_50;
+    $_find_47->($start_47, 0);
+    join "\n", @files_47;
 };
 print "Found shell scripts:\n";
 print $found_files;
