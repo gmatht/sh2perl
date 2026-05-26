@@ -2002,20 +2002,39 @@ pub fn convert_string_interpolation_to_perl_impl(
 }
 
 pub fn convert_arithmetic_to_perl_impl(_generator: &Generator, expr: &str) -> String {
-    // Convert shell arithmetic expression to Perl syntax
+    // Convert shell arithmetic expression to Perl syntax.
+    // Variables may already carry a leading `$` (e.g. `$j * $i`); we must NOT
+    // add another `$` in that case or we produce `$$j` (a scalar dereference).
+    // Strategy: temporarily replace every existing `$name` with a sentinel,
+    // add `$` to bare identifiers, then restore the sentinels.
+
     let result = expr.to_string();
 
-    // Convert shell variables to Perl variables (e.g., i -> $i) first
-    // Use regex to find variable names and replace them with Perl variable syntax
+    // Step 1: protect already-`$`-prefixed variables
+    let dollar_var_regex = Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
+    let protected = dollar_var_regex
+        .replace_all(&result, |caps: &regex::Captures| {
+            format!("__DOLLAR_{}__", &caps[1])
+        })
+        .to_string();
 
-    // Create a regex to match variable names (letters followed by alphanumeric/underscore)
+    // Step 2: prefix bare identifiers with `$`
     let var_regex = Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b").unwrap();
+    let converted = var_regex
+        .replace_all(&protected, |caps: &regex::Captures| {
+            let var_name = &caps[1];
+            if var_name.starts_with("__DOLLAR_") && var_name.ends_with("__") {
+                // Sentinel — restored in step 3
+                var_name.to_string()
+            } else {
+                format!("${}", var_name)
+            }
+        })
+        .to_string();
 
-    // Replace variable names with Perl variable syntax
-    let converted = var_regex.replace_all(&result, |caps: &regex::Captures| {
-        let var_name = &caps[1];
-        format!("${}", var_name)
-    });
-
-    converted.to_string()
+    // Step 3: restore sentinels to `$name`
+    let restore_regex = Regex::new(r"__DOLLAR_([a-zA-Z_][a-zA-Z0-9_]*)__").unwrap();
+    restore_regex
+        .replace_all(&converted, |caps: &regex::Captures| format!("${}", &caps[1]))
+        .to_string()
 }

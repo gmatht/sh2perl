@@ -658,20 +658,86 @@ impl Generator {
     /// Pre-analysis pass to identify variables that are used after for loops
     fn analyze_variable_usage(&mut self, ast: &[Command]) {
         for (i, command) in ast.iter().enumerate() {
-            if let Command::For(for_loop) = command {
-                // Check if this variable is used in subsequent commands
-                let var_name = &for_loop.variable;
-                for j in (i + 1)..ast.len() {
-                    if self.is_variable_used_in_command(&ast[j], var_name) {
-                        self.function_level_vars.insert(var_name.clone());
-                        break;
+            match command {
+                Command::For(for_loop) => {
+                    // Check if the loop iteration variable is used after the loop
+                    let var_name = &for_loop.variable;
+                    for j in (i + 1)..ast.len() {
+                        if self.is_variable_used_in_command(&ast[j], var_name) {
+                            self.function_level_vars.insert(var_name.clone());
+                            break;
+                        }
+                    }
+
+                    // Collect all variables assigned inside the loop body
+                    let assigned = self.collect_assigned_vars_in_block(&for_loop.body);
+                    for var in &assigned {
+                        // If the variable is used after this loop, declare it at outer scope
+                        for j in (i + 1)..ast.len() {
+                            if self.is_variable_used_in_command(&ast[j], var) {
+                                self.function_level_vars.insert(var.clone());
+                                break;
+                            }
+                        }
+                    }
+
+                    // Also check for variables used in arithmetic expressions within the loop body
+                    self.analyze_variables_in_block(&for_loop.body);
+                }
+                Command::While(while_loop) => {
+                    // Collect all variables assigned inside the while body
+                    let assigned = self.collect_assigned_vars_in_block(&while_loop.body);
+                    for var in &assigned {
+                        for j in (i + 1)..ast.len() {
+                            if self.is_variable_used_in_command(&ast[j], var) {
+                                self.function_level_vars.insert(var.clone());
+                                break;
+                            }
+                        }
                     }
                 }
-
-                // Also check for variables used in arithmetic expressions within the loop body
-                self.analyze_variables_in_block(&for_loop.body);
+                _ => {}
             }
         }
+    }
+
+    fn collect_assigned_vars_in_command(&self, cmd: &Command, vars: &mut Vec<String>) {
+        match cmd {
+            Command::Assignment(assign) => {
+                vars.push(assign.variable.clone());
+            }
+            Command::For(for_loop) => {
+                for c in &for_loop.body.commands {
+                    self.collect_assigned_vars_in_command(c, vars);
+                }
+            }
+            Command::While(while_loop) => {
+                for c in &while_loop.body.commands {
+                    self.collect_assigned_vars_in_command(c, vars);
+                }
+            }
+            Command::If(if_stmt) => {
+                self.collect_assigned_vars_in_command(&if_stmt.then_branch, vars);
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    self.collect_assigned_vars_in_command(else_branch, vars);
+                }
+            }
+            Command::Block(block) => {
+                for c in &block.commands {
+                    self.collect_assigned_vars_in_command(c, vars);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect the names of all variables assigned (via Assignment commands) in a block.
+    fn collect_assigned_vars_in_block(&self, block: &Block) -> Vec<String> {
+        let mut vars = Vec::new();
+        for cmd in &block.commands {
+            self.collect_assigned_vars_in_command(cmd, &mut vars);
+        }
+        vars
     }
 
     /// Pre-analysis pass to identify constants needed for magic numbers
