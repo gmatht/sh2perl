@@ -2491,13 +2491,21 @@ fn generate_buffered_pipeline(
                             if let Command::Simple(cmd) = command {
                                 if let Word::Literal(cmd_name, _) = &cmd.name {
                                     if matches!(cmd_name.as_str(), "grep" | "xargs" | "tr") {
-                                        let result_var =
-                                            format!("{}_result_{}_{}", cmd_name, unique_id, i);
-                                        output.push_str(&generator.indent());
-                                        output.push_str(&format!(
-                                            "$output_{} = ${};\n",
-                                            unique_id, result_var
-                                        ));
+                                        // For quiet-mode grep (-q), suppress output assignment
+                                        let is_grep_quiet = cmd_name == "grep" && cmd.args.iter().any(|a| {
+                                            matches!(a, crate::ast::Word::Literal(s, _)
+                                                if s == "-q" || s == "--quiet" || s == "--silent"
+                                                || (s.starts_with('-') && !s.starts_with("--") && s.contains('q')))
+                                        });
+                                        if !is_grep_quiet {
+                                            let result_var =
+                                                format!("{}_result_{}_{}", cmd_name, unique_id, i);
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!(
+                                                "$output_{} = ${};\n",
+                                                unique_id, result_var
+                                            ));
+                                        }
                                         if cmd_name == "grep" {
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!(

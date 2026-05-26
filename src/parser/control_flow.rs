@@ -15,7 +15,7 @@ fn parse_word_list(parser: &mut Parser) -> Result<Vec<Word>, ParserError> {
         parser.lexer.skip_whitespace_and_comments();
         
         // Check for end of list
-        if parser.lexer.is_eof() || matches!(parser.lexer.peek(), Some(Token::Semicolon | Token::Newline | Token::CarriageReturn | Token::Done | Token::Fi | Token::Then | Token::Else | Token::ParenClose | Token::BraceClose)) {
+        if parser.lexer.is_eof() || matches!(parser.lexer.peek(), Some(Token::Semicolon | Token::Newline | Token::CarriageReturn | Token::Do | Token::Done | Token::Fi | Token::Then | Token::Else | Token::ParenClose | Token::BraceClose)) {
             break;
         }
         

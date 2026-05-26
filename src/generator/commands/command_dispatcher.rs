@@ -663,11 +663,15 @@ pub fn generate_command_impl_with_input(
                             let paste_output =
                                 generate_paste_command(generator, cmd, &process_sub_files);
                             // The do-block returns the paste result as a string;
-                            // wrap with print so it actually goes to stdout.
+                            // capture in a variable then print to avoid Perl::Critic's
+                            // RequireBracedFileHandleWithPrint false-positive on "print do".
+                            let paste_var = format!("paste_result_{}", generator.get_unique_id());
                             result.push_str(&generator.indent());
-                            result.push_str("print ");
+                            result.push_str(&format!("my ${} = ", paste_var));
                             result.push_str(&paste_output);
                             result.push_str(";\n");
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("print ${};\n", paste_var));
 
                             return result;
                         }
