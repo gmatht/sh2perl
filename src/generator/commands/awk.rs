@@ -102,7 +102,17 @@ fn translate_awk_print_args(rem: &str, acc_vars: &HashSet<String>, generator: &m
                     let inner = &arg[1..arg.len()-1];
                     parts.push(generator.perl_string_literal(&Word::literal(inner.to_string())));
                 } else {
-                    parts.push(translate_awk_expr(arg, acc_vars));
+                    let mut translated = translate_awk_expr(arg, acc_vars);
+                    // Awk uses implicit concatenation for adjacent tokens (e.g.
+                    // "Name: " $1 " | Age: " $2). After field-ref substitution,
+                    // insert Perl ' . ' operator between adjacent string/variable tokens.
+                    if let Ok(re) = regex::Regex::new(r#"(["'])\s+(\$)"#) {
+                        translated = re.replace_all(&translated, "$1 . $2").to_string();
+                    }
+                    if let Ok(re) = regex::Regex::new(r#"(\$(?:\w+(?:\[\w+\])?))\s+(["])"#) {
+                        translated = re.replace_all(&translated, "$1 . $2").to_string();
+                    }
+                    parts.push(translated);
                 }
             }
             arg_start = i + 1;
