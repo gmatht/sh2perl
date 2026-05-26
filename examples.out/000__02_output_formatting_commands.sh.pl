@@ -126,9 +126,9 @@ do {
 };
 $CHILD_ERROR = 0;
 my $strings_result = do { do {
-    my $output_3 = q{};
-    my $output_printed_3;
-    my $pipeline_success_3 = 1;
+    my $output_0 = q{};
+    my $output_printed_0;
+    my $pipeline_success_0 = 1;
     my $input_data;
     if ( open my $fh, '<', 'test_binary.txt' ) {
         local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
@@ -145,11 +145,11 @@ my $strings_result = do { do {
         push @result, $1;
     }
     my $line = join "\n", @result;
-    $output_3 = $line;
+    $output_0 = $line;
     my $num_lines       = 3;
     my $head_line_count = 0;
     my $result          = q{};
-    my $input           = $output_3;
+    my $input           = $output_0;
     my $pos             = 0;
 
     while ( $pos < length $input && $head_line_count < $num_lines ) {
@@ -162,35 +162,35 @@ my $strings_result = do { do {
         $pos = $line_end + 1;
         ++$head_line_count;
     }
-    $output_3 = $result;
+    $output_0 = $result;
 
-    if ( !$pipeline_success_3 ) { $main_exit_code = 1; }
-    $output_3 =~ s/\n+\z//msx;
-    $output_3;
+    if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    $output_0 =~ s/\n+\z//msx;
+    $output_0;
 } };
 print "Strings result:\n";
 print $strings_result;
 if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
 print "=== I/O Redirection Commands ===\n";
 my $tee_result = do { do {
-    my $output_4 = q{};
-    my $output_printed_4;
-    my $pipeline_success_4 = 1;
-    $output_4 .= 'test output' . "\n";
-    if ( !($output_4 =~ m{\n\z}msx) ) { $output_4 .= "\n"; }
+    my $output_1 = q{};
+    my $output_printed_1;
+    my $pipeline_success_1 = 1;
+    $output_1 .= 'test output' . "\n";
+    if ( !($output_1 =~ m{\n\z}msx) ) { $output_1 .= "\n"; }
     $CHILD_ERROR = 0;
     use Carp qw(carp croak);
     if ( open my $fh, '>', 'test_tee.txt' ) {
-        print {$fh} $output_4;
+        print {$fh} $output_1;
         close $fh or croak "Close failed: $ERRNO";
     }
     else {
         carp "tee: Cannot open 'test_tee.txt': $ERRNO";
     }
-    $output_4 = $output_4;
-    if ( !$pipeline_success_4 ) { $main_exit_code = 1; }
-    $output_4 =~ s/\n+\z//msx;
-    $output_4;
+    $output_1 = $output_1;
+    if ( !$pipeline_success_1 ) { $main_exit_code = 1; }
+    $output_1 =~ s/\n+\z//msx;
+    $output_1;
 } };
 do {
     my $output = "Tee result: $tee_result";
