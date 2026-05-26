@@ -10,15 +10,11 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $perl_output_0 = do {
-            my $result = qx{perl };
-            chomp $result;
-            $result;
-        };
-print $perl_output_0;
+$SIG{__DIE__} = sub { exit 1 };
+# set uo not implemented
+# set pipefail not implemented
+print "== ANSI-C quoting ==\n";
+print "line1\nline2\tTabbed" . "\n";
+$CHILD_ERROR = 0;
 
 exit $main_exit_code;
-
-
-Exit code: exit status: 2
-

@@ -10,15 +10,11 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $perl_output_0 = do {
-            my $result = qx{perl };
-            chomp $result;
-            $result;
-        };
-print $perl_output_0;
+if ((-f"file.txt")) {
+    print "File exists\n";
+}
+else {
+    print "File does not exist\n";
+}
 
 exit $main_exit_code;
-
-
-Exit code: exit status: 2
-

@@ -38,24 +38,24 @@ do {
 };
 $CHILD_ERROR = 0;
 my $tee_result = do { do {
-    my $output_113 = q{};
-    my $output_printed_113;
-    my $pipeline_success_113 = 1;
-    $output_113 .= 'test output' . "\n";
-    if ( !($output_113 =~ m{\n\z}msx) ) { $output_113 .= "\n"; }
+    my $output_0 = q{};
+    my $output_printed_0;
+    my $pipeline_success_0 = 1;
+    $output_0 .= 'test output' . "\n";
+    if ( !($output_0 =~ m{\n\z}msx) ) { $output_0 .= "\n"; }
     $CHILD_ERROR = 0;
     use Carp qw(carp croak);
     if ( open my $fh, '>', 'test_tee.txt' ) {
-        print {$fh} $output_113;
+        print {$fh} $output_0;
         close $fh or croak "Close failed: $ERRNO";
     }
     else {
         carp "tee: Cannot open 'test_tee.txt': $ERRNO";
     }
-    $output_113 = $output_113;
-    if ( !$pipeline_success_113 ) { $main_exit_code = 1; }
-    $output_113 =~ s/\n+\z//msx;
-    $output_113;
+    $output_0 = $output_0;
+    if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    $output_0 =~ s/\n+\z//msx;
+    $output_0;
 } };
 do {
     my $output = "Tee result: $tee_result";

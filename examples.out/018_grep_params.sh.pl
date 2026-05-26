@@ -773,8 +773,7 @@ $CHILD_ERROR = 0;
     $grep_result_21_1 .= "\n";
     }
     $CHILD_ERROR = scalar @grep_filtered_21_1 > 0 ? 0 : 1;
-    $output_21 = $grep_result_21_1;
-    $output_21 = $grep_result_21_1;
+    $output_21 = q{};
     if ((scalar @grep_filtered_21_1) == 0) {
         $pipeline_success_21 = 0;
     }
