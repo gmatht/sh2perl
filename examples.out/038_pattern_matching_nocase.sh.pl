@@ -10,15 +10,19 @@ my $main_exit_code = 0;
 my $ls_success     = 0;
 our $CHILD_ERROR;
 
-my $perl_output_0 = do {
-            my $result = qx{perl };
-            chomp $result;
-            $result;
-        };
-print $perl_output_0;
+$SIG{__DIE__} = sub { exit 1 };
+# set uo not implemented
+# set pipefail not implemented
+print "== nocasematch ==\n";
+# nocasematch option enabled
+my $word;
+$word = "Foo";
+if ($word =~ /^foo$/msxi) {
+        print 'ci-match' . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
 
 exit $main_exit_code;
-
-
-Exit code: exit status: 2
-
