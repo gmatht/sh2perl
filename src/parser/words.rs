@@ -900,10 +900,14 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
         }
         Some(Token::DollarBrace) => {
             // Parse ${...} expansions
-            lexer.next(); // consume the token
+            lexer.next(); // consume ${
 
             // Parse the entire braced content first, then analyze it
             let braced_content = parse_braced_variable_name(lexer)?;
+            // Consume the closing } that parse_braced_variable_name leaves unconsumed
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
 
             // Check if this is array syntax first
             if braced_content.starts_with('#')
@@ -937,11 +941,26 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
 
                         // Special case: if key is "@", this is array iteration
                         if key == "@" {
-                            // Check if there's array slicing after the closing brace
-                            // Look ahead for :offset:length syntax
-                            if let Some(Token::Colon) = lexer.peek() {
+                            // Check if there's array slicing in braced_content after ']'
+                            let after_bracket = &braced_content[bracket_end + 1..];
+                            if after_bracket.starts_with(':') {
                                 // This is array slicing like ${arr[@]:start:length}
-                                return parse_array_slicing(lexer, map_name.to_string());
+                                let slice_part = &after_bracket[1..]; // skip leading ':'
+                                if let Some(second_colon) = slice_part.find(':') {
+                                    let offset = &slice_part[..second_colon];
+                                    let length = &slice_part[second_colon + 1..];
+                                    return Ok(Word::array_slice(
+                                        map_name.to_string(),
+                                        offset.to_string(),
+                                        Some(length.to_string()),
+                                    ));
+                                } else {
+                                    return Ok(Word::array_slice(
+                                        map_name.to_string(),
+                                        slice_part.to_string(),
+                                        None,
+                                    ));
+                                }
                             }
                             return Ok(Word::MapAccess(
                                 map_name.to_string(),
