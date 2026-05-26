@@ -1,0 +1,302 @@
+Perl::Critic violations found:
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 54, Column 5
+  Code:     [VIOLATION!]return;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 55, Column 1
+  Code: [VIOLATION!]}
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 55, Column 1
+  Code: [VIOLATION!]}
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 56, Column 1
+  Code: [VIOLATION!]print "Finding first 100 prime numbers...\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 56, Column 1
+  Code: [VIOLATION!]print "Finding first 100 prime numbers...\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 57, Column 1
+  Code: [VIOLATION!]print "This may take a while...\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 57, Column 1
+  Code: [VIOLATION!]print "This may take a while...\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 58, Column 1
+  Code: [VIOLATION!]{
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 58, Column 1
+  Code: [VIOLATION!]{
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 67, Column 1
+  Code: [VIOLATION!]while ( $count < $MAGIC_100 ) {
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 67, Column 1
+  Code: [VIOLATION!]while ( $count < $MAGIC_100 ) {
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 76, Column 25
+  Code: if ($((count % 10)) == 0[VIOLATION!]) {
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 76, Column 25
+  Code: if ($((count % 10)) == 0[VIOLATION!]) {
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 76, Column 27
+  Code: if ($((count % 10)) == 0) [VIOLATION!]{
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 76, Column 27
+  Code: if ($((count % 10)) == 0) [VIOLATION!]{
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 86, Column 9
+  Code:         [VIOLATION!]}
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 86, Column 9
+  Code:         [VIOLATION!]}
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 87, Column 5
+  Code:     [VIOLATION!]}
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 87, Column 5
+  Code:     [VIOLATION!]}
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 88, Column 5
+  Code:     [VIOLATION!]$candidate = $candidate + 2;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 88, Column 5
+  Code:     [VIOLATION!]$candidate = $candidate + 2;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 89, Column 1
+  Code: [VIOLATION!]}
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 89, Column 1
+  Code: [VIOLATION!]}
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 90, Column 1
+  Code: [VIOLATION!]print "\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 90, Column 1
+  Code: [VIOLATION!]print "\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 91, Column 1
+  Code: [VIOLATION!]print "First 1000 prime numbers found!\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 91, Column 1
+  Code: [VIOLATION!]print "First 1000 prime numbers found!\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 92, Column 1
+  Code: [VIOLATION!]print "Count: " . scalar(@primes) . "\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 92, Column 1
+  Code: [VIOLATION!]print "Count: " . scalar(@primes) . "\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 93, Column 1
+  Code: [VIOLATION!]$CHILD_ERROR = 0;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 93, Column 1
+  Code: [VIOLATION!]$CHILD_ERROR = 0;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 94, Column 1
+  Code: [VIOLATION!]print "First 10: " . @primes . "\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 94, Column 1
+  Code: [VIOLATION!]print "First 10: " . @primes . "\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 95, Column 1
+  Code: [VIOLATION!]$CHILD_ERROR = 0;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 95, Column 1
+  Code: [VIOLATION!]$CHILD_ERROR = 0;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 96, Column 1
+  Code: [VIOLATION!]print "Last 10: " . @primes . "\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 96, Column 1
+  Code: [VIOLATION!]print "Last 10: " . @primes . "\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 97, Column 1
+  Code: [VIOLATION!]$CHILD_ERROR = 0;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 97, Column 1
+  Code: [VIOLATION!]$CHILD_ERROR = 0;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 98, Column 1
+  Code: [VIOLATION!]print "Prime number generation complete!\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 98, Column 1
+  Code: [VIOLATION!]print "Prime number generation complete!\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 100, Column 1
+  Code: [VIOLATION!]exit $main_exit_code;
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 100, Column 1
+  Code: [VIOLATION!]exit $main_exit_code;
+  Explanation: Consider removing it
+
