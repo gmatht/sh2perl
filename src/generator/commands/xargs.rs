@@ -219,10 +219,16 @@ pub fn generate_xargs_command_with_output(
             }
         }
         // Handle xargs with command execution
-        // Split input on whitespace (spaces, tabs, newlines) as xargs does by default.
+        // When -I is specified, xargs reads one line per argument (POSIX behaviour).
+        // Without -I, split on whitespace as xargs does by default.
+        let split_pattern = if replace_placeholder.is_some() {
+            "\\n"
+        } else {
+            "\\s+"
+        };
         output.push_str(&format!(
-            "my @xargs_input_{} = grep {{ $_ ne q{{}} }} split /\\s+/msx, ${};\n",
-            command_index, input_var
+            "my @xargs_input_{} = grep {{ $_ ne q{{}} }} split /{}/msx, ${};\n",
+            command_index, split_pattern, input_var
         ));
         output.push_str(&format!("my @xargs_output_{};\n", command_index));
         output.push_str(&format!(

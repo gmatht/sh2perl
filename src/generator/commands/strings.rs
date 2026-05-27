@@ -80,6 +80,7 @@ pub fn generate_strings_command(
     output.push_str("    push @result, $1;\n");
     output.push_str("}\n");
     output.push_str("my $line = join \"\\n\", @result;\n");
+    output.push_str("if ($line ne q{} && !($line =~ m{\\n\\z}msx)) { $line .= \"\\n\"; }\n");
     if !output_var.is_empty() {
         output.push_str(&format!("${} = $line;\n", output_var));
     } else {
