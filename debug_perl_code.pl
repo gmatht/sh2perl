@@ -11,21 +11,53 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $output_274 = q{};
-my $output_printed_274;
-my $head_line_count = 0;
-my $output_275 = q{};
-while (my $line = <>) {
-    chomp $line;
-    # find doesn't support line-by-line processing
-    if ($head_line_count < 3) {
-    $output_275 .= $line . "\n";
-    ++$head_line_count;
-} else {
-    $line = q{}; # Clear line to prevent printing
-    last; # Break out of the yes loop when head limit is reached
-}
-    print $line . "\n";
-}
+print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
+my $result1 = do {
+    my @ls_files_0 = ();
+    if ( -f q{.} ) {
+        push @ls_files_0, q{.};
+    }
+    elsif ( -d q{.} ) {
+        if ( opendir my $dh, q{.} ) {
+            while ( my $file = readdir $dh ) {
+                push @ls_files_0, $file;
+            }
+            closedir $dh;
+            @ls_files_0 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_0;
+        }
+    }
+    @ls_files_0 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_0;
+    (@ls_files_0 ? join("\n", @ls_files_0) . "\n" : q{});
+};
+my $result2 = do {
+    use File::Basename;
+    my @files_2 = ();
+    my $start_2 = q{.};
+    my $_find_2;
+    $_find_2 = sub {
+        my ($dir_2, $depth_2) = @_;
+        opendir(my $dh_2, $dir_2) or return;
+        my @entries_2 = readdir($dh_2);
+        closedir($dh_2);
+        for my $entry_2 (@entries_2) {
+            next if $entry_2 eq q{.} || $entry_2 eq q{..};
+            my $file_2 = "$dir_2/$entry_2";
+            if (-d $file_2) {
+                $_find_2->($file_2, $depth_2 + 1);
+            }
+            elsif (-f $file_2) {
+                next if !( basename($file_2) =~ m/^.*.txt$/xms );
+                push @files_2, $file_2;
+            }
+        }
+    };
+    $_find_2->($start_2, 0);
+    join "\n", @files_2;
+};
+print "Results:\n";
+print $result1;
+if ( !( ($result1) =~ m{\n\z}msx ) ) { print "\n"; }
+print $result2;
+if ( !( ($result2) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;
