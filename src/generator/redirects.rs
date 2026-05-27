@@ -771,7 +771,10 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
             for arg in &cmd.args {
                 if let Word::Literal(opt, _) = arg {
                     match opt.as_str() {
-                        "-e" => output.push_str("$SIG{__DIE__} = sub { exit 1 };\n"),
+                        "-e" => {
+                            output.push_str("$__set_e = 1;\n");
+                            generator.set_e_active = true;
+                        }
                         "-u" => output.push_str("use strict;\n"),
                         "-o" => {
                             // Handle pipefail and other options

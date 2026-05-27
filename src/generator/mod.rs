@@ -32,6 +32,13 @@ pub struct Generator {
     /// generator code (eg. redirect wrappers) can mark the pipeline's buffer
     /// as printed ($output_printed_<id>) without fragile string scans.
     pub pipeline_output_stack: Vec<String>,
+    /// Whether `set -e` (errexit) has been activated in the script.
+    pub set_e_active: bool,
+    /// Depth counter for contexts where `set -e` exit-on-failure must be
+    /// suppressed (e.g. the condition expression of `if`/`while`/`until`,
+    /// the left-hand side of `||`/`&&`).  When > 0 the exit-on-failure check
+    /// after a pipeline should be omitted.
+    pub suppress_set_e_depth: usize,
 }
 
 /// RAII guard that pops the pipeline_output_stack when dropped.
@@ -93,6 +100,8 @@ impl Generator {
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
             pipeline_output_stack: Vec::new(),
+            set_e_active: false,
+            suppress_set_e_depth: 0,
         }
     }
 
@@ -113,6 +122,8 @@ impl Generator {
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
             pipeline_output_stack: Vec::new(),
+            set_e_active: false,
+            suppress_set_e_depth: 0,
         }
     }
 
@@ -133,6 +144,8 @@ impl Generator {
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
             pipeline_output_stack: Vec::new(),
+            set_e_active: false,
+            suppress_set_e_depth: 0,
         }
     }
 
@@ -288,6 +301,7 @@ impl Generator {
         // Always declare it since it's used in pipeline generation
         output.push_str("my $main_exit_code = 0;\n");
         output.push_str("my $ls_success     = 0;\n");
+        output.push_str("my $__set_e        = 0;\n");
 
         // Add global CHILD_ERROR variable for command substitution
         output.push_str("our $CHILD_ERROR;\n\n");

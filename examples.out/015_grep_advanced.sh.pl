@@ -9,6 +9,7 @@ use File::Path qw(make_path remove_tree);
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
 # Original bash: echo -e "match1\nmatch2\nmatch3\nmatch4" | grep -m 2 "match"

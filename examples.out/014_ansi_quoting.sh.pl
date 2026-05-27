@@ -8,12 +8,13 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $MAGIC_30 = 30;
 my $MAGIC_25 = 25;
+my $MAGIC_30 = 30;
 
-$SIG{__DIE__} = sub { exit 1 };
+$__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== ANSI-C quoting ==\n";

@@ -8,6 +8,7 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
 # Original bash: ls | grep "\.txt$" | wc -l

@@ -9,6 +9,7 @@ my $DATE_SNAPSHOT = time;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
 print "=== Basic Command Substitution ===\n";
@@ -35,14 +36,14 @@ do {
     }
 };
 $CHILD_ERROR = 0;
+my $current_date = do {
+require POSIX; POSIX::strftime('%Y%m', localtime(time())) . "\n"
+};
 my $current_dir = do {
     my $basename_path = do { use Cwd; getcwd(); };
     $basename_path =~ s{.*/}{}msx;
     chomp $basename_path;
     $basename_path;
-};
-my $current_date = do {
-require POSIX; POSIX::strftime('%Y%m', localtime(time())) . "\n"
 };
 do {
     my $output = "Stored date: $current_date";
