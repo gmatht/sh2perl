@@ -156,7 +156,9 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
     if let Command::TestExpression(_) = left {
         // For test expressions, generate: if (!left) { right }
         output.push_str("if (!(");
+        generator.suppress_set_e_depth += 1;
         output.push_str(&generator.generate_command(left));
+        generator.suppress_set_e_depth -= 1;
         output.push_str(")) {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
@@ -167,7 +169,9 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
     } else if let Command::And(_and_left, _and_right) = left {
         // Special handling for AND operations in OR context
         // Use the logical AND generation function to handle the AND operation properly
+        generator.suppress_set_e_depth += 1;
         let and_result = generator.generate_command(left);
+        generator.suppress_set_e_depth -= 1;
         output.push_str(&and_result);
         output.push_str(&generator.indent());
         output.push_str("if ($CHILD_ERROR != 0) {\n");
@@ -185,7 +189,9 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
             if let Word::Literal(name, _) = &simple_cmd.name {
                 if name == "grep" {
                     // For grep commands in logical OR, generate the command and check exit code
+                    generator.suppress_set_e_depth += 1;
                     output.push_str(&generator.generate_command(left));
+                    generator.suppress_set_e_depth -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("if ($CHILD_ERROR != 0) {\n");
                     generator.indent_level += 1;
@@ -197,7 +203,9 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                     return output;
                 } else if name == "ls" {
                     // For ls commands in logical OR, generate the command and check if files were found
+                    generator.suppress_set_e_depth += 1;
                     output.push_str(&generator.generate_command(left));
+                    generator.suppress_set_e_depth -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("if ( !defined $ls_success || $ls_success == 0 ) {\n");
                     generator.indent_level += 1;
@@ -237,7 +245,9 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                 if let Word::Literal(name, _) = &simple_cmd.name {
                     if name == "ls" {
                         // For ls commands in logical OR, generate the command and check if files were found
+                        generator.suppress_set_e_depth += 1;
                         output.push_str(&generator.generate_command(left));
+                        generator.suppress_set_e_depth -= 1;
                         output.push_str(&generator.indent());
                         output.push_str("if ( !defined $ls_success || $ls_success == 0 ) {\n");
                         generator.indent_level += 1;
@@ -253,7 +263,9 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         }
 
         // Execute left command and check exit code
+        generator.suppress_set_e_depth += 1;
         output.push_str(&generator.generate_command(left));
+        generator.suppress_set_e_depth -= 1;
 
         // Execute right command if left command fails
         // For diff commands, check $diff_exit_code; for others, check $CHILD_ERROR

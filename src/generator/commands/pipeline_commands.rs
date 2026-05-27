@@ -2566,6 +2566,10 @@ fn generate_buffered_pipeline(
             "if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n",
             unique_id
         ));
+        if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+            output.push_str(&generator.indent());
+            output.push_str("exit $main_exit_code if $__set_e && $main_exit_code != 0;\n");
+        }
         output.push_str(&generator.indent());
         // output.push_str("exit(1) if $main_exit_code == 1;\n");
 
@@ -2748,6 +2752,12 @@ fn generate_buffered_pipeline(
                     "if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n",
                     unique_id
                 ));
+                if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                    output.push_str(&generator.indent());
+                    output.push_str(
+                        "exit $main_exit_code if $__set_e && $main_exit_code != 0;\n",
+                    );
+                }
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
 
@@ -2881,6 +2891,12 @@ fn generate_buffered_pipeline(
                     "if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n",
                     unique_id
                 ));
+                if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                    output.push_str(&generator.indent());
+                    output.push_str(
+                        "exit $main_exit_code if $__set_e && $main_exit_code != 0;\n",
+                    );
+                }
 
                 // Return the output variable as the last statement.
                 // Bash command substitution strips all trailing newlines.
@@ -3003,6 +3019,11 @@ fn generate_buffered_pipeline(
                 "if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n",
                 unique_id
             ));
+            if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                output.push_str(&generator.indent());
+                output
+                    .push_str("exit $main_exit_code if $__set_e && $main_exit_code != 0;\n");
+            }
             // Bash command substitution strips all trailing newlines.
             output.push_str(&generator.indent());
             output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));

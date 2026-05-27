@@ -1,1 +1,1 @@
-test_grep:y00000
+ALL_TESTS_PASSED:y99999

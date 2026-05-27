@@ -12,7 +12,9 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             generator.generate_test_command(cmd, &mut output);
         }
         _ => {
+            generator.suppress_set_e_depth += 1;
             output.push_str(&generator.generate_command(&if_stmt.condition));
+            generator.suppress_set_e_depth -= 1;
         }
     }
     output.push_str(") {\n");
@@ -221,7 +223,9 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             }
         }
         _ => {
+            generator.suppress_set_e_depth += 1;
             output.push_str(&generator.generate_command(&while_loop.condition));
+            generator.suppress_set_e_depth -= 1;
         }
     }
     output.push_str(" ) {\n");
