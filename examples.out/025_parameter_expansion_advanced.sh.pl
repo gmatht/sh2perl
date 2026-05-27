@@ -36,6 +36,6 @@ $CHILD_ERROR = 0;
 my $s2;
 $s2 = "abba";
 print $s2 =~ s/b/X/grs;
-if ( !( $s2 =~ s/b/X/grs =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($s2 =~ s/b/X/grs) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;

@@ -38,6 +38,6 @@ my $found_files = do {
 };
 print "Found shell scripts:\n";
 print $found_files;
-if ( !( $found_files =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($found_files) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;

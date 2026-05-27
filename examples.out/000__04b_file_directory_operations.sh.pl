@@ -30,7 +30,7 @@ my $file_list = do {
 };
 print "File listing:\n";
 print $file_list;
-if ( !( $file_list =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($file_list) =~ m{\n\z}msx ) ) { print "\n"; }
 my $found_files = do {
     use File::Basename;
     my @files_47 = ();
@@ -58,7 +58,7 @@ my $found_files = do {
 };
 print "Found shell scripts:\n";
 print $found_files;
-if ( !( $found_files =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($found_files) =~ m{\n\z}msx ) ) { print "\n"; }
 print "=== File and Directory Operations Complete ===\n";
 
 exit $main_exit_code;

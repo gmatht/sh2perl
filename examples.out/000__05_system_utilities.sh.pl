@@ -43,6 +43,6 @@ $output_116 };
 } };
 print "Yes command result:\n";
 print $yes_result;
-if ( !( $yes_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($yes_result) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;

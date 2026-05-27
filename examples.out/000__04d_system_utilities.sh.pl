@@ -57,7 +57,7 @@ $output_66 };
 } };
 print "Yes command result:\n";
 print $yes_result;
-if ( !( $yes_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($yes_result) =~ m{\n\z}msx ) ) { print "\n"; }
 print "=== System Utilities Complete ===\n";
 
 exit $main_exit_code;
