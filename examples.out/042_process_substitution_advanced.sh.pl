@@ -9,9 +9,10 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$SIG{__DIE__} = sub { exit 1 };
+$__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== More process substitution examples ==\n";
@@ -20,28 +21,28 @@ my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_0 = q{};
-    my $output_printed_0;
+    my $output_239 = q{};
+    my $output_printed_239;
     {
-        my $pipeline_success_0 = 1;
-        $output_0 .= "a\nc\nb";
-    if ( !($output_0 =~ m{\n\z}msx) ) { $output_0 .= "\n"; }
+        my $pipeline_success_239 = 1;
+        $output_239 .= "a\nc\nb";
+    if ( !($output_239 =~ m{\n\z}msx) ) { $output_239 .= "\n"; }
     $CHILD_ERROR = 0;
-            my @sort_lines_0_1 = split /\n/msx, $output_0;
-        my @sort_sorted_0_1 = sort @sort_lines_0_1;
-        my $output_0_1 = join "\n", @sort_sorted_0_1;
-        if ($output_0_1 ne q{} && !($output_0_1 =~ m{\n\z}msx)) {
-        $output_0_1 .= "\n";
+            my @sort_lines_239_1 = split /\n/msx, $output_239;
+        my @sort_sorted_239_1 = sort @sort_lines_239_1;
+        my $output_239_1 = join "\n", @sort_sorted_239_1;
+        if ($output_239_1 ne q{} && !($output_239_1 =~ m{\n\z}msx)) {
+        $output_239_1 .= "\n";
         }
-        $output_0 = $output_0_1;
-        $output_0 = $output_0_1;
-        if ($output_0 ne q{} && !defined $output_printed_0) {
-            print $output_0;
-            if (!($output_0 =~ m{\n\z}msx)) {
+        $output_239 = $output_239_1;
+        $output_239 = $output_239_1;
+        if ($output_239 ne q{} && !defined $output_printed_239) {
+            print $output_239;
+            if (!($output_239 =~ m{\n\z}msx)) {
                 print "\n";
             }
         }
-        if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+        if ( !$pipeline_success_239 ) { $main_exit_code = 1; }
         }
 }
 use File::Path qw(make_path);
@@ -55,28 +56,28 @@ my $output_ps_fh_2;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_1 = q{};
-    my $output_printed_1;
+    my $output_240 = q{};
+    my $output_printed_240;
     {
-        my $pipeline_success_1 = 1;
-        $output_1 .= "a\nb\nd";
-    if ( !($output_1 =~ m{\n\z}msx) ) { $output_1 .= "\n"; }
+        my $pipeline_success_240 = 1;
+        $output_240 .= "a\nb\nd";
+    if ( !($output_240 =~ m{\n\z}msx) ) { $output_240 .= "\n"; }
     $CHILD_ERROR = 0;
-            my @sort_lines_1_1 = split /\n/msx, $output_1;
-        my @sort_sorted_1_1 = sort @sort_lines_1_1;
-        my $output_1_1 = join "\n", @sort_sorted_1_1;
-        if ($output_1_1 ne q{} && !($output_1_1 =~ m{\n\z}msx)) {
-        $output_1_1 .= "\n";
+            my @sort_lines_240_1 = split /\n/msx, $output_240;
+        my @sort_sorted_240_1 = sort @sort_lines_240_1;
+        my $output_240_1 = join "\n", @sort_sorted_240_1;
+        if ($output_240_1 ne q{} && !($output_240_1 =~ m{\n\z}msx)) {
+        $output_240_1 .= "\n";
         }
-        $output_1 = $output_1_1;
-        $output_1 = $output_1_1;
-        if ($output_1 ne q{} && !defined $output_printed_1) {
-            print $output_1;
-            if (!($output_1 =~ m{\n\z}msx)) {
+        $output_240 = $output_240_1;
+        $output_240 = $output_240_1;
+        if ($output_240 ne q{} && !defined $output_printed_240) {
+            print $output_240;
+            if (!($output_240 =~ m{\n\z}msx)) {
                 print "\n";
             }
         }
-        if ( !$pipeline_success_1 ) { $main_exit_code = 1; }
+        if ( !$pipeline_success_240 ) { $main_exit_code = 1; }
         }
 }
 use File::Path qw(make_path);
@@ -142,7 +143,7 @@ if (!-d $temp_dir_fh_4) { make_path($temp_dir_fh_4); }
 open my $fh_ps_fh_4, '>', $temp_file_ps_fh_4 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_4} $output_ps_fh_4;
 close $fh_ps_fh_4 or croak "Close failed: $ERRNO\n";
-my $paste_result_2 = do {
+my $paste_result_241 = do {
 my @paste_file1_lines_fh_5;
 my @paste_file2_lines_fh_5;
 if (open my $fh1, '<', $temp_file_ps_fh_3) {
@@ -168,6 +169,6 @@ for my $i (0..$max_lines-1) {
 }
 $paste_output
 };
-print $paste_result_2;
+print $paste_result_241;
 
 exit $main_exit_code;
