@@ -112,6 +112,14 @@ fn translate_awk_print_args(rem: &str, acc_vars: &HashSet<String>, generator: &m
                     if let Ok(re) = regex::Regex::new(r#"(\$(?:\w+(?:\[\w+\])?))\s+(["])"#) {
                         translated = re.replace_all(&translated, "$1 . $2").to_string();
                     }
+                    // Function call followed by a string literal: length($x) "str" -> length($x) . "str"
+                    if let Ok(re) = regex::Regex::new(r#"\)\s+(["'])"#) {
+                        translated = re.replace_all(&translated, ") . $1").to_string();
+                    }
+                    // Function call followed by a variable: length($x) $y -> length($x) . $y
+                    if let Ok(re) = regex::Regex::new(r#"\)\s+(\$)"#) {
+                        translated = re.replace_all(&translated, ") . $1").to_string();
+                    }
                     parts.push(translated);
                 }
             }
@@ -399,12 +407,19 @@ pub fn generate_awk_command(
             if parts.is_empty() {
                 output.push_str("push @result, \"\\n\";\n");
             } else {
-                // Wrap numeric expressions (those containing division) with
-                // sprintf("%.6g", ...) to match AWK's default OFMT formatting.
+                // Wrap division sub-expressions with sprintf("%.6g", ...) to match
+                // AWK's default OFMT formatting. The division may be either a
+                // standalone numeric part OR embedded inside a concatenation
+                // expression that starts with a string literal.
                 let formatted_parts: Vec<String> = parts.iter().map(|p| {
-                    let is_quoted = p.starts_with('\'') || p.starts_with('"');
-                    if !is_quoted && p.contains('/') {
-                        format!("sprintf(\"%.6g\", {})", p)
+                    if p.contains('/') {
+                        // Replace bare $var/$var2 patterns (arithmetic division) with
+                        // sprintf("%.6g", ...) wherever they appear in the expression.
+                        if let Ok(re) = regex::Regex::new(r"(\$\w+\s*/\s*\$?\w+)") {
+                            re.replace_all(p, "sprintf(\"%.6g\", $1)").to_string()
+                        } else {
+                            p.clone()
+                        }
                     } else {
                         p.clone()
                     }

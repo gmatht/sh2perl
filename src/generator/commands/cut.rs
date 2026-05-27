@@ -135,6 +135,10 @@ pub fn generate_cut_command(
         "${} = join \"\\n\", @result_{};\n",
         input_var, unique_id
     ));
+    output.push_str(&format!(
+        "if (${} ne q{{}} && !(${}  =~ m{{\\n\\z}}msx)) {{ ${} .= \"\\n\"; }}\n",
+        input_var, input_var, input_var
+    ));
     output.push_str("\n");
 
     output
