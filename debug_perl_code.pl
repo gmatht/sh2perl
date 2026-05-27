@@ -8,29 +8,28 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $result;
-$result = do { my $grep_result_0;
-my @grep_lines_0 = ();
-my @grep_filenames_0 = ();
-if (-e "file.txt") {
-    open my $fh, '<', "file.txt" or croak "Cannot open file: $ERRNO";
-    while (my $line = <$fh>) {
-        chomp $line;
-        push @grep_lines_0, $line;
-        push @grep_filenames_0, "file.txt";
-    }
-    close $fh
-        or croak "Close failed: $OS_ERROR";
+$__set_e = 1;
+# set uo not implemented
+# set pipefail not implemented
+print "== extglob ==\n";
+# extglob option enabled
+my $f1;
+$f1 = "file.js";
+my $f2;
+$f2 = "thing.min.js";
+if ($f1 =~ /^(?!.*[.]min).*[.]js$/msx) {
+        print 'f1-ok' . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
 }
-else { print {*STDERR} "grep: file.txt: No such file or directory\n"; }
-my @grep_filtered_0 = grep { /pattern/msx } @grep_lines_0;
-$grep_result_0 = join "\n", @grep_filtered_0;
-if (!($grep_result_0 =~ m{\n\z}msx || $grep_result_0 eq q{})) {
-    $grep_result_0 .= "\n";
+if (!($f2 =~ /^(?!.*[.]min).*[.]js$/msx)) {
+        print 'f2-filtered' . "\n";
+    $CHILD_ERROR = 0;
 }
-$CHILD_ERROR = scalar @grep_filtered_0 > 0 ? 0 : 1;
- $grep_result_0; };
 
 exit $main_exit_code;

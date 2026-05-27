@@ -9,9 +9,10 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$SIG{__DIE__} = sub { exit 1 };
+$__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== Advanced parameter expansion ==\n";

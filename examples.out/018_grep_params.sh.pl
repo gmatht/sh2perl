@@ -9,9 +9,10 @@ use File::Path qw(make_path remove_tree);
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$SIG{__DIE__} = sub { exit 1 };
+$__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== Basic grep parameters ==\n";
@@ -44,6 +45,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_192 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 # Original bash: echo -e "line1\nline2\nline3" | grep -v "line2"
 {
@@ -74,6 +76,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_193 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 # Original bash: echo -e "match\nno match\nmatch again" | grep -c "match"
 {
@@ -101,6 +104,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_194 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 print "== Context parameters ==\n";
 # Original bash: echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -A 2 "TARGET"
@@ -138,6 +142,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_195 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 # Original bash: echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -B 2 "TARGET"
 {
@@ -176,6 +181,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_196 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 # Original bash: echo -e "line1\nline2\nTARGET\nline4\nline5" | grep -C 1 "TARGET"
 {
@@ -217,6 +223,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_197 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 print "== File handling parameters ==\n";
 do {
@@ -350,6 +357,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_203 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 # Original bash: echo "text with pattern in it" | grep -b "pattern"
 {
@@ -388,6 +396,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_204 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 # Original bash: echo "text with pattern in it" | grep -n "pattern"
 {
@@ -421,6 +430,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_205 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 print "== Recursive and include/exclude parameters ==\n";
 use File::Path qw(make_path);
@@ -726,6 +736,7 @@ $CHILD_ERROR = scalar @grep_filtered_210 > 0 ? 0 : 1;
         }
     }
     if ( !$pipeline_success_211 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 print "== Advanced parameters ==\n";
 # Original bash: echo -e "match1\nmatch2\nmatch3\nmatch4" | grep -m 2 "match"
@@ -758,6 +769,7 @@ $CHILD_ERROR = 0;
         }
     }
     if ( !$pipeline_success_212 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 if (do {
 {
@@ -866,6 +878,7 @@ if ($CHILD_ERROR != 0) {
         }
     }
     if ( !$pipeline_success_214 ) { $main_exit_code = 1; }
+    exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 if ( -e "temp_file.txt" ) {
     if ( -d "temp_file.txt" ) {
