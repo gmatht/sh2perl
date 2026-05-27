@@ -64,8 +64,16 @@ pub fn generate_tail_command(
     output.push_str("my @result = @lines[$start_index..$#lines];\n");
     if input_var.starts_with('$') {
         output.push_str(&format!("{} = join \"\\n\", @result;\n", input_var));
+        output.push_str(&format!(
+            "if ({} ne q{{}} && !({} =~ m{{\\n\\z}}msx)) {{ {} .= \"\\n\"; }}\n",
+            input_var, input_var, input_var
+        ));
     } else {
         output.push_str(&format!("${} = join \"\\n\", @result;\n", input_var));
+        output.push_str(&format!(
+            "if (${} ne q{{}} && !(${}  =~ m{{\\n\\z}}msx)) {{ ${} .= \"\\n\"; }}\n",
+            input_var, input_var, input_var
+        ));
     }
     output.push_str("\n");
 
