@@ -56,8 +56,8 @@ my $result1 = do {
 };
 print "Results:\n";
 print $result1;
-if ( !( $result1 =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($result1) =~ m{\n\z}msx ) ) { print "\n"; }
 print $result2;
-if ( !( $result2 =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($result2) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;

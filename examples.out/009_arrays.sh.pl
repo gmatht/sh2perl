@@ -17,7 +17,7 @@ $__set_e = 1;
 print "== Indexed arrays ==\n";
 my @arr = ("one", "two", "three");
 print $arr[1];
-if ( !( $arr[1] =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($arr[1]) =~ m{\n\z}msx ) ) { print "\n"; }
 print scalar(@arr) . "\n";
 $CHILD_ERROR = 0;
 my $x;
@@ -29,13 +29,13 @@ $CHILD_ERROR = 0;
 print "== Associative arrays ==\n";
 my %map = ();
 # declare map not implemented
-$map{"foo"} = 'bar';
-$map{"two"} = "1 + 1";
 $map{"answer"} = '42';
+$map{"two"} = "1 + 1";
+$map{"foo"} = 'bar';
 print $map{foo};
-if ( !( $map{foo} =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($map{foo}) =~ m{\n\z}msx ) ) { print "\n"; }
 print $map{answer};
-if ( !( $map{answer} =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($map{answer}) =~ m{\n\z}msx ) ) { print "\n"; }
 {
     my $output_154 = q{};
     my $output_printed_154;

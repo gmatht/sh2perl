@@ -62,15 +62,21 @@ $CHILD_ERROR = 0;
 my $s2;
 $s2 = "abba";
 print $s2 =~ s/b/X/grs;
-if ( !( $s2 =~ s/b/X/grs =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($s2 =~ s/b/X/grs) =~ m{\n\z}msx ) ) { print "\n"; }
 print "== More parameter expansion ==\n";
 my $var = "hello world";
 print ${var} =~ s/^hello//r;
-if ( !( ${var} =~ s/^hello//r =~ m{\n\z}msx ) ) { print "\n"; }
-print ${var} =~ s/world$//r;
-if ( !( ${var} =~ s/world$//r =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( (${var} =~ s/^hello//r) =~ m{\n\z}msx ) ) { print "\n"; }
+do {
+    my $output = scalar reverse( (scalar reverse ${var}) =~ s/^dlrow//r );
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
 print $var =~ s/o/0/grs;
-if ( !( $var =~ s/o/0/grs =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($var =~ s/o/0/grs) =~ m{\n\z}msx ) ) { print "\n"; }
 print "== Default values ==\n";
 my $maybe;
 undef $maybe;

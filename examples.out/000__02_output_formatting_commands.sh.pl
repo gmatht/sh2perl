@@ -171,7 +171,7 @@ my $strings_result = do { do {
 } };
 print "Strings result:\n";
 print $strings_result;
-if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }
 print "=== I/O Redirection Commands ===\n";
 my $tee_result = do { do {
     my $output_1 = q{};

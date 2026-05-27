@@ -45,7 +45,7 @@ my $file_content = do { do {
 } };
 print "First 5 lines of this file:\n";
 print $file_content;
-if ( !( $file_content =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($file_content) =~ m{\n\z}msx ) ) { print "\n"; }
 my $grep_result = do { my $grep_result_49;
 my @grep_lines_49 = ();
 my @grep_filenames_49 = ();
@@ -72,7 +72,7 @@ $CHILD_ERROR = scalar @grep_filtered_49 > 0 ? 0 : 1;
  $grep_result_49; };
 print "Lines containing 'echo':\n";
 print $grep_result;
-if ( !( $grep_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($grep_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $sed_result = do { do {
     my $output_50 = q{};
     my $output_printed_50;
@@ -149,7 +149,7 @@ my $sort_result = do { do {
 } };
 print "Sorted words:\n";
 print $sort_result;
-if ( !( $sort_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($sort_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $uniq_result = do { do {
     my $output_53 = q{};
     my $output_printed_53;
@@ -174,7 +174,7 @@ my $uniq_result = do { do {
 } };
 print "Unique words:\n";
 print $uniq_result;
-if ( !( $uniq_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($uniq_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $line_count = do { do {
     my $output_54 = q{};
     my $output_printed_54;
@@ -391,7 +391,7 @@ $paste_output
 };
 print "Pasted columns:\n";
 print $paste_result;
-if ( !( $paste_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($paste_result) =~ m{\n\z}msx ) ) { print "\n"; }
 if ( -e "temp1.txt" ) {
     if ( -d "temp1.txt" ) {
         carp "rm: carping: ", "temp1.txt",
@@ -486,7 +486,7 @@ $comm_output =~ s/\n$//msx;
 $comm_output };
 print "Common lines:\n";
 print $comm_result;
-if ( !( $comm_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($comm_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $diff_result = do { my $diff_exit_code = 0;
 my $diff_output = q{};
 {
@@ -508,7 +508,7 @@ $diff_output;
  };
 print "File differences:\n";
 print $diff_result;
-if ( !( $diff_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($diff_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $tr_result = do { do {
     my $input_data = ("HELLO WORLD") . "\n";
     my $set1_63 = 'A-Z';
@@ -583,7 +583,7 @@ my $xargs_result = do { do {
 } };
 print "Xargs result:\n";
 print $xargs_result;
-if ( !( $xargs_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($xargs_result) =~ m{\n\z}msx ) ) { print "\n"; }
 if ( -e "file1.txt" ) {
     if ( -d "file1.txt" ) {
         carp "rm: carping: ", "file1.txt",

@@ -12,8 +12,8 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $MAGIC_3 = 3;
 my $MAGIC_5 = 5;
+my $MAGIC_3 = 3;
 
 print "=== Text Processing Commands ===\n";
 my $file_content = do { do {
@@ -45,7 +45,7 @@ my $file_content = do { do {
 } };
 print "First 5 lines of main.rs:\n";
 print $file_content;
-if ( !( $file_content =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($file_content) =~ m{\n\z}msx ) ) { print "\n"; }
 my $grep_result = do { my $grep_result_118;
 my @grep_lines_118 = ();
 my @grep_filenames_118 = ();
@@ -72,7 +72,7 @@ $CHILD_ERROR = scalar @grep_filtered_118 > 0 ? 0 : 1;
  $grep_result_118; };
 print "Lines containing 'fn':\n";
 print $grep_result;
-if ( !( $grep_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($grep_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $sed_result = do { do {
     my $output_119 = q{};
     my $output_printed_119;
@@ -149,7 +149,7 @@ my $sort_result = do { do {
 } };
 print "Sorted words:\n";
 print $sort_result;
-if ( !( $sort_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($sort_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $uniq_result = do { do {
     my $output_122 = q{};
     my $output_printed_122;
@@ -174,7 +174,7 @@ my $uniq_result = do { do {
 } };
 print "Unique words:\n";
 print $uniq_result;
-if ( !( $uniq_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($uniq_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $line_count = do { do {
     my $output_123 = q{};
     my $output_printed_123;
@@ -408,7 +408,7 @@ my $paste_result = do { do {
 } };
 print "Pasted columns:\n";
 print $paste_result;
-if ( !( $paste_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($paste_result) =~ m{\n\z}msx ) ) { print "\n"; }
 if ( -e "temp1.txt" ) {
     if ( -d "temp1.txt" ) {
         carp "rm: carping: ", "temp1.txt",
@@ -503,7 +503,7 @@ $comm_output =~ s/\n$//msx;
 $comm_output };
 print "Common lines:\n";
 print $comm_result;
-if ( !( $comm_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($comm_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $diff_result = do { my $diff_exit_code = 0;
 my $diff_output = q{};
 {
@@ -525,7 +525,7 @@ $diff_output;
  };
 print "File differences:\n";
 print $diff_result;
-if ( !( $diff_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($diff_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $tr_result = do { do {
     my $input_data = ("HELLO WORLD") . "\n";
     my $set1_133 = 'A-Z';
@@ -600,7 +600,7 @@ my $xargs_result = do { do {
 } };
 print "Xargs result:\n";
 print $xargs_result;
-if ( !( $xargs_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($xargs_result) =~ m{\n\z}msx ) ) { print "\n"; }
 if ( -e "file1.txt" ) {
     if ( -d "file1.txt" ) {
         carp "rm: carping: ", "file1.txt",

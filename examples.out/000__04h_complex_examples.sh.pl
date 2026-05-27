@@ -168,7 +168,7 @@ date\n";
 my $process_result = do { my $command = "bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
 print "Process substitution result:\n";
 print $process_result;
-if ( !( $process_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($process_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $here_string_result = do { my $here_input = "hello world"; chomp(my $result = qx{echo "$here_input" | tr a-z A-Z}); $CHILD_ERROR = $? >> 8; $result; };
 do {
     my $output = "Here string result: $here_string_result";

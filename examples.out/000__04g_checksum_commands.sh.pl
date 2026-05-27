@@ -130,7 +130,7 @@ my $strings_result = do { do {
 } };
 print "Strings result:\n";
 print $strings_result;
-if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }
 if ( -e "test_checksum.txt" ) {
     if ( -d "test_checksum.txt" ) {
         carp "rm: carping: ", "test_checksum.txt",
