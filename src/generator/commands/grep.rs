@@ -720,13 +720,12 @@ pub fn generate_grep_command(
             ));
         } else {
             output.push_str(&format!(
-                "$grep_result_{} = scalar @grep_filtered_{};\n",
+                "$grep_result_{} = scalar @grep_filtered_{} . \"\\n\";\n",
                 command_index, command_index
             ));
         }
         if should_print && !quiet_mode {
             output.push_str(&format!("print $grep_result_{};\n", command_index));
-            output.push_str("print \"\\n\";\n");
         }
     } else if after_context > 0 || before_context > 0 || context_lines > 0 {
         // Handle context flags: -A, -B, -C
