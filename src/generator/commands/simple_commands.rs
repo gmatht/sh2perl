@@ -785,7 +785,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 output.push_str(&generator.indent());
                 output.push_str("$CHILD_ERROR = 0;\n");
             } else {
-                // Check for -e flag
+                // Check for -e / -n flags
                 let has_e_flag = cmd.args.iter().any(|arg| {
                     if let Word::Literal(s, _) = arg {
                         s == "-e"
@@ -793,14 +793,21 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         false
                     }
                 });
+                let has_n_flag = cmd.args.iter().any(|arg| {
+                    if let Word::Literal(s, _) = arg {
+                        s == "-n"
+                    } else {
+                        false
+                    }
+                });
 
-                // Filter out the -e flag from arguments
+                // Filter out the -e and -n flags from arguments
                 let filtered_args: Vec<&Word> = cmd
                     .args
                     .iter()
                     .filter(|&arg| {
                         if let Word::Literal(s, _) = arg {
-                            s != "-e"
+                            s != "-e" && s != "-n"
                         } else {
                             true
                         }
@@ -998,13 +1005,21 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     })
                     .collect();
 
-                if args.len() == 1 {
+                if args.is_empty() {
+                    // After filtering flags, no content to print
+                    if !has_n_flag {
+                        output.push_str(&generator.indent());
+                        output.push_str("print \"\\n\";\n");
+                    }
+                    output.push_str(&generator.indent());
+                    output.push_str("$CHILD_ERROR = 0;\n");
+                } else if args.len() == 1 {
                     output.push_str(&generator.indent());
                     // Check if the argument is a command substitution
-                    if matches!(cmd.args[0], Word::CommandSubstitution(_, _)) {
+                    if matches!(cmd.args.iter().find(|a| !matches!(a, Word::Literal(s, _) if s == "-n" || s == "-e")), Some(Word::CommandSubstitution(_, _))) {
                         // For command substitution, don't add extra newline as it already contains proper formatting
                         output.push_str(&format!("print {};\n", args[0]));
-                    } else if args[0].starts_with('"')
+                    } else if !has_n_flag && args[0].starts_with('"')
                         && args[0].ends_with('"')
                         && !args[0].contains("\\n")
                         && !args[0].contains('$')
@@ -1012,24 +1027,27 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // The string is already a valid Perl literal, so reuse it directly.
                         let content = &args[0][1..args[0].len() - 1]; // Remove quotes
                         output.push_str(&format!("print \"{}\\n\";\n", content));
-                    } else if args[0].starts_with('$') && !args[0].contains("\\n") {
+                    } else if !has_n_flag && args[0].starts_with('$') && !args[0].contains("\\n") {
                         // For variables, check if they already end with newline to avoid extra blank lines
                         output.push_str(&format!("print {};\n", args[0]));
                         output.push_str(&format!(
-                            "if ( !( {} =~ {} ) ) {{ print \"\\n\"; }}\n",
+                            "if ( !( ({}) =~ {} ) ) {{ print \"\\n\"; }}\n",
                             args[0],
                             generator.newline_end_regex()
                         ));
+                    } else if has_n_flag {
+                        // -n flag: suppress trailing newline
+                        output.push_str(&format!("print {};\n", args[0]));
                     } else {
                         // Check if the argument contains variables that might end with newlines
-                        let has_variables = match &cmd.args[0] {
+                        let has_variables = cmd.args.iter().any(|arg| match arg {
                             Word::Variable(_, _, _) => true,
                             Word::StringInterpolation(interp, _) => interp
                                 .parts
                                 .iter()
                                 .any(|part| matches!(part, crate::ast::StringPart::Variable(_))),
                             _ => false,
-                        } || args[0].contains('$');
+                        }) || args[0].contains('$');
 
                         if has_variables {
                             output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if ( !( $output =~ {} ) ) {{\n        print \"\\n\";\n    }}\n}};\n", args[0], generator.newline_end_regex()));
@@ -1070,7 +1088,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             _ => false,
                         });
                         if has_variables {
-                            output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if (!($output =~ /\\n$/msx)) {{\n        print \"\\n\";\n    }}\n}};\n", args_str));
+                            if has_n_flag {
+                                output.push_str(&format!("print {};\n", args_str));
+                            } else {
+                                output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if (!($output =~ /\\n$/msx)) {{\n        print \"\\n\";\n    }}\n}};\n", args_str));
+                            }
+                        } else if has_n_flag {
+                            output.push_str(&format!("print {};\n", args_str));
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args_str));
                         }

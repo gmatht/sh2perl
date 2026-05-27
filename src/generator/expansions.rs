@@ -56,34 +56,41 @@ pub fn generate_parameter_expansion_impl(
         }
         ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
             // ${var%suffix} - remove shortest suffix
+            // To get shortest (rightmost) suffix, use the reverse trick:
+            // reverse the var, apply shortest-prefix removal on the reversed pattern, then reverse
+            let rev_pattern = reverse_glob_pattern(pattern);
+            let regex = glob_to_perl_regex_nongreedy(&rev_pattern);
             format!(
-                "${{{}}} =~ s/{}$//r",
+                "scalar reverse( (scalar reverse ${{{}}}) =~ s/^{}//r )",
                 pe.variable,
-                escape_regex_pattern(pattern)
+                regex
             )
         }
         ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
-            // ${var%%suffix} - remove longest suffix
+            // ${var%%suffix} - remove longest suffix (greedy from end)
+            let regex = glob_to_perl_regex_greedy(pattern);
             format!(
-                "${{{}}} =~ s/{}$//grs",
+                "${{{}}} =~ s/{}$//sr",
                 pe.variable,
-                escape_regex_pattern(pattern)
+                regex
             )
         }
         ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
-            // ${var#prefix} - remove shortest prefix
+            // ${var#prefix} - remove shortest prefix (non-greedy from start)
+            let regex = glob_to_perl_regex_nongreedy(pattern);
             format!(
                 "${{{}}} =~ s/^{}//r",
                 pe.variable,
-                escape_regex_pattern(pattern)
+                regex
             )
         }
         ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
-            // ${var##prefix} - remove longest prefix
+            // ${var##prefix} - remove longest prefix (greedy from start)
+            let regex = glob_to_perl_regex_greedy(pattern);
             format!(
-                "${{{}}} =~ s/^{}//grs",
+                "${{{}}} =~ s/^{}//sr",
                 pe.variable,
-                escape_regex_pattern(pattern)
+                regex
             )
         }
         ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
@@ -144,6 +151,113 @@ pub fn generate_parameter_expansion_impl(
 }
 
 // Helper methods for regex escaping
+/// Convert a shell glob pattern to a Perl regex with non-greedy `*` (for shortest match)
+fn glob_to_perl_regex_nongreedy(pattern: &str) -> String {
+    let mut result = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => result.push_str(".*?"),
+            '?' => result.push('.'),
+            '[' => {
+                // Pass character classes through
+                result.push('[');
+                while let Some(&c2) = chars.peek() {
+                    chars.next();
+                    result.push(c2);
+                    if c2 == ']' { break; }
+                }
+            }
+            '\\' => {
+                if let Some(&next) = chars.peek() {
+                    chars.next();
+                    result.push('\\');
+                    result.push(next);
+                }
+            }
+            // Escape Perl regex metacharacters that aren't glob metacharacters
+            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' => {
+                result.push('\\');
+                result.push(c);
+            }
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+/// Convert a shell glob pattern to a Perl regex with greedy `*` (for longest match)
+fn glob_to_perl_regex_greedy(pattern: &str) -> String {
+    let mut result = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => result.push_str(".*"),
+            '?' => result.push('.'),
+            '[' => {
+                result.push('[');
+                while let Some(&c2) = chars.peek() {
+                    chars.next();
+                    result.push(c2);
+                    if c2 == ']' { break; }
+                }
+            }
+            '\\' => {
+                if let Some(&next) = chars.peek() {
+                    chars.next();
+                    result.push('\\');
+                    result.push(next);
+                }
+            }
+            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' => {
+                result.push('\\');
+                result.push(c);
+            }
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+/// Reverse a glob pattern for use with the suffix reverse trick.
+/// e.g. "o*" becomes "*o", "*abc" becomes "abc*"
+fn reverse_glob_pattern(pattern: &str) -> String {
+    // Collect glob tokens (literals, *, ?)
+    let mut tokens: Vec<String> = Vec::new();
+    let mut literal = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' | '?' => {
+                if !literal.is_empty() {
+                    tokens.push(literal.chars().rev().collect());
+                    literal = String::new();
+                }
+                tokens.push(c.to_string());
+            }
+            '[' => {
+                if !literal.is_empty() {
+                    tokens.push(literal.chars().rev().collect());
+                    literal = String::new();
+                }
+                let mut class = String::from("[");
+                while let Some(&c2) = chars.peek() {
+                    chars.next();
+                    class.push(c2);
+                    if c2 == ']' { break; }
+                }
+                tokens.push(class);
+            }
+            _ => literal.push(c),
+        }
+    }
+    if !literal.is_empty() {
+        tokens.push(literal.chars().rev().collect());
+    }
+    tokens.reverse();
+    tokens.join("")
+}
+
 fn escape_regex_pattern(pattern: &str) -> String {
     // Escape special regex characters in the pattern
     pattern
