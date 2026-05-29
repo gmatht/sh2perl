@@ -140,7 +140,7 @@ $CHILD_ERROR = 0;
         my $grep_result_184_1;
     my @grep_lines_184_1 = split /\n/msx, $output_184;
     my @grep_filtered_184_1 = grep { /match/msx } @grep_lines_184_1;
-    $grep_result_184_1 = scalar @grep_filtered_184_1;
+    $grep_result_184_1 = scalar @grep_filtered_184_1 . "\n";
     $CHILD_ERROR = scalar @grep_filtered_184_1 > 0 ? 0 : 1;
     $output_184 = $grep_result_184_1;
     $output_184 = $grep_result_184_1;

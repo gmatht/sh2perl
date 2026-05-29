@@ -12,8 +12,8 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $MAGIC_5 = 5;
 my $MAGIC_3 = 3;
+my $MAGIC_5 = 5;
 
 print "=== Text Processing Commands ===\n";
 my $file_content = do { do {
@@ -324,6 +324,7 @@ my $cut_result = do { do {
     }
     }
     $output_129 = join "\n", @result_130;
+    if ($output_129 ne q{} && !($output_129  =~ m{\n\z}msx)) { $output_129 .= "\n"; }
 
     if ( !$pipeline_success_129 ) { $main_exit_code = 1; }
     $output_129 =~ s/\n+\z//msx;
