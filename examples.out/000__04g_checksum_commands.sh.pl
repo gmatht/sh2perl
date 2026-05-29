@@ -105,6 +105,7 @@ my $strings_result = do { do {
         push @result, $1;
     }
     my $line = join "\n", @result;
+    if ($line ne q{} && !($line =~ m{\n\z}msx)) { $line .= "\n"; }
     $output_111 = $line;
     my $num_lines       = 3;
     my $head_line_count = 0;

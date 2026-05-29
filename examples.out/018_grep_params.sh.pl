@@ -90,7 +90,7 @@ $CHILD_ERROR = 0;
         my $grep_result_194_1;
     my @grep_lines_194_1 = split /\n/msx, $output_194;
     my @grep_filtered_194_1 = grep { /match/msx } @grep_lines_194_1;
-    $grep_result_194_1 = scalar @grep_filtered_194_1;
+    $grep_result_194_1 = scalar @grep_filtered_194_1 . "\n";
     $CHILD_ERROR = scalar @grep_filtered_194_1 > 0 ? 0 : 1;
     $output_194 = $grep_result_194_1;
     $output_194 = $grep_result_194_1;
@@ -658,7 +658,6 @@ for my $file (@file_order_210) {
 }
 $grep_result_210 =~ s/\n$//msx; # Remove trailing newline
 print $grep_result_210;
-print "\n";
 $CHILD_ERROR = scalar @grep_filtered_210 > 0 ? 0 : 1;
 # Original bash: grep -r "pattern" test_dir --include="*.txt" | wc -l
 {
