@@ -13,46 +13,46 @@ our $CHILD_ERROR;
 
 print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
 my $result1 = do {
-    my @ls_files_0 = ();
+    my @ls_files_277 = ();
     if ( -f q{.} ) {
-        push @ls_files_0, q{.};
+        push @ls_files_277, q{.};
     }
     elsif ( -d q{.} ) {
         if ( opendir my $dh, q{.} ) {
             while ( my $file = readdir $dh ) {
-                push @ls_files_0, $file;
+                push @ls_files_277, $file;
             }
             closedir $dh;
-            @ls_files_0 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_0;
+            @ls_files_277 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_277;
         }
     }
-    @ls_files_0 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_0;
-    (@ls_files_0 ? join("\n", @ls_files_0) . "\n" : q{});
+    @ls_files_277 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_277;
+    (@ls_files_277 ? join("\n", @ls_files_277) . "\n" : q{});
 };
 my $result2 = do {
     use File::Basename;
-    my @files_2 = ();
-    my $start_2 = q{.};
-    my $_find_2;
-    $_find_2 = sub {
-        my ($dir_2, $depth_2) = @_;
-        opendir(my $dh_2, $dir_2) or return;
-        my @entries_2 = readdir($dh_2);
-        closedir($dh_2);
-        for my $entry_2 (@entries_2) {
-            next if $entry_2 eq q{.} || $entry_2 eq q{..};
-            my $file_2 = "$dir_2/$entry_2";
-            if (-d $file_2) {
-                $_find_2->($file_2, $depth_2 + 1);
+    my @files_279 = ();
+    my $start_279 = q{.};
+    my $_find_279;
+    $_find_279 = sub {
+        my ($dir_279, $depth_279) = @_;
+        opendir(my $dh_279, $dir_279) or return;
+        my @entries_279 = readdir($dh_279);
+        closedir($dh_279);
+        for my $entry_279 (@entries_279) {
+            next if $entry_279 eq q{.} || $entry_279 eq q{..};
+            my $file_279 = "$dir_279/$entry_279";
+            if (-d $file_279) {
+                $_find_279->($file_279, $depth_279 + 1);
             }
-            elsif (-f $file_2) {
-                next if !( basename($file_2) =~ m/^.*.txt$/xms );
-                push @files_2, $file_2;
+            elsif (-f $file_279) {
+                next if !( basename($file_279) =~ m/^.*.txt$/xms );
+                push @files_279, $file_279;
             }
         }
     };
-    $_find_2->($start_2, 0);
-    join "\n", @files_2;
+    $_find_279->($start_279, 0);
+    join "\n", @files_279;
 };
 print "Results:\n";
 print $result1;
