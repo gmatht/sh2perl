@@ -36,22 +36,8 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
     // Skip whitespace
     parser.lexer.skip_whitespace_and_comments();
     
-    // Parse condition - use parse_pipeline which handles test expressions internally
-    let condition = if let Some(Token::ArithmeticEval) = parser.lexer.peek() {
-        // Handle arithmetic evaluation like: if (( a > b )); then
-        let arithmetic_word = parse_arithmetic_expression(parser)?;
-        Box::new(Command::Simple(SimpleCommand {
-            name: Word::literal("test".to_string()),
-            args: vec![arithmetic_word],
-            redirects: Vec::new(),
-            env_vars: HashMap::new(),
-            stdout_used: true,
-            stderr_used: true,
-        }))
-    } else {
-        // Parse as a simple command to handle test expressions and single commands
-        Box::new(parser.parse_simple_command()?)
-    };
+    // Parse condition using parse_command which handles [[ ]], (( )), &&, || and pipelines
+    let condition = Box::new(parser.parse_command()?);
     
     // Consume optional separator (semicolon or newline) after condition
     match parser.lexer.peek() {
@@ -135,25 +121,8 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
                 parser.lexer.next();
             }
             
-            // Parse the elif condition
-            let elif_condition = if let Some(Token::TestBracket) = parser.lexer.peek() {
-                // Handle test expression like: elif [ -f "file.txt" ]; then
-                Box::new(parse_test_expression(&mut parser.lexer)?)
-            } else if let Some(Token::ArithmeticEval) = parser.lexer.peek() {
-                // Handle arithmetic evaluation like: elif (( a == b )); then
-                            let arithmetic_word = parse_arithmetic_expression(parser)?;
-            Box::new(Command::Simple(SimpleCommand {
-                name: Word::literal("test".to_string()),
-                args: vec![arithmetic_word],
-                redirects: Vec::new(),
-                env_vars: HashMap::new(),
-                stdout_used: true,
-                stderr_used: true,
-            }))
-        } else {
-            // Parse as a pipeline to handle && and || operators
-            Box::new(parse_pipeline(parser)?)
-            };
+            // Parse the elif condition using parse_command (handles [[ ]], (( )), &&, ||)
+            let elif_condition = Box::new(parser.parse_command()?);
             
             // Consume optional separator (semicolon or newline) after condition
             match parser.lexer.peek() {
@@ -338,14 +307,8 @@ pub fn parse_while_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     parser.lexer.consume(Token::While)?;
     // Skip whitespace after 'while'
     parser.lexer.skip_whitespace_and_comments();
-    // Parse condition - check for test expression first
-    let condition = if let Some(Token::TestBracket) = parser.lexer.peek() {
-        // Handle test expression like: while [ $i -lt 10 ]; do
-        Box::new(parse_test_expression(&mut parser.lexer)?)
-    } else {
-        // Parse as a regular command
-        Box::new(parser.parse_command()?)
-    };
+    // Parse condition using parse_command which handles [[ ]], (( )), and regular commands
+    let condition = Box::new(parser.parse_command()?);
 
     // Optional separator after condition (semicolon or newline) and skip whitespace
     match parser.lexer.peek() {
@@ -417,6 +380,68 @@ pub fn parse_for_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     parser.lexer.consume(Token::For)?;
     // Allow whitespace/comments after 'for'
     parser.lexer.skip_whitespace_and_comments();
+
+    // Check for C-style for loop: for (( init; cond; incr )); do
+    if let Some(Token::ArithmeticEval) = parser.lexer.peek() {
+        // Consume (( and collect everything until matching ))
+        parser.lexer.next(); // consume ((
+        let mut arith_content = String::new();
+        let mut depth = 1usize;
+        loop {
+            match parser.lexer.peek() {
+                Some(Token::ArithmeticEvalClose) => {
+                    parser.lexer.next();
+                    depth -= 1;
+                    if depth == 0 { break; }
+                    arith_content.push_str("))");
+                }
+                Some(Token::ArithmeticEval) => {
+                    parser.lexer.next();
+                    depth += 1;
+                    arith_content.push_str("((");
+                }
+                None => return Err(ParserError::UnexpectedEOF),
+                _ => {
+                    if let Some(text) = parser.lexer.get_current_text() {
+                        arith_content.push_str(&text);
+                    }
+                    parser.lexer.next();
+                }
+            }
+        }
+        // Skip optional ; or newline before do
+        while matches!(parser.lexer.peek(), Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn | Token::Semicolon)) {
+            parser.lexer.next();
+        }
+        parser.lexer.consume(Token::Do)?;
+        while matches!(parser.lexer.peek(), Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)) {
+            parser.lexer.next();
+        }
+        let mut body_commands = Vec::new();
+        loop {
+            while matches!(parser.lexer.peek(), Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn | Token::Semicolon)) {
+                parser.lexer.next();
+            }
+            if matches!(parser.lexer.peek(), Some(Token::Done) | None) { break; }
+            let pre_pos = parser.lexer.current_position();
+            let command = parser.parse_command()?;
+            body_commands.push(command);
+            if parser.lexer.current_position() == pre_pos {
+                if parser.lexer.next().is_none() { break; }
+            }
+        }
+        while matches!(parser.lexer.peek(), Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn | Token::Semicolon)) {
+            parser.lexer.next();
+        }
+        parser.lexer.consume(Token::Done)?;
+        // Emit as: for variable in <expanded from arith> ... (best-effort: use arithmetic command)
+        // We use a special variable name to signal C-style for to the generator
+        let arith_word = Word::arithmetic(ArithmeticExpression { expression: arith_content, tokens: vec![] });
+        return Ok(Command::CStyleFor(CStyleForLoop {
+            init_expr: arith_word,
+            body: Block { commands: body_commands },
+        }));
+    }
 
     // Variable name
     let variable = match parser.lexer.peek() {
