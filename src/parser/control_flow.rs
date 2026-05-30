@@ -436,9 +436,8 @@ pub fn parse_for_loop(parser: &mut Parser) -> Result<Command, ParserError> {
         parser.lexer.consume(Token::Done)?;
         // Emit as: for variable in <expanded from arith> ... (best-effort: use arithmetic command)
         // We use a special variable name to signal C-style for to the generator
-        let arith_word = Word::arithmetic(ArithmeticExpression { expression: arith_content, tokens: vec![] });
         return Ok(Command::CStyleFor(CStyleForLoop {
-            init_expr: arith_word,
+            arith_content,
             body: Block { commands: body_commands },
         }));
     }

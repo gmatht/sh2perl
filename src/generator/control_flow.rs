@@ -279,6 +279,53 @@ fn is_variable_used_after_for_loop(
     false
 }
 
+pub fn generate_cstyle_for_loop_impl(generator: &mut Generator, for_loop: &CStyleForLoop) -> String {
+    let mut output = String::new();
+
+    // Parse "init; cond; incr" from arith_content
+    let parts: Vec<&str> = for_loop.arith_content.splitn(3, ';').collect();
+    let init_raw = parts.first().map(|s| s.trim()).unwrap_or("");
+    let cond_raw = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    let incr_raw = parts.get(2).map(|s| s.trim()).unwrap_or("");
+
+    let init_perl = if init_raw.is_empty() {
+        String::new()
+    } else {
+        generator.convert_arithmetic_to_perl(init_raw)
+    };
+    let cond_perl = if cond_raw.is_empty() {
+        "1".to_string()
+    } else {
+        generator.convert_arithmetic_to_perl(cond_raw)
+    };
+    let incr_perl = if incr_raw.is_empty() {
+        String::new()
+    } else {
+        generator.convert_arithmetic_to_perl(incr_raw)
+    };
+
+    // Convert shell comparison operators to Perl
+    let cond_perl = cond_perl
+        .replace("<=", "<=")
+        .replace(">=", ">=")
+        .replace("!=", "!=")
+        .replace("==", "==");
+
+    output.push_str(&generator.indent());
+    output.push_str(&format!("for ({init_perl}; {cond_perl}; {incr_perl}) {{\n"));
+
+    generator.indent_level += 1;
+    let body_output = generator.generate_block(&for_loop.body);
+    generator.indent_level -= 1;
+
+    output.push_str(&body_output);
+    output.push_str(&generator.indent());
+    output.push_str("}\n");
+
+    output
+}
+
+
 pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> String {
     let mut output = String::new();
 
