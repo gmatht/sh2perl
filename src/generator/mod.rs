@@ -422,6 +422,10 @@ impl Generator {
         control_flow::generate_for_loop_impl(self, for_loop)
     }
 
+    pub fn generate_cstyle_for_loop(&mut self, for_loop: &CStyleForLoop) -> String {
+        control_flow::generate_cstyle_for_loop_impl(self, for_loop)
+    }
+
     pub fn generate_function(&mut self, func: &Function) -> String {
         control_flow::generate_function_impl(self, func)
     }

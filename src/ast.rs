@@ -36,6 +36,7 @@ pub enum Command {
     Block(Block),
     Redirect(RedirectCommand),
     Assignment(Assignment),               // Variable assignment like i=value
+    CStyleFor(CStyleForLoop),
     Break(Option<String>),      // Optional loop level
     Continue(Option<String>),   // Optional loop level
     Return(Option<Word>),       // Optional return value
@@ -105,6 +106,13 @@ pub struct WhileLoop {
 pub struct ForLoop {
     pub variable: String,
     pub items: Vec<Word>,
+    pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CStyleForLoop {
+    /// The raw content inside `(( ... ))`, e.g. `"i=0; i<10; i++"`
+    pub arith_content: String,
     pub body: Block,
 }
 

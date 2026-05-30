@@ -68,6 +68,7 @@ pub fn generate_command_impl_with_input(
         Command::Case(case_stmt) => generator.generate_case_statement(case_stmt),
         Command::While(while_loop) => generator.generate_while_loop(while_loop),
         Command::For(for_loop) => generator.generate_for_loop(for_loop),
+        Command::CStyleFor(for_loop) => generator.generate_cstyle_for_loop(for_loop),
         Command::Function(func) => generator.generate_function(func),
         Command::Subshell(cmd) => generator.generate_subshell(cmd),
         Command::Background(cmd) => generator.generate_background(cmd),
