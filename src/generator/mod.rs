@@ -449,6 +449,57 @@ impl Generator {
     pub fn generate_assignment(&mut self, assignment: &Assignment) -> String {
         let mut output = String::new();
 
+        if let Some((array_name, key)) = self.extract_array_key(&assignment.variable) {
+            let value_perl = words::word_to_perl_impl(self, &assignment.value);
+            let key_expr = if key.chars().all(|ch| ch.is_ascii_digit()) {
+                key
+            } else {
+                let trimmed = key.trim_matches('"').trim_matches('\'');
+                format!("\"{}\"", self.escape_perl_string(trimmed))
+            };
+            let sigil = if key_expr.starts_with('"') { '{' } else { '[' };
+            let close = if sigil == '{' { '}' } else { ']' };
+
+            output.push_str(&self.indent());
+            match assignment.operator {
+                AssignmentOperator::Assign => {
+                    if value_perl.starts_with('{') && value_perl.ends_with('}') {
+                        output.push_str(&format!(
+                            "${}{}{}{} = do {};\n",
+                            array_name, sigil, key_expr, close, value_perl
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "${}{}{}{} = {};\n",
+                            array_name, sigil, key_expr, close, value_perl
+                        ));
+                    }
+                }
+                AssignmentOperator::PlusAssign => output.push_str(&format!(
+                    "${}{}{}{} += {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+                AssignmentOperator::MinusAssign => output.push_str(&format!(
+                    "${}{}{}{} -= {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+                AssignmentOperator::StarAssign => output.push_str(&format!(
+                    "${}{}{}{} *= {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+                AssignmentOperator::SlashAssign => output.push_str(&format!(
+                    "${}{}{}{} /= {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+                AssignmentOperator::PercentAssign => output.push_str(&format!(
+                    "${}{}{}{} %= {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+            }
+
+            return output;
+        }
+
         // Only declare the variable if not already declared
         // This prevents redeclaring variables inside loops that shadow outer scope variables
         if !self.declared_locals.contains(&assignment.variable)

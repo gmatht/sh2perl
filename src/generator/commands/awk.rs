@@ -42,13 +42,15 @@ fn translate_awk_expr(expr: &str, acc_vars: &HashSet<String>) -> String {
     }
     // Replace $N (N > 0) with $fields[N-1] using a closure
     if let Ok(re) = regex::Regex::new(r"\$([1-9][0-9]*)") {
-        result = re.replace_all(&result, |caps: &regex::Captures| {
-            if let Ok(n) = caps[1].parse::<usize>() {
-                format!("$fields[{}]", n - 1)
-            } else {
-                caps[0].to_string()
-            }
-        }).to_string();
+        result = re
+            .replace_all(&result, |caps: &regex::Captures| {
+                if let Ok(n) = caps[1].parse::<usize>() {
+                    format!("$fields[{}]", n - 1)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .to_string();
     }
     // Replace accumulation variables (whole word)
     for var in acc_vars {
@@ -56,7 +58,9 @@ fn translate_awk_expr(expr: &str, acc_vars: &HashSet<String>) -> String {
         if let Ok(re) = regex::Regex::new(&pattern) {
             // Use $$ in replacement to produce a literal $ in the output
             // (the regex crate treats $name as a capture group reference)
-            result = re.replace_all(&result, format!("$${}", var).as_str()).to_string();
+            result = re
+                .replace_all(&result, format!("$${}", var).as_str())
+                .to_string();
         }
     }
     // Replace NR and NF in expressions
@@ -71,7 +75,11 @@ fn translate_awk_expr(expr: &str, acc_vars: &HashSet<String>) -> String {
 
 /// Parse the "print" tokens from an awk print statement body and translate
 /// each token to its Perl equivalent.
-fn translate_awk_print_args(rem: &str, acc_vars: &HashSet<String>, generator: &mut Generator) -> Vec<String> {
+fn translate_awk_print_args(
+    rem: &str,
+    acc_vars: &HashSet<String>,
+    generator: &mut Generator,
+) -> Vec<String> {
     // Split on commas while respecting quoted strings, then translate each
     // argument as a complete expression (handles arithmetic like $1 + $2).
     let mut parts: Vec<String> = Vec::new();
@@ -90,16 +98,19 @@ fn translate_awk_print_args(rem: &str, acc_vars: &HashSet<String>, generator: &m
             while i < chars.len() && chars[i] != quote {
                 i += 1;
             }
-            if i < chars.len() { i += 1; } // skip closing quote
+            if i < chars.len() {
+                i += 1;
+            } // skip closing quote
             continue;
         }
 
         if c == ',' || at_end {
             let arg = rem[arg_start..i].trim();
             if !arg.is_empty() {
-                if (arg.starts_with('"') && arg.ends_with('"')) ||
-                   (arg.starts_with('\'') && arg.ends_with('\'')) {
-                    let inner = &arg[1..arg.len()-1];
+                if (arg.starts_with('"') && arg.ends_with('"'))
+                    || (arg.starts_with('\'') && arg.ends_with('\''))
+                {
+                    let inner = &arg[1..arg.len() - 1];
                     parts.push(generator.perl_string_literal(&Word::literal(inner.to_string())));
                 } else {
                     let mut translated = translate_awk_expr(arg, acc_vars);
@@ -161,7 +172,7 @@ pub fn generate_awk_command(
     // Find the awk program text (the argument that contains a { ... } block).
     let mut action_block = String::new();
     let mut condition_str = String::new();
-    let mut end_block = String::new();  // END { ... } block
+    let mut end_block = String::new(); // END { ... } block
     for arg in &cmd.args {
         if let Word::Literal(s, _) = arg {
             // Strip one layer of surrounding quotes if present and decode
@@ -279,7 +290,10 @@ pub fn generate_awk_command(
     let action = action_block.trim();
 
     // Check for accumulation statement like "sum += length($0)" or "sum += NF"
-    if acc_vars.iter().any(|v| action.contains(&format!("{} +=", v)) || action.contains(&format!("{}+=", v))) {
+    if acc_vars
+        .iter()
+        .any(|v| action.contains(&format!("{} +=", v)) || action.contains(&format!("{}+=", v)))
+    {
         // Generate accumulation code
         for var in &acc_vars {
             let pat1 = format!("{} +=", var);
@@ -411,19 +425,22 @@ pub fn generate_awk_command(
                 // AWK's default OFMT formatting. The division may be either a
                 // standalone numeric part OR embedded inside a concatenation
                 // expression that starts with a string literal.
-                let formatted_parts: Vec<String> = parts.iter().map(|p| {
-                    if p.contains('/') {
-                        // Replace bare $var/$var2 patterns (arithmetic division) with
-                        // sprintf("%.6g", ...) wherever they appear in the expression.
-                        if let Ok(re) = regex::Regex::new(r"(\$\w+\s*/\s*\$?\w+)") {
-                            re.replace_all(p, "sprintf(\"%.6g\", $1)").to_string()
+                let formatted_parts: Vec<String> = parts
+                    .iter()
+                    .map(|p| {
+                        if p.contains('/') {
+                            // Replace bare $var/$var2 patterns (arithmetic division) with
+                            // sprintf("%.6g", ...) wherever they appear in the expression.
+                            if let Ok(re) = regex::Regex::new(r"(\$\w+\s*/\s*\$?\w+)") {
+                                re.replace_all(p, "sprintf(\"%.6g\", $1)").to_string()
+                            } else {
+                                p.clone()
+                            }
                         } else {
                             p.clone()
                         }
-                    } else {
-                        p.clone()
-                    }
-                }).collect();
+                    })
+                    .collect();
                 output.push_str(&format!(
                     "push @result, ({} . \"\\n\");\n",
                     formatted_parts.join(" . ")

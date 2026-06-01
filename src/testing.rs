@@ -2424,7 +2424,6 @@ pub fn test_all_examples_next_fail_unlimited(
     test_prefix: Option<String>,
     enable_perl_critic: bool,
 ) {
-
     // Filter to only available generators
     let generators: Vec<_> = generators
         .iter()
@@ -2461,10 +2460,7 @@ pub fn test_all_examples_next_fail_unlimited(
     // Sort examples for consistent output
     examples.sort();
 
-    println!(
-        "Running ALL {} examples",
-        examples.len()
-    );
+    println!("Running ALL {} examples", examples.len());
 
     // Test each combination
     let mut passed_tests = 0;
@@ -2619,9 +2615,8 @@ pub fn test_all_examples_next_fail_unlimited(
                         cache.invalidate_bash_cache(example);
 
                         let failure_reason = result.failure_reason.clone();
-                        let example_short = example
-                            .replace("examples/", "")
-                            .replace("examples\\", "");
+                        let example_short =
+                            example.replace("examples/", "").replace("examples\\", "");
                         failure_summaries.push((
                             example_short.clone(),
                             generator.to_string(),
@@ -2813,9 +2808,7 @@ pub fn test_all_examples_next_fail_unlimited(
                     let mut cache = CommandCache::load();
                     cache.invalidate_bash_cache(example);
 
-                    let example_short = example
-                        .replace("examples/", "")
-                        .replace("examples\\", "");
+                    let example_short = example.replace("examples/", "").replace("examples\\", "");
                     failure_summaries.push((
                         example_short.clone(),
                         generator.to_string(),
@@ -2913,8 +2906,7 @@ pub fn test_all_examples_next_fail_unlimited(
                         println!("To run test again: ./fail {}", prefix);
                     } else {
                         // Find the prefix for this test
-                        let short_name =
-                            example.replace("examples/", "").replace("examples\\", "");
+                        let short_name = example.replace("examples/", "").replace("examples\\", "");
                         let prefix = find_shortest_unique_prefix(&examples, &short_name);
                         println!("To run test again: ./fail {}", prefix);
                     }
@@ -2945,7 +2937,10 @@ pub fn test_all_examples_next_fail_unlimited(
             println!("Successfully wrote total test count {} and perfect match (y99999) to first_n_tests_passed.txt", passed_tests);
         }
     } else {
-        println!("TESTS COMPLETED: {} passed, {} failed out of {}", passed_tests, failed_tests, total_tests);
+        println!(
+            "TESTS COMPLETED: {} passed, {} failed out of {}",
+            passed_tests, failed_tests, total_tests
+        );
         println!("{}", "=".repeat(80));
         println!("\nFAILED TESTS:");
         for (example, generator, reason) in &failure_summaries {

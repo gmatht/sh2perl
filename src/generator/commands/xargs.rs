@@ -61,12 +61,21 @@ pub fn generate_xargs_command_with_output(
                                 Some("{}".to_string())
                             } else {
                                 // Non-empty expansion – stringify as {item1,item2}
-                                Some(format!("{{{}}}", be.items.iter().map(|item| {
-                                    match item {
-                                        crate::ast_words::BraceItem::Literal(s) => s.clone(),
-                                        _ => String::new(),
-                                    }
-                                }).collect::<Vec<_>>().join(",")))
+                                Some(format!(
+                                    "{{{}}}",
+                                    be.items
+                                        .iter()
+                                        .map(|item| {
+                                            match item {
+                                                crate::ast_words::BraceItem::Literal(s) => {
+                                                    s.clone()
+                                                }
+                                                _ => String::new(),
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                ))
                             }
                         }
                         _ => None,

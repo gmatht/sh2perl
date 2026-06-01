@@ -1,6 +1,6 @@
 use logos::Logos;
-use thiserror::Error;
 use std::cmp::Ordering;
+use thiserror::Error;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
 pub enum Token {
@@ -284,9 +284,7 @@ pub enum Token {
     // Long options (must come before Identifier to avoid conflicts)
     #[regex(r"--[a-zA-Z][a-zA-Z0-9_*?.-]*=[^ \t\n\r|&;(){}]*", priority = 3)]
     LongOption,
-    
 
-    
     // Identifiers and words
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_*?\-]*", priority = 2)]
     Identifier,
@@ -333,7 +331,10 @@ pub enum Token {
     Question,
     #[token(".")]
     Dot,
-    #[regex(r"\*[a-zA-Z0-9_*?]*|\[[a-zA-Z0-9\-]+\]|\[[a-zA-Z0-9\-]+\]\[[a-zA-Z0-9\-]+\]", priority = 1)]
+    #[regex(
+        r"\*[a-zA-Z0-9_*?]*|\[[a-zA-Z0-9\-]+\]|\[[a-zA-Z0-9\-]+\]\[[a-zA-Z0-9\-]+\]",
+        priority = 1
+    )]
     CasePattern,
     #[token(":", priority = 1)]
     Colon,
@@ -359,7 +360,7 @@ pub enum Token {
     // Comments
     #[regex(r"#[^\r\n]*", priority = 10)]
     Comment,
-    
+
     // Regex pattern content (for bash test expressions)
     #[regex(r"\^[a-zA-Z0-9\-\[\]\+\.\$\*\(\)\?\\|]+", priority = 1)]
     RegexPattern,
@@ -386,7 +387,7 @@ impl Lexer {
     pub fn new(input: &str) -> Self {
         let mut tokens = Vec::new();
         let mut lexer = Token::lexer(input);
-        
+
         while let Some(token_result) = lexer.next() {
             let span = lexer.span();
             match token_result {
@@ -397,13 +398,16 @@ impl Lexer {
                 }
             }
         }
-        
+
         // Precompute starts of lines for quick offset->(line,col)
         let mut line_starts = Vec::new();
         line_starts.push(0);
         let mut i = 0;
         while i < input.len() {
-            if input.as_bytes()[i] == b'\r' && i + 1 < input.len() && input.as_bytes()[i + 1] == b'\n' {
+            if input.as_bytes()[i] == b'\r'
+                && i + 1 < input.len()
+                && input.as_bytes()[i + 1] == b'\n'
+            {
                 // Windows line ending: \r\n - only count \n as line break
                 if i + 2 < input.len() {
                     line_starts.push(i + 2);
@@ -426,7 +430,12 @@ impl Lexer {
             }
         }
 
-        Self { tokens, current: 0, input: input.to_string(), line_starts }
+        Self {
+            tokens,
+            current: 0,
+            input: input.to_string(),
+            line_starts,
+        }
     }
 
     pub fn peek(&self) -> Option<&Token> {
@@ -453,13 +462,25 @@ impl Lexer {
                 if let Some((_, start, end)) = self.tokens.get(self.current - 1) {
                     let actual_char = self.input[*start..*end].chars().next().unwrap_or('?');
                     let (line, col) = self.offset_to_line_col(*start);
-                    Err(LexerError::UnexpectedChar { ch: actual_char, line, col })
+                    Err(LexerError::UnexpectedChar {
+                        ch: actual_char,
+                        line,
+                        col,
+                    })
                 } else {
-                    Err(LexerError::UnexpectedChar { ch: '?', line: 1, col: 1 })
+                    Err(LexerError::UnexpectedChar {
+                        ch: '?',
+                        line: 1,
+                        col: 1,
+                    })
                 }
             }
         } else {
-            Err(LexerError::UnexpectedChar { ch: '?', line: 1, col: 1 })
+            Err(LexerError::UnexpectedChar {
+                ch: '?',
+                line: 1,
+                col: 1,
+            })
         }
     }
 
@@ -471,31 +492,31 @@ impl Lexer {
         self.current
     }
 
-
-
     pub fn get_span(&self) -> Option<(usize, usize)> {
-        self.tokens.get(self.current).map(|(_, start, end)| (*start, *end))
+        self.tokens
+            .get(self.current)
+            .map(|(_, start, end)| (*start, *end))
     }
-    
+
     pub fn get_text(&self, start: usize, end: usize) -> String {
         self.input[start..end].to_string()
     }
-    
+
     pub fn get_current_text(&self) -> Option<String> {
-        self.tokens.get(self.current).map(|(_, start, end)| {
-            self.input[*start..*end].to_string()
-        })
+        self.tokens
+            .get(self.current)
+            .map(|(_, start, end)| self.input[*start..*end].to_string())
     }
-    
+
     pub fn get_position(&self) -> usize {
         self.current
     }
-    
+
     pub fn has_newline_before_current_token(&self) -> bool {
         if self.current == 0 {
             return false;
         }
-        
+
         // Look at the previous tokens to see if there was a newline
         for i in (0..self.current).rev() {
             if let Some((token, _, _)) = self.tokens.get(i) {
@@ -508,11 +529,9 @@ impl Lexer {
         }
         false
     }
-
 }
 
 impl Lexer {
-
     pub fn offset_to_line_col(&self, offset: usize) -> (usize, usize) {
         if self.line_starts.is_empty() {
             return (1, offset + 1);
@@ -543,7 +562,7 @@ mod tests {
     fn test_basic_tokens() {
         let input = "echo hello world";
         let mut lexer = Lexer::new(input);
-        
+
         assert_eq!(lexer.next(), Some(&Token::Identifier));
         assert_eq!(lexer.next(), Some(&Token::Space));
         assert_eq!(lexer.next(), Some(&Token::Identifier));
@@ -556,7 +575,7 @@ mod tests {
     fn test_pipeline() {
         let input = "ls | grep test";
         let mut lexer = Lexer::new(input);
-        
+
         assert_eq!(lexer.next(), Some(&Token::Identifier));
         assert_eq!(lexer.next(), Some(&Token::Space));
         assert_eq!(lexer.next(), Some(&Token::Pipe));
@@ -570,7 +589,7 @@ mod tests {
     fn test_variables() {
         let input = "$HOME ${PATH}";
         let mut lexer = Lexer::new(input);
-        
+
         assert_eq!(lexer.next(), Some(&Token::Dollar));
         assert_eq!(lexer.next(), Some(&Token::Identifier));
         assert_eq!(lexer.next(), Some(&Token::Space));
@@ -578,4 +597,4 @@ mod tests {
         assert_eq!(lexer.next(), Some(&Token::Identifier));
         assert_eq!(lexer.next(), Some(&Token::BraceClose));
     }
-} 
+}

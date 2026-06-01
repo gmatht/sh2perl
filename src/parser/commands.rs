@@ -189,44 +189,10 @@ impl Parser {
                 }
 
                 // Check for simple assignment: identifier=value
-                if matches!(
-                    self.lexer.peek_n(pos),
-                    Some(
-                        Token::Assign
-                            | Token::PlusAssign
-                            | Token::MinusAssign
-                            | Token::StarAssign
-                            | Token::SlashAssign
-                            | Token::PercentAssign
-                    )
-                ) {
+                if Self::is_assignment_operator(self.lexer.peek_n(pos).cloned())
+                    || self.has_indexed_assignment_after_identifier(1)
+                {
                     self.parse_standalone_assignment()?
-                } else if matches!(self.lexer.peek_n(pos), Some(Token::CasePattern)) {
-                    // Check for array subscript assignment: identifier[subscript]=value
-                    let mut next_pos = pos + 1;
-                    while next_pos < 15
-                        && matches!(
-                            self.lexer.peek_n(next_pos),
-                            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
-                        )
-                    {
-                        next_pos += 1;
-                    }
-                    if matches!(
-                        self.lexer.peek_n(next_pos),
-                        Some(
-                            Token::Assign
-                                | Token::PlusAssign
-                                | Token::MinusAssign
-                                | Token::StarAssign
-                                | Token::SlashAssign
-                                | Token::PercentAssign
-                        )
-                    ) {
-                        self.parse_standalone_assignment()?
-                    } else {
-                        self.parse_pipeline()?
-                    }
                 } else {
                     self.parse_pipeline()?
                 }
@@ -358,8 +324,17 @@ impl Parser {
             }
         };
 
-        // Check for redirects that follow the command
-        self.parse_command_redirects(command)
+        let command = self.parse_command_redirects(command)?;
+
+        self.lexer.skip_whitespace_and_comments();
+        if matches!(
+            self.lexer.peek(),
+            Some(Token::And | Token::Or | Token::Pipe)
+        ) {
+            self.parse_pipeline_from_command(command, 0)
+        } else {
+            Ok(command)
+        }
     }
 
     fn parse_command_redirects(&mut self, command: Command) -> Result<Command, ParserError> {
@@ -405,6 +380,144 @@ impl Parser {
                 command: Box::new(command),
                 redirects,
             }))
+        }
+    }
+
+    fn is_assignment_operator(token: Option<Token>) -> bool {
+        matches!(
+            token,
+            Some(
+                Token::Assign
+                    | Token::PlusAssign
+                    | Token::MinusAssign
+                    | Token::StarAssign
+                    | Token::SlashAssign
+                    | Token::PercentAssign
+            )
+        )
+    }
+
+    fn has_indexed_assignment_after_identifier(&mut self, start_pos: usize) -> bool {
+        if matches!(self.lexer.peek_n(start_pos), Some(Token::CasePattern)) {
+            let mut pos = start_pos + 1;
+            while pos < start_pos + 16
+                && matches!(
+                    self.lexer.peek_n(pos),
+                    Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
+                )
+            {
+                pos += 1;
+            }
+            return Self::is_assignment_operator(self.lexer.peek_n(pos).cloned());
+        }
+
+        if !matches!(self.lexer.peek_n(start_pos), Some(Token::TestBracket)) {
+            return false;
+        }
+
+        let mut pos = start_pos;
+        let mut depth = 0usize;
+        while pos < start_pos + 128 {
+            match self.lexer.peek_n(pos) {
+                Some(Token::TestBracket) => depth += 1,
+                Some(Token::TestBracketClose) => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        pos += 1;
+                        while pos < start_pos + 128
+                            && matches!(
+                                self.lexer.peek_n(pos),
+                                Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
+                            )
+                        {
+                            pos += 1;
+                        }
+                        return Self::is_assignment_operator(self.lexer.peek_n(pos).cloned());
+                    }
+                }
+                Some(_) => {}
+                None => return false,
+            }
+            pos += 1;
+        }
+
+        false
+    }
+
+    fn parse_assignment_target(&mut self) -> Result<String, ParserError> {
+        let mut var_name = self.lexer.get_identifier_text()?;
+
+        match self.lexer.peek() {
+            Some(Token::CasePattern) => {
+                var_name.push_str(&self.lexer.get_raw_token_text()?);
+            }
+            Some(Token::TestBracket) => {
+                var_name.push_str(&self.parse_index_suffix()?);
+            }
+            _ => {}
+        }
+
+        Ok(var_name)
+    }
+
+    fn parse_index_suffix(&mut self) -> Result<String, ParserError> {
+        let mut suffix = String::new();
+        let mut depth = 0usize;
+
+        loop {
+            match self.lexer.peek() {
+                Some(Token::TestBracket) => {
+                    suffix.push('[');
+                    self.lexer.next();
+                    depth += 1;
+                }
+                Some(Token::TestBracketClose) => {
+                    suffix.push(']');
+                    self.lexer.next();
+                    if depth == 0 {
+                        return Err(ParserError::InvalidSyntax(
+                            "Unbalanced array index brackets".to_string(),
+                        ));
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Some(_) => suffix.push_str(&self.lexer.get_raw_token_text()?),
+                None => {
+                    return Err(ParserError::InvalidSyntax(
+                        "Unexpected end of input in array index".to_string(),
+                    ))
+                }
+            }
+        }
+
+        Ok(suffix)
+    }
+
+    fn parse_pipeline_segment(&mut self) -> Result<Command, ParserError> {
+        match self.lexer.peek() {
+            Some(Token::If) => parse_if_statement(self),
+            Some(Token::Case) => parse_case_statement(self),
+            Some(Token::While) => parse_while_loop(self),
+            Some(Token::For) => parse_for_loop(self),
+            Some(Token::Function) => parse_function(self),
+            Some(Token::ParenOpen) if matches!(self.lexer.peek_n(1), Some(Token::ParenOpen)) => {
+                self.parse_double_paren_command()
+            }
+            Some(Token::ParenOpen) => self.parse_subshell(),
+            Some(Token::BraceOpen) => parse_block(self),
+            Some(Token::TestBracket) if matches!(self.lexer.peek_n(1), Some(Token::TestBracket)) => {
+                self.lexer.next();
+                self.lexer.next();
+                self.parse_test_expression()
+            }
+            Some(Token::TestBracket) => self.parse_test_expression(),
+            _ => self.parse_simple_command(),
         }
     }
 
@@ -459,7 +572,7 @@ impl Parser {
                 Token::Pipe => {
                     self.lexer.next();
                     self.lexer.skip_whitespace_and_comments();
-                    let command = self.parse_simple_command()?;
+                    let command = self.parse_pipeline_segment()?;
                     // Parse redirects for this command
                     let command_with_redirects = self.parse_command_redirects(command)?;
                     pipe_commands.push(command_with_redirects);
@@ -476,7 +589,9 @@ impl Parser {
                     //   the accumulated result IS the left side.
                     let left = if pipe_commands.is_empty() {
                         // result must be Some — the previous `&&`/`||` stored it
-                        result.take().expect("unexpected empty state in pipeline parsing")
+                        result
+                            .take()
+                            .expect("unexpected empty state in pipeline parsing")
                     } else {
                         let left_pipe = flush_pipe_sequence(pipe_commands, start_byte_pos, self);
                         // Combine with any previously accumulated logical chain
@@ -496,7 +611,7 @@ impl Parser {
                     // ensure left-associativity).
                     let right_start_span = self.lexer.get_span();
                     let right_start_pos = right_start_span.map(|(s, _)| s).unwrap_or(0);
-                    let right_simple = self.parse_simple_command()?;
+                    let right_simple = self.parse_pipeline_segment()?;
                     let right_with_redirects = self.parse_command_redirects(right_simple)?;
                     // Only consume `|` here — stop before `&&`/`||`.
                     let mut right_pipe_cmds = vec![right_with_redirects];
@@ -507,7 +622,7 @@ impl Parser {
                         }
                         self.lexer.next(); // consume `|`
                         self.lexer.skip_whitespace_and_comments();
-                        let next_simple = self.parse_simple_command()?;
+                        let next_simple = self.parse_pipeline_segment()?;
                         let next_with_redirects = self.parse_command_redirects(next_simple)?;
                         right_pipe_cmds.push(next_with_redirects);
                     }
@@ -590,7 +705,7 @@ impl Parser {
                 // Double bracket [[ ]] - consume both opening brackets before parsing
                 self.lexer.next(); // consume first [
                 self.lexer.next(); // consume second [
-                // parse_test_expression will detect is_double_bracket=true since current token is not TestBracket
+                                   // parse_test_expression will detect is_double_bracket=true since current token is not TestBracket
                 return self.parse_test_expression();
             }
             return self.parse_test_expression();
@@ -604,86 +719,83 @@ impl Parser {
         while let Some(token) = self.lexer.peek() {
             match token {
                 Token::Identifier => {
-                    // Handle compound assignment operators
-                    let compound_op = self.lexer.peek_n(1).as_ref().cloned();
-                    if let Some(compound_op) = compound_op {
-                        match compound_op {
-                            Token::PlusAssign => {
-                                // Handle array append (var+=(...)) or compound assignment (var+=value)
-                                if matches!(self.lexer.peek_n(2), Some(Token::ParenOpen)) {
-                                    // Handle array append like: var+=(value)
-                                    let var_name = self.lexer.get_identifier_text()?;
-                                    self.lexer.next(); // consume +=
-                                    self.lexer.next(); // consume (
-                                    let elements = parse_array_elements(&mut self.lexer)?;
-
-                                    let array_word = Word::array(var_name.clone(), elements);
-                                    env_vars.insert(var_name, array_word);
-                                    self.lexer.skip_whitespace_and_comments();
-                                } else {
-                                    // Handle compound assignment like: var+=value
-                                    let var_name = self.lexer.get_identifier_text()?;
-                                    self.lexer.next(); // consume +=
-
-                                    let value_word = parse_word(&mut self.lexer)?;
-
-                                    let arithmetic_expr =
-                                        format!("{}+{}", var_name, value_word.to_string());
-                                    let compound_word = Word::arithmetic(ArithmeticExpression {
-                                        expression: arithmetic_expr,
-                                        tokens: vec![],
-                                    });
-
-                                    env_vars.insert(var_name, compound_word);
-                                    self.lexer.skip_whitespace_and_comments();
+                    let compound_op = if Self::is_assignment_operator(self.lexer.peek_n(1).cloned())
+                    {
+                        self.lexer.peek_n(1).cloned()
+                    } else if self.has_indexed_assignment_after_identifier(1) {
+                        let mut pos = 1usize;
+                        let mut depth = 0usize;
+                        loop {
+                            match self.lexer.peek_n(pos) {
+                                Some(Token::TestBracket) => depth += 1,
+                                Some(Token::TestBracketClose) => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        pos += 1;
+                                        break;
+                                    }
                                 }
+                                Some(_) => pos += 1,
+                                None => break,
                             }
-                            Token::Assign => {
-                                if matches!(self.lexer.peek_n(2), Some(Token::ParenOpen)) {
-                                    // Handle array declaration like: arr=(one two three)
-                                    let var_name = self.lexer.get_identifier_text()?;
-                                    self.lexer.next(); // consume =
-                                    self.lexer.next(); // consume (
-                                    let elements = parse_array_elements(&mut self.lexer)?;
-                                    let array_word = Word::array(var_name.clone(), elements);
-                                    env_vars.insert(var_name, array_word);
-                                    self.lexer.skip_whitespace_and_comments();
-                                } else {
-                                    // Handle regular assignment like: var=value or map[foo]=bar
-                                    let var_name = self.lexer.get_identifier_text()?;
-                                    self.lexer.next(); // consume =
-                                    let value_word = parse_word(&mut self.lexer)?;
-                                    env_vars.insert(var_name, value_word);
-                                    self.lexer.skip_whitespace_and_comments();
-                                }
-                            }
-                            _ => {
-                                break;
-                            }
+                            pos += 1;
                         }
+                        while matches!(
+                            self.lexer.peek_n(pos),
+                            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
+                        ) {
+                            pos += 1;
+                        }
+                        self.lexer.peek_n(pos).cloned()
+                    } else if matches!(self.lexer.peek_n(1), Some(Token::CasePattern)) {
+                        self.lexer.peek_n(2).cloned()
                     } else {
-                        break;
+                        None
+                    };
+
+                    match compound_op {
+                        Some(Token::PlusAssign) => {
+                            let var_name = self.parse_assignment_target()?;
+                            self.lexer.next(); // consume +=
+                            if matches!(self.lexer.peek(), Some(Token::ParenOpen)) {
+                                let elements = parse_array_elements(&mut self.lexer)?;
+                                let array_word = Word::array(var_name.clone(), elements);
+                                env_vars.insert(var_name, array_word);
+                            } else {
+                                let value_word = parse_word(&mut self.lexer)?;
+                                let arithmetic_expr =
+                                    format!("{}+{}", var_name, value_word.to_string());
+                                let compound_word = Word::arithmetic(ArithmeticExpression {
+                                    expression: arithmetic_expr,
+                                    tokens: vec![],
+                                });
+                                env_vars.insert(var_name, compound_word);
+                            }
+                            self.lexer.skip_whitespace_and_comments();
+                        }
+                        Some(Token::Assign) => {
+                            let var_name = self.parse_assignment_target()?;
+                            self.lexer.next(); // consume =
+                            if matches!(self.lexer.peek(), Some(Token::ParenOpen)) {
+                                let elements = parse_array_elements(&mut self.lexer)?;
+                                let array_word = Word::array(var_name.clone(), elements);
+                                env_vars.insert(var_name, array_word);
+                            } else {
+                                let value_word = parse_word(&mut self.lexer)?;
+                                env_vars.insert(var_name, value_word);
+                            }
+                            self.lexer.skip_whitespace_and_comments();
+                        }
+                        Some(Token::MinusAssign)
+                        | Some(Token::StarAssign)
+                        | Some(Token::SlashAssign)
+                        | Some(Token::PercentAssign)
+                        | None => {
+                            break;
+                        }
+                        _ => break,
                     }
                 }
-                // Handle array subscript assignments like map[foo]=bar
-                Token::CasePattern => {
-                    // This might be an array subscript assignment like map[foo]=bar
-                    // We need to look ahead to see if this is followed by = and a value
-                    if let Some(Token::Assign) = self.lexer.peek_n(1) {
-                        // This is an array assignment, parse it properly
-                        // We need to construct the full array access key
-                        // First, get the array name (which should be the previous identifier)
-                        // But we need to be careful about the lexer state
-
-                        // Since we're in the middle of parsing assignments, we need to handle this differently
-                        // Let's break out and let the main assignment parsing logic handle it
-                        break;
-                    } else {
-                        // Not an assignment, break out of assignment parsing
-                        break;
-                    }
-                }
-
                 _ => break,
             }
         }
@@ -708,7 +820,10 @@ impl Parser {
         if let Word::Literal(name_str, _) = &name {
             if is_builtin_command(&name_str) {
                 // Special handling for local/declare/typeset/export command with assignments
-                if matches!(name_str.as_str(), "local" | "declare" | "typeset" | "export") {
+                if matches!(
+                    name_str.as_str(),
+                    "local" | "declare" | "typeset" | "export"
+                ) {
                     // Parse local/declare assignments like: local var=value, declare -a arr=(...)
                     // Stop at newlines to handle multiple local commands on separate lines
                     while let Some(token) = self.lexer.peek() {
@@ -752,7 +867,10 @@ impl Parser {
                                                         // get_identifier_text already advances the lexer
                                                         let var_name =
                                                             self.lexer.get_identifier_text()?;
-                                                        Word::Literal(format!("${}", var_name), None)
+                                                        Word::Literal(
+                                                            format!("${}", var_name),
+                                                            None,
+                                                        )
                                                     }
                                                     _ => {
                                                         return Err(ParserError::InvalidSyntax("Expected identifier or number after $ in local assignment".to_string()));
@@ -795,7 +913,8 @@ impl Parser {
                                     // new local/builtin command (e.g. a second `local` on the
                                     // next line whose leading newline was already consumed).
                                     if let Some(text) = self.lexer.get_current_text() {
-                                        if text == "local" || text == "declare" || text == "export" {
+                                        if text == "local" || text == "declare" || text == "export"
+                                        {
                                             break;
                                         }
                                     }
@@ -1051,15 +1170,7 @@ impl Parser {
 
     fn parse_standalone_assignment(&mut self) -> Result<Command, ParserError> {
         // Get the variable name - this could be a simple identifier or an array access like map[foo]
-        let mut var_name = self.lexer.get_identifier_text()?;
-
-        // Check if the next token is a CasePattern (array subscript like [foo])
-        if let Some(Token::CasePattern) = self.lexer.peek() {
-            // This is an array assignment like map[foo]=bar
-            let case_pattern = self.lexer.get_current_text().unwrap_or_default();
-            var_name = format!("{}{}", var_name, case_pattern);
-            self.lexer.next(); // consume the CasePattern token
-        }
+        let var_name = self.parse_assignment_target()?;
 
         // Consume the assignment token (=, +=, -=, etc.)
         let assignment_op = self.lexer.peek().cloned().unwrap();
@@ -1382,21 +1493,53 @@ impl Parser {
                 }
                 Some(Token::Dollar) => {
                     // Handle variable reference: $variable or regex anchor: $
-                    //                     eprintln!("DEBUG: Found $ token, checking if followed by identifier");
                     if let Some(Token::Identifier) = self.lexer.peek_n(1) {
-                        // This is a variable reference: $variable
-                        //                         eprintln!("DEBUG: Found identifier after $, treating as variable reference");
                         self.lexer.next(); // consume the $
                         let identifier = self.lexer.get_identifier_text()?;
-                        //                         eprintln!("DEBUG: Found identifier after $: {}", identifier);
                         expression_parts.push(format!("${}", identifier));
-                        self.lexer.next();
                     } else {
-                        // This is a regex anchor: $
-                        //                         eprintln!("DEBUG: No identifier after $, treating as regex anchor");
                         expression_parts.push("$".to_string());
                         self.lexer.next();
                     }
+                }
+                Some(Token::DollarBrace)
+                | Some(Token::DollarBraceHash)
+                | Some(Token::DollarBraceBang)
+                | Some(Token::DollarBraceStar)
+                | Some(Token::DollarBraceAt)
+                | Some(Token::DollarBraceHashStar)
+                | Some(Token::DollarBraceHashAt)
+                | Some(Token::DollarBraceBangStar)
+                | Some(Token::DollarBraceBangAt) => {
+                    let mut expansion = self.lexer.get_raw_token_text()?;
+                    let mut brace_depth = 1usize;
+                    while brace_depth > 0 {
+                        match self.lexer.peek() {
+                            Some(Token::BraceClose) => {
+                                expansion.push_str(&self.lexer.get_raw_token_text()?);
+                                brace_depth -= 1;
+                            }
+                            Some(Token::DollarBrace)
+                            | Some(Token::DollarBraceHash)
+                            | Some(Token::DollarBraceBang)
+                            | Some(Token::DollarBraceStar)
+                            | Some(Token::DollarBraceAt)
+                            | Some(Token::DollarBraceHashStar)
+                            | Some(Token::DollarBraceHashAt)
+                            | Some(Token::DollarBraceBangStar)
+                            | Some(Token::DollarBraceBangAt) => {
+                                expansion.push_str(&self.lexer.get_raw_token_text()?);
+                                brace_depth += 1;
+                            }
+                            Some(_) => expansion.push_str(&self.lexer.get_raw_token_text()?),
+                            None => {
+                                return Err(ParserError::InvalidSyntax(
+                                    "Unexpected end of input in parameter expansion".to_string(),
+                                ))
+                            }
+                        }
+                    }
+                    expression_parts.push(expansion);
                 }
                 Some(Token::DoubleQuotedString) | Some(Token::SingleQuotedString) => {
                     let string_text = self.lexer.get_string_text()?;
