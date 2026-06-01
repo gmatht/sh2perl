@@ -2355,6 +2355,24 @@ fn parse_braced_variable_name(lexer: &mut Lexer) -> Result<String, ParserError> 
                     content.push_str(&text);
                     lexer.next();
                 }
+                Some(
+                    Token::DollarBrace
+                    | Token::DollarBraceHash
+                    | Token::DollarBraceBang
+                    | Token::DollarBraceStar
+                    | Token::DollarBraceAt
+                    | Token::DollarBraceHashStar
+                    | Token::DollarBraceHashAt
+                    | Token::DollarBraceBangStar
+                    | Token::DollarBraceBangAt,
+                ) => {
+                    // Nested ${...} — increment depth so the matching } doesn't
+                    // close our outer brace prematurely.
+                    brace_depth += 1;
+                    let text = lexer.get_text(start, end);
+                    content.push_str(&text);
+                    lexer.next();
+                }
                 Some(Token::BraceClose) => {
                     brace_depth -= 1;
                     if brace_depth == 0 {
