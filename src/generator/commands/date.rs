@@ -51,11 +51,13 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
         [] => default_date_expr(),
         // -u: print date in UTC
         [flag_word] if simple_word_text(flag_word).as_deref() == Some("-u") => {
-            "require POSIX; POSIX::strftime('%a %b %e %H:%M:%S UTC %Y', gmtime(time())) . \"\\n\"".to_string()
+            "require POSIX; POSIX::strftime('%a %b %e %H:%M:%S UTC %Y', gmtime(time())) . \"\\n\""
+                .to_string()
         }
         // -u -d 'date string': parse and print in UTC
-        [uflag, dflag, arg, ..] if simple_word_text(uflag).as_deref() == Some("-u")
-            && simple_word_text(dflag).as_deref() == Some("-d") =>
+        [uflag, dflag, arg, ..]
+            if simple_word_text(uflag).as_deref() == Some("-u")
+                && simple_word_text(dflag).as_deref() == Some("-d") =>
         {
             let source_expr = generator.word_to_perl(arg);
             format!(

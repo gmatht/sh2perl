@@ -279,7 +279,10 @@ fn is_variable_used_after_for_loop(
     false
 }
 
-pub fn generate_cstyle_for_loop_impl(generator: &mut Generator, for_loop: &CStyleForLoop) -> String {
+pub fn generate_cstyle_for_loop_impl(
+    generator: &mut Generator,
+    for_loop: &CStyleForLoop,
+) -> String {
     let mut output = String::new();
 
     // Parse "init; cond; incr" from arith_content
@@ -324,7 +327,6 @@ pub fn generate_cstyle_for_loop_impl(generator: &mut Generator, for_loop: &CStyl
 
     output
 }
-
 
 pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> String {
     let mut output = String::new();

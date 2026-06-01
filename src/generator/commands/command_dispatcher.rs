@@ -634,12 +634,16 @@ pub fn generate_command_impl_with_input(
                             let mut modified_diff_cmd = cmd.clone();
                             // Use Word::Variable so perl_string_literal emits `$varname`
                             // (not single-quoted `'$varname'` which prevents interpolation).
-                            modified_diff_cmd
-                                .args
-                                .push(Word::Variable(file1.0.clone(), false, None));
-                            modified_diff_cmd
-                                .args
-                                .push(Word::Variable(file2.0.clone(), false, None));
+                            modified_diff_cmd.args.push(Word::Variable(
+                                file1.0.clone(),
+                                false,
+                                None,
+                            ));
+                            modified_diff_cmd.args.push(Word::Variable(
+                                file2.0.clone(),
+                                false,
+                                None,
+                            ));
                             let diff_output = super::diff::generate_diff_command(
                                 generator,
                                 &modified_diff_cmd,

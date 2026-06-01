@@ -32,25 +32,25 @@ impl SharedUtils {
         if s.is_empty() {
             return false;
         }
-        
+
         let first_char = s.chars().next().unwrap();
         if !first_char.is_alphabetic() && first_char != '_' {
             return false;
         }
-        
+
         s.chars().all(|c| c.is_alphanumeric() || c == '_')
     }
 
     /// Convert shell arithmetic operators to language-specific equivalents
     pub fn convert_arithmetic_operators(expr: &str, language: &str) -> String {
         let mut result = expr.to_string();
-        
+
         // Common arithmetic operators that are usually the same
         let operators = ["++", "--", "+=", "-=", "*=", "/=", "%=", "**="];
         for op in &operators {
             result = result.replace(op, op);
         }
-        
+
         // Handle variable references based on language
         match language {
             "perl" => {
@@ -60,7 +60,7 @@ impl SharedUtils {
                 let parts: Vec<&str> = result.split(|c| operators.contains(&c)).collect();
                 let mut final_result = String::new();
                 let mut last_pos = 0;
-                
+
                 for part in parts {
                     let part = part.trim();
                     if !part.is_empty() {
@@ -71,24 +71,24 @@ impl SharedUtils {
                             if actual_pos > last_pos {
                                 final_result.push_str(&result[last_pos..actual_pos]);
                             }
-                            
+
                             // Add the part (with $ prefix if it's a variable)
                             if Self::is_variable_name(part) {
                                 final_result.push_str(&format!("${}", part));
                             } else {
                                 final_result.push_str(part);
                             }
-                            
+
                             last_pos = actual_pos + part.len();
                         }
                     }
                 }
-                
+
                 // Add any remaining characters
                 if last_pos < result.len() {
                     final_result.push_str(&result[last_pos..]);
                 }
-                
+
                 final_result
             }
             "rust" => {
