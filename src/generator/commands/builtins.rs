@@ -371,7 +371,10 @@ pub fn generate_generic_builtin(
                     || s.starts_with('-') && !s.starts_with("--") && s.contains('q'))
             });
             // Assign the grep result to output_var if not already done; suppress for quiet mode
-            if !output_var.is_empty() && !is_quiet && !grep_output.contains(&format!("${} =", output_var)) {
+            if !output_var.is_empty()
+                && !is_quiet
+                && !grep_output.contains(&format!("${} =", output_var))
+            {
                 grep_output.push_str(&format!(
                     "${} = $grep_result_{};\n",
                     output_var, command_index

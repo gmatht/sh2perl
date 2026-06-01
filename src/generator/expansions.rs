@@ -62,36 +62,23 @@ pub fn generate_parameter_expansion_impl(
             let regex = glob_to_perl_regex_nongreedy(&rev_pattern);
             format!(
                 "scalar reverse( (scalar reverse ${{{}}}) =~ s/^{}//r )",
-                pe.variable,
-                regex
+                pe.variable, regex
             )
         }
         ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
             // ${var%%suffix} - remove longest suffix (greedy from end)
             let regex = glob_to_perl_regex_greedy(pattern);
-            format!(
-                "${{{}}} =~ s/{}$//sr",
-                pe.variable,
-                regex
-            )
+            format!("${{{}}} =~ s/{}$//sr", pe.variable, regex)
         }
         ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
             // ${var#prefix} - remove shortest prefix (non-greedy from start)
             let regex = glob_to_perl_regex_nongreedy(pattern);
-            format!(
-                "${{{}}} =~ s/^{}//r",
-                pe.variable,
-                regex
-            )
+            format!("${{{}}} =~ s/^{}//r", pe.variable, regex)
         }
         ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
             // ${var##prefix} - remove longest prefix (greedy from start)
             let regex = glob_to_perl_regex_greedy(pattern);
-            format!(
-                "${{{}}} =~ s/^{}//sr",
-                pe.variable,
-                regex
-            )
+            format!("${{{}}} =~ s/^{}//sr", pe.variable, regex)
         }
         ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
             // ${var//pattern/replacement} - substitute all occurrences
@@ -165,7 +152,9 @@ fn glob_to_perl_regex_nongreedy(pattern: &str) -> String {
                 while let Some(&c2) = chars.peek() {
                     chars.next();
                     result.push(c2);
-                    if c2 == ']' { break; }
+                    if c2 == ']' {
+                        break;
+                    }
                 }
             }
             '\\' => {
@@ -199,7 +188,9 @@ fn glob_to_perl_regex_greedy(pattern: &str) -> String {
                 while let Some(&c2) = chars.peek() {
                     chars.next();
                     result.push(c2);
-                    if c2 == ']' { break; }
+                    if c2 == ']' {
+                        break;
+                    }
                 }
             }
             '\\' => {
@@ -244,7 +235,9 @@ fn reverse_glob_pattern(pattern: &str) -> String {
                 while let Some(&c2) = chars.peek() {
                     chars.next();
                     class.push(c2);
-                    if c2 == ']' { break; }
+                    if c2 == ']' {
+                        break;
+                    }
                 }
                 tokens.push(class);
             }

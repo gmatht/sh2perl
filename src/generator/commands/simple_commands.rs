@@ -478,10 +478,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     {
                                         let perl_cmd = generator.word_to_perl(&args[i + 1]);
                                         output.push_str(&generator.indent());
-                                        output.push_str(&format!(
-                                            "my ${} = {};\n",
-                                            var, perl_cmd
-                                        ));
+                                        output.push_str(&format!("my ${} = {};\n", var, perl_cmd));
                                         generator.declared_locals.insert(var.to_string());
                                         i += 2; // consume Literal("var=") AND CommandSubstitution
                                         continue;
@@ -541,8 +538,8 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                 ));
                                             }
                                         } else {
-                                            let perl_command = generator.word_to_perl(
-                                                &Word::CommandSubstitution(
+                                            let perl_command =
+                                                generator.word_to_perl(&Word::CommandSubstitution(
                                                     Box::new(Command::Simple(SimpleCommand {
                                                         name: Word::Literal(
                                                             "bash".to_string(),
@@ -561,8 +558,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                         stdout_used: false,
                                                     })),
                                                     None,
-                                                ),
-                                            );
+                                                ));
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!(
                                                 "my ${} = {};\n",
@@ -1016,10 +1012,16 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 } else if args.len() == 1 {
                     output.push_str(&generator.indent());
                     // Check if the argument is a command substitution
-                    if matches!(cmd.args.iter().find(|a| !matches!(a, Word::Literal(s, _) if s == "-n" || s == "-e")), Some(Word::CommandSubstitution(_, _))) {
+                    if matches!(
+                        cmd.args
+                            .iter()
+                            .find(|a| !matches!(a, Word::Literal(s, _) if s == "-n" || s == "-e")),
+                        Some(Word::CommandSubstitution(_, _))
+                    ) {
                         // For command substitution, don't add extra newline as it already contains proper formatting
                         output.push_str(&format!("print {};\n", args[0]));
-                    } else if !has_n_flag && args[0].starts_with('"')
+                    } else if !has_n_flag
+                        && args[0].starts_with('"')
                         && args[0].ends_with('"')
                         && !args[0].contains("\\n")
                         && !args[0].contains('$')

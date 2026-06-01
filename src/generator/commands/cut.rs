@@ -32,19 +32,20 @@ pub fn generate_cut_command(
             } else if arg.starts_with("-f") {
                 let rest = &arg[2..];
                 let mut parsed: Vec<usize> = Vec::new();
-                let parse_field_spec = |spec: &str, parsed: &mut Vec<usize>, open_ended: &mut Option<usize>| {
-                    for p in spec.split(',') {
-                        let p = p.trim();
-                        // Open-ended range like "2-" means from field 2 to end
-                        if p.ends_with('-') {
-                            if let Ok(n) = p[..p.len()-1].parse::<usize>() {
-                                *open_ended = Some(n);
+                let parse_field_spec =
+                    |spec: &str, parsed: &mut Vec<usize>, open_ended: &mut Option<usize>| {
+                        for p in spec.split(',') {
+                            let p = p.trim();
+                            // Open-ended range like "2-" means from field 2 to end
+                            if p.ends_with('-') {
+                                if let Ok(n) = p[..p.len() - 1].parse::<usize>() {
+                                    *open_ended = Some(n);
+                                }
+                            } else if let Ok(n) = p.parse::<usize>() {
+                                parsed.push(n);
                             }
-                        } else if let Ok(n) = p.parse::<usize>() {
-                            parsed.push(n);
                         }
-                    }
-                };
+                    };
                 if !rest.is_empty() {
                     parse_field_spec(rest, &mut parsed, &mut open_ended_from);
                 } else if i + 1 < cmd.args.len() {

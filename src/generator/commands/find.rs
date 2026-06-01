@@ -294,7 +294,10 @@ pub fn generate_find_for_substitution(
     result.push_str("            }\n");
     result.push_str("        }\n");
     result.push_str("    };\n");
-    result.push_str(&format!("    $_find_{}->($start_{}, 0);\n", unique_id, unique_id));
+    result.push_str(&format!(
+        "    $_find_{}->($start_{}, 0);\n",
+        unique_id, unique_id
+    ));
     result.push_str(&format!("    join \"\\n\", @files_{};\n}}", unique_id));
     result
 }

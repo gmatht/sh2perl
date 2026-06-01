@@ -116,9 +116,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     if has_here_string && !has_process_sub {
                         // Convert `cmd <<< "string"` → `echo 'string' | cmd`.
                         // Build the base command without the here-string redirect.
-                        let base_cmd_str = crate::generator::redirects::generate_bash_command_string(
-                            &redirect_cmd.command,
-                        );
+                        let base_cmd_str =
+                            crate::generator::redirects::generate_bash_command_string(
+                                &redirect_cmd.command,
+                            );
                         // Find the first here-string redirect target.
                         let here_target = redirect_cmd
                             .redirects
@@ -140,8 +141,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             crate::generator::redirects::generate_bash_command_string(cmd);
                         let escaped = command_str.replace('\'', "'\\''");
                         let bash_cmd = format!("bash -c '{}'", escaped);
-                        let command_lit = generator
-                            .perl_string_literal_force_interp(&Word::literal(bash_cmd));
+                        let command_lit =
+                            generator.perl_string_literal_force_interp(&Word::literal(bash_cmd));
                         format!(
                             "do {{ my $command = {}; chomp(my $result = qx{{$command}}); $CHILD_ERROR = $? >> 8; $result; }}",
                             command_lit
@@ -153,8 +154,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         // redirect target are interpolated before the command is passed
                         // to the shell.  This mirrors how bash expands $var in
                         // `cmd < "$var"`.
-                        let command_lit = generator
-                            .perl_string_literal_force_interp(&Word::literal(command_str));
+                        let command_lit =
+                            generator.perl_string_literal_force_interp(&Word::literal(command_str));
 
                         format!(
                             "do {{ my $command = {}; chomp(my $result = qx{{$command}}); $CHILD_ERROR = $? >> 8; $result; }}",
@@ -840,7 +841,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     // arguments are consumed.  If there are more args than
                                     // specifiers we must generate a loop so the output
                                     // matches bash behaviour.
-                                    let escaped_fmt = format_string.replace("\"", "\\\"").replace("\\\\", "\\");
+                                    let escaped_fmt =
+                                        format_string.replace("\"", "\\\"").replace("\\\\", "\\");
                                     let specifier_count = {
                                         let mut chars = format_string.chars().peekable();
                                         let mut count = 0usize;
@@ -911,16 +913,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 } else {
                                     "q{}".to_string()
                                 };
-                                let mut code = format!(
-                                    "do {{\n    my $basename_path = {};\n",
-                                    path_expr
-                                );
+                                let mut code =
+                                    format!("do {{\n    my $basename_path = {};\n", path_expr);
                                 if simple_cmd.args.len() > 1 {
                                     let suf = generator.word_to_perl(&simple_cmd.args[1]);
-                                    code.push_str(&format!(
-                                        "    my $basename_suffix = {};\n",
-                                        suf
-                                    ));
+                                    code.push_str(&format!("    my $basename_suffix = {};\n", suf));
                                     code.push_str("    if ($basename_suffix ne q{}) {\n        $basename_path =~ s/\\Q$basename_suffix\\E$//msx;\n    }\n");
                                 }
                                 code.push_str("    $basename_path =~ s{.*/}{}msx;\n");
@@ -2035,6 +2032,8 @@ pub fn convert_arithmetic_to_perl_impl(_generator: &Generator, expr: &str) -> St
     // Step 3: restore sentinels to `$name`
     let restore_regex = Regex::new(r"__DOLLAR_([a-zA-Z_][a-zA-Z0-9_]*)__").unwrap();
     restore_regex
-        .replace_all(&converted, |caps: &regex::Captures| format!("${}", &caps[1]))
+        .replace_all(&converted, |caps: &regex::Captures| {
+            format!("${}", &caps[1])
+        })
         .to_string()
 }
