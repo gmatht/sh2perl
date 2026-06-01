@@ -780,6 +780,19 @@ impl Parser {
                                 let elements = parse_array_elements(&mut self.lexer)?;
                                 let array_word = Word::array(var_name.clone(), elements);
                                 env_vars.insert(var_name, array_word);
+                            } else if matches!(
+                                self.lexer.peek(),
+                                Some(
+                                    Token::Space
+                                        | Token::Tab
+                                        | Token::Newline
+                                        | Token::CarriageReturn
+                                        | Token::Semicolon
+                                )
+                                | None
+                            ) {
+                                // Empty value (e.g. IFS=)
+                                env_vars.insert(var_name, Word::literal(String::new()));
                             } else {
                                 let value_word = parse_word(&mut self.lexer)?;
                                 env_vars.insert(var_name, value_word);
@@ -1081,7 +1094,12 @@ impl Parser {
                         args.push(parse_word_no_newline_skip(&mut self.lexer)?);
                     }
                 }
-                Token::Pipe | Token::And | Token::Or | Token::Semicolon | Token::Background => {
+                Token::Pipe
+                | Token::And
+                | Token::Or
+                | Token::Semicolon
+                | Token::DoubleSemicolon
+                | Token::Background => {
                     break;
                 }
                 Token::Character
@@ -1195,6 +1213,19 @@ impl Parser {
             // This is an array assignment like arr=(one two three)
             let elements = parse_array_elements(&mut self.lexer)?;
             Word::array(var_name.clone(), elements)
+        } else if matches!(
+            self.lexer.peek(),
+            Some(
+                Token::Space
+                    | Token::Tab
+                    | Token::Newline
+                    | Token::CarriageReturn
+                    | Token::Semicolon
+            )
+            | None
+        ) {
+            // Empty value (e.g. IFS= read ...)
+            Word::literal(String::new())
         } else {
             parse_word(&mut self.lexer)?
         };
@@ -1653,6 +1684,21 @@ impl Parser {
                 Some(Token::Newline) | Some(Token::CarriageReturn) => {
                     // Should not appear inside test expression, treat as end
                     break;
+                }
+                Some(Token::Minus) => {
+                    // POSIX test -a (AND) / -o (OR) operators are lexed as Minus + Identifier
+                    self.lexer.next(); // consume -
+                    match self.lexer.peek() {
+                        Some(Token::Identifier) => {
+                            let id = self.lexer.get_identifier_text()?;
+                            match id.as_str() {
+                                "a" => expression_parts.push(" -a ".to_string()),
+                                "o" => expression_parts.push(" -o ".to_string()),
+                                other => expression_parts.push(format!("-{}", other)),
+                            }
+                        }
+                        _ => expression_parts.push("-".to_string()),
+                    }
                 }
                 None => {
                     return Err(ParserError::InvalidSyntax(

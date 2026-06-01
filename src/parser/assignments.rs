@@ -116,9 +116,8 @@ pub fn parse_array_elements(lexer: &mut Lexer) -> Result<Vec<String>, ParserErro
                 lexer.next(); // consume the token
             }
             Some(Token::DoubleQuotedString) | Some(Token::SingleQuotedString) => {
-                let text = lexer.get_string_text()?;
+                let text = lexer.get_string_text()?; // get_string_text() already calls next()
                 current_element.push_str(&text);
-                lexer.next(); // consume the string token
             }
             Some(Token::Dollar) => {
                 // For now, just consume the $ and treat it as part of the element
