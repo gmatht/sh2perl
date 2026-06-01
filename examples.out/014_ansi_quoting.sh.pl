@@ -11,8 +11,8 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $MAGIC_30 = 30;
 my $MAGIC_25 = 25;
+my $MAGIC_30 = 30;
 
 $__set_e = 1;
 # set uo not implemented
