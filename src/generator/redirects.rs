@@ -6,6 +6,48 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Convert a shell assignment RHS value to a Perl scalar expression.
+///
+/// Handles:
+/// - Already-quoted values: `"hello"` or `''` → kept as-is (strip outer shell quotes
+///   and re-emit as a Perl double-quoted string so variable interpolation works)
+/// - Positional parameters: `$1` → `$_[0]`
+/// - Other `$var` references: kept as-is
+/// - Bare literals: wrapped in double quotes
+fn shell_value_to_perl(value: &str) -> String {
+    if value.is_empty() {
+        return "q{}".to_string();
+    }
+    // Strip surrounding shell double-quotes and use the content verbatim (Perl
+    // will interpolate `$var` inside double-quoted strings just like bash).
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let inner = &value[1..value.len() - 1];
+        if inner.is_empty() {
+            return "q{}".to_string();
+        }
+        return format!("\"{}\"", inner);
+    }
+    // Strip surrounding shell single-quotes (no interpolation needed).
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        let inner = &value[1..value.len() - 1];
+        if inner.is_empty() {
+            return "q{}".to_string();
+        }
+        return format!("'{}'", inner);
+    }
+    if value.starts_with('$') {
+        // Positional parameter $1, $2, …
+        if value.chars().skip(1).all(|c| c.is_ascii_digit()) {
+            let index = value[1..].parse::<usize>().unwrap_or(1);
+            return format!("$_[{}]", index.saturating_sub(1));
+        }
+        // Regular variable reference
+        return value.to_string();
+    }
+    // Bare literal
+    format!("\"{}\"", value)
+}
+
 pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) -> String {
     let mut output = String::new();
 
@@ -918,24 +960,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                             }
                                             _ => {
                                                 // Regular assignment without command substitution
-                                                let perl_value = if value.starts_with('$') {
-                                                    // Handle shell variables like $1, $2, etc.
-                                                    if value.chars().skip(1).all(|c| c.is_digit(10))
-                                                    {
-                                                        // Convert $1 to $_[0], $2 to $_[1], etc.
-                                                        let index = value[1..]
-                                                            .parse::<usize>()
-                                                            .unwrap_or(0);
-                                                        format!("$_[{}]", index - 1)
-                                                    // Perl arrays are 0-indexed
-                                                    } else {
-                                                        // Regular variable
-                                                        value.to_string()
-                                                    }
-                                                } else {
-                                                    // Literal value - quote it
-                                                    format!("\"{}\"", value)
-                                                };
+                                                let perl_value = shell_value_to_perl(value);
                                                 output.push_str(&generator.indent());
                                                 output.push_str(&format!(
                                                     "my ${} = {};\n",
@@ -945,21 +970,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                         }
                                     } else {
                                         // Regular assignment without command substitution
-                                        let perl_value = if value.starts_with('$') {
-                                            // Handle shell variables like $1, $2, etc.
-                                            if value.chars().skip(1).all(|c| c.is_digit(10)) {
-                                                // Convert $1 to $_[0], $2 to $_[1], etc.
-                                                let index =
-                                                    value[1..].parse::<usize>().unwrap_or(0);
-                                                format!("$_[{}]", index - 1) // Perl arrays are 0-indexed
-                                            } else {
-                                                // Regular variable
-                                                value.to_string()
-                                            }
-                                        } else {
-                                            // Literal value - quote it
-                                            format!("\"{}\"", value)
-                                        };
+                                        let perl_value = shell_value_to_perl(value);
                                         output.push_str(&generator.indent());
                                         output
                                             .push_str(&format!("my ${} = {};\n", var, perl_value));

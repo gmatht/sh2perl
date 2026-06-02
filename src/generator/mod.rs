@@ -5,6 +5,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Static counter for generating truly unique IDs across all generator instances
 static GLOBAL_UNIQUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Format an integer with `_` grouping separators every three digits (e.g.
+/// `12345` → `"12_345"`, `1000000` → `"1_000_000"`).  Numbers with fewer than
+/// four digits are returned unchanged.  Perl::Critic's
+/// `RequireNumberSeparators` policy requires this for literals ≥ 1 000.
+fn format_integer_with_underscores(n: i64) -> String {
+    if n < 0 {
+        return format!("-{}", format_integer_with_underscores(-n));
+    }
+    let s = n.to_string();
+    if s.len() <= 3 {
+        return s;
+    }
+    // Insert `_` every three digits from the right
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            result.push('_');
+        }
+        result.push(b as char);
+    }
+    result
+}
+
 pub mod commands;
 pub mod control_flow;
 pub mod expansions;
@@ -327,7 +351,12 @@ impl Generator {
             for (name, value) in &self.constants {
                 let padding = max_name_len - name.len();
                 let spaces = " ".repeat(padding);
-                output.push_str(&format!("my ${}{} = {};\n", name, spaces, value));
+                output.push_str(&format!(
+                    "my ${}{} = {};\n",
+                    name,
+                    spaces,
+                    format_integer_with_underscores(*value)
+                ));
             }
         }
         if !self.constants.is_empty() {
