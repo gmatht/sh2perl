@@ -13,7 +13,6 @@ our $CHILD_ERROR;
 
 
 sub get_file_size {
-    my ($file) = @_;
     my $size = do { my $command = "wc -c < \"$file\""; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
     do {
     my $output = "File $file has $size bytes";

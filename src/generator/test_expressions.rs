@@ -1,6 +1,33 @@
 use super::Generator;
 use crate::ast::*;
 
+/// Replace every `$((expr))` arithmetic expansion in `s` with the equivalent
+/// Perl expression `(perl_expr)` so the surrounding test-expression logic
+/// produces syntactically-valid Perl.
+fn convert_arith_subexprs(s: &str, generator: &Generator) -> String {
+    let mut result = s.to_string();
+    loop {
+        if let Some(start) = result.find("$((") {
+            let after = start + 3;
+            if let Some(rel_end) = result[after..].find("))") {
+                let inner = result[after..after + rel_end].to_string();
+                let perl = generator.convert_arithmetic_to_perl(&inner);
+                result = format!(
+                    "{}({}){}",
+                    &result[..start],
+                    perl,
+                    &result[after + rel_end + 2..]
+                );
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    result
+}
+
 // Helper function to convert shell variables to Perl equivalents
 fn convert_shell_var_to_perl(var: &str) -> String {
     match var {
@@ -22,8 +49,9 @@ pub fn generate_test_expression_impl(
     generator: &mut Generator,
     test_expr: &TestExpression,
 ) -> String {
-    // Parse the test expression to extract components
-    let expr = &test_expr.expression;
+    // Pre-process: convert any $((expr)) arithmetic subexpressions to Perl
+    let preprocessed = convert_arith_subexprs(&test_expr.expression, generator);
+    let expr = &preprocessed;
     let modifiers = &test_expr.modifiers;
 
     // Parse the expression to determine the type of test

@@ -107,12 +107,11 @@ if ($system_name =~ /^Linux$/msx) {
         print "Running on Linux\n";
 } elsif ($system_name =~ /^Darwin$/msx) {
         print "Running on macOS\n";
-} elsif ($system_name =~ /^.*$/msx) {
+} elsif (1) {
         print "Running on other " . "sys" . "tem\n";
 }
 
 sub get_file_size {
-    my ($file) = @_;
     my $size = do { my $command = "wc -c < \"$file\""; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
     do {
     my $output = "File $file has $size bytes";
