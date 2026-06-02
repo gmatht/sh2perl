@@ -175,41 +175,41 @@ my $uniq_result = do { do {
 print "Unique words:\n";
 print $uniq_result;
 if ( !( ($uniq_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $word_count = do { do {
+my $line_count = do { do {
     my $output_123 = q{};
     my $output_printed_123;
     my $pipeline_success_123 = 1;
-    $output_123 .= 'Hello World' . "\n";
+    $output_123 .= "line1\nline2\nline3";
     if ( !($output_123 =~ m{\n\z}msx) ) { $output_123 .= "\n"; }
     $CHILD_ERROR = 0;
     use IPC::Open3;
-    my @wc_args_123_1 = ('-w');
+    my @wc_args_123_1 = ('-l');
     my ($wc_in_123_1, $wc_out_123_1, $wc_err_123_1);
     my $wc_pid_123_1 = open3($wc_in_123_1, $wc_out_123_1, $wc_err_123_1, 'wc', @wc_args_123_1);
     print {$wc_in_123_1} $output_123;
     close $wc_in_123_1 or die "Close failed: $OS_ERROR\n";
     $output_123 = do { local $/ = undef; <$wc_out_123_1> };
+    if ($output_123 eq q{}) { $output_123 = "0\n"; }
     close $wc_out_123_1 or die "Close failed: $OS_ERROR\n";
     waitpid $wc_pid_123_1, 0;
     if ( !$pipeline_success_123 ) { $main_exit_code = 1; }
     $output_123 =~ s/\n+\z//msx;
     $output_123;
 } };
-my $line_count = do { do {
+my $word_count = do { do {
     my $output_124 = q{};
     my $output_printed_124;
     my $pipeline_success_124 = 1;
-    $output_124 .= "line1\nline2\nline3";
+    $output_124 .= 'Hello World' . "\n";
     if ( !($output_124 =~ m{\n\z}msx) ) { $output_124 .= "\n"; }
     $CHILD_ERROR = 0;
     use IPC::Open3;
-    my @wc_args_124_1 = ('-l');
+    my @wc_args_124_1 = ('-w');
     my ($wc_in_124_1, $wc_out_124_1, $wc_err_124_1);
     my $wc_pid_124_1 = open3($wc_in_124_1, $wc_out_124_1, $wc_err_124_1, 'wc', @wc_args_124_1);
     print {$wc_in_124_1} $output_124;
     close $wc_in_124_1 or die "Close failed: $OS_ERROR\n";
     $output_124 = do { local $/ = undef; <$wc_out_124_1> };
-    if ($output_124 eq q{}) { $output_124 = "0\n"; }
     close $wc_out_124_1 or die "Close failed: $OS_ERROR\n";
     waitpid $wc_pid_124_1, 0;
     if ( !$pipeline_success_124 ) { $main_exit_code = 1; }

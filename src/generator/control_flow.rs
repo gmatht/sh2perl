@@ -22,15 +22,15 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
     // Generate then branch
     generator.indent_level += 1;
 
-    // Check if the then branch is a single command that doesn't need block wrapping
+    // Emit the then-branch commands.  The surrounding `if (cond) { ... }` already
+    // provides a Perl block, so we must NOT emit an extra bare block wrapper here.
+    // An extra `{ }` would make `last`/`next` inside the branch exit the bare block
+    // instead of the intended enclosing loop.
     match &*if_stmt.then_branch {
-        Command::Block(block) if block.commands.len() == 1 => {
-            // Single command in block - generate it directly without block wrapper
-            // The command will add its own indentation, so we don't add it here
-            output.push_str(&generator.generate_command(&block.commands[0]));
+        Command::Block(block) => {
+            output.push_str(&generator.generate_block_commands(block));
         }
         _ => {
-            // Multiple commands or complex structure - use block generation
             output.push_str(&generator.indent());
             output.push_str(&generator.generate_command(&if_stmt.then_branch));
         }
@@ -45,15 +45,12 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
         output.push_str("else {\n");
         generator.indent_level += 1;
 
-        // Check if the else branch is a single command that doesn't need block wrapping
+        // Same: don't add an extra bare-block wrapper around the else body.
         match &**else_branch {
-            Command::Block(block) if block.commands.len() == 1 => {
-                // Single command in block - generate it directly without block wrapper
-                // The command will add its own indentation, so we don't add it here
-                output.push_str(&generator.generate_command(&block.commands[0]));
+            Command::Block(block) => {
+                output.push_str(&generator.generate_block_commands(block));
             }
             _ => {
-                // Multiple commands or complex structure - use block generation
                 output.push_str(&generator.indent());
                 output.push_str(&generator.generate_command(else_branch));
             }
@@ -91,18 +88,17 @@ pub fn generate_case_statement_impl(
         // Handle multiple patterns in a single case clause
         let mut pattern_conditions = Vec::new();
         for pattern in &case_clause.patterns {
-            let pattern_str = generator.perl_string_literal(pattern);
-            if pattern_str == "\"*\"" {
-                // Default case - this should be the last one
+            // Get the raw pattern string, stripping any surrounding shell quotes.
+            // `perl_string_literal` wraps the content in Perl string delimiters which
+            // then pollute the regex; `strip_shell_quotes_for_regex` gives us the
+            // bare content we want.
+            let pattern_str = generator.strip_shell_quotes_for_regex(pattern);
+            if pattern_str == "*" {
+                // Default case (*)
                 pattern_conditions.push("1".to_string()); // Always true
             } else {
                 // Convert bash glob patterns to Perl regex
-                let mut perl_pattern = pattern_str.trim_matches('"').to_string();
-
-                // Handle q{} patterns by extracting the content
-                if perl_pattern.starts_with("q{") && perl_pattern.ends_with("}") {
-                    perl_pattern = perl_pattern[2..perl_pattern.len() - 1].to_string();
-                }
+                let mut perl_pattern = pattern_str;
 
                 perl_pattern = perl_pattern.replace("*", ".*");
                 perl_pattern = perl_pattern.replace("?", ".");
@@ -130,7 +126,7 @@ pub fn generate_case_statement_impl(
                 };
 
                 // Fix the regex pattern - use proper Perl regex syntax
-                // Remove quotes from the pattern since we're matching against a variable
+                // Remove any remaining quotes from the pattern
                 let clean_pattern = perl_pattern.trim_matches('"').trim_matches('\'');
                 let regex_pattern = format!("^{}$", clean_pattern);
                 pattern_conditions.push(format!("{} =~ /{}/msx", processed_word, regex_pattern));
@@ -581,9 +577,19 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
             output.push_str(&format!("sub {} {{\n", func.name));
             generator.indent_level += 1;
 
-            // Unpack @_ to get positional parameters
-            output.push_str(&generator.indent());
-            output.push_str("my ($file) = @_;\n");
+            // Only emit @_ unpacking if the body does not already handle parameters
+            // via `local` commands (e.g. `local n=$1`).
+            let has_local_commands = func
+                .body
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, Command::BuiltinCommand(cmd) if cmd.name == "local"));
+
+            if !has_local_commands {
+                // Unpack @_ to get positional parameters
+                output.push_str(&generator.indent());
+                output.push_str("my ($file) = @_;\n");
+            }
         } else {
             // No parameters
             output.push_str(&format!("sub {} {{\n", func.name));

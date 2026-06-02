@@ -175,41 +175,41 @@ my $uniq_result = do { do {
 print "Unique words:\n";
 print $uniq_result;
 if ( !( ($uniq_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $line_count = do { do {
+my $word_count = do { do {
     my $output_54 = q{};
     my $output_printed_54;
     my $pipeline_success_54 = 1;
-    $output_54 .= "line1\nline2\nline3";
+    $output_54 .= 'Hello World' . "\n";
     if ( !($output_54 =~ m{\n\z}msx) ) { $output_54 .= "\n"; }
     $CHILD_ERROR = 0;
     use IPC::Open3;
-    my @wc_args_54_1 = ('-l');
+    my @wc_args_54_1 = ('-w');
     my ($wc_in_54_1, $wc_out_54_1, $wc_err_54_1);
     my $wc_pid_54_1 = open3($wc_in_54_1, $wc_out_54_1, $wc_err_54_1, 'wc', @wc_args_54_1);
     print {$wc_in_54_1} $output_54;
     close $wc_in_54_1 or die "Close failed: $OS_ERROR\n";
     $output_54 = do { local $/ = undef; <$wc_out_54_1> };
-    if ($output_54 eq q{}) { $output_54 = "0\n"; }
     close $wc_out_54_1 or die "Close failed: $OS_ERROR\n";
     waitpid $wc_pid_54_1, 0;
     if ( !$pipeline_success_54 ) { $main_exit_code = 1; }
     $output_54 =~ s/\n+\z//msx;
     $output_54;
 } };
-my $word_count = do { do {
+my $line_count = do { do {
     my $output_55 = q{};
     my $output_printed_55;
     my $pipeline_success_55 = 1;
-    $output_55 .= 'Hello World' . "\n";
+    $output_55 .= "line1\nline2\nline3";
     if ( !($output_55 =~ m{\n\z}msx) ) { $output_55 .= "\n"; }
     $CHILD_ERROR = 0;
     use IPC::Open3;
-    my @wc_args_55_1 = ('-w');
+    my @wc_args_55_1 = ('-l');
     my ($wc_in_55_1, $wc_out_55_1, $wc_err_55_1);
     my $wc_pid_55_1 = open3($wc_in_55_1, $wc_out_55_1, $wc_err_55_1, 'wc', @wc_args_55_1);
     print {$wc_in_55_1} $output_55;
     close $wc_in_55_1 or die "Close failed: $OS_ERROR\n";
     $output_55 = do { local $/ = undef; <$wc_out_55_1> };
+    if ($output_55 eq q{}) { $output_55 = "0\n"; }
     close $wc_out_55_1 or die "Close failed: $OS_ERROR\n";
     waitpid $wc_pid_55_1, 0;
     if ( !$pipeline_success_55 ) { $main_exit_code = 1; }
