@@ -70,7 +70,7 @@ pub fn generate_wc_command_with_output(
     }
 
     output.push_str(&format!(
-        "close $wc_in_{} or die \"Close failed: $!\\n\";\n",
+        "close $wc_in_{} or die \"Close failed: $OS_ERROR\\n\";\n",
         command_index
     ));
     let output_name = output_var.trim_start_matches('$');
@@ -103,7 +103,7 @@ pub fn generate_wc_command_with_output(
         ));
     }
     output.push_str(&format!(
-        "close $wc_out_{} or die \"Close failed: $!\\n\";\n",
+        "close $wc_out_{} or die \"Close failed: $OS_ERROR\\n\";\n",
         command_index
     ));
     output.push_str(&format!("waitpid $wc_pid_{}, 0;\n", command_index));

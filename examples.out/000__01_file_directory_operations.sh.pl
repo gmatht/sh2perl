@@ -22,7 +22,7 @@ my $file_list = do {
                 push @ls_files_0, $file;
             }
             closedir $dh;
-            @ls_files_0 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_files_0;
+            @ls_files_0 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_0;
         }
     }
     (@ls_files_0 ? join("\n", @ls_files_0) . "\n" : q{});
@@ -31,20 +31,29 @@ print "File listing:\n";
 print $file_list;
 if ( !( $file_list =~ m{\n\z}msx ) ) { print "\n"; }
 my $found_files = do {
-    use File::Find;
     use File::Basename;
     my @files_2 = ();
     my $start_2 = q{.};
-
-    sub find_files_2 {
-        my $file_2 = $File::Find::name;
-        if ( !( -f $file_2 ) ) {
-            return;
+    my $_find_2;
+    $_find_2 = sub {
+        my ($dir_2, $depth_2) = @_;
+        return if $depth_2 > 1;
+        opendir(my $dh_2, $dir_2) or return;
+        my @entries_2 = readdir($dh_2);
+        closedir($dh_2);
+        for my $entry_2 (@entries_2) {
+            next if $entry_2 eq q{.} || $entry_2 eq q{..};
+            my $file_2 = "$dir_2/$entry_2";
+            if (-d $file_2) {
+                $_find_2->($file_2, $depth_2 + 1);
+            }
+            elsif (-f $file_2) {
+                next if !( basename($file_2) =~ m/^.*.sh$/xms );
+                push @files_2, $file_2;
+            }
         }
-        push @files_2, $file_2;
-        return;
-    }
-    find( \&find_files_2, $start_2 );
+    };
+    $_find_2->($start_2, 0);
     join "\n", @files_2;
 };
 print "Found shell scripts:\n";

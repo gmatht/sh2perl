@@ -317,6 +317,20 @@ pub fn pipeline_supports_linebyline(pipeline: &Pipeline) -> bool {
                         return false;
                     }
                 }
+                "strings" => {
+                    // If strings has a filename argument, it reads from the file,
+                    // not from STDIN, so streaming (line-by-line) is inappropriate.
+                    let has_filename = first_cmd.args.iter().any(|arg| {
+                        if let Word::Literal(s, _) = arg {
+                            !s.starts_with('-')
+                        } else {
+                            true // non-literal args are treated as filenames
+                        }
+                    });
+                    if has_filename {
+                        return false;
+                    }
+                }
                 _ => {}
             }
         }
@@ -351,12 +365,23 @@ pub fn generate_generic_builtin(
                 command_index,
                 should_print,
             );
-            // Assign the grep result to output_var if not already done
-            if !output_var.is_empty() && !grep_output.contains(&format!("${} =", output_var)) {
+            // Check if grep is in quiet mode (-q / --quiet / --silent)
+            let is_quiet = cmd.args.iter().any(|a| {
+                matches!(a, Word::Literal(s, _) if s == "-q" || s == "--quiet" || s == "--silent"
+                    || s.starts_with('-') && !s.starts_with("--") && s.contains('q'))
+            });
+            // Assign the grep result to output_var if not already done; suppress for quiet mode
+            if !output_var.is_empty()
+                && !is_quiet
+                && !grep_output.contains(&format!("${} =", output_var))
+            {
                 grep_output.push_str(&format!(
                     "${} = $grep_result_{};\n",
                     output_var, command_index
                 ));
+            } else if !output_var.is_empty() && is_quiet {
+                // Quiet mode: clear the output so the pipeline wrapper won't print anything
+                grep_output.push_str(&format!("${} = q{{}};\n", output_var));
             }
             grep_output
         }
@@ -453,7 +478,7 @@ pub fn generate_generic_builtin(
             if cmd.args.is_empty() {
                 if output_var.is_empty() {
                     if input_var.is_empty() {
-                        "print do { local $INPUT_RECORD_SEPARATOR = undef; <STDIN> };\n".to_string()
+                        "my $cat_stdin = do { local $INPUT_RECORD_SEPARATOR = undef; <STDIN> };\nprint $cat_stdin;\n".to_string()
                     } else {
                         format!("print ${};\n", input_var)
                     }
