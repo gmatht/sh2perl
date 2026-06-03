@@ -8,47 +8,21 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-print "=== File and Directory Operations ===\n";
-my $file_list = do {
-    my @ls_files_0 = ();
-    if ( -f q{.} ) {
-        push @ls_files_0, q{.};
-    }
-    elsif ( -d q{.} ) {
-        if ( opendir my $dh, q{.} ) {
-            while ( my $file = readdir $dh ) {
-                push @ls_files_0, $file;
-            }
-            closedir $dh;
-            @ls_files_0 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_files_0;
-        }
-    }
-    (@ls_files_0 ? join("\n", @ls_files_0) . "\n" : q{});
-};
-print "File listing:\n";
-print $file_list;
-if ( !( $file_list =~ m{\n\z}msx ) ) { print "\n"; }
-my $found_files = do {
-    use File::Find;
-    use File::Basename;
-    my @files_2 = ();
-    my $start_2 = q{.};
+my $MAGIC_4 = 4;
+my $MAGIC_6 = 6;
+my $MAGIC_5 = 5;
+my $MAGIC_3 = 3;
 
-    sub find_files_2 {
-        my $file_2 = $File::Find::name;
-        if ( !( -f $file_2 ) ) {
-            return;
-        }
-        push @files_2, $file_2;
-        return;
-    }
-    find( \&find_files_2, $start_2 );
-    join "\n", @files_2;
-};
-print "Found shell scripts:\n";
-print $found_files;
-if ( !( $found_files =~ m{\n\z}msx ) ) { print "\n"; }
+system 'bash', 'examples/005_args.sh', 'one';
+system 'bash', 'examples/005_args.sh', 'one', 'two';
+system 'bash', 'examples/005_args.sh', 'one', 'two', 'three';
+system 'bash', 'examples/005_args.sh', q{1};
+system 'bash', 'examples/005_args.sh', q{1}, q{2}, q{3};
+system 'bash', 'examples/005_args.sh', q{1}, 'two', q{3};
+system 'bash', 'examples/005_args.sh', "A 'quoted' Sting";
+system 'bash', 'examples/005_args.sh', "A 'quoted' Sting", q{2}, q{3}, q{4}, q{5}, q{6};
 
 exit $main_exit_code;

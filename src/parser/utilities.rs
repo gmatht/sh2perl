@@ -29,7 +29,9 @@ impl ParserUtilities for Lexer {
     }
 
     fn get_span(&mut self) -> Option<(usize, usize)> {
-        self.tokens.get(self.current).map(|(_, start, end)| (*start, *end))
+        self.tokens
+            .get(self.current)
+            .map(|(_, start, end)| (*start, *end))
     }
 
     fn skip_whitespace_and_comments(&mut self) {
@@ -57,10 +59,10 @@ impl ParserUtilities for Lexer {
     fn capture_parenthetical_text(&mut self) -> Result<String, ParserError> {
         let mut content = String::new();
         let mut depth = 1;
-        
+
         // Consume the opening parenthesis
         self.next();
-        
+
         while depth > 0 {
             match self.peek() {
                 Some(Token::ParenOpen) => {
@@ -84,18 +86,18 @@ impl ParserUtilities for Lexer {
                 None => return Err(ParserError::UnexpectedEOF),
             }
         }
-        
+
         Ok(content)
     }
 
     fn capture_double_bracket_expression(&mut self) -> Result<String, ParserError> {
         let mut content = String::new();
         let mut depth = 2; // Start with depth 2 for [[
-        
+
         // Consume the first two [
         self.next(); // consume first [
         self.next(); // consume second [
-        
+
         while depth > 0 {
             match self.peek() {
                 Some(Token::TestBracket) => {
@@ -119,17 +121,17 @@ impl ParserUtilities for Lexer {
                 None => return Err(ParserError::UnexpectedEOF),
             }
         }
-        
+
         Ok(content)
     }
 
     fn capture_single_bracket_expression(&mut self) -> Result<String, ParserError> {
         let mut content = String::new();
         let mut depth = 1; // Start with depth 1 for [
-        
+
         // Consume the opening [
         self.next();
-        
+
         while depth > 0 {
             match self.peek() {
                 Some(Token::TestBracket) => {
@@ -153,7 +155,7 @@ impl ParserUtilities for Lexer {
                 None => return Err(ParserError::UnexpectedEOF),
             }
         }
-        
+
         Ok(content)
     }
 
@@ -163,10 +165,14 @@ impl ParserUtilities for Lexer {
                 self.next();
                 Ok(text)
             } else {
-                Err(ParserError::InvalidSyntax("Failed to get identifier text".to_string()))
+                Err(ParserError::InvalidSyntax(
+                    "Failed to get identifier text".to_string(),
+                ))
             }
         } else {
-            Err(ParserError::InvalidSyntax("Expected identifier".to_string()))
+            Err(ParserError::InvalidSyntax(
+                "Expected identifier".to_string(),
+            ))
         }
     }
 
@@ -176,7 +182,9 @@ impl ParserUtilities for Lexer {
                 self.next();
                 Ok(text)
             } else {
-                Err(ParserError::InvalidSyntax("Failed to get number text".to_string()))
+                Err(ParserError::InvalidSyntax(
+                    "Failed to get number text".to_string(),
+                ))
             }
         } else {
             Err(ParserError::InvalidSyntax("Expected number".to_string()))
@@ -188,7 +196,9 @@ impl ParserUtilities for Lexer {
             self.next();
             Ok(text)
         } else {
-            Err(ParserError::InvalidSyntax("Failed to get token text".to_string()))
+            Err(ParserError::InvalidSyntax(
+                "Failed to get token text".to_string(),
+            ))
         }
     }
 
@@ -198,7 +208,9 @@ impl ParserUtilities for Lexer {
             self.next();
             Ok(text)
         } else {
-            Err(ParserError::InvalidSyntax("Failed to get string text".to_string()))
+            Err(ParserError::InvalidSyntax(
+                "Failed to get string text".to_string(),
+            ))
         }
     }
 
@@ -210,8 +222,6 @@ impl ParserUtilities for Lexer {
         }
     }
 
-
-
     fn current_position(&mut self) -> usize {
         self.current
     }
@@ -222,11 +232,15 @@ impl ParserUtilities for Lexer {
     }
 
     fn peek(&mut self) -> Option<Token> {
-        self.tokens.get(self.current).map(|(token, _, _)| token.clone())
+        self.tokens
+            .get(self.current)
+            .map(|(token, _, _)| token.clone())
     }
 
     fn peek_n(&mut self, n: usize) -> Option<Token> {
-        self.tokens.get(self.current + n).map(|(token, _, _)| token.clone())
+        self.tokens
+            .get(self.current + n)
+            .map(|(token, _, _)| token.clone())
     }
 
     fn next(&mut self) -> Option<Token> {
@@ -265,4 +279,3 @@ impl ParserUtilities for Lexer {
         }
     }
 }
-

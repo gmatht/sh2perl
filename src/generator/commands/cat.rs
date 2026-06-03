@@ -51,8 +51,11 @@ pub fn generate_cat_command_for_substitution(
     let mut parts = Vec::new();
     for arg in &cmd.args {
         let path = generator.perl_string_literal(arg);
+        // Use a conditional open so a missing file produces empty output
+        // (and a warning to stderr) rather than die-ing, matching bash
+        // command-substitution behaviour: `$(cat missing_file)` → q{}.
         parts.push(format!(
-            "do {{ open my $fh, '<', {} or die 'cat: ' . {} . ': ' . $OS_ERROR . \"\\n\"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . \"\\n\"; $chunk; }}",
+            "do {{ my $cat_chunk = q{{}}; if ( open my $fh, '<', {} ) {{ local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; }} else {{ carp 'cat: ' . {} . ': ' . $OS_ERROR . \"\\n\"; }} $cat_chunk; }}",
             path, path
         ));
     }

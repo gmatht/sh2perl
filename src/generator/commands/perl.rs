@@ -290,15 +290,6 @@ pub fn generate_perl_pipeline_command(
         // Close the for loop for -ne mode and set the output variable
         if is_ne {
             output.push_str("}\n");
-            // Add trailing empty line only for single-line inputs to match shell behavior
-            // Check if input has only one line by counting newlines
-            output.push_str(&format!(
-                "if (${} =~ {}) {{\n",
-                input_var,
-                generator.format_regex_pattern(r"^[^\\n]*$")
-            ));
-            output.push_str(&format!("    ${} .= \"\\n\";\n", output_var));
-            output.push_str("}\n");
         }
 
         // Set the output variable for the pipeline

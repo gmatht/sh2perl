@@ -147,7 +147,7 @@ pub fn generate_curl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         output.push_str("} else {\n");
         if verbose_mode {
             output.push_str(&format!(
-                "print STDERR \"HTTP {}: {}\\n\";\n",
+                "print {{*STDERR}} \"HTTP {}: {}\\n\";\n",
                 "$response->code", "$response->message"
             ));
         }

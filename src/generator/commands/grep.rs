@@ -434,7 +434,7 @@ pub fn generate_grep_command(
                     output.push_str("        or croak \"Close failed: $OS_ERROR\";\n");
                     output.push_str("}\n");
                     output.push_str(&format!(
-                        "else {{ print STDERR \"grep: {}: No such file or directory\\n\"; }}\n",
+                        "else {{ print {{*STDERR}} \"grep: {}: No such file or directory\\n\"; }}\n",
                         file
                     ));
                 }
@@ -679,8 +679,9 @@ pub fn generate_grep_command(
     // Generate output based on options
     if count_only {
         if has_file_args && recursive {
-            // For recursive grep with -c, generate per-file counts
+            // For recursive grep with -c, generate per-file counts preserving traversal order
             output.push_str(&format!("my %file_counts_{};\n", command_index));
+            output.push_str(&format!("my @file_order_{};\n", command_index));
             output.push_str(&format!(
                 "for my $i (0..@grep_lines_{}-1) {{\n",
                 command_index
@@ -690,14 +691,22 @@ pub fn generate_grep_command(
                 command_index, command_index
             ));
             output.push_str(&format!(
-                "        $file_counts_{}{{$grep_filenames_{}[$i]}}++;\n",
+                "        my $f_{} = $grep_filenames_{}[$i];\n",
+                command_index, command_index
+            ));
+            output.push_str(&format!(
+                "        push @file_order_{}, $f_{} unless exists $file_counts_{}{{$f_{}}};\n",
+                command_index, command_index, command_index, command_index
+            ));
+            output.push_str(&format!(
+                "        $file_counts_{}{{$f_{}}}++;\n",
                 command_index, command_index
             ));
             output.push_str("    }\n");
             output.push_str("}\n");
             output.push_str(&format!("$grep_result_{} = q{{}};\n", command_index));
             output.push_str(&format!(
-                "for my $file (sort keys %file_counts_{}) {{\n",
+                "for my $file (@file_order_{}) {{\n",
                 command_index
             ));
             output.push_str(&format!(
@@ -706,20 +715,17 @@ pub fn generate_grep_command(
             ));
             output.push_str("}\n");
             output.push_str(&format!(
-                "$grep_result_{} =~ s{}{}; # Remove trailing newline\n",
+                "$grep_result_{} =~ s/\\n$//msx; # Remove trailing newline\n",
                 command_index,
-                generator.format_regex_pattern(r"\\n$"),
-                ""
             ));
         } else {
             output.push_str(&format!(
-                "$grep_result_{} = scalar @grep_filtered_{};\n",
+                "$grep_result_{} = scalar @grep_filtered_{} . \"\\n\";\n",
                 command_index, command_index
             ));
         }
         if should_print && !quiet_mode {
             output.push_str(&format!("print $grep_result_{};\n", command_index));
-            output.push_str("print \"\\n\";\n");
         }
     } else if after_context > 0 || before_context > 0 || context_lines > 0 {
         // Handle context flags: -A, -B, -C

@@ -2,9 +2,8 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 use File::Copy qw(copy move);
@@ -12,52 +11,43 @@ use POSIX qw(time);
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
 print "=== File Manipulation Commands ===\n";
 do {
     open my $original_stdout, '>&', STDOUT
-      or die "Cannot save STDOUT: $!\n";
+      or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'test_file.txt'
-      or die "Cannot open file: $!\n";
+      or die "Cannot open file: $OS_ERROR\n";
     print "test content\n";
     open STDOUT, '>&', $original_stdout
-      or die "Cannot restore STDOUT: $!\n";
+      or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
-      or die "Close failed: $!\n";
+      or die "Close failed: $OS_ERROR\n";
 };
 my $cp_result = do {
-    my $left_result_70 = do {
-            local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-                my $err;
-                if ( -e 'test_file.txt' ) {
-                    my $dest = 'test_file_copy.txt';
-                    if ( -d $dest ) {
-                        $dest = "$dest/'test_file.txt'";
-                    }
-                    if ( copy( 'test_file.txt', $dest ) ) {
-                    }
-                    else {
-                        croak "cp: cannot copy 'test_file.txt' to $dest: $ERRNO\n";
-                    }
-                }
-                else {
-                    croak "cp: 'test_file.txt': No such file or directory\n";
-                }
-                local $CHILD_ERROR = 0;
-                1;
+    my $left_result_67 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            do {
+                my $cp_cmd = 'cp test_file.txt test_file_copy.txt';
+                my $cp_output = qx{$cp_cmd};
+                # print $cp_output;
+                $cp_output;
             };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
-            }
-            q{};
-    };
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_70 = ("Copy successful");
-        $left_result_70 . $right_result_70;
-    }
-    else {
+        my $right_result_67 = do { ("Copy successful") };
+        $left_result_67 . $right_result_67;
+    } else {
         q{};
     }
 };
@@ -68,61 +58,62 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_68 = ();
+my $ls_all_found_69 = 1;
+my @ls_inputs_70 = ();
+push @ls_inputs_70, 'test_file.txt';
+push @ls_inputs_70, 'test_file_copy.txt';
+push @ls_inputs_70, 'test_file_moved.txt';
 my @ls_files_71 = ();
-my $ls_all_found_72 = 1;
-my @ls_inputs_73 = ();
-push @ls_inputs_73, 'test_file.txt';
-push @ls_inputs_73, 'test_file_copy.txt';
-push @ls_inputs_73, 'test_file_moved.txt';
-my @ls_files_74 = ();
-my @ls_dirs_75 = ();
-my $ls_show_headers_76 = scalar(@ls_inputs_73) > 1;
-for my $ls_item_77 (@ls_inputs_73) {
-    if ( -f $ls_item_77 ) {
-        push @ls_files_74, $ls_item_77;
+my @ls_dirs_72 = ();
+my $ls_show_headers_73 = scalar(@ls_inputs_70) > 1;
+for my $ls_item_74 (@ls_inputs_70) {
+    if ( -f $ls_item_74 ) {
+        push @ls_files_71, $ls_item_74;
     }
-    elsif ( -d $ls_item_77 ) {
-        push @ls_dirs_75, $ls_item_77;
+    elsif ( -d $ls_item_74 ) {
+        push @ls_dirs_72, $ls_item_74;
     }
     else {
-        $ls_all_found_72 = 0;
+        $ls_all_found_69 = 0;
     }
 }
-@ls_files_74 = sort { $a cmp $b } @ls_files_74;
-@ls_dirs_75 = sort { $a cmp $b } @ls_dirs_75;
-if (@ls_files_74) {
-    push @ls_files_71, join("\n", @ls_files_74);
+@ls_files_71 = sort { $a cmp $b } @ls_files_71;
+@ls_dirs_72 = sort { $a cmp $b } @ls_dirs_72;
+if (@ls_files_71) {
+    push @ls_files_68, join("\n", @ls_files_71);
 }
-for my $ls_dir_78 (@ls_dirs_75) {
-    my @ls_dir_entries_79 = ();
-    if ( opendir my $dh, $ls_dir_78 ) {
+for my $ls_dir_75 (@ls_dirs_72) {
+    my @ls_dir_entries_76 = ();
+    if ( opendir my $dh, $ls_dir_75 ) {
         while ( my $file = readdir $dh ) {
             next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-            push @ls_dir_entries_79, $file;
+            push @ls_dir_entries_76, $file;
         }
         closedir $dh;
-        @ls_dir_entries_79 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_dir_entries_79;
-        if ( $ls_show_headers_76 ) {
-            if ( @ls_dir_entries_79 ) {
-                push @ls_files_71, $ls_dir_78 . ":\n" . join("\n", @ls_dir_entries_79);
+        @ls_dir_entries_76 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_76;
+        if ( $ls_show_headers_73 ) {
+            if ( @ls_dir_entries_76 ) {
+                push @ls_files_68, $ls_dir_75 . ":\n" . join("\n", @ls_dir_entries_76);
             } else {
-                push @ls_files_71, $ls_dir_78 . ':';
+                push @ls_files_68, $ls_dir_75 . ':';
             }
         }
-        elsif ( @ls_dir_entries_79 ) {
-            push @ls_files_71, join("\n", @ls_dir_entries_79);
+        elsif ( @ls_dir_entries_76 ) {
+            push @ls_files_68, join("\n", @ls_dir_entries_76);
         }
     }
     else {
-        $ls_all_found_72 = 0;
+        $ls_all_found_69 = 0;
     }
 }
-if (@ls_files_71) {
-    print join "\n\n", @ls_files_71;
+if (@ls_files_68) {
+    print join "\n\n", @ls_files_68;
     print "\n";
 }
-if ( $ls_all_found_72 ) {
+if ( $ls_all_found_69 ) {
     local $CHILD_ERROR = 0;
     $ls_success = 1;
 }
@@ -134,52 +125,54 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "No test files found\n";
 }
 my $mv_result = do {
-    my $left_result_80 = do {
-            local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-                my $force = 0;
-                if ( -e 'test_file_copy.txt' ) {
-                    my $dest = 'test_file_moved.txt';
-                    if ( -e $dest && -d $dest ) {
-                        $dest = "$dest/'test_file_copy.txt'";
-                    }
-                    if ( -e $dest && !$force ) {
-                        croak "mv: $dest: File exists (use -f to force overwrite)\n";
-                    }
-                    my $dest_dir = $dest;
-                    $dest_dir =~ s/\/[^\/]*$//msx;
-                    if ( $dest_dir eq $dest ) {
-                        $dest_dir = q{};
-                    }
-                    if ( $dest_dir ne q{} && !-d $dest_dir ) {
-                        my $err;
-                        make_path( $dest_dir, { error => \$err } );
-                        if ( @{$err} ) {
-                            croak "mv: cannot create directory $dest_dir: $err->[0]\n";
-                        }
-                    }
-                    if ( move( 'test_file_copy.txt', $dest ) ) {
-                        # # print "mv: moved 'test_file_copy.txt' to $dest\n";
-                    } else {
-                        croak
-                  "mv: cannot move 'test_file_copy.txt' to $dest: $ERRNO\n";
-                    }
-                } else {
-                    croak "mv: 'test_file_copy.txt': No such file or directory\n";
+    my $left_result_77 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            my $err;
+            my $force = 0;
+            if ( -e 'test_file_copy.txt' ) {
+                my $dest = 'test_file_moved.txt';
+                if ( -e $dest && -d $dest ) {
+                    my $source_name = 'test_file_copy.txt';
+                    $source_name =~ s{^.*[\/]}{};
+                    $dest = "$dest/$source_name";
                 }
-                local $CHILD_ERROR = 0;
-                1;
-            };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
+                if ( -e $dest && !$force ) {
+                    croak "mv: $dest: File exists (use -f to force overwrite)\n";
+                }
+                my $dest_dir = $dest;
+                $dest_dir =~ s/\/[^\/]*$//msx;
+                if ( $dest_dir eq $dest ) {
+                    $dest_dir = q{};
+                }
+                if ( $dest_dir ne q{} && !-d $dest_dir ) {
+                    my $err;
+                    make_path( $dest_dir, { error => \$err } );
+                    if ( @{$err} ) {
+                        croak "mv: cannot create directory $dest_dir: $err->[0]\n";
+                    }
+                }
+                require File::Copy;
+                if ( File::Copy::move( 'test_file_copy.txt', $dest ) ) {
+                } else {
+                    croak
+              "mv: cannot move 'test_file_copy.txt' to $dest: $ERRNO\n";
+                }
+            } else {
+                croak "mv: 'test_file_copy.txt': No such file or directory\n";
             }
-            q{};
-    };
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_80 = ("Move successful");
-        $left_result_80 . $right_result_80;
-    }
-    else {
+        my $right_result_77 = do { ("Move successful") };
+        $left_result_77 . $right_result_77;
+    } else {
         q{};
     }
 };
@@ -190,61 +183,62 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_78 = ();
+my $ls_all_found_79 = 1;
+my @ls_inputs_80 = ();
+push @ls_inputs_80, 'test_file.txt';
+push @ls_inputs_80, 'test_file_copy.txt';
+push @ls_inputs_80, 'test_file_moved.txt';
 my @ls_files_81 = ();
-my $ls_all_found_82 = 1;
-my @ls_inputs_83 = ();
-push @ls_inputs_83, 'test_file.txt';
-push @ls_inputs_83, 'test_file_copy.txt';
-push @ls_inputs_83, 'test_file_moved.txt';
-my @ls_files_84 = ();
-my @ls_dirs_85 = ();
-my $ls_show_headers_86 = scalar(@ls_inputs_83) > 1;
-for my $ls_item_87 (@ls_inputs_83) {
-    if ( -f $ls_item_87 ) {
-        push @ls_files_84, $ls_item_87;
+my @ls_dirs_82 = ();
+my $ls_show_headers_83 = scalar(@ls_inputs_80) > 1;
+for my $ls_item_84 (@ls_inputs_80) {
+    if ( -f $ls_item_84 ) {
+        push @ls_files_81, $ls_item_84;
     }
-    elsif ( -d $ls_item_87 ) {
-        push @ls_dirs_85, $ls_item_87;
+    elsif ( -d $ls_item_84 ) {
+        push @ls_dirs_82, $ls_item_84;
     }
     else {
-        $ls_all_found_82 = 0;
+        $ls_all_found_79 = 0;
     }
 }
-@ls_files_84 = sort { $a cmp $b } @ls_files_84;
-@ls_dirs_85 = sort { $a cmp $b } @ls_dirs_85;
-if (@ls_files_84) {
-    push @ls_files_81, join("\n", @ls_files_84);
+@ls_files_81 = sort { $a cmp $b } @ls_files_81;
+@ls_dirs_82 = sort { $a cmp $b } @ls_dirs_82;
+if (@ls_files_81) {
+    push @ls_files_78, join("\n", @ls_files_81);
 }
-for my $ls_dir_88 (@ls_dirs_85) {
-    my @ls_dir_entries_89 = ();
-    if ( opendir my $dh, $ls_dir_88 ) {
+for my $ls_dir_85 (@ls_dirs_82) {
+    my @ls_dir_entries_86 = ();
+    if ( opendir my $dh, $ls_dir_85 ) {
         while ( my $file = readdir $dh ) {
             next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-            push @ls_dir_entries_89, $file;
+            push @ls_dir_entries_86, $file;
         }
         closedir $dh;
-        @ls_dir_entries_89 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_dir_entries_89;
-        if ( $ls_show_headers_86 ) {
-            if ( @ls_dir_entries_89 ) {
-                push @ls_files_81, $ls_dir_88 . ":\n" . join("\n", @ls_dir_entries_89);
+        @ls_dir_entries_86 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_86;
+        if ( $ls_show_headers_83 ) {
+            if ( @ls_dir_entries_86 ) {
+                push @ls_files_78, $ls_dir_85 . ":\n" . join("\n", @ls_dir_entries_86);
             } else {
-                push @ls_files_81, $ls_dir_88 . ':';
+                push @ls_files_78, $ls_dir_85 . ':';
             }
         }
-        elsif ( @ls_dir_entries_89 ) {
-            push @ls_files_81, join("\n", @ls_dir_entries_89);
+        elsif ( @ls_dir_entries_86 ) {
+            push @ls_files_78, join("\n", @ls_dir_entries_86);
         }
     }
     else {
-        $ls_all_found_82 = 0;
+        $ls_all_found_79 = 0;
     }
 }
-if (@ls_files_81) {
-    print join "\n\n", @ls_files_81;
+if (@ls_files_78) {
+    print join "\n\n", @ls_files_78;
     print "\n";
 }
-if ( $ls_all_found_82 ) {
+if ( $ls_all_found_79 ) {
     local $CHILD_ERROR = 0;
     $ls_success = 1;
 }
@@ -256,60 +250,59 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "No test files found\n";
 }
 my $rm_result = do {
-    my $left_result_90 = do {
-            local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-                if ( -e "test_file.txt" ) {
-                    if ( -d "test_file.txt" ) {
-                        croak "rm: ", "test_file.txt",
-                          " is a directory (use -r to remove recursively)\n";
-                    }
-                    else {
-                        if ( unlink "test_file.txt" ) {
-                            $main_exit_code = 0;
-                        }
-                        else {
-                            croak "rm: cannot remove ", "test_file.txt",
-                              ": $OS_ERROR\n";
-                        }
-                    }
+    my $left_result_87 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            if ( -e "test_file.txt" ) {
+                if ( -d "test_file.txt" ) {
+                    croak "rm: ", "test_file.txt",
+                      " is a directory (use -r to remove recursively)\n";
                 }
                 else {
-                    local $CHILD_ERROR = 1;
-                    croak "rm: ", "test_file.txt", ": No such file or directory\n";
-                }
-                if ( -e "test_file_moved.txt" ) {
-                    if ( -d "test_file_moved.txt" ) {
-                        croak "rm: ", "test_file_moved.txt",
-                          " is a directory (use -r to remove recursively)\n";
+                    if ( unlink "test_file.txt" ) {
+                        $main_exit_code = 0;
                     }
                     else {
-                        if ( unlink "test_file_moved.txt" ) {
-                            $main_exit_code = 0;
-                        }
-                        else {
-                            croak "rm: cannot remove ", "test_file_moved.txt",
-                              ": $OS_ERROR\n";
-                        }
+                        croak "rm: cannot remove ", "test_file.txt",
+                          ": $OS_ERROR\n";
                     }
                 }
-                else {
-                    local $CHILD_ERROR = 1;
-                    croak "rm: ", "test_file_moved.txt", ": No such file or directory\n";
-                }
-                local $CHILD_ERROR = 0;
-                1;
-            };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
             }
-            q{};
-    };
+            else {
+                local $CHILD_ERROR = 1;
+                croak "rm: ", "test_file.txt", ": No such file or directory\n";
+            }
+            if ( -e "test_file_moved.txt" ) {
+                if ( -d "test_file_moved.txt" ) {
+                    croak "rm: ", "test_file_moved.txt",
+                      " is a directory (use -r to remove recursively)\n";
+                }
+                else {
+                    if ( unlink "test_file_moved.txt" ) {
+                        $main_exit_code = 0;
+                    }
+                    else {
+                        croak "rm: cannot remove ", "test_file_moved.txt",
+                          ": $OS_ERROR\n";
+                    }
+                }
+            }
+            else {
+                local $CHILD_ERROR = 1;
+                croak "rm: ", "test_file_moved.txt", ": No such file or directory\n";
+            }
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_90 = ("Remove successful");
-        $left_result_90 . $right_result_90;
-    }
-    else {
+        my $right_result_87 = do { ("Remove successful") };
+        $left_result_87 . $right_result_87;
+    } else {
         q{};
     }
 };
@@ -320,61 +313,62 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_88 = ();
+my $ls_all_found_89 = 1;
+my @ls_inputs_90 = ();
+push @ls_inputs_90, 'test_file.txt';
+push @ls_inputs_90, 'test_file_copy.txt';
+push @ls_inputs_90, 'test_file_moved.txt';
 my @ls_files_91 = ();
-my $ls_all_found_92 = 1;
-my @ls_inputs_93 = ();
-push @ls_inputs_93, 'test_file.txt';
-push @ls_inputs_93, 'test_file_copy.txt';
-push @ls_inputs_93, 'test_file_moved.txt';
-my @ls_files_94 = ();
-my @ls_dirs_95 = ();
-my $ls_show_headers_96 = scalar(@ls_inputs_93) > 1;
-for my $ls_item_97 (@ls_inputs_93) {
-    if ( -f $ls_item_97 ) {
-        push @ls_files_94, $ls_item_97;
+my @ls_dirs_92 = ();
+my $ls_show_headers_93 = scalar(@ls_inputs_90) > 1;
+for my $ls_item_94 (@ls_inputs_90) {
+    if ( -f $ls_item_94 ) {
+        push @ls_files_91, $ls_item_94;
     }
-    elsif ( -d $ls_item_97 ) {
-        push @ls_dirs_95, $ls_item_97;
+    elsif ( -d $ls_item_94 ) {
+        push @ls_dirs_92, $ls_item_94;
     }
     else {
-        $ls_all_found_92 = 0;
+        $ls_all_found_89 = 0;
     }
 }
-@ls_files_94 = sort { $a cmp $b } @ls_files_94;
-@ls_dirs_95 = sort { $a cmp $b } @ls_dirs_95;
-if (@ls_files_94) {
-    push @ls_files_91, join("\n", @ls_files_94);
+@ls_files_91 = sort { $a cmp $b } @ls_files_91;
+@ls_dirs_92 = sort { $a cmp $b } @ls_dirs_92;
+if (@ls_files_91) {
+    push @ls_files_88, join("\n", @ls_files_91);
 }
-for my $ls_dir_98 (@ls_dirs_95) {
-    my @ls_dir_entries_99 = ();
-    if ( opendir my $dh, $ls_dir_98 ) {
+for my $ls_dir_95 (@ls_dirs_92) {
+    my @ls_dir_entries_96 = ();
+    if ( opendir my $dh, $ls_dir_95 ) {
         while ( my $file = readdir $dh ) {
             next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-            push @ls_dir_entries_99, $file;
+            push @ls_dir_entries_96, $file;
         }
         closedir $dh;
-        @ls_dir_entries_99 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_dir_entries_99;
-        if ( $ls_show_headers_96 ) {
-            if ( @ls_dir_entries_99 ) {
-                push @ls_files_91, $ls_dir_98 . ":\n" . join("\n", @ls_dir_entries_99);
+        @ls_dir_entries_96 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_96;
+        if ( $ls_show_headers_93 ) {
+            if ( @ls_dir_entries_96 ) {
+                push @ls_files_88, $ls_dir_95 . ":\n" . join("\n", @ls_dir_entries_96);
             } else {
-                push @ls_files_91, $ls_dir_98 . ':';
+                push @ls_files_88, $ls_dir_95 . ':';
             }
         }
-        elsif ( @ls_dir_entries_99 ) {
-            push @ls_files_91, join("\n", @ls_dir_entries_99);
+        elsif ( @ls_dir_entries_96 ) {
+            push @ls_files_88, join("\n", @ls_dir_entries_96);
         }
     }
     else {
-        $ls_all_found_92 = 0;
+        $ls_all_found_89 = 0;
     }
 }
-if (@ls_files_91) {
-    print join "\n\n", @ls_files_91;
+if (@ls_files_88) {
+    print join "\n\n", @ls_files_88;
     print "\n";
 }
-if ( $ls_all_found_92 ) {
+if ( $ls_all_found_89 ) {
     local $CHILD_ERROR = 0;
     $ls_success = 1;
 }
@@ -386,28 +380,27 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "No test files found\n";
 }
 my $mkdir_result = do {
-    my $left_result_100 = do {
+    my $left_result_97 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+        use File::Path qw(make_path);
+        if ( mkdir 'test_dir' ) {
+            }
+        else {
+            croak "mkdir: cannot create directory " . 'test_dir' . ": File exists\n";
+        }
             local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-            use File::Path qw(make_path);
-            if ( mkdir 'test_dir' ) {
-                }
-            else {
-                croak "mkdir: cannot create directory 'test_dir': File exists\n";
-            }
-                local $CHILD_ERROR = 0;
-                1;
-            };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
-            }
-            q{};
-    };
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_100 = ("Directory created");
-        $left_result_100 . $right_result_100;
-    }
-    else {
+        my $right_result_97 = do { ("Directory created") };
+        $left_result_97 . $right_result_97;
+    } else {
         q{};
     }
 };
@@ -418,6 +411,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 if ( -e "test_dir/file" ) {
     my $current_time = time;
     utime $current_time, $current_time, "test_dir/file";
@@ -432,58 +426,58 @@ else {
     }
 }
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+my @ls_files_99 = ();
+my $ls_all_found_100 = 1;
+my @ls_inputs_101 = ();
+push @ls_inputs_101, 'test_dir';
 my @ls_files_102 = ();
-my $ls_all_found_103 = 1;
-my @ls_inputs_104 = ();
-push @ls_inputs_104, 'test_dir';
-my @ls_files_105 = ();
-my @ls_dirs_106 = ();
-my $ls_show_headers_107 = scalar(@ls_inputs_104) > 1;
-for my $ls_item_108 (@ls_inputs_104) {
-    if ( -f $ls_item_108 ) {
-        push @ls_files_105, $ls_item_108;
+my @ls_dirs_103 = ();
+my $ls_show_headers_104 = scalar(@ls_inputs_101) > 1;
+for my $ls_item_105 (@ls_inputs_101) {
+    if ( -f $ls_item_105 ) {
+        push @ls_files_102, $ls_item_105;
     }
-    elsif ( -d $ls_item_108 ) {
-        push @ls_dirs_106, $ls_item_108;
+    elsif ( -d $ls_item_105 ) {
+        push @ls_dirs_103, $ls_item_105;
     }
     else {
-        $ls_all_found_103 = 0;
+        $ls_all_found_100 = 0;
     }
 }
-@ls_files_105 = sort { $a cmp $b } @ls_files_105;
-@ls_dirs_106 = sort { $a cmp $b } @ls_dirs_106;
-if (@ls_files_105) {
-    push @ls_files_102, join("\n", @ls_files_105);
+@ls_files_102 = sort { $a cmp $b } @ls_files_102;
+@ls_dirs_103 = sort { $a cmp $b } @ls_dirs_103;
+if (@ls_files_102) {
+    push @ls_files_99, join("\n", @ls_files_102);
 }
-for my $ls_dir_109 (@ls_dirs_106) {
-    my @ls_dir_entries_110 = ();
-    if ( opendir my $dh, $ls_dir_109 ) {
+for my $ls_dir_106 (@ls_dirs_103) {
+    my @ls_dir_entries_107 = ();
+    if ( opendir my $dh, $ls_dir_106 ) {
         while ( my $file = readdir $dh ) {
             next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-            push @ls_dir_entries_110, $file;
+            push @ls_dir_entries_107, $file;
         }
         closedir $dh;
-        @ls_dir_entries_110 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_dir_entries_110;
-        if ( $ls_show_headers_107 ) {
-            if ( @ls_dir_entries_110 ) {
-                push @ls_files_102, $ls_dir_109 . ":\n" . join("\n", @ls_dir_entries_110);
+        @ls_dir_entries_107 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_107;
+        if ( $ls_show_headers_104 ) {
+            if ( @ls_dir_entries_107 ) {
+                push @ls_files_99, $ls_dir_106 . ":\n" . join("\n", @ls_dir_entries_107);
             } else {
-                push @ls_files_102, $ls_dir_109 . ':';
+                push @ls_files_99, $ls_dir_106 . ':';
             }
         }
-        elsif ( @ls_dir_entries_110 ) {
-            push @ls_files_102, join("\n", @ls_dir_entries_110);
+        elsif ( @ls_dir_entries_107 ) {
+            push @ls_files_99, join("\n", @ls_dir_entries_107);
         }
     }
     else {
-        $ls_all_found_103 = 0;
+        $ls_all_found_100 = 0;
     }
 }
-if (@ls_files_102) {
-    print join "\n", @ls_files_102;
+if (@ls_files_99) {
+    print join "\n", @ls_files_99;
     print "\n";
 }
-if ( $ls_all_found_103 ) {
+if ( $ls_all_found_100 ) {
     local $CHILD_ERROR = 0;
     $ls_success = 1;
 }
@@ -495,35 +489,34 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "Directory not found\n";
 }
 my $touch_result = do {
-    my $left_result_111 = do {
-            local $CHILD_ERROR = 0;
-            my $eval_result = eval {
-                if ( -e "test_file.txt" ) {
-                    my $current_time = time;
-                    utime $current_time, $current_time, "test_file.txt";
+    my $left_result_108 = do {
+        local $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            if ( -e "test_file.txt" ) {
+                my $current_time = time;
+                utime $current_time, $current_time, "test_file.txt";
+            }
+            else {
+                if ( open my $fh, '>', "test_file.txt" ) {
+                    close $fh or croak "Close failed: $ERRNO";
                 }
                 else {
-                    if ( open my $fh, '>', "test_file.txt" ) {
-                        close $fh or croak "Close failed: $ERRNO";
-                    }
-                    else {
-                        croak "touch: cannot create ", "test_file.txt",
-                          ": $ERRNO\n";
-                    }
+                    croak "touch: cannot create ", "test_file.txt",
+                      ": $ERRNO\n";
                 }
-                local $CHILD_ERROR = 0;
-                1;
-            };
-            if ( !$eval_result ) {
-                local $CHILD_ERROR = 256;
             }
-            q{};
-    };
+            local $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            local $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_111 = ("File touched");
-        $left_result_111 . $right_result_111;
-    }
-    else {
+        my $right_result_108 = do { ("File touched") };
+        $left_result_108 . $right_result_108;
+    } else {
         q{};
     }
 };
@@ -534,6 +527,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 if ( -e "test_file.txt" ) {
     if ( -d "test_file.txt" ) {
         carp "rm: carping: ", "test_file.txt",
@@ -551,7 +545,6 @@ if ( -e "test_file.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_file.txt", ": No such file or directory\n";
 }
 if ( -e "test_file_copy.txt" ) {
     if ( -d "test_file_copy.txt" ) {
@@ -570,7 +563,6 @@ if ( -e "test_file_copy.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_file_copy.txt", ": No such file or directory\n";
 }
 if ( -e "test_file_moved.txt" ) {
     if ( -d "test_file_moved.txt" ) {
@@ -589,13 +581,13 @@ if ( -e "test_file_moved.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_file_moved.txt", ": No such file or directory\n";
 }
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
 if ( -e "test_dir" ) {
     if ( -d "test_dir" ) {
         my $err;
-        remove_tree("test_dir", {error => \$err});
+        require File::Path;
+        File::Path::remove_tree("test_dir", {error => \$err});
         if (@{$err}) {
             carp "rm: carping: could not remove ", "test_dir", ": $err->[0]\n";
         }
@@ -615,7 +607,6 @@ if ( -e "test_dir" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_dir", ": No such file or directory\n";
 }
 if ($CHILD_ERROR != 0) {
     1;

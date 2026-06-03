@@ -165,12 +165,12 @@ pub fn generate_sha512sum_command(
             // When sha512sum reads from stdin the external tool prints "<hash>  -".
             // Preserve that behavior by appending the literal "  -" so purified
             // scripts that print the result match the host tool's output.
-            output.push_str("sha512_hex(do { local $/ = undef; <STDIN> }) . '  -'");
+            output.push_str("sha512_hex(do { local $/ = undef; <STDIN> }) . \"  -\\n\"");
         } else {
             // Compute hash of the provided Perl variable and return it as an expression
             // When hashing a pipeline/stdin input, emulate the external tool's
             // printed form by appending the literal "  -".
-            output.push_str(&format!("sha512_hex({}) . '  -'", input_expr));
+            output.push_str(&format!("sha512_hex({}) . \"  -\\n\"", input_expr));
         }
     } else {
         // Calculate hashes of specified files
