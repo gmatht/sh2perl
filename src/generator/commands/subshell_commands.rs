@@ -68,6 +68,7 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
                     || w.body.commands.iter().any(|c| contains_background(c))
             }
             Command::For(f) => f.body.commands.iter().any(|c| contains_background(c)),
+            Command::CStyleFor(f) => f.body.commands.iter().any(|c| contains_background(c)),
             Command::Function(func) => func.body.commands.iter().any(|c| contains_background(c)),
             Command::Simple(_)
             | Command::BuiltinCommand(_)

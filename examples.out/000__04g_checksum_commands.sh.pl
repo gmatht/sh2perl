@@ -2,28 +2,28 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 use Digest::SHA   qw(sha256_hex sha512_hex);
 use File::Path    qw(make_path remove_tree);
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
 print "=== Checksum Commands ===\n";
 do {
     open my $original_stdout, '>&', STDOUT
-      or die "Cannot save STDOUT: $!\n";
+      or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'test_checksum.txt'
-      or die "Cannot open file: $!\n";
+      or die "Cannot open file: $OS_ERROR\n";
     print "test content\n";
     open STDOUT, '>&', $original_stdout
-      or die "Cannot restore STDOUT: $!\n";
+      or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
-      or die "Close failed: $!\n";
+      or die "Close failed: $OS_ERROR\n";
 };
 my $sha256_result = do {
     my @results;
@@ -45,7 +45,7 @@ my $sha256_result = do {
         push @results,
 "0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
     }
-    join "\n", @results;
+    join("\n", @results) . "\n";
 };
 do {
     my $output = "SHA256 result: $sha256_result";
@@ -54,6 +54,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 my $sha512_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
@@ -74,7 +75,7 @@ my $sha512_result = do {
         push @results,
 "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
     }
-    join "\n", @results;
+    join("\n", @results) . "\n";
 };
 do {
     my $output = "SHA512 result: $sha512_result";
@@ -83,9 +84,11 @@ do {
         print "\n";
     }
 };
-my $strings_result = do {
-    my $output_114;
-    my $pipeline_success_114 = 1;
+$CHILD_ERROR = 0;
+my $strings_result = do { do {
+    my $output_111 = q{};
+    my $output_printed_111;
+    my $pipeline_success_111 = 1;
     my $input_data;
     if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
         local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
@@ -98,18 +101,16 @@ my $strings_result = do {
         $input_data = q{};
     }
     my @result;
-    my @lines = split /\n/msx, $input_data;
-    for my $line (@lines) {
-        if ( length $line >= 4 ) {
-            push @result, $line;
-        }
+    while ($input_data =~ /([\x20-\x7E]{4,})/g) {
+        push @result, $1;
     }
     my $line = join "\n", @result;
-    $output_114 = $line;
+    if ($line ne q{} && !($line =~ m{\n\z}msx)) { $line .= "\n"; }
+    $output_111 = $line;
     my $num_lines       = 3;
     my $head_line_count = 0;
     my $result          = q{};
-    my $input           = $output_114;
+    my $input           = $output_111;
     my $pos             = 0;
 
     while ( $pos < length $input && $head_line_count < $num_lines ) {
@@ -122,15 +123,15 @@ my $strings_result = do {
         $pos = $line_end + 1;
         ++$head_line_count;
     }
-    $output_114 = $result;
+    $output_111 = $result;
 
-    if ( !$pipeline_success_114 ) { $main_exit_code = 1; }
-    $output_114 =~ s/\n+\z//msx;
-    $output_114;
-};
+    if ( !$pipeline_success_111 ) { $main_exit_code = 1; }
+    $output_111 =~ s/\n+\z//msx;
+    $output_111;
+} };
 print "Strings result:\n";
 print $strings_result;
-if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }
 if ( -e "test_checksum.txt" ) {
     if ( -d "test_checksum.txt" ) {
         carp "rm: carping: ", "test_checksum.txt",
@@ -148,7 +149,6 @@ if ( -e "test_checksum.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_checksum.txt", ": No such file or directory\n";
 }
 print "=== Checksum Commands Complete ===\n";
 

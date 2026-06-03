@@ -1,0 +1,65 @@
+Perl::Critic violations found:
+Long number not separated with underscores
+  Policy: Perl::Critic::Policy::ValuesAndExpressions::RequireNumberSeparators
+  Severity: 2
+  Location: Line 15, Column 19
+  Code: my $MAGIC_12345 = [VIOLATION!]12345;
+  Explanation: See page 59 of PBP
+
+Subroutine "factorize" does not end with "return"
+  Policy: Perl::Critic::Policy::Subroutines::RequireFinalReturn
+  Severity: 4
+  Location: Line 20, Column 1
+  Code: [VIOLATION!]sub factorize {
+  Explanation: See page 197 of PBP
+  How to fix: Add explicit 'return;' at the end of subroutines
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 61, Column 1
+  Code: [VIOLATION!]}
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 62, Column 1
+  Code: [VIOLATION!]factorize('12');
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 63, Column 1
+  Code: [VIOLATION!]factorize('28');
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 64, Column 1
+  Code: [VIOLATION!]factorize('100');
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 65, Column 1
+  Code: [VIOLATION!]factorize('12345');
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 66, Column 1
+  Code: [VIOLATION!]print "Factorization complete!\n";
+  Explanation: Consider removing it
+
+Unreachable code
+  Policy: Perl::Critic::Policy::ControlStructures::ProhibitUnreachableCode
+  Severity: 4
+  Location: Line 68, Column 1
+  Code: [VIOLATION!]exit $main_exit_code;
+  Explanation: Consider removing it
+
