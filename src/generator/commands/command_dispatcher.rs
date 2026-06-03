@@ -68,6 +68,7 @@ pub fn generate_command_impl_with_input(
         Command::Case(case_stmt) => generator.generate_case_statement(case_stmt),
         Command::While(while_loop) => generator.generate_while_loop(while_loop),
         Command::For(for_loop) => generator.generate_for_loop(for_loop),
+        Command::CStyleFor(for_loop) => generator.generate_cstyle_for_loop(for_loop),
         Command::Function(func) => generator.generate_function(func),
         Command::Subshell(cmd) => generator.generate_subshell(cmd),
         Command::Background(cmd) => generator.generate_background(cmd),
@@ -219,10 +220,14 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&generator.indent());
                             result.push_str(&format!("    open STDOUT, '>', \\$output_ps_{} or croak \"Cannot redirect STDOUT\";\n", global_counter));
                             // Ensure nested generators can see the pipeline id so they can
-                            // mark the pipeline buffer as printed. If no pipeline id is
-                            // active, create one, declare minimal Perl vars, and push a guard
-                            // for the duration of nested generation.
-                            if generator.current_pipeline_output_id().is_none() {
+                            // Always create a fresh unique_id for each process-substitution
+                            // block so that every <(…) gets its own $output_N / $output_printed_N
+                            // variables in its own scope.  Re-using the id from a sibling
+                            // process substitution (which happens when its guard is still live
+                            // in _process_sub_guards) causes the second block to skip the `my`
+                            // declarations and produces "Global symbol requires package name"
+                            // compile errors under strict.
+                            {
                                 let unique_id = generator.get_unique_id();
                                 result.push_str(&generator.indent());
                                 result
@@ -234,9 +239,11 @@ pub fn generate_command_impl_with_input(
                                     .declared_locals
                                     .insert(format!("output_{}", unique_id));
 
-                                _process_sub_guards.push(
-                                    generator.push_pipeline_output_id_guard(unique_id.clone()),
-                                );
+                                // The guard is scoped to this inner block: it will be dropped
+                                // (and the id popped) once we exit the block, so the next
+                                // sibling process substitution starts fresh.
+                                let _ps_guard =
+                                    generator.push_pipeline_output_id_guard(unique_id.clone());
 
                                 let perl_code = generator.generate_command(cmd);
                                 for line in perl_code.lines() {
@@ -244,14 +251,7 @@ pub fn generate_command_impl_with_input(
                                         result.push_str(&format!("    {}\n", line));
                                     }
                                 }
-                                // _pipeline_guard drops here and pops the id
-                            } else {
-                                let perl_code = generator.generate_command(cmd);
-                                for line in perl_code.lines() {
-                                    if !line.trim().is_empty() {
-                                        result.push_str(&format!("    {}\n", line));
-                                    }
-                                }
+                                // _ps_guard drops here, popping the pipeline id
                             }
                             result.push_str(&generator.indent());
                             result.push_str(&format!("}}\n"));
@@ -301,7 +301,7 @@ pub fn generate_command_impl_with_input(
                         result.push_str(&format!("open my ${}, '>', ${} or croak \"Cannot create temp file: $ERRNO\\n\";\n", fh_var, temp_var));
                         result.push_str(&generator.indent());
                         result.push_str(&format!(
-                            "print ${} $output_ps_{};\n",
+                            "print {{${}}} $output_ps_{};\n",
                             fh_var, global_counter
                         ));
                         result.push_str(&generator.indent());
@@ -632,12 +632,18 @@ pub fn generate_command_impl_with_input(
 
                             // Generate the actual diff command
                             let mut modified_diff_cmd = cmd.clone();
-                            modified_diff_cmd
-                                .args
-                                .push(Word::literal(format!("${}", file1.0)));
-                            modified_diff_cmd
-                                .args
-                                .push(Word::literal(format!("${}", file2.0)));
+                            // Use Word::Variable so perl_string_literal emits `$varname`
+                            // (not single-quoted `'$varname'` which prevents interpolation).
+                            modified_diff_cmd.args.push(Word::Variable(
+                                file1.0.clone(),
+                                false,
+                                None,
+                            ));
+                            modified_diff_cmd.args.push(Word::Variable(
+                                file2.0.clone(),
+                                false,
+                                None,
+                            ));
                             let diff_output = super::diff::generate_diff_command(
                                 generator,
                                 &modified_diff_cmd,
@@ -661,7 +667,16 @@ pub fn generate_command_impl_with_input(
                             // Use the paste generator for proper output handling
                             let paste_output =
                                 generate_paste_command(generator, cmd, &process_sub_files);
+                            // The do-block returns the paste result as a string;
+                            // capture in a variable then print to avoid Perl::Critic's
+                            // RequireBracedFileHandleWithPrint false-positive on "print do".
+                            let paste_var = format!("paste_result_{}", generator.get_unique_id());
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("my ${} = ", paste_var));
                             result.push_str(&paste_output);
+                            result.push_str(";\n");
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("print ${};\n", paste_var));
 
                             return result;
                         }
@@ -687,7 +702,7 @@ pub fn generate_command_impl_with_input(
                 generator.indent_level += 1;
                 result.push_str(&generator.indent());
                 result.push_str("open my $original_stdout, '>&', STDOUT\n");
-                result.push_str("      or die \"Cannot save STDOUT: $!\\n\";\n");
+                result.push_str("      or die \"Cannot save STDOUT: $OS_ERROR\\n\";\n");
 
                 // Find the output redirect target
                 let output_redirect = all_redirects.iter().find(|r| {
@@ -706,11 +721,11 @@ pub fn generate_command_impl_with_input(
                     };
                     result.push_str(&generator.indent());
                     result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                    result.push_str("      or die \"Cannot open file: $!\\n\";\n");
+                    result.push_str("      or die \"Cannot open file: $OS_ERROR\\n\";\n");
                 } else {
                     result.push_str(&generator.indent());
                     result.push_str("open STDOUT, '>', 'temp_file.txt'\n");
-                    result.push_str("      or die \"Cannot open file: $!\\n\";\n");
+                    result.push_str("      or die \"Cannot open file: $OS_ERROR\\n\";\n");
                 }
             }
 
@@ -966,10 +981,10 @@ pub fn generate_command_impl_with_input(
             if has_output_redirect {
                 result.push_str(&generator.indent());
                 result.push_str("open STDOUT, '>&', $original_stdout\n");
-                result.push_str("      or die \"Cannot restore STDOUT: $!\\n\";\n");
+                result.push_str("      or die \"Cannot restore STDOUT: $OS_ERROR\\n\";\n");
                 result.push_str(&generator.indent());
                 result.push_str("close $original_stdout\n");
-                result.push_str("      or die \"Close failed: $!\\n\";\n");
+                result.push_str("      or die \"Close failed: $OS_ERROR\\n\";\n");
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());
                 result.push_str("};\n");

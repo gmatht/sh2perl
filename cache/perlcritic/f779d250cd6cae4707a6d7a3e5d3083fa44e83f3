@@ -1,0 +1,16 @@
+Perl::Critic violations found:
+Long number not separated with underscores
+  Policy: Perl::Critic::Policy::ValuesAndExpressions::RequireNumberSeparators
+  Severity: 2
+  Location: Line 14, Column 19
+  Code: my $MAGIC_12345 = [VIOLATION!]12345;
+  Explanation: See page 59 of PBP
+
+Subroutine "factorize" does not end with "return"
+  Policy: Perl::Critic::Policy::Subroutines::RequireFinalReturn
+  Severity: 4
+  Location: Line 20, Column 1
+  Code: [VIOLATION!]sub factorize {
+  Explanation: See page 197 of PBP
+  How to fix: Add explicit 'return;' at the end of subroutines
+
