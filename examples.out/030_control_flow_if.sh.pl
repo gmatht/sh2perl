@@ -2,11 +2,13 @@
 use strict;
 use warnings;
 use Carp;
-use English qw( -no_match_vars );
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
+use IPC::Open3;
 
 my $main_exit_code = 0;
-my $ls_success = 0;
+my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
 if ((-f"file.txt")) {
@@ -15,3 +17,5 @@ if ((-f"file.txt")) {
 else {
     print "File does not exist\n";
 }
+
+exit $main_exit_code;

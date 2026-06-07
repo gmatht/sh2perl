@@ -52,10 +52,10 @@ pub fn generate_kill_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         output.push_str("if ($result) {\n");
         output.push_str("print \"Sent signal $signal to process $pid\\n\";\n");
         output.push_str("} else {\n");
-        output.push_str("print STDERR \"kill: ($pid) - No such process\\n\";\n");
+        output.push_str("print {*STDERR} \"kill: ($pid) - No such process\\n\";\n");
         output.push_str("}\n");
         output.push_str("} else {\n");
-        output.push_str("print STDERR \"kill: invalid process id: $pid\\n\";\n");
+        output.push_str("print {*STDERR} \"kill: invalid process id: $pid\\n\";\n");
         output.push_str("}\n");
         output.push_str("}\n");
     }

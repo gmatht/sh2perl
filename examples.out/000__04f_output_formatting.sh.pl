@@ -2,19 +2,19 @@
 use strict;
 use warnings;
 use Carp;
-use English qw(-no_match_vars);
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
-select((select(STDOUT), $| = 1)[0]);
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
 print "=== Output and Formatting Commands ===\n";
 my $echo_result = do {
-    my $_chomp_temp = ('Hello from backticks');
+    my $_chomp_temp = ("Hello from backticks");
     chomp $_chomp_temp;
     $_chomp_temp;
 };
@@ -25,8 +25,9 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 my $printf_result = do {
-    my $result = sprintf "Number: %d, String: %s\n", "42", "test";
+    my $result = sprintf "Number: %d, String: %s\n", '42', "test";
     $result;
 };
 do {
@@ -36,26 +37,27 @@ do {
         print "\n";
     }
 };
-my $tee_result = do {
-    my $output_113;
-    my $pipeline_success_113 = 1;
-    $output_113 .= "test output\n";
-    if ( !($output_113 =~ m{\n\z}msx) ) { $output_113 .= "\n"; }
-    my @lines = split /\n/msx, $output_113;
+$CHILD_ERROR = 0;
+my $tee_result = do { do {
+    my $output_110 = q{};
+    my $output_printed_110;
+    my $pipeline_success_110 = 1;
+    $output_110 .= 'test output' . "\n";
+    if ( !($output_110 =~ m{\n\z}msx) ) { $output_110 .= "\n"; }
+    $CHILD_ERROR = 0;
+    use Carp qw(carp croak);
     if ( open my $fh, '>', 'test_tee.txt' ) {
-        foreach my $line (@lines) {
-            print {$fh} "$line\n";
-        }
-        close $fh
-          or croak "Close failed: $ERRNO";
+        print {$fh} $output_110;
+        close $fh or croak "Close failed: $ERRNO";
     }
     else {
         carp "tee: Cannot open 'test_tee.txt': $ERRNO";
     }
-    if ( !$pipeline_success_113 ) { $main_exit_code = 1; }
-    $output_113 =~ s/\n+\z//msx;
-    $output_113;
-};
+    $output_110 = $output_110;
+    if ( !$pipeline_success_110 ) { $main_exit_code = 1; }
+    $output_110 =~ s/\n+\z//msx;
+    $output_110;
+} };
 do {
     my $output = "Tee result: $tee_result";
     print $output;
@@ -63,6 +65,7 @@ do {
         print "\n";
     }
 };
+$CHILD_ERROR = 0;
 if ( -e "test_tee.txt" ) {
     if ( -d "test_tee.txt" ) {
         carp "rm: carping: ", "test_tee.txt",
@@ -80,7 +83,6 @@ if ( -e "test_tee.txt" ) {
 }
 else {
     local $CHILD_ERROR = 0;
-    carp "rm: carping: ", "test_tee.txt", ": No such file or directory\n";
 }
 print "=== Output and Formatting Commands Complete ===\n";
 
