@@ -771,9 +771,7 @@ pub fn format_regex_pattern(pattern: &str) -> String {
     // Under Perl's /x modifier, unescaped whitespace in the pattern is ignored
     // (it is treated as formatting space, not a literal character). Escape any
     // literal space or tab characters so they remain significant after /x is applied.
-    let escaped_pattern = converted_pattern
-        .replace('\t', "\\t")
-        .replace(' ', "\\ ");
+    let escaped_pattern = converted_pattern.replace('\t', "\\t").replace(' ', "\\ ");
     // Add common flags: /s for dot matching newlines, /x for extended formatting, /m for multiline
     format!("/{}/msx", escaped_pattern)
 }

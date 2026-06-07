@@ -35,7 +35,7 @@ pub fn generate_wget_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
             output.push_str(&format!(
                 "open my $fh, '>', $output_file or die \"Cannot open $output_file: $ERRNO\";\n"
             ));
-            output.push_str("print $fh $content;\n");
+            output.push_str("print {$fh} $content;\n");
             output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
             output.push_str("print \"Downloaded to $output_file\\n\";\n");
             output.push_str("} else {\n");
