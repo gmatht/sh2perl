@@ -151,6 +151,7 @@ pub fn generate_find_for_substitution(
     let mut start_path = String::from(".");
     let mut name_pattern = None;
     let mut file_type = None;
+    let mut max_depth: Option<usize> = None;
 
     // Simple argument parsing
     let mut i = 0;
@@ -209,6 +210,16 @@ pub fn generate_find_for_substitution(
                         i += 1;
                     }
                 }
+                "-maxdepth" => {
+                    if i + 1 < cmd.args.len() {
+                        if let Word::Literal(depth_str, _) = &cmd.args[i + 1] {
+                            if let Ok(d) = depth_str.parse::<usize>() {
+                                max_depth = Some(d);
+                            }
+                        }
+                        i += 1;
+                    }
+                }
                 _ => {
                     if i == 0 {
                         start_path = s;
@@ -219,16 +230,13 @@ pub fn generate_find_for_substitution(
         i += 1;
     }
 
-    // Generate recursive Perl code using File::Find.
-    // Use an *anonymous* sub passed directly to File::Find::find() instead of
-    // a named sub.  Named subs are compiled into the package namespace at
-    // compile time, so two pipelines in the same file that both call find()
-    // would end up with colliding names (e.g. `find_files_1`) because each
-    // debashc invocation restarts its counter at 0.  An anonymous sub has no
-    // name and therefore never collides.
+    // Generate recursive Perl code that matches bash's find traversal order.
+    // bash find recurses into subdirectories immediately upon encountering them,
+    // while Perl's File::Find defers subdirectory processing to the end.
+    // Using a recursive closure ensures the same interleaved order.
     let unique_id = generator.get_unique_id();
     let mut result = format!(
-        "do {{\n    use File::Find;\n    use File::Basename;\n    my @files_{} = ();\n",
+        "do {{\n    use File::Basename;\n    my @files_{} = ();\n",
         unique_id
     );
     result.push_str(&format!(
@@ -236,48 +244,60 @@ pub fn generate_find_for_substitution(
         unique_id, start_path
     ));
 
-    // Open the anonymous sub
-    result.push_str("\n    find( sub {\n");
+    // Declare a recursive closure variable (set to undef first so the closure
+    // can refer to itself without a forward-declaration issue).
+    // The closure takes ($dir, $depth) so -maxdepth can be respected.
+    let max_depth_check = match max_depth {
+        Some(d) => format!("        return if $depth_{u} > {};\n", d, u = unique_id),
+        None => String::new(),
+    };
+    result.push_str(&format!("    my $_find_{u};\n    $_find_{u} = sub {{\n        my ($dir_{u}, $depth_{u}) = @_;\n{max_depth_check}        opendir(my $dh_{u}, $dir_{u}) or return;\n        my @entries_{u} = readdir($dh_{u});\n        closedir($dh_{u});\n        for my $entry_{u} (@entries_{u}) {{\n            next if $entry_{u} eq q{{.}} || $entry_{u} eq q{{..}};\n            my $file_{u} = \"$dir_{u}/$entry_{u}\";\n",
+        u = unique_id, max_depth_check = max_depth_check));
+
+    // Recurse into directories (matches bash find's immediate-recursion order).
     result.push_str(&format!(
-        "        my $file_{} = $File::Find::name;\n",
-        unique_id
+        "            if (-d $file_{u}) {{\n                $_find_{u}->($file_{u}, $depth_{u} + 1);\n            }}\n",
+        u = unique_id
     ));
 
-    if let Some(ftype) = &file_type {
-        if ftype == "f" {
-            result.push_str(&format!("        if ( !( -f $file_{} ) ) {{\n", unique_id));
-            result.push_str("            return;\n");
-            result.push_str("        }\n");
-        } else if ftype == "d" {
-            result.push_str(&format!("        if ( !( -d $file_{} ) ) {{\n", unique_id));
-            result.push_str("            return;\n");
-            result.push_str("        }\n");
-        }
-    }
+    // Build the `elsif` block for files matching the criteria.
+    result.push_str("            elsif (-f $file_");
+    result.push_str(&unique_id);
+    result.push_str(") {\n");
 
     if let Some(pattern) = &name_pattern {
         let glob_pattern = pattern.replace("*", ".*");
         let filename = if pattern.contains('/') {
-            // If pattern contains path separators, match against full path
             format!("$file_{}", unique_id)
         } else {
-            // If pattern doesn't contain path separators, match against basename
             format!("basename($file_{})", unique_id)
         };
         result.push_str(&format!(
-            "        if ( !( {} =~ m/^{}$/xms ) ) {{\n",
+            "                next if !( {} =~ m/^{}$/xms );\n",
             filename, glob_pattern
         ));
-        result.push_str("            return;\n");
-        result.push_str("        }\n");
+    }
+
+    if let Some(ftype) = &file_type {
+        // We already have -f or -d guard above, so add additional type filters.
+        if ftype == "d" {
+            // If type is directory only (handled above — skip files).
+            result.push_str("                next;\n");
+        }
+        // ftype == "f" is already handled by the -f test
     }
 
     result.push_str(&format!(
-        "        push @files_{}, $file_{};\n",
+        "                push @files_{}, $file_{};\n",
         unique_id, unique_id
     ));
-    result.push_str("    },\n");
-    result.push_str(&format!("    $start_{} );\n", unique_id));
+    result.push_str("            }\n");
+    result.push_str("        }\n");
+    result.push_str("    };\n");
+    result.push_str(&format!(
+        "    $_find_{}->($start_{}, 0);\n",
+        unique_id, unique_id
+    ));
     result.push_str(&format!("    join \"\\n\", @files_{};\n}}", unique_id));
     result
 }

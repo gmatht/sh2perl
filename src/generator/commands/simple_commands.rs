@@ -372,7 +372,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 ));
                 output.push_str(&generator.indent());
                 output.push_str(&format!(
-                    "print ${} $output_ps_{};\n",
+                    "print {{${}}} $output_ps_{};\n",
                     fh_var, global_counter
                 ));
                 output.push_str(&generator.indent());
@@ -433,7 +433,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     ));
                     output.push_str(&generator.indent());
                     output.push_str(&format!(
-                        "print ${} {};\n",
+                        "print {{${}}} {};\n",
                         fh_var,
                         // Here-string content is written verbatim into a temp file. Use a
                         // non-interpolating Perl literal so $-sequences and backslashes
@@ -453,8 +453,14 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     // Generate the actual command
     if let Word::Literal(ref name, _) = cmd.name {
         if name == "local" {
-            // Handle local command - convert to my declarations
-            for arg in &cmd.args {
+            // Handle local command - convert to my declarations.
+            // Use an index-based loop so we can look ahead when the parser
+            // emits a (Literal("var="), CommandSubstitution) pair for
+            // `local var=$(cmd)` / `local var=\`cmd\`` assignments.
+            let args = &cmd.args;
+            let mut i = 0;
+            while i < args.len() {
+                let arg = &args[i];
                 match arg {
                     Word::Literal(var_name, _) => {
                         // Check if it's an assignment (var=value)
@@ -464,14 +470,24 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 let var = parts[0];
                                 let value = parts[1];
                                 if !generator.declared_locals.contains(var) {
-                                    // Check if the value contains command substitution
+                                    // Case 1: value is empty and next arg is a CommandSubstitution
+                                    // This is how the parser encodes `local var=$(cmd)`
+                                    if value.is_empty()
+                                        && i + 1 < args.len()
+                                        && matches!(args[i + 1], Word::CommandSubstitution(_, _))
+                                    {
+                                        let perl_cmd = generator.word_to_perl(&args[i + 1]);
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&format!("my ${} = {};\n", var, perl_cmd));
+                                        generator.declared_locals.insert(var.to_string());
+                                        i += 2; // consume Literal("var=") AND CommandSubstitution
+                                        continue;
+                                    }
+
+                                    // Case 2: value contains a backtick (inline `cmd`)
                                     if value.contains('`') {
-                                        // Handle command substitution in local assignment
-                                        // Parse the command substitution and convert to Perl
                                         let command_substitution =
                                             value.trim_start_matches('`').trim_end_matches('`');
-
-                                        // Try to parse the command properly instead of wrapping in bash -c
 
                                         if let Ok(parsed_commands) =
                                             Parser::new(command_substitution).parse()
@@ -483,14 +499,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                         None,
                                                     ),
                                                 );
-
                                                 output.push_str(&generator.indent());
                                                 output.push_str(&format!(
                                                     "my ${} = {};\n",
                                                     var, perl_command
                                                 ));
                                             } else {
-                                                // Fallback to bash -c if parsing fails
                                                 let perl_command = generator.word_to_perl(
                                                     &Word::CommandSubstitution(
                                                         Box::new(Command::Simple(SimpleCommand {
@@ -524,7 +538,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                 ));
                                             }
                                         } else {
-                                            // Fallback to bash -c if parsing fails
                                             let perl_command =
                                                 generator.word_to_perl(&Word::CommandSubstitution(
                                                     Box::new(Command::Simple(SimpleCommand {
@@ -552,11 +565,19 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                 var, perl_command
                                             ));
                                         }
-                                    } else {
+                                        generator.declared_locals.insert(var.to_string());
+                                    } else if !value.is_empty() {
+                                        // Case 3: plain literal value
                                         output.push_str(&generator.indent());
                                         output.push_str(&format!("my ${} = {};\n", var, value));
+                                        generator.declared_locals.insert(var.to_string());
+                                    } else {
+                                        // Case 4: empty value with no following CommandSubstitution
+                                        // (just declare the variable without a value)
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&format!("my ${};\n", var));
+                                        generator.declared_locals.insert(var.to_string());
                                     }
-                                    generator.declared_locals.insert(var.to_string());
                                 }
                             }
                         } else {
@@ -567,6 +588,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 generator.declared_locals.insert(var_name.clone());
                             }
                         }
+                        i += 1;
+                    }
+                    Word::CommandSubstitution(_, _) => {
+                        // A bare CommandSubstitution here means it was NOT consumed as part
+                        // of a "var=" pair above (e.g. the variable name was already declared).
+                        // Skip it silently.
+                        i += 1;
                     }
                     _ => {
                         // For other word types, try to extract variable name and value
@@ -576,6 +604,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             output.push_str(&format!("my {};\n", var_expr));
                             generator.declared_locals.insert(var_expr);
                         }
+                        i += 1;
                     }
                 }
             }
@@ -752,7 +781,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 output.push_str(&generator.indent());
                 output.push_str("$CHILD_ERROR = 0;\n");
             } else {
-                // Check for -e flag
+                // Check for -e / -n flags
                 let has_e_flag = cmd.args.iter().any(|arg| {
                     if let Word::Literal(s, _) = arg {
                         s == "-e"
@@ -760,14 +789,21 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         false
                     }
                 });
+                let has_n_flag = cmd.args.iter().any(|arg| {
+                    if let Word::Literal(s, _) = arg {
+                        s == "-n"
+                    } else {
+                        false
+                    }
+                });
 
-                // Filter out the -e flag from arguments
+                // Filter out the -e and -n flags from arguments
                 let filtered_args: Vec<&Word> = cmd
                     .args
                     .iter()
                     .filter(|&arg| {
                         if let Word::Literal(s, _) = arg {
-                            s != "-e"
+                            s != "-e" && s != "-n"
                         } else {
                             true
                         }
@@ -965,13 +1001,27 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     })
                     .collect();
 
-                if args.len() == 1 {
+                if args.is_empty() {
+                    // After filtering flags, no content to print
+                    if !has_n_flag {
+                        output.push_str(&generator.indent());
+                        output.push_str("print \"\\n\";\n");
+                    }
+                    output.push_str(&generator.indent());
+                    output.push_str("$CHILD_ERROR = 0;\n");
+                } else if args.len() == 1 {
                     output.push_str(&generator.indent());
                     // Check if the argument is a command substitution
-                    if matches!(cmd.args[0], Word::CommandSubstitution(_, _)) {
+                    if matches!(
+                        cmd.args
+                            .iter()
+                            .find(|a| !matches!(a, Word::Literal(s, _) if s == "-n" || s == "-e")),
+                        Some(Word::CommandSubstitution(_, _))
+                    ) {
                         // For command substitution, don't add extra newline as it already contains proper formatting
                         output.push_str(&format!("print {};\n", args[0]));
-                    } else if args[0].starts_with('"')
+                    } else if !has_n_flag
+                        && args[0].starts_with('"')
                         && args[0].ends_with('"')
                         && !args[0].contains("\\n")
                         && !args[0].contains('$')
@@ -979,24 +1029,27 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // The string is already a valid Perl literal, so reuse it directly.
                         let content = &args[0][1..args[0].len() - 1]; // Remove quotes
                         output.push_str(&format!("print \"{}\\n\";\n", content));
-                    } else if args[0].starts_with('$') && !args[0].contains("\\n") {
+                    } else if !has_n_flag && args[0].starts_with('$') && !args[0].contains("\\n") {
                         // For variables, check if they already end with newline to avoid extra blank lines
                         output.push_str(&format!("print {};\n", args[0]));
                         output.push_str(&format!(
-                            "if ( !( {} =~ {} ) ) {{ print \"\\n\"; }}\n",
+                            "if ( !( ({}) =~ {} ) ) {{ print \"\\n\"; }}\n",
                             args[0],
                             generator.newline_end_regex()
                         ));
+                    } else if has_n_flag {
+                        // -n flag: suppress trailing newline
+                        output.push_str(&format!("print {};\n", args[0]));
                     } else {
                         // Check if the argument contains variables that might end with newlines
-                        let has_variables = match &cmd.args[0] {
+                        let has_variables = cmd.args.iter().any(|arg| match arg {
                             Word::Variable(_, _, _) => true,
                             Word::StringInterpolation(interp, _) => interp
                                 .parts
                                 .iter()
                                 .any(|part| matches!(part, crate::ast::StringPart::Variable(_))),
                             _ => false,
-                        } || args[0].contains('$');
+                        }) || args[0].contains('$');
 
                         if has_variables {
                             output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if ( !( $output =~ {} ) ) {{\n        print \"\\n\";\n    }}\n}};\n", args[0], generator.newline_end_regex()));
@@ -1037,7 +1090,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             _ => false,
                         });
                         if has_variables {
-                            output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if (!($output =~ /\\n$/msx)) {{\n        print \"\\n\";\n    }}\n}};\n", args_str));
+                            if has_n_flag {
+                                output.push_str(&format!("print {};\n", args_str));
+                            } else {
+                                output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if (!($output =~ /\\n$/msx)) {{\n        print \"\\n\";\n    }}\n}};\n", args_str));
+                            }
+                        } else if has_n_flag {
+                            output.push_str(&format!("print {};\n", args_str));
                         } else {
                             output.push_str(&format!("print {} . \"\\n\";\n", args_str));
                         }
