@@ -13,14 +13,30 @@ impl std::fmt::Display for ParameterExpansion {
             ParameterExpansionOperator::UppercaseAll => write!(f, "${{{0}^^}}", self.variable),
             ParameterExpansionOperator::LowercaseAll => write!(f, "${{{0},,}}", self.variable),
             ParameterExpansionOperator::UppercaseFirst => write!(f, "${{{0}^}}", self.variable),
-            ParameterExpansionOperator::RemoveLongestPrefix(pattern) => write!(f, "${{{0}##{1}}}", self.variable, pattern),
-            ParameterExpansionOperator::RemoveShortestPrefix(pattern) => write!(f, "${{{0}#{1}}}", self.variable, pattern),
-            ParameterExpansionOperator::RemoveLongestSuffix(pattern) => write!(f, "${{{0}%%{1}}}", self.variable, pattern),
-            ParameterExpansionOperator::RemoveShortestSuffix(pattern) => write!(f, "${{{0}%{1}}}", self.variable, pattern),
-            ParameterExpansionOperator::SubstituteAll(pattern, replacement) => write!(f, "${{{0}//{1}/{2}}}", self.variable, pattern, replacement),
-            ParameterExpansionOperator::DefaultValue(default) => write!(f, "${{{0}:-{1}}}", self.variable, default),
-            ParameterExpansionOperator::AssignDefault(default) => write!(f, "${{{0}:={1}}}", self.variable, default),
-            ParameterExpansionOperator::ErrorIfUnset(error) => write!(f, "${{{0}:?{1}}}", self.variable, error),
+            ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
+                write!(f, "${{{0}##{1}}}", self.variable, pattern)
+            }
+            ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
+                write!(f, "${{{0}#{1}}}", self.variable, pattern)
+            }
+            ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
+                write!(f, "${{{0}%%{1}}}", self.variable, pattern)
+            }
+            ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
+                write!(f, "${{{0}%{1}}}", self.variable, pattern)
+            }
+            ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
+                write!(f, "${{{0}//{1}/{2}}}", self.variable, pattern, replacement)
+            }
+            ParameterExpansionOperator::DefaultValue(default) => {
+                write!(f, "${{{0}:-{1}}}", self.variable, default)
+            }
+            ParameterExpansionOperator::AssignDefault(default) => {
+                write!(f, "${{{0}:={1}}}", self.variable, default)
+            }
+            ParameterExpansionOperator::ErrorIfUnset(error) => {
+                write!(f, "${{{0}:?{1}}}", self.variable, error)
+            }
             ParameterExpansionOperator::Basename => write!(f, "${{{0}##*/}}", self.variable),
             ParameterExpansionOperator::Dirname => write!(f, "${{{0}%/*}}", self.variable),
             ParameterExpansionOperator::ArraySlice(offset, length) => {
@@ -38,30 +54,30 @@ impl std::fmt::Display for ParameterExpansion {
 pub enum ParameterExpansionOperator {
     // No operator (simple variable reference)
     None,
-    
+
     // Case modification
-    UppercaseAll,      // ^^
-    LowercaseAll,      // ,,
-    UppercaseFirst,    // ^
-    
+    UppercaseAll,   // ^^
+    LowercaseAll,   // ,,
+    UppercaseFirst, // ^
+
     // Substring removal
     RemoveLongestPrefix(String),  // ##pattern
     RemoveShortestPrefix(String), // #pattern
     RemoveLongestSuffix(String),  // %%pattern
     RemoveShortestSuffix(String), // %pattern
-    
+
     // Pattern substitution
     SubstituteAll(String, String), // //pattern/replacement
-    
+
     // Default values
-    DefaultValue(String),          // :-default
-    AssignDefault(String),         // :=default
-    ErrorIfUnset(String),         // :?error
-    
+    DefaultValue(String),  // :-default
+    AssignDefault(String), // :=default
+    ErrorIfUnset(String),  // :?error
+
     // Path manipulation
-    Basename,                      // ##*/
-    Dirname,                       // %/*
-    
+    Basename, // ##*/
+    Dirname,  // %/*
+
     // Array slice operations
     ArraySlice(String, Option<String>), // :offset or :start:length
 }
@@ -118,9 +134,9 @@ pub enum StringPart {
     Literal(String),
     Variable(String),
     ParameterExpansion(ParameterExpansion),
-    MapAccess(String, String), // map_name, key
-    MapKeys(String), // !map[@] -> get keys of associative array
-    MapLength(String), // #arr[@] -> get length of array
+    MapAccess(String, String),                  // map_name, key
+    MapKeys(String),                            // !map[@] -> get keys of associative array
+    MapLength(String),                          // #arr[@] -> get length of array
     ArraySlice(String, String, Option<String>), // array_name, offset, optional_length
     Arithmetic(ArithmeticExpression),
     CommandSubstitution(Box<crate::ast::Command>),
@@ -135,9 +151,9 @@ pub enum Word {
     Variable(String, bool, Option<()>), // variable_name, is_mutable, annotations
     ParameterExpansion(ParameterExpansion, Option<()>),
     Array(String, Vec<String>, Option<()>), // array_name, elements, annotations
-    MapAccess(String, String, Option<()>), // map_name, key, annotations
-    MapKeys(String, Option<()>), // !map[@] -> get keys of associative array, annotations
-    MapLength(String, Option<()>), // #arr[@] -> get length of array, annotations
+    MapAccess(String, String, Option<()>),  // map_name, key, annotations
+    MapKeys(String, Option<()>),            // !map[@] -> get keys of associative array, annotations
+    MapLength(String, Option<()>),          // #arr[@] -> get length of array, annotations
     ArraySlice(String, String, Option<String>, Option<()>), // array_name, offset, optional_length, annotations
     Arithmetic(ArithmeticExpression, Option<()>),
     BraceExpansion(BraceExpansion, Option<()>),
@@ -150,28 +166,42 @@ impl std::fmt::Display for Word {
         match self {
             Word::Literal(s, _) => write!(f, "{}", s),
             Word::Variable(var, _, _) => write!(f, "${}", var),
-            Word::ParameterExpansion(pe, _) => {
-                match &pe.operator {
-                    ParameterExpansionOperator::None => write!(f, "${{{}}}", pe.variable),
-                    ParameterExpansionOperator::UppercaseAll => write!(f, "${{{}}}", pe.variable),
-                    ParameterExpansionOperator::LowercaseAll => write!(f, "${{{}}}", pe.variable),
-                    ParameterExpansionOperator::UppercaseFirst => write!(f, "${{{}}}", pe.variable),
-                    ParameterExpansionOperator::RemoveLongestPrefix(pattern) => write!(f, "${{{}}}##{}", pe.variable, pattern),
-                    ParameterExpansionOperator::RemoveShortestPrefix(pattern) => write!(f, "${{{}}}#{}", pe.variable, pattern),
-                    ParameterExpansionOperator::RemoveLongestSuffix(pattern) => write!(f, "${{{}}}%%{}", pe.variable, pattern),
-                    ParameterExpansionOperator::RemoveShortestSuffix(pattern) => write!(f, "${{{}}}%{}", pe.variable, pattern),
-                    ParameterExpansionOperator::SubstituteAll(pattern, replacement) => write!(f, "${{{}}}//{}/{}", pe.variable, pattern, replacement),
-                    ParameterExpansionOperator::DefaultValue(default) => write!(f, "${{{}}}:-{}", pe.variable, default),
-                    ParameterExpansionOperator::AssignDefault(default) => write!(f, "${{{}}}:={}", pe.variable, default),
-                    ParameterExpansionOperator::ErrorIfUnset(error) => write!(f, "${{{}}}:?{}", pe.variable, error),
-                    ParameterExpansionOperator::Basename => write!(f, "${{{}}}##*/", pe.variable),
-                    ParameterExpansionOperator::Dirname => write!(f, "${{{}}}%/*", pe.variable),
-                    ParameterExpansionOperator::ArraySlice(offset, length) => {
-                        if let Some(length_str) = length {
-                            write!(f, "${{{}}}:{}:{}", pe.variable, offset, length_str)
-                        } else {
-                            write!(f, "${{{}}}:{}", pe.variable, offset)
-                        }
+            Word::ParameterExpansion(pe, _) => match &pe.operator {
+                ParameterExpansionOperator::None => write!(f, "${{{}}}", pe.variable),
+                ParameterExpansionOperator::UppercaseAll => write!(f, "${{{}}}", pe.variable),
+                ParameterExpansionOperator::LowercaseAll => write!(f, "${{{}}}", pe.variable),
+                ParameterExpansionOperator::UppercaseFirst => write!(f, "${{{}}}", pe.variable),
+                ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
+                    write!(f, "${{{}}}##{}", pe.variable, pattern)
+                }
+                ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
+                    write!(f, "${{{}}}#{}", pe.variable, pattern)
+                }
+                ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
+                    write!(f, "${{{}}}%%{}", pe.variable, pattern)
+                }
+                ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
+                    write!(f, "${{{}}}%{}", pe.variable, pattern)
+                }
+                ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
+                    write!(f, "${{{}}}//{}/{}", pe.variable, pattern, replacement)
+                }
+                ParameterExpansionOperator::DefaultValue(default) => {
+                    write!(f, "${{{}}}:-{}", pe.variable, default)
+                }
+                ParameterExpansionOperator::AssignDefault(default) => {
+                    write!(f, "${{{}}}:={}", pe.variable, default)
+                }
+                ParameterExpansionOperator::ErrorIfUnset(error) => {
+                    write!(f, "${{{}}}:?{}", pe.variable, error)
+                }
+                ParameterExpansionOperator::Basename => write!(f, "${{{}}}##*/", pe.variable),
+                ParameterExpansionOperator::Dirname => write!(f, "${{{}}}%/*", pe.variable),
+                ParameterExpansionOperator::ArraySlice(offset, length) => {
+                    if let Some(length_str) = length {
+                        write!(f, "${{{}}}:{}:{}", pe.variable, offset, length_str)
+                    } else {
+                        write!(f, "${{{}}}:{}", pe.variable, offset)
                     }
                 }
             },
@@ -185,7 +215,7 @@ impl std::fmt::Display for Word {
                 } else {
                     write!(f, "${{{}}}[@]:{}", array_name, offset)
                 }
-            },
+            }
             Word::Arithmetic(expr, _) => write!(f, "{}", expr.expression),
             Word::BraceExpansion(expansion, _) => {
                 let mut result = String::new();
@@ -224,41 +254,82 @@ impl std::fmt::Display for Word {
                     match part {
                         StringPart::Literal(s) => result.push_str(s),
                         StringPart::Variable(var) => result.push_str(&format!("${}", var)),
-                        StringPart::ParameterExpansion(pe) => {
-                            match &pe.operator {
-                                ParameterExpansionOperator::None => result.push_str(&format!("${{{}}}", pe.variable)),
-                                ParameterExpansionOperator::UppercaseAll => result.push_str(&format!("${{{}}}", pe.variable)),
-                                ParameterExpansionOperator::LowercaseAll => result.push_str(&format!("${{{}}}", pe.variable)),
-                                ParameterExpansionOperator::UppercaseFirst => result.push_str(&format!("${{{}}}", pe.variable)),
-                                ParameterExpansionOperator::RemoveLongestPrefix(pattern) => result.push_str(&format!("${{{}}}##{}", pe.variable, pattern)),
-                                ParameterExpansionOperator::RemoveShortestPrefix(pattern) => result.push_str(&format!("${{{}}}#{}", pe.variable, pattern)),
-                                ParameterExpansionOperator::RemoveLongestSuffix(pattern) => result.push_str(&format!("${{{}}}%%{}", pe.variable, pattern)),
-                                ParameterExpansionOperator::RemoveShortestSuffix(pattern) => result.push_str(&format!("${{{}}}%{}", pe.variable, pattern)),
-                                ParameterExpansionOperator::SubstituteAll(pattern, replacement) => result.push_str(&format!("${{{}}}//{}/{}", pe.variable, pattern, replacement)),
-                                ParameterExpansionOperator::DefaultValue(default) => result.push_str(&format!("${{{}}}:-{}", pe.variable, default)),
-                                ParameterExpansionOperator::AssignDefault(default) => result.push_str(&format!("${{{}}}:={}", pe.variable, default)),
-                                ParameterExpansionOperator::ErrorIfUnset(error) => result.push_str(&format!("${{{}}}:?{}", pe.variable, error)),
-                                ParameterExpansionOperator::Basename => result.push_str(&format!("${{{}}}##*/", pe.variable)),
-                                ParameterExpansionOperator::Dirname => result.push_str(&format!("${{{}}}%/*", pe.variable)),
-                                ParameterExpansionOperator::ArraySlice(offset, length) => {
-                                    if let Some(length_str) = length {
-                                        result.push_str(&format!("${{{}}}:{1}:{2}", pe.variable, offset, length_str))
-                                    } else {
-                                        result.push_str(&format!("${{{}}}:{1}", pe.variable, offset))
-                                    }
+                        StringPart::ParameterExpansion(pe) => match &pe.operator {
+                            ParameterExpansionOperator::None => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
+                            }
+                            ParameterExpansionOperator::UppercaseAll => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
+                            }
+                            ParameterExpansionOperator::LowercaseAll => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
+                            }
+                            ParameterExpansionOperator::UppercaseFirst => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
+                            }
+                            ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
+                                result.push_str(&format!("${{{}}}##{}", pe.variable, pattern))
+                            }
+                            ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
+                                result.push_str(&format!("${{{}}}#{}", pe.variable, pattern))
+                            }
+                            ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
+                                result.push_str(&format!("${{{}}}%%{}", pe.variable, pattern))
+                            }
+                            ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
+                                result.push_str(&format!("${{{}}}%{}", pe.variable, pattern))
+                            }
+                            ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
+                                result.push_str(&format!(
+                                    "${{{}}}//{}/{}",
+                                    pe.variable, pattern, replacement
+                                ))
+                            }
+                            ParameterExpansionOperator::DefaultValue(default) => {
+                                result.push_str(&format!("${{{}}}:-{}", pe.variable, default))
+                            }
+                            ParameterExpansionOperator::AssignDefault(default) => {
+                                result.push_str(&format!("${{{}}}:={}", pe.variable, default))
+                            }
+                            ParameterExpansionOperator::ErrorIfUnset(error) => {
+                                result.push_str(&format!("${{{}}}:?{}", pe.variable, error))
+                            }
+                            ParameterExpansionOperator::Basename => {
+                                result.push_str(&format!("${{{}}}##*/", pe.variable))
+                            }
+                            ParameterExpansionOperator::Dirname => {
+                                result.push_str(&format!("${{{}}}%/*", pe.variable))
+                            }
+                            ParameterExpansionOperator::ArraySlice(offset, length) => {
+                                if let Some(length_str) = length {
+                                    result.push_str(&format!(
+                                        "${{{}}}:{1}:{2}",
+                                        pe.variable, offset, length_str
+                                    ))
+                                } else {
+                                    result.push_str(&format!("${{{}}}:{1}", pe.variable, offset))
                                 }
                             }
+                        },
+                        StringPart::MapAccess(map_name, key) => {
+                            result.push_str(&format!("{}[{}]", map_name, key))
                         }
-                        StringPart::MapAccess(map_name, key) => result.push_str(&format!("{}[{}]", map_name, key)),
-                        StringPart::MapKeys(map_name) => result.push_str(&format!("!{}[@]", map_name)),
-                        StringPart::MapLength(map_name) => result.push_str(&format!("#{}[@]", map_name)),
+                        StringPart::MapKeys(map_name) => {
+                            result.push_str(&format!("!{}[@]", map_name))
+                        }
+                        StringPart::MapLength(map_name) => {
+                            result.push_str(&format!("#{}[@]", map_name))
+                        }
                         StringPart::ArraySlice(array_name, offset, length) => {
                             if let Some(length_str) = length {
-                                result.push_str(&format!("${{{}[@]}}:{}:{}", array_name, offset, length_str));
+                                result.push_str(&format!(
+                                    "${{{}[@]}}:{}:{}",
+                                    array_name, offset, length_str
+                                ));
                             } else {
                                 result.push_str(&format!("${{{}[@]}}:{}", array_name, offset));
                             }
-                        },
+                        }
                         StringPart::Arithmetic(expr) => result.push_str(&expr.expression),
                         StringPart::CommandSubstitution(_) => result.push_str("$(...)"),
                     }
@@ -274,91 +345,103 @@ impl Word {
     pub fn literal(s: String) -> Self {
         Word::Literal(s, None)
     }
-    
+
     /// Create a variable word
     pub fn variable(name: String) -> Self {
         Word::Variable(name, false, None)
     }
-    
+
     /// Create a parameter expansion word
     pub fn parameter_expansion(pe: ParameterExpansion) -> Self {
         Word::ParameterExpansion(pe, None)
     }
-    
+
     /// Create an array word
     pub fn array(name: String, elements: Vec<String>) -> Self {
         Word::Array(name, elements, None)
     }
-    
+
     /// Create a map access word
     pub fn map_access(map_name: String, key: String) -> Self {
         Word::MapAccess(map_name, key, None)
     }
-    
+
     /// Create a map keys word
     pub fn map_keys(map_name: String) -> Self {
         Word::MapKeys(map_name, None)
     }
-    
+
     /// Create a map length word
     pub fn map_length(map_name: String) -> Self {
         Word::MapLength(map_name, None)
     }
-    
+
     /// Create an array slice word
     pub fn array_slice(array_name: String, offset: String, length: Option<String>) -> Self {
         Word::ArraySlice(array_name, offset, length, None)
     }
-    
+
     /// Create an arithmetic word
     pub fn arithmetic(expr: ArithmeticExpression) -> Self {
         Word::Arithmetic(expr, None)
     }
-    
+
     /// Create a brace expansion word
     pub fn brace_expansion(expansion: BraceExpansion) -> Self {
         Word::BraceExpansion(expansion, None)
     }
-    
+
     /// Create a command substitution word
     pub fn command_substitution(cmd: Box<crate::ast::Command>) -> Self {
         Word::CommandSubstitution(cmd, None)
     }
-    
+
     /// Create a string interpolation word
     pub fn string_interpolation(interp: StringInterpolation) -> Self {
         Word::StringInterpolation(interp, None)
     }
 
-
-    
     /// Get a string representation of the word, suitable for display
     pub fn to_string(&self) -> String {
         match self {
             Word::Literal(s, _) => s.to_string(),
             Word::Variable(var, _, _) => format!("${}", var),
-            Word::ParameterExpansion(pe, _) => {
-                match &pe.operator {
-                    ParameterExpansionOperator::None => format!("${{{}}}", pe.variable),
-                    ParameterExpansionOperator::UppercaseAll => format!("${{{}}}", pe.variable),
-                    ParameterExpansionOperator::LowercaseAll => format!("${{{}}}", pe.variable),
-                    ParameterExpansionOperator::UppercaseFirst => format!("${{{}}}", pe.variable),
-                    ParameterExpansionOperator::RemoveLongestPrefix(pattern) => format!("${{{}}}##{}", pe.variable, pattern),
-                    ParameterExpansionOperator::RemoveShortestPrefix(pattern) => format!("${{{}}}#{}", pe.variable, pattern),
-                    ParameterExpansionOperator::RemoveLongestSuffix(pattern) => format!("${{{}}}%%{}", pe.variable, pattern),
-                    ParameterExpansionOperator::RemoveShortestSuffix(pattern) => format!("${{{}}}%{}", pe.variable, pattern),
-                    ParameterExpansionOperator::SubstituteAll(pattern, replacement) => format!("${{{}}}//{}/{}", pe.variable, pattern, replacement),
-                    ParameterExpansionOperator::DefaultValue(default) => format!("${{{}}}:-{}", pe.variable, default),
-                    ParameterExpansionOperator::AssignDefault(default) => format!("${{{}}}:={}", pe.variable, default),
-                    ParameterExpansionOperator::ErrorIfUnset(error) => format!("${{{}}}:?{}", pe.variable, error),
-                    ParameterExpansionOperator::Basename => format!("${{{}}}##*/", pe.variable),
-                    ParameterExpansionOperator::Dirname => format!("${{{}}}%/*", pe.variable),
-                    ParameterExpansionOperator::ArraySlice(offset, length) => {
-                        if let Some(length_str) = length {
-                            format!("${{{}}}:{1}:{2}", pe.variable, offset, length_str)
-                        } else {
-                            format!("${{{}}}:{1}", pe.variable, offset)
-                        }
+            Word::ParameterExpansion(pe, _) => match &pe.operator {
+                ParameterExpansionOperator::None => format!("${{{}}}", pe.variable),
+                ParameterExpansionOperator::UppercaseAll => format!("${{{}}}", pe.variable),
+                ParameterExpansionOperator::LowercaseAll => format!("${{{}}}", pe.variable),
+                ParameterExpansionOperator::UppercaseFirst => format!("${{{}}}", pe.variable),
+                ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
+                    format!("${{{}}}##{}", pe.variable, pattern)
+                }
+                ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
+                    format!("${{{}}}#{}", pe.variable, pattern)
+                }
+                ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
+                    format!("${{{}}}%%{}", pe.variable, pattern)
+                }
+                ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
+                    format!("${{{}}}%{}", pe.variable, pattern)
+                }
+                ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
+                    format!("${{{}}}//{}/{}", pe.variable, pattern, replacement)
+                }
+                ParameterExpansionOperator::DefaultValue(default) => {
+                    format!("${{{}}}:-{}", pe.variable, default)
+                }
+                ParameterExpansionOperator::AssignDefault(default) => {
+                    format!("${{{}}}:={}", pe.variable, default)
+                }
+                ParameterExpansionOperator::ErrorIfUnset(error) => {
+                    format!("${{{}}}:?{}", pe.variable, error)
+                }
+                ParameterExpansionOperator::Basename => format!("${{{}}}##*/", pe.variable),
+                ParameterExpansionOperator::Dirname => format!("${{{}}}%/*", pe.variable),
+                ParameterExpansionOperator::ArraySlice(offset, length) => {
+                    if let Some(length_str) = length {
+                        format!("${{{}}}:{1}:{2}", pe.variable, offset, length_str)
+                    } else {
+                        format!("${{{}}}:{1}", pe.variable, offset)
                     }
                 }
             },
@@ -372,7 +455,7 @@ impl Word {
                 } else {
                     format!("${{{}}}[@]:{}", array_name, offset)
                 }
-            },
+            }
             Word::Arithmetic(expr, _) => expr.expression.to_string(),
             Word::BraceExpansion(expansion, _) => {
                 let mut result = String::new();
@@ -411,41 +494,82 @@ impl Word {
                     match part {
                         StringPart::Literal(s) => result.push_str(s),
                         StringPart::Variable(var) => result.push_str(&format!("${}", var)),
-                        StringPart::ParameterExpansion(pe) => {
-                            match &pe.operator {
-                                ParameterExpansionOperator::None => result.push_str(&format!("${{{}}}", pe.variable)),
-                                ParameterExpansionOperator::UppercaseAll => result.push_str(&format!("${{{}}}", pe.variable)),
-                                ParameterExpansionOperator::LowercaseAll => result.push_str(&format!("${{{}}}", pe.variable)),
-                                ParameterExpansionOperator::UppercaseFirst => result.push_str(&format!("${{{}}}", pe.variable)),
-                                ParameterExpansionOperator::RemoveLongestPrefix(pattern) => result.push_str(&format!("${{{}}}##{}", pe.variable, pattern)),
-                                ParameterExpansionOperator::RemoveShortestPrefix(pattern) => result.push_str(&format!("${{{}}}#{}", pe.variable, pattern)),
-                                ParameterExpansionOperator::RemoveLongestSuffix(pattern) => result.push_str(&format!("${{{}}}%%{}", pe.variable, pattern)),
-                                ParameterExpansionOperator::RemoveShortestSuffix(pattern) => result.push_str(&format!("${{{}}}%{}", pe.variable, pattern)),
-                                ParameterExpansionOperator::SubstituteAll(pattern, replacement) => result.push_str(&format!("${{{}}}//{}/{}", pe.variable, pattern, replacement)),
-                                ParameterExpansionOperator::DefaultValue(default) => result.push_str(&format!("${{{}}}:-{}", pe.variable, default)),
-                                ParameterExpansionOperator::AssignDefault(default) => result.push_str(&format!("${{{}}}:={}", pe.variable, default)),
-                                ParameterExpansionOperator::ErrorIfUnset(error) => result.push_str(&format!("${{{}}}:?{}", pe.variable, error)),
-                                ParameterExpansionOperator::Basename => result.push_str(&format!("${{{}}}##*/", pe.variable)),
-                                ParameterExpansionOperator::Dirname => result.push_str(&format!("${{{}}}%/*", pe.variable)),
-                                ParameterExpansionOperator::ArraySlice(offset, length) => {
-                                    if let Some(length_str) = length {
-                                        result.push_str(&format!("${{{}}}:{1}:{2}", pe.variable, offset, length_str))
-                                    } else {
-                                        result.push_str(&format!("${{{}}}:{1}", pe.variable, offset))
-                                    }
+                        StringPart::ParameterExpansion(pe) => match &pe.operator {
+                            ParameterExpansionOperator::None => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
+                            }
+                            ParameterExpansionOperator::UppercaseAll => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
+                            }
+                            ParameterExpansionOperator::LowercaseAll => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
+                            }
+                            ParameterExpansionOperator::UppercaseFirst => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
+                            }
+                            ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
+                                result.push_str(&format!("${{{}}}##{}", pe.variable, pattern))
+                            }
+                            ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
+                                result.push_str(&format!("${{{}}}#{}", pe.variable, pattern))
+                            }
+                            ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
+                                result.push_str(&format!("${{{}}}%%{}", pe.variable, pattern))
+                            }
+                            ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
+                                result.push_str(&format!("${{{}}}%{}", pe.variable, pattern))
+                            }
+                            ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
+                                result.push_str(&format!(
+                                    "${{{}}}//{}/{}",
+                                    pe.variable, pattern, replacement
+                                ))
+                            }
+                            ParameterExpansionOperator::DefaultValue(default) => {
+                                result.push_str(&format!("${{{}}}:-{}", pe.variable, default))
+                            }
+                            ParameterExpansionOperator::AssignDefault(default) => {
+                                result.push_str(&format!("${{{}}}:={}", pe.variable, default))
+                            }
+                            ParameterExpansionOperator::ErrorIfUnset(error) => {
+                                result.push_str(&format!("${{{}}}:?{}", pe.variable, error))
+                            }
+                            ParameterExpansionOperator::Basename => {
+                                result.push_str(&format!("${{{}}}##*/", pe.variable))
+                            }
+                            ParameterExpansionOperator::Dirname => {
+                                result.push_str(&format!("${{{}}}%/*", pe.variable))
+                            }
+                            ParameterExpansionOperator::ArraySlice(offset, length) => {
+                                if let Some(length_str) = length {
+                                    result.push_str(&format!(
+                                        "${{{}}}:{1}:{2}",
+                                        pe.variable, offset, length_str
+                                    ))
+                                } else {
+                                    result.push_str(&format!("${{{}}}:{1}", pe.variable, offset))
                                 }
                             }
                         },
-                        StringPart::MapAccess(map_name, key) => result.push_str(&format!("${{{}}}[{}]", map_name, key)),
-                        StringPart::MapKeys(map_name) => result.push_str(&format!("${{!{}}}[@]", map_name)),
-                        StringPart::MapLength(map_name) => result.push_str(&format!("${{#{}}}[@]", map_name)),
+                        StringPart::MapAccess(map_name, key) => {
+                            result.push_str(&format!("${{{}}}[{}]", map_name, key))
+                        }
+                        StringPart::MapKeys(map_name) => {
+                            result.push_str(&format!("${{!{}}}[@]", map_name))
+                        }
+                        StringPart::MapLength(map_name) => {
+                            result.push_str(&format!("${{#{}}}[@]", map_name))
+                        }
                         StringPart::ArraySlice(array_name, offset, length) => {
                             if let Some(length_str) = length {
-                                result.push_str(&format!("${{{}[@]}}:{}:{}", array_name, offset, length_str));
+                                result.push_str(&format!(
+                                    "${{{}[@]}}:{}:{}",
+                                    array_name, offset, length_str
+                                ));
                             } else {
                                 result.push_str(&format!("${{{}[@]}}:{}", array_name, offset));
                             }
-                        },
+                        }
                         StringPart::Arithmetic(expr) => result.push_str(&expr.expression),
                         StringPart::CommandSubstitution(_) => result.push_str("$(...)"),
                     }
@@ -474,7 +598,7 @@ impl Word {
 
 impl std::ops::Deref for Word {
     type Target = str;
-    
+
     fn deref(&self) -> &Self::Target {
         match self {
             Word::Literal(s, _) => s,

@@ -184,7 +184,7 @@ sub purify_perl_code {
     # croak was used before the import. To be robust, insert 'use Carp;'
     # at the top whenever the first occurrence of croak/confess is before
     # the first 'use Carp' (or when no 'use Carp' exists at all).
-    if ($serialized =~ /\b(?:croak|confess)\b/) {
+    if ($serialized =~ /\b(?:carp|cluck|croak|confess)\b/) {
         my $first_helper_pos = $-[0];
         my $first_use_pos = -1;
         if ($serialized =~ /\buse\s+Carp\b/) {
@@ -638,7 +638,14 @@ sub process_single_backtick_string {
         #    declared in the do-block context. Remove those assignment lines.
         $perl_result =~ s/[ \t]*if\s*\(\s*!\s*\$pipeline_success_\d+\s*\)\s*\{\s*\$main_exit_code\s*=\s*1;\s*\}[ \t]*\n?//g;
 
-        # 3. Debashc generates open3($in_N, $out_N, $err_N, ...) where $err_N
+        # 3. Debashc adds trailing-newline stripping to match bash $() which
+        #    strips trailing newlines. In Perl backtick context the trailing
+        #    newlines should be preserved (Perl `...` does NOT strip them).
+        #    Remove $var =~ s/\n+\z//msx; lines and chomp() wrapping of qx{}.
+        $perl_result =~ s/[ \t]*\$\w+\s*=~\s*s\/\\n\+\\z\/\/\w*;\n?//g;
+        $perl_result =~ s/chomp\s*\(\s*(my\s+\$\w+\s*=\s*qx\{[^}]*\})\s*\)/$1/g;
+
+        # 4. Debashc generates open3($in_N, $out_N, $err_N, ...) where $err_N
         #    is an uninitialized scalar.  IPC::Open3 treats a false/undef
         #    CHLD_ERR as "merge child stderr into the stdout pipe", which
         #    differs from backtick semantics (child stderr goes to the
@@ -2159,7 +2166,7 @@ sub extract_core_perl_logic_ppi {
 
     my $core_code = join("\n", @core_statements) . "\n";
     my $needs_open3 = $core_code =~ /\bopen3\b/;
-    my $needs_carp = $core_code =~ /\b(?:croak|confess)\b/;
+    my $needs_carp = $core_code =~ /\b(?:carp|cluck|croak|confess)\b/;
     my $needs_english = $core_code =~ /\$(?:OS_ERROR|ERRNO|CHILD_ERROR|EVAL_ERROR)\b/;
 
     my @filtered_statements;

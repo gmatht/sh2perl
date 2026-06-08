@@ -21,7 +21,7 @@ impl MirWord {
             // variable_analysis: None, // TODO: Re-implement variable analysis
         }
     }
-    
+
     // /// Create a MIR word with specific bounds
     // pub fn with_bounds(ast_word: Word, bounds: Bounds) -> Self {
     //     MirWord {
@@ -30,17 +30,17 @@ impl MirWord {
     //         variable_analysis: None,
     //     }
     // }
-    
+
     /// Get the underlying AST word
     pub fn ast_word(&self) -> &Word {
         &self.ast_word
     }
-    
+
     // /// Get the bounds information
     // pub fn bounds(&self) -> Option<&Bounds> {
     //     self.bounds.as_ref()
     // }
-    
+
     // /// Update the bounds
     // pub fn set_bounds(&mut self, bounds: Bounds) {
     //     self.bounds = Some(bounds);
@@ -55,7 +55,7 @@ impl std::fmt::Display for MirWord {
 
 impl std::ops::Deref for MirWord {
     type Target = Word;
-    
+
     fn deref(&self) -> &Self::Target {
         &self.ast_word
     }
@@ -137,13 +137,17 @@ impl MirCommand {
             Command::Simple(simple_cmd) => {
                 // Convert AST words to MIR words
                 let mir_name = MirWord::from_ast_word(simple_cmd.name.clone());
-                let mir_args: Vec<MirWord> = simple_cmd.args.iter()
+                let mir_args: Vec<MirWord> = simple_cmd
+                    .args
+                    .iter()
                     .map(|arg| MirWord::from_ast_word(arg.clone()))
                     .collect();
-                let mir_env_vars: std::collections::HashMap<String, MirWord> = simple_cmd.env_vars.iter()
+                let mir_env_vars: std::collections::HashMap<String, MirWord> = simple_cmd
+                    .env_vars
+                    .iter()
                     .map(|(k, v)| (k.clone(), MirWord::from_ast_word(v.clone())))
                     .collect();
-                
+
                 MirCommand::Simple(MirSimpleCommand {
                     name: mir_name,
                     args: mir_args,
@@ -152,49 +156,47 @@ impl MirCommand {
                     stdout_used: simple_cmd.stdout_used,
                     stderr_used: simple_cmd.stderr_used,
                 })
-            },
+            }
             Command::Pipeline(pipeline) => MirCommand::Pipeline(pipeline.clone()),
             Command::Redirect(redirect) => MirCommand::Redirect(redirect.clone()),
-            Command::And(left, right) => {
-                MirCommand::And(
-                    Box::new(MirCommand::from_ast_command(left)),
-                    Box::new(MirCommand::from_ast_command(right))
-                )
-            },
-            Command::Or(left, right) => {
-                MirCommand::Or(
-                    Box::new(MirCommand::from_ast_command(left)),
-                    Box::new(MirCommand::from_ast_command(right))
-                )
-            },
+            Command::And(left, right) => MirCommand::And(
+                Box::new(MirCommand::from_ast_command(left)),
+                Box::new(MirCommand::from_ast_command(right)),
+            ),
+            Command::Or(left, right) => MirCommand::Or(
+                Box::new(MirCommand::from_ast_command(left)),
+                Box::new(MirCommand::from_ast_command(right)),
+            ),
             Command::For(for_loop) => {
-                let mir_items: Vec<MirWord> = for_loop.items.iter()
+                let mir_items: Vec<MirWord> = for_loop
+                    .items
+                    .iter()
                     .map(|item| MirWord::from_ast_word(item.clone()))
                     .collect();
-                
+
                 MirCommand::For(MirForLoop {
                     variable: for_loop.variable.clone(),
                     items: mir_items,
                     body: for_loop.body.commands.clone(),
                     // loop_analysis: None, // TODO: Re-implement loop analysis
                 })
-            },
+            }
             Command::While(while_loop) => {
                 MirCommand::While(MirWhileLoop {
                     condition: while_loop.condition.clone(),
                     body: while_loop.body.commands.clone(),
                     // loop_analysis: None, // TODO: Re-implement loop analysis
                 })
-            },
+            }
             Command::If(if_stmt) => MirCommand::If(if_stmt.clone()),
             Command::Case(case_stmt) => MirCommand::Case(case_stmt.clone()),
             Command::Function(func) => MirCommand::Function(func.clone()),
             Command::Subshell(cmd) => {
                 MirCommand::Subshell(Box::new(MirCommand::from_ast_command(cmd)))
-            },
+            }
             Command::Background(cmd) => {
                 MirCommand::Background(Box::new(MirCommand::from_ast_command(cmd)))
-            },
+            }
             // TODO: Handle other command types
             _ => {
                 // For now, create a simple command as fallback
@@ -206,7 +208,7 @@ impl MirCommand {
                     stdout_used: false,
                     stderr_used: false,
                 })
-            },
+            }
         }
     }
 }

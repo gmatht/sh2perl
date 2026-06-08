@@ -2,13 +2,23 @@
 use strict;
 use warnings;
 use Carp;
-use English qw( -no_match_vars );
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
 use IPC::Open3;
 
 my $main_exit_code = 0;
-my $ls_success = 0;
+my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $result =  ($a + $b) * ($c - $d) / ($e % $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ;
-print "Deeply nested arithmetic result: $result\n";
+my $result =  ($a + $b) * ($c - $d) / ($e * $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ;
+do {
+    my $output = "Deeply nested arithmetic result: $result";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+
+exit $main_exit_code;

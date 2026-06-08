@@ -10,19 +10,20 @@ use File::Path    qw(make_path remove_tree);
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
 print "=== Checksum Commands ===\n";
 do {
     open my $original_stdout, '>&', STDOUT
-      or die "Cannot save STDOUT: $!\n";
+      or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'test_checksum.txt'
-      or die "Cannot open file: $!\n";
+      or die "Cannot open file: $OS_ERROR\n";
     print "test content\n";
     open STDOUT, '>&', $original_stdout
-      or die "Cannot restore STDOUT: $!\n";
+      or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
-      or die "Close failed: $!\n";
+      or die "Close failed: $OS_ERROR\n";
 };
 my $sha256_result = do {
     my @results;
@@ -84,10 +85,17 @@ do {
     }
 };
 $CHILD_ERROR = 0;
+<<<<<<< HEAD
 my $strings_result = do { my $_pipeline_result = do {
     my $output_112 = q{};
     my $output_printed_112;
     my $pipeline_success_112 = 1;
+=======
+my $strings_result = do { do {
+    my $output_111 = q{};
+    my $output_printed_111;
+    my $pipeline_success_111 = 1;
+>>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
     my $input_data;
     if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
         local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
@@ -104,12 +112,21 @@ my $strings_result = do { my $_pipeline_result = do {
         push @result, $1;
     }
     my $line = join "\n", @result;
+<<<<<<< HEAD
     $output_112 = $line;
     if ($CHILD_ERROR != 0) { $pipeline_success_112 = 0; }
     my $num_lines       = 3;
     my $head_line_count = 0;
     my $result          = q{};
     my $input           = $output_112;
+=======
+    if ($line ne q{} && !($line =~ m{\n\z}msx)) { $line .= "\n"; }
+    $output_111 = $line;
+    my $num_lines       = 3;
+    my $head_line_count = 0;
+    my $result          = q{};
+    my $input           = $output_111;
+>>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
     my $pos             = 0;
 
     while ( $pos < length $input && $head_line_count < $num_lines ) {
@@ -122,14 +139,23 @@ my $strings_result = do { my $_pipeline_result = do {
         $pos = $line_end + 1;
         ++$head_line_count;
     }
+<<<<<<< HEAD
     $output_112 = $result;
 
     if ( !$pipeline_success_112 ) { $main_exit_code = 1; }
     $output_112;
 }; $_pipeline_result =~ s/\n+\z//msx; $_pipeline_result; };
+=======
+    $output_111 = $result;
+
+    if ( !$pipeline_success_111 ) { $main_exit_code = 1; }
+    $output_111 =~ s/\n+\z//msx;
+    $output_111;
+} };
+>>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
 print "Strings result:\n";
 print $strings_result;
-if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }
 if ( -e "test_checksum.txt" ) {
     if ( -d "test_checksum.txt" ) {
         carp "rm: carping: ", "test_checksum.txt",

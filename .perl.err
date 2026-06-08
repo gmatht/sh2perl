@@ -1,0 +1,2 @@
+syntax error at .ci_check.pl line 1, near "script:"
+Execution of .ci_check.pl aborted due to compilation errors.
