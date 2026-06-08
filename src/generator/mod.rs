@@ -5,6 +5,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Static counter for generating truly unique IDs across all generator instances
 static GLOBAL_UNIQUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Format an integer with `_` grouping separators every three digits (e.g.
+/// `12345` → `"12_345"`, `1000000` → `"1_000_000"`).  Numbers with fewer than
+/// four digits are returned unchanged.  Perl::Critic's
+/// `RequireNumberSeparators` policy requires this for literals ≥ 1 000.
+fn format_integer_with_underscores(n: i64) -> String {
+    if n < 0 {
+        return format!("-{}", format_integer_with_underscores(-n));
+    }
+    let s = n.to_string();
+    if s.len() <= 3 {
+        return s;
+    }
+    // Insert `_` every three digits from the right
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            result.push('_');
+        }
+        result.push(b as char);
+    }
+    result
+}
+
 pub mod commands;
 pub mod control_flow;
 pub mod expansions;
@@ -32,6 +56,13 @@ pub struct Generator {
     /// generator code (eg. redirect wrappers) can mark the pipeline's buffer
     /// as printed ($output_printed_<id>) without fragile string scans.
     pub pipeline_output_stack: Vec<String>,
+    /// Whether `set -e` (errexit) has been activated in the script.
+    pub set_e_active: bool,
+    /// Depth counter for contexts where `set -e` exit-on-failure must be
+    /// suppressed (e.g. the condition expression of `if`/`while`/`until`,
+    /// the left-hand side of `||`/`&&`).  When > 0 the exit-on-failure check
+    /// after a pipeline should be omitted.
+    pub suppress_set_e_depth: usize,
 }
 
 /// RAII guard that pops the pipeline_output_stack when dropped.
@@ -93,6 +124,8 @@ impl Generator {
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
             pipeline_output_stack: Vec::new(),
+            set_e_active: false,
+            suppress_set_e_depth: 0,
         }
     }
 
@@ -113,6 +146,8 @@ impl Generator {
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
             pipeline_output_stack: Vec::new(),
+            set_e_active: false,
+            suppress_set_e_depth: 0,
         }
     }
 
@@ -133,6 +168,8 @@ impl Generator {
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
             pipeline_output_stack: Vec::new(),
+            set_e_active: false,
+            suppress_set_e_depth: 0,
         }
     }
 
@@ -273,7 +310,7 @@ impl Generator {
     {
         local *STDOUT;
         open STDOUT, '>', \$captured
-          or die "Cannot capture stdout: $!\n";
+          or die "Cannot capture stdout: $OS_ERROR\n";
         $code->();
     }
     return $captured;
@@ -288,6 +325,7 @@ impl Generator {
         // Always declare it since it's used in pipeline generation
         output.push_str("my $main_exit_code = 0;\n");
         output.push_str("my $ls_success     = 0;\n");
+        output.push_str("my $__set_e        = 0;\n");
 
         // Add global CHILD_ERROR variable for command substitution
         output.push_str("our $CHILD_ERROR;\n\n");
@@ -313,7 +351,12 @@ impl Generator {
             for (name, value) in &self.constants {
                 let padding = max_name_len - name.len();
                 let spaces = " ".repeat(padding);
-                output.push_str(&format!("my ${}{} = {};\n", name, spaces, value));
+                output.push_str(&format!(
+                    "my ${}{} = {};\n",
+                    name,
+                    spaces,
+                    format_integer_with_underscores(*value)
+                ));
             }
         }
         if !self.constants.is_empty() {
@@ -408,6 +451,10 @@ impl Generator {
         control_flow::generate_for_loop_impl(self, for_loop)
     }
 
+    pub fn generate_cstyle_for_loop(&mut self, for_loop: &CStyleForLoop) -> String {
+        control_flow::generate_cstyle_for_loop_impl(self, for_loop)
+    }
+
     pub fn generate_function(&mut self, func: &Function) -> String {
         control_flow::generate_function_impl(self, func)
     }
@@ -430,6 +477,57 @@ impl Generator {
 
     pub fn generate_assignment(&mut self, assignment: &Assignment) -> String {
         let mut output = String::new();
+
+        if let Some((array_name, key)) = self.extract_array_key(&assignment.variable) {
+            let value_perl = words::word_to_perl_impl(self, &assignment.value);
+            let key_expr = if key.chars().all(|ch| ch.is_ascii_digit()) {
+                key
+            } else {
+                let trimmed = key.trim_matches('"').trim_matches('\'');
+                format!("\"{}\"", self.escape_perl_string(trimmed))
+            };
+            let sigil = if key_expr.starts_with('"') { '{' } else { '[' };
+            let close = if sigil == '{' { '}' } else { ']' };
+
+            output.push_str(&self.indent());
+            match assignment.operator {
+                AssignmentOperator::Assign => {
+                    if value_perl.starts_with('{') && value_perl.ends_with('}') {
+                        output.push_str(&format!(
+                            "${}{}{}{} = do {};\n",
+                            array_name, sigil, key_expr, close, value_perl
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "${}{}{}{} = {};\n",
+                            array_name, sigil, key_expr, close, value_perl
+                        ));
+                    }
+                }
+                AssignmentOperator::PlusAssign => output.push_str(&format!(
+                    "${}{}{}{} += {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+                AssignmentOperator::MinusAssign => output.push_str(&format!(
+                    "${}{}{}{} -= {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+                AssignmentOperator::StarAssign => output.push_str(&format!(
+                    "${}{}{}{} *= {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+                AssignmentOperator::SlashAssign => output.push_str(&format!(
+                    "${}{}{}{} /= {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+                AssignmentOperator::PercentAssign => output.push_str(&format!(
+                    "${}{}{}{} %= {};\n",
+                    array_name, sigil, key_expr, close, value_perl
+                )),
+            }
+
+            return output;
+        }
 
         // Only declare the variable if not already declared
         // This prevents redeclaring variables inside loops that shadow outer scope variables
@@ -658,20 +756,86 @@ impl Generator {
     /// Pre-analysis pass to identify variables that are used after for loops
     fn analyze_variable_usage(&mut self, ast: &[Command]) {
         for (i, command) in ast.iter().enumerate() {
-            if let Command::For(for_loop) = command {
-                // Check if this variable is used in subsequent commands
-                let var_name = &for_loop.variable;
-                for j in (i + 1)..ast.len() {
-                    if self.is_variable_used_in_command(&ast[j], var_name) {
-                        self.function_level_vars.insert(var_name.clone());
-                        break;
+            match command {
+                Command::For(for_loop) => {
+                    // Check if the loop iteration variable is used after the loop
+                    let var_name = &for_loop.variable;
+                    for j in (i + 1)..ast.len() {
+                        if self.is_variable_used_in_command(&ast[j], var_name) {
+                            self.function_level_vars.insert(var_name.clone());
+                            break;
+                        }
+                    }
+
+                    // Collect all variables assigned inside the loop body
+                    let assigned = self.collect_assigned_vars_in_block(&for_loop.body);
+                    for var in &assigned {
+                        // If the variable is used after this loop, declare it at outer scope
+                        for j in (i + 1)..ast.len() {
+                            if self.is_variable_used_in_command(&ast[j], var) {
+                                self.function_level_vars.insert(var.clone());
+                                break;
+                            }
+                        }
+                    }
+
+                    // Also check for variables used in arithmetic expressions within the loop body
+                    self.analyze_variables_in_block(&for_loop.body);
+                }
+                Command::While(while_loop) => {
+                    // Collect all variables assigned inside the while body
+                    let assigned = self.collect_assigned_vars_in_block(&while_loop.body);
+                    for var in &assigned {
+                        for j in (i + 1)..ast.len() {
+                            if self.is_variable_used_in_command(&ast[j], var) {
+                                self.function_level_vars.insert(var.clone());
+                                break;
+                            }
+                        }
                     }
                 }
-
-                // Also check for variables used in arithmetic expressions within the loop body
-                self.analyze_variables_in_block(&for_loop.body);
+                _ => {}
             }
         }
+    }
+
+    fn collect_assigned_vars_in_command(&self, cmd: &Command, vars: &mut Vec<String>) {
+        match cmd {
+            Command::Assignment(assign) => {
+                vars.push(assign.variable.clone());
+            }
+            Command::For(for_loop) => {
+                for c in &for_loop.body.commands {
+                    self.collect_assigned_vars_in_command(c, vars);
+                }
+            }
+            Command::While(while_loop) => {
+                for c in &while_loop.body.commands {
+                    self.collect_assigned_vars_in_command(c, vars);
+                }
+            }
+            Command::If(if_stmt) => {
+                self.collect_assigned_vars_in_command(&if_stmt.then_branch, vars);
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    self.collect_assigned_vars_in_command(else_branch, vars);
+                }
+            }
+            Command::Block(block) => {
+                for c in &block.commands {
+                    self.collect_assigned_vars_in_command(c, vars);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect the names of all variables assigned (via Assignment commands) in a block.
+    fn collect_assigned_vars_in_block(&self, block: &Block) -> Vec<String> {
+        let mut vars = Vec::new();
+        for cmd in &block.commands {
+            self.collect_assigned_vars_in_command(cmd, &mut vars);
+        }
+        vars
     }
 
     /// Pre-analysis pass to identify constants needed for magic numbers

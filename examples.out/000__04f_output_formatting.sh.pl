@@ -9,6 +9,7 @@ use File::Path qw(make_path remove_tree);
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
 print "=== Output and Formatting Commands ===\n";
@@ -26,10 +27,15 @@ do {
 };
 $CHILD_ERROR = 0;
 my $printf_result = do {
+<<<<<<< HEAD
     my $_chomp_temp = sprintf("Number: %d, String: %s\n", '42', "test");
 ;
     chomp $_chomp_temp;
     $_chomp_temp;
+=======
+    my $result = sprintf "Number: %d, String: %s\n", '42', "test";
+    $result;
+>>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
 };
 do {
     my $output = "Printf result: $printf_result";
@@ -39,6 +45,7 @@ do {
     }
 };
 $CHILD_ERROR = 0;
+<<<<<<< HEAD
 my $tee_result = do { my $_pipeline_result = do {
     my $output_111 = q{};
     my $output_printed_111;
@@ -50,15 +57,35 @@ my $tee_result = do { my $_pipeline_result = do {
     use Carp qw(carp croak);
     if ( open my $fh, '>', 'test_tee.txt' ) {
         print {$fh} $output_111;
+=======
+my $tee_result = do { do {
+    my $output_110 = q{};
+    my $output_printed_110;
+    my $pipeline_success_110 = 1;
+    $output_110 .= 'test output' . "\n";
+    if ( !($output_110 =~ m{\n\z}msx) ) { $output_110 .= "\n"; }
+    $CHILD_ERROR = 0;
+    use Carp qw(carp croak);
+    if ( open my $fh, '>', 'test_tee.txt' ) {
+        print {$fh} $output_110;
+>>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
         close $fh or croak "Close failed: $ERRNO";
     }
     else {
         carp "tee: Cannot open 'test_tee.txt': $ERRNO";
     }
+<<<<<<< HEAD
     $output_111 = $output_111;
     if ( !$pipeline_success_111 ) { $main_exit_code = 1; }
     $output_111;
 }; $_pipeline_result =~ s/\n+\z//msx; $_pipeline_result; };
+=======
+    $output_110 = $output_110;
+    if ( !$pipeline_success_110 ) { $main_exit_code = 1; }
+    $output_110 =~ s/\n+\z//msx;
+    $output_110;
+} };
+>>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
 do {
     my $output = "Tee result: $tee_result";
     print $output;

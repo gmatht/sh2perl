@@ -33,10 +33,11 @@ fn generate_ls_helper(
                     array_name, dir, dir, array_name
                 ));
             } else {
-                // Match shell ls ordering without letting -p suffixes affect sort order
+                // Match shell ls ordering without letting -p suffixes affect sort order.
+                // Schwartzian transform: strip trailing slash for comparison, keep original.
                 output.push_str(&format!(
-                    "@{} = sort {{ my $aa = $a; my $bb = $b; $aa =~ s{{/$}}{{}}; $bb =~ s{{/$}}{{}}; $aa cmp $bb }} @{};\n",
-                    array_name, array_name
+                    "@{0} = map {{ $_->[0] }} sort {{ $a->[1] cmp $b->[1] }} map {{ [ $_, do {{ (my $s = $_) =~ s{{/$}}{{}}msx; $s }} ] }} @{0};\n",
+                    array_name
                 ));
             }
         }
@@ -102,10 +103,11 @@ fn generate_ls_helper(
                     array_name, dir, dir, array_name
                 ));
             } else {
-                // Match shell ls ordering without letting -p suffixes affect sort order
+                // Match shell ls ordering without letting -p suffixes affect sort order.
+                // Schwartzian transform: strip trailing slash for comparison, keep original.
                 output.push_str(&format!(
-                    "@{} = sort {{ my $aa = $a; my $bb = $b; $aa =~ s{{/$}}{{}}; $bb =~ s{{/$}}{{}}; $aa cmp $bb }} @{};\n",
-                    array_name, array_name
+                    "@{0} = map {{ $_->[0] }} sort {{ $a->[1] cmp $b->[1] }} map {{ [ $_, do {{ (my $s = $_) =~ s{{/$}}{{}}msx; $s }} ] }} @{0};\n",
+                    array_name
                 ));
             }
         }
@@ -322,8 +324,8 @@ fn generate_ls_sections_helper(
     } else {
         output.push_str(&generator.indent());
         output.push_str(&format!(
-            "@{} = sort {{ my $aa = $a; my $bb = $b; $aa =~ s{{/$}}{{}}; $bb =~ s{{/$}}{{}}; $aa cmp $bb }} @{};\n",
-            dir_entries_array, dir_entries_array
+            "@{0} = map {{ $_->[0] }} sort {{ $a->[1] cmp $b->[1] }} map {{ [ $_, do {{ (my $s = $_) =~ s{{/$}}{{}}msx; $s }} ] }} @{0};\n",
+            dir_entries_array
         ));
     }
 

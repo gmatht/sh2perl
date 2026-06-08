@@ -1,0 +1,8 @@
+Perl::Critic violations found:
+Conditional "use" statement
+  Policy: Perl::Critic::Policy::Modules::ProhibitConditionalUseStatements
+  Severity: 3
+  Location: Line 172, Column 5
+  Code:     [VIOLATION!]use Cwd;
+  Explanation: Use "require" to conditionally include a module
+

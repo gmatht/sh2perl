@@ -725,7 +725,7 @@ pub fn generate_pipeline_for_substitution(
                         output.push_str("    my $end_time = [gettimeofday];\n");
                         output.push_str("    my $elapsed = tv_interval($start_time, $end_time);\n");
                         output.push_str("    my $time_output = sprintf \"real\\t0m%.3fs\\nuser\\t0m0.000s\\nsys\\t0m0.000s\\n\", $elapsed;\n");
-                        output.push_str("    print STDERR $time_output;\n");
+                        output.push_str("    print {*STDERR} $time_output;\n");
 
                         // The shell script has a bug where time command output is not captured
                         // by command substitution. Keep the existing empty result.
@@ -1254,11 +1254,16 @@ fn generate_streaming_pipeline(
                 start_index = 1; // Skip the yes command since it is handled here
                 output.push_str(&generator.indent());
                 output.push_str("my $head_line_count = 0;\n");
-                let output_name = format!("output_{}", unique_id);
-                if has_outer_pipeline_id && !generator.declared_locals.contains(&output_name) {
+                // Only declare $output_{unique_id} if the early pipeline guard hasn't already done so.
+                if !generator
+                    .declared_locals
+                    .contains(&format!("output_{}", unique_id))
+                {
                     output.push_str(&generator.indent());
                     output.push_str(&format!("my $output_{} = q{{}};\n", unique_id));
-                    generator.declared_locals.insert(output_name);
+                    generator
+                        .declared_locals
+                        .insert(format!("output_{}", unique_id));
                 }
                 output.push_str(&generator.indent());
                 output.push_str("while (1) {\n");
@@ -1321,8 +1326,7 @@ fn generate_streaming_pipeline(
 
                 // Return the output directly for command substitution
                 output.push_str(&generator.indent());
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{};\n", unique_id));
+                output.push_str(&format!("$output_{}\n", unique_id));
 
                 // Pipeline id guard will pop when it goes out of scope.
                 return output; // Return early since we've handled everything
@@ -1480,6 +1484,12 @@ fn generate_streaming_pipeline(
                         &format!("$output_{}", start_index + i),
                         &format!("$output_{}", unique_id),
                     );
+                    // Also replace the canonical $output_0 placeholder used by head/sha256sum/sha512sum
+                    // line-by-line generators. When the global counter has advanced (e.g. when
+                    // running multiple tests in the same process), unique_id != 0, so this
+                    // replacement is required to avoid referencing an undeclared variable.
+                    linebyline_output =
+                        linebyline_output.replace("$output_0", &format!("$output_{}", unique_id));
                     output.push_str(&linebyline_output);
                 }
                 Command::While(while_loop) => {
@@ -2471,13 +2481,21 @@ fn generate_buffered_pipeline(
                             if let Command::Simple(cmd) = command {
                                 if let Word::Literal(cmd_name, _) = &cmd.name {
                                     if matches!(cmd_name.as_str(), "grep" | "xargs" | "tr") {
-                                        let result_var =
-                                            format!("{}_result_{}_{}", cmd_name, unique_id, i);
-                                        output.push_str(&generator.indent());
-                                        output.push_str(&format!(
-                                            "$output_{} = ${};\n",
-                                            unique_id, result_var
-                                        ));
+                                        // For quiet-mode grep (-q), suppress output assignment
+                                        let is_grep_quiet = cmd_name == "grep" && cmd.args.iter().any(|a| {
+                                            matches!(a, crate::ast::Word::Literal(s, _)
+                                                if s == "-q" || s == "--quiet" || s == "--silent"
+                                                || (s.starts_with('-') && !s.starts_with("--") && s.contains('q')))
+                                        });
+                                        if !is_grep_quiet {
+                                            let result_var =
+                                                format!("{}_result_{}_{}", cmd_name, unique_id, i);
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!(
+                                                "$output_{} = ${};\n",
+                                                unique_id, result_var
+                                            ));
+                                        }
                                         if cmd_name == "grep" {
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!(
@@ -2538,6 +2556,10 @@ fn generate_buffered_pipeline(
             "if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n",
             unique_id
         ));
+        if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+            output.push_str(&generator.indent());
+            output.push_str("exit $main_exit_code if $__set_e && $main_exit_code != 0;\n");
+        }
         output.push_str(&generator.indent());
         // output.push_str("exit(1) if $main_exit_code == 1;\n");
 
@@ -2717,10 +2739,15 @@ fn generate_buffered_pipeline(
                     "if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n",
                     unique_id
                 ));
+                if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                    output.push_str(&generator.indent());
+                    output.push_str("exit $main_exit_code if $__set_e && $main_exit_code != 0;\n");
+                }
                 output.push_str(&generator.indent());
                 // output.push_str("exit(1) if $main_exit_code == 1;\n");
 
-                // Strip trailing newlines to match command substitution semantics.
+                // Bash command substitution strips all trailing newlines from
+                // the captured output before assigning to the variable.
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
                 output.push_str(&generator.indent());
@@ -2855,8 +2882,15 @@ fn generate_buffered_pipeline(
                     "if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n",
                     unique_id
                 ));
+                if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                    output.push_str(&generator.indent());
+                    output.push_str("exit $main_exit_code if $__set_e && $main_exit_code != 0;\n");
+                }
 
-                // Preserve backtick output exactly as captured.
+                // Return the output variable as the last statement.
+                // Bash command substitution strips all trailing newlines.
+                output.push_str(&generator.indent());
+                output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
             }
@@ -2964,6 +2998,11 @@ fn generate_buffered_pipeline(
                 "if ( !$pipeline_success_{} ) {{ $main_exit_code = 1; }}\n",
                 unique_id
             ));
+            if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                output.push_str(&generator.indent());
+                output.push_str("exit $main_exit_code if $__set_e && $main_exit_code != 0;\n");
+            }
+            // Bash command substitution strips all trailing newlines.
             output.push_str(&generator.indent());
             output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
             output.push_str(&generator.indent());

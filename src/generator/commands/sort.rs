@@ -108,10 +108,7 @@ pub fn generate_sort_command_with_output(
         // surrounding whitespace from the selected key field so values like
         // " 95.5" or "95.5 \t" are recognised as numbers.
         let num_re = generator.format_regex_pattern(r"^\d+(?:\.\d+)?$");
-        output.push_str(&format!(
-            "my @sort_sorted_{} = sort {{\n",
-            command_index
-        ));
+        output.push_str(&format!("my @sort_sorted_{} = sort {{\n", command_index));
         output.push_str(&format!("    my @a_fields = split {}, $a;\n", split_pat));
         output.push_str(&format!("    my @b_fields = split {}, $b;\n", split_pat));
         output.push_str("    my $a_num = 0;\n");
@@ -143,10 +140,7 @@ pub fn generate_sort_command_with_output(
         } else {
             generator.format_regex_pattern(r"\s+")
         };
-        output.push_str(&format!(
-            "my @sort_sorted_{} = sort {{\n",
-            command_index
-        ));
+        output.push_str(&format!("my @sort_sorted_{} = sort {{\n", command_index));
         output.push_str(&format!("    my @a_fields = split {}, $a;\n", split_pat));
         output.push_str(&format!("    my @b_fields = split {}, $b;\n", split_pat));
         output.push_str(&format!(
