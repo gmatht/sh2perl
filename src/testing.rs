@@ -2304,11 +2304,6 @@ pub fn test_all_examples_next_fail(
 
             io::stdout().flush().unwrap();
         }
-
-        // Check if we should break out of the outer loop due to limit
-        if should_break {
-            break;
-        }
     }
 
     // All tests passed (only reached when running all tests, not a specific test)
@@ -2433,9 +2428,6 @@ pub fn test_all_examples_next_fail_unlimited(
     test_prefix: Option<String>,
     enable_perl_critic: bool,
 ) {
-    // This is the same as test_all_examples_next_fail but with a reasonable limit to prevent timeouts
-    const MAX_TESTS_WITHOUT_PREFIX: usize = 50; // Limit to prevent timeout while still being useful
-
     // Filter to only available generators
     let generators: Vec<_> = generators
         .iter()
@@ -2472,18 +2464,14 @@ pub fn test_all_examples_next_fail_unlimited(
     // Sort examples for consistent output
     examples.sort();
 
-    println!(
-        "Running ALL {} examples (limited to {} tests to prevent timeout)",
-        examples.len(),
-        MAX_TESTS_WITHOUT_PREFIX
-    );
+    println!("Running ALL {} examples", examples.len());
 
     // Test each combination
     let mut passed_tests = 0;
+    let mut failed_tests = 0;
     let mut current_test = 0;
     let total_tests = examples.len() * generators.len();
-    let mut should_break = false;
-    let mut should_break = false;
+    let mut failure_summaries: Vec<(String, String, String)> = Vec::new(); // (example, generator, reason)
 
     // If a specific test prefix is requested, find the matching example
     let (target_example_index, original_prefix) = if let Some(ref prefix) = test_prefix {
@@ -2546,14 +2534,6 @@ pub fn test_all_examples_next_fail_unlimited(
                     total_tests,
                     (current_test as f64 / total_tests as f64) * 100.0
                 );
-            }
-
-            // Apply limit to prevent timeout when no specific test is requested
-            if target_example_index.is_none() && current_test > MAX_TESTS_WITHOUT_PREFIX {
-                println!("\n\nReached limit of {} tests to prevent timeout. Use specific test prefix to run more tests.", MAX_TESTS_WITHOUT_PREFIX);
-                println!("Example: ./fail 001");
-                should_break = true;
-                break;
             }
 
             // Skip tests until we reach the target example
@@ -2633,23 +2613,31 @@ pub fn test_all_examples_next_fail_unlimited(
                             std::process::exit(0);
                         }
                     } else {
-                        // Test failed - invalidate cache and show diff and exit
+                        // Test failed - record it and continue to next test
+                        failed_tests += 1;
                         let mut cache = CommandCache::load();
                         cache.invalidate_bash_cache(example);
 
-                        // Clear entire terminal before showing failure
-                        print!("\x1B[2J\x1B[1;1H"); // ANSI escape code to clear screen and move cursor to top
+                        let failure_reason = result.failure_reason.clone();
+                        let example_short =
+                            example.replace("examples/", "").replace("examples\\", "");
+                        failure_summaries.push((
+                            example_short.clone(),
+                            generator.to_string(),
+                            failure_reason.clone(),
+                        ));
+
                         println!("{}", "=".repeat(80));
                         println!("                                    TEST FAILED");
                         println!("{}", "=".repeat(80));
                         println!("File: {}", example);
                         println!("Generator: {}", generator);
                         println!("Test: {}/{}", current_test, total_tests);
-                        println!("Tests passed before failure: {}", passed_tests);
+                        println!("Tests passed so far: {}", passed_tests);
 
                         // Show failure reason
-                        if !result.failure_reason.is_empty() {
-                            println!("Failure Reason: {}", result.failure_reason);
+                        if !failure_reason.is_empty() {
+                            println!("Failure Reason: {}", failure_reason);
                         }
 
                         println!("{}", "=".repeat(80));
@@ -2803,65 +2791,33 @@ pub fn test_all_examples_next_fail_unlimited(
                             println!("Perl stderr: '{}'", result.translated_stderr);
                         }
 
-                        // Show summary
                         println!("\n{}", "=".repeat(80));
-                        println!(
-                            "SUMMARY: {} out of {} tests passed before first failure",
-                            passed_tests, total_tests
-                        );
-                        println!("{}", "=".repeat(80));
-
-                        // Show brief failure summary
-                        if !result.failure_reason.is_empty() {
-                            println!("\nBRIEF FAILURE SUMMARY:");
-                            println!("{}", result.failure_reason);
-                        }
-
-                        // Write the passed test count to first_n_tests_passed.txt
-                        println!(
-                            "Writing test count {} to first_n_tests_passed.txt",
-                            passed_tests
-                        );
-                        println!(
-                            "Current working directory: {:?}",
-                            std::env::current_dir().unwrap_or_default()
-                        );
-
-                        // Count matching stdout lines before first mismatch
-                        let matching_lines = count_matching_stdout_lines(
-                            &result.shell_stdout,
-                            &result.translated_stdout,
-                        );
-                        let example_name = example
-                            .replace("examples/", "")
-                            .replace("examples\\", "")
-                            .replace(".sh", "");
-                        let file_content = format!("{}:y{:05}", example_name, matching_lines);
-
-                        if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
-                            println!("Warning: Failed to write test count to first_n_tests_passed.txt: {}", e);
-                        } else {
-                            println!("Successfully wrote test count {} and matching stdout lines {} to first_n_tests_passed.txt", passed_tests, matching_lines);
-                        }
 
                         // Show how to run the test again
                         if let Some(ref prefix) = original_prefix {
-                            println!("\nTo run test again: ./fail {}", prefix);
+                            println!("To run test again: ./fail {}", prefix);
                         } else {
-                            // Find the prefix for this test
-                            let example_name =
+                            let short_name =
                                 example.replace("examples/", "").replace("examples\\", "");
-                            let prefix = find_shortest_unique_prefix(&examples, &example_name);
-                            println!("\nTo run test again: ./fail {}", prefix);
+                            let prefix = find_shortest_unique_prefix(&examples, &short_name);
+                            println!("To run test again: ./fail {}", prefix);
                         }
 
-                        std::process::exit(1);
+                        println!("Continuing to next test...\n");
                     }
                 }
                 Err(e) => {
-                    // Test error - invalidate cache and show error and exit
+                    // Test error - record it and continue
+                    failed_tests += 1;
                     let mut cache = CommandCache::load();
                     cache.invalidate_bash_cache(example);
+
+                    let example_short = example.replace("examples/", "").replace("examples\\", "");
+                    failure_summaries.push((
+                        example_short.clone(),
+                        generator.to_string(),
+                        format!("error: {}", &e[..e.len().min(100)]),
+                    ));
 
                     println!("\n\n");
                     println!("TEST ERROR: {} with {} generator", example, generator);
@@ -2954,45 +2910,28 @@ pub fn test_all_examples_next_fail_unlimited(
                         println!("To run test again: ./fail {}", prefix);
                     } else {
                         // Find the prefix for this test
-                        let example_name =
-                            example.replace("examples/", "").replace("examples\\", "");
-                        let prefix = find_shortest_unique_prefix(&examples, &example_name);
+                        let short_name = example.replace("examples/", "").replace("examples\\", "");
+                        let prefix = find_shortest_unique_prefix(&examples, &short_name);
                         println!("To run test again: ./fail {}", prefix);
                     }
 
-                    std::process::exit(1);
+                    println!("Continuing to next test...\n");
                 }
             }
 
             io::stdout().flush().unwrap();
         }
-
-        // Check if we should break out of the outer loop due to limit
-        if should_break {
-            break;
-        }
     }
 
-    // All tests passed (only reached when running all tests, not a specific test)
-    if target_example_index.is_none() {
-        println!("\n\n");
+    // Print final summary
+    println!("\n\n{}", "=".repeat(80));
+    if failed_tests == 0 {
         println!("ALL TESTS PASSED! 🎉");
         println!("Total tests: {}", total_tests);
         println!("Passed: {} (100%)", passed_tests);
 
-        // Write the total passed test count to first_n_tests_passed.txt
-        println!(
-            "Writing total test count {} to first_n_tests_passed.txt",
-            passed_tests
-        );
-        println!(
-            "Current working directory: {:?}",
-            std::env::current_dir().unwrap_or_default()
-        );
-
-        // When all tests pass, Perl code ran successfully, so write y99999 (all lines matched)
+        // When all tests pass, write y99999 (all lines matched)
         let file_content = format!("ALL_TESTS_PASSED:y99999");
-
         if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
             println!(
                 "Warning: Failed to write test count to first_n_tests_passed.txt: {}",
@@ -3001,5 +2940,30 @@ pub fn test_all_examples_next_fail_unlimited(
         } else {
             println!("Successfully wrote total test count {} and perfect match (y99999) to first_n_tests_passed.txt", passed_tests);
         }
+    } else {
+        println!(
+            "TESTS COMPLETED: {} passed, {} failed out of {}",
+            passed_tests, failed_tests, total_tests
+        );
+        println!("{}", "=".repeat(80));
+        println!("\nFAILED TESTS:");
+        for (example, generator, reason) in &failure_summaries {
+            println!("  FAIL: {} [{}] — {}", example, generator, reason);
+        }
+        println!();
+
+        // Write the first failed test info to first_n_tests_passed.txt
+        if let Some((first_fail, _, _)) = failure_summaries.first() {
+            let example_name = first_fail.replace(".sh", "");
+            let file_content = format!("{}:y{:05}", example_name, passed_tests);
+            if let Err(e) = std::fs::write("first_n_tests_passed.txt", file_content) {
+                println!(
+                    "Warning: Failed to write test count to first_n_tests_passed.txt: {}",
+                    e
+                );
+            }
+        }
+
+        std::process::exit(1);
     }
 }

@@ -17,22 +17,26 @@ pub fn show_help(program_name: &str) {
     println!();
     println!("  parse --perl <input>           - Convert shell script to Perl");
     println!("  --mir <input>                  - Export Mid-level Intermediate Representation (MIR) as JSON");
-    println!("  --mir -O <input>               - Export optimized MIR with transformations applied");
-    
+    println!(
+        "  --mir -O <input>               - Export optimized MIR with transformations applied"
+    );
+
     println!();
     println!("  file --perl <filename>         - Convert shell script file to Perl");
-    
+
     println!();
     println!("EXECUTION OPTIONS:");
     println!();
     println!("  parse --run <lang> <input>     - Generate and run code in specified language");
     println!("  file --run <lang> <filename>   - Generate and run code from file");
-            println!("  Supported languages: perl");
+    println!("  Supported languages: perl");
     println!();
     println!("INPUT/OUTPUT OPTIONS:");
     println!();
     println!("  -i <filename>                  - Always treat as input file (even if doesn't end in .sh)");
-    println!("  -o <filename>                  - Output translated code to file instead of running it");
+    println!(
+        "  -o <filename>                  - Output translated code to file instead of running it"
+    );
     println!("  <filename>.sh                  - Run shell script directly (auto-detected)");
     println!("  <shell_command>                - Run shell command directly (auto-detected)");
     println!();
@@ -57,13 +61,15 @@ pub fn show_help(program_name: &str) {
     println!("  file --test-file <lang> <filename> - Same as above");
     println!("  --test-eq                      - Test all generators against all examples");
     println!("  --uses-of-system               - Translate all examples/*.sh to Perl and find lines containing 'system'");
-            println!("  --next-fail [NUM] [gen1 gen2 ...] - Test specified generators (or perl if none specified), exit after first failure");
-        println!("                                   - If NUM is provided, run only the NUMth test");
-        println!("  fail [NUM] [gen1 gen2 ...]      - Shorthand for --next-fail");
-                        println!("  --clear-cache                    - Clear the command cache");
+    println!("  --next-fail [NUM] [gen1 gen2 ...] - Test specified generators (or perl if none specified), exit after first failure");
+    println!("                                   - If NUM is provided, run only the NUMth test");
+    println!("  fail [NUM] [gen1 gen2 ...]      - Shorthand for --next-fail");
+    println!("  --clear-cache                    - Clear the command cache");
     println!("  --perl-critic                    - Enable Perl::Critic code quality checks (Brutal level)");
     println!("  --perl-critic-only <input>       - Test Perl code with specific exit codes:");
-    println!("                                     0=pass, 101=lex, 102=parse, 104=generate, 137=critic");
+    println!(
+        "                                     0=pass, 101=lex, 102=parse, 104=generate, 137=critic"
+    );
     println!();
     println!("FUNCTION SIGNATURE OPTIONS:");
     println!();
@@ -72,7 +78,9 @@ pub fn show_help(program_name: &str) {
     println!();
     println!("AST FORMATTING OPTIONS (for --next-fail):");
     println!();
-    println!("  --ast-pretty                   - Use pretty-printed AST with indentation and newlines");
+    println!(
+        "  --ast-pretty                   - Use pretty-printed AST with indentation and newlines"
+    );
     println!("  --ast-compact                  - Use compact AST format (default for --next-fail)");
     println!("  --ast-indent                   - Enable indentation in AST output");
     println!("  --ast-no-indent                - Disable indentation in AST output");
@@ -91,29 +99,49 @@ pub fn show_help(program_name: &str) {
     println!("  {} file --perl examples/simple.sh", program_name);
     println!("  {} --test-file perl examples/simple.sh", program_name);
     println!("  {} --test-eq", program_name);
-            println!("  {} --next-fail", program_name);
-            println!("  {} --next-fail 5", program_name);
+    println!("  {} --next-fail", program_name);
+    println!("  {} --next-fail 5", program_name);
     println!("  {} --next-fail perl", program_name);
     println!("  {} --next-fail 10 perl --ast-pretty", program_name);
     println!("  {} --clear-cache", program_name);
     println!("  {} --perl-critic-only 'print \"hello\";'", program_name);
     println!("  {} --debug parse 'echo hello'", program_name);
     println!("  {} --no-debug parse 'echo hello'", program_name);
-    println!("  {} --no-function-signatures parse 'echo hello'", program_name);
-    println!("  {} --function-signatures parse 'echo hello'", program_name);
+    println!(
+        "  {} --no-function-signatures parse 'echo hello'",
+        program_name
+    );
+    println!(
+        "  {} --function-signatures parse 'echo hello'",
+        program_name
+    );
     println!();
     println!("DIRECT EXECUTION EXAMPLES:");
-    println!("  {} examples/simple.sh           - Run shell script directly", program_name);
-    println!("  {} 'echo Hello World!'          - Run shell command directly", program_name);
-    println!("  {} -i myfile.txt -o output.pl   - Convert input file to Perl output file", program_name);
-    println!("  {} -i script.txt                - Convert input file and run generated Perl", program_name);
+    println!(
+        "  {} examples/simple.sh           - Run shell script directly",
+        program_name
+    );
+    println!(
+        "  {} 'echo Hello World!'          - Run shell command directly",
+        program_name
+    );
+    println!(
+        "  {} -i myfile.txt -o output.pl   - Convert input file to Perl output file",
+        program_name
+    );
+    println!(
+        "  {} -i script.txt                - Convert input file and run generated Perl",
+        program_name
+    );
     println!();
     println!("DESCRIPTION:");
-    println!("  sh2perl is a tool that translates shell scripts to Perl. It can parse shell syntax,");
+    println!(
+        "  sh2perl is a tool that translates shell scripts to Perl. It can parse shell syntax,"
+    );
     println!("  generate equivalent Perl code, and optionally run the generated code to verify");
     println!("  correctness against the original shell script.");
     println!();
-        println!("  The tool supports Perl as the target language. It can also generate pseudocode");
+    println!("  The tool supports Perl as the target language. It can also generate pseudocode");
     println!("  in English for educational purposes.");
     println!();
     println!("  The --next-fail command can be used to test the Perl generator.");
@@ -121,8 +149,8 @@ pub fn show_help(program_name: &str) {
     println!("  You can also specify a test number to run only that specific test");
     println!("  (e.g., --next-fail 5 to run only the 5th test).");
     println!();
-                    println!("  The tool uses a cache to store bash script outputs and Perl code, improving test performance.");
-                println!("  Cache is automatically updated when bash files change or tests fail.");
+    println!("  The tool uses a cache to store bash script outputs and Perl code, improving test performance.");
+    println!("  Cache is automatically updated when bash files change or tests fail.");
     println!("  Use --clear-cache to manually clear the cache if needed.");
     println!();
     println!("  For more information, visit: https://github.com/your-repo/sh2perl");

@@ -103,6 +103,19 @@ pub fn generate_xargs_command_with_output(
             } else if arg_str == "grep" {
                 command = "grep";
                 command_found = true;
+            } else if arg_str == "-n1" {
+                max_args = 1;
+            } else if arg_str == "-n" {
+                // -n can be followed by a number as the next argument (the
+                // debashl parser tokenises `-n1` as ["-n", "1"]).
+                if i + 1 < cmd.args.len() {
+                    if let Word::Literal(n_str, _) = &cmd.args[i + 1] {
+                        if let Ok(n) = n_str.parse::<usize>() {
+                            max_args = n;
+                            i += 1; // consume the number
+                        }
+                    }
+                }
             } else if arg_str == "function" {
                 args.push("function".to_string());
             } else if !arg_str.starts_with('-') {
@@ -227,17 +240,18 @@ pub fn generate_xargs_command_with_output(
                 }
             }
         }
-        // Handle xargs with command execution.
-        // `-I` consumes one input line at a time, while the default mode
-        // keeps the shell-style whitespace split for simple cases.
-        let xargs_input_split = if replace_placeholder.is_some() {
+        // Handle xargs with command execution
+        // When -I is specified, xargs reads one line per argument (POSIX behaviour).
+        // Without -I, split on whitespace as xargs does by default.
+        let split_pattern = if replace_placeholder.is_some() {
             "\\n"
         } else {
             "\\s+"
         };
         output.push_str(&format!(
             "my @xargs_input_{} = grep {{ $_ ne q{{}} }} split /{}/msx, ${};\n",
-            command_index, xargs_input_split, input_var
+            command_index, split_pattern, input_var
+        ));
         ));
         output.push_str(&format!("my @xargs_output_{};\n", command_index));
         output.push_str(&format!(
