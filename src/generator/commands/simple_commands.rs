@@ -127,20 +127,20 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 })
                 .collect();
             output.push_str(&generator.indent());
-            // For array elements that are command substitutions, we need to expand them
-            if elements_perl
-                .iter()
-                .any(|e| e.starts_with("glob(") || e.starts_with("do {"))
-            {
-                // Use array expansion for glob results
-                output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
+            // If the array variable is already declared, use push to append elements
+            // (matching shell semantics for `arr+=(elem)` where the parser drops
+            // the operator information).
+            if generator.declared_locals.contains(var) {
+                // Variable already declared - use push to append
+                for elem in &elements_perl {
+                    output.push_str(&format!("push @{}, {};\n", var, elem));
+                }
             } else {
+                // First declaration - use my @
                 output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
-            }
-            // Mark array as declared
-            if !generator.declared_locals.contains(var) {
                 generator.declared_locals.insert(var.clone());
             }
+            // Mark array as declared
         } else if let Word::Literal(s, _) = value {
             if let Some(elements) = generator.extract_array_elements(s) {
                 // Check if this is an indexed array assignment like arr=(one two three)
@@ -149,7 +149,14 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     .map(|s| format!("\"{}\"", generator.escape_perl_string(s)))
                     .collect();
                 output.push_str(&generator.indent());
-                output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
+                if generator.declared_locals.contains(var) {
+                    for elem in &elements_perl {
+                        output.push_str(&format!("push @{}, {};\n", var, elem));
+                    }
+                } else {
+                    output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
+                    generator.declared_locals.insert(var.clone());
+                }
             }
         }
     }
@@ -1110,6 +1117,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
         } else if name == "true" && !cmd.env_vars.is_empty() && cmd.args.is_empty() {
             // This is a standalone assignment (e.g., i=$((i + 1)))
             for (var, value) in &cmd.env_vars {
+                // Skip array values - already handled by the array handler above
+                if matches!(value, Word::Array(..)) {
+                    continue;
+                }
                 match value {
                     Word::Arithmetic(expr, _) => {
                         // Convert arithmetic expression to Perl
@@ -1133,6 +1144,8 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 output.push_str(&format!("${} = {};\n", var, perl_expr));
                             } else {
                                 // Variable not used in expression, declare and assign
+                                // Declare at function level so it persists outside blocks
+                                generator.function_level_vars.insert(var.clone());
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("my ${} = {};\n", var, perl_expr));
                                 generator.declared_locals.insert(var.clone());
@@ -1343,7 +1356,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     ));
                 } else if cmd.args.is_empty() {
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("system '{}';\n", name));
+                    output.push_str(&format!("$main_exit_code = system('{}') >> 8;\n", name));
                 } else {
                     let args: Vec<String> = if name == "perl" {
                         // Special handling for perl command - embed Perl code directly instead of system call
@@ -1489,11 +1502,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // Fallback to system call for other Perl usage
                         let args_str = args.join(", ");
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("system '{}', {};\n", name, args_str));
+                        output.push_str(&format!("$main_exit_code = system('{}', {}) >> 8;\n", name, args_str));
                     } else {
                         let args_str = args.join(", ");
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("system '{}', {};\n", name, args_str));
+                        output.push_str(&format!("$main_exit_code = system('{}', {}) >> 8;\n", name, args_str));
                     }
                 }
             }
@@ -1505,7 +1518,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
         // Fallback to system call
         if cmd.args.is_empty() {
             output.push_str(&generator.indent());
-            output.push_str(&format!("system '{}';\n", cmd_name));
+            output.push_str(&format!("$main_exit_code = system('{}') >> 8;\n", cmd_name));
         } else {
             let args: Vec<String> = cmd
                 .args
@@ -1513,7 +1526,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 .map(|arg| generator.perl_string_literal(arg))
                 .collect();
             output.push_str(&generator.indent());
-            output.push_str(&format!("system '{}', {};\n", cmd_name, args.join(", ")));
+            output.push_str(&format!("$main_exit_code = system('{}', {}) >> 8;\n", cmd_name, args.join(", ")));
         }
     }
 

@@ -1218,8 +1218,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     };
 
     let content = content.replace("\\\"", "\"");
-
-    // Debug output
+    let content = content.replace("\\\\", "\\");
 
     // Parse the string content to extract literal parts and variable references
     let mut parts = Vec::new();
@@ -1747,6 +1746,33 @@ fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion
 
                 // Special case: if key is "@", this is array iteration
                 if key == "@" {
+                    // Check if there is a slice specification after the bracket: @]:offset:length
+                    let rest = &content[bracket_end + 1..];
+                    if rest.starts_with(':') {
+                        let slice_spec = &rest[1..]; // skip ':'
+                        if let Some(colon_pos) = slice_spec.find(':') {
+                            let offset = &slice_spec[..colon_pos];
+                            let length = &slice_spec[colon_pos + 1..];
+                            return Ok(ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    offset.to_string(),
+                                    Some(length.to_string()),
+                                ),
+                                is_mutable: true,
+                            });
+                        } else {
+                            // offset without length
+                            return Ok(ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    slice_spec.to_string(),
+                                    None,
+                                ),
+                                is_mutable: true,
+                            });
+                        }
+                    }
                     return Ok(ParameterExpansion {
                         variable: var_name.to_string(),
                         operator: ParameterExpansionOperator::ArraySlice("@".to_string(), None),

@@ -330,6 +330,12 @@ impl Generator {
         // Add global CHILD_ERROR variable for command substitution
         output.push_str("our $CHILD_ERROR;\n\n");
 
+        // Set $PROGRAM_NAME to original script name if available for $0 compatibility
+        if let Some(ref script_name) = self.original_script_name {
+            let escaped = script_name.replace("\\", "\\\\").replace("'", "\\'");
+            output.push_str(&format!("$PROGRAM_NAME = '{}';\n", escaped));
+        }
+
         // Add declarations for variables that are used in arithmetic expressions
         for var in &self.function_level_vars {
             output.push_str(&format!("my ${} = 0;\n", var));

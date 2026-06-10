@@ -711,6 +711,8 @@ pub fn generate_ls_command(
             output.push_str("local $CHILD_ERROR = 2;\n");
             output.push_str(&generator.indent());
             output.push_str("$ls_success = 0;\n");
+            output.push_str(&generator.indent());
+            output.push_str("$main_exit_code = $CHILD_ERROR;\n");
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");
