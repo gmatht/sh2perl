@@ -11,8 +11,10 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = 'test_simple_function.sh';
 
 sub get_file_size {
+    my $file = $_[0];
     my $size = do { my $command = "wc -c < \"$file\""; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
     do {
     my $output = "File $file has $size bytes";

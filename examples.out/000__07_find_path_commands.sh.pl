@@ -11,35 +11,8 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-<<<<<<< HEAD
+$PROGRAM_NAME = '000__07_find_path_commands.sh';
 my $found_files = do { my $command = q{find . -name '*.sh' -type f}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
-=======
-my $found_files = do {
-    use File::Basename;
-    my @files_135 = ();
-    my $start_135 = q{.};
-    my $_find_135;
-    $_find_135 = sub {
-        my ($dir_135, $depth_135) = @_;
-        opendir(my $dh_135, $dir_135) or return;
-        my @entries_135 = readdir($dh_135);
-        closedir($dh_135);
-        for my $entry_135 (@entries_135) {
-            next if $entry_135 eq q{.} || $entry_135 eq q{..};
-            my $file_135 = "$dir_135/$entry_135";
-            if (-d $file_135) {
-                $_find_135->($file_135, $depth_135 + 1);
-            }
-            elsif (-f $file_135) {
-                next if !( basename($file_135) =~ m/^.*.sh$/xms );
-                push @files_135, $file_135;
-            }
-        }
-    };
-    $_find_135->($start_135, 0);
-    join "\n", @files_135;
-};
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
 print "Found shell scripts:\n";
 print $found_files;
 if ( !( ($found_files) =~ m{\n\z}msx ) ) { print "\n"; }

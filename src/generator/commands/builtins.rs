@@ -922,14 +922,12 @@ fn generate_system_call_fallback(
         // Subsequent command - build a full shell command string and pass it as
         // the argument to bash -c so pipelines and quoting are preserved.
         let command = Command::Simple(cmd.clone());
-        let mut command_str = generator.generate_command_string_for_system(&command);
-        // Prepend an echo of the input variable so the previous pipeline stage
-        // is piped into this command.
-        command_str = format!("echo \"${}\" | {}", input_var, command_str);
-        // This command string will be passed to bash -c in open3 at runtime.
-        // Use a non-interpolating Perl literal to ensure the shell program
-        // text is preserved exactly.
-        let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+        let command_str = generator.generate_command_string_for_system(&command);
+        // Use double quotes so Perl interpolates $input_var into the bash command.
+        // This correctly passes the previous pipeline stage's output to this command.
+        // Escape special characters in the command string for use in double quotes.
+        let escaped_cmd = command_str.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n");
+        let command_lit = format!("\"echo \\\"${}\\\" | {}\"", input_var, escaped_cmd);
         format!(
             "\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
             in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_lit, in_var, output_var, out_var, out_var, pid_var

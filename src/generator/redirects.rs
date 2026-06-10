@@ -1,16 +1,77 @@
 use super::Generator;
 use crate::ast::*;
 use crate::generator::utils::get_temp_dir;
+use regex::Regex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Convert positional parameter references with modifiers to their Perl equivalents.
+/// Returns `Some(...)` if the string is a positional param expansion that can be converted.
+///
+/// Handles:
+/// - `${N}:-word` → `(defined $_[N-1] && $_[N-1] ne q{} ? $_[N-1] : 'word')`
+/// - `${N}//pattern/replacement` → `($_[N-1] =~ s/pattern/replacement/grs)`
+fn convert_positional_params(s: &str) -> Option<String> {
+    // Pattern: ${N}:-word  →  (defined $_[N-1] && $_[N-1] ne q{} ? $_[N-1] : 'word')
+    let re_default = Regex::new(r"^\$\{(\d+)\}:\-(.*)$").ok()?;
+    if let Some(caps) = re_default.captures(s) {
+        let n: usize = caps[1].parse().unwrap_or(1);
+        let default_word = caps[2].trim();
+        return Some(format!(
+            "(defined $_[{}] && $_[{}] ne q{{}} ? $_[{}] : '{}')",
+            n.saturating_sub(1),
+            n.saturating_sub(1),
+            n.saturating_sub(1),
+            default_word
+        ));
+    }
+
+    // Pattern: ${N}//pattern/replacement  →  ($_[N-1] =~ s/pattern/replacement/grs)
+    // Note: the parser stores `${N}` followed by `//...}` with the `}` at the end of the
+    // literal text. The trailing `}` must be stripped so it doesn't become part of the
+    // replacement string.
+    let re_subst = Regex::new(r"^\$\{(\d+)\}//(.*)\}$").ok()?;
+    if let Some(caps) = re_subst.captures(s) {
+        let n: usize = caps[1].parse().unwrap_or(1);
+        let rest = &caps[2];
+        if let Some(slash_pos) = rest.find('/') {
+            let pattern = &rest[..slash_pos];
+            let replacement = &rest[slash_pos + 1..];
+            return Some(format!(
+                "($_[{}] =~ s/{}/{}/grs)",
+                n.saturating_sub(1),
+                pattern,
+                replacement
+            ));
+        }
+    }
+
+    None
+}
+
+/// Replace simple `$N` or `${N}` inside a string with `$_[N-1]`.
+fn replace_positional_params_in_string(s: &str) -> String {
+    let re_brace = Regex::new(r"\$\{(\d+)\}").unwrap();
+    let result = re_brace.replace_all(s, |caps: &regex::Captures| {
+        let n: usize = caps[1].parse().unwrap_or(1);
+        format!("$_[{}]", n.saturating_sub(1))
+    });
+    let re_simple = Regex::new(r"\$(\d)").unwrap();
+    let result = re_simple.replace_all(&result, |caps: &regex::Captures| {
+        let n: usize = caps[1].parse().unwrap_or(1);
+        format!("$_[{}]", n.saturating_sub(1))
+    });
+    result.to_string()
+}
 
 /// Convert a shell assignment RHS value to a Perl scalar expression.
 ///
 /// Handles:
 /// - Already-quoted values: `"hello"` or `''` → kept as-is (strip outer shell quotes
 ///   and re-emit as a Perl double-quoted string so variable interpolation works)
+/// - Positional parameters with modifiers: `${2:-default}`, `${3//pattern/replacement}`
 /// - Positional parameters: `$1` → `$_[0]`
 /// - Other `$var` references: kept as-is
 /// - Bare literals: wrapped in double quotes
@@ -25,7 +86,13 @@ fn shell_value_to_perl(value: &str) -> String {
         if inner.is_empty() {
             return "q{}".to_string();
         }
-        return format!("\"{}\"", inner);
+        // Check for positional parameter expansions with modifiers
+        if let Some(converted) = convert_positional_params(inner) {
+            return converted;
+        }
+        // Replace positional parameter references inside the string
+        let converted = replace_positional_params_in_string(inner);
+        return format!("\"{}\"", converted);
     }
     // Strip surrounding shell single-quotes (no interpolation needed).
     if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
@@ -879,6 +946,18 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 }
             }
         }
+        "exit" => {
+            // Handle exit command
+            if cmd.args.is_empty() {
+                output.push_str("exit $main_exit_code;\n");
+            } else {
+                for arg in &cmd.args {
+                    if let Word::Literal(code, _) = arg {
+                        output.push_str(&format!("exit {};\n", code));
+                    }
+                }
+            }
+        }
         "readonly" => {
             // Handle readonly command (not directly supported in Perl)
             for arg in &cmd.args {
@@ -958,6 +1037,42 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                                     var, perl_command
                                                 ));
                                                 i += 1; // Skip the CommandSubstitution argument
+                                            }
+                                            Word::ParameterExpansion(pe, _) => {
+                                                let pe_word = Word::ParameterExpansion(
+                                                    pe.clone(), None,
+                                                );
+                                                let perl_value = generator.word_to_perl(&pe_word);
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!(
+                                                    "my ${} = {};\n",
+                                                    var, perl_value
+                                                ));
+                                                i += 1;
+                                            }
+                                            Word::StringInterpolation(si, _) => {
+                                                let si_word = Word::StringInterpolation(
+                                                    si.clone(), None,
+                                                );
+                                                let perl_value = generator.word_to_perl(&si_word);
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!(
+                                                    "my ${} = {};\n",
+                                                    var, perl_value
+                                                ));
+                                                i += 1;
+                                            }
+                                            Word::Variable(v, _, _) => {
+                                                let v_word = Word::Variable(
+                                                    v.clone(), true, None,
+                                                );
+                                                let perl_value = generator.word_to_perl(&v_word);
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!(
+                                                    "my ${} = {};\n",
+                                                    var, perl_value
+                                                ));
+                                                i += 1;
                                             }
                                             _ => {
                                                 // Regular assignment without command substitution

@@ -11,6 +11,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '043_home.sh';
 if ($ENV{'HOME'} eq $ENV{'HOME'}) {
         print q{1} . "\n";
     $CHILD_ERROR = 0;

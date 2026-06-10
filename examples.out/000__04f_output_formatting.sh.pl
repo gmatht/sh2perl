@@ -27,15 +27,10 @@ do {
 };
 $CHILD_ERROR = 0;
 my $printf_result = do {
-<<<<<<< HEAD
     my $_chomp_temp = sprintf("Number: %d, String: %s\n", '42', "test");
 ;
     chomp $_chomp_temp;
     $_chomp_temp;
-=======
-    my $result = sprintf "Number: %d, String: %s\n", '42', "test";
-    $result;
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
 };
 do {
     my $output = "Printf result: $printf_result";
@@ -45,47 +40,27 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-<<<<<<< HEAD
-my $tee_result = do { my $_pipeline_result = do {
-    my $output_111 = q{};
-    my $output_printed_111;
-    my $pipeline_success_111 = 1;
-    $output_111 .= 'test output' . "\n";
-    if ( !($output_111 =~ m{\n\z}msx) ) { $output_111 .= "\n"; }
+my $tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+    my $output_109 = q{};
+    my $output_printed_109;
+    my $pipeline_success_109 = 1;
+    $output_109 .= 'test output' . "\n";
+    if ( !($output_109 =~ m{\n\z}msx) ) { $output_109 .= "\n"; }
     $CHILD_ERROR = 0;
-    if ($CHILD_ERROR != 0) { $pipeline_success_111 = 0; }
+    if ($CHILD_ERROR != 0) { $pipeline_success_109 = 0; }
     use Carp qw(carp croak);
     if ( open my $fh, '>', 'test_tee.txt' ) {
-        print {$fh} $output_111;
-=======
-my $tee_result = do { do {
-    my $output_110 = q{};
-    my $output_printed_110;
-    my $pipeline_success_110 = 1;
-    $output_110 .= 'test output' . "\n";
-    if ( !($output_110 =~ m{\n\z}msx) ) { $output_110 .= "\n"; }
-    $CHILD_ERROR = 0;
-    use Carp qw(carp croak);
-    if ( open my $fh, '>', 'test_tee.txt' ) {
-        print {$fh} $output_110;
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
+        print {$fh} $output_109;
         close $fh or croak "Close failed: $ERRNO";
     }
     else {
         carp "tee: Cannot open 'test_tee.txt': $ERRNO";
     }
-<<<<<<< HEAD
-    $output_111 = $output_111;
-    if ( !$pipeline_success_111 ) { $main_exit_code = 1; }
-    $output_111;
-}; $_pipeline_result =~ s/\n+\z//msx; $_pipeline_result; };
-=======
-    $output_110 = $output_110;
-    if ( !$pipeline_success_110 ) { $main_exit_code = 1; }
-    $output_110 =~ s/\n+\z//msx;
-    $output_110;
-} };
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
+    $output_109 = $output_109;
+    if ( !$pipeline_success_109 ) { $main_exit_code = 1; }
+    $output_109 =~ s/\n+\z//msx;
+    $output_109;
+}; $_pipeline_result; };
 do {
     my $output = "Tee result: $tee_result";
     print $output;

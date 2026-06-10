@@ -13,6 +13,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__04g_checksum_commands.sh';
 print "=== Checksum Commands ===\n";
 do {
     open my $original_stdout, '>&', STDOUT
@@ -85,17 +86,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-<<<<<<< HEAD
-my $strings_result = do { my $_pipeline_result = do {
-    my $output_112 = q{};
-    my $output_printed_112;
-    my $pipeline_success_112 = 1;
-=======
-my $strings_result = do { do {
-    my $output_111 = q{};
-    my $output_printed_111;
-    my $pipeline_success_111 = 1;
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
+my $strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+    my $output_107 = q{};
+    my $output_printed_107;
+    my $pipeline_success_107 = 1;
     my $input_data;
     if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
         local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
@@ -112,21 +106,13 @@ my $strings_result = do { do {
         push @result, $1;
     }
     my $line = join "\n", @result;
-<<<<<<< HEAD
-    $output_112 = $line;
-    if ($CHILD_ERROR != 0) { $pipeline_success_112 = 0; }
-    my $num_lines       = 3;
-    my $head_line_count = 0;
-    my $result          = q{};
-    my $input           = $output_112;
-=======
     if ($line ne q{} && !($line =~ m{\n\z}msx)) { $line .= "\n"; }
-    $output_111 = $line;
+    $output_107 = $line;
+    if ($CHILD_ERROR != 0) { $pipeline_success_107 = 0; }
     my $num_lines       = 3;
     my $head_line_count = 0;
     my $result          = q{};
-    my $input           = $output_111;
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
+    my $input           = $output_107;
     my $pos             = 0;
 
     while ( $pos < length $input && $head_line_count < $num_lines ) {
@@ -139,20 +125,12 @@ my $strings_result = do { do {
         $pos = $line_end + 1;
         ++$head_line_count;
     }
-<<<<<<< HEAD
-    $output_112 = $result;
+    $output_107 = $result;
 
-    if ( !$pipeline_success_112 ) { $main_exit_code = 1; }
-    $output_112;
-}; $_pipeline_result =~ s/\n+\z//msx; $_pipeline_result; };
-=======
-    $output_111 = $result;
-
-    if ( !$pipeline_success_111 ) { $main_exit_code = 1; }
-    $output_111 =~ s/\n+\z//msx;
-    $output_111;
-} };
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
+    if ( !$pipeline_success_107 ) { $main_exit_code = 1; }
+    $output_107 =~ s/\n+\z//msx;
+    $output_107;
+}; $_pipeline_result; };
 print "Strings result:\n";
 print $strings_result;
 if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }

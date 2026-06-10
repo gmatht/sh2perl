@@ -700,3 +700,40 @@ implementations for pipelines that use sort. It makes the numeric comparator
 robust to decimal values and honours the delimiter/key options commonly used
 in examples. This fixes the ordering mismatch observed in Example 037 without
 changing other generator behaviour.
+
+Fix: Declare and initialize $CHILD_ERROR inside inline pipeline do-blocks
+------------------------------------------------------------------------
+Problem
+-------
+The Rust generator's inline/backtick mode emitted code containing `$CHILD_ERROR`
+inside `do { ... }` blocks (e.g., for pipelines like `printf '...' | wc -l`)
+without any local declaration or initialization. In full-script mode the global
+`our $CHILD_ERROR;` at the top of the output provided the declaration, but in
+purify's expression-extraction mode the declaration could be stripped, causing
+"Use of uninitialized value $CHILD_ERROR" warnings at runtime.
+
+Fix
+---
+In src/generator/words.rs:1565, changed the pipeline expression wrapper from
+`do {{ my $_pipeline_result = ... }}` to
+`do {{ our $CHILD_ERROR = 0; my $_pipeline_result = ... }}`.
+This declares and initializes `$CHILD_ERROR` locally within the do-block,
+preventing uninitialized-value warnings when the pipeline code uses
+`$CHILD_ERROR` to track child-process exit status.
+
+Also removed the `next if $content =~ /^our\s+\$CHILD_ERROR/;` filter in
+purify.pl which stripped the generator's `our $CHILD_ERROR;` declaration.
+
+Additionally fixed three pre-existing compilation errors:
+- src/generator/commands/find.rs: closed unterminated `/* */` block comment
+- src/generator/commands/xargs.rs: removed duplicate closing `));`
+- src/generator/words.rs: added missing `Command::CStyleFor` arm in
+  `collect_shell_vars_from_command`
+
+Files changed
+-------------
+- src/generator/words.rs: add `our $CHILD_ERROR = 0` inside inline
+  pipeline do-block; add CStyleFor arm in collect_shell_vars_from_command
+- purify.pl: stop stripping `our $CHILD_ERROR;` from generated output
+- src/generator/commands/find.rs: close unterminated block comment
+- src/generator/commands/xargs.rs: remove duplicate `));`

@@ -11,6 +11,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '039_process_substitution_here.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented

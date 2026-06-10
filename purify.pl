@@ -2150,7 +2150,7 @@ sub extract_core_perl_logic_ppi {
         next if $content =~ /^#!/;
         next if $content =~ /^use\s+(?:strict|warnings|locale\b)/;
         next if $content =~ /^my\s+\$ls_success/;
-        next if $content =~ /^our\s+\$CHILD_ERROR/;
+
         next if $content =~ /^$/;
 
         next if $content =~ /my\s+\$main_exit_code/;

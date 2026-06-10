@@ -938,10 +938,13 @@ impl Parser {
                                         };
 
                                         // Create assignment word: var=value
-                                        // Handle command substitutions properly
+                                        // Handle command substitutions and complex expansions properly
+                                        // by storing them as separate args so the generator can handle them correctly
                                         let assignment_word = match &value_word {
-                                            Word::CommandSubstitution(_cmd, _) => {
-                                                // For command substitutions, create a proper assignment
+                                            Word::CommandSubstitution(_, _)
+                                            | Word::ParameterExpansion(_, _)
+                                            | Word::StringInterpolation(_, _)
+                                            | Word::Variable(_, _, _) => {
                                                 Word::Literal(format!("{}=", var_name), None)
                                             }
                                             _ => Word::Literal(
@@ -957,9 +960,29 @@ impl Parser {
                                         };
                                         args.push(assignment_word);
 
-                                        // If the value is a command substitution, add it as a separate argument
-                                        if let Word::CommandSubstitution(cmd, _) = value_word {
-                                            args.push(Word::CommandSubstitution(cmd, None));
+                                        // If the value is a complex type, add it as a separate argument
+                                        match &value_word {
+                                            Word::CommandSubstitution(cmd, _) => {
+                                                args.push(Word::CommandSubstitution(
+                                                    cmd.clone(), None,
+                                                ));
+                                            }
+                                            Word::ParameterExpansion(pe, _) => {
+                                                args.push(Word::ParameterExpansion(
+                                                    pe.clone(), None,
+                                                ));
+                                            }
+                                            Word::StringInterpolation(si, _) => {
+                                                args.push(Word::StringInterpolation(
+                                                    si.clone(), None,
+                                                ));
+                                            }
+                                            Word::Variable(v, _, _) => {
+                                                args.push(Word::Variable(
+                                                    v.clone(), true, None,
+                                                ));
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 } else {

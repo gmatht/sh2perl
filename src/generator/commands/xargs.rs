@@ -252,7 +252,6 @@ pub fn generate_xargs_command_with_output(
             "my @xargs_input_{} = grep {{ $_ ne q{{}} }} split /{}/msx, ${};\n",
             command_index, split_pattern, input_var
         ));
-        ));
         output.push_str(&format!("my @xargs_output_{};\n", command_index));
         output.push_str(&format!(
             "for my $i (0..scalar @xargs_input_{}-1) {{\n",

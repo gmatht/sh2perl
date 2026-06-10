@@ -35,7 +35,7 @@ while (1) {
 
     # This CLI exposes prompt text via `opencode run --prompt`; top-level `-p` is password.
     #system('opencode', 'run', '--prompt', $prompt);
-    system('opencode', 'run',  '-m', 'github-copilot/gpt-5.4-mini', '--variant', 'xhigh', $prompt);
-
+    #system('opencode', 'run',  '-m', 'github-copilot/gpt-5.4-mini', '--variant', 'xhigh', $prompt);
+    system('opencode', 'run',  '-m', 'opencode-go/deepseek-v4-flash', '--variant', 'xhigh', $prompt);
     sleep 1;
 }
