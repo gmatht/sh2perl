@@ -199,6 +199,11 @@ fn collect_shell_vars_from_command(command: &Command, vars: &mut HashSet<String>
                 collect_shell_vars_from_command(cmd, vars);
             }
         }
+        Command::CStyleFor(c_loop) => {
+            for cmd in &c_loop.body.commands {
+                collect_shell_vars_from_command(cmd, vars);
+            }
+        }
         Command::Function(func) => {
             for cmd in &func.body.commands {
                 collect_shell_vars_from_command(cmd, vars);
@@ -1562,7 +1567,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     let pipeline_code = crate::generator::commands::pipeline_commands::
                         generate_pipeline_for_substitution(generator, pipeline);
                     format!(
-                        "do {{ my $_pipeline_result = {}; $_pipeline_result =~ s/\\n+\\z//msx; $_pipeline_result; }}",
+                        "do {{ local $CHILD_ERROR = 0; my $_pipeline_result = {}; $_pipeline_result; }}",
                         pipeline_code
                     )
                 }
@@ -2167,19 +2172,34 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 let map_name = &pe.variable[1..]; // Remove ! prefix
                                 parts.push(format!("keys %{}", map_name));
                             } else {
-                                // ${arr[@]} -> @arr (for array iteration)
+                                // ${arr[@]} -> join(" ", @arr) for string context
                                 let array_name = &pe.variable;
-                                parts.push(format!("@{}", array_name));
+                                parts.push(format!("(join(\" \", @{}))", array_name));
                             }
                         } else {
-                            // Regular array slice
+                            // Regular array slice - use join for string context
+                            let trimmed_offset = offset.trim();
                             if let Some(length_str) = length {
+                                let trimmed_len = length_str.trim();
+                                let start = trimmed_offset.parse::<i32>().unwrap_or(0);
+                                let len = trimmed_len.parse::<i32>().unwrap_or(0);
+                                let end = if len > 0 { start + len - 1 } else { start };
                                 parts.push(format!(
-                                    "@${{{}}}[{}..{}]",
-                                    pe.variable, offset, length_str
+                                    "join(\" \", @{}[{}..{}])",
+                                    pe.variable, trimmed_offset, end
                                 ));
                             } else {
-                                parts.push(format!("@${{{}}}[{}..]", pe.variable, offset));
+                                // For negative offsets like ${arr[@]: -10}, use -1 as end
+                                // For positive offsets, use $#arr as end
+                                let end_idx = if trimmed_offset.starts_with('-') {
+                                    "-1".to_string()
+                                } else {
+                                    format!("$#{}", pe.variable)
+                                };
+                                parts.push(format!(
+                                    "join(\" \", @{}[{}..{}])",
+                                    pe.variable, trimmed_offset, end_idx
+                                ));
                             }
                         }
                     }

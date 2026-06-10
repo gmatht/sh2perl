@@ -11,6 +11,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '006_misc.sh';
 print "== Subshell ==\n";
 do {
     print 'inside-subshell' . "\n";
@@ -19,63 +20,33 @@ do {
 };
 print "== Simple pipeline ==\n";
 {
-<<<<<<< HEAD
-    my $output_148 = q{};
-    my $output_printed_148;
-    my $pipeline_success_148 = 1;
-    $output_148 .= 'alpha beta' . "\n";
-if ( !($output_148 =~ m{\n\z}msx) ) { $output_148 .= "\n"; }
+    my $output_140 = q{};
+    my $output_printed_140;
+    my $pipeline_success_140 = 1;
+    $output_140 .= 'alpha beta' . "\n";
+if ( !($output_140 =~ m{\n\z}msx) ) { $output_140 .= "\n"; }
 $CHILD_ERROR = 0;
 
-        my $grep_result_148_1;
-    my @grep_lines_148_1 = split /\n/msx, $output_148;
-    my @grep_filtered_148_1 = grep { /beta/msx } @grep_lines_148_1;
-    $grep_result_148_1 = join "\n", @grep_filtered_148_1;
-    if (!($grep_result_148_1 =~ m{\n\z}msx || $grep_result_148_1 eq q{})) {
-    $grep_result_148_1 .= "\n";
+        my $grep_result_140_1;
+    my @grep_lines_140_1 = split /\n/msx, $output_140;
+    my @grep_filtered_140_1 = grep { /beta/msx } @grep_lines_140_1;
+    $grep_result_140_1 = join "\n", @grep_filtered_140_1;
+    if (!($grep_result_140_1 =~ m{\n\z}msx || $grep_result_140_1 eq q{})) {
+    $grep_result_140_1 .= "\n";
     }
-    $CHILD_ERROR = scalar @grep_filtered_148_1 > 0 ? 0 : 1;
-    $output_148 = $grep_result_148_1;
-    $output_148 = $grep_result_148_1;
-    if ((scalar @grep_filtered_148_1) == 0) {
-        $pipeline_success_148 = 0;
+    $CHILD_ERROR = scalar @grep_filtered_140_1 > 0 ? 0 : 1;
+    $output_140 = $grep_result_140_1;
+    $output_140 = $grep_result_140_1;
+    if ((scalar @grep_filtered_140_1) == 0) {
+        $pipeline_success_140 = 0;
     }
-    if ($output_148 ne q{} && !defined $output_printed_148) {
-        print $output_148;
-        if (!($output_148 =~ m{\n\z}msx)) {
+    if ($output_140 ne q{} && !defined $output_printed_140) {
+        print $output_140;
+        if (!($output_140 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_148 ) { $main_exit_code = 1; }
-=======
-    my $output_146 = q{};
-    my $output_printed_146;
-    my $pipeline_success_146 = 1;
-    $output_146 .= 'alpha beta' . "\n";
-if ( !($output_146 =~ m{\n\z}msx) ) { $output_146 .= "\n"; }
-$CHILD_ERROR = 0;
-
-        my $grep_result_146_1;
-    my @grep_lines_146_1 = split /\n/msx, $output_146;
-    my @grep_filtered_146_1 = grep { /beta/msx } @grep_lines_146_1;
-    $grep_result_146_1 = join "\n", @grep_filtered_146_1;
-    if (!($grep_result_146_1 =~ m{\n\z}msx || $grep_result_146_1 eq q{})) {
-    $grep_result_146_1 .= "\n";
-    }
-    $CHILD_ERROR = scalar @grep_filtered_146_1 > 0 ? 0 : 1;
-    $output_146 = $grep_result_146_1;
-    $output_146 = $grep_result_146_1;
-    if ((scalar @grep_filtered_146_1) == 0) {
-        $pipeline_success_146 = 0;
-    }
-    if ($output_146 ne q{} && !defined $output_printed_146) {
-        print $output_146;
-        if (!($output_146 =~ m{\n\z}msx)) {
-            print "\n";
-        }
-    }
-    if ( !$pipeline_success_146 ) { $main_exit_code = 1; }
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
+    if ( !$pipeline_success_140 ) { $main_exit_code = 1; }
     }
 
 exit $main_exit_code;

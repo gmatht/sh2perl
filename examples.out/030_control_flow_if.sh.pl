@@ -11,6 +11,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '030_control_flow_if.sh';
 if ((-f"file.txt")) {
     print "File exists\n";
 }

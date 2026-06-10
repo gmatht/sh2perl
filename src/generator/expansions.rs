@@ -1,8 +1,44 @@
 use super::Generator;
 use crate::ast::*;
 
+/// Returns the Perl variable reference for a shell variable in a parameter expansion.
+/// Uses `$ENV{var}` for variables not declared in the script (e.g. environment
+/// variables like PWD, USER) to avoid `use strict` compilation errors, and
+/// `${var}` for script-declared variables.
+fn positional_param_ref(n: usize) -> String {
+    format!("$_[{}]", n.saturating_sub(1))
+}
+
+fn parameter_var_scalar_ref(generator: &Generator, var_name: &str) -> String {
+    if let Ok(n) = var_name.parse::<usize>() {
+        return positional_param_ref(n);
+    }
+    if generator.declared_locals.contains(var_name)
+        || matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+    {
+        format!("${{{}}}", var_name)
+    } else {
+        format!("$ENV{{{}}}", var_name)
+    }
+}
+
+/// Returns the bare sigil-prefixed Perl variable reference (e.g. `$var` or
+/// `$ENV{var}`) for use in places like `$var =~ s/.../`.
+fn parameter_var_bare_ref(generator: &Generator, var_name: &str) -> String {
+    if let Ok(n) = var_name.parse::<usize>() {
+        return positional_param_ref(n);
+    }
+    if generator.declared_locals.contains(var_name)
+        || matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+    {
+        format!("${}", var_name)
+    } else {
+        format!("$ENV{{{}}}", var_name)
+    }
+}
+
 pub fn generate_parameter_expansion_impl(
-    _generator: &mut Generator,
+    generator: &mut Generator,
     pe: &ParameterExpansion,
 ) -> String {
     match &pe.operator {
@@ -24,35 +60,31 @@ pub fn generate_parameter_expansion_impl(
                             format!("${}{{{}}}", var_name, key)
                         }
                     } else {
-                        format!("${{{}}}", pe.variable)
+                        parameter_var_scalar_ref(generator, &pe.variable)
                     }
                 } else {
-                    format!("${{{}}}", pe.variable)
+                    parameter_var_scalar_ref(generator, &pe.variable)
                 }
             } else {
-                format!("${{{}}}", pe.variable)
+                parameter_var_scalar_ref(generator, &pe.variable)
             }
         }
         ParameterExpansionOperator::DefaultValue(default) => {
             // ${var:-default} - use default if var is empty
-            format!(
-                "defined ${{{}}} && ${{{}}} ne q{{}} ? ${{{}}} : '{}'",
-                pe.variable, pe.variable, pe.variable, default
-            )
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            let default_expr = default_value_to_perl(generator, default);
+            format!("(defined {} && {} ne q{{}} ? {} : {})", r, r, r, default_expr)
         }
         ParameterExpansionOperator::AssignDefault(default) => {
             // ${var:=default} - assign default if var is empty
-            format!(
-                "defined ${{{}}} && ${{{}}} ne q{{}} ? ${{{}}} : do {{ ${{{}}} = '{}'; ${{{}}} }}",
-                pe.variable, pe.variable, pe.variable, pe.variable, default, pe.variable
-            )
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            let default_expr = default_value_to_perl(generator, default);
+            format!("(defined {} && {} ne q{{}} ? {} : do {{ {} = {}; {} }})", r, r, r, r, default_expr, r)
         }
         ParameterExpansionOperator::ErrorIfUnset(error) => {
             // ${var:?error} - error if var is empty
-            format!(
-                "defined ${{{}}} && ${{{}}} ne q{{}} ? ${{{}}} : die('{}')",
-                pe.variable, pe.variable, pe.variable, error
-            )
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("(defined {} && {} ne q{{}} ? {} : die('{}'))", r, r, r, error)
         }
         ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
             // ${var%suffix} - remove shortest suffix
@@ -60,54 +92,61 @@ pub fn generate_parameter_expansion_impl(
             // reverse the var, apply shortest-prefix removal on the reversed pattern, then reverse
             let rev_pattern = reverse_glob_pattern(pattern);
             let regex = glob_to_perl_regex_nongreedy(&rev_pattern);
-            format!(
-                "scalar reverse( (scalar reverse ${{{}}}) =~ s/^{}//r )",
-                pe.variable, regex
-            )
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("scalar reverse( (scalar reverse {}) =~ s/^{}//r )", r, regex)
         }
         ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
             // ${var%%suffix} - remove longest suffix (greedy from end)
             let regex = glob_to_perl_regex_greedy(pattern);
-            format!("${{{}}} =~ s/{}$//sr", pe.variable, regex)
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("{} =~ s/{}$//sr", r, regex)
         }
         ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
             // ${var#prefix} - remove shortest prefix (non-greedy from start)
             let regex = glob_to_perl_regex_nongreedy(pattern);
-            format!("${{{}}} =~ s/^{}//r", pe.variable, regex)
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("{} =~ s/^{}//r", r, regex)
         }
         ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
             // ${var##prefix} - remove longest prefix (greedy from start)
             let regex = glob_to_perl_regex_greedy(pattern);
-            format!("${{{}}} =~ s/^{}//sr", pe.variable, regex)
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("{} =~ s/^{}//sr", r, regex)
         }
         ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
             // ${var//pattern/replacement} - substitute all occurrences
+            let r = parameter_var_bare_ref(generator, &pe.variable);
             format!(
-                "${} =~ s/{}/{}/grs",
-                pe.variable,
+                "{} =~ s/{}/{}/grs",
+                r,
                 escape_regex_pattern(pattern),
                 escape_regex_replacement(replacement)
             )
         }
         ParameterExpansionOperator::UppercaseAll => {
             // ${var^^} - uppercase all characters
-            format!("uc(${{{}}})", pe.variable)
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("uc({})", r)
         }
         ParameterExpansionOperator::LowercaseAll => {
             // ${var,,} - lowercase all characters
-            format!("lc(${{{}}})", pe.variable)
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("lc({})", r)
         }
         ParameterExpansionOperator::UppercaseFirst => {
             // ${var^} - uppercase first character
-            format!("ucfirst(${{{}}})", pe.variable)
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("ucfirst({})", r)
         }
         ParameterExpansionOperator::Basename => {
             // ${var##*/} - get basename
-            format!("basename(${{{}}})", pe.variable)
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("basename({})", r)
         }
         ParameterExpansionOperator::Dirname => {
             // ${var%/*} - get dirname
-            format!("dirname(${{{}}})", pe.variable)
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("dirname({})", r)
         }
         ParameterExpansionOperator::ArraySlice(offset, length) => {
             // Special case: ${#arr[@]} should be array length, not array slice
@@ -135,6 +174,30 @@ pub fn generate_parameter_expansion_impl(
             }
         }
     }
+}
+
+/// Convert a parameter expansion default value to Perl code.
+/// If the default contains command substitutions (`$(...)` or backtick), parse and
+/// convert them; otherwise emit a string literal.
+fn default_value_to_perl(generator: &mut Generator, default: &str) -> String {
+    // Check for $(...) command substitution
+    if default.starts_with("$(") && default.ends_with(')') {
+        let inner = &default[2..default.len() - 1];
+        if let Ok(command) = crate::parser::commands::parse_pipeline_from_text(inner) {
+            let perl = generator.word_to_perl(&Word::CommandSubstitution(Box::new(command), None));
+            return format!("do {{ my $_result = {}; $_result; }}", perl);
+        }
+    }
+    // Check for backtick command substitution
+    if default.starts_with('`') && default.ends_with('`') {
+        let inner = &default[1..default.len() - 1];
+        if let Ok(command) = crate::parser::commands::parse_pipeline_from_text(inner) {
+            let perl = generator.word_to_perl(&Word::CommandSubstitution(Box::new(command), None));
+            return format!("do {{ my $_result = {}; $_result; }}", perl);
+        }
+    }
+    // Fall back to string literal
+    format!("'{}'", default)
 }
 
 // Helper methods for regex escaping

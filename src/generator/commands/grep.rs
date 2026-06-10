@@ -718,10 +718,6 @@ pub fn generate_grep_command(
                 command_index, command_index
             ));
             output.push_str("}\n");
-            output.push_str(&format!(
-                "$grep_result_{} =~ s/\\n$//msx; # Remove trailing newline\n",
-                command_index,
-            ));
         } else {
             output.push_str(&format!(
                 "$grep_result_{} = scalar @grep_filtered_{} . \"\\n\";\n",

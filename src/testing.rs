@@ -573,6 +573,7 @@ pub fn test_file_equivalence_with_critic(
                 let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
                 cmd.current_dir(&examples_dir);
                 cmd.env("TZ", "UTC");
+                cmd.env("PWD", &examples_dir);
                 // Replace TEMP_FILE placeholder with actual file path
                 for a in &run_cmd[1..] {
                     if *a == "TEMP_FILE" {
@@ -1207,6 +1208,7 @@ pub fn test_file_equivalence_detailed_with_critic(
                 let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
                 cmd.current_dir(&examples_dir);
                 cmd.env("TZ", "UTC");
+                cmd.env("PWD", &examples_dir);
                 // Replace TEMP_FILE placeholder with actual file path
                 for a in &run_cmd[1..] {
                     if *a == "TEMP_FILE" {

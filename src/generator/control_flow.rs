@@ -11,10 +11,23 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
         Command::Simple(cmd) if cmd.name == "[" || cmd.name == "test" => {
             generator.generate_test_command(cmd, &mut output);
         }
+        Command::TestExpression(test_expr) => {
+            let test_result = generator.generate_test_expression(test_expr);
+            output.push_str(&test_result);
+        }
         _ => {
             generator.suppress_set_e_depth += 1;
-            output.push_str(&generator.generate_command(&if_stmt.condition));
+            let mut cond = generator.generate_command(&if_stmt.condition);
             generator.suppress_set_e_depth -= 1;
+            // Strip trailing semicolons and whitespace - the condition
+            // is used inside if(...) not as a standalone statement
+            let cond = cond.trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t').to_string();
+            // Negate the condition for shell functions:
+            // shell returns 0 for success, non-zero for failure.
+            // In Perl 0 is falsy, so we write
+            // `if (!cond()) { ... }` to match shell semantics
+            // where `if func; then` enters when func returns 0.
+            output.push_str(&format!("!({})", cond));
         }
     }
     output.push_str(") {\n");
@@ -220,8 +233,10 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
         }
         _ => {
             generator.suppress_set_e_depth += 1;
-            output.push_str(&generator.generate_command(&while_loop.condition));
+            let mut cond = generator.generate_command(&while_loop.condition);
             generator.suppress_set_e_depth -= 1;
+            let cond = cond.trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t').to_string();
+            output.push_str(&cond);
         }
     }
     output.push_str(" ) {\n");
@@ -635,53 +650,10 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     eprintln!("DEBUG: Generating function body for {}", func.name);
     eprintln!("DEBUG: Function body commands: {:?}", func.body.commands);
 
-    // Filter out only the parameter declaration from the first local command
-    // when using modern function signatures. Keep any remaining locals so
-    // assignments like `local size=...` still generate.
-    let filtered_commands = if generator.use_function_signatures
-        && uses_positional_params
-        && func.parameters.is_empty()
-    {
-        // Skip only the first local parameter assignment.
-        let mut filtered = Vec::new();
-        let mut skipped_first_local = false;
-
-        for cmd in &func.body.commands {
-            if !skipped_first_local {
-                if let Command::BuiltinCommand(builtin) = cmd {
-                    if builtin.name == "local" && !builtin.args.is_empty() {
-                        if let Some(Word::Literal(arg, _)) = builtin.args.first() {
-                            if arg.starts_with("file=") {
-                                skipped_first_local = true;
-
-                                let mut filtered_builtin = builtin.clone();
-                                filtered_builtin.args = builtin
-                                    .args
-                                    .iter()
-                                    .skip(1)
-                                    .filter(
-                                        |arg| !matches!(arg, Word::Literal(s, _) if s == "local"),
-                                    )
-                                    .cloned()
-                                    .collect();
-
-                                if !filtered_builtin.args.is_empty() {
-                                    filtered.push(Command::BuiltinCommand(filtered_builtin));
-                                }
-
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-            filtered.push(cmd.clone());
-        }
-        filtered
-    } else {
-        // Use all commands when using traditional @_ unpacking or when no filtering needed
-        func.body.commands.clone()
-    };
+    // Use all commands from the function body. The `local` commands
+    // (e.g. `local file=$1`) are handled by redirects.rs which generates
+    // proper `my $var = $_[0];` declarations.
+    let filtered_commands = func.body.commands.clone();
 
     // Create a temporary block with filtered commands
     let filtered_block = Block {
@@ -813,16 +785,13 @@ fn check_word_uses_positional_params(word: &Word) -> bool {
 pub fn generate_block_impl(generator: &mut Generator, block: &Block) -> String {
     let mut output = String::new();
 
-    // Generate block
-    output.push_str("{\n");
-
+    // Generate block commands without wrapping in { } scope
+    // Shell { } does not create a new variable scope, so a Perl bare block
+    // would incorrectly scope my declarations. Emit commands directly
+    // at the current indentation level instead.
     generator.indent_level += 1;
-    output.push_str(&generator.indent());
     output.push_str(&generator.generate_block_commands(block));
     generator.indent_level -= 1;
-
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
 
     output
 }

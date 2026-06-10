@@ -12,13 +12,10 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__04d_system_utilities.sh';
 print "=== System Utilities ===\n";
 my $formatted_date = do {
-<<<<<<< HEAD
-require POSIX; POSIX::strftime('%Y-%m-%d', localtime($DATE_SNAPSHOT)) . "\n"
-=======
 require POSIX; POSIX::strftime('%Y-%m-%d', localtime(time())) . "\n"
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
 };
 do {
     my $output = "Formatted date: $formatted_date";
@@ -42,39 +39,22 @@ do {
 };
 $CHILD_ERROR = 0;
 require Time::HiRes; Time::HiRes::sleep($sleep_duration);
-<<<<<<< HEAD
-my $yes_result = do { my $_pipeline_result = do {
-    do { my $output_67 = q{};
-my $output_printed_67;
+my $yes_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+    do { my $output_63 = q{};
+my $output_printed_63;
 my $head_line_count = 0;
 while (1) {
     my $line = 'Hello';
     if ($head_line_count < 3) {
-    $output_67 .= $line . "\n";
-=======
-my $yes_result = do { do {
-    do { my $output_66 = q{};
-my $output_printed_66;
-my $head_line_count = 0;
-while (1) {
-    my $line = 'Hello';
-    # yes doesn't support line-by-line processing
-    if ($head_line_count < 3) {
-    $output_66 .= $line . "\n";
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
+    $output_63 .= $line . "\n";
     ++$head_line_count;
     } else {
     $line = q{}; # Clear line to prevent printing
     last; # Break out of the yes loop when head limit is reached
     }
 }
-<<<<<<< HEAD
-$output_67; };
-}; $_pipeline_result =~ s/\n+\z//msx; $_pipeline_result; };
-=======
-$output_66 };
-} };
->>>>>>> aebd05460dfb3284730ab659345a8daedaeb6a9e
+$output_63 };
+}; $_pipeline_result; };
 print "Yes command result:\n";
 print $yes_result;
 if ( !( ($yes_result) =~ m{\n\z}msx ) ) { print "\n"; }

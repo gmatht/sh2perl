@@ -561,8 +561,8 @@ fn generate_command_using_builtins(
                 format!("\nmy ({});\nmy {} = open3({}, {}, {}, '{}');\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
                     in_var, pid_var, in_var, out_var, err_var, { let cmd_str = generator.generate_command_string_for_system(command); generator.perl_string_literal_no_interp(&Word::literal(cmd_str)) }, in_var, out_var, output_var, out_var, pid_var)
             } else {
-                // Subsequent command - use a different approach that works
-                format!("\nmy ({});\nmy {} = open3({}, {}, {}, 'echo \"${}\" | {}');\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
+                // Subsequent command - use double quotes so Perl interpolates $var
+                format!("\nmy ({});\nmy {} = open3({}, {}, {}, \"echo \\\"${}\\\" | {}\");\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
                     in_var, pid_var, in_var, out_var, err_var, input_var, { let cmd_str = generator.generate_command_string_for_system(command); generator.perl_string_literal_no_interp(&Word::literal(cmd_str)) }, in_var, out_var, output_var, out_var, pid_var)
             }
         }
@@ -2361,7 +2361,7 @@ fn generate_buffered_pipeline(
                                     "$output_{} = ${};\n",
                                     unique_id, result_var
                                 ));
-                                if cmd_name == "grep" {
+                                if cmd_name == "grep" && i == pipeline.commands.len() - 1 {
                                     output.push_str(&generator.indent());
                                     output.push_str(&format!(
                                         "if ((scalar @grep_filtered_{}_{}) == 0) {{\n",
@@ -2496,7 +2496,7 @@ fn generate_buffered_pipeline(
                                                 unique_id, result_var
                                             ));
                                         }
-                                        if cmd_name == "grep" {
+                                        if cmd_name == "grep" && i == pipeline.commands.len() - 1 {
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!(
                                                 "if ((scalar @grep_filtered_{}_{}) == 0) {{\n",
@@ -2714,7 +2714,7 @@ fn generate_buffered_pipeline(
                                     "$output_{} = ${};\n",
                                     unique_id, result_var
                                 ));
-                                if cmd_name == "grep" {
+                                if cmd_name == "grep" && cmd_i == pipeline.commands.len() - 1 {
                                     output.push_str(&generator.indent());
                                     output.push_str(&format!(
                                         "if ((scalar @grep_filtered_{}_{}) == 0) {{\n",
@@ -2857,7 +2857,7 @@ fn generate_buffered_pipeline(
                     // If this was a simple grep command, track its exit behaviour
                     if let Command::Simple(cmd) = command {
                         if let Word::Literal(cmd_name, _) = &cmd.name {
-                            if cmd_name == "grep" {
+                            if cmd_name == "grep" && i + 1 == pipeline.commands.len() - 1 {
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!(
                                     "if ((scalar @grep_filtered_{}_{}) == 0) {{\n",
@@ -2977,7 +2977,7 @@ fn generate_buffered_pipeline(
                             output.push_str(&generator.indent());
                             output.push_str(&format!("$output_{} = ${};\n", unique_id, result_var));
                         }
-                        if cmd_name == "grep" {
+                        if cmd_name == "grep" && i + 1 == pipeline.commands.len() - 1 {
                             output.push_str(&generator.indent());
                             output.push_str(&format!(
                                 "if ((scalar @grep_filtered_{}_{}) == 0) {{\n",

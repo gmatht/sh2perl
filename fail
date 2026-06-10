@@ -1,4 +1,5 @@
 #!/bin/bash
+set -o pipefail
 
 echo "To run this test: ./fail FAILING_TEST_PREFIX"
 echo "To run a specific test: ./fail TEST_PREFIX"

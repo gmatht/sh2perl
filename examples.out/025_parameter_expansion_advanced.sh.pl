@@ -12,6 +12,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '025_parameter_expansion_advanced.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented

@@ -11,6 +11,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '062_01_ambiguous_operators.sh';
 print "Testing ambiguous operators...\n";
 my $result = 2**3**2;
 do {

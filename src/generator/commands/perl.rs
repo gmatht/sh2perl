@@ -54,7 +54,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                     // Initialize environment variables to empty strings to avoid Perl warnings
                     // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
                     output.push_str(
-                        "if (!defined $ENV{SHELL_VAR}) { local $ENV{SHELL_VAR} = q{}; }\n",
+                        "if (!defined $ENV{SHELL_VAR}) { $ENV{SHELL_VAR} = q{}; }\n",
                     );
 
                     eprintln!("DEBUG: About to execute perl code lines");
@@ -235,8 +235,7 @@ pub fn generate_perl_pipeline_command(
                 "for my $line (split /\\n/msx, ${}) {{\n",
                 input_var
             ));
-            output.push_str(&format!("    chomp $line;\n"));
-            output.push_str(&format!("    $_ = $line;\n"));
+            output.push_str(&format!("    $_ = \"$line\\n\";\n"));
         } else {
             // For -e mode, set $_ to the entire input
             output.push_str(&format!("$_ = ${};\n", input_var));
@@ -244,7 +243,7 @@ pub fn generate_perl_pipeline_command(
 
         // Initialize environment variables to empty strings to avoid Perl warnings
         // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
-        output.push_str("if (!defined $ENV{SHELL_VAR}) { local $ENV{SHELL_VAR} = q{}; }\n");
+        output.push_str("if (!defined $ENV{SHELL_VAR}) { $ENV{SHELL_VAR} = q{}; }\n");
 
         // Execute the perl code - split by newlines and add proper indentation
         for line in clean_code.lines() {
