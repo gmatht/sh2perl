@@ -4,6 +4,8 @@ use warnings;
 use Time::HiRes qw(sleep);
 use File::Spec;
 
+my $model='opencode-go/deepseek-v4-flash';
+
 $| = 1; 
 print "Auto flush enabled\n";
 
@@ -68,7 +70,7 @@ while (1) {
     #system('opencode', 'run', '--prompt', $prompt);
     #system('opencode', 'run',  '-m', 'github-copilot/gpt-5.4-mini', '--variant', 'xhigh', $prompt);
     #system('opencode', 'run',  '-m', 'github-copilot/gpt-5.4-mini', '--variant', 'high', $prompt);
-    system('opencode', 'run',  '-m', 'github-copilot/gpt-5-mini', '--variant', 'high', $prompt);
+    system('opencode', 'run',  '-m', $model, '--variant', 'high', $prompt);
 
     sleep 8;
 
@@ -171,7 +173,7 @@ while (1) {
             print "\nInvoking opencode to ask whether to keep or stash changes...\n";
 
             my $oc_out = '';
-            if (open my $oc, '-|', 'opencode', 'run',  '-m', 'github-copilot/gpt-5-mini', '--variant', 'high', $prompt) {
+            if (open my $oc, '-|', 'opencode', 'run',  '-m', $model,'--variant', 'high', $prompt) {
                 local $/;
                 $oc_out = <$oc>;
                 close $oc;
@@ -214,7 +216,7 @@ while (1) {
         print "\nInvoking opencode to ask whether to keep or stash changes...\n";
 
         my $oc_out = '';
-        if (open my $oc, '-|', 'opencode', 'run',  '-m', 'github-copilot/gpt-5-mini', '--variant', 'high', $prompt) {
+        if (open my $oc, '-|', 'opencode', 'run',  '-m', $model, '--variant', 'high', $prompt) {
             local $/;
             $oc_out = <$oc>;
             close $oc;
