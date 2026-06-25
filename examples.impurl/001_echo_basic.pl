@@ -17,12 +17,16 @@ system("echo", "This is a test of the echo builtin");
 print "\nEcho with special characters using backticks:\n";
 my $output = `printf '%s\\n' "Line 1" "Line 2" "Line 3"`;
 print $output;
+my $output = `echo "Line 1\nLine 2\nLine 3"`;
+print $output;
 
 # Echo with variables using backticks
 my $name = "Perl";
 my $version = "5.32";
 print "\nEcho with variables:\n";
 my $var_output = `printf '%s\\n' "Welcome to $name version $version"`;
+print $var_output;
+my $var_output = `echo "Welcome to $name version $version"`;
 print $var_output;
 
 # Demonstrate echo -e behavior vs printf for portability
