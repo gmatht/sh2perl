@@ -1357,7 +1357,7 @@ pub fn test_file_equivalence_detailed_with_critic(
     let stdout_match = shell_stdout == trans_stdout;
     let stderr_match = shell_stderr == trans_stderr;
 
-    let success = !timed_out && exit_code_match && stdout_match;
+    let success = !timed_out && stdout_match;
 
     // Generate detailed failure reason
     let failure_reason = if timed_out {

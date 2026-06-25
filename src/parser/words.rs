@@ -916,6 +916,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 lexer.next();
             }
 
+            eprintln!("DEBUG parse_variable_expansion: braced_content='{}'", braced_content);
             // Check if this is array syntax first
             if braced_content.starts_with('#')
                 && braced_content.contains('[')
@@ -939,6 +940,59 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         return Ok(Word::MapKeys(map_name.to_string(), None));
                     }
                 }
+            } else if braced_content.contains(":-") {
+                eprintln!("DEBUG parse_variable_expansion: found :- in braced_content='{}'", braced_content);
+                // ${var:-default} - use default if var is empty
+                let colon_pos = braced_content.find(":-").unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let default_val = &braced_content[colon_pos + 2..];
+                return Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                        is_mutable: true,
+                    },
+                    None,
+                ));
+            } else if braced_content.contains(":=") {
+                // ${var:=default} - assign default if var is empty
+                let colon_pos = braced_content.find(":=").unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let default_val = &braced_content[colon_pos + 2..];
+                return Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                        is_mutable: true,
+                    },
+                    None,
+                ));
+            } else if braced_content.contains(":+") {
+                // ${var:+alt} - use alt if var is set and not empty
+                let colon_pos = braced_content.find(":+").unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let alt_val = &braced_content[colon_pos + 2..];
+                return Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                        is_mutable: true,
+                    },
+                    None,
+                ));
+            } else if braced_content.contains(":?") {
+                // ${var:?error} - error if var is empty
+                let colon_pos = braced_content.find(":?").unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let error_msg = &braced_content[colon_pos + 2..];
+                return Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                        is_mutable: true,
+                    },
+                    None,
+                ));
             } else if braced_content.contains('[') && braced_content.contains(']') {
                 // This is a map/array access like ${map[foo]} or ${arr[1]} or ${map[$k]}
                 if let Some(bracket_start) = braced_content.find('[') {
@@ -982,43 +1036,8 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
             }
 
             // Check for parameter expansion operators
-            if braced_content.contains(":") {
-                // Handle array slicing syntax like ${var:offset} or ${var:start:length}
-                if let Some(colon_pos) = braced_content.find(':') {
-                    let var_name = &braced_content[..colon_pos];
-                    let slice_part = &braced_content[colon_pos + 1..];
-
-                    if let Some(second_colon) = slice_part.find(':') {
-                        // This is ${var:start:length} syntax
-                        let offset = &slice_part[..second_colon];
-                        let length = &slice_part[second_colon + 1..];
-                        return Ok(Word::ParameterExpansion(
-                            ParameterExpansion {
-                                variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(
-                                    offset.to_string(),
-                                    Some(length.to_string()),
-                                ),
-                                is_mutable: true,
-                            },
-                            None,
-                        ));
-                    } else {
-                        // This is ${var:offset} syntax
-                        return Ok(Word::ParameterExpansion(
-                            ParameterExpansion {
-                                variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(
-                                    slice_part.to_string(),
-                                    None,
-                                ),
-                                is_mutable: true,
-                            },
-                            None,
-                        ));
-                    }
-                }
-            }
+            // Note: colon-prefix operators like :- := :+ :? are handled above
+            // before the array access check, so only non-colon operators remain here.
 
             // Check if this is a parameter expansion with operators
             // Check longer patterns first to avoid partial matches
@@ -1365,8 +1384,33 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 current_literal.clear();
             }
 
-            // If this is a braced expansion like ${...}
-            if i + 1 < content.len() && content[i + 1..].starts_with('{') {
+            if i + 1 < content.len() && content[i + 1..].starts_with('(') {
+                // Command substitution $(...)
+                i += 2; // skip $ and (
+                let cmd_start = i;
+                let mut paren_count = 1;
+                while i < content.len() && paren_count > 0 {
+                    match content[i..].chars().next() {
+                        Some('(') => paren_count += 1,
+                        Some(')') => paren_count -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if paren_count == 0 {
+                    let cmd_content = &content[cmd_start..i - 1];
+                    if let Ok(cmd) =
+                        crate::parser::commands::parse_pipeline_from_text(cmd_content)
+                    {
+                        parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                    } else {
+                        parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                    }
+                } else {
+                    current_literal.push_str("$(");
+                    i = cmd_start;
+                }
+            } else if i + 1 < content.len() && content[i + 1..].starts_with('{') {
                 // This is a parameter expansion ${...}
                 i += 2; // skip $ and {
                 let expansion_start = i;
@@ -1448,8 +1492,33 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 current_literal.clear();
             }
 
-            // If this is a braced expansion like ${...}
-            if i + 1 < content.len() && content[i + 1..].starts_with('{') {
+            if i + 1 < content.len() && content[i + 1..].starts_with('(') {
+                // Command substitution $(...)
+                i += 2; // skip $ and (
+                let cmd_start = i;
+                let mut paren_count = 1;
+                while i < content.len() && paren_count > 0 {
+                    match content[i..].chars().next() {
+                        Some('(') => paren_count += 1,
+                        Some(')') => paren_count -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if paren_count == 0 {
+                    let cmd_content = &content[cmd_start..i - 1];
+                    if let Ok(cmd) =
+                        crate::parser::commands::parse_pipeline_from_text(cmd_content)
+                    {
+                        parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                    } else {
+                        parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                    }
+                } else {
+                    current_literal.push_str("$(");
+                    i = cmd_start;
+                }
+            } else if i + 1 < content.len() && content[i + 1..].starts_with('{') {
                 i += 2; // skip $ and {
                 let expansion_start = i;
                 let mut brace_count = 1;
@@ -1703,7 +1772,7 @@ pub fn parse_string_interpolation_from_literal(
     Ok(StringInterpolation { parts })
 }
 
-fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion, ParserError> {
+pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion, ParserError> {
     // Parse parameter expansion content like "arr[1]", "map[foo]", "#arr[@]", etc.
 
     // Check for array length: #arr[@]
@@ -1734,6 +1803,48 @@ fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion
                     is_mutable: true,
                 });
             }
+        }
+    }
+
+    // Check for parameter expansion operators with colon prefix BEFORE array access
+    if content.contains(":-") {
+        let parts: Vec<&str> = content.splitn(2, ":-").collect();
+        if parts.len() == 2 {
+            return Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
+                is_mutable: true,
+            });
+        }
+    }
+    if content.contains(":=") {
+        let parts: Vec<&str> = content.splitn(2, ":=").collect();
+        if parts.len() == 2 {
+            return Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
+                is_mutable: true,
+            });
+        }
+    }
+    if content.contains(":+") {
+        let parts: Vec<&str> = content.splitn(2, ":+").collect();
+        if parts.len() == 2 {
+            return Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
+                is_mutable: true,
+            });
+        }
+    }
+    if content.contains(":?") {
+        let parts: Vec<&str> = content.splitn(2, ":?").collect();
+        if parts.len() == 2 {
+            return Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::ErrorIfUnset(parts[1].to_string()),
+                is_mutable: true,
+            });
         }
     }
 
@@ -1918,7 +2029,7 @@ fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion
             })
         }
     } else if content.contains(":-") {
-        let parts: Vec<&str> = content.split(":-").collect();
+        let parts: Vec<&str> = content.splitn(2, ":-").collect();
         if parts.len() == 2 {
             Ok(ParameterExpansion {
                 variable: parts[0].to_string(),
@@ -1933,7 +2044,7 @@ fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion
             })
         }
     } else if content.contains(":=") {
-        let parts: Vec<&str> = content.split(":=").collect();
+        let parts: Vec<&str> = content.splitn(2, ":=").collect();
         if parts.len() == 2 {
             Ok(ParameterExpansion {
                 variable: parts[0].to_string(),
@@ -1948,7 +2059,7 @@ fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion
             })
         }
     } else if content.contains(":?") {
-        let parts: Vec<&str> = content.split(":?").collect();
+        let parts: Vec<&str> = content.splitn(2, ":?").collect();
         if parts.len() == 2 {
             Ok(ParameterExpansion {
                 variable: parts[0].to_string(),

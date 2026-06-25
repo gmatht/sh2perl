@@ -86,10 +86,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
-    my $output_107 = q{};
-    my $output_printed_107;
-    my $pipeline_success_107 = 1;
+my $strings_result = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
+    my $output_45 = q{};
+    my $output_printed_45;
+    my $pipeline_success_45 = 1;
     my $input_data;
     if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
         local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
@@ -107,12 +107,12 @@ my $strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     }
     my $line = join "\n", @result;
     if ($line ne q{} && !($line =~ m{\n\z}msx)) { $line .= "\n"; }
-    $output_107 = $line;
-    if ($CHILD_ERROR != 0) { $pipeline_success_107 = 0; }
+    $output_45 = $line;
+    if ($CHILD_ERROR != 0) { $pipeline_success_45 = 0; }
     my $num_lines       = 3;
     my $head_line_count = 0;
     my $result          = q{};
-    my $input           = $output_107;
+    my $input           = $output_45;
     my $pos             = 0;
 
     while ( $pos < length $input && $head_line_count < $num_lines ) {
@@ -125,11 +125,11 @@ my $strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
         $pos = $line_end + 1;
         ++$head_line_count;
     }
-    $output_107 = $result;
+    $output_45 = $result;
 
-    if ( !$pipeline_success_107 ) { $main_exit_code = 1; }
-    $output_107 =~ s/\n+\z//msx;
-    $output_107;
+    if ( !$pipeline_success_45 ) { $main_exit_code = 1; }
+    $output_45 =~ s/\n+\z//msx;
+    $output_45;
 }; $_pipeline_result; };
 print "Strings result:\n";
 print $strings_result;

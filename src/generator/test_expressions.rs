@@ -112,6 +112,26 @@ pub fn generate_test_expression_impl(
         } else {
             "0".to_string()
         }
+    } else if expr.contains(" != ") {
+        // String inequality: [[ $var != value ]]
+        let parts: Vec<&str> = expr.split(" != ").collect();
+        if parts.len() == 2 {
+            let var = parts[0].trim();
+            let value = parts[1].trim();
+            format!("{} ne {}", var, value)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains("!=") {
+        // String inequality without spaces: [[ $var!=value ]]
+        let parts: Vec<&str> = expr.split("!=").collect();
+        if parts.len() == 2 {
+            let var = parts[0].trim();
+            let value = parts[1].trim();
+            format!("{} ne {}", var, value)
+        } else {
+            "0".to_string()
+        }
     } else if expr.contains(" = ") || expr.contains("=") {
         // String equality: [[ $var = value ]] or [[ $var=value ]]
         let parts: Vec<&str> = if expr.contains(" = ") {
@@ -180,16 +200,6 @@ pub fn generate_test_expression_impl(
                 // Regular variable equality
                 format!("{} eq {}", var, value)
             }
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains(" != ") {
-        // String inequality: [[ $var != value ]]
-        let parts: Vec<&str> = expr.split(" != ").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-            format!("{} ne {}", var, value)
         } else {
             "0".to_string()
         }

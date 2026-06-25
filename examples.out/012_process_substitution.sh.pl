@@ -130,28 +130,28 @@ my $output_ps_fh_5;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_5 or croak "Cannot redirect STDOUT";
-    my $output_160 = q{};
-    my $output_printed_160;
+    my $output_163 = q{};
+    my $output_printed_163;
     {
-        my $pipeline_success_160 = 1;
-        $output_160 .= "a\nc\nb";
-    if ( !($output_160 =~ m{\n\z}msx) ) { $output_160 .= "\n"; }
+        my $pipeline_success_163 = 1;
+        $output_163 .= "a\nc\nb";
+    if ( !($output_163 =~ m{\n\z}msx) ) { $output_163 .= "\n"; }
     $CHILD_ERROR = 0;
-            my @sort_lines_160_1 = split /\n/msx, $output_160;
-        my @sort_sorted_160_1 = sort @sort_lines_160_1;
-        my $output_160_1 = join "\n", @sort_sorted_160_1;
-        if ($output_160_1 ne q{} && !($output_160_1 =~ m{\n\z}msx)) {
-        $output_160_1 .= "\n";
+            my @sort_lines_163_1 = split /\n/msx, $output_163;
+        my @sort_sorted_163_1 = sort @sort_lines_163_1;
+        my $output_163_1 = join "\n", @sort_sorted_163_1;
+        if ($output_163_1 ne q{} && !($output_163_1 =~ m{\n\z}msx)) {
+        $output_163_1 .= "\n";
         }
-        $output_160 = $output_160_1;
-        $output_160 = $output_160_1;
-        if ($output_160 ne q{} && !defined $output_printed_160) {
-            print $output_160;
-            if (!($output_160 =~ m{\n\z}msx)) {
+        $output_163 = $output_163_1;
+        $output_163 = $output_163_1;
+        if ($output_163 ne q{} && !defined $output_printed_163) {
+            print $output_163;
+            if (!($output_163 =~ m{\n\z}msx)) {
                 print "\n";
             }
         }
-        if ( !$pipeline_success_160 ) { $main_exit_code = 1; }
+        if ( !$pipeline_success_163 ) { $main_exit_code = 1; }
         }
 }
 use File::Path qw(make_path);
@@ -165,28 +165,28 @@ my $output_ps_fh_6;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_6 or croak "Cannot redirect STDOUT";
-    my $output_161 = q{};
-    my $output_printed_161;
+    my $output_164 = q{};
+    my $output_printed_164;
     {
-        my $pipeline_success_161 = 1;
-        $output_161 .= "a\nb\nd";
-    if ( !($output_161 =~ m{\n\z}msx) ) { $output_161 .= "\n"; }
+        my $pipeline_success_164 = 1;
+        $output_164 .= "a\nb\nd";
+    if ( !($output_164 =~ m{\n\z}msx) ) { $output_164 .= "\n"; }
     $CHILD_ERROR = 0;
-            my @sort_lines_161_1 = split /\n/msx, $output_161;
-        my @sort_sorted_161_1 = sort @sort_lines_161_1;
-        my $output_161_1 = join "\n", @sort_sorted_161_1;
-        if ($output_161_1 ne q{} && !($output_161_1 =~ m{\n\z}msx)) {
-        $output_161_1 .= "\n";
+            my @sort_lines_164_1 = split /\n/msx, $output_164;
+        my @sort_sorted_164_1 = sort @sort_lines_164_1;
+        my $output_164_1 = join "\n", @sort_sorted_164_1;
+        if ($output_164_1 ne q{} && !($output_164_1 =~ m{\n\z}msx)) {
+        $output_164_1 .= "\n";
         }
-        $output_161 = $output_161_1;
-        $output_161 = $output_161_1;
-        if ($output_161 ne q{} && !defined $output_printed_161) {
-            print $output_161;
-            if (!($output_161 =~ m{\n\z}msx)) {
+        $output_164 = $output_164_1;
+        $output_164 = $output_164_1;
+        if ($output_164 ne q{} && !defined $output_printed_164) {
+            print $output_164;
+            if (!($output_164 =~ m{\n\z}msx)) {
                 print "\n";
             }
         }
-        if ( !$pipeline_success_161 ) { $main_exit_code = 1; }
+        if ( !$pipeline_success_164 ) { $main_exit_code = 1; }
         }
 }
 use File::Path qw(make_path);
@@ -252,7 +252,7 @@ if (!-d $temp_dir_fh_8) { make_path($temp_dir_fh_8); }
 open my $fh_ps_fh_8, '>', $temp_file_ps_fh_8 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_8} $output_ps_fh_8;
 close $fh_ps_fh_8 or croak "Close failed: $ERRNO\n";
-my $paste_result_162 = do {
+my $paste_result_165 = do {
 my @paste_file1_lines_fh_9;
 my @paste_file2_lines_fh_9;
 if (open my $fh1, '<', $temp_file_ps_fh_7) {
@@ -279,6 +279,6 @@ for my $i (0..$max_lines-1) {
 $paste_output
 };
 ;
-print $paste_result_162;
+print $paste_result_165;
 
 exit $main_exit_code;

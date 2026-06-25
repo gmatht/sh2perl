@@ -12,6 +12,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '013_parameter_expansion.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -82,7 +83,7 @@ my $maybe;
 undef $maybe;
 delete $ENV{maybe};
 do {
-    my $output = defined ${maybe} && ${maybe} ne q{} ? ${maybe} : 'default';
+    my $output = (defined ${maybe} && ${maybe} ne q{} ? ${maybe} : 'default');
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
         print "\n";
@@ -90,7 +91,7 @@ do {
 };
 $CHILD_ERROR = 0;
 do {
-    my $output = defined ${maybe} && ${maybe} ne q{} ? ${maybe} : do { ${maybe} = 'default'; ${maybe} };
+    my $output = (defined ${maybe} && ${maybe} ne q{} ? ${maybe} : do { ${maybe} = 'default'; ${maybe} });
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
         print "\n";
@@ -98,7 +99,7 @@ do {
 };
 $CHILD_ERROR = 0;
 do {
-    my $output = defined ${maybe} && ${maybe} ne q{} ? ${maybe} : die('error');
+    my $output = (defined ${maybe} && ${maybe} ne q{} ? ${maybe} : die('error'));
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
         print "\n";

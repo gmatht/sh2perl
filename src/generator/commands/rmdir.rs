@@ -20,24 +20,27 @@ pub fn generate_rmdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     }
 
     if directories.is_empty() {
-        output.push_str("croak \"rmdir: missing operand\\n\";\n");
+        output.push_str("carp \"rmdir: missing operand\\n\";\n");
+        output.push_str("$CHILD_ERROR = 1;\n");
     } else {
         for dir in &directories {
             output.push_str(&format!("if ( -d {} ) {{\n", dir));
             output.push_str(&format!("    if ( rmdir {} ) {{\n", dir));
             output.push_str("    }\n");
-            output.push_str("    else {\n");
+            output.push_str("                else {\n");
             output.push_str(&format!(
-                "        croak \"rmdir: cannot remove directory {}: $ERRNO\\n\";\n",
+                "        carp \"rmdir: failed to remove {}: $ERRNO\\n\";\n",
                 dir
             ));
+            output.push_str("        $CHILD_ERROR = 1;\n");
             output.push_str("    }\n");
             output.push_str("}\n");
             output.push_str("else {\n");
             output.push_str(&format!(
-                "    croak \"rmdir: {}: No such file or directory\\n\";\n",
+                "        carp \"rmdir: failed to remove {}: $ERRNO\\n\";\n",
                 dir
             ));
+            output.push_str("        $CHILD_ERROR = 1;\n");
             output.push_str("}\n");
         }
     }

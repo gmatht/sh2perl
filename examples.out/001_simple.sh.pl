@@ -11,6 +11,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '001_simple.sh';
 my $MAX_LOOP_5 = 5;
 
 print "Hello, World!\n";

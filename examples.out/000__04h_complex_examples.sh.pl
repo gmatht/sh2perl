@@ -26,21 +26,21 @@ our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04h_complex_examples.sh';
 print "=== Complex Backtick Examples ===\n";
-my $nested_result = ("Three wells: " . (do { my $_chomp_temp = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
-    do { my $output_108 = q{};
-my $output_printed_108;
+my $nested_result = ("Three wells: " . (do { my $_chomp_temp = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
+    do { my $output_111 = q{};
+my $output_printed_111;
 my $head_line_count = 0;
 while (1) {
     my $line = 'well';
     if ($head_line_count < 3) {
-    $output_108 .= $line . "\n";
+    $output_111 .= $line . "\n";
     ++$head_line_count;
     } else {
     $line = q{}; # Clear line to prevent printing
     last; # Break out of the yes loop when head limit is reached
     }
 }
-$output_108 };
+$output_111 };
 }; $_pipeline_result; }; chomp $_chomp_temp; $_chomp_temp; }));
 do {
     my $output = "Nested backticks: $nested_result";
@@ -50,42 +50,42 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
-    my $output_109 = q{};
-    my $output_printed_109;
-    my $pipeline_success_109 = 1;
-    $output_109 = do {
-        my @ls_files_110 = ();
+my $count = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
+    my $output_112 = q{};
+    my $output_printed_112;
+    my $pipeline_success_112 = 1;
+    $output_112 = do {
+        my @ls_files_113 = ();
         if ( -f q{.} ) {
-            push @ls_files_110, q{.};
+            push @ls_files_113, q{.};
         }
         elsif ( -d q{.} ) {
             if ( opendir my $dh, q{.} ) {
                 while ( my $file = readdir $dh ) {
                     next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-                    push @ls_files_110, $file;
+                    push @ls_files_113, $file;
                 }
                 closedir $dh;
-                @ls_files_110 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_110;
+                @ls_files_113 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_113;
             }
         }
-        (@ls_files_110 ? join("\n", @ls_files_110) . "\n" : q{});
+        (@ls_files_113 ? join("\n", @ls_files_113) . "\n" : q{});
     };
     ;
-    if ($CHILD_ERROR != 0) { $pipeline_success_109 = 0; }
+    if ($CHILD_ERROR != 0) { $pipeline_success_112 = 0; }
     use IPC::Open3;
-    my @wc_args_109_1 = ('-l');
-    my ($wc_in_109_1, $wc_out_109_1, $wc_err_109_1);
-    my $wc_pid_109_1 = open3($wc_in_109_1, $wc_out_109_1, $wc_err_109_1, 'wc', @wc_args_109_1);
-    print {$wc_in_109_1} $output_109;
-    close $wc_in_109_1 or die "Close failed: $OS_ERROR\n";
-    $output_109 = do { local $/ = undef; <$wc_out_109_1> };
-    if ($output_109 eq q{}) { $output_109 = "0\n"; }
-    close $wc_out_109_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_109_1, 0;
-    if ( !$pipeline_success_109 ) { $main_exit_code = 1; }
-    $output_109 =~ s/\n+\z//msx;
-    $output_109;
+    my @wc_args_112_1 = ('-l');
+    my ($wc_in_112_1, $wc_out_112_1, $wc_err_112_1);
+    my $wc_pid_112_1 = open3($wc_in_112_1, $wc_out_112_1, $wc_err_112_1, 'wc', @wc_args_112_1);
+    print {$wc_in_112_1} $output_112;
+    close $wc_in_112_1 or die "Close failed: $OS_ERROR\n";
+    $output_112 = do { local $/ = undef; <$wc_out_112_1> };
+    if ($output_112 eq q{}) { $output_112 = "0\n"; }
+    close $wc_out_112_1 or die "Close failed: $OS_ERROR\n";
+    waitpid $wc_pid_112_1, 0;
+    if ( !$pipeline_success_112 ) { $main_exit_code = 1; }
+    $output_112 =~ s/\n+\z//msx;
+    $output_112;
 }; $_pipeline_result; };
 do {
     my $output = "File count: $count";

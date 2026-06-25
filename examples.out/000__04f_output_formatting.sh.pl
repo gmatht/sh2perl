@@ -12,6 +12,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__04f_output_formatting.sh';
 print "=== Output and Formatting Commands ===\n";
 my $echo_result = do {
     my $_chomp_temp = ("Hello from backticks");
@@ -40,7 +41,7 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $tee_result = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_109 = q{};
     my $output_printed_109;
     my $pipeline_success_109 = 1;

@@ -470,6 +470,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 let arg = &args[i];
                 match arg {
                     Word::Literal(var_name, _) => {
+                        // Skip flags like -a, -A for local declarations
+                        if var_name.starts_with('-') {
+                            i += 1;
+                            continue;
+                        }
                         // Check if it's an assignment (var=value)
                         if var_name.contains('=') {
                             let parts: Vec<&str> = var_name.splitn(2, '=').collect();
@@ -602,6 +607,30 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // of a "var=" pair above (e.g. the variable name was already declared).
                         // Skip it silently.
                         i += 1;
+                    }
+                    Word::Array(name, elements, _) => {
+                        // Handle array declarations like local -a arr=(...)
+                        if !generator.declared_locals.contains(name) {
+                            let elements_perl: Vec<String> = elements
+                                .iter()
+                                .map(|e| {
+                                    if e == "\"$@\"" || e == "$@" {
+                                        "@_".to_string()
+                                    } else {
+                                        format!("'{}'", e.replace("'", "\\'"))
+                                    }
+                                })
+                                .collect();
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!(
+                                "my @{} = ({});\n",
+                                name,
+                                elements_perl.join(", ")
+                            ));
+                            generator.declared_locals.insert(name.clone());
+                        }
+                        i += 1;
+                        continue;
                     }
                     _ => {
                         // For other word types, try to extract variable name and value

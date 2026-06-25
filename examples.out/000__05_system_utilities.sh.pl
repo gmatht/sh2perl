@@ -25,21 +25,21 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $yes_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
-    do { my $output_112 = q{};
-my $output_printed_112;
+my $yes_result = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
+    do { my $output_115 = q{};
+my $output_printed_115;
 my $head_line_count = 0;
 while (1) {
     my $line = 'Hello';
     if ($head_line_count < 3) {
-    $output_112 .= $line . "\n";
+    $output_115 .= $line . "\n";
     ++$head_line_count;
     } else {
     $line = q{}; # Clear line to prevent printing
     last; # Break out of the yes loop when head limit is reached
     }
 }
-$output_112 };
+$output_115 };
 }; $_pipeline_result; };
 print "Yes command result:\n";
 print $yes_result;

@@ -14,39 +14,40 @@ our $CHILD_ERROR;
 $PROGRAM_NAME = '006_misc.sh';
 print "== Subshell ==\n";
 do {
+    local %ENV = %ENV;
     print 'inside-subshell' . "\n";
     $CHILD_ERROR = 0;
     q{};
 };
 print "== Simple pipeline ==\n";
 {
-    my $output_140 = q{};
-    my $output_printed_140;
-    my $pipeline_success_140 = 1;
-    $output_140 .= 'alpha beta' . "\n";
-if ( !($output_140 =~ m{\n\z}msx) ) { $output_140 .= "\n"; }
+    my $output_46 = q{};
+    my $output_printed_46;
+    my $pipeline_success_46 = 1;
+    $output_46 .= 'alpha beta' . "\n";
+if ( !($output_46 =~ m{\n\z}msx) ) { $output_46 .= "\n"; }
 $CHILD_ERROR = 0;
 
-        my $grep_result_140_1;
-    my @grep_lines_140_1 = split /\n/msx, $output_140;
-    my @grep_filtered_140_1 = grep { /beta/msx } @grep_lines_140_1;
-    $grep_result_140_1 = join "\n", @grep_filtered_140_1;
-    if (!($grep_result_140_1 =~ m{\n\z}msx || $grep_result_140_1 eq q{})) {
-    $grep_result_140_1 .= "\n";
+        my $grep_result_46_1;
+    my @grep_lines_46_1 = split /\n/msx, $output_46;
+    my @grep_filtered_46_1 = grep { /beta/msx } @grep_lines_46_1;
+    $grep_result_46_1 = join "\n", @grep_filtered_46_1;
+    if (!($grep_result_46_1 =~ m{\n\z}msx || $grep_result_46_1 eq q{})) {
+    $grep_result_46_1 .= "\n";
     }
-    $CHILD_ERROR = scalar @grep_filtered_140_1 > 0 ? 0 : 1;
-    $output_140 = $grep_result_140_1;
-    $output_140 = $grep_result_140_1;
-    if ((scalar @grep_filtered_140_1) == 0) {
-        $pipeline_success_140 = 0;
+    $CHILD_ERROR = scalar @grep_filtered_46_1 > 0 ? 0 : 1;
+    $output_46 = $grep_result_46_1;
+    $output_46 = $grep_result_46_1;
+    if ((scalar @grep_filtered_46_1) == 0) {
+        $pipeline_success_46 = 0;
     }
-    if ($output_140 ne q{} && !defined $output_printed_140) {
-        print $output_140;
-        if (!($output_140 =~ m{\n\z}msx)) {
+    if ($output_46 ne q{} && !defined $output_printed_46) {
+        print $output_46;
+        if (!($output_46 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_140 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_46 ) { $main_exit_code = 1; }
     }
 
 exit $main_exit_code;
