@@ -1,14 +1,13 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use File::Temp qw(tempfile);
 use Time::HiRes qw(sleep);
 
-#my $test_cmd = $^O eq 'MSWin32' ? 'test_purify.pl' : './test_purify.pl';
 my $test_cmd = './fail';
 
 while (1) {
     my $output = `$test_cmd 2>&1`;
-    #my $exit_code = $? >> 8;
     my $exit_code = $?;
 
     if ($exit_code == 0) {
@@ -33,9 +32,10 @@ while (1) {
         "After fixing the issue, stop.",
     );
 
-    # This CLI exposes prompt text via `opencode run --prompt`; top-level `-p` is password.
-    #system('opencode', 'run', '--prompt', $prompt);
-    #system('opencode', 'run',  '-m', 'github-copilot/gpt-5.4-mini', '--variant', 'xhigh', $prompt);
-    system('opencode', 'run',  '-m', 'opencode-go/deepseek-v4-flash', '--variant', 'xhigh', $prompt);
+    my ($fh, $filename) = tempfile(UNLINK => 1);
+    print $fh $prompt;
+    close $fh;
+
+    system('opencode', 'run', '-m', 'opencode-go/deepseek-v4-flash', '--variant', 'xhigh', '--file', $filename);
     sleep 1;
 }
