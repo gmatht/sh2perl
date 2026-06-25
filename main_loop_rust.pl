@@ -1,7 +1,6 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use File::Temp qw(tempfile);
 use Time::HiRes qw(sleep);
 
 my $test_cmd = './fail';
@@ -23,6 +22,11 @@ while (1) {
     print $output;
     print "\nInvoking opencode to fix the failure...\n";
 
+    my @lines = split("\n", $output);
+    if (@lines > 50) {
+        $output = join("\n", @lines[0..24]) . "\n...\n" . join("\n", @lines[-25..-1]);
+    }
+
     my $prompt = join("\n",
         "Fix the failure reported by fail.",
         "Use the output below as the task description and make the smallest correct code change.",
@@ -32,10 +36,6 @@ while (1) {
         "After fixing the issue, stop.",
     );
 
-    my ($fh, $filename) = tempfile(UNLINK => 1);
-    print $fh $prompt;
-    close $fh;
-
-    system('opencode', 'run', '-m', 'opencode-go/deepseek-v4-flash', '--variant', 'xhigh', '--file', $filename);
+    system('opencode', 'run', '-m', 'opencode-go/deepseek-v4-flash', '--variant', 'xhigh', $prompt);
     sleep 1;
 }

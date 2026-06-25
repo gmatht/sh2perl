@@ -1567,7 +1567,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     let pipeline_code = crate::generator::commands::pipeline_commands::
                         generate_pipeline_for_substitution(generator, pipeline);
                     format!(
-                        "do {{ local $CHILD_ERROR = 0; my $_pipeline_result = {}; $_pipeline_result; }}",
+                        "do {{ our $CHILD_ERROR = 0; my $_pipeline_result = {}; $_pipeline_result; }}",
                         pipeline_code
                     )
                 }
@@ -2120,9 +2120,17 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 current_string.push_str(&format!("$_[{}]", index - 1));
                             }
                         // Perl arrays are 0-indexed
-                        } else {
-                            // Regular variable - add directly for interpolation
+                        } else if generator.declared_locals.contains(var)
+                            || matches!(
+                                var.as_str(),
+                                "#" | "@" | "*" | "-" | "?" | "!" | "0"
+                            )
+                        {
+                            // Regular declared variable - add directly for interpolation
                             current_string.push_str(&format!("${}", var));
+                        } else {
+                            // Undeclared variable - use $ENV{}
+                            current_string.push_str(&format!("$ENV{{{}}}", var));
                         }
                     }
                 }

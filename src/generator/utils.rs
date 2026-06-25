@@ -717,6 +717,10 @@ pub fn format_regex_pattern(pattern: &str) -> String {
     // (it is treated as formatting space, not a literal character). Escape any
     // literal space or tab characters so they remain significant after /x is applied.
     let escaped_pattern = converted_pattern.replace('\t', "\\t").replace(' ', "\\ ");
+    // Escape forward slashes so they don't conflict with the regex delimiter
+    let escaped_pattern = escaped_pattern.replace('/', "\\/");
+    // Escape # because /x makes it a comment delimiter
+    let escaped_pattern = escaped_pattern.replace('#', "\\#");
     // Add common flags: /s for dot matching newlines, /x for extended formatting, /m for multiline
     format!("/{}/msx", escaped_pattern)
 }

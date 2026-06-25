@@ -15,6 +15,10 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             let test_result = generator.generate_test_expression(test_expr);
             output.push_str(&test_result);
         }
+        Command::And(_, _) | Command::Or(_, _) => {
+            let cond = generate_combined_test_condition(generator, &if_stmt.condition);
+            output.push_str(&cond);
+        }
         _ => {
             generator.suppress_set_e_depth += 1;
             let mut cond = generator.generate_command(&if_stmt.condition);
@@ -171,7 +175,28 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
 
     // Check if the while loop condition uses variables that might need initialization
     // This is needed for shell compatibility where loop variables persist
+    let mut read_vars: Vec<String> = Vec::new();
     if let Command::Simple(cmd) = &*while_loop.condition {
+        if let Word::Literal(name, _) = &cmd.name {
+            if name == "read" {
+                // Extract variable names from read command args (skip flags)
+                for arg in &cmd.args {
+                    if let Word::Literal(s, _) = arg {
+                        if s != "-r" && s != "-p" && s != "-n" && s != "-t" && !s.starts_with('-') {
+                            read_vars.push(s.clone());
+                        }
+                    }
+                }
+                // Declare read variables before the loop
+                for var in &read_vars {
+                    if !generator.declared_locals.contains(var) {
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("my ${};\n", var));
+                        generator.declared_locals.insert(var.clone());
+                    }
+                }
+            }
+        }
         if cmd.name == "[" || cmd.name == "test" {
             // For test commands, check if variables need initialization
             if cmd.args.len() >= 3 {
@@ -217,6 +242,29 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
     }
 
     // Generate while loop
+    // Handle 'while read -r var1 var2 ...' specially to avoid multiple statements in condition
+    if !read_vars.is_empty() {
+        if let Command::Simple(cmd) = &*while_loop.condition {
+            let ifs_sep = if let Some(Word::Literal(sep, _)) = cmd.env_vars.get("IFS") {
+                format!("{}", regex::escape(sep))
+            } else {
+                r"\s+".to_string()
+            };
+            output.push_str(&format!("while ( my $L = <> ) {{\n"));
+            output.push_str(&format!("    chomp $L;\n"));
+            output.push_str(&format!("    my @_fields = split /{}/msx, $L;\n", ifs_sep));
+            for (i, var) in read_vars.iter().enumerate() {
+                output.push_str(&format!("    ${} = $_fields[{}] // q{{}};\n", var, i));
+            }
+            generator.indent_level += 1;
+            output.push_str(&generator.generate_block_commands(&while_loop.body));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+            return output;
+        }
+    }
+
     output.push_str("while ( ");
     match &*while_loop.condition {
         Command::Simple(cmd) if cmd.name == "[" || cmd.name == "test" => {
@@ -834,4 +882,34 @@ pub fn generate_block_commands_impl(generator: &mut Generator, block: &Block) ->
         }
     }
     output
+}
+
+/// Recursively convert a tree of `And`/`Or` commands (whose leaves are
+/// `TestExpression` or other commands) into a single Perl boolean expression.
+fn generate_combined_test_condition(
+    generator: &mut Generator,
+    cmd: &Command,
+) -> String {
+    fn combine(
+        generator: &mut Generator,
+        cmd: &Command,
+    ) -> String {
+        match cmd {
+            Command::TestExpression(te) => generator.generate_test_expression(te),
+            Command::And(l, r) => {
+                format!("({} && {})", combine(generator, l), combine(generator, r))
+            }
+            Command::Or(l, r) => {
+                format!("({} || {})", combine(generator, l), combine(generator, r))
+            }
+            _ => {
+                generator.suppress_set_e_depth += 1;
+                let mut c = generator.generate_command(cmd);
+                generator.suppress_set_e_depth -= 1;
+                let c = c.trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t').to_string();
+                format!("!({})", c)
+            }
+        }
+    }
+    combine(generator, cmd)
 }

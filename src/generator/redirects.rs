@@ -917,13 +917,12 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     if let Some((array_name, key)) = generator.extract_array_key(var_name) {
                         // Unset array element
                         output.push_str(&format!("delete ${}{{{}}};\n", array_name, key));
-                    } else {
-                        // Unset variable - ensure it's declared first
-                        if !generator.declared_locals.contains(var_name) {
-                            output.push_str(&format!("my ${};\n", var_name));
-                            generator.declared_locals.insert(var_name.clone());
-                        }
+                    } else if generator.declared_locals.contains(var_name) {
+                        // Unset already declared variable
                         output.push_str(&format!("undef ${};\n", var_name));
+                        output.push_str(&format!("delete $ENV{{{}}};\n", var_name));
+                    } else {
+                        // Unset undeclared variable - just remove from environment
                         output.push_str(&format!("delete $ENV{{{}}};\n", var_name));
                     }
                 }
@@ -933,14 +932,24 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
             // Handle export command
             for arg in &cmd.args {
                 if let Word::Literal(var_name, _) = arg {
-                    if let Some((array_name, key)) = generator.extract_array_key(var_name) {
+                    if let Some(eq_pos) = var_name.find('=') {
+                        // Export with assignment: export VAR=value
+                        let var = &var_name[..eq_pos];
+                        let value = &var_name[eq_pos + 1..];
+                        let quoted_value = if value.parse::<i64>().is_ok() || value == "0" {
+                            value.to_string()
+                        } else {
+                            format!("'{}'", value.replace("'", "\\'"))
+                        };
+                        output.push_str(&format!("$ENV{{{}}} = {};\n", var, quoted_value));
+                    } else if let Some((array_name, key)) = generator.extract_array_key(var_name) {
                         // Export array element
                         output.push_str(&format!(
                             "$ENV{{{}}} = ${}{{{}}};\n",
                             var_name, array_name, key
                         ));
                     } else {
-                        // Export variable
+                        // Export variable without assignment
                         output.push_str(&format!("$ENV{{{}}} = ${};\n", var_name, var_name));
                     }
                 }
@@ -1013,6 +1022,11 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
             while i < cmd.args.len() {
                 match &cmd.args[i] {
                     Word::Literal(var_name, _) => {
+                        // Skip flags like -a, -A for local declarations
+                        if var_name.starts_with('-') {
+                            i += 1;
+                            continue;
+                        }
                         // Check if it's an assignment (var=value)
                         if var_name.contains('=') {
                             let parts: Vec<&str> = var_name.splitn(2, '=').collect();
@@ -1113,6 +1127,30 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             generator.get_unique_id(),
                             perl_command
                         ));
+                    }
+                    Word::Array(name, elements, _) => {
+                        // Handle array declarations like local -a arr=(...)
+                        if !generator.declared_locals.contains(name) {
+                            let elements_perl: Vec<String> = elements
+                                .iter()
+                                .map(|e| {
+                                    if e == "\"$@\"" || e == "$@" {
+                                        "@_".to_string()
+                                    } else {
+                                        format!("'{}'", e.replace("'", "\\'"))
+                                    }
+                                })
+                                .collect();
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!(
+                                "my @{} = ({});\n",
+                                name,
+                                elements_perl.join(", ")
+                            ));
+                            generator.declared_locals.insert(name.clone());
+                        }
+                        i += 1;
+                        continue;
                     }
                     _ => {
                         // For other word types (Variable, StringInterpolation, etc.)
