@@ -10,6 +10,10 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
     output.push_str("do {\n");
     generator.indent_level += 1;
 
+    // Localize the environment so changes (export/unset) are scoped to this subshell
+    output.push_str(&generator.indent());
+    output.push_str("local %ENV = %ENV;\n");
+
     // Create local copies of all declared variables to isolate subshell scope
     for var_name in &generator.declared_locals {
         output.push_str(&generator.indent());

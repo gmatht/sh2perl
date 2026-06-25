@@ -77,6 +77,29 @@ impl ParserUtilities for Lexer {
                     }
                     self.next();
                 }
+                Some(Token::ArithmeticEvalClose) => {
+                    // )) closes two levels of paren depth
+                    // (ArithmeticEvalClose has priority over ParenClose via logos)
+                    depth -= 2;
+                    if depth > 0 {
+                        content.push_str("))");
+                    } else if depth == 0 {
+                        content.push(')'); // one ) is inside, one closes
+                    } else {
+                        // depth went negative — we overshot; emit all ) needed
+                        content.push_str("))");
+                        depth = 0;
+                    }
+                    self.next();
+                }
+                Some(Token::DollarParen) => {
+                    // Nested $(...) - the ( is already consumed by the $ token,
+                    // but the matching ) will be a ParenClose, so increase depth
+                    depth += 1;
+                    let text = self.get_current_text().unwrap_or_default();
+                    content.push_str(&text);
+                    self.next();
+                }
                 Some(_) => {
                     if let Some(text) = self.get_current_text() {
                         content.push_str(&text);

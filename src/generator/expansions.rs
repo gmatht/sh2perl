@@ -17,6 +17,10 @@ fn parameter_var_scalar_ref(generator: &Generator, var_name: &str) -> String {
         || matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
     {
         format!("${{{}}}", var_name)
+    } else if var_name.contains('[') || var_name.contains(']') || var_name.contains('{') || var_name.contains('}') {
+        // Variable name contains special characters (e.g. array[${index}]),
+        // use a string literal fallback to avoid Perl syntax errors
+        format!("$ENV{{'{}'}}", var_name.replace('\'', "\\'"))
     } else {
         format!("$ENV{{{}}}", var_name)
     }
@@ -159,17 +163,25 @@ pub fn generate_parameter_expansion_impl(
                 if pe.variable.starts_with('!') {
                     // ${!map[@]} -> keys %map (map keys iteration)
                     let map_name = &pe.variable[1..]; // Remove ! prefix
-                    format!("keys %{}", map_name)
+                    if map_name.contains(|c: char| !c.is_alphanumeric() && c != '_') {
+                        // Variable name has special characters - this is likely an indirect
+                        // expansion or prefix matching that can't be cleanly translated
+                        "q{}".to_string()
+                    } else {
+                        format!("(keys %{})", map_name)
+                    }
                 } else {
                     // ${map[@]} -> @map (array iteration)
                     format!("@{}", pe.variable)
                 }
             } else {
+                // Use @main:: to reference the variable safely under strict mode
+                let var_ref = format!("@main::{}", pe.variable);
                 // ${var:offset:length} - array slice
                 if let Some(length_str) = length {
-                    format!("@${{{}}}[{}..{}]", pe.variable, offset, length_str)
+                    format!("{}[{}..{}]", var_ref, offset, length_str)
                 } else {
-                    format!("@${{{}}}[{}..]", pe.variable, offset)
+                    format!("{}[{}..]", var_ref, offset)
                 }
             }
         }
@@ -180,6 +192,14 @@ pub fn generate_parameter_expansion_impl(
 /// If the default contains command substitutions (`$(...)` or backtick), parse and
 /// convert them; otherwise emit a string literal.
 fn default_value_to_perl(generator: &mut Generator, default: &str) -> String {
+    // Check for nested ${...} parameter expansion
+    if default.starts_with("${") && default.ends_with('}') {
+        let inner = &default[2..default.len() - 1];
+        if let Ok(pe) = crate::parser::words::parse_parameter_expansion_content(inner) {
+            let perl = generator.generate_parameter_expansion(&pe);
+            return perl;
+        }
+    }
     // Check for $(...) command substitution
     if default.starts_with("$(") && default.ends_with(')') {
         let inner = &default[2..default.len() - 1];

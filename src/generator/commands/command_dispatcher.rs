@@ -155,6 +155,18 @@ pub fn generate_command_impl_with_input(
             let mut has_here_string = false;
             let mut here_string_content = String::new();
             let mut process_sub_files = Vec::new();
+            // Check if there are stderr redirects that need scope wrapping
+            let has_stderr_redirect = all_redirects.iter().any(|r| {
+                matches!(
+                    r.operator,
+                    RedirectOperator::StderrOutput
+                        | RedirectOperator::StderrAppend
+                        | RedirectOperator::StderrInput
+                )
+            });
+            // We'll open a scope block for stderr redirects after collecting all redirects.
+            // It will be closed after the base command generation.
+            let mut stderr_scope_opened = false;
             for redirect in &all_redirects {
                 match &redirect.operator {
                     RedirectOperator::HereString => {
@@ -246,6 +258,24 @@ pub fn generate_command_impl_with_input(
                                         result.push_str(&format!("    {}\n", line));
                                     }
                                 }
+                                // When the inner command is a Pipeline, the pipeline
+                                // generator already emits a final print for the buffer.
+                                // Only emit our own print for non-pipeline commands so
+                                // we don't double-print the output.
+                                if !matches!(**cmd, Command::Pipeline(_)) {
+                                    result.push_str(&generator.indent());
+                                    result.push_str(&format!(
+                                        "if ($output_{} ne q{{}} && !$output_printed_{}) {{\n",
+                                        unique_id, unique_id
+                                    ));
+                                    result.push_str(&generator.indent());
+                                    result.push_str(&format!(
+                                        "    print $output_{};\n",
+                                        unique_id
+                                    ));
+                                    result.push_str(&generator.indent());
+                                    result.push_str(&format!("}}\n"));
+                                }
                                 // _ps_guard drops here, popping the pipeline id
                             }
                             result.push_str(&generator.indent());
@@ -305,6 +335,17 @@ pub fn generate_command_impl_with_input(
                             fh_var
                         ));
 
+                        // If there is an active pipeline, feed the process-substitution
+                        // output into the pipeline buffer so the next command (e.g. sort)
+                        // can read it when it references $output_<id>.
+                        if let Some(pid) = generator.current_pipeline_output_id() {
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!(
+                                "$output_{} = $output_ps_{};\n",
+                                pid, global_counter
+                            ));
+                        }
+
                         process_sub_files.push((
                             temp_var,
                             format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter),
@@ -322,6 +363,21 @@ pub fn generate_command_impl_with_input(
                         }
                     }
                 }
+            }
+
+            // If there are stderr redirects (and no output redirect which already provides
+            // a do {} block), wrap everything in a do {} so that local *STDERR doesn't leak
+            // beyond the redirected command.
+            let has_output_redirect = all_redirects.iter().any(|r| {
+                matches!(
+                    r.operator,
+                    RedirectOperator::Output | RedirectOperator::Append
+                )
+            });
+            if has_stderr_redirect && !has_output_redirect {
+                result.insert_str(0, &format!("{}do {{\n", generator.indent()));
+                generator.indent_level += 1;
+                stderr_scope_opened = true;
             }
 
             // Now handle the base command with redirect context
@@ -683,14 +739,6 @@ pub fn generate_command_impl_with_input(
             // Instead, generate the base command directly
             //             eprintln!("DEBUG: Generating base command for redirect, has_here_string: {}, command: {:?}", has_here_string, &base_command);
 
-            // Check if we have output redirects that need to be wrapped in a local STDOUT block
-            let has_output_redirect = all_redirects.iter().any(|r| {
-                matches!(
-                    r.operator,
-                    RedirectOperator::Output | RedirectOperator::Append
-                )
-            });
-
             if has_output_redirect {
                 result.push_str(&generator.indent());
                 result.push_str("do {\n");
@@ -880,6 +928,7 @@ pub fn generate_command_impl_with_input(
                             let mut snippet = String::new();
                             // Declare the temp result variable in this scope
                             snippet.push_str(&format!("my ${} = q{{}};\n", tmp_var));
+                            generator.declared_locals.insert(tmp_var.clone());
 
                             // Use the generic builtin generator which understands input_var/output_var
                             snippet.push_str(
@@ -980,6 +1029,11 @@ pub fn generate_command_impl_with_input(
                 result.push_str(&generator.indent());
                 result.push_str("close $original_stdout\n");
                 result.push_str("      or die \"Close failed: $OS_ERROR\\n\";\n");
+                generator.indent_level -= 1;
+                result.push_str(&generator.indent());
+                result.push_str("};\n");
+            }
+            if stderr_scope_opened {
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());
                 result.push_str("};\n");

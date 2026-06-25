@@ -244,6 +244,8 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
+                    output.push_str(&generator.indent());
+                    output.push_str("$main_exit_code = 0;\n");
                     return output;
                 }
             }
@@ -264,6 +266,8 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                         generator.indent_level -= 1;
                         output.push_str(&generator.indent());
                         output.push_str("}\n");
+                        output.push_str(&generator.indent());
+                        output.push_str("$main_exit_code = 0;\n");
                         return output;
                     }
                 }

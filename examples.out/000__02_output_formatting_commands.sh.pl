@@ -25,6 +25,7 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__02_output_formatting_commands.sh';
 print "=== Output and Formatting Commands ===\n";
 my $echo_result = do {
     my $_chomp_temp = ("Hello from backticks");
@@ -128,7 +129,7 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $strings_result = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_0 = q{};
     my $output_printed_0;
     my $pipeline_success_0 = 1;
@@ -177,7 +178,7 @@ print "Strings result:\n";
 print $strings_result;
 if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }
 print "=== I/O Redirection Commands ===\n";
-my $tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $tee_result = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_1 = q{};
     my $output_printed_1;
     my $pipeline_success_1 = 1;

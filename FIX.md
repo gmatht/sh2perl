@@ -737,3 +737,35 @@ Files changed
 - purify.pl: stop stripping `our $CHILD_ERROR;` from generated output
 - src/generator/commands/find.rs: close unterminated block comment
 - src/generator/commands/xargs.rs: remove duplicate `));`
+
+Fix: Use `our` instead of `local` for $CHILD_ERROR declaration in inline pipeline do-blocks
+----------------------------------------------------------------------------
+Problem
+-------
+The previous fix in `src/generator/words.rs:1570` used `local $CHILD_ERROR = 0;`
+inside inline pipeline do-blocks for command-substitution contexts. Under
+Perl's `use strict`, `local` only temporarily saves/restores an existing
+package variable — it does not declare it. If the enclosing script uses
+`use strict` and lacks a top-level `our $CHILD_ERROR;` declaration, Perl
+rejects the code with "Global symbol "$CHILD_ERROR" requires explicit
+package name".
+
+Fix
+---
+Changed `local $CHILD_ERROR = 0;` to `our $CHILD_ERROR = 0;` in
+`src/generator/words.rs:1570`. The `our` keyword properly declares a package
+variable in the current lexical scope, making the code valid under `use strict`
+while still initializing `$CHILD_ERROR` to 0.
+
+Why this is minimal and safe
+----------------------------
+This is a one-word change (`local` -> `our`) in the generated Perl template.
+It fixes the compilation error under `use strict` without altering the
+runtime semantics: `$CHILD_ERROR` is still initialized to 0 in the do-block,
+and subsequent code that reads/writes `$CHILD_ERROR` continues to work
+identically. The only difference is that `our` makes the variable visible to
+`use strict`, whereas `local` requires a pre-existing declaration elsewhere.
+
+Files changed
+-------------
+- src/generator/words.rs: `local $CHILD_ERROR = 0` -> `our $CHILD_ERROR = 0`
