@@ -767,5 +767,38 @@ identically. The only difference is that `our` makes the variable visible to
 `use strict`, whereas `local` requires a pre-existing declaration elsewhere.
 
 Files changed
--------------
+------------
 - src/generator/words.rs: `local $CHILD_ERROR = 0` -> `our $CHILD_ERROR = 0`
+
+Fix: Preserve Perl variable references in inline/backtick mode
+---------------------------------------------------------------
+Applied: Verified this fixes examples.impurl/001_echo_basic.pl where
+backtick variables $name, $version were emitted as $ENV{name}/$ENV{version}
+(inline mode) causing empty output. The inline_mode check at
+src/generator/words.rs:2131 now emits $var for undeclared variables
+in inline mode instead of $ENV{var}.-
+Problem
+-------
+Commit 636146d5 changed the string-interpolation generator so that
+undeclared shell variables were emitted as `$ENV{name}` instead of
+`$name`. This was correct for standalone shell --perl conversion
+where unknown variables should be treated as environment variables.
+However, in --inline mode (used for backtick conversion) the
+undeclared variables are actually Perl `my` variables from the
+enclosing Perl scope. Emitting `$ENV{name}` made them resolve to
+environment variables (which are unset) instead of the local Perl
+variables, causing output strings to lose variable content (e.g.
+"Welcome to  version " instead of "Welcome to Perl version 5.32").
+
+Fix
+---
+In convert_string_interpolation_to_perl_impl, when the variable is
+not in declared_locals and the generator is in inline_mode, emit
+`$var` directly (like the pre-636146d5 behaviour) instead of
+`$ENV{var}`. In non-inline mode the `$ENV{...}` fallback is
+preserved, which is correct for standalone shell conversion.
+
+Files changed
+-------------
+- src/generator/words.rs: emit `$var` for undeclared variables in
+  inline mode so backtick variable references remain valid Perl.
