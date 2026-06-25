@@ -2128,6 +2128,10 @@ pub fn convert_string_interpolation_to_perl_impl(
                         {
                             // Regular declared variable - add directly for interpolation
                             current_string.push_str(&format!("${}", var));
+                        } else if generator.inline_mode {
+                            // In inline/backtick mode, undeclared variables are Perl
+                            // variables from the enclosing scope, not environment variables.
+                            current_string.push_str(&format!("${}", var));
                         } else {
                             // Undeclared variable - use $ENV{}
                             current_string.push_str(&format!("$ENV{{{}}}", var));
