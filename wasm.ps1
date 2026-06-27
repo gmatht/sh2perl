@@ -109,23 +109,6 @@ function Test-WasmRebuildNeeded {
     return $false
 }
 
-# Function to get file size in human readable format
-function Get-FileSize {
-    param([string]$FilePath)
-    
-    if (Test-Path $FilePath) {
-        $size = (Get-Item $FilePath).Length
-        if ($size -gt 1MB) {
-            return [math]::Round($size / 1MB, 2).ToString() + " MB"
-        } elseif ($size -gt 1KB) {
-            return [math]::Round($size / 1KB, 2).ToString() + " KB"
-        } else {
-            return $size.ToString() + " B"
-        }
-    }
-    return "0 B"
-}
-
 # Function to build WASM target
 function Build-Wasm {
     Write-Host "Building WASM target..." -ForegroundColor Yellow
@@ -137,17 +120,8 @@ function Build-Wasm {
     }
     
     try {
-        wasm-pack build --target web --out-dir www/pkg --release
+        wasm-pack build --target web --out-dir www/pkg
         Write-Host "WASM build completed successfully!" -ForegroundColor Green
-        
-        # Show initial WASM size
-        $initialSize = Get-FileSize "www/pkg/debashl_bg.wasm"
-        Write-Host "Initial WASM size: $initialSize" -ForegroundColor Cyan
-        
-        # Note: wasm-opt is disabled in Cargo.toml due to bulk memory compatibility
-        Write-Host "wasm-opt optimization is disabled for compatibility" -ForegroundColor Yellow
-        Write-Host "WASM size: $initialSize" -ForegroundColor Cyan
-        
         return $true
     }
     catch {
@@ -257,15 +231,20 @@ else {
     Write-Host "wasm-pack is already installed" -ForegroundColor Green
 }
 
-# Always regenerate examples to ensure they're current
-Write-Host "Converting examples to JavaScript..." -ForegroundColor Cyan
-try {
-    cargo run --bin convert_examples
-    Write-Host "Examples converted successfully!" -ForegroundColor Green
+# Check if examples need updating
+if (Test-ExamplesUpdateNeeded) {
+    Write-Host "Converting examples to JavaScript..." -ForegroundColor Cyan
+    try {
+        cargo run --bin convert_examples
+        Write-Host "Examples converted successfully!" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Failed to convert examples: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Continuing with existing examples..." -ForegroundColor Yellow
+    }
 }
-catch {
-    Write-Host "Failed to convert examples: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Continuing with existing examples..." -ForegroundColor Yellow
+else {
+    Write-Host "Examples are up to date, skipping conversion" -ForegroundColor Green
 }
 
 # Check if WASM rebuild is needed

@@ -1,156 +1,25 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
-use IPC::Open3;
-use Digest::SHA   qw(sha256_hex sha512_hex);
-use File::Path    qw(make_path remove_tree);
+use File::Basename;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
-our $CHILD_ERROR;
+# DEBUG: Collected 3 variables: ["sha256_result", "sha512_result", "strings_result"]
+my $sha256_result = 0;
+my $sha512_result = 0;
+my $strings_result = 0;
 
-$PROGRAM_NAME = '000__04g_checksum_commands.sh';
-print "=== Checksum Commands ===\n";
-do {
-    open my $original_stdout, '>&', STDOUT
-      or die "Cannot save STDOUT: $OS_ERROR\n";
-    open STDOUT, '>', 'test_checksum.txt'
-      or die "Cannot open file: $OS_ERROR\n";
-    print "test content\n";
-    open STDOUT, '>&', $original_stdout
-      or die "Cannot restore STDOUT: $OS_ERROR\n";
-    close $original_stdout
-      or die "Close failed: $OS_ERROR\n";
-};
-my $sha256_result = do {
-    my @results;
-    if ( -f 'test_checksum.txt' ) {
-        my $hash = sha256_hex(
-            do {
-                local $INPUT_RECORD_SEPARATOR = undef;
-                open my $fh, '<', 'test_checksum.txt'
-                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
-                my $content = <$fh>;
-                close $fh
-                  or croak "Close failed: $ERRNO";
-                $content;
-            }
-        );
-        push @results, "$hash  test_checksum.txt";
-    }
-    else {
-        push @results,
-"0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
-    }
-    join("\n", @results) . "\n";
-};
-do {
-    my $output = "SHA256 result: $sha256_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-$CHILD_ERROR = 0;
-my $sha512_result = do {
-    my @results;
-    if ( -f 'test_checksum.txt' ) {
-        my $hash = sha512_hex(
-            do {
-                local $INPUT_RECORD_SEPARATOR = undef;
-                open my $fh, '<', 'test_checksum.txt'
-                  or croak "Cannot open 'test_checksum.txt': $ERRNO";
-                my $content = <$fh>;
-                close $fh
-                  or croak "Close failed: $ERRNO";
-                $content;
-            }
-        );
-        push @results, "$hash  test_checksum.txt";
-    }
-    else {
-        push @results,
-"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
-    }
-    join("\n", @results) . "\n";
-};
-do {
-    my $output = "SHA512 result: $sha512_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-$CHILD_ERROR = 0;
-my $strings_result = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
-    my $output_45 = q{};
-    my $output_printed_45;
-    my $pipeline_success_45 = 1;
-    my $input_data;
-    if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
-        local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
-        $input_data = <$fh>;
-        close $fh
-          or croak "Close failed: $ERRNO";
-    }
-    else {
-        print {*STDERR} "strings: 'target/debug/debashc.exe': No such file\n";
-        $input_data = q{};
-    }
-    my @result;
-    while ($input_data =~ /([\x20-\x7E]{4,})/g) {
-        push @result, $1;
-    }
-    my $line = join "\n", @result;
-    if ($line ne q{} && !($line =~ m{\n\z}msx)) { $line .= "\n"; }
-    $output_45 = $line;
-    if ($CHILD_ERROR != 0) { $pipeline_success_45 = 0; }
-    my $num_lines       = 3;
-    my $head_line_count = 0;
-    my $result          = q{};
-    my $input           = $output_45;
-    my $pos             = 0;
-
-    while ( $pos < length $input && $head_line_count < $num_lines ) {
-        my $line_end = index $input, "\n", $pos;
-        if ( $line_end == -1 ) {
-            $line_end = length $input;
-        }
-        my $head_line = substr $input, $pos, $line_end - $pos;
-        $result .= $head_line . "\n";
-        $pos = $line_end + 1;
-        ++$head_line_count;
-    }
-    $output_45 = $result;
-
-    if ( !$pipeline_success_45 ) { $main_exit_code = 1; }
-    $output_45 =~ s/\n+\z//msx;
-    $output_45;
-}; $_pipeline_result; };
-print "Strings result:\n";
-print $strings_result;
-if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }
-if ( -e "test_checksum.txt" ) {
-    if ( -d "test_checksum.txt" ) {
-        carp "rm: carping: ", "test_checksum.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "test_checksum.txt" ) {
-                    }
-        else {
-            carp "rm: carping: could not remove ", "test_checksum.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
-print "=== Checksum Commands Complete ===\n";
-
-exit $main_exit_code;
+print("=== Checksum Commands ===\n");
+local *STDOUT; open(STDOUT, '>', 'test_checksum.txt') or die "Cannot open file: $!\n";
+print("test content\n");
+$sha256_result = `sha256sum test_checksum.txt`;
+$ENV{sha256_result} = $sha256_result;
+print(("SHA256 result: " . $sha256_result) . "\n");
+$sha512_result = `sha512sum test_checksum.txt`;
+$ENV{sha512_result} = $sha512_result;
+print(("SHA512 result: " . $sha512_result) . "\n");
+$strings_result = `strings target/debug/debashc.exe | head -3`;
+$ENV{strings_result} = $strings_result;
+print("Strings result:\n");
+print($strings_result . "\n");
+unlink('test_checksum.txt');
+print("=== Checksum Commands Complete ===\n");

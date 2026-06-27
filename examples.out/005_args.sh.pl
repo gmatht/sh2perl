@@ -1,37 +1,15 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
-use IPC::Open3;
+use File::Basename;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
-our $CHILD_ERROR;
+# DEBUG: Collected 1 variables: ["a"]
+my $a = 0;
 
-$PROGRAM_NAME = '005_args.sh';
-print "== Argument count ==\n";
-do {
-    my $output = scalar(@ARGV);
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-$CHILD_ERROR = 0;
-print "== Arguments ==\n";
-my $a;
-for my $a (@ARGV) {
-    do {
-    my $output = "Arg: $a";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-    $CHILD_ERROR = 0;
+print("== Argument count ==\n");
+print(scalar(@ARGV) . "\n");
+print("== Arguments ==\n");
+for $a (@ARGV) {
+    print(("Arg: " . $a) . "\n");
+;
 }
-
-exit $main_exit_code;

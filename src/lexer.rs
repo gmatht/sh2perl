@@ -282,7 +282,7 @@ pub enum Token {
     DollarDoubleQuotedString,
 
     // Long options (must come before Identifier to avoid conflicts)
-    #[regex(r"--[a-zA-Z][a-zA-Z0-9_*?.-]*=[^ \t\n\r|&;(){}]*", priority = 3)]
+    #[regex(r"--[a-zA-Z][a-zA-Z0-9_*?.-]*(=[^ \t\n\r|&;(){}]*)?", priority = 3)]
     LongOption,
 
     // Identifiers and words
@@ -291,12 +291,10 @@ pub enum Token {
 
     #[regex(r"[0-9]+")]
     Number,
-    #[regex(r"[0-9]+\.[0-9]+")]
-    Float,
     #[regex(r"0x[0-9a-fA-F]+")]
     HexNumber,
-    #[regex(r"0+[0-9]+")]
-    PaddedNumber,
+    #[regex(r"0[0-7]+")]
+    OctalNumber,
 
     // Special characters
     #[token("!")]
@@ -424,15 +422,11 @@ impl Lexer {
                                 b'\\' if end + 1 < bytes.len() => {
                                     end += 2; // skip escaped char
                                 }
-                                b'$' if end + 1 < bytes.len()
-                                    && bytes[end + 1] == b'(' =>
-                                {
+                                b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'(' => {
                                     p_depth += 1;
                                     end += 2;
                                 }
-                                b'$' if end + 1 < bytes.len()
-                                    && bytes[end + 1] == b'{' =>
-                                {
+                                b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'{' => {
                                     b_depth += 1;
                                     end += 2;
                                 }

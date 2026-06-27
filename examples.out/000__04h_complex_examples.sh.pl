@@ -1,237 +1,75 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
-use IPC::Open3;
-use File::Path qw(make_path remove_tree);
-sub capture_stdout {
-    my ($code) = @_;
-    my $captured = q{};
-    {
-        local *STDOUT;
-        open STDOUT, '>', \$captured
-          or die "Cannot capture stdout: $OS_ERROR\n";
-        $code->();
-    }
-    return $captured;
-}
+use File::Basename;
+use feature 'switch';
 
+# DEBUG: Collected 9 variables: ["nested_result", "count", "current_user", "system_name", "files", "file", "process_result", "here_string_result", "perl_result"]
+my $nested_result = 0;
+my $count = 0;
+my $current_user = 0;
+my $system_name = 0;
+my $files = 0;
+my $file = 0;
+my $process_result = 0;
+my $here_string_result = 0;
+my $perl_result = 0;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
-our $CHILD_ERROR;
-
-$PROGRAM_NAME = '000__04h_complex_examples.sh';
-print "=== Complex Backtick Examples ===\n";
-my $nested_result = ("Three wells: " . (do { my $_chomp_temp = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
-    do { my $output_111 = q{};
-my $output_printed_111;
-my $head_line_count = 0;
-while (1) {
-    my $line = 'well';
-    if ($head_line_count < 3) {
-    $output_111 .= $line . "\n";
-    ++$head_line_count;
-    } else {
-    $line = q{}; # Clear line to prevent printing
-    last; # Break out of the yes loop when head limit is reached
+print("=== Complex Backtick Examples ===\n");
+$nested_result = `echo "Three wells: \`yes well | head -3\`"`;
+$ENV{nested_result} = $nested_result;
+print(("Nested backticks: " . $nested_result) . "\n");
+$count = `ls -1 | wc -l`;
+$ENV{count} = $count;
+print(("File count: " . $count) . "\n");
+$current_user = `echo root`;
+$ENV{current_user} = $current_user;
+if (("$current_user" eq "root")) {
+        print("Running as root\n");
+;
+} else {
+        print("Not running as root\n");
+;
+}
+$system_name = "Darwin";
+$ENV{system_name} = $system_name;
+given ($system_name) {
+when (qr/^Linux$/) {
+        print("Running on Linux\n");
+    }
+when (qr/^Darwin$/) {
+        print("Running on macOS\n");
+    }
+default {
+        print("Running on other system\n");
     }
 }
-$output_111 };
-}; $_pipeline_result; }; chomp $_chomp_temp; $_chomp_temp; }));
-do {
-    my $output = "Nested backticks: $nested_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-$CHILD_ERROR = 0;
-my $count = do { our $CHILD_ERROR = 0; my $_pipeline_result = do {
-    my $output_112 = q{};
-    my $output_printed_112;
-    my $pipeline_success_112 = 1;
-    $output_112 = do {
-        my @ls_files_113 = ();
-        if ( -f q{.} ) {
-            push @ls_files_113, q{.};
-        }
-        elsif ( -d q{.} ) {
-            if ( opendir my $dh, q{.} ) {
-                while ( my $file = readdir $dh ) {
-                    next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-                    push @ls_files_113, $file;
-                }
-                closedir $dh;
-                @ls_files_113 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_113;
-            }
-        }
-        (@ls_files_113 ? join("\n", @ls_files_113) . "\n" : q{});
-    };
-    ;
-    if ($CHILD_ERROR != 0) { $pipeline_success_112 = 0; }
-    use IPC::Open3;
-    my @wc_args_112_1 = ('-l');
-    my ($wc_in_112_1, $wc_out_112_1, $wc_err_112_1);
-    my $wc_pid_112_1 = open3($wc_in_112_1, $wc_out_112_1, $wc_err_112_1, 'wc', @wc_args_112_1);
-    print {$wc_in_112_1} $output_112;
-    close $wc_in_112_1 or die "Close failed: $OS_ERROR\n";
-    $output_112 = do { local $/ = undef; <$wc_out_112_1> };
-    if ($output_112 eq q{}) { $output_112 = "0\n"; }
-    close $wc_out_112_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_112_1, 0;
-    if ( !$pipeline_success_112 ) { $main_exit_code = 1; }
-    $output_112 =~ s/\n+\z//msx;
-    $output_112;
-}; $_pipeline_result; };
-do {
-    my $output = "File count: $count";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-$CHILD_ERROR = 0;
-my $current_user;
-$current_user = ('root');
-if ("$current_user" eq "root") {
-    print "Running as root\n";
-}
-else {
-    print "Not running as root\n";
-}
-my $system_name;
-$system_name = 'Darwin';
-if ($system_name =~ /^Linux$/msx) {
-        print "Running on Linux\n";
-} elsif ($system_name =~ /^Darwin$/msx) {
-        print "Running on macOS\n";
-} elsif (1) {
-        print "Running on other " . "sys" . "tem\n";
-}
-
 sub get_file_size {
-    my $file = $_[0];
-    my $size = do { my $command = "wc -c < \"$file\""; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
-    do {
-    my $output = "File $file has $size bytes";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-    $CHILD_ERROR = 0;
-    return;
+    my $file = "$_[0]";
+    my $size = do { my $v = `wc -c < "$file"`; chomp $v; $v };
+    print(("File " . $file . " has " . $size . " bytes") . "\n");
 }
-get_file_size('000__01_file_directory_operations.sh');
-my @files = ((grep { !/\//msx } glob '*.sh'), (glob 'examples/*.sh'));
-print "Shell scripts found: " . scalar(@files) . "\n";
-$CHILD_ERROR = 0;
-for my $file (@files) {
-    do {
-    my $output = "  - $file";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-    $CHILD_ERROR = 0;
+get_file_size("000__01_file_directory_operations.sh");
+my @files = ("`ls", "-1", "*.sh", "examples/*.sh", "2>/dev/null`");
+print(("Shell scripts found: " . "Shell scripts found: " . scalar(@files)) . "\n");
+for $file (@files) {
+    print(("  - " . $file) . "\n");
+;
 }
-do {
-    open my $original_stdout, '>&', STDOUT
-      or die "Cannot save STDOUT: $OS_ERROR\n";
-    open STDOUT, '>', 'file1.txt'
-      or die "Cannot open file: $OS_ERROR\n";
-    print "apple
-banana
-cherry\n";
-    open STDOUT, '>&', $original_stdout
-      or die "Cannot restore STDOUT: $OS_ERROR\n";
-    close $original_stdout
-      or die "Close failed: $OS_ERROR\n";
-};
-do {
-    open my $original_stdout, '>&', STDOUT
-      or die "Cannot save STDOUT: $OS_ERROR\n";
-    open STDOUT, '>', 'file2.txt'
-      or die "Cannot open file: $OS_ERROR\n";
-    print "banana
-cherry
-date\n";
-    open STDOUT, '>&', $original_stdout
-      or die "Cannot restore STDOUT: $OS_ERROR\n";
-    close $original_stdout
-      or die "Close failed: $OS_ERROR\n";
-};
-my $process_result = do { my $command = "bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
-print "Process substitution result:\n";
-print $process_result;
-if ( !( ($process_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $here_string_result = do { my $here_input = "hello world"; chomp(my $result = qx{echo "$here_input" | tr a-z A-Z}); $CHILD_ERROR = $? >> 8; $result; };
-do {
-    my $output = "Here string result: $here_string_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-$CHILD_ERROR = 0;
-my $perl_result = do {
-    my $result;
-    my $eval_success = eval {
-        $result = capture_stdout( sub { print "Hello from Perl\n" } );
-        1;
-    };
-    if ( !$eval_success ) {
-        $result = "Error executing Perl code: $EVAL_ERROR";
-    }
-    $result;
-};
-do {
-    my $output = "Perl result: $perl_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-$CHILD_ERROR = 0;
-if ( -e "file1.txt" ) {
-    if ( -d "file1.txt" ) {
-        carp "rm: carping: ", "file1.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "file1.txt" ) {
-                    }
-        else {
-            carp "rm: carping: could not remove ", "file1.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
-if ( -e "file2.txt" ) {
-    if ( -d "file2.txt" ) {
-        carp "rm: carping: ", "file2.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "file2.txt" ) {
-                    }
-        else {
-            carp "rm: carping: could not remove ", "file2.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
-print "=== Complex Backtick Examples Complete ===\n";
-
-exit $main_exit_code;
+local *STDOUT; open(STDOUT, '>', 'file1.txt') or die "Cannot open file: $!\n";
+print("apple\nbanana\ncherry");
+local *STDOUT; open(STDOUT, '>', 'file2.txt') or die "Cannot open file: $!\n";
+print("banana\ncherry\ndate");
+$process_result = `comm -23 <(sort file1.txt) <(sort file2.txt)`;
+$ENV{process_result} = $process_result;
+print("Process substitution result:\n");
+print($process_result . "\n");
+$here_string_result = `tr 'a-z' 'A-Z' <<< "hello world"`;
+$ENV{here_string_result} = $here_string_result;
+print(("Here string result: " . $here_string_result) . "\n");
+$perl_result = `perl -e 'print "Hello from Perl\n"'`;
+$ENV{perl_result} = $perl_result;
+print(("Perl result: " . $perl_result) . "\n");
+unlink('file1.txt');
+unlink('file2.txt');
+print("=== Complex Backtick Examples Complete ===\n");
