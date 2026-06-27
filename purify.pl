@@ -147,8 +147,13 @@ sub purify_perl_code {
         die "Error: Failed to parse Perl code with PPI\n";
     }
 
+    # Serialize once to capture the line count before comment stripping,
+    # so we can compute the right #line offset later.
+    my $pre_strip_content = $document->serialize;
+    my $pre_strip_lines = () = $pre_strip_content =~ /\n/g;
+
     strip_comments_ppi($document);
-    
+
     # Process system() calls by replacing the original statement text in place.
     my $serialized = $document->serialize;
     $serialized = process_system_calls_string($serialized);
@@ -166,12 +171,28 @@ sub purify_perl_code {
     # original input file. Put the assignment in a BEGIN block so it runs
     # during compilation, before any double-quoted string interpolation
     # that references $0 occurs.
+    # Also emit a #line directive so Perl's __FILE__ and __LINE__ in
+    # warnings and error messages reference the original file rather
+    # than the purified copy, keeping stderr byte-for-byte identical
+    # between original and purified runs.
     if (defined $input_file && length $input_file) {
         my $escaped = _escape_perl_fragment($input_file);
+        # Count how many lines were removed by comment stripping / PPI
+        # serialization relative to the pre-strip content.  The #line
+        # directive is placed after the shebang (line 1), and the BEGIN
+        # block follows on the next line.  serialized line S ends up at
+        # purified line S+2, and original line L = serialized line S +
+        # lines_removed.  Solving N + (P - 3) = P - 2 + lines_removed
+        # gives N = 1 + lines_removed.
+        my $post_strip_lines = () = $serialized =~ /\n/g;
+        my $lines_removed = $pre_strip_lines - $post_strip_lines;
+        $lines_removed = 0 if $lines_removed < 0;
+        my $line_number = 1 + $lines_removed;
+        my $line_directive = "#line $line_number \"$escaped\"\n";
         if ($serialized =~ s/^(#![^\n]*\n)//) {
-            $serialized = $1 . "BEGIN { \$0 = \"$escaped\" }\n" . $serialized;
+            $serialized = $1 . $line_directive . "BEGIN { \$0 = \"$escaped\" }\n" . $serialized;
         } else {
-            $serialized = "BEGIN { \$0 = \"$escaped\" }\n" . $serialized;
+            $serialized = $line_directive . "BEGIN { \$0 = \"$escaped\" }\n" . $serialized;
         }
     }
 
@@ -207,6 +228,12 @@ sub purify_perl_code {
     # add the import so the generated open3() calls are defined at runtime.
     if ($serialized =~ /\bopen3\b/ && $serialized !~ /\buse\s+IPC::Open3\b/) {
         $serialized = "use IPC::Open3;\n" . $serialized;
+    }
+
+    # If the converted code uses Cwd::cwd but the document does not already
+    # import Cwd, add the import so the generated call is defined at runtime.
+    if ($serialized =~ /\bCwd::cwd\b/ && $serialized !~ /\buse\s+Cwd\b/) {
+        $serialized = "use Cwd;\n" . $serialized;
     }
 
     # If the converted code references the __bt() helper (used to wrap
@@ -557,17 +584,32 @@ sub process_single_backtick_string {
 
     print "DEBUG: Processing backtick command: $command\n" if $verbose;
 
-    # Convert using debashc
-    my $perl_result = convert_shell_to_perl($command, 1);
+    # Check if the raw command contains unescaped Perl variable references
+    # (like $lines[$i]) that would confuse debashc's shell parser.
+    # In Perl backtick context, all unescaped $variables are Perl
+    # variables interpolated before the shell sees them, so debashc
+    # cannot correctly handle them and must be bypassed.
+    my $perl_result;
+    if ($raw_command =~ /(?<!\\)\$[A-Za-z_]\w*/) {
+        print "DEBUG: Command contains Perl variables; skipping debashc\n" if $verbose;
+        # Leave $perl_result undef to trigger IPC::Open3 fallback
+    } else {
+        $perl_result = convert_shell_to_perl($command, 1);
+    }
 
     # Debashc sometimes generates code that references internal variables
     # (e.g. $DATE_SNAPSHOT) that are never defined in the output context.
     # Detect such patterns and treat them as conversion failures so the
     # open3-based fallback below is used instead.
-    if ($perl_result && $perl_result =~ /\$DATE_SNAPSHOT\b/) {
-        print "DEBUG: debashc output references \$DATE_SNAPSHOT; treating as conversion failure\n" if $verbose;
-        undef $perl_result;
-    }
+        if ($perl_result && $perl_result =~ /\$DATE_SNAPSHOT\b/) {
+            print "DEBUG: debashc output references \$DATE_SNAPSHOT; treating as conversion failure\n" if $verbose;
+            undef $perl_result;
+        }
+
+        if ($perl_result && $perl_result =~ /\bsystem\s*\(/) {
+            print "DEBUG: debashc output contains system() call; treating as conversion failure\n" if $verbose;
+            undef $perl_result;
+        }
 
     if ($perl_result) {
         # Heuristic fix: debashc sometimes emits a Perl command string where
@@ -765,6 +807,15 @@ sub process_single_backtick_string {
             # causes a syntax error (it terminates the statement), so we must
             # remove it before embedding the expression in __bt(...).
             (my $expr = $perl_result) =~ s/;\s*$//s;
+            # If debashc emitted a multi-statement sequence (e.g. my $output_1;
+            # $output_1 = "..."; ...; $output_1) we cannot pass it directly as
+            # a function argument -- Perl does not allow statements in that
+            # position.  Wrap it in a do { ... } block so it becomes a single
+            # expression.  Only wrap when the code is not already a do { ... }
+            # block (the open3 fallback is already self-contained).
+            if ($expr !~ /^\s*do\s*\{/s) {
+                $expr = "do { $expr }";
+            }
             $perl_result = "__bt($expr)";
         }
 
@@ -1445,9 +1496,10 @@ sub _perl_quote_interpolating {
     my @parts;
     my $remaining = $text;
     while (length $remaining) {
-        # Find the next unescaped named scalar variable ($identifier).
+        # Find the next unescaped named scalar variable ($identifier),
+        # optionally followed by an array subscript like $lines[$i].
         # (?<!\\) prevents matching escaped sigils like \$cmd.
-        if ($remaining =~ /\A(.*?)(?<!\\)(\$[A-Za-z_]\w*)/s) {
+        if ($remaining =~ /\A(.*?)(?<!\\)(\$[A-Za-z_]\w*(?:\[[^\[\]]*\])?)/s) {
             my ($before, $var) = ($1, $2);
             push @parts, _perl_quote_literal_no_interp($before) if length $before;
             push @parts, $var;  # bare scalar reference; interpolates at runtime
