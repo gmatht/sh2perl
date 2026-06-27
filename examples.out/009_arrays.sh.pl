@@ -1,68 +1,37 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
-use IPC::Open3;
+use File::Basename;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
-our $CHILD_ERROR;
+# DEBUG: Collected 3 variables: ["arr", "x", "k"]
+my $arr = 0;
+my $x = 0;
+my $k = 0;
 
-$PROGRAM_NAME = '009_arrays.sh';
-$__set_e = 1;
-# set uo not implemented
-# set pipefail not implemented
-print "== Indexed arrays ==\n";
+# set -euo
+# set pipefail
+print("== Indexed arrays ==\n");
 my @arr = ("one", "two", "three");
-print $arr[1];
-if ( !( ($arr[1]) =~ m{\n\z}msx ) ) { print "\n"; }
-print scalar(@arr) . "\n";
-$CHILD_ERROR = 0;
-my $x;
-for my $x (@arr) {
-printf('%s ', "$x");
+print($arr[1] . "\n");
+print(scalar(@arr) . "\n");
+for $x (@arr) {
+    printf("%s ", "${x}");
+;
 }
-print "\n";
-$CHILD_ERROR = 0;
-print "== Associative arrays ==\n";
+print("\n");
+print("== Associative arrays ==\n");
 my %map = ();
-# declare map not implemented
-$map{"two"} = "1 + 1";
-$map{"answer"} = '42';
-$map{"foo"} = 'bar';
-print $map{foo};
-if ( !( ($map{foo}) =~ m{\n\z}msx ) ) { print "\n"; }
-print $map{answer};
-if ( !( ($map{answer}) =~ m{\n\z}msx ) ) { print "\n"; }
-{
-    my $output_151 = q{};
-    my $output_printed_151;
-    my $pipeline_success_151 = 1;
-        $output_151 = q{};
-    my @output_151_items = (keys %map);
-    for my $k (@output_151_items) {
-    $output_151 .= "$k => " . $map{$k}. "\n";
-    }
-
-        my @sort_lines_151_1 = split /\n/msx, $output_151;
-    my @sort_sorted_151_1 = sort @sort_lines_151_1;
-    my $output_151_1 = join "\n", @sort_sorted_151_1;
-    if ($output_151_1 ne q{} && !($output_151_1 =~ m{\n\z}msx)) {
-    $output_151_1 .= "\n";
-    }
-    $output_151 = $output_151_1;
-    $output_151 = $output_151_1;
-    if ($output_151 ne q{} && !defined $output_printed_151) {
-        print $output_151;
-        if (!($output_151 =~ m{\n\z}msx)) {
-            print "\n";
-        }
-    }
-    if ( !$pipeline_success_151 ) { $main_exit_code = 1; }
-    exit $main_exit_code if $__set_e && $main_exit_code != 0;
-    }
-
-exit $main_exit_code;
+$map{foo} = "bar";
+$map{answer} = "42";
+$map{two} = "1 + 1";
+print($map{foo} . "\n");
+print($map{answer} . "\n");
+my $output_1 = '';
+my $output_total_1 = '';
+for my $k (keys(%map)) {
+$output_1 .= $k . " => " . $map{$k} . "\n";
+}
+$output_1 = join("\n", sort { $a cmp $b } split(/\n/, $output_1)) . "\n";
+$output_total_1 .= $output_1;
+$output_1 = $output_total_1;
+print($output_1);

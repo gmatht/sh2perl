@@ -1,30 +1,15 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
-use IPC::Open3;
+use File::Basename;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
-our $CHILD_ERROR;
+# DEBUG: Collected 1 variables: ["word"]
+my $word = 0;
 
-$PROGRAM_NAME = '038_pattern_matching_nocase.sh';
-$__set_e = 1;
-# set uo not implemented
-# set pipefail not implemented
-print "== nocasematch ==\n";
+# set -euo
+# set pipefail
+print("== nocasematch ==\n");
 # nocasematch option enabled
-my $word;
 $word = "Foo";
-if ($word =~ /^foo$/msxi) {
-        print 'ci-match' . "\n";
-    $CHILD_ERROR = 0;
-    $CHILD_ERROR = 0;
-} else {
-    $CHILD_ERROR = 1;
-}
-
-exit $main_exit_code;
+$ENV{word} = $word;
+my $pipeline_result_1 = (($word =~ /^^foo$$/i)) && (print("ci-match\n"));

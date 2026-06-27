@@ -16,7 +16,33 @@ impl SharedUtils {
 
     // Removed unused escape_string_for_language function
 
-    /// Generate indentation string    // Removed unused extract_var_name function
+    /// Generate indentation string
+    pub fn indent(level: usize) -> String {
+        "    ".repeat(level)
+    }
+
+    /// Convert shell glob pattern to regex pattern
+    pub fn convert_glob_to_regex(pattern: &str) -> String {
+        let mut regex = String::new();
+        regex.push('^');
+        for c in pattern.chars() {
+            match c {
+                '*' => regex.push_str(".*"),
+                '?' => regex.push('.'),
+                '.' => regex.push_str("\\."),
+                '[' => regex.push('['),
+                ']' => regex.push(']'),
+                '\\' => regex.push_str("\\\\"),
+                c if c.is_ascii_punctuation() => {
+                    regex.push('\\');
+                    regex.push(c);
+                }
+                c => regex.push(c),
+            }
+        }
+        regex.push('$');
+        regex
+    }
 
     /// Write content to file with proper UTF-8 encoding
     pub fn write_utf8_file(path: &str, content: &str) -> io::Result<()> {

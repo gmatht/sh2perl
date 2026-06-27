@@ -237,7 +237,6 @@ fn main_with_args(args: Vec<String>) {
 
                     // Generate Perl code
                     let mut gen = Generator::new();
-                    gen.use_function_signatures = use_function_signatures;
                     let mut code = gen.generate(&commands);
 
                     // Post-process to fix command substitution placeholders
@@ -672,7 +671,7 @@ fn main_with_args(args: Vec<String>) {
 
                         // Generate Perl code
                         let mut gen = Generator::new();
-                        gen.use_function_signatures = use_function_signatures;
+
                         let code = gen.generate(&commands);
 
                         // Handle output file option
@@ -726,7 +725,7 @@ fn main_with_args(args: Vec<String>) {
 
                         // Generate Perl code
                         let mut gen = Generator::new();
-                        gen.use_function_signatures = use_function_signatures;
+
                         let code = gen.generate(&commands);
 
                         // Handle output file option
@@ -962,7 +961,7 @@ fn main_with_args(args: Vec<String>) {
 
                             // Generate Perl code
                             let mut gen = Generator::new();
-                            gen.use_function_signatures = use_function_signatures;
+
                             let perl_code = gen.generate(&commands);
 
                             // Write to temporary file and execute
@@ -1138,7 +1137,6 @@ fn main_with_args(args: Vec<String>) {
                         Ok(commands) => {
                             // Generate Perl code
                             let mut generator = Generator::new();
-                            generator.use_function_signatures = use_function_signatures;
                             let perl_code = generator.generate(&commands);
 
                             // Write to temporary file and execute

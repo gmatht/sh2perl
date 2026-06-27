@@ -1,1 +1,1 @@
-ALL_TESTS_PASSED:y99999
+test_simple_function:y00000

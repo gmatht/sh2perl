@@ -1,36 +1,19 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
-use IPC::Open3;
+use File::Basename;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
-our $CHILD_ERROR;
+# DEBUG: Collected 2 variables: ["f1", "f2"]
+my $f1 = 0;
+my $f2 = 0;
 
-$PROGRAM_NAME = '037_pattern_matching_extglob.sh';
-$__set_e = 1;
-# set uo not implemented
-# set pipefail not implemented
-print "== extglob ==\n";
+# set -euo
+# set pipefail
+print("== extglob ==\n");
 # extglob option enabled
-my $f1;
 $f1 = "file.js";
-my $f2;
+$ENV{f1} = $f1;
 $f2 = "thing.min.js";
-if ($f1 =~ /^(?!.*[.]min).*[.]js$/msx) {
-        print 'f1-ok' . "\n";
-    $CHILD_ERROR = 0;
-    $CHILD_ERROR = 0;
-} else {
-    $CHILD_ERROR = 1;
-}
-if (!($f2 =~ /^(?!.*[.]min).*[.]js$/msx)) {
-        print 'f2-filtered' . "\n";
-    $CHILD_ERROR = 0;
-}
-
-exit $main_exit_code;
+$ENV{f2} = $f2;
+my $pipeline_result_1 = (($f1 =~ /^(?!.*\.min\.js).*\.js$/)) && (print("f1-ok\n"));
+my $pipeline_result_2 = (($f2 =~ /^(?!.*\.min\.js).*\.js$/)) || (print("f2-filtered\n"));

@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -13,9 +12,9 @@ use crate::timeout_manager::{
 use crate::utils::{
     check_ast_must_contain, check_ast_must_not_contain, check_generator_available,
     check_perl_must_contain, check_perl_must_not_contain, check_perl_no_open3_builtins,
-    check_perl_no_system_builtins, cleanup_tmp, generate_unified_diff,
+    check_perl_no_system_builtins, check_perl_no_system_calls, cleanup_tmp, generate_unified_diff,
 };
-use debashl::parser::errors::ParserError;
+use debashl::parser::ParserError;
 use debashl::shared_utils;
 use debashl::{lexer::Token, Generator, Lexer, Parser};
 
@@ -45,64 +44,6 @@ fn perl_executable() -> &'static str {
         "C:\\Strawberry\\perl\\bin\\perl.exe"
     } else {
         "perl"
-    }
-}
-
-struct ExamplesSnapshot {
-    backup_dir: PathBuf,
-}
-
-impl ExamplesSnapshot {
-    fn capture() -> Result<Self, String> {
-        let unique_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let backup_dir = std::env::temp_dir().join(format!(
-            "sh2perl_examples_snapshot_{}_{}",
-            std::process::id(),
-            unique_id
-        ));
-
-        let status = Command::new("cp")
-            .args(["-a", "examples", backup_dir.to_string_lossy().as_ref()])
-            .status()
-            .map_err(|e| format!("Failed to snapshot examples: {}", e))?;
-        if !status.success() {
-            return Err(format!(
-                "Failed to snapshot examples: cp exited with {}",
-                status
-            ));
-        }
-
-        Ok(Self { backup_dir })
-    }
-
-    fn restore(&self) -> Result<(), String> {
-        if std::path::Path::new("examples").exists() {
-            fs::remove_dir_all("examples")
-                .map_err(|e| format!("Failed to clear examples: {}", e))?;
-        }
-
-        let status = Command::new("cp")
-            .args(["-a", self.backup_dir.to_string_lossy().as_ref(), "examples"])
-            .status()
-            .map_err(|e| format!("Failed to restore examples: {}", e))?;
-        if !status.success() {
-            return Err(format!(
-                "Failed to restore examples: cp exited with {}",
-                status
-            ));
-        }
-
-        Ok(())
-    }
-}
-
-impl Drop for ExamplesSnapshot {
-    fn drop(&mut self) {
-        let _ = self.restore();
-        let _ = fs::remove_dir_all(&self.backup_dir);
     }
 }
 
@@ -481,13 +422,31 @@ pub fn test_file_equivalence_with_critic(
         "perl" => {
             let mut gen = Generator::new();
             // Set the original script name for $0 compatibility
-            if let Some(script_name) = filename.split(['\\', '/']).last() {
-                eprintln!("DEBUG: Setting original script name to: {}", script_name);
-                gen.set_original_script_name(script_name.to_string());
-            } else {
-                eprintln!("DEBUG: Could not extract script name from: {}", filename);
-            }
             let code = gen.generate(&commands);
+
+            // Check for any system() calls (unconditional)
+            if let Err(violation_msg) = check_perl_no_system_calls(&code) {
+                return Err(format!(
+                    "SYSTEM_CALL violation in {}:\n{}",
+                    filename, violation_msg
+                ));
+            }
+
+            // Check for system calls with builtin commands
+            if let Err(violation_msg) = check_perl_no_system_builtins(&code) {
+                return Err(format!(
+                    "SYSTEM_BUILTIN violation in {}:\n{}",
+                    filename, violation_msg
+                ));
+            }
+
+            // Check for open3 usage with builtin commands
+            if let Err(violation_msg) = check_perl_no_open3_builtins(&code) {
+                return Err(format!(
+                    "OPEN3_BUILTIN violation in {}:\n{}",
+                    filename, violation_msg
+                ));
+            }
 
             // Check PERL_MUST_NOT_CONTAIN constraints for Perl code
             if let Err(violation_msg) = check_perl_must_not_contain(&shell_content, &code) {
@@ -723,7 +682,6 @@ pub fn test_file_equivalence_detailed_with_critic(
     // Load caches
     let mut cache = CommandCache::load();
     let mut shell_output = None;
-    let examples_snapshot = ExamplesSnapshot::capture()?;
 
     // Declare variables that will be used throughout the function
     let mut shell_content = String::new();
@@ -800,8 +758,6 @@ pub fn test_file_equivalence_detailed_with_critic(
                 status: create_exit_status(0),
             });
         } else {
-            examples_snapshot.restore()?;
-
             // Clean up any temporary files in examples directory before running shell script
             let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
             if let Ok(entries) = std::fs::read_dir(&examples_dir) {
@@ -845,7 +801,6 @@ pub fn test_file_equivalence_detailed_with_critic(
 
     // Get the shell output (either cached or fresh)
     let shell_output_result = shell_output.unwrap();
-    examples_snapshot.restore()?;
     eprintln!("DEBUG: Shell script execution completed, now starting Perl generation");
 
     // If no cached Perl code, we need to parse and generate
@@ -911,13 +866,6 @@ pub fn test_file_equivalence_detailed_with_critic(
         let (tmp, run_cmd_vec, code) = match lang {
             "perl" => {
                 let mut gen = Generator::new();
-                // Set the original script name for $0 compatibility
-                if let Some(script_name) = filename.split(['\\', '/']).last() {
-                    eprintln!("DEBUG: Setting original script name to: {}", script_name);
-                    gen.set_original_script_name(script_name.to_string());
-                } else {
-                    eprintln!("DEBUG: Could not extract script name from: {}", filename);
-                }
                 let code = gen.generate(&commands);
 
                 // Create examples.out directory if it doesn't exist
@@ -978,44 +926,9 @@ pub fn test_file_equivalence_detailed_with_critic(
     }
 
     // For Perl, run static analysis tests first before executing the code
-    if lang == "perl" && enable_perl_critic {
-        // Run Perl::Critic
-        match run_perl_critic_brutal(&translated_code) {
-            Ok(_) => {
-                // Perl::Critic passed, continue
-            }
-            Err(violations) => {
-                // Perl::Critic failed, return early without executing
-                cleanup_tmp(lang, &tmp_file);
-                return Ok(TestResult {
-                    success: false,
-                    shell_stdout: String::from_utf8_lossy(&shell_output_result.stdout)
-                        .to_string()
-                        .replace("\r\n", "\n")
-                        .trim()
-                        .to_string(),
-                    shell_stderr: String::from_utf8_lossy(&shell_output_result.stderr)
-                        .to_string()
-                        .replace("\r\n", "\n")
-                        .trim()
-                        .to_string(),
-                    translated_stdout: String::new(),
-                    translated_stderr: String::new(),
-                    shell_exit: shell_output_result.status.code().unwrap_or(-1),
-                    translated_exit: -1,
-                    original_code: shell_content,
-                    translated_code,
-                    ast,
-                    _lexer_output: String::new(),
-                    failure_reason: format!("Perl::Critic violations found:\n{}", violations),
-                    shell_duration: std::time::Duration::from_secs(0),
-                    translated_duration: std::time::Duration::from_secs(0),
-                });
-            }
-        }
-
-        // Check #PERL_MUST_CONTAIN constraints
-        if let Err(violation_msg) = check_perl_must_contain(&shell_content, &translated_code) {
+    if lang == "perl" {
+        // Check for any system() calls (unconditional - these are never acceptable)
+        if let Err(violation_msg) = check_perl_no_system_calls(&translated_code) {
             cleanup_tmp(lang, &tmp_file);
             return Ok(TestResult {
                 success: false,
@@ -1037,7 +950,36 @@ pub fn test_file_equivalence_detailed_with_critic(
                 translated_code,
                 ast,
                 _lexer_output: String::new(),
-                failure_reason: format!("PERL_MUST_CONTAIN violations:\n{}", violation_msg),
+                failure_reason: format!("SYSTEM_CALL violations:\n{}", violation_msg),
+                shell_duration: std::time::Duration::from_secs(0),
+                translated_duration: std::time::Duration::from_secs(0),
+            });
+        }
+
+        // Check for system calls with builtin commands (should use native Perl instead)
+        if let Err(violation_msg) = check_perl_no_system_builtins(&translated_code) {
+            cleanup_tmp(lang, &tmp_file);
+            return Ok(TestResult {
+                success: false,
+                shell_stdout: String::from_utf8_lossy(&shell_output_result.stdout)
+                    .to_string()
+                    .replace("\r\n", "\n")
+                    .trim()
+                    .to_string(),
+                shell_stderr: String::from_utf8_lossy(&shell_output_result.stderr)
+                    .to_string()
+                    .replace("\r\n", "\n")
+                    .trim()
+                    .to_string(),
+                translated_stdout: String::new(),
+                translated_stderr: String::new(),
+                shell_exit: shell_output_result.status.code().unwrap_or(-1),
+                translated_exit: -1,
+                original_code: shell_content,
+                translated_code,
+                ast,
+                _lexer_output: String::new(),
+                failure_reason: format!("SYSTEM_BUILTIN violations:\n{}", violation_msg),
                 shell_duration: std::time::Duration::from_secs(0),
                 translated_duration: std::time::Duration::from_secs(0),
             });
@@ -1072,8 +1014,8 @@ pub fn test_file_equivalence_detailed_with_critic(
             });
         }
 
-        // Check for system calls with builtin commands (should use native Perl instead)
-        if let Err(violation_msg) = check_perl_no_system_builtins(&translated_code) {
+        // Check #PERL_MUST_CONTAIN constraints
+        if let Err(violation_msg) = check_perl_must_contain(&shell_content, &translated_code) {
             cleanup_tmp(lang, &tmp_file);
             return Ok(TestResult {
                 success: false,
@@ -1095,10 +1037,44 @@ pub fn test_file_equivalence_detailed_with_critic(
                 translated_code,
                 ast,
                 _lexer_output: String::new(),
-                failure_reason: format!("SYSTEM_BUILTIN violations:\n{}", violation_msg),
+                failure_reason: format!("PERL_MUST_CONTAIN violations:\n{}", violation_msg),
                 shell_duration: std::time::Duration::from_secs(0),
                 translated_duration: std::time::Duration::from_secs(0),
             });
+        }
+
+        // Run Perl::Critic if enabled
+        if enable_perl_critic {
+            match run_perl_critic_brutal(&translated_code) {
+                Ok(_) => {}
+                Err(violations) => {
+                    cleanup_tmp(lang, &tmp_file);
+                    return Ok(TestResult {
+                        success: false,
+                        shell_stdout: String::from_utf8_lossy(&shell_output_result.stdout)
+                            .to_string()
+                            .replace("\r\n", "\n")
+                            .trim()
+                            .to_string(),
+                        shell_stderr: String::from_utf8_lossy(&shell_output_result.stderr)
+                            .to_string()
+                            .replace("\r\n", "\n")
+                            .trim()
+                            .to_string(),
+                        translated_stdout: String::new(),
+                        translated_stderr: String::new(),
+                        shell_exit: shell_output_result.status.code().unwrap_or(-1),
+                        translated_exit: -1,
+                        original_code: shell_content,
+                        translated_code,
+                        ast,
+                        _lexer_output: String::new(),
+                        failure_reason: format!("Perl::Critic violations found:\n{}", violations),
+                        shell_duration: std::time::Duration::from_secs(0),
+                        translated_duration: std::time::Duration::from_secs(0),
+                    });
+                }
+            }
         }
 
         // Check PerlTidy formatting

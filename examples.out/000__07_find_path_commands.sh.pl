@@ -1,20 +1,12 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
-use IPC::Open3;
+use File::Basename;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
-our $CHILD_ERROR;
+# DEBUG: Collected 1 variables: ["found_files"]
+my $found_files = 0;
 
-$PROGRAM_NAME = '000__07_find_path_commands.sh';
-my $found_files = do { my $command = q{find . -name '*.sh' -type f}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
-print "Found shell scripts:\n";
-print $found_files;
-if ( !( ($found_files) =~ m{\n\z}msx ) ) { print "\n"; }
-
-exit $main_exit_code;
+$found_files = `find . -name "*.sh" -type f`;
+$ENV{found_files} = $found_files;
+print("Found shell scripts:\n");
+print($found_files . "\n");

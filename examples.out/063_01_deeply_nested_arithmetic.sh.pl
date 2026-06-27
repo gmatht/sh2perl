@@ -1,25 +1,25 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
-use IPC::Open3;
+use File::Basename;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
-our $CHILD_ERROR;
+# DEBUG: Collected 15 variables: ["result", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n"]
+my $result = 0;
+my $a = 0;
+my $b = 0;
+my $c = 0;
+my $d = 0;
+my $e = 0;
+my $f = 0;
+my $g = 0;
+my $h = 0;
+my $i = 0;
+my $j = 0;
+my $k = 0;
+my $l = 0;
+my $m = 0;
+my $n = 0;
 
-$PROGRAM_NAME = '063_01_deeply_nested_arithmetic.sh';
-my $result =  ($a + $b) * ($c - $d) / ($e * $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ;
-do {
-    my $output = "Deeply nested arithmetic result: $result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-$CHILD_ERROR = 0;
-
-exit $main_exit_code;
+$result = do { my $v = eval {  ($a + $b) * ($c - $d) / ($e % $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n)  }; $@ ? '' : $v };
+$ENV{result} = $result;
+print(("Deeply nested arithmetic result: " . $result) . "\n");
