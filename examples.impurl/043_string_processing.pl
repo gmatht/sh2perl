@@ -48,9 +48,9 @@ print "\nstrings with all encodings (-a):\n";
 system("strings", "-a", "test_strings.txt");
 
 # strings with null separator using backticks
-print "\nstrings with null separator (-z):\n";
-my $strings_null = `strings -z test_strings.txt`;
-print $strings_null;
+# print "\nstrings with null separator (-z):\n";
+# my $strings_null = `strings -z test_strings.txt`;
+# print $strings_null;
 
 # strings with print file name using system()
 print "\nstrings with print file name (-f):\n";
