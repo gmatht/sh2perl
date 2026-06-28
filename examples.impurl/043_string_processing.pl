@@ -66,9 +66,9 @@ print "\nstrings with print file name and null separator (-f -z):\n";
 system("strings", "-f", "-z", "test_strings.txt");
 
 # strings with print file name and null separator using backticks
-print "\nstrings with print file name and null separator (-f -z):\n";
-my $strings_file_null = `strings -f -z test_strings.txt`;
-print $strings_file_null;
+# print "\nstrings with print file name and null separator (-f -z):\n";
+# my $strings_file_null = `strings -f -z test_strings.txt`;
+# print $strings_file_null;
 
 # strings with multiple files using system()
 print "\nstrings with multiple files:\n";
