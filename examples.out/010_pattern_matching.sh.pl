@@ -1,31 +1,62 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use File::Basename;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
+use IPC::Open3;
 
-# DEBUG: Collected 4 variables: ["s", "f1", "f2", "word"]
-my $s = 0;
-my $f1 = 0;
-my $f2 = 0;
-my $word = 0;
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
 
-# set -euo
-# set pipefail
-print("== [[ pattern and regex ]]\n");
+$SIG{__DIE__} = sub { exit 1 };
+# set uo not implemented
+# set pipefail not implemented
+print "== [[ pattern and regex ]]\n";
+my $s;
 $s = "file.txt";
-$ENV{s} = $s;
-my $pipeline_result_1 = (($s =~ /^^.*\.txt$$/)) && (print("pattern-match\n"));
-my $pipeline_result_2 = (($s =~ /^file\.[a-z]+$/)) && (print("regex-match\n"));
-print("== extglob ==\n");
+if ($s =~ /^.*[.]txt$/msx) {
+        print 'pattern-match' . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+if ($s =~ /^file[.][a-z]+$/msx) {
+        print 'regex-match' . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+print "== extglob ==\n";
 # extglob option enabled
+my $f1;
 $f1 = "file.js";
-$ENV{f1} = $f1;
+my $f2;
 $f2 = "thing.min.js";
-$ENV{f2} = $f2;
-my $pipeline_result_3 = (($f1 =~ /^(?!.*\.min\.js).*\.js$/)) && (print("f1-ok\n"));
-my $pipeline_result_4 = (($f2 =~ /^(?!.*\.min\.js).*\.js$/)) || (print("f2-filtered\n"));
-print("== nocasematch ==\n");
+if ($f1 =~ /^(?!.*[.]min).*[.]js$/msx) {
+        print 'f1-ok' . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+if (!($f2 =~ /^(?!.*[.]min).*[.]js$/msx)) {
+        print 'f2-filtered' . "\n";
+    $CHILD_ERROR = 0;
+}
+print "== nocasematch ==\n";
 # nocasematch option enabled
+my $word;
 $word = "Foo";
-$ENV{word} = $word;
-my $pipeline_result_5 = (($word =~ /foo/i)) && (print("ci-match\n"));
+if ($word =~ /foo/msxi) {
+        print 'ci-match' . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+
+exit $main_exit_code;

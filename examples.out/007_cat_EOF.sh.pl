@@ -1,19 +1,23 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use File::Basename;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
+use IPC::Open3;
 
-# DEBUG: Collected 0 variables: []
-print <<'EOF';
-alpha
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+print q{alpha
 beta
 gamma ...
-EOF
-;
-print <<'FISH';
-oyster
+};
+print q{oyster
 snapper
 salmon
-FISH
-;
-print("Fin. That is all folks.\n");
+};
+print "Fin. That is all folks.\n";
+
+exit $main_exit_code;

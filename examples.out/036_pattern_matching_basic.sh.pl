@@ -1,15 +1,34 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use File::Basename;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
+use IPC::Open3;
 
-# DEBUG: Collected 1 variables: ["s"]
-my $s = 0;
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
 
-# set -euo
-# set pipefail
-print("== [[ pattern and regex ]]\n");
+$SIG{__DIE__} = sub { exit 1 };
+# set uo not implemented
+# set pipefail not implemented
+print "== [[ pattern and regex ]]\n";
+my $s;
 $s = "file.txt";
-$ENV{s} = $s;
-my $pipeline_result_1 = (($s =~ /^^.*\.txt$$/)) && (print("pattern-match\n"));
-my $pipeline_result_2 = (($s =~ /^file\.[a-z]+$/)) && (print("regex-match\n"));
+if ($s =~ /^.*[.]txt$/msx) {
+        print 'pattern-match' . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+if ($s =~ /^file[.][a-z]+$/msx) {
+        print 'regex-match' . "\n";
+    $CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+
+exit $main_exit_code;

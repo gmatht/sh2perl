@@ -1,19 +1,56 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use File::Basename;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
+use IPC::Open3;
 
-# DEBUG: Collected 2 variables: ["current_date", "current_dir"]
-my $current_date = 0;
-my $current_dir = 0;
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
 
-print("=== Basic Command Substitution ===\n");
-print("Current date: `date +%Y`\n");
-print(("Current directory: `basename " . "$(pwd)`") . "\n");
-$current_date = `date +%Y%m`;
-$ENV{current_date} = $current_date;
-$current_dir = `basename $(pwd)`;
-$ENV{current_dir} = $current_dir;
-print(("Stored date: " . $current_date) . "\n");
-print(("Stored directory: " . $current_dir) . "\n");
-print("=== Basic Command Substitution Complete ===\n");
+print "=== Basic Command Substitution ===\n";
+do {
+    my $output = "Current date: " . (do { my $_chomp_temp = do {
+require POSIX; POSIX::strftime('%Y', localtime($DATE_SNAPSHOT)) . "\n"
+}; chomp $_chomp_temp; $_chomp_temp; });
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+do {
+    my $output = "Current directory: " . (do { my $_chomp_temp = do { my $basename_cmd = q{basename "$(echo 'command substitution not supported in system command context')"}; my $basename_output = qx{$basename_cmd}; $CHILD_ERROR = $? >> 8; $basename_output; }; chomp $_chomp_temp; $_chomp_temp; });
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+my $current_date;
+$current_date = do {
+require POSIX; POSIX::strftime('%Y%m', localtime($DATE_SNAPSHOT)) . "\n"
+};
+my $current_dir;
+$current_dir = do { my $basename_cmd = q{basename "$(echo 'command substitution not supported in system command context')"}; my $basename_output = qx{$basename_cmd}; $CHILD_ERROR = $? >> 8; $basename_output; };
+do {
+    my $output = "Stored date: $current_date";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+do {
+    my $output = "Stored directory: $current_dir";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+print "=== Basic Command Substitution Complete ===\n";
+
+exit $main_exit_code;

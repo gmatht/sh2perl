@@ -1,9 +1,47 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use File::Basename;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
+use IPC::Open3;
 
-# DEBUG: Collected 0 variables: []
-my $pipeline_result_1 = (($ENV{'HOME'} eq $ENV{'HOME'})) && (print("1\n")) || (print("\n"));
-my $pipeline_result_2 = (($ENV{'HOME'} . '/Documents') eq $ENV{'HOME'}) && (print("2\n")) || (print("\n"));
-my $pipeline_result_3 = (($ENV{'HOME'} . '/Documents') eq ($ENV{'HOME'} . '/Documents')) && (print("3\n")) || (print("\n"));
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+if ($ENV{'HOME'} eq $ENV{'HOME'}) {
+            print q{1} . "\n";
+    $CHILD_ERROR = 0;
+    if ($CHILD_ERROR != 0) {
+                print q{-} . "\n";
+        $CHILD_ERROR = 0;
+    }
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+if (($ENV{'HOME'} . '/Documents') eq $ENV{'HOME'}) {
+            print q{2} . "\n";
+    $CHILD_ERROR = 0;
+    if ($CHILD_ERROR != 0) {
+                print q{-} . "\n";
+        $CHILD_ERROR = 0;
+    }
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+if (($ENV{'HOME'} . '/Documents') eq ($ENV{'HOME'} . '/Documents')) {
+            print q{3} . "\n";
+    $CHILD_ERROR = 0;
+    if ($CHILD_ERROR != 0) {
+                print q{-} . "\n";
+        $CHILD_ERROR = 0;
+    }
+    $CHILD_ERROR = 0;
+} else {
+    $CHILD_ERROR = 1;
+}
+
+exit $main_exit_code;
