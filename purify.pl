@@ -606,7 +606,7 @@ sub process_single_backtick_string {
             undef $perl_result;
         }
 
-        if ($perl_result && $perl_result =~ /\bsystem\s*\(/) {
+        if ($perl_result && $perl_result =~ /\bsystem\b/) {
             print "DEBUG: debashc output contains system() call; treating as conversion failure\n" if $verbose;
             undef $perl_result;
         }
@@ -2062,7 +2062,7 @@ sub convert_shell_to_perl {
     my $exit_code = $? >> 8;
 
     # Strip debashc debug chatter so the returned Perl is valid code.
-    $stdout =~ s/^DEBUG:.*(?:\n|\z)//mg;
+    $stdout =~ s/^DEBUG\b.*(?:\n|\z)//mg;
 
     print "DEBUG: Command output length: " . length($stdout) . "\n" if $verbose;
 
