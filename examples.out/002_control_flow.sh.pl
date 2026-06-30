@@ -1,28 +1,61 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use File::Basename;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
+use IPC::Open3;
 
-# DEBUG: Collected 1 variables: ["i"]
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
 my $i = 0;
 
-if (-f "file.txt") {
-        print("File exists\n");
-;
-} else {
-        print("File does not exist\n");
-;
+my $MAGIC_10   = 10;
+my $MAX_LOOP_5 = 5;
+
+if ((-f"file.txt")) {
+    print "File exists\n";
 }
-for $i (1..5) {
-    print(("Number: " . $i) . "\n");
-;
+else {
+    print "File does not exist\n";
 }
-while ($i < 10) {
-    print(("Counter: " . $i) . "\n");
-    $i = do { my $v = eval { $i + 1 }; $@ ? '' : $v };
-$ENV{i} = $i;
+for my $i ( 1 .. $MAX_LOOP_5 ) {
+    do {
+    my $output = "Number: $i";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+    $CHILD_ERROR = 0;
 }
+$i = 5;
+while ( $i < $MAGIC_10 ) {
+    do {
+    my $output = "Counter: $i";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+    $CHILD_ERROR = 0;
+    $i = $i + 1;
+}
+
 sub greet {
-    print(("Hello, " . $1 . "!") . "\n");
+    my ($file) = @_;
+    do {
+    my $output = "Hello, $_[0]!";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+    $CHILD_ERROR = 0;
+    return;
 }
 greet("World");
+
+exit $main_exit_code;

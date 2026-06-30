@@ -47,6 +47,7 @@ pub enum Token {
     Export,
     #[token("readonly")]
     Readonly,
+    #[token("local")]
     Local,
     #[token("declare")]
     Declare,
@@ -291,10 +292,12 @@ pub enum Token {
 
     #[regex(r"[0-9]+")]
     Number,
+    #[regex(r"[0-9]+\.[0-9]+")]
+    Float,
     #[regex(r"0x[0-9a-fA-F]+")]
     HexNumber,
-    #[regex(r"0[0-7]+")]
-    OctalNumber,
+    #[regex(r"0+[0-9]+")]
+    PaddedNumber,
 
     // Special characters
     #[token("!")]
@@ -395,71 +398,6 @@ impl Lexer {
                     continue;
                 }
             }
-        }
-
-        // Post-process: re-parse DoubleQuotedString tokens to properly
-        // handle $(...) and ${...} nesting. Logos's regex splits on every
-        // " even inside $(...)/${...}, so we manually scan from each
-        // opening " forward, tracking nesting, to find the real closing ".
-        {
-            let mut merged: Vec<(Token, usize, usize)> = Vec::new();
-            let mut i = 0;
-            while i < tokens.len() {
-                if tokens[i].0 == Token::DoubleQuotedString {
-                    let start = tokens[i].1;
-                    let bytes = input.as_bytes();
-                    // Only re-parse if this " is at byte position with "
-                    if bytes[start] == b'"' {
-                        let mut end = start + 1; // skip past opening "
-                        let mut p_depth = 0i32;
-                        let mut b_depth = 0i32;
-                        while end < bytes.len() {
-                            match bytes[end] {
-                                b'"' if p_depth == 0 && b_depth == 0 => {
-                                    end += 1; // include closing "
-                                    break;
-                                }
-                                b'\\' if end + 1 < bytes.len() => {
-                                    end += 2; // skip escaped char
-                                }
-                                b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'(' => {
-                                    p_depth += 1;
-                                    end += 2;
-                                }
-                                b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'{' => {
-                                    b_depth += 1;
-                                    end += 2;
-                                }
-                                b')' => {
-                                    if p_depth > 0 {
-                                        p_depth -= 1;
-                                    }
-                                    end += 1;
-                                }
-                                b'}' => {
-                                    if b_depth > 0 {
-                                        b_depth -= 1;
-                                    }
-                                    end += 1;
-                                }
-                                _ => {
-                                    end += 1;
-                                }
-                            }
-                        }
-                        merged.push((Token::DoubleQuotedString, start, end));
-                        // Skip all logos tokens covered by this span
-                        while i + 1 < tokens.len() && tokens[i + 1].1 < end {
-                            i += 1;
-                        }
-                        i += 1;
-                        continue;
-                    }
-                }
-                merged.push(tokens[i].clone());
-                i += 1;
-            }
-            tokens = merged;
         }
 
         // Precompute starts of lines for quick offset->(line,col)

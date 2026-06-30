@@ -1,39 +1,105 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
 use File::Basename;
+use IPC::Open3;
 
-# DEBUG: Collected 5 variables: ["name", "path", "s2", "var", "maybe"]
-my $name = 0;
-my $path = 0;
-my $s2 = 0;
-my $var = 0;
-my $maybe = 0;
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
 
-# set -euo
-# set pipefail
-print("== Case modification in parameter expansion ==\n");
+$SIG{__DIE__} = sub { exit 1 };
+# set uo not implemented
+# set pipefail not implemented
+print "== Case modification in parameter expansion ==\n";
+my $name;
 $name = "world";
-$ENV{name} = $name;
-print(uc($name) . "\n");
-print(lc($name) . "\n");
-print(ucfirst($name) . "\n");
-print("== Advanced parameter expansion ==\n");
+do {
+    my $output = uc(${name});
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+do {
+    my $output = lc(${name});
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+do {
+    my $output = ucfirst(${name});
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+print "== Advanced parameter expansion ==\n";
+my $path;
 $path = "/tmp/file.txt";
-$ENV{path} = $path;
-print(basename($path) . "\n");
-print(dirname($path) . "\n");
+do {
+    my $output = basename(${path});
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+do {
+    my $output = dirname(${path});
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+my $s2;
 $s2 = "abba";
-$ENV{s2} = $s2;
-print(do { my $temp = $s2; $temp =~ s/b/X/g; $temp } . "\n");
-print("== More parameter expansion ==\n");
+print $s2 =~ s/b/X/grs;
+if ( !( $s2 =~ s/b/X/grs =~ m{\n\z}msx ) ) { print "\n"; }
+print "== More parameter expansion ==\n";
+my $var;
 $var = "hello world";
-$ENV{var} = $var;
-print(do { my $temp = $var; $temp =~ s/^hello//; $temp } . "\n");
-print(do { my $temp = $var; $temp =~ s/world$//; $temp } . "\n");
-print(do { my $temp = $var; $temp =~ s/o/0/g; $temp } . "\n");
-print("== Default values ==\n");
+print ${var} =~ s/^hello//r;
+if ( !( ${var} =~ s/^hello//r =~ m{\n\z}msx ) ) { print "\n"; }
+print ${var} =~ s/world$//r;
+if ( !( ${var} =~ s/world$//r =~ m{\n\z}msx ) ) { print "\n"; }
+print $var =~ s/o/0/grs;
+if ( !( $var =~ s/o/0/grs =~ m{\n\z}msx ) ) { print "\n"; }
+print "== Default values ==\n";
+my $maybe;
 undef $maybe;
-print((defined($ENV{maybe}) ? $ENV{maybe} : 'default') . "\n");
-print(($ENV{maybe} //= 'default') . "\n");
-print((defined($ENV{maybe}) ? $ENV{maybe} : die('error')) . "\n");
+delete $ENV{maybe};
+do {
+    my $output = defined ${maybe} && ${maybe} ne q{} ? ${maybe} : 'default';
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+do {
+    my $output = defined ${maybe} && ${maybe} ne q{} ? ${maybe} : do { ${maybe} = 'default'; ${maybe} };
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+do {
+    my $output = defined ${maybe} && ${maybe} ne q{} ? ${maybe} : die('error');
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+
+exit $main_exit_code;

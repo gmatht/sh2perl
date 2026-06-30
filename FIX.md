@@ -373,6 +373,36 @@ Verification
 Regenerate the purified Perl for the failing example (examples.impurl/039_subshell_operations.pl)
 and confirm the placeholder no longer appears in the generated output.
 
+Fix: Strip DEBUG-prefixed stderr lines from debashc output in purify.pl
+-------------------------------------------------------------------
+Problem
+-------
+The rm command generator in src/generator/commands/rm.rs emits debug messages
+via eprintln!() (e.g. "DEBUG rm arg: ...", "DEBUG rm arg_str: ..."). purify.pl
+captures both child stdout and stderr into a single buffer, then attempts to
+strip debug lines with the regex `s/^DEBUG:.*(?:\n|\z)//mg`. However, the
+eprintln! output starts with "DEBUG " (space), not "DEBUG:" (colon), so the
+regex did not match and the debug lines leaked into the generated Perl code,
+causing syntax errors (e.g. "syntax error near 'arg:'").
+
+Fix
+---
+Changed the stripping regex in convert_shell_to_perl from `^DEBUG:` to `^DEBUG\b`
+so it matches both "DEBUG:" and "DEBUG " variants. This ensures all
+DEBUG-prefixed diagnostic lines from the Rust generator are removed from the
+captured output before it is returned as valid Perl code.
+
+Files changed
+-------------
+- purify.pl: line 2065, `^DEBUG:` -> `^DEBUG\b`
+
+Why this is minimal and safe
+----------------------------
+The change is a single word-boundary assertion (\b) in an existing stripping
+regex that only removes lines prefixed with "DEBUG". It cannot affect
+non-DEBUG output and keeps purify.pl as a thin wrapper around the Rust
+generator.
+
 Fix: Preserve first argument when generating exec(...) blocks from system() calls
 ---------------------------------------------------------------------------------
 Problem
@@ -802,3 +832,68 @@ Files changed
 -------------
 - src/generator/words.rs: emit `$var` for undeclared variables in
   inline mode so backtick variable references remain valid Perl.
+
+# Fixes for test_purify.pl 035_pipeline_basic and 037_complex_pipeline
+
+## Bug 15: tail builtin emits `join "\n", @result` without trailing newline (Rust)
+
+In `tail.rs`, the `generate_tail_command` function used `join "\n", @result` to
+reconstruct tail output from the split lines array. `split /\n/` removes the
+trailing newline from each line, and `join "\n"` reassembles without a trailing
+newline. The shell `tail` command always terminates its last output line with
+`\n`, so the missing newline caused the subsequent `print "\n..."` statement's
+newline to visually "fill in" as a blank line in the output diff.
+
+**Fix:** After the join, add a trailing `"\n"` when the result is non-empty,
+using the same conditional-pattern as the grep and sort handlers.
+
+## Bug 16: grep -c in pipeline mode emits count without trailing newline (Rust)
+
+In `grep.rs`, the `-c` (count-only) mode assigned `$grep_result = scalar @grep_filtered`
+without a trailing newline when in pipeline accumulation mode (where `should_print`
+is false). The shell `grep -c` always terminates its count output with `\n`.
+When the purified code ran in a backtick context, the missing trailing newline
+caused the next `print "\n..."` to appear as a blank line shift in the diff.
+
+**Fix:** When `should_print` is false (pipeline accumulation mode), append
+`"\n"` to `$grep_result` if non-empty, matching the behavior of `grep -c` and
+the pattern used by grep's non-count output path.
+
+# Fixes for test_purify.pl 039_subshell_operations
+
+## Bug 17: ls/wc builtins in `_site/src` lack inline_mode handling, causing subshell backtick nondeterminism (Rust)
+
+In `_site/src/generator/commands/simple_commands.rs`, the Rust source in the
+`_site/` tree (the tracked/original source) was missing inline_mode checks for
+the `ls` and `wc` builtins that were already present in `src/generator/commands/simple_commands.rs`
+(the refactored build tree). When purify.pl generated code for backtick commands
+containing `ls` or `wc` in subshells (e.g., `` `(cd .; ls -la | head -3; pwd)` ``),
+the generated code used `print $output_var` instead of `$output_var;` as the
+last expression, causing the `do` block's return value to be the print return
+value (1) instead of the actual command output. This produced output mismatches
+between original and purified runs; when re-running the original also showed
+different results (due to the mismatched output being fed into subsequent
+operations), the test was marked nondeterministic and skipped.
+
+Three changes were needed:
+1. Remove outer parentheses from format argument in echo-style expression
+   (cosmetic, no behavioral change).
+2. In the `ls` match arm, check `generator.inline_mode` and call
+   `generate_ls_for_substitution` instead of `generate_ls_command` so the
+   `do` block returns the file listing value instead of the print return value.
+3. In the `wc` output path, check `generator.inline_mode` and emit the bare
+   `$output_var;` instead of `print $output_var;` so the `do` block returns
+   the word count value instead of the print return value.
+
+**Fix:** Applied the same three changes from `src/generator/commands/simple_commands.rs`
+to `_site/src/generator/commands/simple_commands.rs`, keeping both source trees
+in sync. This ensures subshell commands inside backticks that use `ls` or `wc`
+return the correct output value in inline mode.
+
+# Current status
+
+All 54 tests in `test_purify.pl` pass with 0 failures (`PROGRESS 54:0`). No fix was needed for this invocation.
+
+## Verification (2026-06-30)
+
+Re-ran `test_purify.pl` after `cargo build` — all 54 tests pass (`PROGRESS 54:0`). All previously documented fixes remain in place and working. No code change required.

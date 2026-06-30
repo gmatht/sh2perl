@@ -1,18 +1,18 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
+use std::thread;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Different types of operations that can have timeouts
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationType {
-    ShellExecution, // Running shell scripts
-    PerlExecution,  // Running Perl code
-    Parsing,        // Parsing shell scripts
-    CodeGeneration, // Generating Perl code
-    FileOperations, // File I/O operations
-    TestExecution,  // Overall test execution
-    DebugFreeze,    // Debug freeze pause
+    ShellExecution,      // Running shell scripts
+    PerlExecution,       // Running Perl code
+    Parsing,            // Parsing shell scripts
+    CodeGeneration,     // Generating Perl code
+    FileOperations,     // File I/O operations
+    TestExecution,      // Overall test execution
+    DebugFreeze,        // Debug freeze pause
 }
 
 /// Timeout configuration for different operations
@@ -30,13 +30,13 @@ pub struct TimeoutConfig {
 impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
-            shell_execution: Duration::from_secs(120), // 2 minutes for shell scripts
-            perl_execution: Duration::from_secs(30),   // 30 seconds for Perl execution
-            parsing: Duration::from_secs(5),           // 5 seconds for parsing
-            code_generation: Duration::from_secs(5),   // 5 seconds for code generation
-            file_operations: Duration::from_secs(2),   // 2 seconds for file operations
-            test_execution: Duration::from_secs(300),  // 5 minutes for overall test
-            debug_freeze: Duration::from_secs(300),    // 5 minutes for debug freeze
+            shell_execution: Duration::from_secs(120),   // 2 minutes for shell scripts
+            perl_execution: Duration::from_secs(30),     // 30 seconds for Perl execution
+            parsing: Duration::from_secs(5),             // 5 seconds for parsing
+            code_generation: Duration::from_secs(5),     // 5 seconds for code generation
+            file_operations: Duration::from_secs(2),     // 2 seconds for file operations
+            test_execution: Duration::from_secs(300),    // 5 minutes for overall test
+            debug_freeze: Duration::from_secs(300),      // 5 minutes for debug freeze
         }
     }
 }
@@ -62,10 +62,8 @@ impl DebugFreezeManager {
 
     pub fn freeze(&self) {
         self.is_frozen.store(true, Ordering::Relaxed);
-        eprintln!(
-            "DEBUG: Execution frozen for debugging. Press Ctrl+C to continue or wait {} seconds.",
-            self.freeze_duration.as_secs()
-        );
+        eprintln!("DEBUG: Execution frozen for debugging. Press Ctrl+C to continue or wait {} seconds.", 
+                 self.freeze_duration.as_secs());
     }
 
     pub fn unfreeze(&self) {
@@ -133,23 +131,15 @@ impl TimeoutManager {
     }
 
     /// Execute an operation with timeout and debug freeze support
-    pub fn execute_with_timeout<F, T>(
-        &self,
-        operation: OperationType,
-        operation_fn: F,
-    ) -> Result<T, String>
+    pub fn execute_with_timeout<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
     where
         F: FnOnce() -> Result<T, String> + Send + 'static,
         T: Send + 'static,
     {
         let timeout_duration = self.get_timeout(operation);
         let debug_freeze = self.debug_freeze.is_frozen.clone();
-        eprintln!(
-            "DEBUG: Timeout manager starting {:?} with timeout of {:.1} seconds",
-            operation,
-            timeout_duration.as_secs_f64()
-        );
-
+        eprintln!("DEBUG: Timeout manager starting {:?} with timeout of {:.1} seconds", operation, timeout_duration.as_secs_f64());
+        
         // Check if we're in debug freeze mode
         if debug_freeze.load(Ordering::Relaxed) {
             eprintln!("DEBUG: Operation {:?} is frozen for debugging", operation);
@@ -166,50 +156,33 @@ impl TimeoutManager {
         // Wait for completion or timeout
         match rx.recv_timeout(timeout_duration) {
             Ok(result) => {
-                eprintln!(
-                    "DEBUG: Timeout manager completed {:?} successfully",
-                    operation
-                );
+                eprintln!("DEBUG: Timeout manager completed {:?} successfully", operation);
                 result
-            }
+            },
             Err(_) => {
                 // Check if we're in debug freeze mode before timing out
                 if debug_freeze.load(Ordering::Relaxed) {
-                    eprintln!(
-                        "DEBUG: Operation {:?} timed out but debug freeze is active",
-                        operation
-                    );
+                    eprintln!("DEBUG: Operation {:?} timed out but debug freeze is active", operation);
                     return Err("Operation timed out during debug freeze".to_string());
                 }
-
-                eprintln!(
-                    "DEBUG: Timeout manager timed out {:?} after {:.1} seconds",
-                    operation,
-                    timeout_duration.as_secs_f64()
-                );
+                
+                eprintln!("DEBUG: Timeout manager timed out {:?} after {:.1} seconds", operation, timeout_duration.as_secs_f64());
                 let operation_name = format!("{:?}", operation);
-                Err(format!(
-                    "{} timed out after {:.1} seconds",
-                    operation_name,
-                    timeout_duration.as_secs_f64()
-                ))
+                Err(format!("{} timed out after {:.1} seconds", 
+                           operation_name, timeout_duration.as_secs_f64()))
             }
         }
     }
 
     /// Execute an operation with timeout and progress reporting
-    pub fn execute_with_progress<F, T>(
-        &self,
-        operation: OperationType,
-        operation_fn: F,
-    ) -> Result<T, String>
+    pub fn execute_with_progress<F, T>(&self, operation: OperationType, operation_fn: F) -> Result<T, String>
     where
         F: FnOnce() -> Result<T, String> + Send + 'static,
         T: Send + 'static,
     {
         let timeout_duration = self.get_timeout(operation);
         let debug_freeze = self.debug_freeze.is_frozen.clone();
-
+        
         // Check if we're in debug freeze mode
         if debug_freeze.load(Ordering::Relaxed) {
             eprintln!("DEBUG: Operation {:?} is frozen for debugging", operation);
@@ -233,38 +206,26 @@ impl TimeoutManager {
                 Ok(result) => return result,
                 Err(_) => {
                     let elapsed = start.elapsed();
-
+                    
                     // Check if we're in debug freeze mode
                     if debug_freeze.load(Ordering::Relaxed) {
-                        eprintln!(
-                            "DEBUG: Operation {:?} timed out but debug freeze is active",
-                            operation
-                        );
+                        eprintln!("DEBUG: Operation {:?} timed out but debug freeze is active", operation);
                         return Err("Operation timed out during debug freeze".to_string());
                     }
-
+                    
                     // Check for timeout
                     if elapsed > timeout_duration {
                         let operation_name = format!("{:?}", operation);
-                        return Err(format!(
-                            "{} timed out after {:.1} seconds",
-                            operation_name,
-                            timeout_duration.as_secs_f64()
-                        ));
+                        return Err(format!("{} timed out after {:.1} seconds", 
+                                         operation_name, timeout_duration.as_secs_f64()));
                     }
-
+                    
                     // Report progress if enough time has passed
                     if last_progress.elapsed() > progress_interval {
-                        let progress_percent =
-                            (elapsed.as_secs_f64() / timeout_duration.as_secs_f64() * 100.0)
-                                .min(100.0);
-                        eprintln!(
-                            "DEBUG: {} in progress... {:.1}% ({:.1}s/{:.1}s)",
-                            format!("{:?}", operation),
-                            progress_percent,
-                            elapsed.as_secs_f64(),
-                            timeout_duration.as_secs_f64()
-                        );
+                        let progress_percent = (elapsed.as_secs_f64() / timeout_duration.as_secs_f64() * 100.0).min(100.0);
+                        eprintln!("DEBUG: {} in progress... {:.1}% ({:.1}s/{:.1}s)", 
+                                 format!("{:?}", operation), progress_percent, 
+                                 elapsed.as_secs_f64(), timeout_duration.as_secs_f64());
                         last_progress = Instant::now();
                     }
                 }
@@ -275,39 +236,39 @@ impl TimeoutManager {
     /// Create a timeout configuration for fast tests
     pub fn fast_test_config() -> TimeoutConfig {
         TimeoutConfig {
-            shell_execution: Duration::from_secs(10), // 10 seconds for shell scripts
-            perl_execution: Duration::from_secs(5),   // 5 seconds for Perl execution
-            parsing: Duration::from_secs(2),          // 2 seconds for parsing
-            code_generation: Duration::from_secs(2),  // 2 seconds for code generation
-            file_operations: Duration::from_secs(1),  // 1 second for file operations
-            test_execution: Duration::from_secs(30),  // 30 seconds for overall test
-            debug_freeze: Duration::from_secs(60),    // 1 minute for debug freeze
+            shell_execution: Duration::from_secs(10),    // 10 seconds for shell scripts
+            perl_execution: Duration::from_secs(5),      // 5 seconds for Perl execution
+            parsing: Duration::from_secs(2),             // 2 seconds for parsing
+            code_generation: Duration::from_secs(2),     // 2 seconds for code generation
+            file_operations: Duration::from_secs(1),     // 1 second for file operations
+            test_execution: Duration::from_secs(30),     // 30 seconds for overall test
+            debug_freeze: Duration::from_secs(60),       // 1 minute for debug freeze
         }
     }
 
     /// Create a timeout configuration for slow tests
     pub fn slow_test_config() -> TimeoutConfig {
         TimeoutConfig {
-            shell_execution: Duration::from_secs(60), // 60 seconds for shell scripts
-            perl_execution: Duration::from_secs(30),  // 30 seconds for Perl execution
-            parsing: Duration::from_secs(10),         // 10 seconds for parsing
-            code_generation: Duration::from_secs(10), // 10 seconds for code generation
-            file_operations: Duration::from_secs(5),  // 5 seconds for file operations
-            test_execution: Duration::from_secs(300), // 5 minutes for overall test
-            debug_freeze: Duration::from_secs(600),   // 10 minutes for debug freeze
+            shell_execution: Duration::from_secs(60),    // 60 seconds for shell scripts
+            perl_execution: Duration::from_secs(30),     // 30 seconds for Perl execution
+            parsing: Duration::from_secs(10),            // 10 seconds for parsing
+            code_generation: Duration::from_secs(10),    // 10 seconds for code generation
+            file_operations: Duration::from_secs(5),     // 5 seconds for file operations
+            test_execution: Duration::from_secs(300),    // 5 minutes for overall test
+            debug_freeze: Duration::from_secs(600),      // 10 minutes for debug freeze
         }
     }
 
     /// Create a timeout configuration for debug mode
     pub fn debug_config() -> TimeoutConfig {
         TimeoutConfig {
-            shell_execution: Duration::from_secs(120), // 2 minutes for shell scripts
-            perl_execution: Duration::from_secs(60),   // 1 minute for Perl execution
-            parsing: Duration::from_secs(30),          // 30 seconds for parsing
-            code_generation: Duration::from_secs(30),  // 30 seconds for code generation
-            file_operations: Duration::from_secs(10),  // 10 seconds for file operations
-            test_execution: Duration::from_secs(600),  // 10 minutes for overall test
-            debug_freeze: Duration::from_secs(1800),   // 30 minutes for debug freeze
+            shell_execution: Duration::from_secs(120),   // 2 minutes for shell scripts
+            perl_execution: Duration::from_secs(60),     // 1 minute for Perl execution
+            parsing: Duration::from_secs(30),            // 30 seconds for parsing
+            code_generation: Duration::from_secs(30),    // 30 seconds for code generation
+            file_operations: Duration::from_secs(10),    // 10 seconds for file operations
+            test_execution: Duration::from_secs(600),    // 10 minutes for overall test
+            debug_freeze: Duration::from_secs(1800),     // 30 minutes for debug freeze
         }
     }
 }

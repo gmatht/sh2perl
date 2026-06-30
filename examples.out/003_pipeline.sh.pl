@@ -1,144 +1,313 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use File::Basename;
-use File::Find;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
+use IPC::Open3;
 
-# DEBUG: Collected 0 variables: []
-my $output_1 = '';
-my $output_total_1 = '';
-my @ls_files_1;
-if (opendir(my $dh_1, '.')) {
-    while (my $file = readdir($dh_1)) {
-        next if $file eq '.' || $file eq '..';
-        push @ls_files_1, $file;
+my $main_exit_code = 0;
+my $ls_success     = 0;
+our $CHILD_ERROR;
+
+# Original bash: ls | grep "\.txt$" | wc -l
+{
+    my $output_138 = q{};
+    my $output_printed_138;
+    my $pipeline_success_138 = 1;
+        $output_138 = do {
+    my @ls_files_139 = ();
+    if ( -f q{.} ) {
+    push @ls_files_139, q{.};
     }
-    closedir($dh_1);
-}
-@ls_files_1 = sort @ls_files_1;
-$output_1 = join("\n", @ls_files_1);
-my @grep_lines_1;
-my $count_1 = 0;
-for my $line (split(/\n/, $output_1)) {
-    if ($line =~ /\.txt$/) {
-        push @grep_lines_1, $line;
-        $count_1++;
+    elsif ( -d q{.} ) {
+    if ( opendir my $dh, q{.} ) {
+    while ( my $file = readdir $dh ) {
+    next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
+    push @ls_files_139, $file;
     }
-}
-$output_1 = join("\n", @grep_lines_1) . "\n";
-$output_1 = scalar(split(/\n/, $output_1)) . "\n";
-$output_total_1 .= $output_1;
-$output_1 = $output_total_1;
-print($output_1);
-print("\n");
-my $output_2 = '';
-my $output_total_2 = '';
-my $cat_content_2 = '';
-if (open(my $fh_2, '<', 'file.txt')) {
-    while (my $line = <$fh_2>) {
-        $cat_content_2 .= $line;
+    closedir $dh;
+    @ls_files_139 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_files_139;
     }
-    close($fh_2);
-} else {
-    warn "cat: file.txt: No such file or directory";
-}
-$output_2 = $cat_content_2;
-$output_2 = join("\n", sort { $a cmp $b } split(/\n/, $output_2)) . "\n";
-my %count_2;
-for my $line (split(/\n/, $output_2)) {
-    $count_2{$line}++;
-}
-my @uniq_result_2;
-for my $key (sort keys %count_2) {
-    my $count_val = $count_2{$key};
-    my $count_str = sprintf("%7s %s", $count_val, $key);
-    push @uniq_result_2, $count_str;
-}
-$output_2 = join("\n", @uniq_result_2) . "\n";
-$output_2 = join("\n", reverse(sort { ($a <=> $b) || ($a cmp $b) } split(/\n/, $output_2))) . "\n";
-$output_total_2 .= $output_2;
-$output_2 = $output_total_2;
-print($output_2);
-print("\n");
-my $output_3 = '';
-my $output_total_3 = '';
-my @find_files_3;
-require File::Find;
-File::Find::find({wanted => sub { if ($_ =~ /^.*\.sh$/) { push @find_files_3, $File::Find::name; } }, no_chdir => 1}, '.');
-$output_3 = join("\n", @find_files_3);
-my @xargs_files_3;
-for my $file (split(/\n/, $output_3)) {
-    if ($file ne '') {
-        # Use Perl's built-in file reading instead of system grep for cross-platform compatibility
-        my $found = 0;
-        if (open(my $fh, '<', $file)) {
-            while (my $line = <$fh>) {
-                if ($line =~ /function/) {
-                    $found = 1;
-                    last;
-                }
-            }
-            close($fh);
-        }
-        if ($found) {
-            push @xargs_files_3, $file;
+    }
+    (@ls_files_139 ? join("\n", @ls_files_139) . "\n" : q{});
+    };
+
+        my $grep_result_138_1;
+    my @grep_lines_138_1 = split /\n/msx, $output_138;
+    my @grep_filtered_138_1 = grep { /[.]txt$/msx } @grep_lines_138_1;
+    $grep_result_138_1 = join "\n", @grep_filtered_138_1;
+    if (!($grep_result_138_1 =~ m{\n\z}msx || $grep_result_138_1 eq q{})) {
+    $grep_result_138_1 .= "\n";
+    }
+    $CHILD_ERROR = scalar @grep_filtered_138_1 > 0 ? 0 : 1;
+    $output_138 = $grep_result_138_1;
+    $output_138 = $grep_result_138_1;
+    if ((scalar @grep_filtered_138_1) == 0) {
+        $pipeline_success_138 = 0;
+    }
+
+        use IPC::Open3;
+    my @wc_args_138_2 = ('-l');
+    my ($wc_in_138_2, $wc_out_138_2, $wc_err_138_2);
+    my $wc_pid_138_2 = open3($wc_in_138_2, $wc_out_138_2, $wc_err_138_2, 'wc', @wc_args_138_2);
+    print {$wc_in_138_2} $output_138;
+    close $wc_in_138_2 or die "Close failed: $!\n";
+    my $output_138_2 = do { local $/ = undef; <$wc_out_138_2> };
+    if ($output_138_2 eq q{}) { $output_138_2 = "0\n"; }
+    close $wc_out_138_2 or die "Close failed: $!\n";
+    waitpid $wc_pid_138_2, 0;
+    $output_138 = $output_138_2;
+    if ($output_138 ne q{} && !defined $output_printed_138) {
+        print $output_138;
+        if (!($output_138 =~ m{\n\z}msx)) {
+            print "\n";
         }
     }
-}
-$output_3 = join("\n", @xargs_files_3);
-$output_3 =~ tr/\\\\\\\\\///d;
-$output_total_3 .= $output_3;
-$output_3 = $output_total_3;
-print($output_3);
-print("\n");
-my $output_4 = '';
-my $output_total_4 = '';
-my $cat_content_4 = '';
-if (open(my $fh_4, '<', 'file.txt')) {
-    while (my $line = <$fh_4>) {
-        $cat_content_4 .= $line;
+    if ( !$pipeline_success_138 ) { $main_exit_code = 1; }
     }
-    close($fh_4);
-} else {
-    warn "cat: file.txt: No such file or directory";
-}
-$output_4 = $cat_content_4;
-$output_4 =~ tr/a/b/;
-my @grep_lines_4;
-my $count_4 = 0;
-for my $line (split(/\n/, $output_4)) {
-    if ($line =~ /hello/) {
-        push @grep_lines_4, $line;
-        $count_4++;
+print "\n";
+$CHILD_ERROR = 0;
+# Original bash: cat file.txt | sort | uniq -c | sort -nr
+{
+    my $output_141 = q{};
+    my $output_printed_141;
+    my $pipeline_success_141 = 1;
+        $output_141 = do { open my $fh, '<', 'file.txt' or die 'cat: ' . 'file.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; };
+    if ($output_141 eq q{}) {
+        $pipeline_success_141 = 0;
     }
-}
-$output_4 = join("\n", @grep_lines_4) . "\n";
-$output_total_4 .= $output_4;
-$output_4 = $output_total_4;
-print($output_4);
-print("\n");
-my $output_5 = '';
-my $output_total_5 = '';
-my $cat_content_5 = '';
-if (open(my $fh_5, '<', 'file.txt')) {
-    while (my $line = <$fh_5>) {
-        $cat_content_5 .= $line;
+
+        my @sort_lines_141_1 = split /\n/msx, $output_141;
+    my @sort_sorted_141_1 = sort @sort_lines_141_1;
+    my $output_141_1 = join "\n", @sort_sorted_141_1;
+    if ($output_141_1 ne q{} && !($output_141_1 =~ m{\n\z}msx)) {
+    $output_141_1 .= "\n";
     }
-    close($fh_5);
-} else {
-    warn "cat: file.txt: No such file or directory";
-}
-$output_5 = $cat_content_5;
-$output_5 = join("\n", sort { $a cmp $b } split(/\n/, $output_5)) . "\n";
-my @grep_lines_5;
-my $count_5 = 0;
-for my $line (split(/\n/, $output_5)) {
-    if ($line =~ /hello/) {
-        push @grep_lines_5, $line;
-        $count_5++;
+    $output_141 = $output_141_1;
+    $output_141 = $output_141_1;
+
+        my @uniq_lines_141_2 = split /\n/msx, $output_141;
+    @uniq_lines_141_2 = grep { $_ ne q{} } @uniq_lines_141_2; # Filter out empty lines
+    my %uniq_counts_141_2;
+    my @uniq_order_141_2;
+    foreach my $line (@uniq_lines_141_2) {
+    if (!exists $uniq_counts_141_2{$line}) { push @uniq_order_141_2, $line; }
+    $uniq_counts_141_2{$line}++;
     }
-}
-$output_5 = join("\n", @grep_lines_5) . "\n";
-$output_total_5 .= $output_5;
-$output_5 = $output_total_5;
-print($output_5);
+    my @uniq_result_141_2;
+    foreach my $line (@uniq_order_141_2) {
+    push @uniq_result_141_2, sprintf "%7d %s", $uniq_counts_141_2{$line}, $line;
+    }
+    my $output_141_2 = join "\n", @uniq_result_141_2;
+    if ($output_141_2 ne q{} && !($output_141_2 =~ m{\n\z}msx)) {
+    $output_141_2 .= "\n";
+    }
+    $output_141 = $output_141_2;
+
+        my @sort_lines_141_3 = split /\n/msx, $output_141;
+    my @sort_sorted_141_3 = sort {
+    my @a_fields = split /\s+/msx, $a;
+    my @b_fields = split /\s+/msx, $b;
+    my $a_num = 0;
+    my $b_num = 0;
+    my $a_key = ( scalar @a_fields > 0 ) ? $a_fields[0] : q{}; $a_key =~ s/^\s+|\s+$//g;
+    my $b_key = ( scalar @b_fields > 0 ) ? $b_fields[0] : q{}; $b_key =~ s/^\s+|\s+$//g;
+    if ( $a_key =~ /^\d+(?:[.]\d+)?$/msx ) { $a_num = $a_key; }
+    if ( $b_key =~ /^\d+(?:[.]\d+)?$/msx ) { $b_num = $b_key; }
+    $a_num <=> $b_num || $a cmp $b
+    } @sort_lines_141_3;
+    @sort_sorted_141_3 = reverse @sort_sorted_141_3;
+    my $output_141_3 = join "\n", @sort_sorted_141_3;
+    if ($output_141_3 ne q{} && !($output_141_3 =~ m{\n\z}msx)) {
+    $output_141_3 .= "\n";
+    }
+    $output_141 = $output_141_3;
+    $output_141 = $output_141_3;
+    if ($output_141 ne q{} && !defined $output_printed_141) {
+        print $output_141;
+        if (!($output_141 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_141 ) { $main_exit_code = 1; }
+    }
+print "\n";
+$CHILD_ERROR = 0;
+# Original bash: find . -name "*.sh" | xargs grep -l "function"  | tr -d "\\\\/"
+{
+    my $output_142 = q{};
+    my $output_printed_142;
+    my $pipeline_success_142 = 1;
+        $output_142 = do {
+    use File::Find;
+    use File::Basename;
+    my @files_143 = ();
+    my $start_143 = q{.};
+    find( sub {
+    my $file_143 = $File::Find::name;
+    if ( !( basename($file_143) =~ m/^.*.sh$/xms ) ) {
+    return;
+    }
+    push @files_143, $file_143;
+    },
+    $start_143 );
+    join "\n", @files_143;
+    };
+
+        my @xargs_files_142_1 = split /\n/msx, $output_142;
+    my @xargs_matching_files_142_1;
+    foreach my $file (@xargs_files_142_1) {
+    next if !($file && -f $file);
+    if (open my $fh, '<', $file) {
+    my $xargs_found_142_1 = 0;
+    while (my $line = <$fh>) {
+    if ($line =~ /function/msx) {
+    $xargs_found_142_1 = 1;
+    last;
+    }
+    }
+    close $fh or carp "Close failed: $OS_ERROR";
+    if ($xargs_found_142_1) { push @xargs_matching_files_142_1, $file; }
+    }
+    }
+    my $xargs_result_142_1 = join "\n", @xargs_matching_files_142_1;
+    if (!($xargs_result_142_1 =~ m{\n\z}msx)) {
+    $xargs_result_142_1 .= "\n";
+    }
+    $output_142 = $xargs_result_142_1;
+
+        my $set1_144 = "\\\\/";
+    my $input_144 = $output_142;
+    my $tr_result_142_2 = q{};
+    for my $char ( split //msx, $input_144 ) {
+    if ( (index $set1_144, $char) == -1 ) {
+    $tr_result_142_2 .= $char;
+    }
+    }
+    if (!($tr_result_142_2 =~ m{\n\z}msx || $tr_result_142_2 eq q{})) {
+    $tr_result_142_2 .= "\n";
+    }
+    $output_142 = $tr_result_142_2;
+    $output_142 = $tr_result_142_2;
+    if ($output_142 ne q{} && !defined $output_printed_142) {
+        print $output_142;
+        if (!($output_142 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_142 ) { $main_exit_code = 1; }
+    }
+print "\n";
+$CHILD_ERROR = 0;
+# Original bash: cat file.txt | tr 'a' 'b' | grep 'hello'
+{
+    my $output_145 = q{};
+    my $output_printed_145;
+    my $pipeline_success_145 = 1;
+        $output_145 = do { open my $fh, '<', 'file.txt' or die 'cat: ' . 'file.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; };
+    if ($output_145 eq q{}) {
+        $pipeline_success_145 = 0;
+    }
+
+        my $set1_146 = q{a};
+    my $set2_146 = q{b};
+    my $input_146 = $output_145;
+    # Expand character ranges for tr command
+    my $expanded_set1_146 = $set1_146;
+    my $expanded_set2_146 = $set2_146;
+    # Handle a-z range in set1
+    if ($expanded_set1_146 =~ /a-z/msx) {
+    $expanded_set1_146 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+    }
+    # Handle A-Z range in set1
+    if ($expanded_set1_146 =~ /A-Z/msx) {
+    $expanded_set1_146 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    # Handle a-z range in set2
+    if ($expanded_set2_146 =~ /a-z/msx) {
+    $expanded_set2_146 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+    }
+    # Handle A-Z range in set2
+    if ($expanded_set2_146 =~ /A-Z/msx) {
+    $expanded_set2_146 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    my $tr_result_145_1 = q{};
+    for my $char ( split //msx, $input_146 ) {
+    my $pos_146 = index $expanded_set1_146, $char;
+    if ( $pos_146 >= 0 && $pos_146 < length $expanded_set2_146 ) {
+    $tr_result_145_1 .= substr $expanded_set2_146, $pos_146, 1;
+    } else {
+    $tr_result_145_1 .= $char;
+    }
+    }
+    if (!($tr_result_145_1 =~ m{\n\z}msx || $tr_result_145_1 eq q{})) {
+    $tr_result_145_1 .= "\n";
+    }
+    $output_145 = $tr_result_145_1;
+    $output_145 = $tr_result_145_1;
+
+        my $grep_result_145_2;
+    my @grep_lines_145_2 = split /\n/msx, $output_145;
+    my @grep_filtered_145_2 = grep { /hello/msx } @grep_lines_145_2;
+    $grep_result_145_2 = join "\n", @grep_filtered_145_2;
+    if (!($grep_result_145_2 =~ m{\n\z}msx || $grep_result_145_2 eq q{})) {
+    $grep_result_145_2 .= "\n";
+    }
+    $CHILD_ERROR = scalar @grep_filtered_145_2 > 0 ? 0 : 1;
+    $output_145 = $grep_result_145_2;
+    $output_145 = $grep_result_145_2;
+    if ((scalar @grep_filtered_145_2) == 0) {
+        $pipeline_success_145 = 0;
+    }
+    if ($output_145 ne q{} && !defined $output_printed_145) {
+        print $output_145;
+        if (!($output_145 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_145 ) { $main_exit_code = 1; }
+    }
+print "\n";
+$CHILD_ERROR = 0;
+{
+    my $output_147 = q{};
+    my $output_printed_147;
+    my $pipeline_success_147 = 1;
+        $output_147 = do { open my $fh, '<', 'file.txt' or die 'cat: ' . 'file.txt' . ': ' . $OS_ERROR . "\n"; local $INPUT_RECORD_SEPARATOR = undef; my $chunk = <$fh>; close $fh or die 'cat: close failed: ' . $OS_ERROR . "\n"; $chunk; };
+    if ($output_147 eq q{}) {
+        $pipeline_success_147 = 0;
+    }
+
+        my @sort_lines_147_1 = split /\n/msx, $output_147;
+    my @sort_sorted_147_1 = sort @sort_lines_147_1;
+    my $output_147_1 = join "\n", @sort_sorted_147_1;
+    if ($output_147_1 ne q{} && !($output_147_1 =~ m{\n\z}msx)) {
+    $output_147_1 .= "\n";
+    }
+    $output_147 = $output_147_1;
+    $output_147 = $output_147_1;
+
+        my $grep_result_147_2;
+    my @grep_lines_147_2 = split /\n/msx, $output_147;
+    my @grep_filtered_147_2 = grep { /hello/msx } @grep_lines_147_2;
+    $grep_result_147_2 = join "\n", @grep_filtered_147_2;
+    if (!($grep_result_147_2 =~ m{\n\z}msx || $grep_result_147_2 eq q{})) {
+    $grep_result_147_2 .= "\n";
+    }
+    $CHILD_ERROR = scalar @grep_filtered_147_2 > 0 ? 0 : 1;
+    $output_147 = $grep_result_147_2;
+    $output_147 = $grep_result_147_2;
+    if ((scalar @grep_filtered_147_2) == 0) {
+        $pipeline_success_147 = 0;
+    }
+    if ($output_147 ne q{} && !defined $output_printed_147) {
+        print $output_147;
+        if (!($output_147 =~ m{\n\z}msx)) {
+            print "\n";
+        }
+    }
+    if ( !$pipeline_success_147 ) { $main_exit_code = 1; }
+    }
+
+exit $main_exit_code;

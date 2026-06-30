@@ -8,7 +8,7 @@ use File::Path qw(make_path remove_tree);
 use File::Spec;
 use Cwd qw(abs_path getcwd);
 use Time::HiRes qw(time);
-use POSIX qw(WIFEXITED WEXITSTATUS);
+use POSIX qw(:sys_wait_h WIFEXITED WEXITSTATUS);
 
 # Command line options
 # By default keep output minimal — only failures and concise pass lines.
@@ -176,43 +176,38 @@ sub run_system_with_timeout {
     debug_print(3, "Command: $command");
     my $start_time = time();
     
-    my $result;
+    my $pid = fork();
+    return -1 unless defined $pid;
     
-    if ($^O eq 'MSWin32') {
-        # Use PowerShell timeout on Windows
-        my $ps_command = "powershell.exe -ExecutionPolicy Bypass -File \"ps_timeout.ps1\" -TimeoutSeconds $timeout -Command \"$command\" -Description \"$description\" 2>&1";
-        $result = system($ps_command);
-        
-        # Check if it was a timeout (exit code 124)
-        if ($result == 124) {
-            debug_print(1, "TIMEOUT after ${timeout}s for $description");
-            return -1;
-        }
-    } else {
-        # Use alarm for timeout on Unix systems
-        local $SIG{ALRM} = sub { 
-            debug_print(1, "TIMEOUT after ${timeout}s for $description");
-            die "Timeout after ${timeout}s for $description\n";
-        };
-        
-        eval {
-            alarm($timeout);
-            $result = system($command);
-            alarm(0);
-        };
-        
-        if ($@) {
-            alarm(0);
-            my $duration = time() - $start_time;
-            debug_print(1, "$description failed after ${duration}s: $@");
-            return -1;
-        }
+    if ($pid == 0) {
+        exec('/bin/sh', '-c', $command);
+        exit(1);
+    }
+    
+    # Poll for completion with timeout
+    my $timed_out = 0;
+    my $deadline = time() + $timeout;
+    while (1) {
+        my $remaining = $deadline - time();
+        if ($remaining <= 0) { $timed_out = 1; last; }
+        my $kid = waitpid($pid, WNOHANG);
+        last if $kid == $pid;
+        Time::HiRes::sleep(0.05);
+    }
+    
+    if ($timed_out) {
+        debug_print(1, "TIMEOUT after ${timeout}s for $description");
+        kill('TERM', $pid);
+        Time::HiRes::sleep(0.2);
+        kill('KILL', $pid) if kill(0, $pid);
+        waitpid($pid, 0);
+        return -1;
     }
     
     my $end_time = time();
     my $duration = $end_time - $start_time;
+    my $exit_code = $? >> 8;
     
-    my $exit_code = $result >> 8;
     debug_print(2, "$description completed in ${duration}s (exit code: $exit_code)");
     if ($duration > $timeout * 0.8) {
         debug_print(1, "WARNING: $description took ${duration}s (${timeout}s timeout) - may need longer timeout");
@@ -229,45 +224,41 @@ sub run_backticks_with_timeout {
     debug_print(3, "Command: $command");
     my $start_time = time();
     
-    # Windows-compatible timeout using PowerShell
-    my $result;
-    my $exit_code;
+    my $pid = open(my $fh, '-|', '/bin/sh', '-c', $command);
+    return (undef, -1) unless defined $pid;
     
-    if ($^O eq 'MSWin32') {
-        # Use PowerShell timeout on Windows
-        my $ps_command = "powershell.exe -ExecutionPolicy Bypass -File \"ps_timeout.ps1\" -TimeoutSeconds $timeout -Command \"$command\" -Description \"$description\" 2>&1";
-        $result = `$ps_command`;
-        $exit_code = $? >> 8;
-        
-        # Check if it was a timeout (exit code 124)
-        if ($exit_code == 124) {
-            debug_print(1, "TIMEOUT after ${timeout}s for $description");
-            return (undef, -1);
-        }
-    } else {
-        # Use alarm for timeout on Unix systems
-        local $SIG{ALRM} = sub { 
-            debug_print(1, "TIMEOUT after ${timeout}s for $description");
-            die "Timeout after ${timeout}s for $description\n";
-        };
-        
-        eval {
-            alarm($timeout);
-            $result = `$command`;
-            alarm(0);
-        };
-        
-        if ($@) {
-            alarm(0);
-            my $duration = time() - $start_time;
-            debug_print(1, "$description failed after ${duration}s: $@");
-            return (undef, -1);
-        }
-        $exit_code = $? >> 8;
+    my $result = '';
+    my $timed_out = 0;
+    my $deadline = time() + $timeout;
+    while (1) {
+        my $remaining = $deadline - time();
+        if ($remaining <= 0) { $timed_out = 1; last; }
+        my $rin = '';
+        vec($rin, fileno($fh), 1) = 1;
+        my $nfound = select($rin, undef, undef, $remaining);
+        if ($nfound <= 0) { $timed_out = 1; last; }
+        my $buf;
+        my $read = sysread($fh, $buf, 8192);
+        last unless defined $read && $read > 0;
+        $result .= $buf;
+    }
+    
+    close($fh);
+    
+    if ($timed_out) {
+        debug_print(1, "TIMEOUT after ${timeout}s for $description");
+        kill('TERM', $pid);
+        Time::HiRes::sleep(0.2);
+        kill('KILL', $pid) if kill(0, $pid);
+        waitpid($pid, 0);
+        my $duration = time() - $start_time;
+        debug_print(1, "$description failed after ${duration}s: TIMEOUT");
+        return (undef, -1);
     }
     
     my $end_time = time();
     my $duration = $end_time - $start_time;
+    my $exit_code = $? >> 8;
     
     debug_print(2, "$description completed in ${duration}s (exit code: $exit_code)");
     if ($duration > $timeout * 0.8) {

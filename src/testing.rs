@@ -14,7 +14,7 @@ use crate::utils::{
     check_perl_must_contain, check_perl_must_not_contain, check_perl_no_open3_builtins,
     check_perl_no_system_builtins, check_perl_no_system_calls, cleanup_tmp, generate_unified_diff,
 };
-use debashl::parser::ParserError;
+// use debashl::parser::ParserError;
 use debashl::shared_utils;
 use debashl::{lexer::Token, Generator, Lexer, Parser};
 
@@ -865,8 +865,11 @@ pub fn test_file_equivalence_detailed_with_critic(
 
         let (tmp, run_cmd_vec, code) = match lang {
             "perl" => {
-                let mut gen = Generator::new();
-                let code = gen.generate(&commands);
+                let commands_for_gen = commands.clone();
+                let code = execute_with_timeout(OperationType::CodeGeneration, move || {
+                    let mut gen = Generator::new();
+                    Ok(gen.generate(&commands_for_gen))
+                })?;
 
                 // Create examples.out directory if it doesn't exist
                 if let Err(_) = fs::create_dir_all("examples.out") {

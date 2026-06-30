@@ -107,7 +107,7 @@ pub fn parse_to_perl(input: &str) {
 }
 
 pub fn parse_to_perl_inline(input: &str) {
-    let mut generator = Generator::new_inline();
+    let mut generator = Generator::new_inline_mode();
 
     if debashl::debug::is_debug_enabled() {
         println!("Converting to inline Perl:");
@@ -158,7 +158,7 @@ pub fn parse_system_to_perl(input: &str) {
 }
 
 pub fn parse_backticks_to_perl(input: &str) {
-    let mut generator = Generator::new_inline();
+    let mut generator = Generator::new_inline_mode();
 
     println!("Converting backticks command to Perl:");
     println!("{}", "=".repeat(50));
