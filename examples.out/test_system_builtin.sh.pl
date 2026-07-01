@@ -13,7 +13,6 @@ our $CHILD_ERROR;
 
 $PROGRAM_NAME = 'test_system_builtin.sh';
 print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
-my $result2 = do { my $command = q{find . -name '*.txt'}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
 my $result1 = do {
     my @ls_files_343 = ();
     if ( -f q{.} ) {
@@ -31,6 +30,7 @@ my $result1 = do {
     @ls_files_343 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_343;
     (@ls_files_343 ? join("\n", @ls_files_343) . "\n" : q{});
 };
+my $result2 = do { my $command = q{find . -name '*.txt'}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
 print "Results:\n";
 print $result1;
 if ( !( ($result1) =~ m{\n\z}msx ) ) { print "\n"; }

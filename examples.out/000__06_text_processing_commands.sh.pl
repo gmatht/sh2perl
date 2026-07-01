@@ -13,8 +13,8 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__06_text_processing_commands.sh';
-my $MAGIC_5 = 5;
 my $MAGIC_3 = 3;
+my $MAGIC_5 = 5;
 
 print "=== Text Processing Commands ===\n";
 my $file_content = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
@@ -181,43 +181,43 @@ my $uniq_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
 print "Unique words:\n";
 print $uniq_result;
 if ( !( ($uniq_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $word_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $line_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_122 = q{};
     my $output_printed_122;
     my $pipeline_success_122 = 1;
-    $output_122 .= 'Hello World' . "\n";
+    $output_122 .= "line1\nline2\nline3";
     if ( !($output_122 =~ m{\n\z}msx) ) { $output_122 .= "\n"; }
     $CHILD_ERROR = 0;
     if ($CHILD_ERROR != 0) { $pipeline_success_122 = 0; }
     use IPC::Open3;
-    my @wc_args_122_1 = ('-w');
+    my @wc_args_122_1 = ('-l');
     my ($wc_in_122_1, $wc_out_122_1, $wc_err_122_1);
     my $wc_pid_122_1 = open3($wc_in_122_1, $wc_out_122_1, $wc_err_122_1, 'wc', @wc_args_122_1);
     print {$wc_in_122_1} $output_122;
     close $wc_in_122_1 or die "Close failed: $OS_ERROR\n";
     $output_122 = do { local $/ = undef; <$wc_out_122_1> };
+    if ($output_122 eq q{}) { $output_122 = "0\n"; }
     close $wc_out_122_1 or die "Close failed: $OS_ERROR\n";
     waitpid $wc_pid_122_1, 0;
     if ( !$pipeline_success_122 ) { $main_exit_code = 1; }
     $output_122 =~ s/\n+\z//msx;
     $output_122;
 }; $_pipeline_result; };
-my $line_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $word_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_123 = q{};
     my $output_printed_123;
     my $pipeline_success_123 = 1;
-    $output_123 .= "line1\nline2\nline3";
+    $output_123 .= 'Hello World' . "\n";
     if ( !($output_123 =~ m{\n\z}msx) ) { $output_123 .= "\n"; }
     $CHILD_ERROR = 0;
     if ($CHILD_ERROR != 0) { $pipeline_success_123 = 0; }
     use IPC::Open3;
-    my @wc_args_123_1 = ('-l');
+    my @wc_args_123_1 = ('-w');
     my ($wc_in_123_1, $wc_out_123_1, $wc_err_123_1);
     my $wc_pid_123_1 = open3($wc_in_123_1, $wc_out_123_1, $wc_err_123_1, 'wc', @wc_args_123_1);
     print {$wc_in_123_1} $output_123;
     close $wc_in_123_1 or die "Close failed: $OS_ERROR\n";
     $output_123 = do { local $/ = undef; <$wc_out_123_1> };
-    if ($output_123 eq q{}) { $output_123 = "0\n"; }
     close $wc_out_123_1 or die "Close failed: $OS_ERROR\n";
     waitpid $wc_pid_123_1, 0;
     if ( !$pipeline_success_123 ) { $main_exit_code = 1; }
