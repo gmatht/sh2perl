@@ -13,7 +13,11 @@ pub struct SourceSpan {
 
 impl SourceSpan {
     pub fn new(start: usize, end: usize, original_text: String) -> Self {
-        Self { start, end, original_text }
+        Self {
+            start,
+            end,
+            original_text,
+        }
     }
 }
 
@@ -24,8 +28,8 @@ pub enum Command {
     ShoptCommand(ShoptCommand),
     TestExpression(TestExpression),
     Pipeline(Pipeline),
-    And(Box<Command>, Box<Command>),      // left && right
-    Or(Box<Command>, Box<Command>),       // left || right
+    And(Box<Command>, Box<Command>), // left && right
+    Or(Box<Command>, Box<Command>),  // left || right
     If(IfStatement),
     Case(CaseStatement),
     While(WhileLoop),
@@ -35,10 +39,11 @@ pub enum Command {
     Background(Box<Command>),
     Block(Block),
     Redirect(RedirectCommand),
-    Assignment(Assignment),               // Variable assignment like i=value
-    Break(Option<String>),      // Optional loop level
-    Continue(Option<String>),   // Optional loop level
-    Return(Option<Word>),       // Optional return value
+    Assignment(Assignment), // Variable assignment like i=value
+    CStyleFor(CStyleForLoop),
+    Break(Option<String>),    // Optional loop level
+    Continue(Option<String>), // Optional loop level
+    Return(Option<Word>),     // Optional return value
     BlankLine,
 }
 
@@ -48,8 +53,8 @@ pub struct SimpleCommand {
     pub args: Vec<Word>,
     pub redirects: Vec<Redirect>,
     pub env_vars: HashMap<String, Word>,
-    pub stdout_used: bool,  // true if stdout is not redirected to /dev/null
-    pub stderr_used: bool,  // true if stderr is not redirected to /dev/null
+    pub stdout_used: bool, // true if stdout is not redirected to /dev/null
+    pub stderr_used: bool, // true if stderr is not redirected to /dev/null
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -58,8 +63,8 @@ pub struct BuiltinCommand {
     pub args: Vec<Word>,
     pub redirects: Vec<Redirect>,
     pub env_vars: HashMap<String, Word>,
-    pub stdout_used: bool,  // true if stdout is not redirected to /dev/null
-    pub stderr_used: bool,  // true if stderr is not redirected to /dev/null
+    pub stdout_used: bool, // true if stdout is not redirected to /dev/null
+    pub stderr_used: bool, // true if stderr is not redirected to /dev/null
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -72,8 +77,8 @@ pub struct ShoptCommand {
 pub struct Pipeline {
     pub commands: Vec<Command>,
     pub source_text: Option<String>, // Original bash command text for comments
-    pub stdout_used: bool,  // true if stdout is not redirected to /dev/null
-    pub stderr_used: bool,  // true if stderr is not redirected to /dev/null
+    pub stdout_used: bool,           // true if stdout is not redirected to /dev/null
+    pub stderr_used: bool,           // true if stderr is not redirected to /dev/null
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -109,6 +114,13 @@ pub struct ForLoop {
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CStyleForLoop {
+    /// The raw content inside `(( ... ))`, e.g. `"i=0; i<10; i++"`
+    pub arith_content: String,
+    pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Function {
     pub name: String,
     pub parameters: Vec<String>,
@@ -135,11 +147,11 @@ pub struct Assignment {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum AssignmentOperator {
-    Assign,      // =
-    PlusAssign,  // +=
-    MinusAssign, // -=
-    StarAssign,  // *=
-    SlashAssign, // /=
+    Assign,        // =
+    PlusAssign,    // +=
+    MinusAssign,   // -=
+    StarAssign,    // *=
+    SlashAssign,   // /=
     PercentAssign, // %=
 }
 
@@ -153,18 +165,18 @@ pub struct Redirect {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum RedirectOperator {
-    Input,     // <
-    Output,    // >
-    Append,    // >>
-    InputOutput, // <>
-    Heredoc,   // <<
-    HeredocTabs, // <<-
-    HereString, // <<<
+    Input,                                   // <
+    Output,                                  // >
+    Append,                                  // >>
+    InputOutput,                             // <>
+    Heredoc,                                 // <<
+    HeredocTabs,                             // <<-
+    HereString,                              // <<<
     ProcessSubstitutionInput(Box<Command>),  // <(command)
     ProcessSubstitutionOutput(Box<Command>), // >(command)
-    StderrOutput,    // 2>
-    StderrAppend,    // 2>>
-    StderrInput,     // 2<
+    StderrOutput,                            // 2>
+    StderrAppend,                            // 2>>
+    StderrInput,                             // 2<
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
