@@ -53,9 +53,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
 
                     // Initialize environment variables to empty strings to avoid Perl warnings
                     // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
-                    output.push_str(
-                        "if (!defined $ENV{SHELL_VAR}) { $ENV{SHELL_VAR} = q{}; }\n",
-                    );
+                    output.push_str("if (!defined $ENV{SHELL_VAR}) { $ENV{SHELL_VAR} = q{}; }\n");
 
                     eprintln!("DEBUG: About to execute perl code lines");
                     // Execute the perl code - split by newlines and add proper indentation

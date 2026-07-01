@@ -269,10 +269,7 @@ pub fn generate_command_impl_with_input(
                                         unique_id, unique_id
                                     ));
                                     result.push_str(&generator.indent());
-                                    result.push_str(&format!(
-                                        "    print $output_{};\n",
-                                        unique_id
-                                    ));
+                                    result.push_str(&format!("    print $output_{};\n", unique_id));
                                     result.push_str(&generator.indent());
                                     result.push_str(&format!("}}\n"));
                                 }

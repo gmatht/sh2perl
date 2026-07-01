@@ -79,7 +79,7 @@ fn translate_awk_print_args(
     rem: &str,
     acc_vars: &HashSet<String>,
     generator: &mut Generator,
-    ) -> Vec<String> {
+) -> Vec<String> {
     // Split on commas while respecting quoted strings, then translate each
     // argument as a complete expression (handles arithmetic like $1 + $2).
     let mut parts: Vec<String> = Vec::new();
