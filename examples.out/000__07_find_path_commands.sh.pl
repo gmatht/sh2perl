@@ -8,30 +8,13 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $found_files;
-$found_files = do {
-    use File::Find;
-    use File::Basename;
-    my @files_137 = ();
-    my $start_137 = q{.};
-
-    find( sub {
-        my $file_137 = $File::Find::name;
-        if ( !( -f $file_137 ) ) {
-            return;
-        }
-        if ( !( basename($file_137) =~ m/^.*.sh$/xms ) ) {
-            return;
-        }
-        push @files_137, $file_137;
-    },
-    $start_137 );
-    join "\n", @files_137;
-};
+$PROGRAM_NAME = '000__07_find_path_commands.sh';
+my $found_files = do { my $command = q{find . -name '*.sh' -type f}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
 print "Found shell scripts:\n";
 print $found_files;
-if ( !( $found_files =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($found_files) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;

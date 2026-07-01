@@ -8,12 +8,14 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $MAGIC_30 = 30;
+$PROGRAM_NAME = '014_ansi_quoting.sh';
 my $MAGIC_25 = 25;
+my $MAGIC_30 = 30;
 
-$SIG{__DIE__} = sub { exit 1 };
+$__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== ANSI-C quoting ==\n";
@@ -38,8 +40,8 @@ $CHILD_ERROR = 0;
 print 'Hello' . "\n";
 $CHILD_ERROR = 0;
 print "== Practical examples ==\n";
-printf("%-10s %-10s %s\nName", "Age", "City");
-printf("%-10s %-10s %s\nJohn", "25", "NYC");
-printf("%-10s %-10s %s\nJane", "30", "LA");
+printf("%-10s %-10s %s\n", "Name", "Age", "City");
+printf("%-10s %-10s %s\n", "John", "25", "NYC");
+printf("%-10s %-10s %s\n", "Jane", "30", "LA");
 
 exit $main_exit_code;

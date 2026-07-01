@@ -8,12 +8,14 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '002_control_flow.sh';
 my $i = 0;
 
-my $MAGIC_10   = 10;
 my $MAX_LOOP_5 = 5;
+my $MAGIC_10   = 10;
 
 if ((-f"file.txt")) {
     print "File exists\n";

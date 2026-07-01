@@ -10,9 +10,11 @@ use POSIX qw(time);
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$SIG{__DIE__} = sub { exit 1 };
+$PROGRAM_NAME = '011_brace_expansion.sh';
+$__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== Basic brace expansion ==\n";
@@ -105,70 +107,71 @@ else {
           ": $ERRNO\n";
     }
 }
-my @ls_files_158 = ();
-my $ls_all_found_159 = 1;
-my @ls_inputs_160 = ();
-my @ls_glob_ls_inputs_160_0 = glob('file_*.txt');
-if ( !@ls_glob_ls_inputs_160_0 ) {
-    push @ls_inputs_160, 'file_*.txt';
-    $ls_all_found_159 = 0;
+my @ls_files_153 = ();
+my $ls_all_found_154 = 1;
+my @ls_inputs_155 = ();
+my @ls_glob_ls_inputs_155_0 = glob('file_*.txt');
+if ( !@ls_glob_ls_inputs_155_0 ) {
+    push @ls_inputs_155, 'file_*.txt';
+    $ls_all_found_154 = 0;
 } else {
-    push @ls_inputs_160, @ls_glob_ls_inputs_160_0;
+    push @ls_inputs_155, @ls_glob_ls_inputs_155_0;
 }
-my @ls_files_161 = ();
-my @ls_dirs_162 = ();
-my $ls_show_headers_163 = scalar(@ls_inputs_160) > 1;
-for my $ls_item_164 (@ls_inputs_160) {
-    if ( -f $ls_item_164 ) {
-        push @ls_files_161, $ls_item_164;
+my @ls_files_156 = ();
+my @ls_dirs_157 = ();
+my $ls_show_headers_158 = scalar(@ls_inputs_155) > 1;
+for my $ls_item_159 (@ls_inputs_155) {
+    if ( -f $ls_item_159 ) {
+        push @ls_files_156, $ls_item_159;
     }
-    elsif ( -d $ls_item_164 ) {
-        push @ls_dirs_162, $ls_item_164;
+    elsif ( -d $ls_item_159 ) {
+        push @ls_dirs_157, $ls_item_159;
     }
     else {
-        $ls_all_found_159 = 0;
+        $ls_all_found_154 = 0;
     }
 }
-@ls_files_161 = sort { $a cmp $b } @ls_files_161;
-@ls_dirs_162 = sort { $a cmp $b } @ls_dirs_162;
-if (@ls_files_161) {
-    push @ls_files_158, join("\n", @ls_files_161);
+@ls_files_156 = sort { $a cmp $b } @ls_files_156;
+@ls_dirs_157 = sort { $a cmp $b } @ls_dirs_157;
+if (@ls_files_156) {
+    push @ls_files_153, join("\n", @ls_files_156);
 }
-for my $ls_dir_165 (@ls_dirs_162) {
-    my @ls_dir_entries_166 = ();
-    if ( opendir my $dh, $ls_dir_165 ) {
+for my $ls_dir_160 (@ls_dirs_157) {
+    my @ls_dir_entries_161 = ();
+    if ( opendir my $dh, $ls_dir_160 ) {
         while ( my $file = readdir $dh ) {
             next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-            push @ls_dir_entries_166, $file;
+            push @ls_dir_entries_161, $file;
         }
         closedir $dh;
-        @ls_dir_entries_166 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_dir_entries_166;
-        if ( $ls_show_headers_163 ) {
-            if ( @ls_dir_entries_166 ) {
-                push @ls_files_158, $ls_dir_165 . ":\n" . join("\n", @ls_dir_entries_166);
+        @ls_dir_entries_161 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_161;
+        if ( $ls_show_headers_158 ) {
+            if ( @ls_dir_entries_161 ) {
+                push @ls_files_153, $ls_dir_160 . ":\n" . join("\n", @ls_dir_entries_161);
             } else {
-                push @ls_files_158, $ls_dir_165 . ':';
+                push @ls_files_153, $ls_dir_160 . ':';
             }
         }
-        elsif ( @ls_dir_entries_166 ) {
-            push @ls_files_158, join("\n", @ls_dir_entries_166);
+        elsif ( @ls_dir_entries_161 ) {
+            push @ls_files_153, join("\n", @ls_dir_entries_161);
         }
     }
     else {
-        $ls_all_found_159 = 0;
+        $ls_all_found_154 = 0;
     }
 }
-if (@ls_files_158) {
-    print join "\n", @ls_files_158;
+if (@ls_files_153) {
+    print join "\n", @ls_files_153;
     print "\n";
 }
-if ( $ls_all_found_159 ) {
+if ( $ls_all_found_154 ) {
     local $CHILD_ERROR = 0;
     $ls_success = 1;
 }
 else {
     local $CHILD_ERROR = 2;
     $ls_success = 0;
+    $main_exit_code = $CHILD_ERROR;
 }
 my @files_to_remove = glob("file_*.txt");
 foreach my $file_to_remove (@files_to_remove) {
@@ -181,14 +184,14 @@ foreach my $file_to_remove (@files_to_remove) {
             if ( unlink $file_to_remove ) {
             }
             else {
-                $CHILD_ERROR = 1;
+                local $CHILD_ERROR = 1;
                 croak "rm: cannot remove ", $file_to_remove,
     ": $OS_ERROR\n";
             }
         }
     }
     else {
-        $CHILD_ERROR = 1;
+        local $CHILD_ERROR = 1;
         croak "rm: ", $file_to_remove,
     ": No such file or directory\n";
     }

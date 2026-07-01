@@ -1,0 +1,2941 @@
+use crate::ast::*;
+use crate::lexer::{Lexer, Token};
+use crate::parser::commands::Parser;
+use crate::parser::errors::ParserError;
+use crate::parser::redirects::parse_redirect;
+use crate::parser::utilities::ParserUtilities;
+use std::collections::HashMap;
+
+fn parse_at_prefixed_word(lexer: &mut Lexer) -> Option<Word> {
+    if !matches!(lexer.peek(), Some(Token::At)) {
+        return None;
+    }
+
+    let mut combined = String::new();
+    while matches!(
+        lexer.peek(),
+        Some(Token::At) | Some(Token::Dollar) | Some(Token::Identifier) | Some(Token::Number)
+    ) {
+        if let Some(text) = lexer.get_current_text() {
+            combined.push_str(&text);
+            lexer.next();
+        } else {
+            break;
+        }
+    }
+
+    if combined.is_empty() {
+        None
+    } else {
+        lexer.skip_inline_whitespace_and_comments();
+        Some(Word::Literal(combined, None))
+    }
+}
+
+fn plain_text_of_word(word: &Word) -> Option<String> {
+    match word {
+        Word::Literal(text, _) => Some(text.clone()),
+        Word::StringInterpolation(interp, _) => {
+            let mut text = String::new();
+            for part in &interp.parts {
+                if let StringPart::Literal(s) = part {
+                    text.push_str(s);
+                } else {
+                    return None;
+                }
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
+    match word {
+        Word::Literal(text, _) => {
+            text.push_str(fragment);
+            true
+        }
+        Word::StringInterpolation(interp, _) => {
+            if let Some(StringPart::Literal(last)) = interp.parts.last_mut() {
+                last.push_str(fragment);
+            } else {
+                interp.parts.push(StringPart::Literal(fragment.to_string()));
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn merge_contiguous_quoted_fragments(
+    lexer: &mut Lexer,
+    word: &mut Word,
+) -> Result<(), ParserError> {
+    loop {
+        let prev_end = match lexer.tokens.get(lexer.current.saturating_sub(1)) {
+            Some((_, _, end)) => *end,
+            None => break,
+        };
+        let next_start = match lexer.tokens.get(lexer.current) {
+            Some((_, start, _)) => *start,
+            None => break,
+        };
+
+        if next_start != prev_end {
+            break;
+        }
+
+        let fragment = match lexer.peek() {
+            Some(Token::SingleQuotedString) => {
+                let text = lexer.get_string_text()?;
+                strip_outer_quotes(&text)
+            }
+            Some(Token::DoubleQuotedString) => {
+                let fragment_word = parse_string_interpolation(lexer)?;
+                match plain_text_of_word(&fragment_word) {
+                    Some(text) => text,
+                    None => break,
+                }
+            }
+            Some(Token::DollarSingleQuotedString) => match parse_ansic_quoted_string(lexer)? {
+                Word::Literal(text, _) => text,
+                _ => break,
+            },
+            _ => break,
+        };
+
+        if !append_plain_text(word, &fragment) {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn strip_outer_quotes(text: &str) -> String {
+    if (text.starts_with('"') && text.ends_with('"'))
+        || (text.starts_with('\'') && text.ends_with('\''))
+    {
+        text[1..text.len() - 1].to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    // Handle backtick command substitution first
+    if matches!(lexer.peek(), Some(Token::BacktickChar)) {
+        eprintln!("DEBUG: Found backtick in parse_word");
+        lexer.next(); // consume the opening backtick
+        let mut cmd_content = String::new();
+        while let Some(token) = lexer.peek() {
+            match token {
+                Token::BacktickChar => {
+                    lexer.next(); // consume the closing backtick
+                    break;
+                }
+                _ => {
+                    if let Some(text) = lexer.get_current_text() {
+                        cmd_content.push_str(&text);
+                    }
+                    lexer.next();
+                }
+            }
+        }
+        eprintln!("DEBUG: Backtick content: '{}'", cmd_content);
+        // Parse the command content
+        match crate::parser::commands::parse_pipeline_from_text(&cmd_content) {
+            Ok(command) => {
+                eprintln!("DEBUG: Successfully parsed backtick command: {:?}", command);
+                return Ok(Word::CommandSubstitution(Box::new(command), None));
+            }
+            Err(e) => {
+                eprintln!(
+                    "DEBUG: Failed to parse backtick command '{}': {:?}",
+                    cmd_content, e
+                );
+                return Ok(Word::Literal(format!("`{}`", cmd_content), None));
+            }
+        }
+    }
+
+    if let Some(word) = parse_at_prefixed_word(lexer) {
+        return Ok(word);
+    }
+
+    // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
+    // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
+    // and also handles find arguments like "+1M" by combining Plus + Number + Identifier
+    if matches!(
+        lexer.peek(),
+        Some(Token::Identifier)
+            | Some(Token::Number)
+            | Some(Token::Float)
+            | Some(Token::PaddedNumber)
+            | Some(Token::Slash)
+            | Some(Token::Dot)
+            | Some(Token::Range)
+            | Some(Token::Plus)
+            | Some(Token::Minus)
+            | Some(Token::Escape)
+            | Some(Token::Colon)
+            | Some(Token::Star)
+            | Some(Token::Percent)
+            | Some(Token::Comma)
+    ) {
+        let mut combined = String::new();
+        loop {
+            match lexer.peek() {
+                Some(Token::Identifier)
+                | Some(Token::Number)
+                | Some(Token::Float)
+                | Some(Token::PaddedNumber)
+                | Some(Token::Slash)
+                | Some(Token::Dot)
+                | Some(Token::Range)
+                | Some(Token::Plus)
+                | Some(Token::Minus)
+                | Some(Token::Escape)
+                | Some(Token::Colon)
+                | Some(Token::Star)
+                | Some(Token::Percent)
+                | Some(Token::Comma) => {
+                    // Append raw token text and consume
+                    if let Some(text) = lexer.get_current_text() {
+                        combined.push_str(&text);
+                        lexer.next();
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        // Skip inline whitespace after consuming the word
+        lexer.skip_inline_whitespace_and_comments();
+        return Ok(Word::Literal(combined, None));
+    }
+
+    let result = match lexer.peek() {
+        Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?, None)),
+        Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
+        Some(Token::Float) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
+        Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
+        Some(Token::DoubleQuotedString) => {
+            // Always parse as string interpolation for double-quoted strings
+            // This handles both strings and strings with variables
+            Ok(parse_string_interpolation(lexer)?)
+        }
+        Some(Token::SingleQuotedString) => {
+            let quoted_text = lexer.get_string_text()?;
+            // Strip the outer quotes from single-quoted strings
+            let content = if quoted_text.starts_with("'") && quoted_text.ends_with("'") {
+                quoted_text[1..quoted_text.len() - 1].to_string()
+            } else {
+                quoted_text
+            };
+            Ok(Word::Literal(content, None))
+        }
+        Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
+        Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
+        Some(Token::DollarDoubleQuotedString) => Ok(parse_string_interpolation(lexer)?),
+        Some(Token::BraceOpen) => Ok(parse_brace_expansion(lexer)?),
+        Some(Token::Source) => {
+            // Treat standalone 'source' as a normal word (e.g., `source file.sh`)
+            lexer.next();
+            Ok(Word::Literal("source".to_string(), None))
+        }
+        Some(Token::Set) => {
+            // Treat standalone 'set' as a normal word (e.g., `set -euo pipefail`)
+            lexer.next();
+            Ok(Word::Literal("set".to_string(), None))
+        }
+        Some(Token::Declare) => {
+            // Treat standalone 'declare' as a normal word (e.g., `declare -a arr`)
+            lexer.next();
+            Ok(Word::Literal("declare".to_string(), None))
+        }
+        Some(Token::Unset) => {
+            // Treat standalone 'unset' as a normal word (e.g., `unset var`)
+            lexer.next();
+            Ok(Word::Literal("unset".to_string(), None))
+        }
+        Some(Token::Export) => {
+            // Treat standalone 'export' as a normal word (e.g., `export PATH`)
+            lexer.next();
+            Ok(Word::Literal("export".to_string(), None))
+        }
+        Some(Token::Readonly) => {
+            // Treat standalone 'readonly' as a normal word (e.g., `readonly VAR`)
+            lexer.next();
+            Ok(Word::Literal("readonly".to_string(), None))
+        }
+        Some(Token::Typeset) => {
+            // Treat standalone 'typeset' as a normal word (e.g., `typeset -i var`)
+            lexer.next();
+            Ok(Word::Literal("typeset".to_string(), None))
+        }
+        Some(Token::Local) => {
+            // Treat standalone 'local' as a normal word (e.g., `local var`)
+            lexer.next();
+            Ok(Word::Literal("local".to_string(), None))
+        }
+        Some(Token::Shift) => {
+            // Treat standalone 'shift' as a normal word (e.g., `shift 2`)
+            lexer.next();
+            Ok(Word::Literal("shift".to_string(), None))
+        }
+        Some(Token::Eval) => {
+            // Treat standalone 'eval' as a normal word (e.g., `eval $cmd`)
+            lexer.next();
+            Ok(Word::Literal("eval".to_string(), None))
+        }
+        Some(Token::Exec) => {
+            // Treat standalone 'exec' as a normal word (e.g., `exec cmd`)
+            lexer.next();
+            Ok(Word::Literal("exec".to_string(), None))
+        }
+        Some(Token::Trap) => {
+            // Treat standalone 'trap' as a normal word (e.g., `trap 'echo' INT`)
+            lexer.next();
+            Ok(Word::Literal("trap".to_string(), None))
+        }
+        Some(Token::Wait) => {
+            // Treat standalone 'wait' as a normal word (e.g., `wait $pid`)
+            lexer.next();
+            Ok(Word::Literal("wait".to_string(), None))
+        }
+        Some(Token::Exit) => {
+            // Treat standalone 'exit' as a normal word (e.g., `exit 0`)
+            lexer.next();
+            Ok(Word::Literal("exit".to_string(), None))
+        }
+        Some(Token::Range) => {
+            // Treat standalone '..' as a literal (e.g., `cd ..`)
+            lexer.next();
+            Ok(Word::Literal("..".to_string(), None))
+        }
+        Some(Token::Star) | Some(Token::Percent) => {
+            // Treat standalone '*' as a literal (e.g., `ls *`)
+            lexer.next();
+            Ok(Word::Literal("*".to_string(), None))
+        }
+        Some(Token::Dot) => {
+            // Treat standalone '.' as a literal (e.g., `ls .`)
+            lexer.next();
+            Ok(Word::Literal(".".to_string(), None))
+        }
+        Some(Token::CasePattern) => {
+            // Treat case statement patterns like *.txt as literals.
+            // get_raw_token_text() consumes the current token, so do not call next() here.
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+        }
+        Some(Token::Slash) => {
+            // Treat standalone '/' as a literal (e.g., `cd /`)
+            lexer.next();
+            Ok(Word::Literal("/".to_string(), None))
+        }
+        // Test operators
+        Some(Token::File) => {
+            lexer.next();
+            Ok(Word::Literal("-f".to_string(), None))
+        }
+        Some(Token::Directory) => {
+            lexer.next();
+            Ok(Word::Literal("-d".to_string(), None))
+        }
+        Some(Token::Exists) => {
+            lexer.next();
+            Ok(Word::Literal("-e".to_string(), None))
+        }
+        Some(Token::Readable) => {
+            lexer.next();
+            Ok(Word::Literal("-r".to_string(), None))
+        }
+        Some(Token::Writable) => {
+            lexer.next();
+            Ok(Word::Literal("-w".to_string(), None))
+        }
+        Some(Token::Executable) => {
+            lexer.next();
+            Ok(Word::Literal("-x".to_string(), None))
+        }
+        Some(Token::Size) => {
+            lexer.next();
+            Ok(Word::Literal("-s".to_string(), None))
+        }
+        Some(Token::Symlink) => {
+            lexer.next();
+            Ok(Word::Literal("-L".to_string(), None))
+        }
+        Some(Token::TestBracketClose) => {
+            lexer.next();
+            Ok(Word::Literal("]".to_string(), None))
+        }
+        Some(Token::Tilde) => {
+            // Treat standalone '~' as a literal (e.g., `cd ~`)
+            lexer.next();
+            Ok(Word::Literal("~".to_string(), None))
+        }
+        Some(Token::LongOption) => {
+            // Treat long options like --color=always as literals
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::RegexPattern) => {
+            // Treat regex patterns as literals
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::RegexMatch) => {
+            // Treat regex match operator as literal
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::NameFlag) | Some(Token::MaxDepthFlag) | Some(Token::TypeFlag) => {
+            // Treat command-line flags as literals
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::Minus) => {
+            // Handle minus tokens like -l, -c, etc.
+            // Consume the minus and combine with following identifier or number if present
+            lexer.next(); // consume the minus
+            let mut combined = "-".to_string();
+
+            // Look ahead to see if there's an identifier or number following
+            if let Some(Token::Identifier) = lexer.peek() {
+                let identifier = lexer.get_identifier_text()?;
+                combined.push_str(&identifier);
+            } else if let Some(Token::Number) = lexer.peek() {
+                let number = lexer.get_number_text()?;
+                combined.push_str(&number);
+            }
+
+            Ok(Word::Literal(combined, None))
+        }
+        Some(Token::Character)
+        | Some(Token::NonZero)
+        | Some(Token::SymlinkH)
+        | Some(Token::PipeFile)
+        | Some(Token::Socket)
+        | Some(Token::Block)
+        | Some(Token::SetGid)
+        | Some(Token::Sticky)
+        | Some(Token::SetUid)
+        | Some(Token::Owned)
+        | Some(Token::GroupOwned)
+        | Some(Token::Modified)
+        | Some(Token::Eq)
+        | Some(Token::Ne)
+        | Some(Token::Lt)
+        | Some(Token::Le)
+        | Some(Token::Gt)
+        | Some(Token::Ge)
+        | Some(Token::Zero) => {
+            // Handle test operator tokens like -e, -f, -d, etc.
+            // These are already complete flags, just get their text
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::Dollar) => Ok(parse_variable_expansion(lexer)?),
+        Some(Token::DollarBrace)
+        | Some(Token::DollarParen)
+        | Some(Token::DollarHashSimple)
+        | Some(Token::DollarAtSimple)
+        | Some(Token::DollarStarSimple)
+        | Some(Token::DollarBraceHash)
+        | Some(Token::DollarBraceBang)
+        | Some(Token::DollarBraceStar)
+        | Some(Token::DollarBraceAt)
+        | Some(Token::DollarBraceHashStar)
+        | Some(Token::DollarBraceHashAt)
+        | Some(Token::DollarBraceBangStar)
+        | Some(Token::DollarBraceBangAt) => Ok(parse_variable_expansion(lexer)?),
+        Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+            Ok(parse_arithmetic_expression(lexer)?)
+        }
+        Some(Token::True) => {
+            // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
+            lexer.next();
+            Ok(Word::Literal("true".to_string(), None))
+        }
+        Some(Token::False) => {
+            // Treat standalone 'false' as a normal word (e.g., `false` or `command && false`)
+            lexer.next();
+            Ok(Word::Literal("false".to_string(), None))
+        }
+        Some(Token::ParenOpen) => {
+            let text = lexer.capture_parenthetical_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        _ => {
+            let current_pos = lexer.current_position();
+            let (line, col) = lexer.offset_to_line_col(current_pos);
+            let token = lexer.peek().unwrap_or(Token::Identifier).to_owned();
+            Err(ParserError::UnexpectedToken { token, line, col })
+        }
+    };
+
+    let mut result = result?;
+    merge_contiguous_quoted_fragments(lexer, &mut result)?;
+
+    // Skip inline whitespace after consuming the word
+    lexer.skip_inline_whitespace_and_comments();
+
+    Ok(result)
+}
+
+/// Parse a word without skipping newlines at the end.
+/// This is used specifically for argument parsing where we want to preserve newlines.
+pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    if let Some(word) = parse_at_prefixed_word(lexer) {
+        return Ok(word);
+    }
+
+    // When parsing command arguments, preserve token boundaries between
+    // whitespace-separated words. Adjacent quoted fragments are only merged
+    // by parse_word(), which is used in contexts that need that behavior.
+    let start_pos = lexer.current_position();
+
+    // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
+    // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
+    // and also handles find arguments like "+1M" by combining Plus + Number + Identifier
+    if matches!(
+        lexer.peek(),
+        Some(Token::Identifier)
+            | Some(Token::Number)
+            | Some(Token::Float)
+            | Some(Token::PaddedNumber)
+            | Some(Token::Slash)
+            | Some(Token::Dot)
+            | Some(Token::Range)
+            | Some(Token::Plus)
+            | Some(Token::Minus)
+            | Some(Token::Escape)
+            | Some(Token::Colon)
+            | Some(Token::Star)
+            | Some(Token::Percent)
+            | Some(Token::Comma)
+    ) {
+        let mut combined = String::new();
+        loop {
+            match lexer.peek() {
+                Some(Token::Identifier)
+                | Some(Token::Number)
+                | Some(Token::Float)
+                | Some(Token::PaddedNumber)
+                | Some(Token::Slash)
+                | Some(Token::Dot)
+                | Some(Token::Range)
+                | Some(Token::Plus)
+                | Some(Token::Minus)
+                | Some(Token::Escape)
+                | Some(Token::Colon)
+                | Some(Token::Star)
+                | Some(Token::Percent)
+                | Some(Token::Comma) => {
+                    // Append raw token text and consume
+                    if let Some(text) = lexer.get_current_text() {
+                        combined.push_str(&text);
+                        lexer.next();
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        // Skip inline whitespace after consuming the word, but NOT newlines
+        lexer.skip_inline_whitespace_and_comments();
+        return Ok(Word::Literal(combined, None));
+    }
+
+    let result = match lexer.peek() {
+        Some(Token::Identifier) => Ok(Word::Literal(lexer.get_identifier_text()?, None)),
+        Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
+        Some(Token::Float) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
+        Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
+        Some(Token::DoubleQuotedString) => {
+            // Always parse as string interpolation for double-quoted strings
+            // This handles both simple strings and strings with variables
+            Ok(parse_string_interpolation(lexer)?)
+        }
+        Some(Token::SingleQuotedString) => {
+            let quoted_text = lexer.get_string_text()?;
+            // Strip the outer quotes from single-quoted strings
+            let content = if quoted_text.starts_with("'") && quoted_text.ends_with("'") {
+                quoted_text[1..quoted_text.len() - 1].to_string()
+            } else {
+                quoted_text
+            };
+            Ok(Word::Literal(content, None))
+        }
+        Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
+        Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
+        Some(Token::DollarDoubleQuotedString) => Ok(parse_string_interpolation(lexer)?),
+        Some(Token::BraceOpen) => Ok(parse_brace_expansion(lexer)?),
+        Some(Token::Source) => {
+            // Treat standalone 'source' as a normal word (e.g., `source file.sh`)
+            lexer.next();
+            Ok(Word::Literal("source".to_string(), None))
+        }
+        Some(Token::Set) => {
+            // Treat standalone 'set' as a normal word (e.g., `set -euo pipefail`)
+            lexer.next();
+            Ok(Word::Literal("set".to_string(), None))
+        }
+        Some(Token::Declare) => {
+            // Treat standalone 'declare' as a normal word (e.g., `declare -a arr`)
+            lexer.next();
+            Ok(Word::Literal("declare".to_string(), None))
+        }
+        Some(Token::Unset) => {
+            // Treat standalone 'unset' as a normal word (e.g., `unset var`)
+            lexer.next();
+            Ok(Word::Literal("unset".to_string(), None))
+        }
+        Some(Token::Export) => {
+            // Treat standalone 'export' as a normal word (e.g., `export PATH`)
+            lexer.next();
+            Ok(Word::Literal("export".to_string(), None))
+        }
+        Some(Token::Readonly) => {
+            // Treat standalone 'readonly' as a normal word (e.g., `readonly VAR`)
+            lexer.next();
+            Ok(Word::Literal("readonly".to_string(), None))
+        }
+        Some(Token::Typeset) => {
+            // Treat standalone 'typeset' as a normal word (e.g., `typeset -i var`)
+            lexer.next();
+            Ok(Word::Literal("typeset".to_string(), None))
+        }
+        Some(Token::Local) => {
+            // Treat standalone 'local' as a normal word (e.g., `local var`)
+            lexer.next();
+            Ok(Word::Literal("local".to_string(), None))
+        }
+        Some(Token::Shift) => {
+            // Treat standalone 'shift' as a normal word (e.g., `shift 2`)
+            lexer.next();
+            Ok(Word::Literal("shift".to_string(), None))
+        }
+        Some(Token::Eval) => {
+            // Treat standalone 'eval' as a normal word (e.g., `eval $cmd`)
+            lexer.next();
+            Ok(Word::Literal("eval".to_string(), None))
+        }
+        Some(Token::Exec) => {
+            // Treat standalone 'exec' as a normal word (e.g., `exec cmd`)
+            lexer.next();
+            Ok(Word::Literal("exec".to_string(), None))
+        }
+        Some(Token::Trap) => {
+            // Treat standalone 'trap' as a normal word (e.g., `trap 'echo' INT`)
+            lexer.next();
+            Ok(Word::Literal("trap".to_string(), None))
+        }
+        Some(Token::Wait) => {
+            // Treat standalone 'wait' as a normal word (e.g., `wait $pid`)
+            lexer.next();
+            Ok(Word::Literal("wait".to_string(), None))
+        }
+        Some(Token::Exit) => {
+            // Treat standalone 'exit' as a normal word (e.g., `exit 0`)
+            lexer.next();
+            Ok(Word::Literal("exit".to_string(), None))
+        }
+        Some(Token::Range) => {
+            // Treat standalone '..' as a literal (e.g., `cd ..`)
+            lexer.next();
+            Ok(Word::Literal("..".to_string(), None))
+        }
+        Some(Token::Star) | Some(Token::Percent) => {
+            // Treat standalone '*' as a literal (e.g., `ls *`)
+            lexer.next();
+            Ok(Word::Literal("*".to_string(), None))
+        }
+        Some(Token::Dot) => {
+            // Treat standalone '.' as a literal (e.g., `ls .`)
+            lexer.next();
+            Ok(Word::Literal(".".to_string(), None))
+        }
+        Some(Token::CasePattern) => {
+            // Treat case statement patterns like *.txt as literals.
+            // get_raw_token_text() consumes the current token, so do not call next() here.
+            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+        }
+        Some(Token::Slash) => {
+            // Treat standalone '/' as a literal (e.g., `cd /`)
+            lexer.next();
+            Ok(Word::Literal("/".to_string(), None))
+        }
+        // Test operators
+        Some(Token::File) => {
+            lexer.next();
+            Ok(Word::Literal("-f".to_string(), None))
+        }
+        Some(Token::Directory) => {
+            lexer.next();
+            Ok(Word::Literal("-d".to_string(), None))
+        }
+        Some(Token::Exists) => {
+            lexer.next();
+            Ok(Word::Literal("-e".to_string(), None))
+        }
+        Some(Token::Readable) => {
+            lexer.next();
+            Ok(Word::Literal("-r".to_string(), None))
+        }
+        Some(Token::Writable) => {
+            lexer.next();
+            Ok(Word::Literal("-w".to_string(), None))
+        }
+        Some(Token::Executable) => {
+            lexer.next();
+            Ok(Word::Literal("-x".to_string(), None))
+        }
+        Some(Token::Size) => {
+            lexer.next();
+            Ok(Word::Literal("-s".to_string(), None))
+        }
+        Some(Token::Symlink) => {
+            lexer.next();
+            Ok(Word::Literal("-L".to_string(), None))
+        }
+        Some(Token::TestBracketClose) => {
+            lexer.next();
+            Ok(Word::Literal("]".to_string(), None))
+        }
+        Some(Token::Tilde) => {
+            // Treat standalone '~' as a literal (e.g., `cd ~`)
+            lexer.next();
+            Ok(Word::Literal("~".to_string(), None))
+        }
+        Some(Token::LongOption) => {
+            // Treat long options like --color=always as literals
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::RegexPattern) => {
+            // Treat regex patterns as literals
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::RegexMatch) => {
+            // Treat regex match operator as literal
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::NameFlag) | Some(Token::MaxDepthFlag) | Some(Token::TypeFlag) => {
+            // Treat command-line flags as literals
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::Minus) => {
+            // Handle minus tokens like -l, -c, etc.
+            // Consume the minus and combine with following identifier or number if present
+            lexer.next(); // consume the minus
+            let mut combined = "-".to_string();
+
+            // Look ahead to see if there's an identifier or number following
+            if let Some(Token::Identifier) = lexer.peek() {
+                let identifier = lexer.get_identifier_text()?;
+                combined.push_str(&identifier);
+            } else if let Some(Token::Number) = lexer.peek() {
+                let number = lexer.get_number_text()?;
+                combined.push_str(&number);
+            }
+
+            Ok(Word::Literal(combined, None))
+        }
+        Some(Token::Character)
+        | Some(Token::NonZero)
+        | Some(Token::SymlinkH)
+        | Some(Token::PipeFile)
+        | Some(Token::Socket)
+        | Some(Token::Block)
+        | Some(Token::SetGid)
+        | Some(Token::Sticky)
+        | Some(Token::SetUid)
+        | Some(Token::Owned)
+        | Some(Token::GroupOwned)
+        | Some(Token::Modified)
+        | Some(Token::Eq)
+        | Some(Token::Ne)
+        | Some(Token::Lt)
+        | Some(Token::Le)
+        | Some(Token::Gt)
+        | Some(Token::Ge)
+        | Some(Token::Zero) => {
+            // Handle test operator tokens like -e, -f, -d, etc.
+            // These are already complete flags, just get their text
+            let text = lexer.get_raw_token_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        Some(Token::Dollar) => Ok(parse_variable_expansion(lexer)?),
+        Some(Token::DollarBrace)
+        | Some(Token::DollarParen)
+        | Some(Token::DollarHashSimple)
+        | Some(Token::DollarAtSimple)
+        | Some(Token::DollarStarSimple)
+        | Some(Token::DollarBraceHash)
+        | Some(Token::DollarBraceBang)
+        | Some(Token::DollarBraceStar)
+        | Some(Token::DollarBraceAt)
+        | Some(Token::DollarBraceHashStar)
+        | Some(Token::DollarBraceHashAt)
+        | Some(Token::DollarBraceBangStar)
+        | Some(Token::DollarBraceBangAt) => Ok(parse_variable_expansion(lexer)?),
+        Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+            Ok(parse_arithmetic_expression(lexer)?)
+        }
+        Some(Token::True) => {
+            // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
+            lexer.next();
+            Ok(Word::Literal("true".to_string(), None))
+        }
+        Some(Token::False) => {
+            // Treat standalone 'false' as a normal word (e.g., `false` or `command && false`)
+            lexer.next();
+            Ok(Word::Literal("false".to_string(), None))
+        }
+        Some(Token::ParenOpen) => {
+            let text = lexer.capture_parenthetical_text()?;
+            Ok(Word::Literal(text, None))
+        }
+        _ => {
+            let current_pos = lexer.current_position();
+            let (line, col) = lexer.offset_to_line_col(current_pos);
+            let token = lexer.peek().unwrap_or(Token::Identifier).to_owned();
+            Err(ParserError::UnexpectedToken { token, line, col })
+        }
+    };
+
+    let mut result = result?;
+    if lexer.current_position() == start_pos {
+        merge_contiguous_quoted_fragments(lexer, &mut result)?;
+    }
+
+    // Don't skip inline whitespace after consuming the word - this preserves newlines
+    // for argument parsing context
+
+    Ok(result)
+}
+
+pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    match lexer.peek() {
+        Some(Token::Dollar) => {
+            lexer.next();
+            if let Some(Token::Identifier) = lexer.peek() {
+                let var_name = lexer.get_identifier_text()?;
+
+                // Check if this is followed by a bracket for array/map access like $map[key]
+                if let Some(Token::TestBracket) = lexer.peek() {
+                    // This is $map[key] syntax - parse the array/map access
+                    lexer.next(); // consume the [
+
+                    // Parse the array index content until we find the closing ]
+                    let mut index_content = String::new();
+                    let mut bracket_depth = 1;
+
+                    while bracket_depth > 0 {
+                        if let Some((start, end)) = lexer.get_span() {
+                            let token = lexer.peek();
+
+                            match token {
+                                Some(Token::TestBracket) => {
+                                    bracket_depth += 1;
+                                    let text = lexer.get_text(start, end);
+                                    index_content.push_str(&text);
+                                    lexer.next();
+                                }
+                                Some(Token::TestBracketClose) => {
+                                    bracket_depth -= 1;
+                                    if bracket_depth == 0 {
+                                        // Consume the closing ]
+                                        lexer.next();
+                                        break;
+                                    } else {
+                                        let text = lexer.get_text(start, end);
+                                        index_content.push_str(&text);
+                                        lexer.next();
+                                    }
+                                }
+                                Some(Token::Dollar) => {
+                                    // Handle variable references in the key like $k
+                                    let text = lexer.get_text(start, end);
+                                    index_content.push_str(&text);
+                                    lexer.next();
+
+                                    // If followed by an identifier, consume it too
+                                    if let Some(Token::Identifier) = lexer.peek() {
+                                        let var_text = lexer.get_identifier_text()?;
+                                        index_content.push_str(&var_text);
+                                    }
+                                }
+                                _ => {
+                                    let text = lexer.get_text(start, end);
+                                    index_content.push_str(&text);
+                                    lexer.next();
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Return the map access
+                    return Ok(Word::MapAccess(var_name, index_content, None));
+                }
+
+                Ok(Word::Variable(var_name, false, None))
+            } else if let Some(Token::Number) = lexer.peek() {
+                // Handle special shell variables like $0, $1, $2, etc.
+                let var_name = lexer.get_number_text()?;
+                Ok(Word::Variable(var_name, false, None))
+            } else {
+                Err(ParserError::InvalidSyntax(
+                    "Expected identifier or number after $".to_string(),
+                ))
+            }
+        }
+        Some(Token::DollarHashSimple) => {
+            lexer.next();
+            Ok(Word::Variable("#".to_string(), false, None))
+        }
+        Some(Token::DollarAtSimple) => {
+            lexer.next();
+            Ok(Word::Variable("@".to_string(), false, None))
+        }
+        Some(Token::DollarStarSimple) => {
+            lexer.next();
+            Ok(Word::Variable("*".to_string(), false, None))
+        }
+        Some(Token::DollarBrace) => {
+            // Parse ${...} expansions
+            lexer.next(); // consume ${
+
+            // Parse the entire braced content first, then analyze it
+            let braced_content = parse_braced_variable_name(lexer)?;
+            // Consume the closing } that parse_braced_variable_name leaves unconsumed
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
+
+            eprintln!(
+                "DEBUG parse_variable_expansion: braced_content='{}'",
+                braced_content
+            );
+            // Check if this is array syntax first
+            if braced_content.starts_with('#')
+                && braced_content.contains('[')
+                && braced_content.contains(']')
+            {
+                // This is ${#arr[@]} - array length
+                if let Some(bracket_start) = braced_content.find('[') {
+                    if let Some(_bracket_end) = braced_content.rfind(']') {
+                        let array_name = &braced_content[1..bracket_start]; // Remove # prefix
+                        return Ok(Word::MapLength(array_name.to_string(), None));
+                    }
+                }
+            } else if braced_content.starts_with('!')
+                && braced_content.contains('[')
+                && braced_content.contains(']')
+            {
+                // This is ${!map[@]} - get keys of associative array
+                if let Some(bracket_start) = braced_content.find('[') {
+                    if let Some(_bracket_end) = braced_content.rfind(']') {
+                        let map_name = &braced_content[1..bracket_start]; // Remove ! prefix
+                        return Ok(Word::MapKeys(map_name.to_string(), None));
+                    }
+                }
+            } else if braced_content.contains(":-") {
+                eprintln!(
+                    "DEBUG parse_variable_expansion: found :- in braced_content='{}'",
+                    braced_content
+                );
+                // ${var:-default} - use default if var is empty
+                let colon_pos = braced_content.find(":-").unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let default_val = &braced_content[colon_pos + 2..];
+                return Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                        is_mutable: true,
+                    },
+                    None,
+                ));
+            } else if braced_content.contains(":=") {
+                // ${var:=default} - assign default if var is empty
+                let colon_pos = braced_content.find(":=").unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let default_val = &braced_content[colon_pos + 2..];
+                return Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::AssignDefault(
+                            default_val.to_string(),
+                        ),
+                        is_mutable: true,
+                    },
+                    None,
+                ));
+            } else if braced_content.contains(":+") {
+                // ${var:+alt} - use alt if var is set and not empty
+                let colon_pos = braced_content.find(":+").unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let alt_val = &braced_content[colon_pos + 2..];
+                return Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                        is_mutable: true,
+                    },
+                    None,
+                ));
+            } else if braced_content.contains(":?") {
+                // ${var:?error} - error if var is empty
+                let colon_pos = braced_content.find(":?").unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let error_msg = &braced_content[colon_pos + 2..];
+                return Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                        is_mutable: true,
+                    },
+                    None,
+                ));
+            } else if braced_content.contains('[') && braced_content.contains(']') {
+                // This is a map/array access like ${map[foo]} or ${arr[1]} or ${map[$k]}
+                if let Some(bracket_start) = braced_content.find('[') {
+                    if let Some(bracket_end) = braced_content.rfind(']') {
+                        let map_name = &braced_content[..bracket_start];
+                        let key = &braced_content[bracket_start + 1..bracket_end];
+
+                        // Special case: if key is "@", this is array iteration
+                        if key == "@" {
+                            // Check if there's array slicing in braced_content after ']'
+                            let after_bracket = &braced_content[bracket_end + 1..];
+                            if after_bracket.starts_with(':') {
+                                // This is array slicing like ${arr[@]:start:length}
+                                let slice_part = &after_bracket[1..]; // skip leading ':'
+                                if let Some(second_colon) = slice_part.find(':') {
+                                    let offset = &slice_part[..second_colon];
+                                    let length = &slice_part[second_colon + 1..];
+                                    return Ok(Word::array_slice(
+                                        map_name.to_string(),
+                                        offset.to_string(),
+                                        Some(length.to_string()),
+                                    ));
+                                } else {
+                                    return Ok(Word::array_slice(
+                                        map_name.to_string(),
+                                        slice_part.to_string(),
+                                        None,
+                                    ));
+                                }
+                            }
+                            return Ok(Word::MapAccess(
+                                map_name.to_string(),
+                                "@".to_string(),
+                                None,
+                            ));
+                        }
+
+                        return Ok(Word::MapAccess(map_name.to_string(), key.to_string(), None));
+                    }
+                }
+            }
+
+            // Check for parameter expansion operators
+            // Note: colon-prefix operators like :- := :+ :? are handled above
+            // before the array access check, so only non-colon operators remain here.
+
+            // Check if this is a parameter expansion with operators
+            // Check longer patterns first to avoid partial matches
+            if braced_content.ends_with("^^") {
+                let base_var = braced_content.trim_end_matches("^^");
+                Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: base_var.to_string(),
+                        operator: ParameterExpansionOperator::UppercaseAll,
+                        is_mutable: true,
+                    },
+                    None,
+                ))
+            } else if braced_content.ends_with(",,") {
+                let base_var = braced_content.trim_end_matches(",,");
+                Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: base_var.to_string(),
+                        operator: ParameterExpansionOperator::LowercaseAll,
+                        is_mutable: true,
+                    },
+                    None,
+                ))
+            } else if braced_content.ends_with("^") && !braced_content.ends_with("^^") {
+                let base_var = braced_content.trim_end_matches("^");
+                Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: base_var.to_string(),
+                        operator: ParameterExpansionOperator::UppercaseFirst,
+                        is_mutable: true,
+                    },
+                    None,
+                ))
+            } else if braced_content.ends_with("##*/") {
+                let base_var = braced_content.trim_end_matches("##*/");
+                Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: base_var.to_string(),
+                        operator: ParameterExpansionOperator::Basename,
+                        is_mutable: true,
+                    },
+                    None,
+                ))
+            } else if braced_content.ends_with("%/*") {
+                let base_var = braced_content.trim_end_matches("%/*");
+                Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: base_var.to_string(),
+                        operator: ParameterExpansionOperator::Dirname,
+                        is_mutable: true,
+                    },
+                    None,
+                ))
+            } else if braced_content.contains("##") && !braced_content.ends_with("##*/") {
+                let parts: Vec<&str> = braced_content.split("##").collect();
+                if parts.len() == 2 {
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: parts[0].to_string(),
+                            operator: ParameterExpansionOperator::RemoveLongestPrefix(
+                                parts[1].to_string(),
+                            ),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
+            } else if braced_content.contains("%%") && !braced_content.ends_with("%/*") {
+                let parts: Vec<&str> = braced_content.split("%%").collect();
+                if parts.len() == 2 {
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: parts[0].to_string(),
+                            operator: ParameterExpansionOperator::RemoveLongestSuffix(
+                                parts[1].to_string(),
+                            ),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
+            } else if braced_content.contains("//") {
+                let parts: Vec<&str> = braced_content.split("//").collect();
+                if parts.len() == 3 {
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: parts[0].to_string(),
+                            operator: ParameterExpansionOperator::SubstituteAll(
+                                parts[1].to_string(),
+                                parts[2].to_string(),
+                            ),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
+            } else if braced_content.contains("/") && !braced_content.contains("//") {
+                let parts: Vec<&str> = braced_content.split("/").collect();
+                if parts.len() == 3 {
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: parts[0].to_string(),
+                            operator: ParameterExpansionOperator::SubstituteAll(
+                                parts[1].to_string(),
+                                parts[2].to_string(),
+                            ),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
+            } else {
+                // If it's not a special case, return as a variable
+                Ok(Word::Variable(braced_content, true, None))
+            }
+        }
+        Some(Token::DollarBraceHash) => {
+            lexer.next();
+            let braced_content = parse_braced_variable_name(lexer)?;
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
+            let prefixed = format!("#{}", braced_content);
+            // ${#...} - variable length
+            if prefixed.starts_with('#') && prefixed.contains('[') && prefixed.contains(']') {
+                // ${#arr[@]} - array length
+                Ok(Word::MapLength(
+                    braced_content[..braced_content.find('[').unwrap_or(0)].to_string(),
+                    None,
+                ))
+            } else {
+                Ok(Word::Variable(prefixed, true, None))
+            }
+        }
+        Some(Token::DollarBraceBang) => {
+            lexer.next();
+            let braced_content = parse_braced_variable_name(lexer)?;
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
+            let prefixed = format!("!{}", braced_content);
+            // ${!...} - indirect reference or map keys
+            if prefixed.starts_with('!') && prefixed.contains('[') && prefixed.contains(']') {
+                if let Some(bracket_start) = prefixed.find('[') {
+                    if prefixed[bracket_start..].contains('@')
+                        || prefixed[bracket_start..].contains('*')
+                    {
+                        // ${!map[@]} - get keys
+                        let map_name = &prefixed[1..bracket_start];
+                        return Ok(Word::MapKeys(map_name.to_string(), None));
+                    }
+                }
+            }
+            Ok(Word::Variable(prefixed, true, None))
+        }
+        Some(Token::DollarBraceStar) => {
+            lexer.next();
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
+            Ok(Word::Variable("*".to_string(), true, None))
+        }
+        Some(Token::DollarBraceAt) => {
+            lexer.next();
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
+            Ok(Word::Variable("@".to_string(), true, None))
+        }
+        Some(Token::DollarBraceHashStar) => {
+            lexer.next();
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
+            Ok(Word::Variable("#*".to_string(), true, None))
+        }
+        Some(Token::DollarBraceHashAt) => {
+            lexer.next();
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
+            Ok(Word::Variable("#@".to_string(), true, None))
+        }
+        Some(Token::DollarBraceBangStar) => {
+            lexer.next();
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
+            Ok(Word::Variable("!*".to_string(), true, None))
+        }
+        Some(Token::DollarBraceBangAt) => {
+            lexer.next();
+            if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                lexer.next();
+            }
+            Ok(Word::Variable("!@".to_string(), true, None))
+        }
+        Some(Token::DollarParen) => {
+            // Parse $(...) command substitution
+            let command_text = lexer.capture_parenthetical_text()?;
+            // Parse the command_text into an actual Command
+            let sub_lexer = Lexer::new(&command_text);
+            let mut sub_parser = Parser::new_with_lexer(sub_lexer);
+            match sub_parser.parse() {
+                Ok(commands) => {
+                    if commands.is_empty() {
+                        // If no commands parsed, treat as a simple command with the text as argument
+                        let placeholder_cmd = Command::Simple(SimpleCommand {
+                            name: Word::Literal("echo".to_string(), None),
+                            args: vec![Word::Literal(command_text, None)],
+                            redirects: Vec::new(),
+                            env_vars: HashMap::new(),
+                            stdout_used: true,
+                            stderr_used: true,
+                        });
+                        Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
+                    } else if commands.len() == 1 {
+                        Ok(Word::CommandSubstitution(
+                            Box::new(commands[0].clone()),
+                            None,
+                        ))
+                    } else {
+                        // If multiple commands, wrap in a pipeline or use the first one
+                        Ok(Word::CommandSubstitution(
+                            Box::new(commands[0].clone()),
+                            None,
+                        ))
+                    }
+                }
+                Err(_) => {
+                    // Fallback: treat as a simple command with the text as argument
+                    let placeholder_cmd = Command::Simple(SimpleCommand {
+                        name: Word::Literal("echo".to_string(), None),
+                        args: vec![Word::Literal(command_text, None)],
+                        redirects: Vec::new(),
+                        env_vars: HashMap::new(),
+                        stdout_used: true,
+                        stderr_used: true,
+                    });
+                    Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
+                }
+            }
+        }
+        _ => {
+            let current_pos = lexer.current_position();
+            let (line, col) = lexer.offset_to_line_col(current_pos);
+            Err(ParserError::UnexpectedToken {
+                token: Token::Identifier,
+                line,
+                col,
+            })
+        }
+    }
+}
+
+// Placeholder functions - these would need to be implemented based on the actual AST structures
+
+fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    use crate::ast::{Command, SimpleCommand, StringInterpolation, StringPart, Word};
+    use std::collections::HashMap;
+
+    // Get the double-quoted string content (this includes the quotes)
+    let string_content = lexer.get_string_text()?;
+
+    // Remove the outer quotes
+    let content = if string_content.starts_with('"') && string_content.ends_with('"') {
+        &string_content[1..string_content.len() - 1]
+    } else {
+        &string_content
+    };
+
+    let content = content.replace("\\\"", "\"");
+    let content = content.replace("\\\\", "\\");
+
+    // Parse the string content to extract literal parts and variable references
+    let mut parts = Vec::new();
+    let mut current_literal = String::new();
+    let mut i = 0;
+
+    while i < content.len() {
+        let _ch = content.chars().nth(i).unwrap_or('?');
+        if content[i..].starts_with("\\\\`") {
+            // We found an escaped backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+
+            // Find the closing escaped backtick
+            i += 3; // skip the \\`
+            let cmd_start = i;
+            while i < content.len() && !content[i..].starts_with("\\\\`") {
+                i += 1;
+            }
+
+            if i < content.len() {
+                // We found a complete escaped command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 3; // skip the closing \\`
+
+                // Parse the command content as a pipeline (to handle pipes)
+                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
+                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                } else {
+                    // Fall back to treating it as a literal
+                    parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
+                }
+            } else {
+                // Unmatched escaped backtick, treat as literal
+                parts.push(StringPart::Literal("\\\\`".to_string()));
+                i = cmd_start;
+            }
+        } else if content[i..].starts_with("\\`") {
+            // We found a single-escaped backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+
+            // Find the closing escaped backtick
+            i += 2; // skip the \`
+            let cmd_start = i;
+            while i < content.len() && !content[i..].starts_with("\\`") {
+                i += 1;
+            }
+
+            if i < content.len() {
+                // We found a complete escaped command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 2; // skip the closing \`
+
+                // Parse the command content as a pipeline (to handle pipes)
+                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
+                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                } else {
+                    // Fall back to treating it as a literal
+                    parts.push(StringPart::Literal(format!("\\`{}\\`", cmd_content)));
+                }
+            } else {
+                // Unmatched escaped backtick, treat as literal
+                parts.push(StringPart::Literal("\\`".to_string()));
+                i = cmd_start;
+            }
+        } else if content[i..].starts_with("`") {
+            // We found a backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+
+            // Find the closing backtick
+            i += 1; // skip the opening `
+            let cmd_start = i;
+            while i < content.len() && content[i..].chars().next() != Some('`') {
+                i += 1;
+            }
+
+            if i < content.len() {
+                // We found a complete command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 1; // skip the closing `
+
+                // Parse the command content using the full parser to handle pipelines
+                let sub_lexer = Lexer::new(cmd_content);
+                let mut sub_parser = Parser::new_with_lexer(sub_lexer);
+                match sub_parser.parse() {
+                    Ok(commands) => {
+                        eprintln!(
+                            "DEBUG: String interpolation parsed command '{}' as {} commands",
+                            cmd_content,
+                            commands.len()
+                        );
+                        if commands.len() == 1 {
+                            parts.push(StringPart::CommandSubstitution(Box::new(
+                                commands[0].clone(),
+                            )));
+                        } else if commands.is_empty() {
+                            // If no commands parsed, treat as a simple command with the text as argument
+                            let placeholder_cmd = Command::Simple(SimpleCommand {
+                                name: Word::Literal("echo".to_string(), None),
+                                args: vec![Word::Literal(cmd_content.to_string(), None)],
+                                redirects: Vec::new(),
+                                env_vars: HashMap::new(),
+                                stdout_used: true,
+                                stderr_used: true,
+                            });
+                            parts.push(StringPart::CommandSubstitution(Box::new(placeholder_cmd)));
+                        } else {
+                            // If multiple commands, use the first one
+                            parts.push(StringPart::CommandSubstitution(Box::new(
+                                commands[0].clone(),
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "DEBUG: String interpolation failed to parse command '{}': {:?}",
+                            cmd_content, e
+                        );
+                        // Fall back to treating it as a literal
+                        parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
+                    }
+                }
+            } else {
+                // Unmatched backtick, treat as literal
+                parts.push(StringPart::Literal("`".to_string()));
+                i = cmd_start;
+            }
+        } else if content[i..].starts_with("$") {
+            // We found a variable reference (or a literal $ that's not a variable)
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+
+            if i + 1 < content.len() && content[i + 1..].starts_with('(') {
+                // Command substitution $(...)
+                i += 2; // skip $ and (
+                let cmd_start = i;
+                let mut paren_count = 1;
+                while i < content.len() && paren_count > 0 {
+                    match content[i..].chars().next() {
+                        Some('(') => paren_count += 1,
+                        Some(')') => paren_count -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if paren_count == 0 {
+                    let cmd_content = &content[cmd_start..i - 1];
+                    if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content)
+                    {
+                        parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                    } else {
+                        parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                    }
+                } else {
+                    current_literal.push_str("$(");
+                    i = cmd_start;
+                }
+            } else if i + 1 < content.len() && content[i + 1..].starts_with('{') {
+                // This is a parameter expansion ${...}
+                i += 2; // skip $ and {
+                let expansion_start = i;
+
+                // Find the closing brace
+                let mut brace_count = 1;
+                while i < content.len() && brace_count > 0 {
+                    match content[i..].chars().next() {
+                        Some('{') => brace_count += 1,
+                        Some('}') => brace_count -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+
+                if brace_count == 0 {
+                    // We found a complete parameter expansion
+                    let expansion_content = &content[expansion_start..i - 1]; // -1 to exclude the closing }
+
+                    // Parse the parameter expansion content
+                    if let Ok(expansion_word) = parse_parameter_expansion_content(expansion_content)
+                    {
+                        parts.push(StringPart::ParameterExpansion(expansion_word));
+                    } else {
+                        // Fall back to treating it as a literal
+                        parts.push(StringPart::Literal(format!("${{{}}}", expansion_content)));
+                    }
+                } else {
+                    // Unmatched braces, treat as literal
+                    parts.push(StringPart::Literal("${".to_string()));
+                    i = expansion_start;
+                }
+            } else {
+                // Simple variable reference like $var or a literal $ followed by a non-variable char
+                // Skip the $ for inspection, but if it's not a valid variable start we'll treat it as literal
+                i += 1; // skip the $
+
+                // If there's no following character, treat the $ as a literal
+                if i >= content.len() {
+                    current_literal.push('$');
+                    break;
+                }
+
+                let next_char = content[i..].chars().next().unwrap();
+                if next_char == '#' || next_char == '@' || next_char == '*' {
+                    // Special shell variable
+                    parts.push(StringPart::Variable(next_char.to_string()));
+                    i += 1;
+                } else if next_char.is_alphanumeric() || next_char == '_' {
+                    // Regular variable name
+                    let var_start = i;
+                    while i < content.len() {
+                        let nc = content[i..].chars().next();
+                        if let Some(c) = nc {
+                            if c.is_alphanumeric() || c == '_' {
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    let var_name = &content[var_start..i];
+                    if !var_name.is_empty() {
+                        parts.push(StringPart::Variable(var_name.to_string()));
+                    }
+                } else {
+                    // Not a recognized variable start; treat the $ as a literal and
+                    // leave the following character to be processed in the next loop iteration.
+                    current_literal.push('$');
+                }
+            }
+        } else if content[i..].starts_with("$") {
+            // Found a $ inside a literal-style string. This could be a variable or a literal $.
+            // Treat it similarly to parse_string_interpolation: preserve $ when it's not a valid variable start.
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+
+            if i + 1 < content.len() && content[i + 1..].starts_with('(') {
+                // Command substitution $(...)
+                i += 2; // skip $ and (
+                let cmd_start = i;
+                let mut paren_count = 1;
+                while i < content.len() && paren_count > 0 {
+                    match content[i..].chars().next() {
+                        Some('(') => paren_count += 1,
+                        Some(')') => paren_count -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if paren_count == 0 {
+                    let cmd_content = &content[cmd_start..i - 1];
+                    if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content)
+                    {
+                        parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                    } else {
+                        parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                    }
+                } else {
+                    current_literal.push_str("$(");
+                    i = cmd_start;
+                }
+            } else if i + 1 < content.len() && content[i + 1..].starts_with('{') {
+                i += 2; // skip $ and {
+                let expansion_start = i;
+                let mut brace_count = 1;
+                while i < content.len() && brace_count > 0 {
+                    match content[i..].chars().next() {
+                        Some('{') => brace_count += 1,
+                        Some('}') => brace_count -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+
+                if brace_count == 0 {
+                    let expansion_content = &content[expansion_start..i - 1];
+                    if let Ok(expansion_word) = parse_parameter_expansion_content(expansion_content)
+                    {
+                        parts.push(StringPart::ParameterExpansion(expansion_word));
+                    } else {
+                        parts.push(StringPart::Literal(format!("${{{}}}", expansion_content)));
+                    }
+                } else {
+                    parts.push(StringPart::Literal("${".to_string()));
+                    i = expansion_start;
+                }
+            } else {
+                // Simple $var or special var or literal $
+                i += 1; // skip $
+                if i >= content.len() {
+                    current_literal.push('$');
+                    break;
+                }
+
+                let next_char = content[i..].chars().next().unwrap();
+                if next_char == '#' || next_char == '@' || next_char == '*' {
+                    parts.push(StringPart::Variable(next_char.to_string()));
+                    i += 1;
+                } else if next_char.is_alphanumeric() || next_char == '_' {
+                    let var_start = i;
+                    while i < content.len() {
+                        let nc = content[i..].chars().next();
+                        if let Some(c) = nc {
+                            if c.is_alphanumeric() || c == '_' {
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    let var_name = &content[var_start..i];
+                    if !var_name.is_empty() {
+                        parts.push(StringPart::Variable(var_name.to_string()));
+                    }
+                } else {
+                    // Not a variable - keep the $ as a literal and continue
+                    current_literal.push('$');
+                }
+            }
+        } else {
+            // Add to current literal
+            current_literal.push(content[i..].chars().next().unwrap());
+            i += 1;
+        }
+    }
+
+    // Add any remaining literal text
+    if !current_literal.is_empty() {
+        parts.push(StringPart::Literal(current_literal));
+    }
+
+    // If we have no parts, this shouldn't happen, but handle it gracefully
+    if parts.is_empty() {
+        parts.push(StringPart::Literal(content.to_string()));
+    }
+
+    Ok(Word::StringInterpolation(
+        StringInterpolation { parts },
+        None,
+    ))
+}
+
+/// Parse a literal string as string interpolation to handle escaped backticks
+pub fn parse_string_interpolation_from_literal(
+    literal: &str,
+) -> Result<StringInterpolation, ParserError> {
+    use crate::ast::{StringInterpolation, StringPart};
+
+    // Remove outer quotes if present
+    let content = if (literal.starts_with('"') && literal.ends_with('"'))
+        || (literal.starts_with('\'') && literal.ends_with('\''))
+    {
+        &literal[1..literal.len() - 1]
+    } else {
+        literal
+    };
+
+    // Parse the string content to extract literal parts and command substitutions
+    let mut parts = Vec::new();
+    let mut current_literal = String::new();
+    let mut i = 0;
+
+    while i < content.len() {
+        if content[i..].starts_with("\\\\`") {
+            // We found an escaped backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+
+            // Find the closing escaped backtick
+            i += 3; // skip the \\`
+            let cmd_start = i;
+            while i < content.len() && !content[i..].starts_with("\\\\`") {
+                i += 1;
+            }
+
+            if i < content.len() {
+                // We found a complete escaped command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 3; // skip the closing \\`
+
+                // Parse the command content as a pipeline (to handle pipes)
+                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
+                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                } else {
+                    // Fall back to treating it as a literal
+                    parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
+                }
+            } else {
+                // Unmatched escaped backtick, treat as literal
+                parts.push(StringPart::Literal("\\\\`".to_string()));
+                i = cmd_start;
+            }
+        } else if content[i..].starts_with("\\`") {
+            // We found a single-escaped backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+
+            // Find the closing escaped backtick
+            i += 2; // skip the \`
+            let cmd_start = i;
+            while i < content.len() && !content[i..].starts_with("\\`") {
+                i += 1;
+            }
+
+            if i < content.len() {
+                // We found a complete escaped command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 2; // skip the closing \`
+
+                // Parse the command content as a pipeline (to handle pipes)
+                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
+                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                } else {
+                    // Fall back to treating it as a literal
+                    parts.push(StringPart::Literal(format!("\\`{}\\`", cmd_content)));
+                }
+            } else {
+                // Unmatched escaped backtick, treat as literal
+                parts.push(StringPart::Literal("\\`".to_string()));
+                i = cmd_start;
+            }
+        } else if content[i..].starts_with("`") {
+            // We found a backtick command substitution
+            // First, add any accumulated literal text
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+
+            // Find the closing backtick
+            i += 1; // skip the opening `
+            let cmd_start = i;
+            while i < content.len() && content[i..].chars().next() != Some('`') {
+                i += 1;
+            }
+
+            if i < content.len() {
+                // We found a complete command substitution
+                let cmd_content = &content[cmd_start..i];
+                i += 1; // skip the closing `
+
+                // Parse the command content using the full parser to handle pipelines
+                let sub_lexer = Lexer::new(cmd_content);
+                let mut sub_parser = Parser::new_with_lexer(sub_lexer);
+                match sub_parser.parse() {
+                    Ok(commands) => {
+                        eprintln!(
+                            "DEBUG: String interpolation parsed command '{}' as {} commands",
+                            cmd_content,
+                            commands.len()
+                        );
+                        if commands.len() == 1 {
+                            parts.push(StringPart::CommandSubstitution(Box::new(
+                                commands[0].clone(),
+                            )));
+                        } else if commands.is_empty() {
+                            // If no commands parsed, treat as a simple command with the text as argument
+                            let placeholder_cmd = Command::Simple(SimpleCommand {
+                                name: Word::Literal("echo".to_string(), None),
+                                args: vec![Word::Literal(cmd_content.to_string(), None)],
+                                redirects: Vec::new(),
+                                env_vars: HashMap::new(),
+                                stdout_used: true,
+                                stderr_used: true,
+                            });
+                            parts.push(StringPart::CommandSubstitution(Box::new(placeholder_cmd)));
+                        } else {
+                            // If multiple commands, use the first one
+                            parts.push(StringPart::CommandSubstitution(Box::new(
+                                commands[0].clone(),
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "DEBUG: String interpolation failed to parse command '{}': {:?}",
+                            cmd_content, e
+                        );
+                        // Fall back to treating it as a literal
+                        parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
+                    }
+                }
+            } else {
+                // Unmatched backtick, treat as literal
+                parts.push(StringPart::Literal("`".to_string()));
+                i = cmd_start;
+            }
+        } else {
+            // Add to current literal
+            current_literal.push(content[i..].chars().next().unwrap());
+            i += 1;
+        }
+    }
+
+    // Add any remaining literal text
+    if !current_literal.is_empty() {
+        parts.push(StringPart::Literal(current_literal));
+    }
+
+    // If we have no parts, this shouldn't happen, but handle it gracefully
+    if parts.is_empty() {
+        parts.push(StringPart::Literal(content.to_string()));
+    }
+
+    Ok(StringInterpolation { parts })
+}
+
+pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion, ParserError> {
+    // Parse parameter expansion content like "arr[1]", "map[foo]", "#arr[@]", etc.
+
+    // Check for array length: #arr[@]
+    if content.starts_with('#') && content.contains('[') && content.contains(']') {
+        if let Some(bracket_start) = content.find('[') {
+            if let Some(_bracket_end) = content.rfind(']') {
+                // Keep the # prefix in the variable name so the generator can detect it
+                let array_name = &content[..bracket_start]; // Keep # prefix
+                return Ok(ParameterExpansion {
+                    variable: array_name.to_string(),
+                    operator: ParameterExpansionOperator::ArraySlice("@".to_string(), None),
+                    is_mutable: true,
+                });
+            }
+        }
+    }
+
+    // Check for map keys: !map[@]
+    if content.starts_with('!') && content.contains('[') && content.contains(']') {
+        if let Some(bracket_start) = content.find('[') {
+            if let Some(_bracket_end) = content.rfind(']') {
+                let map_name = &content[1..bracket_start]; // Remove ! prefix
+                                                           // This should return a Word::MapKeys, but we're in a ParameterExpansion context
+                                                           // so we mark it with a special operator that the generator can recognize
+                return Ok(ParameterExpansion {
+                    variable: format!("!{}", map_name), // Keep the ! prefix to indicate map keys
+                    operator: ParameterExpansionOperator::ArraySlice("@".to_string(), None),
+                    is_mutable: true,
+                });
+            }
+        }
+    }
+
+    // Check for parameter expansion operators with colon prefix BEFORE array access
+    if content.contains(":-") {
+        let parts: Vec<&str> = content.splitn(2, ":-").collect();
+        if parts.len() == 2 {
+            return Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
+                is_mutable: true,
+            });
+        }
+    }
+    if content.contains(":=") {
+        let parts: Vec<&str> = content.splitn(2, ":=").collect();
+        if parts.len() == 2 {
+            return Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
+                is_mutable: true,
+            });
+        }
+    }
+    if content.contains(":+") {
+        let parts: Vec<&str> = content.splitn(2, ":+").collect();
+        if parts.len() == 2 {
+            return Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
+                is_mutable: true,
+            });
+        }
+    }
+    if content.contains(":?") {
+        let parts: Vec<&str> = content.splitn(2, ":?").collect();
+        if parts.len() == 2 {
+            return Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::ErrorIfUnset(parts[1].to_string()),
+                is_mutable: true,
+            });
+        }
+    }
+
+    // Check for array/map access: arr[1], map[foo]
+    if content.contains('[') && content.contains(']') {
+        if let Some(bracket_start) = content.find('[') {
+            if let Some(bracket_end) = content.rfind(']') {
+                let var_name = &content[..bracket_start];
+                let key = &content[bracket_start + 1..bracket_end];
+
+                // Special case: if key is "@", this is array iteration
+                if key == "@" {
+                    // Check if there is a slice specification after the bracket: @]:offset:length
+                    let rest = &content[bracket_end + 1..];
+                    if rest.starts_with(':') {
+                        let slice_spec = &rest[1..]; // skip ':'
+                        if let Some(colon_pos) = slice_spec.find(':') {
+                            let offset = &slice_spec[..colon_pos];
+                            let length = &slice_spec[colon_pos + 1..];
+                            return Ok(ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    offset.to_string(),
+                                    Some(length.to_string()),
+                                ),
+                                is_mutable: true,
+                            });
+                        } else {
+                            // offset without length
+                            return Ok(ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    slice_spec.to_string(),
+                                    None,
+                                ),
+                                is_mutable: true,
+                            });
+                        }
+                    }
+                    return Ok(ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::ArraySlice("@".to_string(), None),
+                        is_mutable: true,
+                    });
+                }
+
+                // This is array/map access - we'll handle this in the generator
+                return Ok(ParameterExpansion {
+                    variable: format!("{}[{}]", var_name, key),
+                    operator: ParameterExpansionOperator::None,
+                    is_mutable: true,
+                });
+            }
+        }
+    }
+
+    // Check for parameter expansion operators
+    // Check longer patterns first to avoid partial matches
+    if content.ends_with("^^") {
+        let base_var = content.trim_end_matches("^^");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::UppercaseAll,
+            is_mutable: true,
+        })
+    } else if content.ends_with(",,") {
+        let base_var = content.trim_end_matches(",,");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::LowercaseAll,
+            is_mutable: true,
+        })
+    } else if content.ends_with("^") && !content.ends_with("^^") {
+        let base_var = content.trim_end_matches("^");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::UppercaseFirst,
+            is_mutable: true,
+        })
+    } else if content.ends_with("##*/") {
+        let base_var = content.trim_end_matches("##*/");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::Basename,
+            is_mutable: true,
+        })
+    } else if content.ends_with("%/*") {
+        let base_var = content.trim_end_matches("%/*");
+        Ok(ParameterExpansion {
+            variable: base_var.to_string(),
+            operator: ParameterExpansionOperator::Dirname,
+            is_mutable: true,
+        })
+    } else if content.contains("##") && !content.ends_with("##*/") {
+        let parts: Vec<&str> = content.split("##").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::RemoveLongestPrefix(parts[1].to_string()),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if content.contains("%%") && !content.ends_with("%/*") {
+        let parts: Vec<&str> = content.split("%%").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::RemoveLongestSuffix(parts[1].to_string()),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if content.contains("#") && !content.starts_with('#') && !content.contains("##") {
+        let parts: Vec<&str> = content.split("#").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::RemoveShortestPrefix(parts[1].to_string()),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if content.contains("%") && !content.contains("%%") && !content.ends_with("%/*") {
+        let parts: Vec<&str> = content.split("%").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::RemoveShortestSuffix(parts[1].to_string()),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if content.contains("//") {
+        let parts: Vec<&str> = content.split("//").collect();
+        if parts.len() == 2 {
+            // This is ${var//pattern/replacement} - split the second part by the first '/'
+            let pattern_replacement = parts[1];
+            if let Some(slash_pos) = pattern_replacement.find('/') {
+                let pattern = &pattern_replacement[..slash_pos];
+                let replacement = &pattern_replacement[slash_pos + 1..];
+                Ok(ParameterExpansion {
+                    variable: parts[0].to_string(),
+                    operator: ParameterExpansionOperator::SubstituteAll(
+                        pattern.to_string(),
+                        replacement.to_string(),
+                    ),
+                    is_mutable: true,
+                })
+            } else {
+                Ok(ParameterExpansion {
+                    variable: content.to_string(),
+                    operator: ParameterExpansionOperator::None,
+                    is_mutable: true,
+                })
+            }
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if content.contains(":-") {
+        let parts: Vec<&str> = content.splitn(2, ":-").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if content.contains(":=") {
+        let parts: Vec<&str> = content.splitn(2, ":=").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if content.contains(":?") {
+        let parts: Vec<&str> = content.splitn(2, ":?").collect();
+        if parts.len() == 2 {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::ErrorIfUnset(parts[1].to_string()),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else {
+        // Simple variable reference
+        Ok(ParameterExpansion {
+            variable: content.to_string(),
+            operator: ParameterExpansionOperator::None,
+            is_mutable: true,
+        })
+    }
+}
+
+fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    // Get the raw token text (e.g., "$'line1\nline2\tTabbed'")
+    let raw_text = lexer.get_raw_token_text()?;
+
+    // Extract the content between $' and ' (remove the $' prefix and ' suffix)
+    if raw_text.len() < 3 || !raw_text.starts_with("$'") || !raw_text.ends_with("'") {
+        return Err(ParserError::InvalidSyntax(
+            "Invalid ANSI-C quoted string format".to_string(),
+        ));
+    }
+
+    let content = &raw_text[2..raw_text.len() - 1]; // Remove $' and '
+
+    // Process escape sequences
+    let mut result = String::new();
+    let mut chars = content.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next_ch) = chars.next() {
+                match next_ch {
+                    'a' => result.push('\x07'), // Bell
+                    'b' => result.push('\x08'), // Backspace
+                    'f' => result.push('\x0C'), // Form feed
+                    'n' => result.push('\n'),   // Newline
+                    'r' => result.push('\r'),   // Carriage return
+                    't' => result.push('\t'),   // Tab
+                    'v' => result.push('\x0B'), // Vertical tab
+                    '\\' => result.push('\\'),  // Backslash
+                    '\'' => result.push('\''),  // Single quote
+                    '"' => result.push('"'),    // Double quote
+                    '?' => result.push('?'),    // Question mark
+                    '0' => result.push('\0'),   // Null byte
+                    'x' => {
+                        // Hex escape: \xHH
+                        let mut hex_chars = String::new();
+                        for _ in 0..2 {
+                            if let Some(hex_ch) = chars.next() {
+                                if hex_ch.is_ascii_hexdigit() {
+                                    hex_chars.push(hex_ch);
+                                } else {
+                                    return Err(ParserError::InvalidSyntax(format!(
+                                        "Invalid hex escape: \\x{}",
+                                        hex_ch
+                                    )));
+                                }
+                            } else {
+                                return Err(ParserError::InvalidSyntax(
+                                    "Incomplete hex escape".to_string(),
+                                ));
+                            }
+                        }
+                        if let Ok(byte_val) = u8::from_str_radix(&hex_chars, 16) {
+                            result.push(byte_val as char);
+                        } else {
+                            return Err(ParserError::InvalidSyntax(format!(
+                                "Invalid hex value: {}",
+                                hex_chars
+                            )));
+                        }
+                    }
+                    'u' => {
+                        // Unicode escape: \uHHHH
+                        let mut hex_chars = String::new();
+                        for _ in 0..4 {
+                            if let Some(hex_ch) = chars.next() {
+                                if hex_ch.is_ascii_hexdigit() {
+                                    hex_chars.push(hex_ch);
+                                } else {
+                                    return Err(ParserError::InvalidSyntax(format!(
+                                        "Invalid unicode escape: \\u{}",
+                                        hex_ch
+                                    )));
+                                }
+                            } else {
+                                return Err(ParserError::InvalidSyntax(
+                                    "Incomplete unicode escape".to_string(),
+                                ));
+                            }
+                        }
+                        if let Ok(unicode_val) = u32::from_str_radix(&hex_chars, 16) {
+                            if let Some(unicode_char) = char::from_u32(unicode_val) {
+                                result.push(unicode_char);
+                            } else {
+                                return Err(ParserError::InvalidSyntax(format!(
+                                    "Invalid unicode value: {}",
+                                    unicode_val
+                                )));
+                            }
+                        } else {
+                            return Err(ParserError::InvalidSyntax(format!(
+                                "Invalid unicode hex value: {}",
+                                hex_chars
+                            )));
+                        }
+                    }
+                    'U' => {
+                        // Extended unicode escape: \UHHHHHHHH
+                        let mut hex_chars = String::new();
+                        for _ in 0..8 {
+                            if let Some(hex_ch) = chars.next() {
+                                if hex_ch.is_ascii_hexdigit() {
+                                    hex_chars.push(hex_ch);
+                                } else {
+                                    return Err(ParserError::InvalidSyntax(format!(
+                                        "Invalid extended unicode escape: \\U{}",
+                                        hex_ch
+                                    )));
+                                }
+                            } else {
+                                return Err(ParserError::InvalidSyntax(
+                                    "Incomplete extended unicode escape".to_string(),
+                                ));
+                            }
+                        }
+                        if let Ok(unicode_val) = u32::from_str_radix(&hex_chars, 16) {
+                            if let Some(unicode_char) = char::from_u32(unicode_val) {
+                                result.push(unicode_char);
+                            } else {
+                                return Err(ParserError::InvalidSyntax(format!(
+                                    "Invalid extended unicode value: {}",
+                                    unicode_val
+                                )));
+                            }
+                        } else {
+                            return Err(ParserError::InvalidSyntax(format!(
+                                "Invalid extended unicode hex value: {}",
+                                hex_chars
+                            )));
+                        }
+                    }
+                    _ => {
+                        // Unknown escape sequence, treat as literal
+                        result.push('\\');
+                        result.push(next_ch);
+                    }
+                }
+            } else {
+                // Backslash at end of string, treat as literal
+                result.push('\\');
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    Ok(Word::Literal(result, None))
+}
+
+fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    use crate::ast::{BraceExpansion, BraceItem, BraceRange};
+
+    // Consume the opening brace
+    if !matches!(lexer.peek(), Some(Token::BraceOpen)) {
+        return Err(ParserError::InvalidSyntax(
+            "Expected '{' for brace expansion".to_string(),
+        ));
+    }
+    lexer.next(); // consume '{'
+
+    let mut items = Vec::new();
+
+    // Parse the content inside braces
+    loop {
+        match lexer.peek() {
+            Some(Token::BraceClose) => {
+                lexer.next(); // consume '}'
+                break;
+            }
+            Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) => {
+                let start = lexer.get_number_text()?;
+                //                 debug_eprintln!("DEBUG: Found start number: {}", start);
+                //                 debug_eprintln!("DEBUG: After getting start number, current token: {:?}", lexer.peek());
+
+                // Check if this is a range (look for ..)
+                if matches!(lexer.peek(), Some(Token::Range)) {
+                    //                     debug_eprintln!("DEBUG: Found '..' after start number");
+                    lexer.next(); // consume '..'
+
+                    if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
+                        let end = lexer.get_number_text()?;
+                        //                         debug_eprintln!("DEBUG: Found end number: {}", end);
+                        //                         debug_eprintln!("DEBUG: After getting end number, current token: {:?}", lexer.peek());
+
+                        // Check if there's a step value (another ..)
+                        if matches!(lexer.peek(), Some(Token::Range)) {
+                            //                             eprintln!("DEBUG: Found second '..' in number range, looking for step value");
+                            lexer.next(); // consume second '..'
+                                          //                             eprintln!("DEBUG: After consuming second '..', current token: {:?}", lexer.peek());
+
+                            if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
+                                let step = lexer.get_number_text()?;
+                                //                                 eprintln!("DEBUG: Found step value: {}", step);
+                                //                                 eprintln!("DEBUG: Added step range, continuing to next iteration");
+                                items.push(BraceItem::Range(BraceRange {
+                                    start,
+                                    end,
+                                    step: Some(step),
+                                    format: None,
+                                }));
+                                continue; // Continue to next iteration to look for closing brace or more items
+                            } else {
+                                //                                 eprintln!("DEBUG: Expected number after second '..', but got: {:?}", lexer.peek());
+                                return Err(ParserError::InvalidSyntax(
+                                    "Expected number after second '..' in brace range".to_string(),
+                                ));
+                            }
+                        } else {
+                            //                             eprintln!("DEBUG: No step value, creating range from {} to {}", start, end);
+                            items.push(BraceItem::Range(BraceRange {
+                                start,
+                                end,
+                                step: None,
+                                format: None,
+                            }));
+                            //                             eprintln!("DEBUG: Added simple range, continuing to next iteration");
+                            continue; // Continue to next iteration to look for closing brace or more items
+                        }
+                    } else {
+                        //                         eprintln!("DEBUG: Expected number after '..', but got: {:?}", lexer.peek());
+                        return Err(ParserError::InvalidSyntax(
+                            "Expected number after '..' in brace range".to_string(),
+                        ));
+                    }
+                } else {
+                    //                     eprintln!("DEBUG: No range, treating as literal number: {}", start);
+                    // Just a literal number
+                    items.push(BraceItem::Literal(start));
+                }
+            }
+            Some(Token::Identifier) => {
+                let text = lexer.get_identifier_text()?;
+
+                // Check if this is a range (look for ..)
+                if matches!(lexer.peek(), Some(Token::Range)) {
+                    lexer.next(); // consume '..'
+
+                    if let Some(Token::Identifier) = lexer.peek() {
+                        let end = lexer.get_identifier_text()?;
+
+                        // Check if there's a step value (another ..)
+                        if matches!(lexer.peek(), Some(Token::Range)) {
+                            lexer.next(); // consume second '..'
+
+                            if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
+                                let step = lexer.get_number_text()?;
+                                items.push(BraceItem::Range(BraceRange {
+                                    start: text,
+                                    end,
+                                    step: Some(step),
+                                    format: None,
+                                }));
+                                continue; // Continue to next iteration to look for closing brace or more items
+                            } else {
+                                return Err(ParserError::InvalidSyntax(
+                                    "Expected number after second '..' in identifier brace range"
+                                        .to_string(),
+                                ));
+                            }
+                        } else {
+                            items.push(BraceItem::Range(BraceRange {
+                                start: text,
+                                end,
+                                step: None,
+                                format: None,
+                            }));
+                            continue; // Continue to next iteration to look for closing brace or more items
+                        }
+                    } else {
+                        return Err(ParserError::InvalidSyntax(
+                            "Expected identifier after '..' in brace range".to_string(),
+                        ));
+                    }
+                } else {
+                    // Just a literal identifier
+                    items.push(BraceItem::Literal(text));
+                }
+            }
+            Some(Token::BraceOpen) => {
+                let nested = parse_brace_expansion(lexer)?;
+                if let Word::BraceExpansion(be, _) = nested {
+                    items.push(BraceItem::Nested(Box::new(be)));
+                } else {
+                    return Err(ParserError::InvalidSyntax(
+                        "Expected brace expansion from nested brace".to_string(),
+                    ));
+                }
+            }
+            Some(Token::Comma) => {
+                lexer.next(); // consume ','
+                              // Continue to next item
+            }
+            Some(
+                Token::Slash
+                | Token::Dot
+                | Token::Colon
+                | Token::Minus
+                | Token::Plus
+                | Token::Star
+                | Token::At
+                | Token::Bang
+                | Token::Percent
+                | Token::Caret
+                | Token::Tilde
+                | Token::Escape
+                | Token::HexNumber
+                | Token::Semicolon
+                | Token::NonZero
+                | Token::Size
+                | Token::File
+                | Token::Directory
+                | Token::Readable
+                | Token::PipeFile,
+            ) => {
+                let text = lexer.get_current_text().unwrap_or_default();
+                lexer.next();
+                items.push(BraceItem::Literal(text));
+            }
+            _ => {
+                return Err(ParserError::InvalidSyntax(
+                    "Unexpected token in brace expansion".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(Word::BraceExpansion(
+        BraceExpansion {
+            prefix: None,
+            items,
+            suffix: None,
+        },
+        None,
+    ))
+}
+
+fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    // Parse arithmetic expressions like $((i + 1))
+    // First, consume the opening $(( or $(
+    match lexer.peek() {
+        Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+            lexer.next(); // consume $(( or $(
+        }
+        _ => {
+            return Err(ParserError::InvalidSyntax(
+                "Expected arithmetic expression start".to_string(),
+            ));
+        }
+    }
+
+    // Capture the content until we find the closing ))
+    let mut expression_parts = Vec::new();
+    let mut paren_depth = 1; // We're already inside one level of parentheses
+
+    loop {
+        match lexer.peek() {
+            Some(Token::ArithmeticEvalClose) => {
+                // This is the closing )) for $((...))
+                lexer.next();
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    break;
+                }
+            }
+            Some(Token::Arithmetic) => {
+                // This is another opening $((...))
+                lexer.next();
+                paren_depth += 1;
+            }
+            Some(Token::Identifier) => {
+                expression_parts.push(lexer.get_identifier_text()?);
+            }
+            Some(Token::Number) => {
+                expression_parts.push(lexer.get_number_text()?);
+            }
+            Some(Token::Plus) => {
+                expression_parts.push("+".to_string());
+                lexer.next();
+            }
+            Some(Token::Minus) => {
+                expression_parts.push("-".to_string());
+                lexer.next();
+            }
+            Some(Token::Star) | Some(Token::Percent) => {
+                expression_parts.push("*".to_string());
+                lexer.next();
+            }
+            Some(Token::Slash) => {
+                expression_parts.push("/".to_string());
+                lexer.next();
+            }
+            Some(Token::Space) | Some(Token::Tab) => {
+                expression_parts.push(" ".to_string());
+                lexer.next();
+            }
+            Some(Token::Dollar) => {
+                // Handle variable references like $i
+                lexer.next();
+                if let Some(Token::Identifier) = lexer.peek() {
+                    let var_name = lexer.get_identifier_text()?;
+                    expression_parts.push(format!("${}", var_name));
+                } else {
+                    return Err(ParserError::InvalidSyntax(
+                        "Expected identifier after $ in arithmetic expression".to_string(),
+                    ));
+                }
+            }
+            None => {
+                return Err(ParserError::InvalidSyntax(
+                    "Unexpected end of input in arithmetic expression".to_string(),
+                ));
+            }
+            _ => {
+                // For any other token, just consume it and add its text
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                    lexer.next();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    let expression = expression_parts.join("");
+
+    // Return as an Arithmetic Word variant
+    Ok(Word::Arithmetic(
+        ArithmeticExpression {
+            expression,
+            tokens: Vec::new(), // We don't need to store individual tokens for now
+        },
+        None,
+    ))
+}
+
+fn parse_braced_variable_name(lexer: &mut Lexer) -> Result<String, ParserError> {
+    // Parse the content inside ${...} until we find the closing }
+    let mut content = String::new();
+    let mut brace_depth = 1; // We're already inside one level of braces
+
+    while brace_depth > 0 {
+        if let Some((start, end)) = lexer.get_span() {
+            let token = lexer.peek();
+
+            match token {
+                Some(Token::BraceOpen) => {
+                    brace_depth += 1;
+                    let text = lexer.get_text(start, end);
+                    content.push_str(&text);
+                    lexer.next();
+                }
+                Some(
+                    Token::DollarBrace
+                    | Token::DollarBraceHash
+                    | Token::DollarBraceBang
+                    | Token::DollarBraceStar
+                    | Token::DollarBraceAt
+                    | Token::DollarBraceHashStar
+                    | Token::DollarBraceHashAt
+                    | Token::DollarBraceBangStar
+                    | Token::DollarBraceBangAt,
+                ) => {
+                    // Nested ${...} — increment depth so the matching } doesn't
+                    // close our outer brace prematurely.
+                    brace_depth += 1;
+                    let text = lexer.get_text(start, end);
+                    content.push_str(&text);
+                    lexer.next();
+                }
+                Some(Token::BraceClose) => {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        // Don't consume the closing } yet, let the caller handle it
+                        break;
+                    } else {
+                        let text = lexer.get_text(start, end);
+                        content.push_str(&text);
+                        lexer.next();
+                    }
+                }
+                _ => {
+                    let text = lexer.get_text(start, end);
+                    content.push_str(&text);
+                    lexer.next();
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    Ok(content)
+}
+
+fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+    // TODO: Implement parameter expansion parsing
+    Err(ParserError::InvalidSyntax(
+        "Parameter expansion not yet implemented".to_string(),
+    ))
+}
+
+fn parse_array_slicing(_lexer: &mut Lexer, _array_name: String) -> Result<Word, ParserError> {
+    // TODO: Implement array slicing parsing
+    Err(ParserError::InvalidSyntax(
+        "Array slicing not yet implemented".to_string(),
+    ))
+}
+
+fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    // Parse backtick command substitution
+    let backtick_text = lexer.get_raw_token_text()?;
+    // Remove the surrounding backticks
+    let command_text = &backtick_text[1..backtick_text.len() - 1];
+
+    // Check if the command contains command substitutions (like $(pwd)), pipelines (like |), or logical operators (like && or ||)
+    if command_text.contains("$(")
+        || command_text.contains("|")
+        || command_text.contains("&&")
+        || command_text.contains("||")
+    {
+        // Use the full parser for commands with command substitutions, pipelines, or logical operators
+        let sub_lexer = Lexer::new(command_text);
+        let mut sub_parser = Parser::new_with_lexer(sub_lexer);
+        match sub_parser.parse() {
+            Ok(commands) => {
+                if commands.len() == 1 {
+                    Ok(Word::CommandSubstitution(
+                        Box::new(commands[0].clone()),
+                        None,
+                    ))
+                } else if commands.is_empty() {
+                    // If no commands parsed, treat as a simple command with the text as argument
+                    let placeholder_cmd = Command::Simple(SimpleCommand {
+                        name: Word::Literal("echo".to_string(), None),
+                        args: vec![Word::Literal(command_text.to_string(), None)],
+                        redirects: Vec::new(),
+                        env_vars: HashMap::new(),
+                        stdout_used: true,
+                        stderr_used: true,
+                    });
+                    Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
+                } else {
+                    // If multiple commands, use the first one
+                    Ok(Word::CommandSubstitution(
+                        Box::new(commands[0].clone()),
+                        None,
+                    ))
+                }
+            }
+            Err(_) => {
+                // Fall back to using the simple command parser
+                match crate::parser::commands::parse_pipeline_from_text(command_text) {
+                    Ok(command) => Ok(Word::CommandSubstitution(Box::new(command), None)),
+                    Err(_) => {
+                        // Fall back to treating it as a literal
+                        Ok(Word::Literal(format!("`{}`", command_text), None))
+                    }
+                }
+            }
+        }
+    } else {
+        // Use the simple command parser for commands without command substitutions
+        match crate::parser::commands::parse_pipeline_from_text(command_text) {
+            Ok(command) => Ok(Word::CommandSubstitution(Box::new(command), None)),
+            Err(_) => {
+                // Fall back to treating it as a literal
+                Ok(Word::Literal(format!("`{}`", command_text), None))
+            }
+        }
+    }
+}
+
+// Helper function to parse a simple command from text
+fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
+    use crate::lexer::{Lexer, Token};
+
+    // Create a lexer for the command text
+    let mut lexer = Lexer::new(text);
+    let mut args = Vec::new();
+    let mut redirects = Vec::new();
+    let mut current_arg = String::new();
+    let mut in_quotes = false;
+    let mut quote_char = '\0';
+
+    // Process tokens and group them into arguments or redirections
+    while let Some(token) = lexer.peek() {
+        match token {
+            Token::Space => {
+                lexer.next(); // consume the space
+                if in_quotes {
+                    current_arg.push(' ');
+                } else if !current_arg.is_empty() {
+                    args.push(current_arg.clone());
+                    current_arg.clear();
+                }
+            }
+            Token::Comment => break, // Stop at comments
+            Token::RedirectIn
+            | Token::RedirectOut
+            | Token::RedirectAppend
+            | Token::RedirectInErr
+            | Token::RedirectOutErr
+            | Token::RedirectInOut
+            | Token::Heredoc
+            | Token::HeredocTabs
+            | Token::HereString => {
+                // This is a redirection operator
+                // First, add any current argument
+                if !current_arg.is_empty() {
+                    args.push(current_arg.clone());
+                    current_arg.clear();
+                }
+
+                // Parse the redirection (don't consume the token here, let parse_redirect handle it)
+                let redirect = parse_redirect(&mut lexer)?;
+                redirects.push(redirect);
+            }
+            Token::Number => {
+                // Check if this is a file descriptor redirection (number followed by redirect operator)
+                if let Some(next_token) = lexer.peek_n(1) {
+                    match next_token {
+                        Token::RedirectIn
+                        | Token::RedirectOut
+                        | Token::RedirectAppend
+                        | Token::RedirectInErr
+                        | Token::RedirectOutErr
+                        | Token::RedirectInOut
+                        | Token::Heredoc
+                        | Token::HeredocTabs
+                        | Token::HereString => {
+                            // This is a file descriptor redirection
+                            // First, add any current argument
+                            if !current_arg.is_empty() {
+                                args.push(current_arg.clone());
+                                current_arg.clear();
+                            }
+
+                            // Parse the redirection (don't consume the number token here, let parse_redirect handle it)
+                            let redirect = parse_redirect(&mut lexer)?;
+                            redirects.push(redirect);
+                        }
+                        _ => {
+                            // This is just a regular number argument
+                            lexer.next(); // consume the number
+                            if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                                let token_text = &text[*start..*end];
+                                current_arg.push_str(token_text);
+                            }
+                        }
+                    }
+                } else {
+                    // No next token, treat as regular number argument
+                    lexer.next(); // consume the number
+                    if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                        let token_text = &text[*start..*end];
+                        current_arg.push_str(token_text);
+                    }
+                }
+            }
+            Token::Identifier => {
+                // Handle identifier as literal
+                lexer.next();
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+                    current_arg.push_str(token_text);
+                }
+            }
+            Token::Plus => {
+                // Handle plus character as literal
+                lexer.next();
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+                    current_arg.push_str(token_text);
+                }
+            }
+            Token::Minus => {
+                // Handle minus character as literal
+                lexer.next();
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+                    current_arg.push_str(token_text);
+                }
+            }
+            Token::Percent => {
+                // Handle percent character as literal
+                lexer.next();
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+                    current_arg.push_str(token_text);
+                }
+            }
+            Token::DollarParen => {
+                // Handle $(...) command substitution
+                let command_text = lexer.capture_parenthetical_text()?;
+                // For now, just add as literal - this is a limitation of parse_simple_command_from_text
+                // The proper fix would require changing the return type to handle command substitutions
+                args.push(format!("$({})", command_text));
+            }
+            _ => {
+                // Consume the token
+                lexer.next();
+                // Get the token text from the current position
+                if let Some((_, start, end)) = lexer.tokens.get(lexer.current - 1) {
+                    let token_text = &text[*start..*end];
+
+                    // Handle quoted strings
+                    if (token_text.starts_with('"') || token_text.starts_with('\'')) && !in_quotes {
+                        quote_char = token_text.chars().next().unwrap();
+                        if token_text.ends_with(quote_char) && token_text.len() > 1 {
+                            // Complete quoted string in one token
+                            current_arg.push_str(&token_text[1..token_text.len() - 1]);
+                        } else {
+                            // Start of quoted string
+                            in_quotes = true;
+                            current_arg.push_str(&token_text[1..]);
+                        }
+                    } else if in_quotes && token_text.ends_with(quote_char) {
+                        // End of quoted string
+                        current_arg.push_str(&token_text[..token_text.len() - 1]);
+                        in_quotes = false;
+                    } else {
+                        // Regular token - add to current argument
+                        current_arg.push_str(token_text);
+                    }
+                }
+            }
+        }
+    }
+
+    // Add the last argument if it exists
+    if !current_arg.is_empty() {
+        args.push(current_arg);
+    }
+
+    if args.is_empty() {
+        return Err(ParserError::InvalidSyntax(
+            "Empty command in backticks".to_string(),
+        ));
+    }
+
+    // First argument is the command name
+    let name = Word::Literal(args[0].clone(), None);
+
+    // Remaining arguments
+    let mut word_args = Vec::new();
+    for arg in &args[1..] {
+        word_args.push(Word::Literal(arg.clone(), None));
+    }
+
+    let cmd = Command::Simple(SimpleCommand {
+        name,
+        args: word_args,
+        redirects,
+        env_vars: HashMap::new(),
+        stdout_used: true,
+        stderr_used: true,
+    });
+
+    Ok(cmd)
+}

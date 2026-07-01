@@ -5,27 +5,28 @@ use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
 use IPC::Open3;
-use File::Path qw(make_path remove_tree);
+use Digest::SHA   qw(sha256_hex sha512_hex);
+use File::Path    qw(make_path remove_tree);
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__04g_checksum_commands.sh';
 print "=== Checksum Commands ===\n";
 do {
     open my $original_stdout, '>&', STDOUT
-      or die "Cannot save STDOUT: $!\n";
+      or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'test_checksum.txt'
-      or die "Cannot open file: $!\n";
+      or die "Cannot open file: $OS_ERROR\n";
     print "test content\n";
     open STDOUT, '>&', $original_stdout
-      or die "Cannot restore STDOUT: $!\n";
+      or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
-      or die "Close failed: $!\n";
-    0;
+      or die "Close failed: $OS_ERROR\n";
 };
-my $sha256_result;
-$sha256_result = do {
+my $sha256_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha256_hex(
@@ -47,7 +48,6 @@ $sha256_result = do {
     }
     join("\n", @results) . "\n";
 };
-;
 do {
     my $output = "SHA256 result: $sha256_result";
     print $output;
@@ -56,8 +56,7 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $sha512_result;
-$sha512_result = do {
+my $sha512_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha512_hex(
@@ -79,7 +78,6 @@ $sha512_result = do {
     }
     join("\n", @results) . "\n";
 };
-;
 do {
     my $output = "SHA512 result: $sha512_result";
     print $output;
@@ -88,49 +86,54 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $strings_result;
-$strings_result = do { do {
-    do { my $output_112 = q{};
-my $output_printed_112;
-my $head_line_count = 0;
-my $output_113 = q{};
-while (my $line = <>) {
-    chomp $line;
-    my @filenames = ('target/debug/debashc.exe');
-my $combined_output = q{};
-foreach my $filename (@filenames) {
-my $input_data;
-if ( open my $fh, '<', $filename ) {
-    local $INPUT_RECORD_SEPARATOR = undef;
-    $input_data = <$fh>;
-    close $fh
-      or croak "Close failed: $ERRNO";
-}
-else {
-    $combined_output .= "strings: '$filename': No such file\n";
-    $input_data = q{};
-}
-my @result;
-while ($input_data =~ /([\x20-\x7E]{4,})/g) {
-    push @result, $1;
-}
-my $line = join "\n", @result;
-$line .= "\n" if $line ne q{};
-$combined_output .= $line;
-}
-$output_113 = $combined_output;
-    if ($head_line_count < 3) {
-    $output_0 .= $line . "\n";
-    ++$head_line_count;
-} else {
-    $line = q{}; # Clear line to prevent printing
-    last; # Break out of the yes loop when head limit is reached
-}
-} };
-} };
+my $strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+    my $output_110 = q{};
+    my $output_printed_110;
+    my $pipeline_success_110 = 1;
+    my $input_data;
+    if ( open my $fh, '<', 'target/debug/debashc.exe' ) {
+        local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
+        $input_data = <$fh>;
+        close $fh
+          or croak "Close failed: $ERRNO";
+    }
+    else {
+        print {*STDERR} "strings: 'target/debug/debashc.exe': No such file\n";
+        $input_data = q{};
+    }
+    my @result;
+    while ($input_data =~ /([\x20-\x7E]{4,})/g) {
+        push @result, $1;
+    }
+    my $line = join "\n", @result;
+    if ($line ne q{} && !($line =~ m{\n\z}msx)) { $line .= "\n"; }
+    $output_110 = $line;
+    if ($CHILD_ERROR != 0) { $pipeline_success_110 = 0; }
+    my $num_lines       = 3;
+    my $head_line_count = 0;
+    my $result          = q{};
+    my $input           = $output_110;
+    my $pos             = 0;
+
+    while ( $pos < length $input && $head_line_count < $num_lines ) {
+        my $line_end = index $input, "\n", $pos;
+        if ( $line_end == -1 ) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_110 = $result;
+
+    if ( !$pipeline_success_110 ) { $main_exit_code = 1; }
+    $output_110 =~ s/\n+\z//msx;
+    $output_110;
+}; $_pipeline_result; };
 print "Strings result:\n";
 print $strings_result;
-if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }
 if ( -e "test_checksum.txt" ) {
     if ( -d "test_checksum.txt" ) {
         carp "rm: carping: ", "test_checksum.txt",
@@ -138,8 +141,7 @@ if ( -e "test_checksum.txt" ) {
     }
     else {
         if ( unlink "test_checksum.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "test_checksum.txt",
               ": $OS_ERROR\n";
@@ -147,7 +149,7 @@ if ( -e "test_checksum.txt" ) {
     }
 }
 else {
-    $CHILD_ERROR = 0;
+    local $CHILD_ERROR = 0;
 }
 print "=== Checksum Commands Complete ===\n";
 
