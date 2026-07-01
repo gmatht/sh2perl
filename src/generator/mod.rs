@@ -273,7 +273,9 @@ impl Generator {
             output.push_str("use File::Basename;\n");
         }
         // IPC::Open3 is used by command-substitution fallbacks and a few command generators.
-        output.push_str("use IPC::Open3;\n");
+        if needs_ipc_open3 {
+            output.push_str("use IPC::Open3;\n");
+        }
         if needs_file_find {
             // No additional imports needed for glob-based approach
         }

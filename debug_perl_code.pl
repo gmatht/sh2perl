@@ -11,53 +11,27 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '002_control_flow.sh';
-my $i = 0;
-
-my $MAX_LOOP_5 = 5;
-my $MAGIC_10   = 10;
-
-if ((-f"file.txt")) {
-    print "File exists\n";
+$PROGRAM_NAME = '063_06_complex_pipeline_background.sh';
+if (my $pid = fork()) {
+    # Parent process continues
+} elsif (defined $pid) {
+    # Child process executes the background command
+    exec 'bash', '-c', '(echo Starting; sleep 1)';
+    croak "exec failed: $OS_ERROR\n";
+} else {
+    die "Cannot fork: $ERRNO\n";
 }
-else {
-    print "File does not exist\n";
+if (my $pid = fork()) {
+    # Parent process continues
+} elsif (defined $pid) {
+    # Child process executes the background command
+    exec 'bash', '-c', '(echo Processing; sleep 2)';
+    croak "exec failed: $OS_ERROR\n";
+} else {
+    die "Cannot fork: $ERRNO\n";
 }
-for my $i ( 1 .. $MAX_LOOP_5 ) {
-    do {
-    my $output = "Number: $i";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-    $CHILD_ERROR = 0;
-}
-$i = 5;
-while ( $i < $MAGIC_10 ) {
-    do {
-    my $output = "Counter: $i";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-    $CHILD_ERROR = 0;
-    $i = $i + 1;
-}
-
-sub greet {
-    my ($file) = @_;
-    do {
-    my $output = "Hello, $_[0]!";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
-        print "\n";
-    }
-};
-    $CHILD_ERROR = 0;
-    return;
-}
-greet("World");
+1 while wait() > -1;
+$CHILD_ERROR = $? >> 8;
+print "All done\n";
 
 exit $main_exit_code;
