@@ -8,10 +8,11 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-my $result;
-$result =  ($a + $b) * ($c - $d) / ($e * $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ;
+$PROGRAM_NAME = '063_01_deeply_nested_arithmetic.sh';
+my $result =  ($a + $b) * ($c - $d) / ($e * $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ;
 do {
     my $output = "Deeply nested arithmetic result: $result";
     print $output;

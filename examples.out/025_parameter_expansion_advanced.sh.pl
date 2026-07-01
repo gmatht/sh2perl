@@ -9,14 +9,15 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$SIG{__DIE__} = sub { exit 1 };
+$PROGRAM_NAME = '025_parameter_expansion_advanced.sh';
+$__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== Advanced parameter expansion ==\n";
-my $path;
-$path = "/tmp/file.txt";
+my $path = "/tmp/file.txt";
 do {
     my $output = basename(${path});
     print $output;
@@ -36,6 +37,6 @@ $CHILD_ERROR = 0;
 my $s2;
 $s2 = "abba";
 print $s2 =~ s/b/X/grs;
-if ( !( $s2 =~ s/b/X/grs =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($s2 =~ s/b/X/grs) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;

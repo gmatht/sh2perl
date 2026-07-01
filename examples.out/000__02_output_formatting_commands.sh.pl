@@ -5,15 +5,33 @@ use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
 use IPC::Open3;
-use File::Path qw(make_path remove_tree);
+use Digest::SHA   qw(sha256_hex sha512_hex);
+use File::Path    qw(make_path remove_tree);
+sub capture_stdout {
+    my ($code) = @_;
+    my $captured = q{};
+    {
+        local *STDOUT;
+        open STDOUT, '>', \$captured
+          or die "Cannot capture stdout: $OS_ERROR\n";
+        $code->();
+    }
+    return $captured;
+}
+
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__02_output_formatting_commands.sh';
 print "=== Output and Formatting Commands ===\n";
-my $echo_result;
-$echo_result = ("Hello from backticks");
+my $echo_result = do {
+    my $_chomp_temp = ("Hello from backticks");
+    chomp $_chomp_temp;
+    $_chomp_temp;
+};
 do {
     my $output = "Echo result: $echo_result";
     print $output;
@@ -22,10 +40,11 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $printf_result;
-$printf_result = do {
-    my $result = sprintf "Number: %d, String: %s\n", '42', "test";
-    $result;
+my $printf_result = do {
+    my $_chomp_temp = sprintf("Number: %d, String: %s\n", '42', "test");
+;
+    chomp $_chomp_temp;
+    $_chomp_temp;
 };
 do {
     my $output = "Printf result: $printf_result";
@@ -41,18 +60,16 @@ print "=== Process Management Commands ===\n";
 print "=== Checksum Commands ===\n";
 do {
     open my $original_stdout, '>&', STDOUT
-      or die "Cannot save STDOUT: $!\n";
+      or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'test_checksum.txt'
-      or die "Cannot open file: $!\n";
+      or die "Cannot open file: $OS_ERROR\n";
     print "test content\n";
     open STDOUT, '>&', $original_stdout
-      or die "Cannot restore STDOUT: $!\n";
+      or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
-      or die "Close failed: $!\n";
-    0;
+      or die "Close failed: $OS_ERROR\n";
 };
-my $sha256_result;
-$sha256_result = do {
+my $sha256_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha256_hex(
@@ -74,7 +91,6 @@ $sha256_result = do {
     }
     join("\n", @results) . "\n";
 };
-;
 do {
     my $output = "SHA256 result: $sha256_result";
     print $output;
@@ -83,8 +99,7 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $sha512_result;
-$sha512_result = do {
+my $sha512_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha512_hex(
@@ -106,7 +121,6 @@ $sha512_result = do {
     }
     join("\n", @results) . "\n";
 };
-;
 do {
     my $output = "SHA512 result: $sha512_result";
     print $output;
@@ -115,73 +129,76 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $strings_result;
-$strings_result = do { do {
-    do { my $output_0 = q{};
-my $output_printed_0;
-my $head_line_count = 0;
-my $output_1 = q{};
-while (my $line = <>) {
-    chomp $line;
-    my @filenames = ('test_binary.txt');
-my $combined_output = q{};
-foreach my $filename (@filenames) {
-my $input_data;
-if ( open my $fh, '<', $filename ) {
-    local $INPUT_RECORD_SEPARATOR = undef;
-    $input_data = <$fh>;
-    close $fh
-      or croak "Close failed: $ERRNO";
-}
-else {
-    $combined_output .= "strings: '$filename': No such file\n";
-    $input_data = q{};
-}
-my @result;
-while ($input_data =~ /([\x20-\x7E]{4,})/g) {
-    push @result, $1;
-}
-my $line = join "\n", @result;
-$line .= "\n" if $line ne q{};
-$combined_output .= $line;
-}
-$output_1 = $combined_output;
-    if ($head_line_count < 3) {
-    $output_0 .= $line . "\n";
-    ++$head_line_count;
-} else {
-    $line = q{}; # Clear line to prevent printing
-    last; # Break out of the yes loop when head limit is reached
-}
-} };
-} };
+my $strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+    my $output_0 = q{};
+    my $output_printed_0;
+    my $pipeline_success_0 = 1;
+    my $input_data;
+    if ( open my $fh, '<', 'test_binary.txt' ) {
+        local $INPUT_RECORD_SEPARATOR = undef;    # Read entire file at once
+        $input_data = <$fh>;
+        close $fh
+          or croak "Close failed: $ERRNO";
+    }
+    else {
+        print {*STDERR} "strings: 'test_binary.txt': No such file\n";
+        $input_data = q{};
+    }
+    my @result;
+    while ($input_data =~ /([\x20-\x7E]{4,})/g) {
+        push @result, $1;
+    }
+    my $line = join "\n", @result;
+    if ($line ne q{} && !($line =~ m{\n\z}msx)) { $line .= "\n"; }
+    $output_0 = $line;
+    if ($CHILD_ERROR != 0) { $pipeline_success_0 = 0; }
+    my $num_lines       = 3;
+    my $head_line_count = 0;
+    my $result          = q{};
+    my $input           = $output_0;
+    my $pos             = 0;
+
+    while ( $pos < length $input && $head_line_count < $num_lines ) {
+        my $line_end = index $input, "\n", $pos;
+        if ( $line_end == -1 ) {
+            $line_end = length $input;
+        }
+        my $head_line = substr $input, $pos, $line_end - $pos;
+        $result .= $head_line . "\n";
+        $pos = $line_end + 1;
+        ++$head_line_count;
+    }
+    $output_0 = $result;
+
+    if ( !$pipeline_success_0 ) { $main_exit_code = 1; }
+    $output_0 =~ s/\n+\z//msx;
+    $output_0;
+}; $_pipeline_result; };
 print "Strings result:\n";
 print $strings_result;
-if ( !( $strings_result =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }
 print "=== I/O Redirection Commands ===\n";
-my $tee_result;
-$tee_result = do { do {
-    my $output_2 = q{};
-    my $output_printed_2;
-    my $pipeline_success_2 = 1;
-    $output_2 .= 'test output' . "\n";
-    if ( !($output_2 =~ m{\n\z}msx) ) { $output_2 .= "\n"; }
+my $tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+    my $output_1 = q{};
+    my $output_printed_1;
+    my $pipeline_success_1 = 1;
+    $output_1 .= 'test output' . "\n";
+    if ( !($output_1 =~ m{\n\z}msx) ) { $output_1 .= "\n"; }
     $CHILD_ERROR = 0;
+    if ($CHILD_ERROR != 0) { $pipeline_success_1 = 0; }
     use Carp qw(carp croak);
     if ( open my $fh, '>', 'test_tee.txt' ) {
-        print {$fh} $output_2;
+        print {$fh} $output_1;
         close $fh or croak "Close failed: $ERRNO";
     }
     else {
         carp "tee: Cannot open 'test_tee.txt': $ERRNO";
     }
-    $output_2 = $output_2;
-    if ( !$pipeline_success_2 ) { $main_exit_code = 1; }
-    if ($output_2 ne q{} && !($output_2 =~ m{\n\z}msx)) {
-        $output_2 .= "\n";
-    }
-    $output_2;
-} };
+    $output_1 = $output_1;
+    if ( !$pipeline_success_1 ) { $main_exit_code = 1; }
+    $output_1 =~ s/\n+\z//msx;
+    $output_1;
+}; $_pipeline_result; };
 do {
     my $output = "Tee result: $tee_result";
     print $output;
@@ -191,8 +208,7 @@ do {
 };
 $CHILD_ERROR = 0;
 print "=== Perl Command ===\n";
-my $perl_result;
-$perl_result = do {
+my $perl_result = do {
     my $result;
     my $eval_success = eval {
         $result = capture_stdout( sub { print "Hello from Perl\n" } );
@@ -218,8 +234,7 @@ if ( -e "test_checksum.txt" ) {
     }
     else {
         if ( unlink "test_checksum.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "test_checksum.txt",
               ": $OS_ERROR\n";
@@ -227,7 +242,7 @@ if ( -e "test_checksum.txt" ) {
     }
 }
 else {
-    $CHILD_ERROR = 0;
+    local $CHILD_ERROR = 0;
 }
 if ( -e "test_tee.txt" ) {
     if ( -d "test_tee.txt" ) {
@@ -236,8 +251,7 @@ if ( -e "test_tee.txt" ) {
     }
     else {
         if ( unlink "test_tee.txt" ) {
-            $main_exit_code = 0;
-        }
+                    }
         else {
             carp "rm: carping: could not remove ", "test_tee.txt",
               ": $OS_ERROR\n";
@@ -245,7 +259,7 @@ if ( -e "test_tee.txt" ) {
     }
 }
 else {
-    $CHILD_ERROR = 0;
+    local $CHILD_ERROR = 0;
 }
 
 exit $main_exit_code;

@@ -484,37 +484,6 @@ pub fn check_perl_no_system_builtins(perl_code: &str) -> Result<(), String> {
     }
 }
 
-/// Check for any system() calls in generated Perl code
-/// Returns an error if ANY system(...) call is found
-pub fn check_perl_no_system_calls(perl_code: &str) -> Result<(), String> {
-    use regex::Regex;
-
-    let re = match Regex::new(r"\bsystem\s*\(") {
-        Ok(re) => re,
-        Err(e) => return Err(format!("Failed to create system() regex: {}", e)),
-    };
-
-    let mut violations = Vec::new();
-    for mat in re.find_iter(perl_code) {
-        let line_num = perl_code[..mat.start()].matches('\n').count() + 1;
-        let start = mat.start();
-        let end = std::cmp::min(mat.start() + 60, perl_code.len());
-        let context = &perl_code[start..end];
-        violations.push(format!("Line {}: system() call found: {}{}",
-            line_num, context.trim(),
-            if end < perl_code.len() { "..." } else { "" }));
-    }
-
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "SYSTEM_CALL violations:\n{}",
-            violations.join("\n")
-        ))
-    }
-}
-
 /// Parse a pattern list like [Literal("-"), Literal("1")] into a vector of strings
 pub fn parse_ast_pattern_list(pattern_text: &str) -> Option<Vec<String>> {
     // Remove outer brackets and split by comma

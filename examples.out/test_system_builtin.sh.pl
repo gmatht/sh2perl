@@ -8,48 +8,33 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = 'test_system_builtin.sh';
 print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
-my $result1;
-$result1 = do {
-    my @ls_files_298 = ();
+my $result2 = do { my $command = q{find . -name '*.txt'}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
+my $result1 = do {
+    my @ls_files_343 = ();
     if ( -f q{.} ) {
-        push @ls_files_298, q{.};
+        push @ls_files_343, q{.};
     }
     elsif ( -d q{.} ) {
         if ( opendir my $dh, q{.} ) {
             while ( my $file = readdir $dh ) {
-                push @ls_files_298, $file;
+                push @ls_files_343, $file;
             }
             closedir $dh;
-            @ls_files_298 = sort { my $aa = $a; my $bb = $b; $aa =~ s{/$}{}; $bb =~ s{/$}{}; $aa cmp $bb } @ls_files_298;
+            @ls_files_343 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_343;
         }
     }
-    @ls_files_298 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_298;
-    (@ls_files_298 ? join("\n", @ls_files_298) . "\n" : q{});
-};
-my $result2;
-$result2 = do {
-    use File::Find;
-    use File::Basename;
-    my @files_300 = ();
-    my $start_300 = q{.};
-
-    find( sub {
-        my $file_300 = $File::Find::name;
-        if ( !( basename($file_300) =~ m/^.*.txt$/xms ) ) {
-            return;
-        }
-        push @files_300, $file_300;
-    },
-    $start_300 );
-    join "\n", @files_300;
+    @ls_files_343 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_343;
+    (@ls_files_343 ? join("\n", @ls_files_343) . "\n" : q{});
 };
 print "Results:\n";
 print $result1;
-if ( !( $result1 =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($result1) =~ m{\n\z}msx ) ) { print "\n"; }
 print $result2;
-if ( !( $result2 =~ m{\n\z}msx ) ) { print "\n"; }
+if ( !( ($result2) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;

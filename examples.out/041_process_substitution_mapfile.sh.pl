@@ -9,9 +9,11 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$SIG{__DIE__} = sub { exit 1 };
+$PROGRAM_NAME = '041_process_substitution_mapfile.sh';
+$__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== readarray/mapfile ==\n";
@@ -30,7 +32,7 @@ use File::Path qw(make_path);
 my $temp_dir_fh_1 = dirname($temp_file_ps_fh_1);
 if (!-d $temp_dir_fh_1) { make_path($temp_dir_fh_1); }
 open my $fh_ps_fh_1, '>', $temp_file_ps_fh_1 or croak "Cannot create temp file: $ERRNO\n";
-print $fh_ps_fh_1 $output_ps_fh_1;
+print {$fh_ps_fh_1} $output_ps_fh_1;
 close $fh_ps_fh_1 or croak "Close failed: $ERRNO\n";
 my @lines = ();
 if (open(my $mapfile_fh, '<', $temp_file_ps_fh_1)) {
@@ -40,9 +42,7 @@ if (open(my $mapfile_fh, '<', $temp_file_ps_fh_1)) {
     }
     close($mapfile_fh);
 }
-foreach my $item (@lines) {
-    printf('%s ', $item);
-}
+printf('%s ', (join(" ", @lines)));
 print "\n";
 $CHILD_ERROR = 0;
 

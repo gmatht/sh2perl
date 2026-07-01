@@ -8,8 +8,10 @@ use IPC::Open3;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
+my $__set_e        = 0;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '005_args.sh';
 print "== Argument count ==\n";
 do {
     my $output = scalar(@ARGV);
