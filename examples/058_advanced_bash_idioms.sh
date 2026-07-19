@@ -86,14 +86,14 @@ user="admin"
 host="localhost"
 port="22"
 
-cat <<-EOF
+cat <<'EOF'
     SSH Configuration:
-    $(cat <<-INNER
+    $(cat <<'INNER'
         User: $user
         Host: $host
         Port: $port
         Status: $(ping -c 1 $host >/dev/null 2>&1 && echo "Online" || echo "Offline")
-    INNER
+INNER
     )
 EOF
 echo
@@ -159,5 +159,6 @@ echo "  Home directory: $(dirname "$(dirname "$(pwd)")")"
 file_info=$(stat -c "%s %y" "nonexistent_file" 2>/dev/null || echo "File not found")
 echo "  File info: $file_info"
 echo
+}
 
 echo "=== Advanced Bash Idioms Examples Complete ==="
