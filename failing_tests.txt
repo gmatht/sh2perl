@@ -1,12 +1,9 @@
-009_arrays.sh	Failed due to: exit code mismatch, stdout mismatch
 012_process_substitution.sh	Failed due to: stdout mismatch
 019_grep_regex.sh	Failed due to: stdout mismatch
-029_arrays_associative.sh	Failed due to: exit code mismatch, stdout mismatch
 042_process_substitution_advanced.sh	Failed due to: stdout mismatch
 047_for_arithematic.sh	Failed due to: stdout mismatch
 051_primes.sh	Failed due to: exit code mismatch, stdout mismatch
 058_advanced_bash_idioms.sh	Failed due to: exit code mismatch, stdout mismatch
-062_10_simple_pipeline.sh	Failed due to: stdout mismatch
 062_14_complex_array_operations.sh	Failed due to: stdout mismatch
 062_15_complex_local_variables.sh	Failed due to: stdout mismatch
 062_hard_to_lex.sh	Failed due to: stdout mismatch
@@ -35,4 +32,3 @@
 064_24_advanced_parameter_expansion.sh	Failed due to: exit code mismatch, stdout mismatch
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
 065_yes_head_while.sh	Failed due to: exit code mismatch, stdout mismatch
-test_system_builtin.sh	Failed due to: stdout mismatch
