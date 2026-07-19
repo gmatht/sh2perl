@@ -48,67 +48,7 @@ fn perl_executable() -> &'static str {
     }
 }
 
-struct ExamplesSnapshot {
-    backup_dir: PathBuf,
-}
 
-impl ExamplesSnapshot {
-    fn capture() -> Result<Self, String> {
-        let unique_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let backup_dir = std::env::temp_dir().join(format!(
-            "sh2perl_examples_snapshot_{}_{}",
-            std::process::id(),
-            unique_id
-        ));
-
-        let status = Command::new("cp")
-            .args(["-a", "examples", backup_dir.to_string_lossy().as_ref()])
-            .status()
-            .map_err(|e| format!("Failed to snapshot examples: {}", e))?;
-        if !status.success() {
-            return Err(format!(
-                "Failed to snapshot examples: cp exited with {}",
-                status
-            ));
-        }
-
-        Ok(Self { backup_dir })
-    }
-
-    fn restore(&self) -> Result<(), String> {
-        if std::path::Path::new("examples").exists() {
-            // Make examples writable before trying to remove it (in case it's root-owned)
-            let _ = Command::new("chmod")
-                .args(["-R", "a+w", "examples"])
-                .status();
-            fs::remove_dir_all("examples")
-                .map_err(|e| format!("Failed to clear examples: {}", e))?;
-        }
-
-        let status = Command::new("cp")
-            .args(["-a", self.backup_dir.to_string_lossy().as_ref(), "examples"])
-            .status()
-            .map_err(|e| format!("Failed to restore examples: {}", e))?;
-        if !status.success() {
-            return Err(format!(
-                "Failed to restore examples: cp exited with {}",
-                status
-            ));
-        }
-
-        Ok(())
-    }
-}
-
-impl Drop for ExamplesSnapshot {
-    fn drop(&mut self) {
-        let _ = self.restore();
-        let _ = fs::remove_dir_all(&self.backup_dir);
-    }
-}
 
 #[derive(Debug)]
 pub struct TestResult {
@@ -727,7 +667,6 @@ pub fn test_file_equivalence_detailed_with_critic(
     // Load caches
     let mut cache = CommandCache::load();
     let mut shell_output = None;
-    let examples_snapshot = ExamplesSnapshot::capture()?;
 
     // Declare variables that will be used throughout the function
     let mut shell_content = String::new();
@@ -804,10 +743,6 @@ pub fn test_file_equivalence_detailed_with_critic(
                 status: create_exit_status(0),
             });
         } else {
-            if let Err(e) = examples_snapshot.restore() {
-                eprintln!("Warning: Failed to restore examples: {}", e);
-            }
-
             // Clean up any temporary files in examples directory before running shell script
             let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
             if let Ok(entries) = std::fs::read_dir(&examples_dir) {
@@ -851,9 +786,6 @@ pub fn test_file_equivalence_detailed_with_critic(
 
     // Get the shell output (either cached or fresh)
     let shell_output_result = shell_output.unwrap();
-    if let Err(e) = examples_snapshot.restore() {
-        eprintln!("Warning: Failed to restore examples: {}", e);
-    }
     eprintln!("DEBUG: Shell script execution completed, now starting Perl generation");
 
     // If no cached Perl code, we need to parse and generate
