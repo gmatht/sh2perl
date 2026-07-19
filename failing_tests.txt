@@ -1,7 +1,3 @@
-000__04b_file_directory_operations.sh	Failed due to: exit code mismatch, stdout mismatch
-000__04h_complex_examples.sh	Failed due to: exit code mismatch, stdout mismatch
-003_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
-004_test_quoted.sh	Failed due to: exit code mismatch, stdout mismatch
 009_arrays.sh	Failed due to: exit code mismatch, stdout mismatch
 012_process_substitution.sh	Failed due to: stdout mismatch
 019_grep_regex.sh	Failed due to: stdout mismatch
