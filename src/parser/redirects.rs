@@ -3,7 +3,7 @@ use crate::lexer::{Lexer, Token};
 use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::parse_word;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     let fd = if let Some(Token::Number) = lexer.peek() {

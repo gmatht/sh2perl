@@ -63,6 +63,10 @@ pub struct Generator {
     /// the left-hand side of `||`/`&&`).  When > 0 the exit-on-failure check
     /// after a pipeline should be omitted.
     pub suppress_set_e_depth: usize,
+    /// Set of variable names that were declared as associative arrays
+    /// (via `declare -A` or `local -A`).  Used to emit Perl hash syntax
+    /// `$map{key}` instead of array syntax `$map[key]`.
+    pub associative_arrays: HashSet<String>,
 }
 
 /// RAII guard that pops the pipeline_output_stack when dropped.
@@ -126,6 +130,7 @@ impl Generator {
             pipeline_output_stack: Vec::new(),
             set_e_active: false,
             suppress_set_e_depth: 0,
+            associative_arrays: HashSet::new(),
         }
     }
 
@@ -148,6 +153,7 @@ impl Generator {
             pipeline_output_stack: Vec::new(),
             set_e_active: false,
             suppress_set_e_depth: 0,
+            associative_arrays: HashSet::new(),
         }
     }
 
@@ -170,6 +176,7 @@ impl Generator {
             pipeline_output_stack: Vec::new(),
             set_e_active: false,
             suppress_set_e_depth: 0,
+            associative_arrays: HashSet::new(),
         }
     }
 

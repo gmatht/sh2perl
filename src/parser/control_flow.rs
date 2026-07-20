@@ -4,7 +4,7 @@ use crate::parser::commands::Parser;
 use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::parse_word;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // Add the missing parse_word_list function
 fn parse_word_list(parser: &mut Parser) -> Result<Vec<Word>, ParserError> {
@@ -1258,7 +1258,7 @@ pub fn parse_simple_command(parser: &mut Parser) -> Result<Command, ParserError>
 
     let mut args = Vec::new();
     let redirects = Vec::new();
-    let env_vars = HashMap::new();
+    let env_vars = BTreeMap::new();
 
     // Parse the command name
     let name = match parser.lexer.peek() {
@@ -1691,7 +1691,7 @@ fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
     let value = parse_word(&mut parser.lexer)?;
 
     // Create a simple command that represents the assignment
-    let mut env_vars = HashMap::new();
+    let mut env_vars = BTreeMap::new();
     env_vars.insert(var_name.clone(), value);
 
     Ok(Command::Simple(SimpleCommand {
