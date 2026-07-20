@@ -1,0 +1,5 @@
+# Shell command prefixes that are allowed to use qx{}/system() calls
+# because there is no practical native Perl equivalent.
+# Format: one pattern per line, matched as prefix against the shell command.
+bash -c
+ls -l
