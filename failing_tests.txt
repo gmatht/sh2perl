@@ -1,15 +1,12 @@
-009_arrays.sh	Failed due to: exit code mismatch, stdout mismatch
 012_process_substitution.sh	Failed due to: stdout mismatch
 019_grep_regex.sh	Failed due to: stdout mismatch
-029_arrays_associative.sh	Failed due to: exit code mismatch, stdout mismatch
 042_process_substitution_advanced.sh	Failed due to: stdout mismatch
 047_for_arithematic.sh	Failed due to: stdout mismatch
 058_advanced_bash_idioms.sh	Failed due to: exit code mismatch, stdout mismatch
 062_10_simple_pipeline.sh	Failed due to: stdout mismatch
-062_11_mixed_arithmetic.sh	Failed due to: exit code mismatch, stdout mismatch
 062_14_complex_array_operations.sh	Failed due to: stdout mismatch
 062_15_complex_local_variables.sh	Failed due to: stdout mismatch
-062_hard_to_lex.sh	Failed due to: exit code mismatch, stdout mismatch
+062_hard_to_lex.sh	Failed due to: stdout mismatch
 063_01_deeply_nested_arithmetic.sh	Failed due to: exit code mismatch, stdout mismatch
 063_02_complex_array_assignments.sh	Failed due to: exit code mismatch, stdout mismatch
 063_05_heredoc_with_complex_content.sh	Failed due to: stdout mismatch
@@ -26,13 +23,13 @@
 064_09_process_substitution_pipeline.sh	error: PerlExecution timed out after 30.0 seconds
 064_10_nested_function_definitions.sh	Failed due to: exit code mismatch, stdout mismatch
 064_12_brace_expansion_nested_sequences.sh	Failed due to: exit code mismatch, stdout mismatch
+064_13_complex_string_manipulation.sh	Failed due to: stdout mismatch
 064_14_nested_command_substitution_arithmetic.sh	Failed due to: exit code mismatch, stdout mismatch
 064_18_array_slicing_manipulation.sh	Failed due to: exit code mismatch, stdout mismatch
 064_19_complex_pattern_matching_extended_globs.sh	Failed due to: stdout mismatch
 064_21_complex_string_interpolation_multiple_variables.sh	Failed due to: stdout mismatch
 064_22_function_returning_complex_data_structures.sh	Failed due to: exit code mismatch, stdout mismatch
 064_23_complex_error_handling_traps.sh	Failed due to: stdout mismatch
-064_24_advanced_parameter_expansion.sh	Failed due to: exit code mismatch, stdout mismatch
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
 065_yes_head_while.sh	Failed due to: exit code mismatch, stdout mismatch
 test_system_builtin.sh	Failed due to: stdout mismatch
