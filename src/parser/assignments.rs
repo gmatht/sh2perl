@@ -117,7 +117,20 @@ pub fn parse_array_elements(lexer: &mut Lexer) -> Result<Vec<String>, ParserErro
             }
             Some(Token::DoubleQuotedString) | Some(Token::SingleQuotedString) => {
                 let text = lexer.get_string_text()?; // get_string_text() already calls next()
-                current_element.push_str(&text);
+                // Strip surrounding quotes from the element value
+                let stripped = if text.len() >= 2 {
+                    let chars: Vec<char> = text.chars().collect();
+                    let first = chars[0];
+                    let last = chars[chars.len() - 1];
+                    if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+                        chars[1..chars.len()-1].iter().collect()
+                    } else {
+                        text
+                    }
+                } else {
+                    text
+                };
+                current_element.push_str(&stripped);
             }
             Some(Token::Dollar) => {
                 // For now, just consume the $ and treat it as part of the element

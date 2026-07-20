@@ -138,12 +138,20 @@ pub fn generate_command_impl_with_input(
                         });
 
                         if has_heredoc {
-                            // Use the dedicated cat command generator for heredocs
+                            // Use the dedicated cat command generator for heredocs.
+                            // In a pipeline context, assign to $output (the pipeline
+                            // handler declares it); in a standalone context, pass empty
+                            // target so the generator prints directly.
+                            let heredoc_target = if generator.current_pipeline_output_id().is_some() {
+                                "$output"
+                            } else {
+                                ""
+                            };
                             return generate_cat_command(
                                 generator,
                                 cat_cmd,
                                 &all_redirects,
-                                "$output",
+                                heredoc_target,
                             );
                         }
                     }
@@ -176,24 +184,14 @@ pub fn generate_command_impl_with_input(
                             // The content is already a string, just use it directly
                             here_string_content = format!("\"{}\"", content);
                         } else {
-                            // Fallback: try to extract from target
-                            match &redirect.target {
-                                Word::Literal(s, _) => {
-                                    // Remove surrounding quotes if they exist
-                                    let content = if (s.starts_with('"') && s.ends_with('"'))
-                                        || (s.starts_with('\'') && s.ends_with('\''))
-                                    {
-                                        &s[1..s.len() - 1]
-                                    } else {
-                                        s
-                                    };
-                                    here_string_content = format!("\"{}\"", content);
-                                }
-                                _ => {
-                                    // Fallback to empty string
-                                    here_string_content = "\"\"".to_string();
-                                }
-                            }
+                            // Dynamic here-string: evaluate the target word at runtime
+                            // using the existing word_to_perl machinery so that command
+                            // substitutions, parameter expansions, etc. are properly
+                            // translated.
+                            let perl_expr = generator.word_to_perl(&redirect.target);
+                            // Strip outer interpolation if word_to_perl produced a
+                            // string that is already the expression we want.
+                            here_string_content = perl_expr;
                         }
                     }
                     RedirectOperator::ProcessSubstitutionInput(cmd) => {
@@ -602,15 +600,28 @@ pub fn generate_command_impl_with_input(
                         result.push_str(&generator.indent());
                         result.push_str(&format!("my ${} = {};\n", temp_var, here_string_content));
 
-                        // Call the tr generator with the here-string content (pass with $ prefix)
+                        // Call the tr generator with the here-string content
+                        // Note: input_var does NOT include a leading $ — the function adds it.
                         let specific_output =
                             crate::generator::commands::tr::generate_tr_command_for_substitution(
                                 generator,
                                 &tr_cmd,
-                                &format!("${}", temp_var),
+                                &temp_var,
                                 "0",
                             );
-                        result.push_str(&specific_output);
+                        // Replace the trailing bare "$tr_result_0" (which is designed for use
+                        // inside a do{...} block) with a print statement for standalone commands.
+                        let output_var = format!("tr_result_{}", "0");
+                        let mut lines: Vec<&str> = specific_output.rsplitn(2, '\n').collect();
+                        if lines.len() == 2 && lines[0].trim() == format!("${}", output_var) {
+                            // Found the trailing bare variable reference; replace with print
+                            let rest = lines[1];
+                            result.push_str(rest);
+                            result.push_str(&format!("    print ${};\n", output_var));
+                        } else {
+                            // Fallback: just append the code as-is
+                            result.push_str(&specific_output);
+                        }
 
                         //                         eprintln!("DEBUG: Final tr result: {}", result);
                         return result;

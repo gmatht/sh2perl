@@ -18,7 +18,19 @@ pub fn extract_array_key_impl(var: &str) -> Option<(String, String)> {
             if bracket_start < bracket_end {
                 let array_name = var[..bracket_start].to_string();
                 let key = var[bracket_start + 1..bracket_end].to_string();
-                return Some((array_name, key));
+                // Strip surrounding quotes from the key (bash allows quoted and unquoted keys)
+                let stripped_key = if key.len() >= 2 {
+                    let first = key.chars().next().unwrap();
+                    let last = key.chars().next_back().unwrap();
+                    if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+                        key[1..key.len()-1].to_string()
+                    } else {
+                        key
+                    }
+                } else {
+                    key
+                };
+                return Some((array_name, stripped_key));
             }
         }
     }

@@ -46,8 +46,20 @@ pub fn word_to_bash_string_for_system(generator: &mut Generator, word: &Word) ->
                 || s.contains('?')
                 || s.contains('[')
             {
-                // Escape single quotes for safe embedding in single-quoted shell literals
-                format!("'{}'", s.replace("'", "'\\''"))
+                // If the literal contains backslash escape sequences (\n, \t, etc.),
+                // use double quotes so that bash's echo -e will interpret them.
+                // Single quotes would preserve the backslash literally.
+                if s.contains('\\') {
+                    let escaped = s
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('$', "\\$")
+                        .replace('`', "\\`");
+                    format!("\"{}\"", escaped)
+                } else {
+                    // Escape single quotes for safe embedding in single-quoted shell literals
+                    format!("'{}'", s.replace("'", "'\\''"))
+                }
             } else {
                 s.clone()
             }
@@ -99,9 +111,21 @@ pub fn word_to_bash_string_for_system(generator: &mut Generator, word: &Word) ->
                 || result.contains('*')
                 || result.contains('?')
                 || result.contains('[')
+                || result.contains('\\')
             {
-                // No variables, but contains characters that need quoting - use single-quote
-                format!("'{}'", result.replace("'", "'\\''"))
+                // If the result contains backslash escape sequences, use double
+                // quotes so that bash's echo -e will interpret them.
+                if result.contains('\\') {
+                    let escaped = result
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('$', "\\$")
+                        .replace('`', "\\`");
+                    format!("\"{}\"", escaped)
+                } else {
+                    // No variables, but contains characters that need quoting - use single-quote
+                    format!("'{}'", result.replace("'", "'\\''"))
+                }
             } else {
                 result
             }

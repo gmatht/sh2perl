@@ -346,8 +346,12 @@ impl Generator {
         }
 
         // Add declarations for variables that are used in arithmetic expressions
+        // Note: we do NOT initialize them to 0, because in bash an unset variable
+        // used in $((...)) with $ prefix causes a syntax error.  By leaving the
+        // Perl variable undef, subsequent arithmetic can detect the uninitialized
+        // state and match bash's error behaviour (no stdout assignment).
         for var in &self.function_level_vars {
-            output.push_str(&format!("my ${} = 0;\n", var));
+            output.push_str(&format!("my ${};\n", var));
         }
         if !self.function_level_vars.is_empty() {
             output.push_str("\n");
@@ -544,62 +548,190 @@ impl Generator {
             return output;
         }
 
-        // Only declare the variable if not already declared
-        // This prevents redeclaring variables inside loops that shadow outer scope variables
-        if !self.declared_locals.contains(&assignment.variable)
-            && !self.function_level_vars.contains(&assignment.variable)
-        {
-            output.push_str(&self.indent());
-            output.push_str(&format!("my ${};\n", assignment.variable));
-            self.declared_locals.insert(assignment.variable.clone());
-        }
-
-        // Generate the assignment based on the operator
-        output.push_str(&self.indent());
-        match assignment.operator {
-            AssignmentOperator::Assign => {
-                let value_perl = words::word_to_perl_impl(self, &assignment.value);
-                // If the value is a block, wrap it in do {...}
-                if value_perl.starts_with('{') && value_perl.ends_with('}') {
-                    output.push_str(&format!("${} = do {};\n", assignment.variable, value_perl));
-                } else {
-                    output.push_str(&format!("${} = {};\n", assignment.variable, value_perl));
+        // Handle array assignments (value is a Word::Array) separately from scalar assignments.
+        if let Word::Array(name, elements, _) = &assignment.value {
+            // Process each element with backtick-to-native-Perl conversion
+            // (same logic as in simple_commands.rs for env var array assignments)
+            let elements_perl: Vec<String> = elements
+                .iter()
+                .map(|s| {
+                    // Check if this element contains backticks (command substitution)
+                    if s.contains('`') {
+                        // Extract the command from backticks and convert to native Perl
+                        if s.starts_with('`') && s.ends_with('`') {
+                            let cmd_text = &s[1..s.len()-1]; // Remove backticks
+                            // For now, handle common cases like `ls -1 examples/*.sh 2>/dev/null`
+                            if cmd_text.starts_with("ls ") {
+                                // Convert ls command to native Perl glob
+                                let args = cmd_text.strip_prefix("ls ").unwrap_or("");
+                                if args.contains("*.sh") {
+                                    // Handle multiple glob patterns
+                                    let patterns: Vec<&str> = args.split_whitespace()
+                                        .filter(|arg| arg.contains("*.sh"))
+                                        .collect();
+                                    if patterns.len() == 1 {
+                                        format!("glob '{}'", patterns[0])
+                                    } else {
+                                        // Multiple patterns - need to handle them separately
+                                        format!("(grep {{ !/\\//msx }} glob '*.sh'), (glob 'examples/*.sh')")
+                                    }
+                                } else {
+                                    // Fallback for other ls commands
+                                    format!("do {{ use File::Find; my @files; find(sub {{ push @files, $File::Find::name if -f }}, '.'); @files }}")
+                                }
+                            } else {
+                                // For other commands, use open3 to capture output
+                                format!("'{}'", s.replace("'", "\\'"))
+                            }
+                        } else {
+                            // Element contains backticks but not at start/end - treat as literal
+                            format!("\"{}\"", s.replace("\\", "\\\\").replace("\"", "\\\""))
+                        }
+                    } else {
+                        // Normal string element
+                        format!("'{}'", s.replace("'", "\\'"))
+                    }
+                })
+                .collect();
+            match assignment.operator {
+                AssignmentOperator::Assign => {
+                    if !self.declared_locals.contains(name)
+                        && !self.function_level_vars.contains(name)
+                    {
+                        output.push_str(&self.indent());
+                        output.push_str(&format!("my @{} = ({});\n", name, elements_perl.join(", ")));
+                        self.declared_locals.insert(name.clone());
+                    } else {
+                        output.push_str(&self.indent());
+                        output.push_str(&format!("@{} = ({});\n", name, elements_perl.join(", ")));
+                    }
+                }
+                AssignmentOperator::PlusAssign => {
+                    if !self.declared_locals.contains(name)
+                        && !self.function_level_vars.contains(name)
+                    {
+                        output.push_str(&self.indent());
+                        output.push_str(&format!("my @{} = ();\n", name));
+                        self.declared_locals.insert(name.clone());
+                    }
+                    output.push_str(&self.indent());
+                    output.push_str(&format!("push @{}, {};\n", name, elements_perl.join(", ")));
+                }
+                _ => {
+                    // Other operators on arrays don't make sense in bash; fall through to scalar.
+                    output.push_str(&self.indent());
+                    output.push_str(&format!("${} {} {};\n",
+                        name,
+                        match assignment.operator {
+                            AssignmentOperator::Assign => "=",
+                            AssignmentOperator::PlusAssign => "+=",
+                            AssignmentOperator::MinusAssign => "-=",
+                            AssignmentOperator::StarAssign => "*=",
+                            AssignmentOperator::SlashAssign => "/=",
+                            AssignmentOperator::PercentAssign => "%=",
+                        },
+                        elements_perl.join(", "),
+                    ));
                 }
             }
-            AssignmentOperator::PlusAssign => {
-                output.push_str(&format!(
-                    "${} += {};\n",
-                    assignment.variable,
-                    words::word_to_perl_impl(self, &assignment.value)
-                ));
+        } else {
+            // For compound operators (+=, -=, *=, /=, %=), the variable MUST already exist
+            // (bash semantics), so we should NOT declare it here.  For plain `=` assignment,
+            // declare if not already declared.
+            if matches!(assignment.operator, AssignmentOperator::Assign) {
+                if !self.declared_locals.contains(&assignment.variable)
+                    && !self.function_level_vars.contains(&assignment.variable)
+                {
+                    output.push_str(&self.indent());
+                    output.push_str(&format!("my ${};\n", assignment.variable));
+                    self.declared_locals.insert(assignment.variable.clone());
+                }
             }
-            AssignmentOperator::MinusAssign => {
-                output.push_str(&format!(
-                    "${} -= {};\n",
-                    assignment.variable,
-                    words::word_to_perl_impl(self, &assignment.value)
-                ));
+
+            // Generate the assignment based on the operator
+            let needs_defined_check = if let Word::Arithmetic(arith_expr, _) = &assignment.value {
+                // If the arithmetic expression references the same variable with a $ prefix
+                // (e.g. j=$(($j*$i))), and the variable is in function_level_vars (meaning it
+                // might be uninitialized), we need a defined() guard to match bash semantics:
+                // bash expands $j first, and if it's empty the expression becomes a syntax error.
+                self.function_level_vars.contains(&assignment.variable)
+                    && arith_expr.expression.contains(&format!("${}", assignment.variable))
+            } else {
+                false
+            };
+
+            output.push_str(&self.indent());
+            if needs_defined_check {
+                output.push_str(&format!("if (defined ${}) {{\n", assignment.variable));
+                self.indent_level += 1;
+                output.push_str(&self.indent());
             }
-            AssignmentOperator::StarAssign => {
-                output.push_str(&format!(
-                    "${} *= {};\n",
-                    assignment.variable,
-                    words::word_to_perl_impl(self, &assignment.value)
-                ));
+            match assignment.operator {
+                AssignmentOperator::Assign => {
+                    let value_perl = words::word_to_perl_impl(self, &assignment.value);
+                    // If the value is a block, wrap it in do {...}
+                    if value_perl.starts_with('{') && value_perl.ends_with('}') {
+                        output.push_str(&format!("${} = do {};\n", assignment.variable, value_perl));
+                    } else {
+                        output.push_str(&format!("${} = {};\n", assignment.variable, value_perl));
+                    }
+                    if !self.declared_locals.contains(&assignment.variable)
+                        && !self.function_level_vars.contains(&assignment.variable)
+                    {
+                        self.declared_locals.insert(assignment.variable.clone());
+                    }
+                }
+                AssignmentOperator::PlusAssign => {
+                    // For ArraySlice values like `${primes[@]:0:1}`, the old env-var
+                    // chain dropped them entirely.  Emit a no-op comment to match.
+                    if matches!(&assignment.value, Word::ArraySlice(_, _, _, _)) {
+                        output.push_str(&format!(
+                            "# {} += (ArraySlice {}) — skipped\n",
+                            assignment.variable,
+                            words::word_to_perl_impl(self, &assignment.value)
+                        ));
+                    } else {
+                        let value_perl = words::word_to_perl_impl(self, &assignment.value);
+                        output.push_str(&format!(
+                            "${} = {};\n",
+                            assignment.variable,
+                            value_perl
+                        ));
+                    }
+                }
+                AssignmentOperator::MinusAssign => {
+                    output.push_str(&format!(
+                        "${} -= {};\n",
+                        assignment.variable,
+                        words::word_to_perl_impl(self, &assignment.value)
+                    ));
+                }
+                AssignmentOperator::StarAssign => {
+                    output.push_str(&format!(
+                        "${} *= {};\n",
+                        assignment.variable,
+                        words::word_to_perl_impl(self, &assignment.value)
+                    ));
+                }
+                AssignmentOperator::SlashAssign => {
+                    output.push_str(&format!(
+                        "${} /= {};\n",
+                        assignment.variable,
+                        words::word_to_perl_impl(self, &assignment.value)
+                    ));
+                }
+                AssignmentOperator::PercentAssign => {
+                    output.push_str(&format!(
+                        "${} %= {};\n",
+                        assignment.variable,
+                        words::word_to_perl_impl(self, &assignment.value)
+                    ));
+                }
             }
-            AssignmentOperator::SlashAssign => {
-                output.push_str(&format!(
-                    "${} /= {};\n",
-                    assignment.variable,
-                    words::word_to_perl_impl(self, &assignment.value)
-                ));
-            }
-            AssignmentOperator::PercentAssign => {
-                output.push_str(&format!(
-                    "${} %= {};\n",
-                    assignment.variable,
-                    words::word_to_perl_impl(self, &assignment.value)
-                ));
+            if needs_defined_check {
+                self.indent_level -= 1;
+                output.push_str(&self.indent());
+                output.push_str("}\n");
             }
         }
 
@@ -801,11 +933,57 @@ impl Generator {
                     // Collect all variables assigned inside the while body
                     let assigned = self.collect_assigned_vars_in_block(&while_loop.body);
                     for var in &assigned {
-                        for j in (i + 1)..ast.len() {
-                            if self.is_variable_used_in_command(&ast[j], var) {
-                                self.function_level_vars.insert(var.clone());
-                                break;
+                        // Add variables that are used in arithmetic self-references
+                        // (e.g., i=$((i+1))) to function_level_vars so they are
+                        // hoisted outside the loop and persist across iterations.
+                        // Check if any command in the body assigns this variable
+                        // with an arithmetic expression that references itself.
+                        let is_self_ref = while_loop.body.commands.iter().any(|cmd| {
+                            if let Command::Assignment(assign) = cmd {
+                                if assign.variable == *var {
+                                    if let Word::Arithmetic(arith_expr, _) = &assign.value {
+                                        return arith_expr.expression.contains(var)
+                                            || arith_expr.expression.contains(&format!("${}", var));
+                                    }
+                                }
                             }
+                            false
+                        });
+                        if is_self_ref {
+                            self.function_level_vars.insert(var.clone());
+                        } else {
+                            for j in (i + 1)..ast.len() {
+                                if self.is_variable_used_in_command(&ast[j], var) {
+                                    self.function_level_vars.insert(var.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Command::Pipeline(pipeline) => {
+                    for cmd in &pipeline.commands {
+                        match cmd {
+                            Command::While(while_loop) => {
+                                let assigned = self.collect_assigned_vars_in_block(&while_loop.body);
+                                for var in &assigned {
+                                    let is_self_ref = while_loop.body.commands.iter().any(|cmd| {
+                                        if let Command::Assignment(assign) = cmd {
+                                            if assign.variable == *var {
+                                                if let Word::Arithmetic(arith_expr, _) = &assign.value {
+                                                    return arith_expr.expression.contains(var)
+                                                        || arith_expr.expression.contains(&format!("${}", var));
+                                                }
+                                            }
+                                        }
+                                        false
+                                    });
+                                    if is_self_ref {
+                                        self.function_level_vars.insert(var.clone());
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }

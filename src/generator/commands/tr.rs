@@ -256,6 +256,26 @@ fn generate_tr_buffered_impl_with_output(
             unique_id
         ));
         output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle [:upper:] POSIX class in set1\n"));
+        output.push_str(&format!(
+            "if ($expanded_set1_{} =~ /\\[:upper:\\]/msx) {{\n",
+            unique_id
+        ));
+        output.push_str(&format!(
+            "    $expanded_set1_{} =~ s/\\[:upper:\\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n",
+            unique_id
+        ));
+        output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle [:lower:] POSIX class in set1\n"));
+        output.push_str(&format!(
+            "if ($expanded_set1_{} =~ /\\[:lower:\\]/msx) {{\n",
+            unique_id
+        ));
+        output.push_str(&format!(
+            "    $expanded_set1_{} =~ s/\\[:lower:\\]/abcdefghijklmnopqrstuvwxyz/msx;\n",
+            unique_id
+        ));
+        output.push_str(&format!("}}\n"));
         output.push_str(&format!("# Handle a-z range in set2\n"));
         output.push_str(&format!(
             "if ($expanded_set2_{} =~ /a-z/msx) {{\n",
@@ -273,6 +293,26 @@ fn generate_tr_buffered_impl_with_output(
         ));
         output.push_str(&format!(
             "    $expanded_set2_{} =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n",
+            unique_id
+        ));
+        output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle [:upper:] POSIX class in set2\n"));
+        output.push_str(&format!(
+            "if ($expanded_set2_{} =~ /\\[:upper:\\]/msx) {{\n",
+            unique_id
+        ));
+        output.push_str(&format!(
+            "    $expanded_set2_{} =~ s/\\[:upper:\\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n",
+            unique_id
+        ));
+        output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle [:lower:] POSIX class in set2\n"));
+        output.push_str(&format!(
+            "if ($expanded_set2_{} =~ /\\[:lower:\\]/msx) {{\n",
+            unique_id
+        ));
+        output.push_str(&format!(
+            "    $expanded_set2_{} =~ s/\\[:lower:\\]/abcdefghijklmnopqrstuvwxyz/msx;\n",
             unique_id
         ));
         output.push_str(&format!("}}\n"));
@@ -428,6 +468,26 @@ fn generate_tr_buffered_impl_with_output_for_substitution(
             unique_id
         ));
         output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle [:upper:] POSIX class in set1\n"));
+        output.push_str(&format!(
+            "if ($expanded_set1_{} =~ /\\[:upper:\\]/msx) {{\n",
+            unique_id
+        ));
+        output.push_str(&format!(
+            "    $expanded_set1_{} =~ s/\\[:upper:\\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n",
+            unique_id
+        ));
+        output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle [:lower:] POSIX class in set1\n"));
+        output.push_str(&format!(
+            "if ($expanded_set1_{} =~ /\\[:lower:\\]/msx) {{\n",
+            unique_id
+        ));
+        output.push_str(&format!(
+            "    $expanded_set1_{} =~ s/\\[:lower:\\]/abcdefghijklmnopqrstuvwxyz/msx;\n",
+            unique_id
+        ));
+        output.push_str(&format!("}}\n"));
         output.push_str(&format!("# Handle a-z range in set2\n"));
         output.push_str(&format!(
             "if ($expanded_set2_{} =~ /a-z/msx) {{\n",
@@ -445,6 +505,26 @@ fn generate_tr_buffered_impl_with_output_for_substitution(
         ));
         output.push_str(&format!(
             "    $expanded_set2_{} =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n",
+            unique_id
+        ));
+        output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle [:upper:] POSIX class in set2\n"));
+        output.push_str(&format!(
+            "if ($expanded_set2_{} =~ /\\[:upper:\\]/msx) {{\n",
+            unique_id
+        ));
+        output.push_str(&format!(
+            "    $expanded_set2_{} =~ s/\\[:upper:\\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;\n",
+            unique_id
+        ));
+        output.push_str(&format!("}}\n"));
+        output.push_str(&format!("# Handle [:lower:] POSIX class in set2\n"));
+        output.push_str(&format!(
+            "if ($expanded_set2_{} =~ /\\[:lower:\\]/msx) {{\n",
+            unique_id
+        ));
+        output.push_str(&format!(
+            "    $expanded_set2_{} =~ s/\\[:lower:\\]/abcdefghijklmnopqrstuvwxyz/msx;\n",
             unique_id
         ));
         output.push_str(&format!("}}\n"));

@@ -78,24 +78,67 @@ pub fn generate_cat_command(
 
     // Check if this cat command has heredoc redirects
     let mut has_heredoc = false;
+    let mut output_file: Option<String> = None;
     for redir in redirects {
         if matches!(
             redir.operator,
             RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
         ) {
             has_heredoc = true;
-            if let Some(body) = &redir.heredoc_body {
-                // Print the heredoc content directly
-                output.push_str(&format!(
-                    "print {};\n",
-                    generator.perl_string_literal_no_interp(&Word::literal(body.clone()))
-                ));
+        }
+        // Check for output redirect: > file or >> file
+        if matches!(redir.operator, RedirectOperator::Output | RedirectOperator::Append) {
+            if let Word::Literal(filename, _) = &redir.target {
+                output_file = Some(filename.clone());
+            } else {
+                output_file = Some(generator.perl_string_literal(&redir.target));
             }
         }
     }
 
-    // If no heredocs, handle file reading as before
-    if !has_heredoc {
+    if has_heredoc {
+        // Collect heredoc content
+        let mut body = String::new();
+        for redir in redirects {
+            if matches!(
+                redir.operator,
+                RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
+            ) {
+                if let Some(content) = &redir.heredoc_body {
+                    body.push_str(content);
+                }
+            }
+        }
+
+        if let Some(filename) = output_file {
+            // Write heredoc content to the output file
+            let filename_pl = generator.perl_string_literal(&Word::literal(filename));
+            output.push_str(&format!(
+                "open my $fh_cat, '>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
+                filename_pl
+            ));
+            output.push_str(&format!(
+                "print {{$fh_cat}} {};\n",
+                generator.perl_string_literal_no_interp(&Word::literal(body))
+            ));
+            output.push_str(&format!(
+                "close $fh_cat or croak \"Close failed: $OS_ERROR\\n\";\n"
+            ));
+        } else {
+            // No output redirect.
+            // In a pipeline or command-substitution context, assign the heredoc
+            // content to the target variable instead of printing directly.
+            let body_lit = generator.perl_string_literal_no_interp(&Word::literal(body));
+            if target_var.is_empty() {
+                // Standalone command: print to stdout.
+                output.push_str(&format!("print {};\n", body_lit));
+            } else {
+                // Pipeline/command-substitution context: set the variable.
+                output.push_str(&format!("${} = {};\n", target_var, body_lit));
+            }
+        }
+    } else {
+        // If no heredocs, handle file reading as before
         let substitution = generate_cat_command_for_substitution(generator, cmd);
         if target_var.is_empty() {
             output.push_str(&format!("print {};\n", substitution));
