@@ -1,6 +1,3 @@
-012_process_substitution.sh	Failed due to: stdout mismatch
-019_grep_regex.sh	Failed due to: stdout mismatch
-042_process_substitution_advanced.sh	Failed due to: stdout mismatch
 047_for_arithematic.sh	Failed due to: stdout mismatch
 058_advanced_bash_idioms.sh	Failed due to: exit code mismatch, stdout mismatch
 062_10_simple_pipeline.sh	Failed due to: stdout mismatch
