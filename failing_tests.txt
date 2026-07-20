@@ -4,7 +4,6 @@
 062_hard_to_lex.sh	Failed due to: stdout mismatch
 063_01_deeply_nested_arithmetic.sh	Failed due to: exit code mismatch, stdout mismatch
 063_02_complex_array_assignments.sh	Failed due to: exit code mismatch, stdout mismatch
-063_05_heredoc_with_complex_content.sh	Failed due to: stdout mismatch
 063_09_complex_function_parameter_handling.sh	Failed due to: exit code mismatch, stdout mismatch
 063_12_complex_eval.sh	Failed due to: stdout mismatch
 063_15_complex_function_definition.sh	Failed due to: exit code mismatch, stdout mismatch
@@ -13,7 +12,7 @@
 064_03_complex_parameter_expansion.sh	Failed due to: exit code mismatch, stdout mismatch
 064_06_nested_arithmetic_expressions.sh	Failed due to: stdout mismatch
 064_07_complex_array_operations.sh	Failed due to: stdout mismatch
-064_09_process_substitution_pipeline.sh	error: PerlExecution timed out after 30.0 seconds
+064_09_process_substitution_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
 064_10_nested_function_definitions.sh	Failed due to: exit code mismatch, stdout mismatch
 064_12_brace_expansion_nested_sequences.sh	Failed due to: exit code mismatch, stdout mismatch
 064_13_complex_string_manipulation.sh	Failed due to: stdout mismatch
