@@ -11,17 +11,17 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '001_simple.sh';
-my $MAX_LOOP_5 = 5;
-
-print "Hello, World!\n";
-if ((-f"test.txt")) {
-    print "File exists\n";
-}
-my $i;
-for my $i ( 1 .. $MAX_LOOP_5 ) {
-    print $i;
-if ( !( ($i) =~ m{\n\z}msx ) ) { print "\n"; }
-}
+$PROGRAM_NAME = '064_24_advanced_parameter_expansion.sh';
+my $input = (defined $_[0] && $_[0] ne q{} ? $_[0] : 'default_value');
+my $sanitized = $input =~ s/\[\^a-zA-Z0-9\]/_/grs;
+my $uppercase = uc(${sanitized});
+do {
+    my $output = "Input: '$input' -> Sanitized: '$sanitized' -> Uppercase: '$uppercase'";
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
 
 exit $main_exit_code;
