@@ -10,7 +10,7 @@ use crate::parser::errors::ParserError;
 use crate::parser::redirects::parse_redirect;
 use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::{parse_word, parse_word_no_newline_skip};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub struct Parser {
     pub lexer: Lexer,
@@ -249,7 +249,7 @@ impl Parser {
                             name: Word::literal("".to_string()),
                             args: vec![],
                             redirects: vec![],
-                            env_vars: HashMap::new(),
+                            env_vars: BTreeMap::new(),
                             stdout_used: true,
                             stderr_used: true,
                         })),
@@ -315,7 +315,7 @@ impl Parser {
                         name: Word::literal("".to_string()),
                         args: vec![],
                         redirects: vec![],
-                        env_vars: HashMap::new(),
+                        env_vars: BTreeMap::new(),
                         stdout_used: true,
                         stderr_used: true,
                     }));
@@ -754,7 +754,7 @@ impl Parser {
 
         let mut args = Vec::new();
         let redirects = Vec::new();
-        let mut env_vars = HashMap::new();
+        let mut env_vars = BTreeMap::new();
 
         // Parse environment variable-style assignments at the start
         while let Some(token) = self.lexer.peek() {
@@ -1298,7 +1298,7 @@ impl Parser {
         self.lexer.skip_whitespace_and_comments();
         if let Some(Token::Identifier) = self.lexer.peek() {
             // There's a command following, parse it as a command with environment variables
-            let mut env_vars = HashMap::new();
+            let mut env_vars = BTreeMap::new();
             env_vars.insert(var_name, value_word);
 
             let command = self.parse_command()?;
@@ -1314,7 +1314,7 @@ impl Parser {
                 }
                 _ => {
                     // For non-simple commands, wrap in a block with environment variables
-                    let mut env_vars_cmd = HashMap::new();
+                    let mut env_vars_cmd = BTreeMap::new();
                     for (key, value) in env_vars {
                         env_vars_cmd.insert(key, value);
                     }

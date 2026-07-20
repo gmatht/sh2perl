@@ -1878,6 +1878,26 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
             if key.parse::<usize>().is_ok() {
                 // Indexed array access: arr[1] -> $arr[1]
                 format!("${}[{}]", map_name, key)
+            } else if generator.associative_arrays.contains(map_name) {
+                // Associative array access: map[foo] -> $map{'foo'}
+                // or map[$k] -> $map{$k}
+                if key.starts_with('$') {
+                    // Variable key: map[$k] -> $map{$k}
+                    let mut result = String::from("$");
+                    result.push_str(map_name);
+                    result.push('{');
+                    result.push_str(key);
+                    result.push('}');
+                    result
+                } else {
+                    // Literal string key: map[foo] -> $map{'foo'}
+                    let mut result = String::from("$");
+                    result.push_str(map_name);
+                    result.push_str("{'");
+                    result.push_str(&key.replace("'", "\\'"));
+                    result.push_str("'}");
+                    result
+                }
             } else {
                 // Indexed array access with variable/expression key: arr[i] -> $arr[$i]
                 format!(
@@ -2140,8 +2160,22 @@ pub fn convert_string_interpolation_to_perl_impl(
                 }
             }
             StringPart::MapAccess(map_name, key) => {
-                if map_name == "map" {
-                    current_string.push_str(&format!("$map{{{}}}", key));
+                if generator.associative_arrays.contains(map_name) {
+                    // Associative array access: map[foo] -> $map{'foo'}
+                    // or map[$k] -> $map{$k}
+                    if key.starts_with('$') {
+                        current_string.push('$');
+                        current_string.push_str(map_name);
+                        current_string.push('{');
+                        current_string.push_str(key);
+                        current_string.push('}');
+                    } else {
+                        current_string.push('$');
+                        current_string.push_str(map_name);
+                        current_string.push_str("{'");
+                        current_string.push_str(&key.replace("'", "\\'"));
+                        current_string.push_str("'}");
+                    }
                 } else {
                     current_string.push_str(&format!(
                         "${}[{}]",
@@ -2231,6 +2265,26 @@ pub fn convert_string_interpolation_to_perl_impl(
                                     if key.parse::<usize>().is_ok() {
                                         // Indexed array access: arr[1] -> $arr[1]
                                         parts.push(format!("${}[{}]", var_name, key));
+                                    } else if generator.associative_arrays.contains(var_name) {
+                                        // Associative array access: map[foo] -> $map{'foo'}
+                                        // or map[$k] -> $map{$k}
+                                        if key.starts_with('$') {
+                                            // Variable key: map[$k] -> $map{$k}
+                                            let mut result = String::from("$");
+                                            result.push_str(var_name);
+                                            result.push('{');
+                                            result.push_str(key);
+                                            result.push('}');
+                                            parts.push(result);
+                                        } else {
+                                            // Literal string key: map[foo] -> $map{'foo'}
+                                            let mut result = String::from("$");
+                                            result.push_str(var_name);
+                                            result.push_str("{'");
+                                            result.push_str(&key.replace("'", "\\'"));
+                                            result.push_str("'}");
+                                            parts.push(result);
+                                        }
                                     } else {
                                         // Indexed array access with variable/expression key: arr[i] -> $arr[$i]
                                         parts.push(format!(

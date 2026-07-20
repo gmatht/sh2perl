@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::mir_words::{MirWord, Bounds};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// MIR representation of a simple command with analysis information
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -8,7 +8,7 @@ pub struct MirSimpleCommand {
     pub name: MirWord,
     pub args: Vec<MirWord>,
     pub redirects: Vec<Redirect>,
-    pub env_vars: HashMap<String, MirWord>,
+    pub env_vars: BTreeMap<String, MirWord>,
     pub stdout_used: bool,  // true if stdout is not redirected to /dev/null
     pub stderr_used: bool,  // true if stderr is not redirected to /dev/null
 }
@@ -280,7 +280,7 @@ impl MirCommand {
                     name: MirWord::from_ast_word(Word::literal("UNSUPPORTED".to_string())),
                     args: vec![],
                     redirects: vec![],
-                    env_vars: std::collections::HashMap::new(),
+                    env_vars: std::collections::BTreeMap::new(),
                     stdout_used: true,
                     stderr_used: true,
                 })

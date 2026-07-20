@@ -91,7 +91,7 @@ pub struct MirSimpleCommand {
     pub name: MirWord,
     pub args: Vec<MirWord>,
     pub redirects: Vec<Redirect>,
-    pub env_vars: std::collections::HashMap<String, MirWord>,
+    pub env_vars: std::collections::BTreeMap<String, MirWord>,
     pub stdout_used: bool,
     pub stderr_used: bool,
 }
@@ -142,7 +142,7 @@ impl MirCommand {
                     .iter()
                     .map(|arg| MirWord::from_ast_word(arg.clone()))
                     .collect();
-                let mir_env_vars: std::collections::HashMap<String, MirWord> = simple_cmd
+                let mir_env_vars: std::collections::BTreeMap<String, MirWord> = simple_cmd
                     .env_vars
                     .iter()
                     .map(|(k, v)| (k.clone(), MirWord::from_ast_word(v.clone())))
@@ -204,7 +204,7 @@ impl MirCommand {
                     name: MirWord::from_ast_word(Word::literal("UNSUPPORTED".to_string())),
                     args: vec![],
                     redirects: vec![],
-                    env_vars: std::collections::HashMap::new(),
+                    env_vars: std::collections::BTreeMap::new(),
                     stdout_used: false,
                     stderr_used: false,
                 })

@@ -505,26 +505,3 @@ pub fn parse_ast_pattern_list(pattern_text: &str) -> Option<Vec<String>> {
         Some(patterns)
     }
 }
-
-/// Load exemption patterns from a file (one shell-command prefix per line, "#" comments).
-pub fn load_qx_exemptions(path: &str) -> Vec<String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => content
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| l.to_string())
-            .collect(),
-        Err(_) => {
-            eprintln!("DEBUG: No qx exemptions file at '{}', using empty list", path);
-            Vec::new()
-        }
-    }
-}
-
-/// Check that generated Perl code does not contain qx{{}} calls for known
-/// builtin commands, unless the command matches an exemption pattern.
-pub fn check_perl_no_qx_builtins(_perl_code: &str, _exemptions: &[String]) -> Result<(), String> {
-    // Disabled: this check is too strict and causes many false positives.
-    Ok(())
-}
