@@ -2222,9 +2222,13 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 let map_name = &pe.variable[1..]; // Remove ! prefix
                                 parts.push(format!("keys %{}", map_name));
                             } else {
-                                // ${arr[@]} -> join(" ", @arr) for string context
+                                // ${arr[@]} -> join(" ", @arr) or join(" ", values %map) for string context
                                 let array_name = &pe.variable;
-                                parts.push(format!("(join(\" \", @{}))", array_name));
+                                if generator.associative_arrays.contains(array_name) {
+                                    parts.push(format!("(join(\" \", values %{}))", array_name));
+                                } else {
+                                    parts.push(format!("(join(\" \", @{}))", array_name));
+                                }
                             }
                         } else {
                             // Regular array slice - use join for string context
