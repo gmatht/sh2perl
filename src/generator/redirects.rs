@@ -701,10 +701,23 @@ fn word_to_bash_string(word: &Word) -> String {
             }
 
             if needs_shell_quoting_literal(s) {
-                // Single-quote the token and escape embedded single quotes in a
-                // shell-friendly way: abc'd -> 'abc'\''
-                let escaped = s.replace("'", "'\\''");
-                format!("'{}'", escaped)
+                // If the literal contains backslash escape sequences like \n, \t,
+                // we must use double quotes so that bash's echo -e will interpret
+                // them.  Single quotes would preserve the backslash literally.
+                if s.contains('\\') {
+                    // Escape backslashes, double-quotes, dollar signs, and backticks
+                    let escaped = s
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('$', "\\$")
+                        .replace('`', "\\`");
+                    format!("\"{}\"", escaped)
+                } else {
+                    // Single-quote the token and escape embedded single quotes in a
+                    // shell-friendly way: abc'd -> 'abc'\''
+                    let escaped = s.replace("'", "'\\''");
+                    format!("'{}'", escaped)
+                }
             } else {
                 s.clone()
             }
@@ -780,8 +793,19 @@ fn word_to_bash_string(word: &Word) -> String {
                 let escaped = result.replace('\\', "\\\\").replace('"', "\\\"");
                 format!("\"{}\"", escaped)
             } else if needs_shell_quoting_literal(&result) {
-                let escaped = result.replace("'", "'\\''");
-                format!("'{}'", escaped)
+                // If the result contains backslash escape sequences, use double
+                // quotes so that bash's echo -e will interpret them.
+                if result.contains('\\') {
+                    let escaped = result
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('$', "\\$")
+                        .replace('`', "\\`");
+                    format!("\"{}\"", escaped)
+                } else {
+                    let escaped = result.replace("'", "'\\''");
+                    format!("'{}'", escaped)
+                }
             } else {
                 result
             }
@@ -982,40 +1006,78 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
         }
         "declare" => {
             // Handle declare command
+            let mut is_assoc = false;
+            let mut is_array = false;
             for arg in &cmd.args {
-                if let Word::Literal(opt, _) = arg {
-                    match opt.as_str() {
-                        "-a" => {
-                            // Declare array
-                            if let Some(next_arg) = cmd
-                                .args
-                                .get(cmd.args.iter().position(|a| a == arg).unwrap() + 1)
-                            {
-                                if let Word::Literal(var_name, _) = next_arg {
-                                    if !generator.declared_locals.contains(var_name) {
-                                        output.push_str(&format!("my @{} = ();\n", var_name));
-                                        generator.declared_locals.insert(var_name.clone());
+                match arg {
+                    Word::Literal(opt, _) => {
+                        // Track flags like -a (indexed) and -A (associative)
+                        if opt.starts_with('-') {
+                            is_assoc = opt.as_str() == "-A";
+                            is_array = opt.as_str() == "-a";
+                            continue;
+                        }
+                        // Check if it's an assignment (var=value)
+                        if opt.contains('=') {
+                            let parts: Vec<&str> = opt.splitn(2, '=').collect();
+                            if parts.len() == 2 {
+                                let var = parts[0];
+                                let value = parts[1];
+                                if !generator.declared_locals.contains(var) {
+                                    let perl_value = shell_value_to_perl(value);
+                                    output.push_str(&generator.indent());
+                                    if is_assoc {
+                                        output.push_str(&format!("my %{} = ({});\n", var, perl_value));
+                                    } else if is_array {
+                                        output.push_str(&format!("my @{} = ({});\n", var, perl_value));
+                                    } else {
+                                        output.push_str(&format!("my ${} = {};\n", var, perl_value));
                                     }
+                                    generator.declared_locals.insert(var.to_string());
                                 }
                             }
-                        }
-                        "-A" => {
-                            // Declare associative array
-                            if let Some(next_arg) = cmd
-                                .args
-                                .get(cmd.args.iter().position(|a| a == arg).unwrap() + 1)
-                            {
-                                if let Word::Literal(var_name, _) = next_arg {
-                                    if !generator.declared_locals.contains(var_name) {
-                                        output.push_str(&format!("my %{} = ();\n", var_name));
-                                        generator.declared_locals.insert(var_name.clone());
-                                        generator.associative_arrays.insert(var_name.clone());
-                                    }
+                        } else {
+                            // Just declaration without assignment
+                            if !generator.declared_locals.contains(opt) {
+                                output.push_str(&generator.indent());
+                                if is_assoc {
+                                    output.push_str(&format!("my %{} = ();\n", opt));
+                                    generator.associative_arrays.insert(opt.clone());
+                                } else if is_array {
+                                    output.push_str(&format!("my @{} = ();\n", opt));
+                                } else {
+                                    output.push_str(&format!("my ${};\n", opt));
                                 }
+                                generator.declared_locals.insert(opt.clone());
                             }
                         }
-                        _ => output.push_str(&format!("# declare {} not implemented\n", opt)),
                     }
+                    Word::Array(name, elements, _) => {
+                        // Handle array declarations like declare -a arr=(...)
+                        if !generator.declared_locals.contains(name) {
+                            let elements_perl: Vec<String> = elements
+                                .iter()
+                                .map(|e| format!("'{}'", e.replace("'", "\\'")))
+                                .collect();
+                            output.push_str(&generator.indent());
+                            if is_assoc {
+                                output.push_str(&format!(
+                                    "my %{} = ({});\n",
+                                    name,
+                                    elements_perl.join(", ")
+                                ));
+                                generator.associative_arrays.insert(name.clone());
+                            } else {
+                                output.push_str(&format!(
+                                    "my @{} = ({});\n",
+                                    name,
+                                    elements_perl.join(", ")
+                                ));
+                            }
+                            generator.declared_locals.insert(name.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

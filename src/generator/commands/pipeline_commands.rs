@@ -1319,6 +1319,59 @@ fn generate_streaming_pipeline(
                                 }
                             }
                         }
+                        Command::While(while_loop) => {
+                            // Handle while loops in pipeline context
+                            // The while loop should read from the current line and process it
+                            output.push_str(&generator.indent());
+                            output.push_str("my $L = $line;\n");
+
+                            // Generate the while loop body with line-by-line processing
+                            generator.indent_level += 1;
+                            for body_cmd in &while_loop.body.commands {
+                                match body_cmd {
+                                    Command::Simple(cmd) => {
+                                        let _cmd_name = match &cmd.name {
+                                            Word::Literal(s, _) => s,
+                                            _ => "unknown_command",
+                                        };
+
+                                        // Generate line-by-line version of each command
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&generate_linebyline_command(generator, cmd, "L", 0));
+                                    }
+                                    Command::Pipeline(pipeline) => {
+                                        // Handle nested pipelines in while loop body with line-by-line processing
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&generate_linebyline_command_for_pipeline(
+                                            generator, pipeline, "L",
+                                        ));
+                                    }
+                                    _ => {
+                                        // For other command types, generate them normally
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&generator.generate_command(body_cmd));
+                                    }
+                                }
+                            }
+                            // The head command has already added the original $line to $output_0.
+                            // Replace the last line in $output_0 with the processed line.
+                            output.push_str(&generator.indent());
+                            let output_var = format!("output_{}", unique_id);
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("my @_tmp_lines = split /\\n/, ${};", output_var));
+                            output.push_str("\n");
+                            output.push_str(&generator.indent());
+                            output.push_str("pop @_tmp_lines;\n");
+                            output.push_str(&generator.indent());
+                            output.push_str("push @_tmp_lines, $L;\n");
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("${} = join \"\\n\", @_tmp_lines;", output_var));
+                            output.push_str("\n");
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("${} .= \"\\n\";", output_var));
+                            output.push_str("\n");
+                            generator.indent_level -= 1;
+                        }
                         _ => {}
                     }
                 }
@@ -1327,9 +1380,14 @@ fn generate_streaming_pipeline(
                 output.push_str(&generator.indent());
                 output.push_str("}\n");
 
-                // Return the output directly for command substitution
-                output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{}\n", unique_id));
+                // Return the output directly, printing if this is a standalone pipeline
+                if should_print {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("print $output_{};\n", unique_id));
+                } else {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("$output_{}\n", unique_id));
+                }
 
                 // Pipeline id guard will pop when it goes out of scope.
                 return output; // Return early since we've handled everything
@@ -1903,6 +1961,56 @@ fn generate_linebyline_command(
         "sed" => {
             // For sed, we'll use basic substitution for now
             let mut output = String::new();
+
+            // Helper: extract a substitution from a StringInterpolation argument
+            // where the parts are [literal(pattern), variable(replacement), ...]
+            let handle_interp_sed = |interp: &StringInterpolation| -> Option<String> {
+                if interp.parts.len() >= 2 {
+                    if let StringPart::Literal(part0) = &interp.parts[0] {
+                        if part0.starts_with("s/") {
+                            // Extract pattern: remove "s/" prefix and trailing "/"
+                            let pattern_str = &part0[2..];
+                            let pattern_str = pattern_str.strip_suffix('/').unwrap_or(pattern_str);
+                            // Get replacement from second part
+                            let replacement_perl = match &interp.parts[1] {
+                                StringPart::Variable(var) => {
+                                    format!("${}", var)
+                                }
+                                StringPart::Literal(s) => {
+                                    s.clone()
+                                }
+                                _ => return None,
+                            };
+                            // Check for flags in third part
+                            let flags = if interp.parts.len() >= 3 {
+                                if let StringPart::Literal(s) = &interp.parts[2] {
+                                    let s = s.trim_matches('/');
+                                    if !s.is_empty() { format!("{}", s) } else { String::new() }
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            };
+                            // Build the replacement expression, escaping $ and @ in the pattern
+                            let escaped_pattern = pattern_str.replace('$', "\\$").replace('@', "\\@");
+                            if flags.is_empty() {
+                                return Some(format!(
+                                    "${} =~ s/{}/{}/;",
+                                    line_var, escaped_pattern, replacement_perl
+                                ));
+                            } else {
+                                return Some(format!(
+                                    "${} =~ s/{}/{}/{};",
+                                    line_var, escaped_pattern, replacement_perl, flags
+                                ));
+                            }
+                        }
+                    }
+                }
+                None
+            };
+
             if cmd.args.len() >= 3 {
                 // Handle sed with multiple arguments like "s/LINE/" + variable + "/"
                 if let (
@@ -1921,25 +2029,17 @@ fn generate_linebyline_command(
                         };
                         // Handle variable replacement properly
                         let replacement_str = format!("${}", replacement);
+                        let escaped_pattern = pattern_str.replace('$', "\\$").replace('@', "\\@");
                         if flags.is_empty() || flags == "/" {
                             output.push_str(&format!(
-                                "${} =~ s{}{};\n",
-                                line_var,
-                                generator.format_regex_pattern(&format!(
-                                    "{}/{}",
-                                    pattern_str, replacement_str
-                                )),
-                                ""
+                                "${} =~ s/{}/{}/;\n",
+                                line_var, escaped_pattern, replacement_str
                             ));
                         } else {
+                            let flag_str = flags.trim_matches('/');
                             output.push_str(&format!(
-                                "${} =~ s{}{};\n",
-                                line_var,
-                                generator.format_regex_pattern(&format!(
-                                    "{}/{}/{}",
-                                    pattern_str, replacement_str, flags
-                                )),
-                                ""
+                                "${} =~ s/{}/{}/{};\n",
+                                line_var, escaped_pattern, replacement_str, flag_str
                             ));
                         }
                     }
@@ -1953,6 +2053,17 @@ fn generate_linebyline_command(
             }) {
                 let expr = generator.word_to_perl(sed_expr);
                 output.push_str(&format!("${} =~ {expr};\n", line_var));
+            } else if let Some(sed_expr) = cmd.args.iter().find(|arg| {
+                matches!(arg, Word::StringInterpolation(_, _))
+            }) {
+                // Handle StringInterpolation args like s/LINE/$i/
+                if let Word::StringInterpolation(interp, _) = sed_expr {
+                    if let Some(subst) = handle_interp_sed(interp) {
+                        output.push_str(&generator.indent());
+                        output.push_str(&subst);
+                        output.push_str("\n");
+                    }
+                }
             }
             output
         }
@@ -2282,20 +2393,17 @@ fn generate_buffered_pipeline(
                 // First command - generate output
                 output.push_str(&generator.indent());
                 if matches!(command, Command::Redirect(_)) {
-                    // For Redirect commands, we need to handle them specially
-                    // The Redirect command contains the actual command (like time) that needs to be executed
-                    if let Command::Redirect(redirect_cmd) = command {
-                        // Generate the inner command with proper output handling
-                        let command_output = generate_command_using_builtins(
-                            generator,
-                            &redirect_cmd.command,
-                            "",
-                            &format!("output_{}", unique_id),
-                            &format!("{}_{}", unique_id, i),
-                            false,
-                        );
-                        output.push_str(&command_output);
-                    }
+                    // For Redirect commands (e.g. cat << EOF), use the full command
+                    // generator which preserves redirect information (heredocs, etc.).
+                    // The generated code already has proper indentation; do NOT
+                    // re-indent it line-by-line (which would corrupt multi-line
+                    // string literals like q[...]).
+                    output.push_str(&generator.indent());
+                    output.push_str("my $output;\n");
+                    output.push_str(&generator.indent());
+                    output.push_str(&generator.generate_command(command));
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("$output_{} = $output;\n", unique_id));
                 } else {
                     // Handle the first command - use generate_command_using_builtins for all command types
                     let command_output = generate_command_using_builtins(

@@ -5,7 +5,11 @@ use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::parse_word;
 use std::collections::{BTreeMap, HashMap};
 
-pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
+/// Parse the redirect header (operator + target) but do NOT parse the heredoc
+/// body.  Returns a partial Redirect; the caller must call
+/// `parse_heredoc_body` for heredoc redirects after all redirects on the same
+/// line have been collected.
+pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     let fd = if let Some(Token::Number) = lexer.peek() {
         let fd_str = lexer.get_number_text()?;
         Some(fd_str.parse().unwrap_or(0))
@@ -126,22 +130,34 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
         parse_word(lexer)?
     };
 
-    // If this is a heredoc, capture lines until the delimiter is found at start of line
-    // If this is a here-string, the target is the string content
+    // If this is a heredoc, DO NOT parse the body here — the caller
+    // (`parse_command_redirects`) will call `parse_heredoc_body` after
+    // collecting all redirects on the same line.
+    // For here-strings, extract static content as before.
     let heredoc_body = match operator {
-        RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => parse_heredoc(lexer, &target)?,
+        RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => None,
         RedirectOperator::HereString => {
-            // For here-strings, the target is the string content
-            // We need to extract the string content from the target
+            // For here-strings, extract static content from the target.
+            // If the here-string contains any dynamic parts (command substitution,
+            // variable reference, parameter expansion), we cannot represent it as
+            // a static string — return None so the generator will evaluate it at
+            // runtime via word_to_perl.
             match &target {
                 Word::Literal(s, _) => Some(s.clone()),
                 Word::StringInterpolation(interp, _) => {
-                    // For string interpolation, concatenate all parts
                     let mut content = String::new();
                     for part in &interp.parts {
                         match part {
                             StringPart::Literal(s) => content.push_str(&s),
-                            _ => content.push_str(&format!("{:?}", part)), // Fallback for non-literal parts
+                            _ => {
+                                // Dynamic part — cannot be represented as a static string.
+                                return Ok(Redirect {
+                                    fd,
+                                    operator,
+                                    target,
+                                    heredoc_body: None,
+                                });
+                            }
                         }
                     }
                     Some(content)
@@ -160,6 +176,27 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     })
 }
 
+/// Parse the body of a heredoc (or heredoc-tabs) redirect.
+/// `target` must be the delimiter word.
+pub fn parse_heredoc_body(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, ParserError> {
+    // Reuse the existing parse_heredoc function
+    parse_heredoc(lexer, target)
+}
+
+/// Full redirect parsing: header + heredoc body (if applicable).
+pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
+    let header = parse_redirect_header(lexer)?;
+    if matches!(&header.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs) {
+        let body = parse_heredoc_body(lexer, &header.target)?;
+        Ok(Redirect {
+            heredoc_body: body,
+            ..header
+        })
+    } else {
+        Ok(header)
+    }
+}
+
 fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, ParserError> {
     let delim = match target {
         Word::Literal(s, _) => s.clone(),
@@ -170,33 +207,24 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         }
     };
 
-    //     eprintln!("DEBUG: parse_heredoc called with delimiter: '{}'", delim);
-
-    // Skip to the next newline in the raw input WITHOUT consuming tokens
-    // that belong to subsequent parts of the pipeline (e.g. | grep, | sed).
-    if let Some((start, _)) = lexer.get_span() {
-        let newline_pos = lexer.input[start..].find('\n').map(|pos| start + pos);
-        if let Some(nl_pos) = newline_pos {
-            let after_newline = std::cmp::min(nl_pos + 1, lexer.input.len());
-            while lexer.current < lexer.tokens.len() {
-                if lexer.tokens[lexer.current].1 >= after_newline {
-                    break;
-                }
-                lexer.current += 1;
-            }
-        } else {
-            lexer.current = lexer.tokens.len();
+    // Find the start of the heredoc body in the raw input.
+    // The body begins after the first newline following the command line.
+    // We locate this newline from the raw input WITHOUT consuming any tokens,
+    // because tokens before the newline may belong to a pipeline (e.g.
+    // `cat << EOF | grep ... | sed ...`) and must remain in the token stream
+    // for later pipeline parsing.
+    let start_pos = if let Some((cur_pos, _)) = lexer.get_span() {
+        match lexer.input[cur_pos..].find('\n') {
+            Some(nl_offset) => cur_pos + nl_offset + 1,
+            None => lexer.input.len(),
         }
-    }
-
-    // Get the current position in the input after the newline
-    let start_pos = if let Some((start, _)) = lexer.get_span() {
-        start
     } else {
         return Ok(Some(String::new()));
     };
 
-    //     eprintln!("DEBUG: Starting heredoc parsing from position: {}", start_pos);
+    // Save the current lexer position; we will only advance past tokens
+    // that lie within the heredoc body (i.e. at or after start_pos).
+    let saved_lexer_current = lexer.current;
 
     // Read the raw input line by line until we find the delimiter
     let mut body = String::new();
@@ -211,11 +239,8 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
             .unwrap_or(input.len());
         let line = &input[current_pos..line_end];
 
-        //         eprintln!("DEBUG: Processing line: '{}'", line);
-
         // Check if this line is the delimiter (exact match, possibly with whitespace)
         if line.trim() == delim {
-            //             eprintln!("DEBUG: Found delimiter line, stopping");
             break;
         }
 
@@ -231,21 +256,38 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         }
     }
 
-    // Advance the lexer to skip over the processed content
-    // We need to consume tokens until we reach the delimiter
-    while let Some(token) = lexer.peek() {
-        match token {
-            Token::Identifier => {
-                let word = lexer.get_identifier_text()?;
-                lexer.next();
-                if word == delim {
-                    break;
-                }
-            }
-            _ => {
-                lexer.next();
-            }
+    // Compute the byte position right after the delimiter line.
+    // current_pos is at the start of the delimiter; find the end of this line.
+    let body_end = if let Some(nl_pos) = input[current_pos..].find('\n') {
+        // Include the newline after the delimiter.
+        current_pos + nl_pos + 1
+    } else {
+        // No newline after delimiter — end of input.
+        input.len()
+    };
+
+    // Remove the heredoc body tokens from the token stream entirely.
+    // Tokens before start_pos (pipeline operators like `|`, `grep`, etc.)
+    // must remain for later pipeline parsing, so we only remove the range
+    // [body_start_idx, body_end_idx) of tokens whose start >= start_pos.
+    let mut body_start_idx = saved_lexer_current;
+    while body_start_idx < lexer.tokens.len() {
+        if lexer.tokens[body_start_idx].1 >= start_pos {
+            break;
         }
+        body_start_idx += 1;
+    }
+    let mut body_end_idx = body_start_idx;
+    while body_end_idx < lexer.tokens.len() {
+        if lexer.tokens[body_end_idx].1 >= body_end {
+            break;
+        }
+        body_end_idx += 1;
+    }
+    // Remove the body tokens.  lexer.current is unchanged (still pointing at
+    // pipeline tokens before start_pos), so pipeline parsing can proceed.
+    if body_end_idx > body_start_idx {
+        lexer.tokens.drain(body_start_idx..body_end_idx);
     }
 
     //     eprintln!("DEBUG: Final heredoc body: '{}'", body);
