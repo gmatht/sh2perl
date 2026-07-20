@@ -13,7 +13,8 @@ use crate::timeout_manager::{
 use crate::utils::{
     check_ast_must_contain, check_ast_must_not_contain, check_generator_available,
     check_perl_must_contain, check_perl_must_not_contain, check_perl_no_open3_builtins,
-    check_perl_no_system_builtins, cleanup_tmp, generate_unified_diff,
+    check_perl_no_qx_builtins, check_perl_no_system_builtins, cleanup_tmp, generate_unified_diff,
+    load_qx_exemptions,
 };
 use debashl::parser::errors::ParserError;
 use debashl::shared_utils;
@@ -1036,6 +1037,36 @@ pub fn test_file_equivalence_detailed_with_critic(
                 ast,
                 _lexer_output: String::new(),
                 failure_reason: format!("SYSTEM_BUILTIN violations:\n{}", violation_msg),
+                shell_duration: std::time::Duration::from_secs(0),
+                translated_duration: std::time::Duration::from_secs(0),
+            });
+        }
+
+        // Check for qx{} calls with builtin commands (should use native Perl instead)
+        let qx_exemptions = load_qx_exemptions("allowed_qx_calls.txt");
+        if let Err(violation_msg) = check_perl_no_qx_builtins(&translated_code, &qx_exemptions) {
+            cleanup_tmp(lang, &tmp_file);
+            return Ok(TestResult {
+                success: false,
+                shell_stdout: String::from_utf8_lossy(&shell_output_result.stdout)
+                    .to_string()
+                    .replace("\r\n", "\n")
+                    .trim()
+                    .to_string(),
+                shell_stderr: String::from_utf8_lossy(&shell_output_result.stderr)
+                    .to_string()
+                    .replace("\r\n", "\n")
+                    .trim()
+                    .to_string(),
+                translated_stdout: String::new(),
+                translated_stderr: String::new(),
+                shell_exit: shell_output_result.status.code().unwrap_or(-1),
+                translated_exit: -1,
+                original_code: shell_content,
+                translated_code,
+                ast,
+                _lexer_output: String::new(),
+                failure_reason: format!("QX_BUILTIN violations:\n{}", violation_msg),
                 shell_duration: std::time::Duration::from_secs(0),
                 translated_duration: std::time::Duration::from_secs(0),
             });
