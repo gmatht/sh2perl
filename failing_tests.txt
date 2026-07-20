@@ -7,13 +7,12 @@
 063_15_complex_function_definition.sh	Failed due to: exit code mismatch, stdout mismatch
 063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
 064_02_nested_brace_expansions.sh	Failed due to: stdout mismatch
-064_03_complex_parameter_expansion.sh	Failed due to: exit code mismatch, stdout mismatch
 064_09_process_substitution_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
 064_12_brace_expansion_nested_sequences.sh	Failed due to: exit code mismatch, stdout mismatch
 064_14_nested_command_substitution_arithmetic.sh	Failed due to: exit code mismatch, stdout mismatch
 064_18_array_slicing_manipulation.sh	Failed due to: exit code mismatch, stdout mismatch
 064_19_complex_pattern_matching_extended_globs.sh	Failed due to: stdout mismatch
-064_22_function_returning_complex_data_structures.sh	Failed due to: exit code mismatch, stdout mismatch
+064_22_function_returning_complex_data_structures.sh	Failed due to: stdout mismatch
 064_23_complex_error_handling_traps.sh	Failed due to: stdout mismatch
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
 test_system_builtin.sh	Failed due to: stdout mismatch
