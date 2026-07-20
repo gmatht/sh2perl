@@ -137,6 +137,9 @@ fn generate_command_using_builtins(
                 ));
                 generator.indent_level += 1;
 
+                // Register the loop variable so string interpolation inside the body uses $k not $ENV{k}
+                generator.declared_locals.insert(for_loop.variable.clone());
+
                 // Generate the body commands, but capture their output instead of printing
                 for cmd in &for_loop.body.commands {
                     if let Command::Simple(simple_cmd) = cmd {

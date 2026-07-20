@@ -4,7 +4,7 @@ use crate::parser::commands::Parser;
 use crate::parser::errors::ParserError;
 use crate::parser::redirects::parse_redirect;
 use crate::parser::utilities::ParserUtilities;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 fn parse_at_prefixed_word(lexer: &mut Lexer) -> Option<Word> {
     if !matches!(lexer.peek(), Some(Token::At)) {
@@ -1273,7 +1273,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                             name: Word::Literal("echo".to_string(), None),
                             args: vec![Word::Literal(command_text, None)],
                             redirects: Vec::new(),
-                            env_vars: HashMap::new(),
+                            env_vars: BTreeMap::new(),
                             stdout_used: true,
                             stderr_used: true,
                         });
@@ -1297,7 +1297,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         name: Word::Literal("echo".to_string(), None),
                         args: vec![Word::Literal(command_text, None)],
                         redirects: Vec::new(),
-                        env_vars: HashMap::new(),
+                        env_vars: BTreeMap::new(),
                         stdout_used: true,
                         stderr_used: true,
                     });
@@ -1321,7 +1321,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
 
 fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     use crate::ast::{Command, SimpleCommand, StringInterpolation, StringPart, Word};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     // Get the double-quoted string content (this includes the quotes)
     let string_content = lexer.get_string_text()?;
@@ -1447,7 +1447,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                 name: Word::Literal("echo".to_string(), None),
                                 args: vec![Word::Literal(cmd_content.to_string(), None)],
                                 redirects: Vec::new(),
-                                env_vars: HashMap::new(),
+                                env_vars: BTreeMap::new(),
                                 stdout_used: true,
                                 stderr_used: true,
                             });
@@ -1821,7 +1821,7 @@ pub fn parse_string_interpolation_from_literal(
                                 name: Word::Literal("echo".to_string(), None),
                                 args: vec![Word::Literal(cmd_content.to_string(), None)],
                                 redirects: Vec::new(),
-                                env_vars: HashMap::new(),
+                                env_vars: BTreeMap::new(),
                                 stdout_used: true,
                                 stderr_used: true,
                             });
@@ -1943,7 +1943,34 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         }
     }
 
+    // Check for operators that use `//` and `/` BEFORE checking for array access,
+    // because patterns like ${var//[^a-z]/_} contain brackets that look like array access.
+    // Must check these before the array-access branch.
+
+    // Check for // pattern substitution: ${var//pattern/replacement}
+    if content.contains("//") {
+        let parts: Vec<&str> = content.splitn(2, "//").collect();
+        if parts.len() == 2 {
+            let pattern_replacement = parts[1];
+            if let Some(slash_pos) = pattern_replacement.find('/') {
+                let pattern = &pattern_replacement[..slash_pos];
+                let replacement = &pattern_replacement[slash_pos + 1..];
+                return Ok(ParameterExpansion {
+                    variable: parts[0].to_string(),
+                    operator: ParameterExpansionOperator::SubstituteAll(
+                        pattern.to_string(),
+                        replacement.to_string(),
+                    ),
+                    is_mutable: true,
+                });
+            }
+        }
+    }
+
     // Check for array/map access: arr[1], map[foo]
+    // IMPORTANT: This check must come AFTER the // and / substitution checks above,
+    // because a regex character class like [a-z] inside a substitution pattern
+    // would otherwise be misinterpreted as array access.
     if content.contains('[') && content.contains(']') {
         if let Some(bracket_start) = content.find('[') {
             if let Some(bracket_end) = content.rfind(']') {
@@ -1986,6 +2013,14 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                     });
                 }
 
+                // Check if there is a substitution operator after the bracket
+                let rest = &content[bracket_end + 1..];
+                // If there's a / after ], this is probably ${arr[1]/pattern/replacement}
+                if rest.starts_with('/') {
+                    // This is substitution on an array element
+                    // We'll handle this later - for now, just treat as array access
+                }
+
                 // This is array/map access - we'll handle this in the generator
                 return Ok(ParameterExpansion {
                     variable: format!("{}[{}]", var_name, key),
@@ -1996,7 +2031,7 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         }
     }
 
-    // Check for parameter expansion operators
+    // Check for parameter expansion operators (except // and / which are checked above)
     // Check longer patterns first to avoid partial matches
     if content.ends_with("^^") {
         let base_var = content.trim_end_matches("^^");
@@ -2086,36 +2121,6 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 operator: ParameterExpansionOperator::RemoveShortestSuffix(parts[1].to_string()),
                 is_mutable: true,
             })
-        } else {
-            Ok(ParameterExpansion {
-                variable: content.to_string(),
-                operator: ParameterExpansionOperator::None,
-                is_mutable: true,
-            })
-        }
-    } else if content.contains("//") {
-        let parts: Vec<&str> = content.split("//").collect();
-        if parts.len() == 2 {
-            // This is ${var//pattern/replacement} - split the second part by the first '/'
-            let pattern_replacement = parts[1];
-            if let Some(slash_pos) = pattern_replacement.find('/') {
-                let pattern = &pattern_replacement[..slash_pos];
-                let replacement = &pattern_replacement[slash_pos + 1..];
-                Ok(ParameterExpansion {
-                    variable: parts[0].to_string(),
-                    operator: ParameterExpansionOperator::SubstituteAll(
-                        pattern.to_string(),
-                        replacement.to_string(),
-                    ),
-                    is_mutable: true,
-                })
-            } else {
-                Ok(ParameterExpansion {
-                    variable: content.to_string(),
-                    operator: ParameterExpansionOperator::None,
-                    is_mutable: true,
-                })
-            }
         } else {
             Ok(ParameterExpansion {
                 variable: content.to_string(),
@@ -2715,7 +2720,7 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
                         name: Word::Literal("echo".to_string(), None),
                         args: vec![Word::Literal(command_text.to_string(), None)],
                         redirects: Vec::new(),
-                        env_vars: HashMap::new(),
+                        env_vars: BTreeMap::new(),
                         stdout_used: true,
                         stderr_used: true,
                     });
@@ -2932,7 +2937,7 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
         name,
         args: word_args,
         redirects,
-        env_vars: HashMap::new(),
+        env_vars: BTreeMap::new(),
         stdout_used: true,
         stderr_used: true,
     });

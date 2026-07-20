@@ -1009,6 +1009,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                     if !generator.declared_locals.contains(var_name) {
                                         output.push_str(&format!("my %{} = ();\n", var_name));
                                         generator.declared_locals.insert(var_name.clone());
+                                        generator.associative_arrays.insert(var_name.clone());
                                     }
                                 }
                             }
@@ -1116,6 +1117,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 output.push_str(&generator.indent());
                                 if is_assoc {
                                     output.push_str(&format!("my %{} = ();\n", var_name));
+                                    generator.associative_arrays.insert(var_name.clone());
                                 } else if is_array {
                                     output.push_str(&format!("my @{} = ();\n", var_name));
                                 } else {
@@ -1156,6 +1158,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                     name,
                                     elements_perl.join(", ")
                                 ));
+                                generator.associative_arrays.insert(name.clone());
                             } else {
                                 output.push_str(&format!(
                                     "my @{} = ({});\n",

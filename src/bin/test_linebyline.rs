@@ -1,6 +1,6 @@
 use debashl::ast::*;
 use debashl::generator::commands::builtins::{get_builtin_commands, pipeline_supports_linebyline};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 fn main() {
     // Test the line-by-line pipeline support
@@ -35,7 +35,7 @@ fn main() {
                 name: Word::literal("cat".to_string()),
                 args: vec![],
                 redirects: vec![],
-                env_vars: HashMap::new(),
+                env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
             }),
@@ -46,7 +46,7 @@ fn main() {
                     Word::literal("b".to_string()),
                 ],
                 redirects: vec![],
-                env_vars: HashMap::new(),
+                env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
             }),
@@ -54,7 +54,7 @@ fn main() {
                 name: Word::literal("grep".to_string()),
                 args: vec![Word::literal("hello".to_string())],
                 redirects: vec![],
-                env_vars: HashMap::new(),
+                env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
             }),
@@ -80,7 +80,7 @@ fn main() {
                 name: Word::literal("cat".to_string()),
                 args: vec![],
                 redirects: vec![],
-                env_vars: HashMap::new(),
+                env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
             }),
@@ -88,7 +88,7 @@ fn main() {
                 name: Word::literal("sort".to_string()),
                 args: vec![],
                 redirects: vec![],
-                env_vars: HashMap::new(),
+                env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
             }),
@@ -96,7 +96,7 @@ fn main() {
                 name: Word::literal("grep".to_string()),
                 args: vec![Word::literal("hello".to_string())],
                 redirects: vec![],
-                env_vars: HashMap::new(),
+                env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
             }),
@@ -123,7 +123,7 @@ fn main() {
                 name: Word::literal("cat".to_string()),
                 args: vec![],
                 redirects: vec![],
-                env_vars: HashMap::new(),
+                env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
             }),
@@ -131,7 +131,7 @@ fn main() {
                 name: Word::literal("custom_script".to_string()),
                 args: vec![],
                 redirects: vec![],
-                env_vars: HashMap::new(),
+                env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
             }),

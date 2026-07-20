@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // Import word types from the separate ast_words module
 pub use crate::ast_words::*;
@@ -52,7 +52,7 @@ pub struct SimpleCommand {
     pub name: Word,
     pub args: Vec<Word>,
     pub redirects: Vec<Redirect>,
-    pub env_vars: HashMap<String, Word>,
+    pub env_vars: BTreeMap<String, Word>,
     pub stdout_used: bool, // true if stdout is not redirected to /dev/null
     pub stderr_used: bool, // true if stderr is not redirected to /dev/null
 }
@@ -62,7 +62,7 @@ pub struct BuiltinCommand {
     pub name: String,
     pub args: Vec<Word>,
     pub redirects: Vec<Redirect>,
-    pub env_vars: HashMap<String, Word>,
+    pub env_vars: BTreeMap<String, Word>,
     pub stdout_used: bool, // true if stdout is not redirected to /dev/null
     pub stderr_used: bool, // true if stderr is not redirected to /dev/null
 }

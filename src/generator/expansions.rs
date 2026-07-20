@@ -65,6 +65,27 @@ pub fn generate_parameter_expansion_impl(
                         if key.parse::<usize>().is_ok() {
                             // Indexed array access: arr[1] -> $arr[1]
                             format!("${}[{}]", var_name, key)
+                        } else if generator.associative_arrays.contains(var_name) {
+                            // Associative array access: map[foo] -> $map{'foo'}
+                            // or map[$k] -> $map{$k}
+                            if key.starts_with('$') {
+                                // Variable key: map[$k] -> $map{$k}
+                                // Use string concatenation to avoid complex format escapes
+                                let mut result = String::from("$");
+                                result.push_str(var_name);
+                                result.push('{');
+                                result.push_str(key);
+                                result.push('}');
+                                result
+                            } else {
+                                // Literal string key: map[foo] -> $map{'foo'}
+                                let mut result = String::from("$");
+                                result.push_str(var_name);
+                                result.push_str("{'");
+                                result.push_str(&key.replace("'", "\\'"));
+                                result.push_str("'}");
+                                result
+                            }
                         } else {
                             // Indexed array access with variable/expression key: arr[i] -> $arr[$i]
                             format!(

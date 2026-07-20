@@ -269,7 +269,7 @@ impl MirCommand {
                     name: Word::literal("UNSUPPORTED".to_string()),
                     args: vec![],
                     redirects: vec![],
-                    env_vars: std::collections::HashMap::new(),
+                    env_vars: std::collections::BTreeMap::new(),
                     stdout_used: true,
                     stderr_used: true,
                 })
