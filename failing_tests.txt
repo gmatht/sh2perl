@@ -10,7 +10,6 @@
 064_02_nested_brace_expansions.sh	Failed due to: stdout mismatch
 064_03_complex_parameter_expansion.sh	Failed due to: exit code mismatch, stdout mismatch
 064_06_nested_arithmetic_expressions.sh	Failed due to: stdout mismatch
-064_07_complex_array_operations.sh	Failed due to: stdout mismatch
 064_09_process_substitution_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
 064_10_nested_function_definitions.sh	Failed due to: exit code mismatch, stdout mismatch
 064_12_brace_expansion_nested_sequences.sh	Failed due to: exit code mismatch, stdout mismatch
