@@ -27,7 +27,27 @@ fn parameter_var_scalar_ref(generator: &Generator, var_name: &str) -> String {
         // use a string literal fallback to avoid Perl syntax errors
         format!("$ENV{{'{}'}}", var_name.replace('\'', "\\'"))
     } else {
-        format!("$ENV{{{}}}", var_name)
+        // Undeclared variable — use $ENV{var} with // "" to avoid
+        // "uninitialized value" warnings when the env var is not set.
+        format!("($ENV{{{var}}} // q{{}})", var = var_name)
+    }
+}
+
+/// Like `parameter_var_scalar_ref` but returns a bare reference that
+/// can be assigned to (e.g. for `${var:=default}`).  Undeclared vars
+/// are returned as `$ENV{var}` without the // "" wrapper because
+/// `($ENV{var} // "")` is not assignable.
+fn parameter_var_bare_assignable_ref(generator: &Generator, var_name: &str) -> String {
+    if let Ok(n) = var_name.parse::<usize>() {
+        return positional_param_ref(n);
+    }
+    if generator.declared_locals.contains(var_name)
+        || generator.function_level_vars.contains(var_name)
+        || matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+    {
+        format!("${}", var_name)
+    } else {
+        format!("$ENV{{{var}}}", var = var_name)
     }
 }
 
@@ -43,7 +63,9 @@ fn parameter_var_bare_ref(generator: &Generator, var_name: &str) -> String {
     {
         format!("${}", var_name)
     } else {
-        format!("$ENV{{{}}}", var_name)
+        // Undeclared variable — use $ENV{var} with // "" to avoid
+        // "uninitialized value" warnings when the env var is not set.
+        format!("($ENV{{{var}}} // q{{}})", var = var_name)
     }
 }
 
@@ -152,10 +174,11 @@ pub fn generate_parameter_expansion_impl(
         ParameterExpansionOperator::AssignDefault(default) => {
             // ${var:=default} - assign default if var is empty
             let r = parameter_var_scalar_ref(generator, &pe.variable);
+            let assign_target = parameter_var_bare_assignable_ref(generator, &pe.variable);
             let default_expr = default_value_to_perl(generator, default);
             format!(
                 "(defined {} && {} ne q{{}} ? {} : do {{ {} = {}; {} }})",
-                r, r, r, r, default_expr, r
+                r, r, r, assign_target, default_expr, r
             )
         }
         ParameterExpansionOperator::ErrorIfUnset(error) => {

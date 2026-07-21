@@ -1868,8 +1868,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         crate::generator::redirects::generate_bash_command_string(cmd);
                     let command_lit =
                         generator.perl_string_literal_no_interp(&Word::literal(command_str));
+                    let mut shell_vars = std::collections::HashSet::new();
+                    collect_shell_vars_from_command(cmd, &mut shell_vars);
+                    let mut shell_vars: Vec<String> = shell_vars.into_iter().collect();
+                    shell_vars.sort();
                     let mut env_setup = String::new();
-                    for var in &generator.declared_locals {
+                    for var in &shell_vars {
                         if var != "file" {
                             env_setup.push_str(&format!("    local $ENV{{{}}} = ${};\n", var, var));
                         }
@@ -1970,12 +1974,29 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 // or map[$k] -> $map{$k}
                 if key.starts_with('$') {
                     // Variable key: map[$k] -> $map{$k}
-                    let mut result = String::from("$");
-                    result.push_str(map_name);
-                    result.push('{');
-                    result.push_str(key);
-                    result.push('}');
-                    result
+                    // If the key contains a comma or other operators (not just a
+                    // single variable), wrap in quotes to avoid Perl interpreting
+                    // the comma as the comma operator inside the hash subscript.
+                    let needs_quoting = key.contains(',');
+                    if needs_quoting {
+                        // e.g. map[$i,$j] -> $map{"$i,$j"}
+                        // Use double-quoted interpolation so variables are expanded.
+                        let mut result = String::from("$");
+                        result.push_str(map_name);
+                        result.push('{');
+                        result.push('"');
+                        result.push_str(&key);
+                        result.push('"');
+                        result.push('}');
+                        result
+                    } else {
+                        let mut result = String::from("$");
+                        result.push_str(map_name);
+                        result.push('{');
+                        result.push_str(key);
+                        result.push('}');
+                        result
+                    }
                 } else {
                     // Literal string key: map[foo] -> $map{'foo'}
                     let mut result = String::from("$");

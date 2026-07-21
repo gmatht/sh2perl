@@ -81,7 +81,7 @@ if ( !( ($var =~ s/o/0/grs) =~ m{\n\z}msx ) ) { print "\n"; }
 print "== Default values ==\n";
 delete $ENV{maybe};
 do {
-    my $output = (defined $ENV{maybe} && $ENV{maybe} ne q{} ? $ENV{maybe} : 'default');
+    my $output = (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : 'default');
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
         print "\n";
@@ -89,7 +89,7 @@ do {
 };
 $CHILD_ERROR = 0;
 do {
-    my $output = (defined $ENV{maybe} && $ENV{maybe} ne q{} ? $ENV{maybe} : do { $ENV{maybe} = 'default'; $ENV{maybe} });
+    my $output = (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : do { $ENV{maybe} = 'default'; ($ENV{maybe} // q{}) });
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
         print "\n";
@@ -97,7 +97,7 @@ do {
 };
 $CHILD_ERROR = 0;
 do {
-    my $output = (defined $ENV{maybe} && $ENV{maybe} ne q{} ? $ENV{maybe} : die('error'));
+    my $output = (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : die('error'));
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
         print "\n";

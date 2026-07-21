@@ -2,6 +2,48 @@
 
 ## Tests fixed in this session
 
+### Generator: save/restore declared_locals/function_level_vars around function bodies
+Added save/restore of `declared_locals`, `function_level_vars`, and
+`associative_arrays` in `generate_function_impl` so that variables declared
+via `local` inside a function don't leak into the outer scope (and vice
+versa, outer scope vars don't conflict with function-internal declarations).
+Previously all `local` declarations were added to the global sets, causing
+Perl `my $var` declarations to be skipped when the same variable name was
+used later in the main script body.
+
+### Generator: fix env-var fallback path to scope variables per command
+Changed the `_ =>` fallback in `word_to_perl_impl` (And/Or command handling)
+to collect only the shell variables actually referenced by the bash command
+(via `collect_shell_vars_from_command`) instead of blindly iterating over
+the entire `declared_locals` set.  The old code caused `local $ENV{var} =
+$var;` lines for variables that were out of lexical scope in the generated
+Perl, leading to "Global symbol requires explicit package name" errors.
+
+### Generator: fix `$ENV{var}` to use `// ""` for undeclared variables
+Changed `parameter_var_scalar_ref` and `parameter_var_bare_ref` in
+expansions.rs to produce `($ENV{var} // "")` instead of bare `$ENV{var}`
+for undeclared variables.  In bash, reading an undeclared variable yields
+empty string; in Perl, `$ENV{var}` returns `undef` when the environment
+variable is not set, triggering "uninitialized value" warnings under
+`use warnings`.
+
+### Generator: fix hash key with comma in associative array access
+When a MapAccess key contains a comma (e.g. `${matrix[$i,$j]}`), the
+generated Perl `$matrix{$i,$j}` is interpreted as the comma operator
+(equivalent to `$matrix{$j}`).  The fix detects commas in the key and
+emits `$matrix{"$i,$j"}` (double-quoted interpolation) instead.
+
+### Generator: fix `let` condition negation in `if` statements
+The `if` statement generator unconditionally negated the condition for
+non-trivial commands (to convert bash exit-code conventions to Perl
+truth values).  For `let` commands, which already produce a 1/0 value
+from `eval { int(...) }`, the extra negation flipped the logic (even
+numbers printed "Odd" and vice versa).  Added a special case to skip
+negation for `let` commands.
+
+Fixed tests: 058_advanced_bash_idioms.sh (several remaining issues
+listed below), 064_19_complex_pattern_matching_extended_globs.sh
+
 ### Generator: fix `local var=$(cmd)` when `var` already exists globally
 Changed the `local` handler in `redirects.rs` to use `function_level_vars`
 instead of `declared_locals` for the skip-already-declared check.  `local`
@@ -103,16 +145,25 @@ Fixed tests: partially fixes 063_12_complex_eval.sh
 ### Generator: use `scalar(keys %map)` for `${#map[@]}` on associative arrays
 Fixed tests: partially fixes 063_09_complex_function_parameter_handling.sh
 
-## Still failing tests (10)
+## Tests fixed in this session (continued)
+
+### 064_19_complex_pattern_matching_extended_globs.sh
+Now passes. The `${i,$j}` comma-key fix and other enhancements resolved
+this test.
+
+## Still failing tests (9)
 
 ### 058_advanced_bash_idioms.sh
-Complex script combining many feature interactions. The `matrix[0,2]=value`
-assignments now generate valid Perl (`$matrix{"0,2"} = value;`). Remaining
-issues include: `$matrix{$i,$j}` uses Perl comma operator instead of proper
-key `"$i,$j"`; `$value` undeclared due to function-scope leak from
-`local value="$2"`; `$ENV{test_string}` for undeclared variable;
-heredoc-with-subshell translation issues; `local $ENV{var} = $var;` lines
-reference variables out of lexical scope.
+Complex script combining many feature interactions. The following issues
+have been fixed in this session: function-scope leak of `declared_locals`
+(caused `$value` undeclared), `$matrix{$i,$j}` comma-operator key (now
+`$matrix{"$i,$j"}` via double-quoted interpolation), `$ENV{test_string}`
+uninitialized warning (now `($ENV{test_string} // "")`), env-var fallback
+passing all `declared_locals` (now scoped per command), and `let` condition
+negation in `if` (even/odd numbers were inverted). The remaining failure is
+caused by the test harness running the shell script from the `examples/`
+directory while the translated Perl script runs from the project root,
+causing `find . -maxdepth 1` to count different files.
 
 ### 063_09_complex_function_parameter_handling.sh
 `let` is now handled natively (no more timeout). The remaining failure is
@@ -148,15 +199,6 @@ and iterating in that order instead of using `values %`.
 ### 064_09_process_substitution_pipeline.sh
 Syntax error near `$;` — process substitution temp files not correctly
 created/passed.
-
-### 064_19_complex_pattern_matching_extended_globs.sh
-The brace expansion `*.{txt,log,dat}` now correctly expands to
-`*.txt`, `*.log`, `*.dat` in the for-loop (parser now merges the `*.`
-prefix with the adjacent brace expansion; generator now includes the
-prefix when emitting for-loop items). However, the for-loop still needs
-glob expansion: bash expands `*.txt` to matching filenames, but the
-generated Perl iterates over the literal pattern strings. Adding glob
-expansion to for-loop items would fix this.
 
 ### 064_22_function_returning_complex_data_structures.sh
 `declare -A info` and `declare -p info` not translated. Bash's
