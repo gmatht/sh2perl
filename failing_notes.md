@@ -2,6 +2,30 @@
 
 ## Tests fixed in this session
 
+### Generator: handle `${var[@]:offset:length}` array slicing and env var dependency ordering (qd. 2026-07-21)
+Fixed two issues:
+
+1. **Array slice translation**: Added `array_element_to_perl_impl()` in
+   `src/generator/utils.rs` which detects `${var[@]:offset:length}` patterns in
+   `Word::Array` element strings and converts them to Perl array slices like
+   `@var[offset..offset+length-1]`. Previously the raw string was wrapped in
+   single quotes, producing invalid Perl like `("${numbers[@]:0:5}")`.
+
+2. **Env var dependency ordering**: Changed `generate_simple_command_impl()` in
+   `src/generator/commands/simple_commands.rs` to sort ALL env vars (both array
+   and scalar) by dependency order before processing, so that variables like
+   `numbers` are declared before `first_half` which depends on `@numbers[...]`.
+   Also added `Word::Array` handling to `env_var_refs_var()` so that array
+   elements referencing other variables (like `${numbers[@]:3:4}` referring to
+   `numbers`) are correctly detected.
+
+3. **Auto-declare bare variables in arithmetic**: Added logic to `generate_assignment`
+   and the env-var processing loop to extract bare identifiers from arithmetic
+   expressions (like `a`, `b` in `$((a + b))`) and declare them as `my $var;`
+   before use, preventing `use strict` compilation errors.
+
+Fixed tests: 064_18_array_slicing_manipulation.sh
+
 ### Generator: support `Nested` and `Compound` BraceItem variants (qd. 2026-07-21)
 Implemented `brace_item_to_word_impl()` handling for `BraceItem::Nested` and
 `BraceItem::Compound` in `src/generator/words.rs`. Previously these had
@@ -116,7 +140,7 @@ the same mixed-range logic.
 
 Fixed tests: 064_02_nested_brace_expansions.sh
 
-## Still failing tests (18)
+## Still failing tests (17)
 
 ### 058_advanced_bash_idioms.sh
 Complex script combining many feature interactions. QX violations for find/
@@ -134,8 +158,8 @@ Hard-to-lex constructs challenge the parser/lexer — stdout mismatch.
 
 ### 063_01_deeply_nested_arithmetic.sh
 Division by zero (0 % 0) produces fatal "Illegal modulus zero" in Perl vs
-non-fatal warning in bash. Also variables `$a`..`$n` are undeclared in the
-arithmetic expression, causing `use strict` compilation errors.
+non-fatal warning in bash. Undeclared variables in arithmetic (fixed: generator
+now auto-declares bare identifiers found in arithmetic expressions).
 
 ### 063_02_complex_array_assignments.sh
 `$index` and `@array` not declared. Variables used in MapAccess keys need array
@@ -168,11 +192,6 @@ Process substitution temp files not correctly created/passed.
 ### 064_14_nested_command_substitution_arithmetic.sh
 `$(( $(wc -l < /etc/passwd) + $(wc -l < /etc/group) ))` — inner `$(...)`
 treated as literal text inside the arithmetic expression.
-
-### 064_18_array_slicing_manipulation.sh
-Array slicing `${arr[@]:offset:length}` not correctly translated — the literal
-pattern is kept as-is in the Perl output instead of being converted to a Perl
-array slice.
 
 ### 064_19_complex_pattern_matching_extended_globs.sh
 Extended glob patterns `*.{txt,log,dat}` brace expansion not expanded correctly.

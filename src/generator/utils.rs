@@ -49,6 +49,46 @@ pub fn extract_array_elements_impl(value: &str) -> Option<Vec<String>> {
     None
 }
 
+/// Convert a raw string array element to Perl code, handling `${...}` expansions.
+/// Called from `generate_assignment` and `word_to_perl_impl` for `Word::Array` elements.
+pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String {
+    // Check if this element is a ${...} parameter expansion
+    if s.starts_with("${") && s.ends_with('}') {
+        let content = &s[2..s.len() - 1];
+        if let Ok(pe) = crate::parser::words::parse_parameter_expansion_content(content) {
+            match &pe.operator {
+                ParameterExpansionOperator::ArraySlice(offset, length) => {
+                    if offset == "@" {
+                        // ${arr[@]} - expand to Perl array
+                        format!("@{}", pe.variable)
+                    } else {
+                        // ${arr[@]:offset:length} - array slice
+                        let start = offset.trim();
+                        if let Some(len_str) = length {
+                            let len = len_str.trim().parse::<i32>().unwrap_or(0);
+                            let start_num = start.parse::<i32>().unwrap_or(0);
+                            let end = if len > 0 { start_num + len - 1 } else { start_num };
+                            format!("@{}[{}..{}]", pe.variable, start, end)
+                        } else {
+                            format!("@{}[{}..$#{}]", pe.variable, start, pe.variable)
+                        }
+                    }
+                }
+                _ => {
+                    // Other parameter expansions - use the normal generator
+                    generator.generate_parameter_expansion(&pe)
+                }
+            }
+        } else {
+            // Failed to parse parameter expansion, fall back to literal
+            format!("'{}'", s.replace("'", "\\'"))
+        }
+    } else {
+        // Not a ${...} pattern - wrap in quotes
+        format!("'{}'", s.replace("'", "\\'"))
+    }
+}
+
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {

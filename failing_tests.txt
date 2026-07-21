@@ -9,7 +9,6 @@
 063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
 064_07_complex_array_operations.sh	Failed due to: stdout mismatch
 064_09_process_substitution_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
-064_12_brace_expansion_nested_sequences.sh	Failed due to: exit code mismatch, stdout mismatch
 064_14_nested_command_substitution_arithmetic.sh	Failed due to: exit code mismatch, stdout mismatch
 064_18_array_slicing_manipulation.sh	Failed due to: exit code mismatch, stdout mismatch
 064_19_complex_pattern_matching_extended_globs.sh	Failed due to: stdout mismatch

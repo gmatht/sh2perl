@@ -12,11 +12,48 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     let mut output = String::new();
 
     // Handle array assignments first (these need to be in the main scope)
-    for (var, value) in &cmd.env_vars {
+    // Collect all env vars (both array and scalar) and sort by dependency order
+    // so that variables referenced by other variables are declared first.
+    let mut env_vec: Vec<(&String, &Word)> = cmd.env_vars.iter().collect();
+    env_vec.sort_by(|(a_key, a_val), (b_key, _b_val)| {
+        let a_refs_b = env_var_refs_var(a_val, b_key);
+        let b_refs_a = env_var_refs_var(_b_val, a_key);
+        if a_refs_b && !b_refs_a {
+            std::cmp::Ordering::Greater  // a depends on b, so b comes first
+        } else if b_refs_a && !a_refs_b {
+            std::cmp::Ordering::Less     // b depends on a, so a comes first
+        } else {
+            std::cmp::Ordering::Equal    // no dependency, keep BTreeMap order
+        }
+    });
+
+    for (var, value) in &env_vec {
+        // Auto-declare bare variables used in arithmetic expressions (like a, b in $((a + b)))
+        if let Word::Arithmetic(expr, _) = value {
+            let re = regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b").unwrap();
+            for cap in re.captures_iter(&expr.expression) {
+                let var_name = &cap[1];
+                // Skip Perl keywords and operators
+                if matches!(var_name, "if" | "else" | "for" | "while" | "do" | "not" | "and" | "or" | "xor" | "sub" | "my" | "local" | "our" | "defined" | "undef" | "int" | "length" | "substr" | "keys" | "values" | "scalar" | "join" | "split" | "grep" | "map" | "sort") {
+                    continue;
+                }
+                if !generator.declared_locals.contains(var_name)
+                    && !generator.function_level_vars.contains(var_name)
+                {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("my ${};\n", var_name));
+                    generator.declared_locals.insert(var_name.to_string());
+                }
+            }
+        }
         if let Word::Array(_, elements, _) = value {
             // Handle array assignment like arr=(one two three)
             let elements_perl: Vec<String> = elements.iter()
                 .map(|s| {
+                    // Check if this element is a ${...} parameter expansion (e.g. ${numbers[@]:3:4})
+                    if s.starts_with("${") && s.ends_with('}') {
+                        return generator.array_element_to_perl(s);
+                    }
                     // Check if this element contains backticks (command substitution)
                     if s.contains('`') {
                         // Extract the command from backticks and convert to native Perl
@@ -130,7 +167,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             // If the array variable is already declared, use push to append elements
             // (matching shell semantics for `arr+=(elem)` where the parser drops
             // the operator information).
-            if generator.declared_locals.contains(var) {
+            if generator.declared_locals.contains(*var) {
                 // Variable already declared - use push to append
                 for elem in &elements_perl {
                     output.push_str(&format!("push @{}, {};\n", var, elem));
@@ -138,7 +175,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             } else {
                 // First declaration - use my @
                 output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
-                generator.declared_locals.insert(var.clone());
+                generator.declared_locals.insert((*var).clone());
             }
             // Mark array as declared
         } else if let Word::Literal(s, _) = value {
@@ -149,13 +186,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     .map(|s| format!("\"{}\"", generator.escape_perl_string(s)))
                     .collect();
                 output.push_str(&generator.indent());
-                if generator.declared_locals.contains(var) {
+                if generator.declared_locals.contains(*var) {
                     for elem in &elements_perl {
                         output.push_str(&format!("push @{}, {};\n", var, elem));
                     }
                 } else {
                     output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
-                    generator.declared_locals.insert(var.clone());
+                    generator.declared_locals.insert((*var).clone());
                 }
             }
         }
@@ -1176,6 +1213,24 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 }
                 match value {
                     Word::Arithmetic(expr, _) => {
+                        // Auto-declare bare variables used in arithmetic expressions (like a, b in $((a + b)))
+                        {
+                            let re = regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b").unwrap();
+                            for cap in re.captures_iter(&expr.expression) {
+                                let var_name = &cap[1];
+                                // Skip Perl keywords and operators
+                                if matches!(var_name, "if" | "else" | "for" | "while" | "do" | "not" | "and" | "or" | "xor" | "sub" | "my" | "local" | "our" | "defined" | "undef" | "int" | "length" | "substr" | "keys" | "values" | "scalar" | "join" | "split" | "grep" | "map" | "sort") {
+                                    continue;
+                                }
+                                if !generator.declared_locals.contains(var_name)
+                                    && !generator.function_level_vars.contains(var_name)
+                                {
+                                    output.push_str(&generator.indent());
+                                    output.push_str(&format!("my ${};\n", var_name));
+                                    generator.declared_locals.insert(var_name.to_string());
+                                }
+                            }
+                        }
                         // Convert arithmetic expression to Perl
                         let perl_expr = generator.convert_arithmetic_to_perl(&expr.expression);
                         if !generator.declared_locals.contains(var) {
@@ -2311,6 +2366,21 @@ fn env_var_refs_var(value: &Word, var_name: &str) -> bool {
         }
         Word::ParameterExpansion(pe, _) => {
             pe.variable == var_name || pe.variable.contains(var_name)
+        }
+        Word::Array(_, elements, _) => {
+            // Check if any element in the array references var_name
+            for element in elements {
+                if element == var_name || element.contains(var_name) {
+                    return true;
+                }
+                // Check for ${var_name} patterns in the element
+                if element.starts_with("${") && element.ends_with('}')
+                    && element[2..element.len()-1].contains(var_name)
+                {
+                    return true;
+                }
+            }
+            false
         }
         _ => false,
     }
