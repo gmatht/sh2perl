@@ -2933,7 +2933,7 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
                     | "join" | "split" | "grep" | "map" | "sort"
                     | "defined" | "undef" | "substr" | "reverse"
                     | "pop" | "push" | "shift" | "unshift"
-                    | "sprintf" | "index"
+                    | "sprintf"
             ) {
                 // Perl builtin function — leave as-is.
                 // Only include truly unambiguous Perl builtins that are
