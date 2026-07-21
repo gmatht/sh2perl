@@ -32,7 +32,17 @@ my $file_list = do {
 print "File listing:\n";
 print $file_list;
 if ( !( ($file_list) =~ m{\n\z}msx ) ) { print "\n"; }
-my $found_files = do { my $command = q{find . -name '*.sh' -type f}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
+my $found_files = do {
+    require File::Find;
+    my @find_results;
+
+    File::Find::find(sub { if (-f $_ && $_ =~ /^.*\.sh$/msx) { push @find_results, $File::Find::name; } }, q{.});
+    @find_results = sort @find_results;
+    my $result = join "\n", @find_results;
+    if ($result ne q{}) { $result .= "\n"; }
+    $CHILD_ERROR = 0;
+    $result;
+};
 print "Found shell scripts:\n";
 print $found_files;
 if ( !( ($found_files) =~ m{\n\z}msx ) ) { print "\n"; }

@@ -1067,7 +1067,7 @@ pub fn test_file_equivalence_detailed_with_critic(
         }
 
         // Check for qx{} calls with builtin commands (should use native Perl instead)
-        let qx_exemptions = load_qx_exemptions("allowed_qx_calls.txt");
+        let qx_exemptions = load_qx_exemptions("../allowed_qx_calls.txt");
         if let Err(violation_msg) = check_perl_no_qx_builtins(&translated_code, &qx_exemptions) {
             cleanup_tmp(lang, &tmp_file);
             return Ok(TestResult {

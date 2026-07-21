@@ -134,7 +134,16 @@ $CHILD_ERROR = 0;
     my $output_140 = q{};
     my $output_printed_140;
     my $pipeline_success_140 = 1;
-        $output_140 = do { my $command = q{find . -name '*.sh'}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
+        $output_140 = do {
+    require File::Find;
+    my @find_results;
+    File::Find::find(sub { if ($_ =~ /^.*\.sh$/msx) { push @find_results, $File::Find::name; } }, q{.});
+    @find_results = sort @find_results;
+    my $result = join "\n", @find_results;
+    if ($result ne q{}) { $result .= "\n"; }
+    $CHILD_ERROR = 0;
+    $result;
+    };
 
         my @xargs_files_140_1 = split /\n/msx, $output_140;
     my @xargs_matching_files_140_1;

@@ -113,7 +113,14 @@ if ($system_name =~ /^Linux$/msx) {
 
 sub get_file_size {
     my $file = $_[0];
-    my $size = do { my $command = "wc -c < \"$file\""; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
+    my $size = do {
+    my $wc_file = "$file";
+    open my $fh, '<', $wc_file or croak "Cannot open $wc_file: $OS_ERROR\n";
+    my $content = do { local $INPUT_RECORD_SEPARATOR = undef; <$fh> };
+    close $fh or croak "Close failed: $OS_ERROR\n";
+    my $wc_bytes = length($content);
+    $wc_bytes;
+};
     do {
     my $output = "File $file has $size bytes";
     print $output;

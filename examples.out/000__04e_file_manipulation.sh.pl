@@ -31,12 +31,16 @@ my $cp_result = do {
     my $left_result_66 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
-            do {
-                my $cp_cmd = 'cp test_file.txt test_file_copy.txt';
-                my $cp_output = qx{$cp_cmd};
-                # print $cp_output;
-                $cp_output;
-            };
+            use File::Copy qw(copy);
+            if ( -e 'test_file.txt' ) {
+                if ( -d 'test_file_copy.txt' ) {
+                    require File::Copy; File::Copy::copy('test_file.txt', 'test_file_copy.txt' . '/' . ('test_file.txt' =~ m|([^/]+)$|)[0]);
+                } else {
+                    require File::Copy; File::Copy::copy('test_file.txt', 'test_file_copy.txt');
+                }
+            } else {
+                croak "cp: cannot stat 'test_file.txt': No such file or directory\n";
+            }
             1;
             };
         if ( !$eval_result ) {
@@ -391,7 +395,23 @@ if ( !defined $ls_success || $ls_success == 0 ) {
 }
 $main_exit_code = 0;
 my $mkdir_result = do {
-    my $left_result_96 = do { my $mkdir_cmd = 'mkdir test_dir'; my $mkdir_output = qx{$mkdir_cmd}; $CHILD_ERROR = $? >> 8; $mkdir_output; };
+    my $left_result_96 = do {
+        $CHILD_ERROR = 0;
+        my $eval_result = eval {
+            use File::Path qw(make_path);
+            if ( mkdir 'test_dir' ) {
+                }
+            else {
+                croak "mkdir: cannot create directory " . 'test_dir' . ": File exists\n";
+            }
+            $CHILD_ERROR = 0;
+            1;
+        };
+        if ( !$eval_result ) {
+            $CHILD_ERROR = 256;
+        }
+        q{};
+};
     if ( $CHILD_ERROR == 0 ) {
         my $right_result_96 = do { ("Directory created") };
         $left_result_96 . $right_result_96;
