@@ -1300,6 +1300,84 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 ));
             }
         }
+        "trap" => {
+            // Handle trap command: trap 'handler' SIGNAL
+            // For EXIT, generate END block. For other signals, use %SIG.
+            // The handler is executed via shell (qx{}) since translating
+            // arbitrary shell commands to Perl is not practical.
+            if cmd.args.len() >= 2 {
+                let handler_arg = &cmd.args[0];
+                let signal_arg = &cmd.args[1];
+                let handler_str = match handler_arg {
+                    Word::Literal(s, _) => Some(s.clone()),
+                    Word::StringInterpolation(si, _) => {
+                        if si.parts.len() == 1 {
+                            if let StringPart::Literal(s) = &si.parts[0] {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(handler) = handler_str {
+                    let escaped_handler = handler.replace("'", "'\\''");
+                    let signal_name = match signal_arg {
+                        Word::Literal(s, _) => s.to_uppercase(),
+                        _ => String::new(),
+                    };
+                    if signal_name == "EXIT" || signal_name == "0" {
+                        // EXIT trap -> END block
+                        output.push_str(&format!(
+                            "END {{ system '{}'; }}\n",
+                            escaped_handler
+                        ));
+                    } else if signal_name == "DEBUG" {
+                        // DEBUG trap
+                        output.push_str(&format!(
+                            "# DEBUG trap not fully supported: {}\n",
+                            handler
+                        ));
+                    } else if signal_name == "RETURN" {
+                        // RETURN trap
+                        output.push_str(&format!(
+                            "# RETURN trap not supported: {}\n",
+                            handler
+                        ));
+                    } else if signal_name == "ERR" {
+                        // ERR trap - use __DIE__ or custom handler
+                        output.push_str(&format!(
+                            "# ERR trap not fully supported: {}\n",
+                            handler
+                        ));
+                    } else if !signal_name.is_empty() {
+                        // Other signals: INT, TERM, etc.
+                        let escaped_handler_for_perl = handler
+                            .replace("\\", "\\\\")
+                            .replace("\"", "\\\"")
+                            .replace("$", "\\$");
+                        output.push_str(&format!(
+                            "$SIG{{{}}} = sub {{ system '{}'; }};\n",
+                            signal_name, escaped_handler
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "# Builtin command 'trap' not implemented for signal {}\n",
+                            signal_name
+                        ));
+                    }
+                } else {
+                    output.push_str(&format!(
+                        "# Builtin command 'trap' with dynamic handler not supported\n"
+                    ));
+                }
+            } else {
+                output.push_str("# Builtin command 'trap' with insufficient arguments\n");
+            }
+        }
         _ => {
             // Other builtin commands
             output.push_str(&format!(

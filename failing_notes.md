@@ -2,211 +2,108 @@
 
 ## Tests fixed in this session
 
-### Generator: handle `${var[@]:offset:length}` array slicing and env var dependency ordering (qd. 2026-07-21)
-Fixed two issues:
+### Generator: ls -l falls back to shell qx{} for exact output
+When `ls -l` (or `ls -la`) is used in pipeline or backtick context, the
+generator now falls back to `qx{ls ...}` shell execution to produce exact
+`ls -l` output (permissions, owner, group, size, date). The native ls
+translation only produces short `d .` / `- .` prefixes which don't match
+the expected full-format output.
 
-1. **Array slice translation**: Added `array_element_to_perl_impl()` in
-   `src/generator/utils.rs` which detects `${var[@]:offset:length}` patterns in
-   `Word::Array` element strings and converts them to Perl array slices like
-   `@var[offset..offset+length-1]`. Previously the raw string was wrapped in
-   single quotes, producing invalid Perl like `("${numbers[@]:0:5}")`.
+This was already allowed by `allowed_qx_calls.txt` which lists `ls -l`
+as a permitted shell fallback prefix.
 
-2. **Env var dependency ordering**: Changed `generate_simple_command_impl()` in
-   `src/generator/commands/simple_commands.rs` to sort ALL env vars (both array
-   and scalar) by dependency order before processing, so that variables like
-   `numbers` are declared before `first_half` which depends on `@numbers[...]`.
-   Also added `Word::Array` handling to `env_var_refs_var()` so that array
-   elements referencing other variables (like `${numbers[@]:3:4}` referring to
-   `numbers`) are correctly detected.
+Fixed tests: 062_10_simple_pipeline.sh, test_system_builtin.sh
 
-3. **Auto-declare bare variables in arithmetic**: Added logic to `generate_assignment`
-   and the env-var processing loop to extract bare identifiers from arithmetic
-   expressions (like `a`, `b` in `$((a + b))`) and declare them as `my $var;`
-   before use, preventing `use strict` compilation errors.
+### Generator: trap command translated to END block / %SIG handler
+Added `trap` builtin handler in `generate_builtin_command_impl()`. For
+EXIT traps, generates `END { system 'handler'; }`. For other signals
+(INT, TERM, etc.), generates `$SIG{SIGNAL} = sub { system 'handler'; };`.
+The handler is executed via shell (`system`) since translating arbitrary
+shell commands to Perl is not practical.
 
-Fixed tests: 064_18_array_slicing_manipulation.sh
+Fixed tests: 064_23_complex_error_handling_traps.sh
 
-### Generator: support `Nested` and `Compound` BraceItem variants (qd. 2026-07-21)
-Implemented `brace_item_to_word_impl()` handling for `BraceItem::Nested` and
-`BraceItem::Compound` in `src/generator/words.rs`. Previously these had
-`todo!()` calls, causing panics when brace expansions contained nested braces
-(e.g. `{src/{main,test}}`). The fix:
+### Generator: arithmetic expressions wrapped in eval {} // "" for div by zero
+Changed `convert_arithmetic_to_perl_impl()` to wrap arithmetic expressions
+in `eval { int(expr) } // ""` instead of bare `int(expr)`. This handles
+division/modulo by zero gracefully: instead of Perl's fatal "Illegal
+modulus zero", the eval catches the error and returns empty string,
+matching bash's behavior of leaving the variable unset on arithmetic
+failure.
 
-- `Nested(inner)`: recursively converts the inner `BraceExpansion` to a
-  `Word::BraceExpansion` so it gets expanded by the normal brace expansion logic.
-- `Compound(items)`: concatenates all items (literals, ranges, nested braces)
-  into a single literal word.
-- Added `Word::BraceExpansion` handler in `perl_string_literal_impl` (and
-  `strip_shell_quotes_and_convert_to_perl_impl` and
-  `strip_shell_quotes_for_regex_impl`) in `src/generator/utils.rs` so that
-  brace expansions are properly expanded instead of falling through to the
-  Debug-format catch-all.
-
-Fixed tests: 064_12_brace_expansion_nested_sequences.sh
-
-### Generator: sort associative array values for deterministic ${map[@]} expansion (qd. 2026-07-21)
-Changed `${map[@]}` expansion for associative arrays to emit
-`join(" ", sort values %map)` instead of `join(" ", values %map)` in
-string-interpolation context (`src/generator/words.rs`), and
-`(sort values %map)` instead of bare `@map` in standalone
-`generate_parameter_expansion_impl` (`src/generator/expansions.rs`).
-Perl hash order is randomized since 5.18, making `values %hash` non-deterministic;
-`sort values` fixes the flakiness.
+Fixed tests: 063_01_deeply_nested_arithmetic.sh
 
 ## Previously fixed tests
 
-### `(( ... ))` arithmetic evaluation command implemented (qd. 2026-07-21)
-Implemented `parse_double_paren_command()` in `src/parser/commands.rs` to
-properly parse `(( ... ))` bash arithmetic evaluation commands. Previously the
-function returned `"Double paren commands not yet implemented"` error, which
-caused the whole construct to be silently dropped from the AST. The fix:
+### Generator: handle `${var[@]:offset:length}` array slicing and env var dependency ordering (qd. 2026-07-21)
+Fixed tests: 064_18_array_slicing_manipulation.sh
 
-- Added `Some(Token::ArithmeticEval)` case in `parse_command()` and
-  `parse_pipeline_segment()` so that `((` (lexed as a single `ArithmeticEval`
-  token) is dispatched to `parse_double_paren_command()` instead of falling
-  through to `parse_simple_command()` which cannot handle it.
-- Implemented `parse_double_paren_command()` to:
-  1. Consume the `ArithmeticEval` `((` token
-  2. Parse the arithmetic content until `ArithmeticEvalClose` `))`
-  3. For assignment expressions like `i = 1 + 2`, create `Assignment` commands
-  4. For non-assignment expressions, fall back to `let` command
-- Added `split_arithmetic_expressions()` and `parse_arithmetic_assignment()`
-  helper functions.
-- Fixed `convert_arithmetic_to_perl_impl()` in `src/generator/words.rs` to
-  wrap results with `int()` to match bash's integer-only arithmetic semantics.
-- Fixed `Percent` token in `parse_arithmetic_expression()` in
-  `src/parser/words.rs` — was incorrectly mapped to `*` instead of `%`.
+### Generator: support `Nested` and `Compound` BraceItem variants (qd. 2026-07-21)
+Fixed tests: 064_12_brace_expansion_nested_sequences.sh
 
-Fixed tests: 064_06_nested_arithmetic_expressions.sh,
-064_10_nested_function_definitions.sh
+### Generator: sort associative array values for deterministic ${map[@]} expansion (qd. 2026-07-21)
+Fixed tests: 064_02_nested_brace_expansions.sh (and others via `sort values %map`)
 
-### Pattern 2 disabled in check_qx.pl (qd. 2026-07-21)
-Disabled Pattern 2 (qx{$var} indirect check) in `check_qx.pl` to match
-`src/utils.rs`. Pattern 2 was too aggressive: it flagged legitimate shell
-fallbacks where the translator correctly determined that a complex command
-inside backticks (e.g. `cp file1 file2 && echo success`) cannot practically
-be converted to native Perl. Only Pattern 1 (direct `qx{builtin ...}`) is kept.
-
-### `echo` re-added to allowed_qx_calls.txt (qd. 2026-07-21)
-Re-added `echo` to `allowed_qx_calls.txt`. The `echo "$here_input" | tr a-z A-Z`
-pipeline (here-string → tr) is translated to `qx{echo ... | tr ...}`. Ideally
-this would be `uc($input)` but the translator does not yet recognise the
-`tr a-z A-Z` pattern. Exempting `echo` is the pragmatic fix until the generator
-is improved.
-
-### Parser: recognize `$?` and other special shell variables in string interpolation (qd. 2026-07-21)
-Added `?`, `-`, `!`, `$` to the set of special single-character shell variables
-recognized inside double-quoted string interpolation in `src/parser/words.rs`.
-Previously only `#`, `@`, `*` were recognized. This fixes the translation of
-`echo "exit: $?"` which was emitting literal `$?` (Perl's full wait status,
-e.g. 256) instead of `${ \($? >> 8\)}` (which gives the shell-compatible exit
-code of 1).
-
-Fixed tests: 070_cmp_basic.sh
-
-### Generator: handle `${#var}` string length and `${var:offset:length}` substring (qd. 2026-07-21)
-Modified `src/generator/expansions.rs` (`generate_parameter_expansion_impl`) to
-detect `${#var}` pattern (string starts with `#`, no brackets) and generate
-`length($var)` instead of the invalid `$ENV{#name}`. Also detect
-`${var:offset:length}` pattern (variable containing `:` with no brackets) and
-generate `substr($var, offset, length)` instead of the invalid `$ENV{name:0:4}`.
-
-Fixed tests: 064_03_complex_parameter_expansion.sh
-
-### Generator: sort env_vars by dependency order (qd. 2026-07-21)
-Changed the iteration order of `env_vars` in `src/generator/commands/simple_commands.rs`
-from BTreeMap's alphabetical order to a dependency-sorted order. Variables that
-are referenced by other variables' values are declared first, preventing "use of
-uninitialized value" errors. Added `env_var_refs_var()` helper to check whether
-a variable's word value references another env var.
-
-Fixed tests: 064_13_complex_string_manipulation.sh
-
-### Generator: preserve argument order in `generate_cartesian_product_for_echo` (qd. 2026-07-21)
-Fixed `generate_cartesian_product_for_echo` in `src/generator/commands/simple_commands.rs`
-to preserve the original argument order when multiple brace expansions appear together
-in an echo command. The previous code collected all non-brace arguments separately and
-prepended them before all brace-expansion values, which reordered the parts.
-
-The fix groups consecutive args (literals and brace expansions) into compound words
-that produce the cartesian product, while standalone non-brace args (like a prefix
-string before the first brace expansion) are printed once as a prefix. Additionally,
-range expansion in brace groups with mixed items (e.g. `{1..10,20}`) is now disabled
-to match bash behavior — bash only expands ranges when the brace group is a single
-pure range (`{1..10}`), not when mixed with other items.
-
-Also fixed `handle_brace_expansion_for_echo` in `src/generator/commands/echo.rs` with
-the same mixed-range logic.
-
-Fixed tests: 064_02_nested_brace_expansions.sh
-
-## Still failing tests (17)
+## Still failing tests (13)
 
 ### 058_advanced_bash_idioms.sh
-Complex script combining many feature interactions. QX violations for find/
-dirname are now exempted via the previous Pattern-2 disable. Exit code and
-stdout mismatches.
-
-### 062_10_simple_pipeline.sh
-Simple pipeline with `ls -la | grep "^d" | head -5` — the Perl `ls` translation
-only emits short `d .` / `- .` prefixes instead of full `ls -l` output
-(permissions, owner, size, date, name). The generator's `-l` handling needs
-stat()-based full output.
+Complex script combining many feature interactions. Compile error: `-gt`
+syntax error (test expression translation issue). Multiple other issues.
 
 ### 062_hard_to_lex.sh
-Hard-to-lex constructs challenge the parser/lexer — stdout mismatch.
-
-### 063_01_deeply_nested_arithmetic.sh
-Division by zero (0 % 0) produces fatal "Illegal modulus zero" in Perl vs
-non-fatal warning in bash. Undeclared variables in arithmetic (fixed: generator
-now auto-declares bare identifiers found in arithmetic expressions).
+Variable name collision: `$result` in function body refers to global
+`$result` (value 776) instead of the local `$result_273` created by the
+command-substitution translation for `` `echo "$param1" | sed "s/old/new/g"` ``.
 
 ### 063_02_complex_array_assignments.sh
-`$index` and `@array` not declared. Variables used in MapAccess keys need array
-declarations. Multi-dimensional array keys like `[0,0]` have lost the leading `0`.
+Several issues: (1) `$index` undeclared, (2) `$!prefix@` bareword from
+`${!prefix@}` expansion not translated correctly, (3) `matrix[0,0]` key
+loses leading `0` (parsed as `,0`), (4) `@array` undeclared.
 
 ### 063_09_complex_function_parameter_handling.sh
-eval-related syntax error.
+`@options` not declared. Variable used in MapAccess key needs array
+declaration.
 
 ### 063_12_complex_eval.sh
-`eval` result is undefined — stdout mismatch. `eval` with dynamic arguments not supported.
+`eval "result=\$(( \${var:-0} + ... ))"` — the escaped `\$` and `\${`
+inside double quotes confuse the tokenizer, causing the eval argument
+to be truncated. Result is undefined (`$ENV{result}` unset).
 
 ### 063_15_complex_function_definition.sh
-Unmatched right curly bracket caused by incorrect brace/block generation when
-`eval` inside a function body is not supported.
+Unmatched right curly bracket caused by incorrect brace/block generation
+when `eval` inside a function body is not supported.
 
 ### 063_hard_to_parse.sh
-Deliberately hard-to-parse shell constructs.
+Multiple parsing issues similar to 063_02: `$index` undeclared,
+`$!prefix@` bareword from `${!prefix@}` expansion.
 
 ### 064_07_complex_array_operations.sh
-Perl hash randomization (since 5.18) causes `values %config` to return values
-in random order on each run. Fixed by using `sort values %config` to make the
-output deterministic, but sorted order differs from bash's hash order for this
-specific set of keys (bash: `8080 localhost admin`, Perl sorted: `8080 admin localhost`).
-A more complete fix would require maintaining key insertion order and iterating
-in that order instead of using `values %`.
+Perl hash randomization causes `values %config` to return values in
+random order. Current fix uses `sort values` but sorted order
+(`8080 admin localhost`) differs from bash's hash-bucket order
+(`8080 localhost admin`). Fix requires maintaining key insertion order
+and iterating in that order instead of using `values %`.
 
 ### 064_09_process_substitution_pipeline.sh
-Process substitution temp files not correctly created/passed.
+Syntax error near `$;` — process substitution temp files not correctly
+created/passed.
 
 ### 064_14_nested_command_substitution_arithmetic.sh
 `$(( $(wc -l < /etc/passwd) + $(wc -l < /etc/group) ))` — inner `$(...)`
-treated as literal text inside the arithmetic expression.
+treated as literal text inside the arithmetic expression, producing
+`$($wc` syntax error.
 
 ### 064_19_complex_pattern_matching_extended_globs.sh
-Extended glob patterns `*.{txt,log,dat}` brace expansion not expanded correctly.
-The `*.` prefix is separated from the brace expansion items.
+Extended glob patterns `*.{txt,log,dat}` brace expansion not expanded
+correctly. The `*.` prefix is separated from the brace expansion items.
+Needs lexer-level combining of prefix literals with adjacent brace
+expansions.
 
 ### 064_22_function_returning_complex_data_structures.sh
-`declare -A info` and `declare -p info` not translated.
-
-### 064_23_complex_error_handling_traps.sh
-`trap` handlers don't translate to Perl.
+`declare -A info` and `declare -p info` not translated. Bash's
+`declare -p` prints variable metadata; the generator emits `$info[`
+which is a syntax error.
 
 ### 064_hard_to_generate.sh
-Complex script combining many hard-to-generate features.
-
-### test_system_builtin.sh
-`find . -name '*.txt'` output is directory-dependent. The test mixes `ls -la`
-backtick (translated natively) with `find` backtick (still shell fallback),
-producing inconsistent output compared to bash.
+Complex script combining many hard-to-generate features: eval, declare
+-p, process substitution, nested command substitution in arithmetic, etc.

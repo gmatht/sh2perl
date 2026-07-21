@@ -26,7 +26,7 @@ my $k;
 my $l;
 my $m;
 my $n;
-my $result = int( ($a + $b) * ($c - $d) / ($e % $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) );
+my $result = eval { int( ($a + $b) * ($c - $d) / ($e % $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ) } // "";
 do {
     my $output = "Deeply nested arithmetic result: $result";
     print $output;
