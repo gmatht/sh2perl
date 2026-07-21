@@ -96,6 +96,32 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
             }
         }
     }
+
+    # Pattern 4: open3(..., 'builtin', ...) — direct system call via IPC::Open3
+    while ($code =~ /open3\s*\([^)]*['"]\s*([^'",)]+)['"],?[^)]*\)/g) {
+        my $open3_cmd = $1;
+        next if $is_exempt->($open3_cmd);
+        for my $b (@builtins) {
+            if ($open3_cmd =~ /\b\Q$b\E\b/) {
+                print "OPEN3 VIOLATION: $basename uses open3() with builtin '$b'\n";
+                $violations++;
+                last;
+            }
+        }
+    }
+
+    # Pattern 5: exec('builtin', ...) — replaces Perl process with shell command
+    while ($code =~ /exec\s*['"]\s*(\w+)['"]/g) {
+        my $exec_cmd = $1;
+        next if $is_exempt->($exec_cmd);
+        for my $b (@builtins) {
+            if ($exec_cmd =~ /\b\Q$b\E\b/) {
+                print "EXEC VIOLATION: $basename uses exec() with builtin '$b'\n";
+                $violations++;
+                last;
+            }
+        }
+    }
 }
 
 exit $violations;
