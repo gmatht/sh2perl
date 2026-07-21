@@ -1864,12 +1864,49 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         }
         Word::Variable(var, _, _) => {
             // Handle special shell variables
-            match var.as_str() {
-                "#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
-                "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
-                "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
-                "0" => "$PROGRAM_NAME".to_string(), // $0 -> $PROGRAM_NAME (Perl::Critic compliant)
-                _ => format!("${}", var),           // Regular variable
+            // ${#var} -> length($var) for string length
+            if var.starts_with('#') && var.len() > 1 {
+                let inner = &var[1..];
+                // Check if inner itself is a variable that needs ENV
+                if generator.declared_locals.contains(inner)
+                    || generator.function_level_vars.contains(inner)
+                {
+                    format!("length(${})", inner)
+                } else {
+                    format!("length($ENV{{{}}})", inner)
+                }
+            } else if var.contains(':') && !var.contains('[') && !var.starts_with('!') {
+                // ${var:offset} or ${var:offset:length} -> substr($var, offset) or substr($var, offset, length)
+                // Split on the first ':' to get variable name and the rest (offset:length)
+                if let Some(colon_pos) = var.find(':') {
+                    let var_name = &var[..colon_pos];
+                    let rest = &var[colon_pos + 1..];
+                    let var_ref = if generator.declared_locals.contains(var_name)
+                        || generator.function_level_vars.contains(var_name)
+                    {
+                        format!("${}", var_name)
+                    } else {
+                        format!("$ENV{{{}}}", var_name)
+                    };
+                    if let Some(second_colon) = rest.find(':') {
+                        let offset = &rest[..second_colon].trim();
+                        let length = &rest[second_colon + 1..].trim();
+                        format!("substr({}, {}, {})", var_ref, offset, length)
+                    } else {
+                        let offset = rest.trim();
+                        format!("substr({}, {})", var_ref, offset)
+                    }
+                } else {
+                    format!("${}", var)
+                }
+            } else {
+                match var.as_str() {
+                    "#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
+                    "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
+                    "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
+                    "0" => "$PROGRAM_NAME".to_string(), // $0 -> $PROGRAM_NAME (Perl::Critic compliant)
+                    _ => format!("${}", var),           // Regular variable
+                }
             }
         }
         Word::MapAccess(map_name, key, _) => {

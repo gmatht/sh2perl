@@ -51,14 +51,36 @@ code of 1).
 
 Fixed tests: 070_cmp_basic.sh
 
-## Still failing tests (22)
+### Generator: handle `${#var}` string length and `${var:offset:length}` substring (qd. 2026-07-21)
+Modified `src/generator/expansions.rs` (`generate_parameter_expansion_impl`) to
+detect `${#var}` pattern (string starts with `#`, no brackets) and generate
+`length($var)` instead of the invalid `$ENV{#name}`. Also detect
+`${var:offset:length}` pattern (variable containing `:` with no brackets) and
+generate `substr($var, offset, length)` instead of the invalid `$ENV{name:0:4}`.
+
+Fixed tests: 064_03_complex_parameter_expansion.sh
+
+### Generator: sort env_vars by dependency order (qd. 2026-07-21)
+Changed the iteration order of `env_vars` in `src/generator/commands/simple_commands.rs`
+from BTreeMap's alphabetical order to a dependency-sorted order. Variables that
+are referenced by other variables' values are declared first, preventing "use of
+uninitialized value" errors. Added `env_var_refs_var()` helper to check whether
+a variable's word value references another env var.
+
+Fixed tests: 064_13_complex_string_manipulation.sh
+
+## Still failing tests (20)
 
 ### 058_advanced_bash_idioms.sh
 Complex script combining many feature interactions. QX violations for find/
-dirname are now exempted via the previous Pattern-2 disable.
+dirname are now exempted via the previous Pattern-2 disable. Exit code and
+stdout mismatches.
 
 ### 062_10_simple_pipeline.sh
-Simple pipeline translation issue — stdout mismatch.
+Simple pipeline with `ls -la | grep "^d" | head -5` — the Perl `ls` translation
+only emits short `d .` / `- .` prefixes instead of full `ls -l` output
+(permissions, owner, size, date, name). The generator's `-l` handling needs
+stat()-based full output.
 
 ### 062_hard_to_lex.sh
 Hard-to-lex constructs challenge the parser/lexer — stdout mismatch.
@@ -87,12 +109,6 @@ Deliberately hard-to-parse shell constructs.
 ### 064_02_nested_brace_expansions.sh
 Nested brace expansions produce incorrect expansion — stdout mismatch.
 
-### 064_03_complex_parameter_expansion.sh
-`${#name}` generates `$ENV{#name}` instead of `length($name)`.
-`${name:offset:length}` generates `$ENV{name:offset:length}` instead of
-`substr($name, offset, length)`. `${name// /_}` has precedence issue with
-concatenation.
-
 ### 064_07_complex_array_operations.sh
 **FLAKY** — Perl hash randomization (since 5.18) causes `values %config` to
 return values in random order on each run. Bash's `${config[@]}` order is
@@ -105,11 +121,6 @@ Process substitution temp files not correctly created/passed.
 
 ### 064_12_brace_expansion_nested_sequences.sh
 Nested/mixed brace expansions produce invalid Perl.
-
-### 064_13_complex_string_manipulation.sh
-Variable assignment order (BTreeMap sorts alphabetically) causes `filename` to
-be assigned after `basename=${filename%.*}` that depends on it. Requires
-two-pass env-var processing or replacing BTreeMap with an insertion-order map.
 
 ### 064_14_nested_command_substitution_arithmetic.sh
 `$(( $(wc -l < /etc/passwd) + $(wc -l < /etc/group) ))` — inner `$(...)`
