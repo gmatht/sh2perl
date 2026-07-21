@@ -342,6 +342,16 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 }
             }
         }
+        Word::BraceExpansion(expansion, _) => {
+            // Expand brace expansion and return as string literal
+            let expanded = generator.handle_brace_expansion(expansion);
+            if expanded.is_empty() {
+                "q{}".to_string()
+            } else {
+                let escaped = expanded.replace('\\', "\\\\").replace("'", "\\'");
+                format!("'{}'", escaped)
+            }
+        }
         _ => format!("{:?}", word),
     }
 }
@@ -654,6 +664,16 @@ pub fn strip_shell_quotes_and_convert_to_perl_impl(
             // Handle string interpolation
             generator.convert_string_interpolation_to_perl(interp)
         }
+        Word::BraceExpansion(expansion, _) => {
+            // Expand brace expansion and return as string literal
+            let expanded = generator.handle_brace_expansion(expansion);
+            if expanded.is_empty() {
+                "q{}".to_string()
+            } else {
+                let escaped = expanded.replace('\\', "\\\\").replace("'", "\\'");
+                format!("'{}'", escaped)
+            }
+        }
         _ => format!("{:?}", word),
     }
 }
@@ -710,6 +730,16 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
             } else {
                 // Fall back to normal string interpolation handling
                 generator.convert_string_interpolation_to_perl(interp)
+            }
+        }
+        Word::BraceExpansion(expansion, _) => {
+            // Expand brace expansion and return as string literal
+            let expanded = generator.handle_brace_expansion(expansion);
+            if expanded.is_empty() {
+                "q{}".to_string()
+            } else {
+                let escaped = expanded.replace('\\', "\\\\").replace("'", "\\'");
+                format!("'{}'", escaped)
             }
         }
         _ => format!("{:?}", word),
