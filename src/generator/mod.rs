@@ -505,9 +505,59 @@ impl Generator {
                 key
             } else {
                 let trimmed = key.trim_matches('"').trim_matches('\'');
-                format!("\"{}\"", self.escape_perl_string(trimmed))
+                // Check if the key contains bash parameter expansion patterns like ${var:offset:length}
+                // that need to be translated to Perl expressions instead of treated as literal strings.
+                if trimmed.starts_with("${") && trimmed.contains(':') {
+                    // Translate ${var:offset} or ${var:offset:length} -> substr($var, offset, length)
+                    let inner = &trimmed[2..trimmed.len()-1]; // Strip ${ and }
+                    if let Some(colon_pos) = inner.find(':') {
+                        let var_name = &inner[..colon_pos];
+                        let rest = &inner[colon_pos + 1..];
+                        let ref_str = if self.declared_locals.contains(var_name)
+                            || self.function_level_vars.contains(var_name)
+                        {
+                            format!("${}", var_name)
+                        } else {
+                            format!("$ENV{{{}}}", var_name)
+                        };
+                        if let Some(second_colon) = rest.find(':') {
+                            let offset = rest[..second_colon].trim();
+                            let length = rest[second_colon + 1..].trim();
+                            let offset_expr = if offset.chars().all(|c| c.is_alphanumeric() || c == '_') && !offset.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+                                format!("${}", offset)
+                            } else {
+                                offset.to_string()
+                            };
+                            let length_expr = if length.chars().all(|c| c.is_alphanumeric() || c == '_') && !length.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+                                format!("${}", length)
+                            } else {
+                                length.to_string()
+                            };
+                            format!("substr({}, {}, {})", ref_str, offset_expr, length_expr)
+                        } else {
+                            let offset = rest.trim();
+                            let offset_expr = if offset.chars().all(|c| c.is_alphanumeric() || c == '_') && !offset.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+                                format!("${}", offset)
+                            } else {
+                                offset.to_string()
+                            };
+                            format!("substr({}, {})", ref_str, offset_expr)
+                        }
+                    } else {
+                        format!("\"{}\"", self.escape_perl_string(trimmed))
+                    }
+                } else {
+                    format!("\"{}\"", self.escape_perl_string(trimmed))
+                }
             };
-            let sigil = if key_expr.starts_with('"') { '{' } else { '[' };
+            // Use {} for hash access when the array is known to be associative,
+            // or when the key is a quoted string.
+            // Use [] for numeric literal keys (indexed array access).
+            let sigil = if self.associative_arrays.contains(&array_name) || key_expr.starts_with('"') {
+                '{'
+            } else {
+                '['
+            };
             let close = if sigil == '{' { '}' } else { ']' };
 
             output.push_str(&self.indent());
