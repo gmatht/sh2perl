@@ -130,6 +130,7 @@ get_file_size('000__01_file_directory_operations.sh');
 my @files = ((grep { !/\//msx } glob '*.sh'), (glob 'examples/*.sh'));
 print "Shell scripts found: " . scalar(@files) . "\n";
 $CHILD_ERROR = 0;
+my $file;
 for my $file (@files) {
     do {
     my $output = "  - $file";

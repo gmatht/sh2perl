@@ -28,12 +28,20 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             let cond = cond
                 .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                 .to_string();
-            // Negate the condition for shell functions:
-            // shell returns 0 for success, non-zero for failure.
-            // In Perl 0 is falsy, so we write
-            // `if (!cond()) { ... }` to match shell semantics
-            // where `if func; then` enters when func returns 0.
-            output.push_str(&format!("!({})", cond));
+            // For `let` commands, the generated code already produces a
+            // truthy value (1 for true, 0 for false) that Perl's if() can
+            // use directly.  Negating would flip the logic.
+            let is_let_command = matches!(&*if_stmt.condition, Command::Simple(cmd) if cmd.name == "let");
+            if is_let_command {
+                output.push_str(&cond);
+            } else {
+                // Negate the condition for shell functions:
+                // shell returns 0 for success, non-zero for failure.
+                // In Perl 0 is falsy, so we write
+                // `if (!cond()) { ... }` to match shell semantics
+                // where `if func; then` enters when func returns 0.
+                output.push_str(&format!("!({})", cond));
+            }
         }
     }
     output.push_str(") {\n");
@@ -729,11 +737,23 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     // proper `my $var = $_[0];` declarations.
     let filtered_commands = func.body.commands.clone();
 
+    // Save declared_locals, function_level_vars and associative_arrays so that
+    // variables declared inside the function (via `local` etc.) do not leak into
+    // the outer scope.
+    let saved_declared_locals = generator.declared_locals.clone();
+    let saved_function_level_vars = generator.function_level_vars.clone();
+    let saved_associative_arrays = generator.associative_arrays.clone();
+
     // Create a temporary block with filtered commands
     let filtered_block = Block {
         commands: filtered_commands,
     };
     output.push_str(&generator.generate_block_commands(&filtered_block));
+
+    // Restore scope state — function-level declarations are scoped.
+    generator.declared_locals = saved_declared_locals;
+    generator.function_level_vars = saved_function_level_vars;
+    generator.associative_arrays = saved_associative_arrays;
 
     // Add final return statement to satisfy Perl::Critic
     output.push_str(&generator.indent());
