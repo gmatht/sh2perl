@@ -54,268 +54,12 @@ pub fn generate_test_expression_impl(
     let expr = &preprocessed;
     let modifiers = &test_expr.modifiers;
 
-    // Parse the expression to determine the type of test
-    if expr.contains("=~") {
-        // Regex matching: [[ $var =~ pattern ]]
-        let parts: Vec<&str> = expr.split("=~").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let pattern = parts[1].trim();
-
-            // Convert to Perl regex matching
-            format!("{} =~ {}", var, generator.format_regex_pattern(pattern))
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains("==") {
-        // Pattern matching: [[ $var == pattern ]]
-        let parts: Vec<&str> = expr.split("==").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let pattern = parts[1].trim();
-
-            if modifiers.extglob {
-                // Handle extglob patterns
-                let regex_pattern = generator.convert_extglob_to_perl_regex(pattern);
-                if modifiers.nocasematch {
-                    format!(
-                        "{} =~ {}i",
-                        var,
-                        generator.format_regex_pattern(&regex_pattern)
-                    )
-                } else {
-                    format!(
-                        "{} =~ {}",
-                        var,
-                        generator.format_regex_pattern(&regex_pattern)
-                    )
-                }
-            } else {
-                // Regular glob pattern matching - convert glob to regex
-                let regex_pattern = generator.convert_glob_to_regex(pattern);
-                if modifiers.nocasematch {
-                    // Case-insensitive matching
-                    format!(
-                        "{} =~ {}i",
-                        var,
-                        generator.format_regex_pattern(&format!("^{}$", regex_pattern))
-                    )
-                } else {
-                    // Case-sensitive matching
-                    format!(
-                        "{} =~ {}",
-                        var,
-                        generator.format_regex_pattern(&format!("^{}$", regex_pattern))
-                    )
-                }
-            }
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains(" != ") {
-        // String inequality: [[ $var != value ]]
-        let parts: Vec<&str> = expr.split(" != ").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-            format!("{} ne {}", var, value)
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains("!=") {
-        // String inequality without spaces: [[ $var!=value ]]
-        let parts: Vec<&str> = expr.split("!=").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-            format!("{} ne {}", var, value)
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains(" = ") || expr.contains("=") {
-        // String equality: [[ $var = value ]] or [[ $var=value ]]
-        let parts: Vec<&str> = if expr.contains(" = ") {
-            expr.split(" = ").collect()
-        } else {
-            expr.split("=").collect()
-        };
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-
-            // Handle tilde expansion for home directory
-            if var == "~" {
-                // Remove quotes from value if it's a shell variable reference
-                let clean_value =
-                    if value.starts_with('"') && value.ends_with('"') && value.contains('$') {
-                        let unquoted = value[1..value.len() - 1].to_string();
-                        // Convert shell variables to Perl environment variables
-                        if unquoted == "$HOME" {
-                            "$ENV{'HOME'}".to_string()
-                        } else {
-                            unquoted
-                        }
-                    } else {
-                        value.to_string()
-                    };
-                format!("$ENV{{'HOME'}} eq {}", clean_value)
-            } else if var.starts_with("~/") {
-                let path = var[2..].to_string();
-                // Remove quotes from value if it's a shell variable reference
-                let clean_value =
-                    if value.starts_with('"') && value.ends_with('"') && value.contains('$') {
-                        let unquoted = value[1..value.len() - 1].to_string();
-                        // Convert shell variables to Perl environment variables
-                        if unquoted == "$HOME" {
-                            "$ENV{'HOME'}".to_string()
-                        } else {
-                            unquoted
-                        }
-                    } else {
-                        value.to_string()
-                    };
-
-                // Handle the case where the value is a path that should be concatenated
-                if clean_value.contains('/') && clean_value.starts_with('$') {
-                    // Convert $HOME/Documents to $ENV{'HOME'} . '/Documents'
-                    let clean_path = clean_value.replace("$HOME", "$ENV{'HOME'}");
-                    // Split the path and reconstruct it properly
-                    if clean_path.contains('/') {
-                        let path_parts: Vec<&str> = clean_path.split('/').collect();
-                        if path_parts.len() == 2 && path_parts[0] == "$ENV{'HOME'}" {
-                            format!(
-                                "($ENV{{'HOME'}} . '/{}') eq ($ENV{{'HOME'}} . '/{}')",
-                                path, path_parts[1]
-                            )
-                        } else {
-                            format!("($ENV{{'HOME'}} . '/{}') eq {}", path, clean_path)
-                        }
-                    } else {
-                        format!("($ENV{{'HOME'}} . '/{}') eq {}", path, clean_path)
-                    }
-                } else {
-                    format!("($ENV{{'HOME'}} . '/{}') eq {}", path, clean_value)
-                }
-            } else {
-                // Regular variable equality
-                format!("{} eq {}", var, value)
-            }
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains(" -eq ") {
-        // Numeric equality: [[ $var -eq value ]]
-        let parts: Vec<&str> = expr.split(" -eq ").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-            format!("{} == {}", var, value)
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains(" -ne ") {
-        // Numeric inequality: [[ $var -ne value ]]
-        let parts: Vec<&str> = expr.split(" -ne ").collect();
-        if parts.len() == 2 {
-            let var = parts[0].trim();
-            let value = parts[1].trim();
-            format!("{} != {}", var, value)
-        } else {
-            "0".to_string()
-        }
-    } else if expr.contains(" -z ") {
-        // String is empty: [[ -z $var ]]
-        let var = expr.replace("-z ", "").trim().to_string();
-        format!("{} eq q{{}}", var)
-    } else if expr.contains(" -n ") {
-        // String is not empty: [[ -n $var ]]
-        let var = expr.replace("-n ", "").trim().to_string();
-        format!("{} ne q{{}}", var)
-    } else if expr.contains(" -f ") || expr.starts_with("-f ") {
-        // File exists and is regular file: [[ -f $var ]]
-        let var = expr.replace("-f ", "").trim().to_string();
-        format!("(-f {})", var)
-    } else if expr.contains(" -d ") || expr.starts_with("-d ") {
-        // File exists and is directory: [[ -d $var ]]
-        let var = expr.replace("-d ", "").trim().to_string();
-        format!("(-d {})", var)
-    } else if expr.contains(" -e ") || expr.starts_with("-e ") {
-        // File exists: [[ -e $var ]]
-        let var = expr.replace("-e ", "").trim().to_string();
-        format!("(-e {})", var)
-    } else if expr.contains(" -r ") || expr.starts_with("-r ") {
-        // File is readable: [[ -r $var ]]
-        let var = expr.replace("-r ", "").trim().to_string();
-        format!("(-r {})", var)
-    } else if expr.contains(" -w ") || expr.starts_with("-w ") {
-        // File is writable: [[ -w $var ]]
-        let var = expr.replace("-w ", "").trim().to_string();
-        format!("(-w {})", var)
-    } else if expr.contains(" -x ") || expr.starts_with("-x ") {
-        // File is executable: [[ -x $var ]]
-        let var = expr.replace("-x ", "").trim().to_string();
-        format!("(-x {})", var)
-    } else if expr.contains(" -s ") || expr.starts_with("-s ") {
-        // File exists and has size greater than 0: [[ -s $var ]]
-        let var = expr.replace("-s ", "").trim().to_string();
-        format!("((-s {}) > 0)", var)
-    } else if expr.contains(" -L ") {
-        // File exists and is symbolic link: [[ -L $var ]]
-        let var = expr.replace("-L ", "").trim().to_string();
-        format!("(-l {})", var)
-    } else if expr.contains(" -S ") {
-        // File exists and is socket: [[ -S $var ]]
-        let var = expr.replace("-S ", "").trim().to_string();
-        format!("(-S {})", var)
-    } else if expr.contains(" -p ") {
-        // File exists and is named pipe: [[ -p $var ]]
-        let var = expr.replace("-p ", "").trim().to_string();
-        format!("(-p {})", var)
-    } else if expr.contains(" -b ") {
-        // File exists and is block device: [[ -b $var ]]
-        let var = expr.replace("-b ", "").trim().to_string();
-        format!("(-b {})", var)
-    } else if expr.contains(" -c ") {
-        // File exists and is character device: [[ -c $var ]]
-        let var = expr.replace("-c ", "").trim().to_string();
-        format!("(-c {})", var)
-    } else if expr.contains(" -t ") {
-        // File descriptor is terminal: [[ -t $var ]]
-        let var = expr.replace("-t ", "").trim().to_string();
-        format!("(-t {})", var)
-    } else if expr.contains(" -u ") {
-        // File exists and set-user-id bit is set: [[ -u $var ]]
-        let var = expr.replace("-u ", "").trim().to_string();
-        format!("(-u {})", var)
-    } else if expr.contains(" -g ") {
-        // File exists and set-group-id bit is set: [[ -g $var ]]
-        let var = expr.replace("-g ", "").trim().to_string();
-        format!("(-g {})", var)
-    } else if expr.contains(" -k ") {
-        // File exists and sticky bit is set: [[ -k $var ]]
-        let var = expr.replace("-k ", "").trim().to_string();
-        format!("(-k {})", var)
-    } else if expr.contains(" -O ") {
-        // File exists and is owned by effective user ID: [[ -O $var ]]
-        let var = expr.replace("-O ", "").trim().to_string();
-        format!("(-O {})", var)
-    } else if expr.contains(" -G ") {
-        // File exists and is owned by effective group ID: [[ -G $var ]]
-        let var = expr.replace("-G ", "").trim().to_string();
-        format!("(-G {})", var)
-    } else if expr.contains(" -N ") {
-        // File exists and has been modified since it was last read: [[ -N $var ]]
-        let var = expr.replace("-N ", "").trim().to_string();
-        format!("(-N {})", var)
-    } else if expr.contains(" -h ") || expr.contains(" -L ") {
-        // File exists and is symbolic link: [[ -h $var ]] or [[ -L $var ]]
-        let var = if expr.contains("-h ") {
-            expr.replace("-h ", "").trim().to_string()
-        } else {
-            expr.replace("-L ", "").trim().to_string()
-        };
-        format!("(-l {})", var)
-    } else if expr.contains(" -a ") {
+    // Parse the expression to determine the type of test.
+    // Order matters: logical operators (-a, -o) must be checked FIRST because
+    // they combine sub-expressions that may themselves contain comparison operators.
+    // Then grouping/parentheses and NOT. Then pattern/comparison operators,
+    // then unary file/string tests.
+    if expr.contains(" -a ") {
         // Logical AND: [[ expr1 -a expr2 ]]
         let parts: Vec<&str> = expr.split(" -a ").collect();
         if parts.len() == 2 {
@@ -372,6 +116,105 @@ pub fn generate_test_expression_impl(
                 modifiers: modifiers.clone(),
             });
             format!("({})", parsed_subexpr)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains("=~") {
+        // Regex matching: [[ $var =~ pattern ]]
+        let parts: Vec<&str> = expr.split("=~").collect();
+        if parts.len() == 2 {
+            let var = parts[0].trim();
+            let pattern = parts[1].trim();
+            // Convert to Perl regex matching
+            format!("{} =~ {}", var, generator.format_regex_pattern(pattern))
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains("==") {
+        // Pattern matching: [[ $var == pattern ]]
+        let parts: Vec<&str> = expr.split("==").collect();
+        if parts.len() == 2 {
+            let var = parts[0].trim();
+            let pattern = parts[1].trim();
+            if modifiers.extglob {
+                let regex_pattern = generator.convert_extglob_to_perl_regex(pattern);
+                if modifiers.nocasematch {
+                    format!("{} =~ {}i", var, generator.format_regex_pattern(&regex_pattern))
+                } else {
+                    format!("{} =~ {}", var, generator.format_regex_pattern(&regex_pattern))
+                }
+            } else {
+                let regex_pattern = generator.convert_glob_to_regex(pattern);
+                if modifiers.nocasematch {
+                    format!("{} =~ {}i", var, generator.format_regex_pattern(&format!("^{}$", regex_pattern)))
+                } else {
+                    format!("{} =~ {}", var, generator.format_regex_pattern(&format!("^{}$", regex_pattern)))
+                }
+            }
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" != ") {
+        // String inequality: [[ $var != value ]]
+        let parts: Vec<&str> = expr.split(" != ").collect();
+        if parts.len() == 2 {
+            let var = parts[0].trim();
+            let value = parts[1].trim();
+            format!("{} ne {}", var, value)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains("!=") {
+        // String inequality without spaces: [[ $var!=value ]]
+        let parts: Vec<&str> = expr.split("!=").collect();
+        if parts.len() == 2 {
+            let var = parts[0].trim();
+            let value = parts[1].trim();
+            format!("{} ne {}", var, value)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" = ") || expr.contains("=") {
+        // String equality: [[ $var = value ]] or [[ $var=value ]]
+        let parts: Vec<&str> = if expr.contains(" = ") {
+            expr.split(" = ").collect()
+        } else {
+            expr.split("=").collect()
+        };
+        if parts.len() == 2 {
+            let var = parts[0].trim();
+            let value = parts[1].trim();
+            // Handle tilde expansion for home directory
+            if var == "~" {
+                let clean_value = if value.starts_with('"') && value.ends_with('"') && value.contains('$') {
+                    let unquoted = value[1..value.len() - 1].to_string();
+                    if unquoted == "$HOME" { "$ENV{'HOME'}".to_string() } else { unquoted }
+                } else { value.to_string() };
+                format!("$ENV{{'HOME'}} eq {}", clean_value)
+            } else if var.starts_with("~/") {
+                let path = var[2..].to_string();
+                let clean_value = if value.starts_with('"') && value.ends_with('"') && value.contains('$') {
+                    let unquoted = value[1..value.len() - 1].to_string();
+                    if unquoted == "$HOME" { "$ENV{'HOME'}".to_string() } else { unquoted }
+                } else { value.to_string() };
+                if clean_value.contains('/') && clean_value.starts_with('$') {
+                    let clean_path = clean_value.replace("$HOME", "$ENV{'HOME'}");
+                    if clean_path.contains('/') {
+                        let path_parts: Vec<&str> = clean_path.split('/').collect();
+                        if path_parts.len() == 2 && path_parts[0] == "$ENV{'HOME'}" {
+                            format!("($ENV{{'HOME'}} . '/{}') eq ($ENV{{'HOME'}} . '/{}')", path, path_parts[1])
+                        } else {
+                            format!("($ENV{{'HOME'}} . '/{}') eq {}", path, clean_path)
+                        }
+                    } else {
+                        format!("($ENV{{'HOME'}} . '/{}') eq {}", path, clean_path)
+                    }
+                } else {
+                    format!("($ENV{{'HOME'}} . '/{}') eq {}", path, clean_value)
+                }
+            } else {
+                format!("{} eq {}", var, value)
+            }
         } else {
             "0".to_string()
         }
@@ -489,6 +332,46 @@ pub fn generate_test_expression_impl(
         } else {
             "0".to_string()
         }
+    } else if expr.contains(" -z ") || expr.starts_with("-z ") {
+        // String is empty: [[ -z $var ]]
+        let var = expr.replace("-z ", "").trim().to_string();
+        format!("{} eq q{{}}", var)
+    } else if expr.contains(" -n ") || expr.starts_with("-n ") {
+        // String is not empty: [[ -n $var ]]
+        let var = expr.replace("-n ", "").trim().to_string();
+        format!("{} ne q{{}}", var)
+    } else if expr.contains(" -f ") || expr.starts_with("-f ") {
+        // File exists and is regular file: [[ -f $var ]]
+        let var = expr.replace("-f ", "").trim().to_string();
+        format!("(-f {})", var)
+    } else if expr.contains(" -d ") || expr.starts_with("-d ") {
+        // File exists and is directory: [[ -d $var ]]
+        let var = expr.replace("-d ", "").trim().to_string();
+        format!("(-d {})", var)
+    } else if expr.contains(" -e ") || expr.starts_with("-e ") {
+        // File exists: [[ -e $var ]]
+        let var = expr.replace("-e ", "").trim().to_string();
+        format!("(-e {})", var)
+    } else if expr.contains(" -r ") || expr.starts_with("-r ") {
+        // File is readable: [[ -r $var ]]
+        let var = expr.replace("-r ", "").trim().to_string();
+        format!("(-r {})", var)
+    } else if expr.contains(" -w ") || expr.starts_with("-w ") {
+        // File is writable: [[ -w $var ]]
+        let var = expr.replace("-w ", "").trim().to_string();
+        format!("(-w {})", var)
+    } else if expr.contains(" -x ") || expr.starts_with("-x ") {
+        // File is executable: [[ -x $var ]]
+        let var = expr.replace("-x ", "").trim().to_string();
+        format!("(-x {})", var)
+    } else if expr.contains(" -s ") || expr.starts_with("-s ") {
+        // File exists and has size greater than 0: [[ -s $var ]]
+        let var = expr.replace("-s ", "").trim().to_string();
+        format!("((-s {}) > 0)", var)
+    } else if expr.contains(" -L ") || expr.starts_with("-L ") {
+        // File exists and is symbolic link: [[ -L $var ]]
+        let var = expr.replace("-L ", "").trim().to_string();
+        format!("(-l {})", var)
     } else {
         // Default case: treat as a simple boolean expression
         // This handles cases like [[ $var ]] which should check if $var is non-empty

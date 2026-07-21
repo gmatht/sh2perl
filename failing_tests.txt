@@ -1,13 +1,13 @@
+000__04h_complex_examples.sh	QX_BUILTIN violations:
 058_advanced_bash_idioms.sh	Failed due to: exit code mismatch, stdout mismatch
 062_hard_to_lex.sh	Failed due to: stdout mismatch
 063_02_complex_array_assignments.sh	Failed due to: exit code mismatch, stdout mismatch
-063_09_complex_function_parameter_handling.sh	Failed due to: exit code mismatch, stdout mismatch
+063_09_complex_function_parameter_handling.sh	error: PerlExecution timed out after 30.0 seconds
 063_12_complex_eval.sh	Failed due to: stdout mismatch
 063_15_complex_function_definition.sh	Failed due to: exit code mismatch, stdout mismatch
 063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
 064_07_complex_array_operations.sh	Failed due to: stdout mismatch
 064_09_process_substitution_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
-064_14_nested_command_substitution_arithmetic.sh	Failed due to: exit code mismatch, stdout mismatch
 064_19_complex_pattern_matching_extended_globs.sh	Failed due to: stdout mismatch
 064_22_function_returning_complex_data_structures.sh	Failed due to: exit code mismatch, stdout mismatch
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
