@@ -7,7 +7,7 @@
 063_12_complex_eval.sh	Failed due to: stdout mismatch
 063_15_complex_function_definition.sh	Failed due to: exit code mismatch, stdout mismatch
 063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
-064_02_nested_brace_expansions.sh	Failed due to: stdout mismatch
+064_07_complex_array_operations.sh	Failed due to: stdout mismatch
 064_09_process_substitution_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
 064_12_brace_expansion_nested_sequences.sh	Failed due to: exit code mismatch, stdout mismatch
 064_14_nested_command_substitution_arithmetic.sh	Failed due to: exit code mismatch, stdout mismatch
