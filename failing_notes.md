@@ -2,6 +2,30 @@
 
 ## Tests fixed in this session
 
+### Generator: fix `local var=$(cmd)` when `var` already exists globally
+Changed the `local` handler in `redirects.rs` to use `function_level_vars`
+instead of `declared_locals` for the skip-already-declared check.  `local`
+always creates a new Perl `my $var` that shadows the global, so a variable
+that exists at global scope must still be declared as a new local inside
+the function.
+
+Also applied the same fix in `simple_commands.rs` for consistency.
+
+Fixed tests: 062_hard_to_lex.sh
+
+### Generator: handle `let` (arithmetic evaluation) builtin natively
+Added `let` to the builtins registry and added a handler that converts
+each argument to a Perl arithmetic expression via
+`convert_arithmetic_to_perl`.  Also enhanced
+`convert_arithmetic_to_perl_impl` to handle bash array-length syntax
+`${#var[@]}` → `scalar(@var)` and string-length `${#var}` → `length($var)`,
+using placeholders to protect them from the variable-name converter.
+Added Perl builtin keyword detection so identifiers like `scalar`,
+`length`, `keys` are not erroneously converted to `$ENV{...}`.
+
+Fixed tests: 063_09_complex_function_parameter_handling.sh (no longer
+times out; still has pre-existing `--flag1` argument loss)
+
 ### Generator/parser: array index keys with commas, ${!prefix@} indirect expansion, and undeclared vars
 Fixed the `parse_index_suffix` function to use the full text of the `TestBracket`
 token (which can include extra characters due to logos fallback behavior when
@@ -69,7 +93,7 @@ Fixed tests: partially fixes 063_12_complex_eval.sh
 ### Generator: use `scalar(keys %map)` for `${#map[@]}` on associative arrays
 Fixed tests: partially fixes 063_09_complex_function_parameter_handling.sh
 
-## Still failing tests (12)
+## Still failing tests (10)
 
 ### 058_advanced_bash_idioms.sh
 Complex script combining many feature interactions including `declare -A`
@@ -77,19 +101,12 @@ Complex script combining many feature interactions including `declare -A`
 syntax not supported in Perl), `let` commands passed to system() which hangs,
 and heredoc-with-subshell translation issues.
 
-### 062_hard_to_lex.sh
-Variable name collision: `$result` in function body refers to global
-`$result` (value 776) instead of the local `$result_273` created by the
-command-substitution translation for `` `echo "$param1" | sed "s/old/new/g"` ``.
-The `local result=$(cmd)` pattern generates code where the assignment target
-is a different variable than the one used later.
-
 ### 063_09_complex_function_parameter_handling.sh
-`let` command (bash builtin for arithmetic) is passed to `system('let', ...)`
-which does not exist as an external command. The while-loop condition
-`system('let', 'i < ${#args[@]}')` returns a non-zero exit code (command
-not found), which is truthy in Perl, causing an infinite loop / timeout.
-The `@options` compilation error is now fixed (uses `keys %options`).
+`let` is now handled natively (no more timeout). The remaining failure is
+due to a pre-existing parser bug: the `--flag1` argument in the function
+call `complex_function --flag1 --option1=value1 -abc` is lost during
+tokenisation (double `--` → two `Minus` tokens, the first bare `-` may
+be dropped by the argument parser).
 
 ### 063_12_complex_eval.sh
 `eval "result=\$(( \${var:-0} + ... ))"` — the `\$` is now properly treated

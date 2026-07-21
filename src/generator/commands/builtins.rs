@@ -216,6 +216,10 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
         "local",
         BuiltinCommand::new("local", "Declare local variables", false),
     );
+    commands.insert(
+        "let",
+        BuiltinCommand::new("let", "Evaluate arithmetic expressions", false),
+    );
 
     // Output generation
     commands.insert(
