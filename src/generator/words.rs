@@ -2797,7 +2797,15 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
             let full_match = caps.get(0).unwrap().as_str().to_string();
             let var_name = caps.get(1).unwrap().as_str().to_string();
             let placeholder = format!("__ARR_LEN_{}__", idx);
-            let perl_expr = format!("scalar(@{})", var_name);
+            // Use 0 for undeclared arrays to avoid "Global symbol requires
+            // explicit package name" errors at compile time.
+            let perl_expr = if generator.declared_locals.contains(&var_name)
+                || generator.function_level_vars.contains(&var_name)
+            {
+                format!("scalar(@{})", var_name)
+            } else {
+                "0".to_string()
+            };
             arr_len_replacements.push((full_match, placeholder.clone()));
             arr_len_replacements.push((placeholder, perl_expr));
             idx += 1;
