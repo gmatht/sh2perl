@@ -5,6 +5,5 @@
 063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
 064_07_complex_array_operations.sh	Failed due to: stdout mismatch
 064_09_process_substitution_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
-064_19_complex_pattern_matching_extended_globs.sh	Failed due to: stdout mismatch
 064_22_function_returning_complex_data_structures.sh	Failed due to: exit code mismatch, stdout mismatch
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch

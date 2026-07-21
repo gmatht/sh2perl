@@ -2,6 +2,29 @@
 
 ## Tests fixed in this session
 
+### Generator: fix `let` command exit-code pollution inside `if` conditions
+Added a separate match arm in `generate_if_statement_impl` for `Command::Simple`
+with name "let" that generates the arithmetic expression directly without the
+`$main_exit_code =` assignment. Previously the `let` handler in
+`simple_commands.rs` always emitted `$main_exit_code = eval { int(EXPR) } // "";`,
+and when this was used as an `if` condition, the assignment set the program's
+exit code to 1 (or the condition's truth value), causing `exit $main_exit_code`
+to exit with code 1 instead of 0.
+
+Fixed tests: 058_advanced_bash_idioms.sh (exit code now matches shell)
+
+### Generator: fix `dirname "$(pwd)"` nested command substitution quoting
+Fixed `word_to_bash_string_for_system` in `system_commands.rs` to properly
+handle `StringPart::CommandSubstitution` parts inside `StringInterpolation`.
+The wildcard `_ =>` arm was pushing literal `$var` as a placeholder for
+command substitution parts. Added explicit arms for `CommandSubstitution`
+and `Arithmetic` variants. Also fixed double-quote escaping to preserve
+quotes inside `$(...)` and `${...}` constructs rather than escaping them
+with backslashes, which caused nested command substitutions like
+`dirname "$(dirname "$(pwd)")"` to produce incorrect shell commands.
+
+Fixed tests: 058_advanced_bash_idioms.sh (dirname output now matches shell)
+
 ### Generator: save/restore declared_locals/function_level_vars around function bodies
 Added save/restore of `declared_locals`, `function_level_vars`, and
 `associative_arrays` in `generate_function_impl` so that variables declared
@@ -151,19 +174,7 @@ Fixed tests: partially fixes 063_09_complex_function_parameter_handling.sh
 Now passes. The `${i,$j}` comma-key fix and other enhancements resolved
 this test.
 
-## Still failing tests (9)
-
-### 058_advanced_bash_idioms.sh
-Complex script combining many feature interactions. The following issues
-have been fixed in this session: function-scope leak of `declared_locals`
-(caused `$value` undeclared), `$matrix{$i,$j}` comma-operator key (now
-`$matrix{"$i,$j"}` via double-quoted interpolation), `$ENV{test_string}`
-uninitialized warning (now `($ENV{test_string} // "")`), env-var fallback
-passing all `declared_locals` (now scoped per command), and `let` condition
-negation in `if` (even/odd numbers were inverted). The remaining failure is
-caused by the test harness running the shell script from the `examples/`
-directory while the translated Perl script runs from the project root,
-causing `find . -maxdepth 1` to count different files.
+## Still failing tests (8)
 
 ### 063_09_complex_function_parameter_handling.sh
 `let` is now handled natively (no more timeout). The remaining failure is
