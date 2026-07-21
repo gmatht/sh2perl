@@ -4,3 +4,7 @@
 bash -c
 ls -l
 diff
+cp
+find
+mkdir
+wc

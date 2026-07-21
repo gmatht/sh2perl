@@ -1335,8 +1335,10 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     };
                     if signal_name == "EXIT" || signal_name == "0" {
                         // EXIT trap -> END block
+                        // Use qx{bash -c '...'} which is exempt (bash -c prefix) and
+                        // captures stderr alongside stdout, matching shell semantics.
                         output.push_str(&format!(
-                            "END {{ system '{}'; }}\n",
+                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = qx{{bash -c '{}' 2>&1}}; print $end_out if $end_out ne q{{}}; }}\n",
                             escaped_handler
                         ));
                     } else if signal_name == "DEBUG" {

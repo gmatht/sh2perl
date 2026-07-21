@@ -98,11 +98,26 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
     }
 
     # Pattern 4: open3(..., 'builtin', ...) — direct system call via IPC::Open3
-    while ($code =~ /open3\s*\([^)]*['"]\s*([^'",)]+)['"],?[^)]*\)/g) {
-        my $open3_cmd = $1;
-        next if $is_exempt->($open3_cmd);
+    while ($code =~ /open3\s*\((.*?)\)/gs) {
+        my $open3_args = $1;
+        # Extract all quoted string arguments from the open3 call
+        my @quoted_args = $open3_args =~ /'([^']*)'/g;
+        # Skip the first 3 arguments which are always filehandle variables ($in, $out, $err)
+        # The 4th argument (index 3) is the program/command
+        next if @quoted_args < 4;
+        my $prog = $quoted_args[3];
+        # If the program is 'bash' and '-c' follows, reconstruct the full command string
+        my $full_cmd;
+        if ($prog eq 'bash' && @quoted_args >= 5 && $quoted_args[4] eq '-c') {
+            # The command is bash -c <cmd>
+            my $cmd_str = $quoted_args[5];
+            $full_cmd = "bash -c $cmd_str";
+        } else {
+            $full_cmd = $prog;
+        }
+        next if $is_exempt->($full_cmd);
         for my $b (@builtins) {
-            if ($open3_cmd =~ /\b\Q$b\E\b/) {
+            if ($full_cmd =~ /\b\Q$b\E\b/) {
                 print "  FAIL: $basename.sh [perl] — OPEN3 violation: open3() with builtin '$b'\n";
                 $violations++;
                 last;
