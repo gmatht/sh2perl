@@ -64,6 +64,16 @@ Fixed tests: 055_factorize.sh (was `-z` not translated), partially fixes
 058_advanced_bash_idioms.sh (test expression syntax errors fixed, but
 matrix/declare issues remain)
 
+### Generator: handle array-index env-var assignment syntax
+When a standalone assignment with an array subscript (e.g. `matrix[0,2]=3`)
+is parsed as an environment variable for the next command, the generator now
+recognises the `var[key]` pattern in the env-var name and emits `$var{key}`
+syntax instead of the invalid `my $var[key]` syntax, which Perl rejects as
+multidimensional array access.
+
+Partially fixes: 058_advanced_bash_idioms.sh (matrix assignments no longer
+cause a Perl syntax error)
+
 ## Previously fixed tests
 
 ### Generator: ls -l falls back to shell qx{} for exact output
@@ -96,10 +106,13 @@ Fixed tests: partially fixes 063_09_complex_function_parameter_handling.sh
 ## Still failing tests (10)
 
 ### 058_advanced_bash_idioms.sh
-Complex script combining many feature interactions including `declare -A`
-(associative arrays) with matrix-like `$matrix[$i,$j]` access (multidimensional
-syntax not supported in Perl), `let` commands passed to system() which hangs,
-and heredoc-with-subshell translation issues.
+Complex script combining many feature interactions. The `matrix[0,2]=value`
+assignments now generate valid Perl (`$matrix{"0,2"} = value;`). Remaining
+issues include: `$matrix{$i,$j}` uses Perl comma operator instead of proper
+key `"$i,$j"`; `$value` undeclared due to function-scope leak from
+`local value="$2"`; `$ENV{test_string}` for undeclared variable;
+heredoc-with-subshell translation issues; `local $ENV{var} = $var;` lines
+reference variables out of lexical scope.
 
 ### 063_09_complex_function_parameter_handling.sh
 `let` is now handled natively (no more timeout). The remaining failure is

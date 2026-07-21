@@ -11,14 +11,14 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '022_ansi_quoting_unicode.sh';
-$__set_e = 1;
-# set uo not implemented
-# set pipefail not implemented
-print "== Unicode and hex ==\n";
-print 'Hello' . "\n";
-$CHILD_ERROR = 0;
-print 'Hello' . "\n";
-$CHILD_ERROR = 0;
+$PROGRAM_NAME = 'test_system_builtin.sh';
+print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
+my $result1 = do { my $command = 'ls -la'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
+my $result2 = do { my $command = q{find . -name '*.txt'}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
+print "Results:\n";
+print $result1;
+if ( !( ($result1) =~ m{\n\z}msx ) ) { print "\n"; }
+print $result2;
+if ( !( ($result2) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;
