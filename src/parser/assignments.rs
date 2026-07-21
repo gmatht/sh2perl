@@ -143,6 +143,130 @@ pub fn parse_array_elements(lexer: &mut Lexer) -> Result<Vec<String>, ParserErro
                     lexer.next(); // consume the identifier
                 }
             }
+            Some(Token::DollarParen) => {
+                // Consume entire $(...) as a single element, handling nested
+                // constructs and avoiding the ArithmeticEvalClose pitfall.
+                lexer.next(); // consume the DollarParen token ($()
+                let mut depth = 1i32;
+                current_element.push_str("$(");
+                while depth > 0 {
+                    match lexer.peek() {
+                        Some(Token::ParenOpen) => {
+                            depth += 1;
+                            current_element.push('(');
+                            lexer.next();
+                        }
+                        Some(Token::ParenClose) => {
+                            depth -= 1;
+                            if depth > 0 {
+                                current_element.push(')');
+                            }
+                            lexer.next();
+                        }
+                        Some(Token::ArithmeticEvalClose) => {
+                            // `))` as a single token — it could mean:
+                            //   a) closing a $((...))  (both ) belong to the arithmetic)
+                            //   b) closing $() plus the array's closing )
+                            // Decrement by 1 first; if depth reaches 0, the second )
+                            // closes the array (break out). If depth remains >0,
+                            // decrement again for a true $((...)) close.
+                            depth -= 1;
+                            if depth == 0 {
+                                // First ) closes the $(...), second ) closes the array
+                                current_element.push(')');
+                                lexer.next();
+                                // Now break out of both loops: the array element
+                                // is complete and the array itself is closed.
+                                // Flush current element and return immediately.
+                                if !current_element.is_empty() {
+                                    elements.push(current_element.trim().to_string());
+                                    current_element.clear();
+                                }
+                                return Ok(elements);
+                            }
+                            depth -= 1;
+                            if depth > 0 {
+                                current_element.push_str("))");
+                            } else if depth == 0 {
+                                current_element.push(')');
+                            } else {
+                                current_element.push_str("))");
+                                depth = 0;
+                            }
+                            lexer.next();
+                        }
+                        Some(Token::Arithmetic) => {
+                            if let Some(text) = lexer.get_current_text() {
+                                current_element.push_str(&text);
+                            }
+                            lexer.next();
+                            // $(( adds two paren levels
+                            depth += 2;
+                        }
+                        Some(Token::DollarParen) => {
+                            // Nested $(
+                            if let Some(text) = lexer.get_current_text() {
+                                current_element.push_str(&text);
+                            }
+                            lexer.next();
+                            depth += 1;
+                        }
+                        Some(_) => {
+                            if let Some(text) = lexer.get_current_text() {
+                                current_element.push_str(&text);
+                            }
+                            lexer.next();
+                        }
+                        None => return Err(ParserError::InvalidSyntax(
+                            "Unterminated $(...) in array element".to_string(),
+                        )),
+                    }
+                }
+            }
+            Some(Token::Arithmetic) => {
+                // Capture entire $((...)) arithmetic expression as a single element
+                lexer.next(); // consume the $(( token
+                let mut depth = 2i32;
+                let mut expr = String::from("$((");
+                while depth > 0 {
+                    match lexer.peek() {
+                        Some(Token::ParenOpen) => {
+                            depth += 1;
+                            expr.push('(');
+                            lexer.next();
+                        }
+                        Some(Token::ParenClose) => {
+                            depth -= 1;
+                            if depth > 0 {
+                                expr.push(')');
+                            }
+                            lexer.next();
+                        }
+                        Some(Token::ArithmeticEvalClose) => {
+                            depth -= 2;
+                            if depth > 0 {
+                                expr.push_str("))");
+                            } else if depth == 0 {
+                                expr.push(')');
+                            } else {
+                                expr.push_str("))");
+                                depth = 0;
+                            }
+                            lexer.next();
+                        }
+                        Some(_) => {
+                            if let Some(text) = lexer.get_current_text() {
+                                expr.push_str(&text);
+                            }
+                            lexer.next();
+                        }
+                        None => return Err(ParserError::InvalidSyntax(
+                            "Unterminated $((...)) in array element".to_string(),
+                        )),
+                    }
+                }
+                current_element.push_str(&expr);
+            }
             _ => {
                 // For any other token, get its text and advance
                 if let Some(text) = lexer.get_current_text() {

@@ -875,7 +875,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     // Regular string assignment
                     let val = generator.perl_string_literal(value);
                     // Declare the variable if it's not already declared
-                    if !generator.declared_locals.contains(var) {
+                    if !generator.function_level_vars.contains(var) {
                         output.push_str(&format!("my ${} = {};\n", var, val));
                         generator.declared_locals.insert(var.clone());
                     } else {
@@ -888,7 +888,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
             } else {
                 let val = generator.perl_string_literal(value);
                 // Declare the variable if it's not already declared
-                if !generator.declared_locals.contains(var) {
+                if !generator.function_level_vars.contains(var) {
                     output.push_str(&format!("my ${} = {};\n", var, val));
                     generator.declared_locals.insert(var.clone());
                 } else {
@@ -1060,7 +1060,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 if parts.len() == 2 {
                                     let var = parts[0];
                                     let value = parts[1];
-                                    if !generator.declared_locals.contains(var) {
+                                    if !generator.function_level_vars.contains(var) {
                                         let perl_value = shell_value_to_perl(value);
                                         output.push_str(&generator.indent());
                                         if is_assoc {
@@ -1141,89 +1141,90 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 let var = parts[0];
                                 let value = parts[1];
                                 // `local` always creates a new local variable, shadowing any global.
-                                // Only skip if this variable was already declared as local in
-                                // the current function scope (function_level_vars).
-                                if !generator.function_level_vars.contains(var) {
-                                    // Check if the next argument is a CommandSubstitution
-                                    if i + 1 < cmd.args.len() {
-                                        match &cmd.args[i + 1] {
-                                            Word::CommandSubstitution(cmd_sub, _) => {
-                                                // Handle command substitution
-                                                let perl_command = generator.word_to_perl(
-                                                    &Word::CommandSubstitution(
-                                                        cmd_sub.clone(),
-                                                        None,
-                                                    ),
-                                                );
-                                                output.push_str(&generator.indent());
-                                                output.push_str(&format!(
-                                                    "my ${} = {};\n",
-                                                    var, perl_command
-                                                ));
-                                                i += 1; // Skip the CommandSubstitution argument
-                                            }
-                                            Word::ParameterExpansion(pe, _) => {
-                                                let pe_word =
-                                                    Word::ParameterExpansion(pe.clone(), None);
-                                                let perl_value = generator.word_to_perl(&pe_word);
-                                                output.push_str(&generator.indent());
-                                                output.push_str(&format!(
-                                                    "my ${} = {};\n",
-                                                    var, perl_value
-                                                ));
-                                                i += 1;
-                                            }
-                                            Word::StringInterpolation(si, _) => {
-                                                let si_word =
-                                                    Word::StringInterpolation(si.clone(), None);
-                                                let perl_value = generator.word_to_perl(&si_word);
-                                                output.push_str(&generator.indent());
-                                                output.push_str(&format!(
-                                                    "my ${} = {};\n",
-                                                    var, perl_value
-                                                ));
-                                                i += 1;
-                                            }
-                                            Word::Variable(v, _, _) => {
-                                                let v_word = Word::Variable(v.clone(), true, None);
-                                                let perl_value = generator.word_to_perl(&v_word);
-                                                output.push_str(&generator.indent());
-                                                output.push_str(&format!(
-                                                    "my ${} = {};\n",
-                                                    var, perl_value
-                                                ));
-                                                i += 1;
-                                            }
-                                            Word::Arithmetic(arith_expr, _) => {
-                                                let arith_word = Word::Arithmetic(arith_expr.clone(), None);
-                                                let perl_value = generator.word_to_perl(&arith_word);
-                                                output.push_str(&generator.indent());
-                                                output.push_str(&format!(
-                                                    "my ${} = {};\n",
-                                                    var, perl_value
-                                                ));
-                                                i += 1;
-                                            }
-                                            _ => {
-                                                // Regular assignment without command substitution
-                                                let perl_value = shell_value_to_perl(value);
-                                                output.push_str(&generator.indent());
-                                                output.push_str(&format!(
-                                                    "my ${} = {};\n",
-                                                    var, perl_value
-                                                ));
-                                            }
+                                // Always emit the my declaration — function_level_vars and
+                                // declared_locals may already contain the variable from global
+                                // scope or pre-analysis, but `local` still needs a fresh my.
+                                // We track in declared_locals to avoid a second my declaration
+                                // for the same variable within a single function body.
+                                // Check if the next argument is a CommandSubstitution
+                                if i + 1 < cmd.args.len() {
+                                    match &cmd.args[i + 1] {
+                                        Word::CommandSubstitution(cmd_sub, _) => {
+                                            // Handle command substitution
+                                            let perl_command = generator.word_to_perl(
+                                                &Word::CommandSubstitution(
+                                                    cmd_sub.clone(),
+                                                    None,
+                                                ),
+                                            );
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!(
+                                                "my ${} = {};\n",
+                                                var, perl_command
+                                            ));
+                                            i += 1; // Skip the CommandSubstitution argument
                                         }
-                                    } else {
-                                        // Regular assignment without command substitution
-                                        let perl_value = shell_value_to_perl(value);
-                                        output.push_str(&generator.indent());
-                                        output
-                                            .push_str(&format!("my ${} = {};\n", var, perl_value));
+                                        Word::ParameterExpansion(pe, _) => {
+                                            let pe_word =
+                                                Word::ParameterExpansion(pe.clone(), None);
+                                            let perl_value = generator.word_to_perl(&pe_word);
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!(
+                                                "my ${} = {};\n",
+                                                var, perl_value
+                                            ));
+                                            i += 1;
+                                        }
+                                        Word::StringInterpolation(si, _) => {
+                                            let si_word =
+                                                Word::StringInterpolation(si.clone(), None);
+                                            let perl_value = generator.word_to_perl(&si_word);
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!(
+                                                "my ${} = {};\n",
+                                                var, perl_value
+                                            ));
+                                            i += 1;
+                                        }
+                                        Word::Variable(v, _, _) => {
+                                            let v_word = Word::Variable(v.clone(), true, None);
+                                            let perl_value = generator.word_to_perl(&v_word);
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!(
+                                                "my ${} = {};\n",
+                                                var, perl_value
+                                            ));
+                                            i += 1;
+                                        }
+                                        Word::Arithmetic(arith_expr, _) => {
+                                            let arith_word = Word::Arithmetic(arith_expr.clone(), None);
+                                            let perl_value = generator.word_to_perl(&arith_word);
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!(
+                                                "my ${} = {};\n",
+                                                var, perl_value
+                                            ));
+                                            i += 1;
+                                        }
+                                        _ => {
+                                            // Regular assignment without command substitution
+                                            let perl_value = shell_value_to_perl(value);
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!(
+                                                "my ${} = {};\n",
+                                                var, perl_value
+                                            ));
+                                        }
                                     }
-                                    generator.declared_locals.insert(var.to_string());
-                                    generator.function_level_vars.insert(var.to_string());
+                                } else {
+                                    // Regular assignment without command substitution
+                                    let perl_value = shell_value_to_perl(value);
+                                    output.push_str(&generator.indent());
+                                    output
+                                        .push_str(&format!("my ${} = {};\n", var, perl_value));
                                 }
+                                generator.declared_locals.insert(var.to_string());
+                                generator.function_level_vars.insert(var.to_string());
                             }
                         } else {
                             // Just declaration without assignment

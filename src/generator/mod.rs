@@ -1298,10 +1298,10 @@ impl Generator {
                         }
                     }
                 }
-                Command::Function(func) => {
-                    for c in &func.body.commands {
-                        scan_command(test_self, c);
-                    }
+                Command::Function(_func) => {
+                    // Skip function bodies — variables inside functions
+                    // are declared via `local` and should not be added
+                    // to function_level_vars by pre-analysis.
                 }
                 Command::Block(block) => {
                     for c in &block.commands {
