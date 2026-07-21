@@ -28,5 +28,11 @@ echo "exit: $?"
 cmp -s /tmp/cmp_test_a.txt /tmp/cmp_test_c.txt
 echo "exit: $?"
 
+# Process substitution
+cmp <(echo a) <(echo a)
+echo "aa exit: $?"
+cmp <(echo b) <(echo c)
+echo "bc exit: $?"
+
 # Cleanup
 rm -f /tmp/cmp_test_a.txt /tmp/cmp_test_b.txt /tmp/cmp_test_c.txt /tmp/cmp_test_empty.txt
