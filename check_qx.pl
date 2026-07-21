@@ -83,12 +83,17 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         }
     }
 
-    # Pattern 3: system('builtin') or system("builtin")
-    for my $b (@builtins) {
-        if ($code =~ /system\s*['"]\s*\Q$b\E\b/) {
-            print "SYSTEM VIOLATION: $basename has system() call with builtin '$b'\n";
-            $violations++;
-            last;
+    # Pattern 3: system('builtin ...') or system("builtin ...")
+    # Extract the full command string and check exemptions.
+    while ($code =~ /system\s*['"]\s*([^'"]+)['"]/g) {
+        my $system_body = $1;
+        next if $is_exempt->($system_body);
+        for my $b (@builtins) {
+            if ($system_body =~ /\b\Q$b\E\b/) {
+                print "SYSTEM VIOLATION: $basename has system() call with builtin '$b'\n";
+                $violations++;
+                last;
+            }
         }
     }
 }
