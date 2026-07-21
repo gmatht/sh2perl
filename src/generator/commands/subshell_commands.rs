@@ -14,14 +14,12 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
     output.push_str(&generator.indent());
     output.push_str("local %ENV = %ENV;\n");
 
-    // Create local copies of all declared variables to isolate subshell scope
-    // Note: We use an empty initializer (no RHS reference) to avoid compile-time
-    // errors when the variable is an array/hash (wrong sigil) or was declared in
-    // a scope not visible from here. The variables start undef but that is
-    // acceptable because the main purpose is to prevent changes from leaking out.
+    // Create local copies of all declared variables to isolate subshell scope.
+    // Initialize each from the outer variable so the subshell inherits the
+    // current value just like a real bash subshell does.
     for var_name in &generator.declared_locals {
         output.push_str(&generator.indent());
-        output.push_str(&format!("my ${};\n", var_name));
+        output.push_str(&format!("my ${} = ${};\n", var_name, var_name));
     }
 
     // Emit the subshell body. Ensure the block returns an empty string

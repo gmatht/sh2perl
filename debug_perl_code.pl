@@ -11,26 +11,22 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '049_local.sh';
-my $a = q{1};
-print $a;
-if ( !( ($a) =~ m{\n\z}msx ) ) { print "\n"; }
-do {
-    local %ENV = %ENV;
-    my $a;
-        $a = q{2};
-        print $a;
-if ( !( ($a) =~ m{\n\z}msx ) ) { print "\n"; }
-    q{};
+$PROGRAM_NAME = 'test_system_builtin.sh';
+print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
+my $result1 = do { my $command = 'ls -la'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
+my $result2 = do {
+    require File::Find;
+    my @find_results;
+    File::Find::find(sub { if ($_ =~ /^.*\.txt$/msx) { push @find_results, $File::Find::name; } }, q{.});
+    my $result = join "\n", @find_results;
+    if ($result ne q{}) { $result .= "\n"; }
+    $CHILD_ERROR = 0;
+    $result;
 };
-do {
-    local %ENV = %ENV;
-    my $a;
-    print $a;
-if ( !( ($a) =~ m{\n\z}msx ) ) { print "\n"; }
-    q{};
-};
-print $a;
-if ( !( ($a) =~ m{\n\z}msx ) ) { print "\n"; }
+print "Results:\n";
+print $result1;
+if ( !( ($result1) =~ m{\n\z}msx ) ) { print "\n"; }
+print $result2;
+if ( !( ($result2) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;
