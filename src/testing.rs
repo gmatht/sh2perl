@@ -757,19 +757,30 @@ pub fn test_file_equivalence_detailed_with_critic(
                 status: create_exit_status(0),
             });
         } else {
-            // Clean up any temporary files in examples directory before running shell script
+            // Remove leftover files from previous tests that could affect directory listings
             let examples_dir = std::env::current_dir().unwrap_or_default().join("examples");
             if let Ok(entries) = std::fs::read_dir(&examples_dir) {
                 for entry in entries.flatten() {
-                    let file_name = entry.file_name();
-                    let file_name_str = file_name.to_string_lossy();
-                    // Remove common temporary files that might affect file counts
-                    if file_name_str.starts_with("temp_")
-                        || file_name_str.starts_with("file")
-                            && (file_name_str.ends_with(".txt") || file_name_str.ends_with(".tmp"))
-                        || file_name_str.starts_with("debug_")
-                        || file_name_str.ends_with("_out.txt")
-                    {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) != Some("sh") {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            // Remove /tmp files created by tests
+            for f in &[
+                "/tmp/cmp_a.txt", "/tmp/cmp_diff.txt", "/tmp/cmp_diff2.txt",
+                "/tmp/cmp_empty.txt", "/tmp/cmp_same.txt", "/tmp/cmp_short.txt",
+                "/tmp/file.txt",
+            ] {
+                let _ = std::fs::remove_file(f);
+            }
+            // Remove /tmp/temp_* files
+            if let Ok(entries) = std::fs::read_dir("/tmp") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("temp_") {
                         let _ = std::fs::remove_file(entry.path());
                     }
                 }
