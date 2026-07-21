@@ -41,7 +41,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
     close $fh;
 
     my $basename = (split '/', $file)[-1];
-    $basename =~ s/\.pl$//;
+    $basename =~ s/\.sh\.pl$//;
 
     # Pattern 1: direct qx{builtin ...}
     # First extract the full qx body, then check if it contains a builtin.
@@ -51,7 +51,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         next if $is_exempt->($qx_body);
         for my $b (@builtins) {
             if ($qx_body =~ /\b\Q$b\E\b/) {
-                print "QX VIOLATION: $basename has qx{} call with builtin '$b'\n";
+                print "  FAIL: $basename.sh [perl] — QX violation: qx{} call with builtin '$b'\n";
                 $violations++;
                 last;
             }
@@ -76,7 +76,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         for my $b (@builtins) {
             if ($last_assign =~ /\b\Q$b\E\b/) {
                 my $line_num = ($before =~ tr/\n//) + 1;
-                print "QX VIOLATION: $basename uses qx{$var} where $var contains builtin '$b'\n";
+                print "  FAIL: $basename.sh [perl] — QX violation: qx{$var} where $var contains builtin '$b'\n";
                 $violations++;
                 last;
             }
@@ -90,7 +90,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         next if $is_exempt->($system_body);
         for my $b (@builtins) {
             if ($system_body =~ /\b\Q$b\E\b/) {
-                print "SYSTEM VIOLATION: $basename has system() call with builtin '$b'\n";
+                print "  FAIL: $basename.sh [perl] — SYSTEM violation: system() call with builtin '$b'\n";
                 $violations++;
                 last;
             }
@@ -103,7 +103,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         next if $is_exempt->($open3_cmd);
         for my $b (@builtins) {
             if ($open3_cmd =~ /\b\Q$b\E\b/) {
-                print "OPEN3 VIOLATION: $basename uses open3() with builtin '$b'\n";
+                print "  FAIL: $basename.sh [perl] — OPEN3 violation: open3() with builtin '$b'\n";
                 $violations++;
                 last;
             }
@@ -116,7 +116,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         next if $is_exempt->($exec_cmd);
         for my $b (@builtins) {
             if ($exec_cmd =~ /\b\Q$b\E\b/) {
-                print "EXEC VIOLATION: $basename uses exec() with builtin '$b'\n";
+                print "  FAIL: $basename.sh [perl] — EXEC violation: exec() with builtin '$b'\n";
                 $violations++;
                 last;
             }
