@@ -44,7 +44,37 @@ Fixed tests: 064_12_brace_expansion_nested_sequences.sh
 ### Generator: sort associative array values for deterministic ${map[@]} expansion (qd. 2026-07-21)
 Fixed tests: 064_02_nested_brace_expansions.sh (and others via `sort values %map`)
 
-## Still failing tests (13)
+## Tests fixed in this session
+
+### Generator: handle `$(...)` inside arithmetic expressions
+Modified `convert_arithmetic_to_perl_impl()` to scan for `$(...)` command
+substitutions within the arithmetic expression text, replace each with a
+Perl `qx{}` call that captures stdout, then process the remainder normally.
+
+Fixed tests: 064_14_nested_command_substitution_arithmetic.sh
+
+### Generator: fix `\$` escaping in double-quoted strings for eval
+Added handling for `\$` (escaped dollar sign) inside double-quoted string
+content in `parse_string_interpolation()`. Previously, `\$` was not
+recognized as an escaped literal `$`, causing the parser to interpret
+`$((` and `${` as real expansions inside eval arguments.
+
+Fixed tests: partially fixes 063_12_complex_eval.sh (the `\$` is now
+properly treated as literal, but the eval handler still cannot parse
+the complex nested parameter expansions in the resulting command).
+
+### Generator: use `scalar(keys %map)` for `${#map[@]}` on associative arrays
+Modified both `generate_parameter_expansion_impl()` (expansions.rs) and
+`convert_string_interpolation_to_perl_impl()` (words.rs) to check whether
+the array name is registered as an associative array. If so, `${#arr[@]}`
+generates `scalar(keys %arr)` instead of `scalar(@arr)`, which avoids
+"Global symbol \"@arr\" requires explicit package name" errors.
+
+Fixed tests: partially fixes 063_09_complex_function_parameter_handling.sh
+(the `@options` vs `%options` compilation error is fixed; the test still
+times out due to `let` commands being passed to `system()` which hangs).
+
+## Still failing tests (12)
 
 ### 058_advanced_bash_idioms.sh
 Complex script combining many feature interactions. Compile error: `-gt`
@@ -61,13 +91,20 @@ Several issues: (1) `$index` undeclared, (2) `$!prefix@` bareword from
 loses leading `0` (parsed as `,0`), (4) `@array` undeclared.
 
 ### 063_09_complex_function_parameter_handling.sh
-`@options` not declared. Variable used in MapAccess key needs array
-declaration.
+`let` command (bash builtin for arithmetic) is passed to `system('let', ...)`
+which does not exist as an external command. The while-loop condition
+`system('let', 'i < ${#args[@]}')` returns a non-zero exit code (command
+not found), which is truthy in Perl, causing an infinite loop / timeout.
+The `@options` compilation error is now fixed (uses `keys %options`).
 
 ### 063_12_complex_eval.sh
-`eval "result=\$(( \${var:-0} + ... ))"` — the escaped `\$` and `\${`
-inside double quotes confuse the tokenizer, causing the eval argument
-to be truncated. Result is undefined (`$ENV{result}` unset).
+`eval "result=\$(( \${var:-0} + ... ))"` — the `\$` is now properly treated
+as literal `$`, and the eval string is correctly extracted as
+`result=$(( ${var:-0} + ${array[${index:-0}]:-0} ))`. However, the parser
+cannot parse this command due to the deeply nested parameter expansion
+`${array[${index:-0}]:-0}` (array access with default value and nested
+variable index). The eval handler falls through to the "could not parse"
+comment, so `$result` remains undefined.
 
 ### 063_15_complex_function_definition.sh
 Unmatched right curly bracket caused by incorrect brace/block generation
@@ -88,16 +125,14 @@ and iterating in that order instead of using `values %`.
 Syntax error near `$;` — process substitution temp files not correctly
 created/passed.
 
-### 064_14_nested_command_substitution_arithmetic.sh
-`$(( $(wc -l < /etc/passwd) + $(wc -l < /etc/group) ))` — inner `$(...)`
-treated as literal text inside the arithmetic expression, producing
-`$($wc` syntax error.
-
 ### 064_19_complex_pattern_matching_extended_globs.sh
-Extended glob patterns `*.{txt,log,dat}` brace expansion not expanded
-correctly. The `*.` prefix is separated from the brace expansion items.
-Needs lexer-level combining of prefix literals with adjacent brace
-expansions.
+The brace expansion `*.{txt,log,dat}` now correctly expands to
+`*.txt`, `*.log`, `*.dat` in the for-loop (parser now merges the `*.`
+prefix with the adjacent brace expansion; generator now includes the
+prefix when emitting for-loop items). However, the for-loop still needs
+glob expansion: bash expands `*.txt` to matching filenames, but the
+generated Perl iterates over the literal pattern strings. Adding glob
+expansion to for-loop items would fix this.
 
 ### 064_22_function_returning_complex_data_structures.sh
 `declare -A info` and `declare -p info` not translated. Bash's

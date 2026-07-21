@@ -234,9 +234,13 @@ pub fn generate_parameter_expansion_impl(
         ParameterExpansionOperator::ArraySlice(offset, length) => {
             // Special case: ${#arr[@]} should be array length, not array slice
             if pe.variable.starts_with('#') && offset == "@" && length.is_none() {
-                // ${#arr[@]} -> scalar(@arr)
+                // ${#arr[@]} -> scalar(@arr) or scalar(keys %arr) for associative arrays
                 let array_name = &pe.variable[1..]; // Remove the '#' prefix
-                format!("scalar(@{})", array_name)
+                if generator.associative_arrays.contains(array_name) {
+                    format!("scalar(keys %{})", array_name)
+                } else {
+                    format!("scalar(@{})", array_name)
+                }
             } else if offset == "@" && length.is_none() {
                 // ${map[@]} or ${!map[@]} - this represents array/map values or keys
                 if pe.variable.starts_with('!') {

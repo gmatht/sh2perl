@@ -2298,9 +2298,13 @@ pub fn convert_string_interpolation_to_perl_impl(
                         if offset == "@" {
                             // This is ${#arr[@]} or ${arr[@]} - array length or array iteration
                             if pe.variable.starts_with('#') {
-                                // ${#arr[@]} -> scalar(@arr)
+                                // ${#arr[@]} -> scalar(@arr) or scalar(keys %arr) for associative arrays
                                 let array_name = &pe.variable[1..];
-                                parts.push(format!("scalar(@{})", array_name));
+                                if generator.associative_arrays.contains(array_name) {
+                                    parts.push(format!("scalar(keys %{})", array_name));
+                                } else {
+                                    parts.push(format!("scalar(@{})", array_name));
+                                }
                             } else if pe.variable.starts_with('!') {
                                 // ${!map[@]} -> keys %map (map keys iteration)
                                 let map_name = &pe.variable[1..]; // Remove ! prefix
@@ -2420,14 +2424,105 @@ pub fn convert_string_interpolation_to_perl_impl(
     }
 }
 
-pub fn convert_arithmetic_to_perl_impl(_generator: &Generator, expr: &str) -> String {
+/// Helper: find the closing paren matching the opening `$(` starting at `start`.
+/// Returns the index in `s` right after the closing `)`.
+fn find_matching_paren(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start + 2 > bytes.len() || &bytes[start..start + 2] != b"$(" {
+        return None;
+    }
+    let mut depth: i32 = 1;
+    let mut i = start + 2;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' => {
+                // skip single-quoted string
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if i < bytes.len() {
+                    i += 1; // skip closing '
+                }
+            }
+            b'"' => {
+                // skip double-quoted string
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if i < bytes.len() {
+                    i += 1; // skip closing "
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> String {
     // Convert shell arithmetic expression to Perl syntax.
     // Variables may already carry a leading `$` (e.g. `$j * $i`); we must NOT
     // add another `$` in that case or we produce `$$j` (a scalar dereference).
     // Strategy: temporarily replace every existing `$name` with a sentinel,
     // add `$` to bare identifiers, then restore the sentinels.
+    //
+    // Additionally, before the normal conversion, extract any `$(...)` command
+    // substitutions from the expression and replace them with Perl code that
+    // runs the command via qx{} and captures its output.
 
-    let result = expr.to_string();
+    let mut result = expr.to_string();
+
+    // Phase 0: extract $(...) command substitutions and replace with placeholders
+    let mut cmd_subst_replacements: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < result.len() {
+        if i + 1 < result.len() && &result.as_bytes()[i..i + 2] == b"$(" {
+            if let Some(end) = find_matching_paren(&result, i) {
+                // Extract the command text (including the parens)
+                let full_match = result[i..end].to_string();
+                let inner_cmd = result[i + 2..end - 1].to_string();
+                // Create a placeholder
+                let placeholder = format!("__CMD_SUBST_{}__", cmd_subst_replacements.len());
+                // Generate Perl code: chomp(my $r = qx{cmd}); $r
+                // Escape any `}` in the command text so qx{} is safe
+                let escaped_cmd = inner_cmd.replace("}", "\\}");
+                let perl_code = format!(
+                    "do {{ chomp(my $_r = qx{{{}}}); $_r; }}",
+                    escaped_cmd
+                );
+                cmd_subst_replacements.push((placeholder.clone(), perl_code));
+                result.replace_range(i..end, &placeholder);
+                i += placeholder.len();
+            } else {
+                i += 2;
+            }
+        } else {
+            i += 1;
+        }
+    }
 
     // Step 1: protect already-`$`-prefixed variables
     let dollar_var_regex = Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
@@ -2445,6 +2540,9 @@ pub fn convert_arithmetic_to_perl_impl(_generator: &Generator, expr: &str) -> St
             if var_name.starts_with("__DOLLAR_") && var_name.ends_with("__") {
                 // Sentinel — restored in step 3
                 var_name.to_string()
+            } else if var_name.starts_with("__CMD_SUBST_") && var_name.ends_with("__") {
+                // Command substitution placeholder — leave untouched
+                var_name.to_string()
             } else {
                 format!("${}", var_name)
             }
@@ -2458,6 +2556,12 @@ pub fn convert_arithmetic_to_perl_impl(_generator: &Generator, expr: &str) -> St
             format!("${}", &caps[1])
         })
         .to_string();
+
+    // Step 4: restore command substitution placeholders
+    let mut result = result;
+    for (placeholder, perl_code) in &cmd_subst_replacements {
+        result = result.replace(placeholder, perl_code);
+    }
 
     // Wrap with int() to match bash integer arithmetic semantics.
     // Use eval {} // "" to handle division/modulo by zero (bash leaves

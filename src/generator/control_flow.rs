@@ -494,13 +494,21 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                             }
                         }
                         BraceItem::Literal(s) => {
-                            // Single literal item
-                            all_items.push(format!("\"{}\"", s));
+                            // Single literal item, include prefix/suffix
+                            let val = format!("{}{}{}",
+                                expansion.prefix.as_deref().unwrap_or(""),
+                                s,
+                                expansion.suffix.as_deref().unwrap_or(""));
+                            all_items.push(format!("\"{}\"", val));
                         }
                         BraceItem::Sequence(seq) => {
-                            // Convert {a,b,c} to separate quoted items
+                            // Convert {a,b,c} to separate quoted items, include prefix/suffix
                             for item in seq {
-                                all_items.push(format!("\"{}\"", item));
+                                let val = format!("{}{}{}",
+                                    expansion.prefix.as_deref().unwrap_or(""),
+                                    item,
+                                    expansion.suffix.as_deref().unwrap_or(""));
+                                all_items.push(format!("\"{}\"", val));
                             }
                         }
                         BraceItem::Nested(_) => todo!(),
@@ -510,7 +518,13 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                     // Multiple brace items - expand each one
                     for item in &expansion.items {
                         match item {
-                            BraceItem::Literal(s) => all_items.push(format!("\"{}\"", s)),
+                            BraceItem::Literal(s) => {
+                                let val = format!("{}{}{}",
+                                    expansion.prefix.as_deref().unwrap_or(""),
+                                    s,
+                                    expansion.suffix.as_deref().unwrap_or(""));
+                                all_items.push(format!("\"{}\"", val));
+                            },
                             BraceItem::Range(range) => {
                                 if let (Ok(start_num), Ok(end_num)) =
                                     (range.start.parse::<i64>(), range.end.parse::<i64>())
@@ -544,7 +558,11 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                             }
                             BraceItem::Sequence(seq) => {
                                 for item in seq {
-                                    all_items.push(format!("\"{}\"", item));
+                                    let val = format!("{}{}{}",
+                                        expansion.prefix.as_deref().unwrap_or(""),
+                                        item,
+                                        expansion.suffix.as_deref().unwrap_or(""));
+                                    all_items.push(format!("\"{}\"", val));
                                 }
                             }
                             BraceItem::Nested(_) => todo!(),
