@@ -284,12 +284,180 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
         }
     }
 
-    output.push_str("while ( ");
+    // Handle And/Or conditions specially: generate a while (1) loop
+    // with explicit condition checks via last unless/last if.
     match &*while_loop.condition {
+        Command::And(_, _) | Command::Or(_, _) => {
+            output.push_str("while (1) {\n");
+            generator.indent_level += 1;
+            // Flatten the And/Or tree and generate each condition as a last check
+            let mut conds = Vec::new();
+            let is_and = matches!(&*while_loop.condition, Command::And(_, _));
+            flatten_conditions(&while_loop.condition, &mut conds);
+            for cond in &conds {
+                // Test expressions generate a boolean expression directly
+                // (e.g., "$line" ne q{}). Other commands generate code that
+                // sets $CHILD_ERROR.
+                if matches!(cond, Command::TestExpression(_)) {
+                    generator.suppress_set_e_depth += 1;
+                    let cond_code = generator.generate_command(cond);
+                    generator.suppress_set_e_depth -= 1;
+                    let cond_code = cond_code.trim().to_string();
+                    if is_and {
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("last unless ({});\n", cond_code));
+                    } else {
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("last if ({});\n", cond_code));
+                    }
+                } else {
+                    generator.suppress_set_e_depth += 1;
+                    let cond_code = generator.generate_command(cond);
+                    generator.suppress_set_e_depth -= 1;
+                    output.push_str(&generator.indent());
+                    if is_and {
+                        output.push_str("last unless do {\n");
+                    } else {
+                        output.push_str("last if do {\n");
+                    }
+                    generator.indent_level += 1;
+                    for line in cond_code.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            output.push_str(&generator.indent());
+                            output.push_str(trimmed);
+                            output.push('\n');
+                        }
+                    }
+                    output.push_str(&generator.indent());
+                    output.push_str("$CHILD_ERROR == 0\n");
+                    generator.indent_level -= 1;
+                    output.push_str(&generator.indent());
+                    output.push_str("};\n");
+                }
+            }
+            // Generate body
+            output.push_str(&generator.generate_block_commands(&while_loop.body));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+        }
+        Command::Block(block) => {
+            // Block conditions arise when env vars are assigned before a command
+            // (e.g. `IFS= read -r line && ...`). Generate each command in the block
+            // as a step in a while (1) loop, checking exit code after each.
+            output.push_str("while (1) {\n");
+            generator.indent_level += 1;
+            // Generate all commands except the last one as plain statements
+            let len = block.commands.len();
+            for (i, cmd) in block.commands.iter().enumerate() {
+                if i < len - 1 {
+                    // Non-last commands: execute and check exit code
+                    generator.suppress_set_e_depth += 1;
+                    let cmd_code = generator.generate_command(cmd);
+                    generator.suppress_set_e_depth -= 1;
+                    for line in cmd_code.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            output.push_str(&generator.indent());
+                            output.push_str(trimmed);
+                            output.push('\n');
+                        }
+                    }
+                    output.push_str(&generator.indent());
+                    output.push_str("last unless $CHILD_ERROR == 0;\n");
+                } else {
+                    // Last command: treat as the main condition
+                    match cmd {
+                        Command::And(_, _) | Command::Or(_, _) => {
+                            // Flatten and generate each condition as a last check
+                            let mut conds = Vec::new();
+                            let is_and = matches!(cmd, Command::And(_, _));
+                            flatten_conditions(cmd, &mut conds);
+                            for cond in &conds {
+                                if matches!(cond, Command::TestExpression(_)) {
+                                    generator.suppress_set_e_depth += 1;
+                                    let cond_code = generator.generate_command(cond);
+                                    generator.suppress_set_e_depth -= 1;
+                                    let cond_code = cond_code.trim().to_string();
+                                    if is_and {
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&format!("last unless ({});\n", cond_code));
+                                    } else {
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&format!("last if ({});\n", cond_code));
+                                    }
+                                } else {
+                                    generator.suppress_set_e_depth += 1;
+                                    let cond_code = generator.generate_command(cond);
+                                    generator.suppress_set_e_depth -= 1;
+                                    output.push_str(&generator.indent());
+                                    if is_and {
+                                        output.push_str("last unless do {\n");
+                                    } else {
+                                        output.push_str("last if do {\n");
+                                    }
+                                    generator.indent_level += 1;
+                                    for line in cond_code.lines() {
+                                        let trimmed = line.trim();
+                                        if !trimmed.is_empty() {
+                                            output.push_str(&generator.indent());
+                                            output.push_str(trimmed);
+                                            output.push('\n');
+                                        }
+                                    }
+                                    output.push_str(&generator.indent());
+                                    output.push_str("$CHILD_ERROR == 0\n");
+                                    generator.indent_level -= 1;
+                                    output.push_str(&generator.indent());
+                                    output.push_str("};\n");
+                                }
+                            }
+                        }
+                        _ => {
+                            // Simple condition: wrap in do {} and check
+                            generator.suppress_set_e_depth += 1;
+                            let cond_code = generator.generate_command(cmd);
+                            generator.suppress_set_e_depth -= 1;
+                            output.push_str(&generator.indent());
+                            output.push_str("last unless do {\n");
+                            generator.indent_level += 1;
+                            for line in cond_code.lines() {
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    output.push_str(&generator.indent());
+                                    output.push_str(trimmed);
+                                    output.push('\n');
+                                }
+                            }
+                            output.push_str(&generator.indent());
+                            output.push_str("$CHILD_ERROR == 0\n");
+                            generator.indent_level -= 1;
+                            output.push_str(&generator.indent());
+                            output.push_str("};\n");
+                        }
+                    }
+                }
+            }
+            // Generate body
+            output.push_str(&generator.generate_block_commands(&while_loop.body));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+        }
         Command::Simple(cmd) if cmd.name == "[" || cmd.name == "test" => {
+            output.push_str("while ( ");
             generator.generate_test_command(cmd, &mut output);
+            output.push_str(" ) {\n");
+            // Generate body
+            generator.indent_level += 1;
+            output.push_str(&generator.generate_block_commands(&while_loop.body));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
         }
         Command::TestExpression(test_expr) => {
+            output.push_str("while ( ");
             let test_result = generator.generate_test_expression(test_expr);
             // Remove outer parentheses if present to avoid double parentheses
             if test_result.starts_with('(') && test_result.ends_with(')') {
@@ -297,8 +465,16 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             } else {
                 output.push_str(&test_result);
             }
+            output.push_str(" ) {\n");
+            // Generate body
+            generator.indent_level += 1;
+            output.push_str(&generator.generate_block_commands(&while_loop.body));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
         }
         _ => {
+            output.push_str("while ( ");
             generator.suppress_set_e_depth += 1;
             let mut cond = generator.generate_command(&while_loop.condition);
             generator.suppress_set_e_depth -= 1;
@@ -306,17 +482,15 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                 .to_string();
             output.push_str(&cond);
+            output.push_str(" ) {\n");
+            // Generate body
+            generator.indent_level += 1;
+            output.push_str(&generator.generate_block_commands(&while_loop.body));
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
         }
     }
-    output.push_str(" ) {\n");
-
-    // Generate body
-    generator.indent_level += 1;
-    output.push_str(&generator.generate_block_commands(&while_loop.body));
-    generator.indent_level -= 1;
-
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
 
     output
 }
@@ -963,4 +1137,17 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
         }
     }
     combine(generator, cmd)
+}
+
+/// Recursively flatten an `And`/`Or` tree into a list of leaf commands.
+fn flatten_conditions(cmd: &Command, conds: &mut Vec<Command>) {
+    match cmd {
+        Command::And(left, right) | Command::Or(left, right) => {
+            flatten_conditions(left, conds);
+            flatten_conditions(right, conds);
+        }
+        other => {
+            conds.push(other.clone());
+        }
+    }
 }
