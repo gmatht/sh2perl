@@ -149,11 +149,8 @@ pub fn generate_find_command(
             start_dir_expr
         ));
 
-        output.push_str(&generator.indent());
-        output.push_str(&format!(
-            "@{} = sort @{};\n",
-            input_var, input_var
-        ));
+        // Results are already in find traversal order (depth-first), matching bash find
+        // sorting would change the order and cause test failures
         output.push_str(&generator.indent());
         output.push_str(&format!(
             "${} = join \"\\n\", @{};\n",
@@ -254,24 +251,21 @@ pub fn generate_find_for_substitution(
         conditions.join(" && ")
     };
 
-    // Maxdepth
-    let maxdepth_code = if let Some(ref depth) = maxdepth {
+    // Maxdepth condition for inside the callback
+    let mut maxdepth_cond = String::new();
+    if let Some(ref depth) = maxdepth {
         if let Ok(d) = depth.parse::<usize>() {
-            format!(
-                "my $maxdepth = {}; my $depth = ($File::Find::dir =~ tr/\\///) + 1; return if $depth > $maxdepth;",
+            maxdepth_cond = format!(
+                "my $maxdepth = {}; my $depth = ($File::Find::dir =~ tr/\\///) + 1; next if $depth > $maxdepth; ",
                 d
-            )
-        } else {
-            String::new()
+            );
         }
-    } else {
-        String::new()
-    };
+    }
 
     format!(
-        "do {{\n    require File::Find;\n    my @find_results;\n    {maxdepth_code}\n    File::Find::find(sub {{ if ({condition_code}) {{ push @find_results, $File::Find::name; }} }}, {start_dir});\n    @find_results = sort @find_results;\n    my $result = join \"\\n\", @find_results;\n    if ($result ne q{{}}) {{ $result .= \"\\n\"; }}\n    $CHILD_ERROR = 0;\n    $result;\n}}",
+        "do {{\n    require File::Find;\n    my @find_results;\n    File::Find::find(sub {{ {maxdepth_cond}if ({condition_code}) {{ push @find_results, $File::Find::name; }} }}, {start_dir});\n    my $result = join \"\\n\", @find_results;\n    if ($result ne q{{}}) {{ $result .= \"\\n\"; }}\n    $CHILD_ERROR = 0;\n    $result;\n}}",
         condition_code = condition_code,
         start_dir = start_dir_expr,
-        maxdepth_code = maxdepth_code,
+        maxdepth_cond = maxdepth_cond,
     )
 }

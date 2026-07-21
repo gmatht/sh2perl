@@ -1031,7 +1031,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("    my $output = \"declare -A {}=(\";\n", var));
                                 output.push_str(&generator.indent());
-                                output.push_str(&format!("    for my $key (sort keys %{}) {{\n", var));
+                                output.push_str(&format!("    for my $key (keys %{}) {{\n", var));
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("        $output .= \"[$key]=\\\"\" . ${}{{$key}} . \"\\\" \";\n", var));
                                 output.push_str(&generator.indent());
@@ -1395,7 +1395,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 }
                 let concat_expr = parts_perl.join(" . ");
                 output.push_str(&format!(
-                    "do {{ my $eval_input = {}; system('bash', '-c', \"eval \\\"$eval_input\\\"\"); $CHILD_ERROR = $? >> 8; }}\n",
+                    "do {{ my $eval_input = {}; system('bash', '-c', \"eval \\\"$eval_input\\\"\"); $CHILD_ERROR = $? >> 8; }};\n",
                     concat_expr
                 ));
             }
