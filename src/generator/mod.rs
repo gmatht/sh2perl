@@ -234,6 +234,10 @@ impl Generator {
         // Pre-analysis pass: identify constants needed for magic numbers
         self.analyze_constants_needed(ast);
 
+        // Pre-analysis pass: scan test expressions for shell variable references
+        // and add them to function_level_vars so they get proper `my` declarations.
+        self.analyze_test_expression_vars(ast);
+
 
 
         // In inline mode, skip the script header and just generate the command code
@@ -352,8 +356,12 @@ impl Generator {
         // used in $((...)) with $ prefix causes a syntax error.  By leaving the
         // Perl variable undef, subsequent arithmetic can detect the uninitialized
         // state and match bash's error behaviour (no stdout assignment).
+        // Also declare array (@) and hash (%) forms for variables that may be
+        // accessed with different sigils in different contexts (e.g., $array vs @array).
         for var in &self.function_level_vars {
             output.push_str(&format!("my ${};\n", var));
+            output.push_str(&format!("my @{};\n", var));
+            output.push_str(&format!("my %{};\n", var));
         }
         if !self.function_level_vars.is_empty() {
             output.push_str("\n");
@@ -663,6 +671,12 @@ impl Generator {
                 {
                     output.push_str(&self.indent());
                     output.push_str(&format!("my ${};\n", assignment.variable));
+                    // Also declare @ and % forms to handle potential array/hash access
+                    // to the same variable (e.g., $result[$i] and $result{"i"})
+                    output.push_str(&self.indent());
+                    output.push_str(&format!("my @{};\n", assignment.variable));
+                    output.push_str(&self.indent());
+                    output.push_str(&format!("my %{};\n", assignment.variable));
                     self.declared_locals.insert(assignment.variable.clone());
                 }
             }
@@ -1245,6 +1259,122 @@ impl Generator {
                     }
                 }
             }
+        }
+    }
+
+    /// Pre-scan: walk all commands and collect variable references from TestExpression nodes.
+    /// This ensures variables used only in test expressions (like `$var`, `$file`)
+    /// get proper `my` declarations at the top of the generated program.
+    fn analyze_test_expression_vars(&mut self, ast: &[Command]) {
+        fn scan_command(test_self: &mut Generator, cmd: &Command) {
+            match cmd {
+                Command::If(if_stmt) => {
+                    scan_command(test_self, &if_stmt.condition);
+                    scan_command(test_self, &if_stmt.then_branch);
+                    if let Some(else_branch) = &if_stmt.else_branch {
+                        scan_command(test_self, else_branch);
+                    }
+                }
+                Command::While(while_loop) => {
+                    scan_command(test_self, &while_loop.condition);
+                    for c in &while_loop.body.commands {
+                        scan_command(test_self, c);
+                    }
+                }
+                Command::For(for_loop) => {
+                    for c in &for_loop.body.commands {
+                        scan_command(test_self, c);
+                    }
+                }
+                Command::CStyleFor(for_loop) => {
+                    for c in &for_loop.body.commands {
+                        scan_command(test_self, c);
+                    }
+                }
+                Command::Case(case_stmt) => {
+                    for case in &case_stmt.cases {
+                        for c in &case.body {
+                            scan_command(test_self, c);
+                        }
+                    }
+                }
+                Command::Function(func) => {
+                    for c in &func.body.commands {
+                        scan_command(test_self, c);
+                    }
+                }
+                Command::Block(block) => {
+                    for c in &block.commands {
+                        scan_command(test_self, c);
+                    }
+                }
+                Command::Subshell(c) => scan_command(test_self, c),
+                Command::Pipeline(p) => {
+                    for c in &p.commands {
+                        scan_command(test_self, c);
+                    }
+                }
+                Command::And(l, r) => {
+                    scan_command(test_self, l);
+                    scan_command(test_self, r);
+                }
+                Command::Or(l, r) => {
+                    scan_command(test_self, l);
+                    scan_command(test_self, r);
+                }
+                Command::Redirect(r) => scan_command(test_self, &r.command),
+                Command::Background(c) => scan_command(test_self, c),
+                Command::TestExpression(te) => {
+                    // Extract $var or ${var} references from the test expression
+                    let expr = &te.expression;
+                    let mut i = 0;
+                    let chars: Vec<char> = expr.chars().collect();
+                    while i < chars.len() {
+                        if chars[i] == '$' && i + 1 < chars.len() {
+                            if chars[i + 1] == '{' {
+                                // ${...} variable
+                                if let Some(end) = expr[i + 2..].find('}') {
+                                    let var_name = &expr[i + 2..i + 2 + end];
+                                    // Strip bash operators like :-default, #pattern, etc.
+                                    let base_name = var_name.split(|c: char| c == ':' || c == '#' || c == '%' || c == '/' || c == '!' || c == '^' || c == ',')
+                                        .next()
+                                        .unwrap_or(var_name)
+                                        .to_string();
+                                    // Strip leading ! or # (for indirection or length)
+                                    let clean_name = base_name.trim_start_matches('!').trim_start_matches('#').to_string();
+                                    // Strip array indices like [i], [@], [*]
+                                    let clean_name = if let Some(bracket_pos) = clean_name.find('[') {
+                                        clean_name[..bracket_pos].to_string()
+                                    } else {
+                                        clean_name
+                                    };
+                                    if !clean_name.is_empty() && clean_name.as_bytes()[0].is_ascii_alphabetic() {
+                                        test_self.function_level_vars.insert(clean_name);
+                                    }
+                                    i = i + 2 + end + 1;
+                                    continue;
+                                }
+                            } else if chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_' {
+                                // $identifier variable
+                                let start = i + 1;
+                                let mut end = start;
+                                while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                                    end += 1;
+                                }
+                                let var_name: String = chars[start..end].iter().collect();
+                                test_self.function_level_vars.insert(var_name);
+                                i = end;
+                                continue;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for cmd in ast {
+            scan_command(self, cmd);
         }
     }
 
