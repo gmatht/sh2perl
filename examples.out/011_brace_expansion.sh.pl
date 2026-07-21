@@ -22,22 +22,7 @@ print "1 2 3 4 5\n";
 print "a b c\n";
 print "00 02 04\n";
 print "== Advanced brace expansion ==\n";
-my @combinations = (
-    ['a', '1'],
-    ['a', '2'],
-    ['a', '3'],
-    ['b', '1'],
-    ['b', '2'],
-    ['b', '3'],
-    ['c', '1'],
-    ['c', '2'],
-    ['c', '3'],
-);
-my @all_combinations;
-for my $combo (@combinations) {
-push @all_combinations, join("", @$combo);
-}
-print join(" ", @all_combinations) . "\n";
+print join(q[ ], ('a' . '1', 'a' . '2', 'a' . '3', 'b' . '1', 'b' . '2', 'b' . '3', 'c' . '1', 'c' . '2', 'c' . '3')) . "\n";
 $CHILD_ERROR = 0;
 print "1 3 5 7 9\n";
 print "a d g j m p s v y\n";

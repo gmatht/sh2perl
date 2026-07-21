@@ -1979,166 +1979,311 @@ fn handle_brace_expansion_for_command(
     }
 }
 
-/// Generate cartesian product for multiple brace expansions in echo commands
+/// Generate cartesian product for multiple brace expansions in echo commands.
+/// Matches bash echo semantics: a run of consecutive literals and brace
+/// expansions (all forming one word after expansion) is expanded into
+/// multiple space-separated echo arguments.
 fn generate_cartesian_product_for_echo(generator: &mut Generator, args: &[Word]) -> String {
     let mut output = String::new();
 
-    // Collect all brace expansions and their expanded values
-    let mut expansions: Vec<Vec<String>> = Vec::new();
-    let mut non_brace_args: Vec<String> = Vec::new();
+    // Parse args into groups.  A group is either:
+    // - Standalone: a single non-brace arg that is not adjacent to any BraceExpansion
+    // - Compound: a sequence of literals and BraceExpansions that form a single
+    //   word after expansion (they produce a cartesian product)
+    enum Group {
+        Standalone(String),
+        Compound(Vec<Part>),
+    }
+    enum Part {
+        Fixed(String),
+        Variable(Vec<String>),
+    }
 
-    for arg in args {
-        match arg {
-            Word::BraceExpansion(items, _) => {
-                let mut expanded = Vec::new();
-                for item in &items.items {
-                    match item {
-                        BraceItem::Range(range) => {
-                            // Handle numeric ranges like {1..5} or {001..005}
-                            if let (Ok(start), Ok(end)) =
-                                (range.start.parse::<i32>(), range.end.parse::<i32>())
-                            {
-                                let step = range
-                                    .step
-                                    .as_ref()
-                                    .and_then(|s| s.parse::<i32>().ok())
-                                    .unwrap_or(1);
-                                let mut current = start;
-
-                                // Check if we need to preserve leading zeros
-                                let format_width =
-                                    if range.start.starts_with('0') && range.start.len() > 1 {
-                                        Some(range.start.len())
-                                    } else {
-                                        None
-                                    };
-
-                                while if step > 0 {
-                                    current <= end
-                                } else {
-                                    current >= end
-                                } {
-                                    let formatted = if let Some(width) = format_width {
-                                        format!("{:0width$}", current, width = width)
-                                    } else {
-                                        current.to_string()
-                                    };
-                                    expanded.push(formatted);
-                                    current += step;
-                                }
-                            } else {
-                                // Handle character ranges like {a..c}
-                                if let (Some(start_char), Some(end_char)) =
-                                    (range.start.chars().next(), range.end.chars().next())
-                                {
-                                    let step = range
-                                        .step
-                                        .as_ref()
-                                        .and_then(|s| s.parse::<i32>().ok())
-                                        .unwrap_or(1);
-                                    let mut current = start_char as i32;
-                                    let end_code = end_char as i32;
-                                    while if step > 0 {
-                                        current <= end_code
-                                    } else {
-                                        current >= end_code
-                                    } {
-                                        if let Some(c) = char::from_u32(current as u32) {
-                                            expanded.push(c.to_string());
-                                        }
-                                        current += step;
-                                    }
-                                }
-                            }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if matches!(args[i], Word::BraceExpansion(..)) {
+            // Start a compound group: consume all consecutive args that form
+            // one expanded word (literals interleaved with brace expansions).
+            let mut parts = Vec::new();
+            while i < args.len() {
+                match &args[i] {
+                    Word::BraceExpansion(items, _) => {
+                        let expanded = expand_brace_items(items);
+                        if !expanded.is_empty() {
+                            parts.push(Part::Variable(expanded));
                         }
-                        BraceItem::Literal(s) => {
-                            expanded.push(s.clone());
+                        i += 1;
+                    }
+                    Word::Literal(_, _)
+                    | Word::StringInterpolation(_, _)
+                    | Word::Variable(_, _, _)
+                    | Word::Array(_, _, _) => {
+                        // Check if the next arg is a BraceExpansion; if so,
+                        // this literal is part of the same compound word.
+                        if i + 1 < args.len()
+                            && matches!(args[i + 1], Word::BraceExpansion(..))
+                        {
+                            let perl = generator.word_to_perl(&args[i]);
+                            parts.push(Part::Fixed(perl));
+                            i += 1;
+                        } else if !parts.is_empty() {
+                            // We are inside a compound group, finish it
+                            break;
+                        } else {
+                            // Standalone literal, not adjacent to brace expansion
+                            break;
                         }
-                        BraceItem::Sequence(seq) => {
-                            // Handle sequence items like {one,two,three}
-                            for item in seq {
-                                expanded.push(item.clone());
-                            }
-                        }
-                        BraceItem::Nested(_) => todo!(),
-                        BraceItem::Compound(_) => todo!(),
+                    }
+                    _ => {
+                        break;
                     }
                 }
-                expansions.push(expanded);
             }
-            _ => {
-                // Convert non-brace arguments to Perl strings
-                non_brace_args.push(generator.word_to_perl(arg));
+            if !parts.is_empty() {
+                groups.push(Group::Compound(parts));
+            }
+        } else {
+            // Non-brace arg. Check if the NEXT arg is a BraceExpansion.
+            // If so, start a compound group that includes this arg.
+            if i + 1 < args.len() && matches!(args[i + 1], Word::BraceExpansion(..)) {
+                let mut parts = Vec::new();
+                // This literal is part of a compound word
+                let perl = generator.word_to_perl(&args[i]);
+                parts.push(Part::Fixed(perl));
+                i += 1;
+                // Now consume all consecutive brace expansions and adjacent literals
+                while i < args.len() {
+                    match &args[i] {
+                        Word::BraceExpansion(items, _) => {
+                            let expanded = expand_brace_items(items);
+                            if !expanded.is_empty() {
+                                parts.push(Part::Variable(expanded));
+                            }
+                            i += 1;
+                        }
+                        Word::Literal(_, _)
+                        | Word::StringInterpolation(_, _)
+                        | Word::Variable(_, _, _)
+                        | Word::Array(_, _, _) => {
+                            if i + 1 < args.len()
+                                && matches!(args[i + 1], Word::BraceExpansion(..))
+                            {
+                                let perl = generator.word_to_perl(&args[i]);
+                                parts.push(Part::Fixed(perl));
+                                i += 1;
+                            } else {
+                                // End of compound word
+                                break;
+                            }
+                        }
+                        _ => {
+                            break;
+                        }
+                    }
+                }
+                groups.push(Group::Compound(parts));
+            } else {
+                // Standalone non-brace argument
+                let perl = generator.word_to_perl(&args[i]);
+                groups.push(Group::Standalone(perl));
+                i += 1;
             }
         }
     }
 
-    if expansions.is_empty() {
-        // No brace expansions, fall back to simple joining
+    // If there are no compound groups, fall back to simple joining
+    let has_compound = groups.iter().any(|g| matches!(g, Group::Compound(_)));
+    if !has_compound {
         let args_str = args
             .iter()
             .map(|arg| generator.word_to_perl(arg))
             .collect::<Vec<_>>()
-            .join(" . \" \" . ");
+            .join(" . q{ } . ");
         output.push_str(&generator.indent());
         output.push_str(&format!("print {} . \"\\n\";\n", args_str));
         return output;
     }
 
-    // Generate cartesian product
-    let mut combinations = vec![Vec::new()];
+    // Build output pieces for each group
+    let mut output_pieces: Vec<String> = Vec::new();
 
-    for expansion in &expansions {
-        let mut new_combinations = Vec::new();
-        for combination in &combinations {
-            for item in expansion {
-                let mut new_combo = combination.clone();
-                new_combo.push(item.clone());
-                new_combinations.push(new_combo);
+    for group in &groups {
+        match group {
+            Group::Standalone(perl) => {
+                output_pieces.push(perl.clone());
+            }
+            Group::Compound(parts) => {
+                // Collect Variable values for cartesian product
+                let var_values: Vec<&Vec<String>> = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Part::Variable(v) => Some(v),
+                        _ => None,
+                    })
+                    .collect();
+
+                // Generate cartesian product
+                let mut var_combinations = vec![Vec::new()];
+                for values in &var_values {
+                    let mut new_combinations = Vec::new();
+                    for combination in &var_combinations {
+                        for val in *values {
+                            let mut new_combo = combination.clone();
+                            new_combo.push(val.clone());
+                            new_combinations.push(new_combo);
+                        }
+                    }
+                    var_combinations = new_combinations;
+                }
+
+                // Build each combination as a Perl expression
+                let mut combo_exprs: Vec<String> = Vec::new();
+                for var_combo in &var_combinations {
+                    let mut combo_parts = Vec::new();
+                    let mut var_idx = 0;
+                    for part in parts {
+                        match part {
+                            Part::Fixed(perl) => {
+                                combo_parts.push(perl.clone());
+                            }
+                            Part::Variable(_) => {
+                                combo_parts.push(format!("'{}'", var_combo[var_idx]));
+                                var_idx += 1;
+                            }
+                        }
+                    }
+                    let expr = if combo_parts.len() == 1 {
+                        combo_parts[0].clone()
+                    } else {
+                        combo_parts.join(" . ")
+                    };
+                    combo_exprs.push(expr);
+                }
+
+                if combo_exprs.is_empty() {
+                    // Shouldn't happen, but handle gracefully
+                    output_pieces.push("\'\'".to_string());
+                } else {
+                    // Join all combinations with space (echo separates arguments with space)
+                    let joined = format!(
+                        "join(q[ ], ({}))",
+                        combo_exprs.join(", ")
+                    );
+                    output_pieces.push(joined);
+                }
             }
         }
-        combinations = new_combinations;
     }
 
-    // Generate Perl code to print all combinations
-    output.push_str(&generator.indent());
-    output.push_str("my @combinations = (\n");
-
-    for combination in &combinations {
+    if output_pieces.is_empty() {
         output.push_str(&generator.indent());
-        output.push_str("    ");
-
-        let mut combo_parts = Vec::new();
-
-        // Add non-brace arguments at the beginning
-        for non_brace in &non_brace_args {
-            combo_parts.push(non_brace.clone());
-        }
-
-        // Add brace expansion values
-        for item in combination {
-            combo_parts.push(format!("'{}'", item));
-        }
-
-        output.push_str(&format!("[{}],\n", combo_parts.join(", ")));
+        output.push_str("print \"\\n\";\n");
+    } else {
+        let final_expr = output_pieces.join(" . q[ ] . ");
+        output.push_str(&generator.indent());
+        output.push_str(&format!("print {} . \"\\n\";\n", final_expr));
     }
-
-    output.push_str(&generator.indent());
-    output.push_str(");\n");
-
-    output.push_str(&generator.indent());
-    output.push_str("my @all_combinations;\n");
-    output.push_str(&generator.indent());
-    output.push_str("for my $combo (@combinations) {\n");
-    output.push_str(&generator.indent());
-    output.push_str(&generator.indent());
-    output.push_str("push @all_combinations, join(\"\", @$combo);\n");
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
-    output.push_str(&generator.indent());
-    output.push_str("print join(\" \", @all_combinations) . \"\\n\";\n");
 
     output
+}
+
+/// Convert a BraceItem back to its bracket-text representation for literal use.
+pub fn item_to_bracket_text(item: &BraceItem) -> String {
+    match item {
+        BraceItem::Literal(s) => s.clone(),
+        BraceItem::Range(range) => {
+            let start = &range.start;
+            let end = &range.end;
+            if let Some(step) = &range.step {
+                format!("{}..{}..{}", start, end, step)
+            } else {
+                format!("{}..{}", start, end)
+            }
+        }
+        BraceItem::Sequence(seq) => seq.join(","),
+        BraceItem::Nested(_) => "{...}".to_string(),
+        BraceItem::Compound(items) => {
+            let inner: Vec<String> = items.iter().map(item_to_bracket_text).collect();
+            inner.join(",")
+        }
+    }
+}
+
+/// Expand a BraceExpansion into its list of string values.
+fn expand_brace_items(items: &BraceExpansion) -> Vec<String> {
+    let mut expanded = Vec::new();
+    // In bash, a brace expansion with a single Range item is the only
+    // case where ranges are actually expanded. When there are multiple
+    // items (e.g. {1..10,20,30..40}), all items are treated as literals.
+    let is_single_range = items.items.len() == 1
+        && matches!(items.items.first(), Some(BraceItem::Range(_)));
+    for item in &items.items {
+        match item {
+            BraceItem::Range(range) if is_single_range => {
+                // Handle numeric ranges like {1..5} or {001..005}
+                if let (Ok(start), Ok(end)) =
+                    (range.start.parse::<i32>(), range.end.parse::<i32>())
+                {
+                    let step = range
+                        .step
+                        .as_ref()
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(1);
+                    let mut current = start;
+                    let format_width =
+                        if range.start.starts_with('0') && range.start.len() > 1 {
+                            Some(range.start.len())
+                        } else {
+                            None
+                        };
+                    while if step > 0 { current <= end } else { current >= end } {
+                        let formatted = if let Some(width) = format_width {
+                            format!("{:0width$}", current, width = width)
+                        } else {
+                            current.to_string()
+                        };
+                        expanded.push(formatted);
+                        current += step;
+                    }
+                } else {
+                    // Handle character ranges like {a..c}
+                    if let (Some(start_char), Some(end_char)) =
+                        (range.start.chars().next(), range.end.chars().next())
+                    {
+                        let step = range
+                            .step
+                            .as_ref()
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(1);
+                        let mut current = start_char as i32;
+                        let end_code = end_char as i32;
+                        while if step > 0 { current <= end_code } else { current >= end_code } {
+                            if let Some(c) = char::from_u32(current as u32) {
+                                expanded.push(c.to_string());
+                            }
+                            current += step;
+                        }
+                    }
+                }
+            }
+            BraceItem::Range(_) => {
+                // Mixed brace group: treat range as literal string
+                expanded.push(item_to_bracket_text(item));
+            }
+            BraceItem::Literal(s) => {
+                expanded.push(s.clone());
+            }
+            BraceItem::Sequence(seq) => {
+                for seq_item in seq {
+                    expanded.push(seq_item.clone());
+                }
+            }
+            BraceItem::Nested(_) => todo!(),
+            BraceItem::Compound(_) => todo!(),
+        }
+    }
+    expanded
 }
 
 /// Check if a variable's value references another env var.
