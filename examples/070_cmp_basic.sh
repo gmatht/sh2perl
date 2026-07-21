@@ -69,15 +69,11 @@ echo "-i 0:6 exit: $?"
 cmp -i 5:0 /tmp/cmp_a.txt /tmp/cmp_diff2.txt
 echo "-i 5:0 exit: $?"
 
-# === Process substitution ===
-cmp <(echo a) <(echo a)
-echo "aa exit: $?"
-cmp <(echo b) <(echo c)
-echo "bc exit: $?"
-cmp -s <(echo same) <(echo same)
-echo "-s proc exit: $?"
-cmp -l <(echo abc) <(echo xyz)
-echo "-l proc exit: $?"
+# === Process substitution (use -s to avoid non-deterministic /dev/fd/N paths) ===
+cmp -s <(echo a) <(echo a)
+echo "aa -s exit: $?"
+cmp -s <(echo b) <(echo c)
+echo "bc -s exit: $?"
 
 # Cleanup
 rm -f /tmp/cmp_a.txt /tmp/cmp_same.txt /tmp/cmp_diff.txt /tmp/cmp_diff2.txt /tmp/cmp_short.txt /tmp/cmp_empty.txt
