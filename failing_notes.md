@@ -176,12 +176,20 @@ this test.
 
 ## Still failing tests (8)
 
-### 063_09_complex_function_parameter_handling.sh
-`let` is now handled natively (no more timeout). The remaining failure is
-due to a pre-existing parser bug: the `--flag1` argument in the function
-call `complex_function --flag1 --option1=value1 -abc` is lost during
-tokenisation (double `--` → two `Minus` tokens, the first bare `-` may
-be dropped by the argument parser).
+### 063_09_complex_function_parameter_handling.sh (FIXED)
+Fixed the `--flag1` argument being lost during tokenisation by changing
+the `LongOption` regex in `src/lexer.rs` to make the `=value` part optional
+so that `--flag1` is tokenised as a single `LongOption` token instead of
+failing to tokenise at all (logos error).  Also added `${var:offset:length}`
+to `substr()` translation in `generate_assignment` for the `"${flags:j:1}"`
+key in associative array assignments, and use `{}` sigil for associative arrays.
+
+Remaining issues (pre-existing):
+- `${var#pattern}` prefix removal (e.g. `${args[i]#--}`) is not parsed:
+  `parse_parameter_expansion_content` returns early with `array access`
+  (`args[i]`) before checking for `#` prefix operator, so `#--` is ignored.
+  This causes the `--` prefix on `--flag1` and `-` prefix on `-abc` to be
+  kept, making the result 5 options instead of 4.
 
 ### 063_12_complex_eval.sh
 `eval "result=\$(( \${var:-0} + ... ))"` — the `\$` is now properly treated
