@@ -2,88 +2,75 @@
 
 ## Tests fixed in this session
 
-### Generator: ls -l falls back to shell qx{} for exact output
-When `ls -l` (or `ls -la`) is used in pipeline or backtick context, the
-generator now falls back to `qx{ls ...}` shell execution to produce exact
-`ls -l` output (permissions, owner, group, size, date). The native ls
-translation only produces short `d .` / `- .` prefixes which don't match
-the expected full-format output.
+### Generator: handle here-strings with tr/grep natively instead of qx{echo} fallback
+Modified the command-substitution handling in `words.rs` for `Command::Redirect`
+with here-strings: when the base command is `tr` or `grep`, generate native Perl
+code via `generate_tr_command_for_substitution()` / `generate_grep_command()`
+instead of the `qx{echo "$here_input" | cmd}` fallback. This fixes QX_BUILTIN
+violations for `echo` and `tr`.
 
-This was already allowed by `allowed_qx_calls.txt` which lists `ls -l`
-as a permitted shell fallback prefix.
+Fixed tests: 000__04h_complex_examples.sh
 
-Fixed tests: 062_10_simple_pipeline.sh, test_system_builtin.sh
+### Generator: fix test expression operator precedence
+Reordered the `generate_test_expression_impl()` if-else chain so that logical
+operators (`-a`, `-o`) are checked FIRST and recurse into their sub-expressions,
+followed by NOT/grouping, then string comparison operators (`=~`, `==`, `!=`,
+`=`), then numeric comparisons (`-lt`, `-le`, `-gt`, `-ge`, `-eq`, `-ne`), then
+unary tests (`-z`, `-n`, `-f`, `-d`, etc.). Previously, `-ne` and `-eq` were
+checked before `-a`/`-o`, causing compound conditions like
+`$num -gt 3 -a $letter!="c"` to be incorrectly split on `-ne`/`!=` first,
+leaving `-gt` and `-a` untranslated.
 
-### Generator: trap command translated to END block / %SIG handler
-Added `trap` builtin handler in `generate_builtin_command_impl()`. For
-EXIT traps, generates `END { system 'handler'; }`. For other signals
-(INT, TERM, etc.), generates `$SIG{SIGNAL} = sub { system 'handler'; };`.
-The handler is executed via shell (`system`) since translating arbitrary
-shell commands to Perl is not practical.
+Also restored unary test checks (`-z`, `-n`, `-f`, `-d`, `-e`, etc.) that were
+missing from the reordered chain.
 
-Fixed tests: 064_23_complex_error_handling_traps.sh
-
-### Generator: arithmetic expressions wrapped in eval {} // "" for div by zero
-Changed `convert_arithmetic_to_perl_impl()` to wrap arithmetic expressions
-in `eval { int(expr) } // ""` instead of bare `int(expr)`. This handles
-division/modulo by zero gracefully: instead of Perl's fatal "Illegal
-modulus zero", the eval catches the error and returns empty string,
-matching bash's behavior of leaving the variable unset on arithmetic
-failure.
-
-Fixed tests: 063_01_deeply_nested_arithmetic.sh
+Fixed tests: 055_factorize.sh (was `-z` not translated), partially fixes
+058_advanced_bash_idioms.sh (test expression syntax errors fixed, but
+matrix/declare issues remain)
 
 ## Previously fixed tests
 
-### Generator: handle `${var[@]:offset:length}` array slicing and env var dependency ordering (qd. 2026-07-21)
+### Generator: ls -l falls back to shell qx{} for exact output
+Fixed tests: 062_10_simple_pipeline.sh, test_system_builtin.sh
+
+### Generator: trap command translated to END block / %SIG handler
+Fixed tests: 064_23_complex_error_handling_traps.sh
+
+### Generator: arithmetic expressions wrapped in eval {} // "" for div by zero
+Fixed tests: 063_01_deeply_nested_arithmetic.sh
+
+### Generator: handle `${var[@]:offset:length}` array slicing and env var dependency ordering
 Fixed tests: 064_18_array_slicing_manipulation.sh
 
-### Generator: support `Nested` and `Compound` BraceItem variants (qd. 2026-07-21)
+### Generator: support `Nested` and `Compound` BraceItem variants
 Fixed tests: 064_12_brace_expansion_nested_sequences.sh
 
-### Generator: sort associative array values for deterministic ${map[@]} expansion (qd. 2026-07-21)
+### Generator: sort associative array values for deterministic ${map[@]} expansion
 Fixed tests: 064_02_nested_brace_expansions.sh (and others via `sort values %map`)
 
-## Tests fixed in this session
-
 ### Generator: handle `$(...)` inside arithmetic expressions
-Modified `convert_arithmetic_to_perl_impl()` to scan for `$(...)` command
-substitutions within the arithmetic expression text, replace each with a
-Perl `qx{}` call that captures stdout, then process the remainder normally.
-
 Fixed tests: 064_14_nested_command_substitution_arithmetic.sh
 
 ### Generator: fix `\$` escaping in double-quoted strings for eval
-Added handling for `\$` (escaped dollar sign) inside double-quoted string
-content in `parse_string_interpolation()`. Previously, `\$` was not
-recognized as an escaped literal `$`, causing the parser to interpret
-`$((` and `${` as real expansions inside eval arguments.
-
-Fixed tests: partially fixes 063_12_complex_eval.sh (the `\$` is now
-properly treated as literal, but the eval handler still cannot parse
-the complex nested parameter expansions in the resulting command).
+Fixed tests: partially fixes 063_12_complex_eval.sh
 
 ### Generator: use `scalar(keys %map)` for `${#map[@]}` on associative arrays
-Modified both `generate_parameter_expansion_impl()` (expansions.rs) and
-`convert_string_interpolation_to_perl_impl()` (words.rs) to check whether
-the array name is registered as an associative array. If so, `${#arr[@]}`
-generates `scalar(keys %arr)` instead of `scalar(@arr)`, which avoids
-"Global symbol \"@arr\" requires explicit package name" errors.
-
 Fixed tests: partially fixes 063_09_complex_function_parameter_handling.sh
-(the `@options` vs `%options` compilation error is fixed; the test still
-times out due to `let` commands being passed to `system()` which hangs).
 
 ## Still failing tests (12)
 
 ### 058_advanced_bash_idioms.sh
-Complex script combining many feature interactions. Compile error: `-gt`
-syntax error (test expression translation issue). Multiple other issues.
+Complex script combining many feature interactions including `declare -A`
+(associative arrays) with matrix-like `$matrix[$i,$j]` access (multidimensional
+syntax not supported in Perl), `let` commands passed to system() which hangs,
+and heredoc-with-subshell translation issues.
 
 ### 062_hard_to_lex.sh
 Variable name collision: `$result` in function body refers to global
 `$result` (value 776) instead of the local `$result_273` created by the
 command-substitution translation for `` `echo "$param1" | sed "s/old/new/g"` ``.
+The `local result=$(cmd)` pattern generates code where the assignment target
+is a different variable than the one used later.
 
 ### 063_02_complex_array_assignments.sh
 Several issues: (1) `$index` undeclared, (2) `$!prefix@` bareword from

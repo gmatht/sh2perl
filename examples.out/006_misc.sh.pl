@@ -21,33 +21,33 @@ do {
 };
 print "== Simple pipeline ==\n";
 {
-    my $output_143 = q{};
-    my $output_printed_143;
-    my $pipeline_success_143 = 1;
-    $output_143 .= 'alpha beta' . "\n";
-if ( !($output_143 =~ m{\n\z}msx) ) { $output_143 .= "\n"; }
+    my $output_145 = q{};
+    my $output_printed_145;
+    my $pipeline_success_145 = 1;
+    $output_145 .= 'alpha beta' . "\n";
+if ( !($output_145 =~ m{\n\z}msx) ) { $output_145 .= "\n"; }
 $CHILD_ERROR = 0;
 
-        my $grep_result_143_1;
-    my @grep_lines_143_1 = split /\n/msx, $output_143;
-    my @grep_filtered_143_1 = grep { /beta/msx } @grep_lines_143_1;
-    $grep_result_143_1 = join "\n", @grep_filtered_143_1;
-    if (!($grep_result_143_1 =~ m{\n\z}msx || $grep_result_143_1 eq q{})) {
-    $grep_result_143_1 .= "\n";
+        my $grep_result_145_1;
+    my @grep_lines_145_1 = split /\n/msx, $output_145;
+    my @grep_filtered_145_1 = grep { /beta/msx } @grep_lines_145_1;
+    $grep_result_145_1 = join "\n", @grep_filtered_145_1;
+    if (!($grep_result_145_1 =~ m{\n\z}msx || $grep_result_145_1 eq q{})) {
+    $grep_result_145_1 .= "\n";
     }
-    $CHILD_ERROR = scalar @grep_filtered_143_1 > 0 ? 0 : 1;
-    $output_143 = $grep_result_143_1;
-    $output_143 = $grep_result_143_1;
-    if ((scalar @grep_filtered_143_1) == 0) {
-        $pipeline_success_143 = 0;
+    $CHILD_ERROR = scalar @grep_filtered_145_1 > 0 ? 0 : 1;
+    $output_145 = $grep_result_145_1;
+    $output_145 = $grep_result_145_1;
+    if ((scalar @grep_filtered_145_1) == 0) {
+        $pipeline_success_145 = 0;
     }
-    if ($output_143 ne q{} && !defined $output_printed_143) {
-        print $output_143;
-        if (!($output_143 =~ m{\n\z}msx)) {
+    if ($output_145 ne q{} && !defined $output_printed_145) {
+        print $output_145;
+        if (!($output_145 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_143 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_145 ) { $main_exit_code = 1; }
     }
 
 exit $main_exit_code;

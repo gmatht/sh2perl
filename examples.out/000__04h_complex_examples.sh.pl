@@ -170,7 +170,54 @@ my $process_result = do { my $command = "bash -c 'comm -23 <(sort file1.txt) <(s
 print "Process substitution result:\n";
 print $process_result;
 if ( !( ($process_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $here_string_result = do { my $here_input = "hello world"; chomp(my $result = qx{echo "$here_input" | tr a-z A-Z}); $CHILD_ERROR = $? >> 8; $result; };
+my $here_string_result = do { my $input_data = "hello world"; my $set1_116 = 'a-z';
+my $set2_116 = 'A-Z';
+my $input_116 = $input_data;
+# Expand character ranges for tr command
+my $expanded_set1_116 = $set1_116;
+my $expanded_set2_116 = $set2_116;
+# Handle a-z range in set1
+if ($expanded_set1_116 =~ /a-z/msx) {
+    $expanded_set1_116 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+}
+# Handle A-Z range in set1
+if ($expanded_set1_116 =~ /A-Z/msx) {
+    $expanded_set1_116 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+# Handle [:upper:] POSIX class in set1
+if ($expanded_set1_116 =~ /\[:upper:\]/msx) {
+    $expanded_set1_116 =~ s/\[:upper:\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+# Handle [:lower:] POSIX class in set1
+if ($expanded_set1_116 =~ /\[:lower:\]/msx) {
+    $expanded_set1_116 =~ s/\[:lower:\]/abcdefghijklmnopqrstuvwxyz/msx;
+}
+# Handle a-z range in set2
+if ($expanded_set2_116 =~ /a-z/msx) {
+    $expanded_set2_116 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
+}
+# Handle A-Z range in set2
+if ($expanded_set2_116 =~ /A-Z/msx) {
+    $expanded_set2_116 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+# Handle [:upper:] POSIX class in set2
+if ($expanded_set2_116 =~ /\[:upper:\]/msx) {
+    $expanded_set2_116 =~ s/\[:upper:\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+}
+# Handle [:lower:] POSIX class in set2
+if ($expanded_set2_116 =~ /\[:lower:\]/msx) {
+    $expanded_set2_116 =~ s/\[:lower:\]/abcdefghijklmnopqrstuvwxyz/msx;
+}
+my $tr_result_115 = q{};
+for my $char ( split //msx, $input_116 ) {
+    my $pos_116 = index $expanded_set1_116, $char;
+    if ( $pos_116 >= 0 && $pos_116 < length $expanded_set2_116 ) {
+        $tr_result_115 .= substr $expanded_set2_116, $pos_116, 1;
+    } else {
+        $tr_result_115 .= $char;
+    }
+}
+$tr_result_115 };
 do {
     my $output = "Here string result: $here_string_result";
     print $output;
