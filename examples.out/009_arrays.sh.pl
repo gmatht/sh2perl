@@ -16,7 +16,7 @@ $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== Indexed arrays ==\n";
-my @arr = ("one", "two", "three");
+my @arr = ('one', 'two', 'three');
 print $arr[1];
 if ( !( ($arr[1]) =~ m{\n\z}msx ) ) { print "\n"; }
 print scalar(@arr) . "\n";
@@ -29,8 +29,8 @@ print "\n";
 $CHILD_ERROR = 0;
 print "== Associative arrays ==\n";
 my %map = ();
-$map{"answer"} = '42';
 $map{"foo"} = 'bar';
+$map{"answer"} = '42';
 $map{"two"} = "1 + 1";
 print $map{'foo'};
 if ( !( ($map{'foo'}) =~ m{\n\z}msx ) ) { print "\n"; }

@@ -13,8 +13,14 @@ our $CHILD_ERROR;
 
 $PROGRAM_NAME = 'test_system_builtin.sh';
 print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
-my $result1 = do { my $command = 'ls -la'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
-my $result2 = do {
+my $result1;
+my @result1;
+my %result1;
+$result1 = do { my $command = 'ls -la'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
+my $result2;
+my @result2;
+my %result2;
+$result2 = do {
     require File::Find;
     my @find_results;
     File::Find::find(sub { if ($_ =~ /^.*\.txt$/msx) { push @find_results, $File::Find::name; } }, q{.});

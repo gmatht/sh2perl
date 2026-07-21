@@ -17,7 +17,10 @@ $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== Advanced parameter expansion ==\n";
-my $path = "/tmp/file.txt";
+my $path;
+my @path;
+my %path;
+$path = "/tmp/file.txt";
 do {
     my $output = basename(${path});
     print $output;

@@ -17,7 +17,10 @@ my $MAGIC_5 = 5;
 my $MAGIC_3 = 3;
 
 print "=== Text Processing Commands ===\n";
-my $file_content = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $file_content;
+my @file_content;
+my %file_content;
+$file_content = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_118 = q{};
     my $output_printed_118;
     my $pipeline_success_118 = 1;
@@ -48,7 +51,10 @@ my $file_content = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
 print "First 5 lines of main.rs:\n";
 print $file_content;
 if ( !( ($file_content) =~ m{\n\z}msx ) ) { print "\n"; }
-my $grep_result = do { my $grep_result_119;
+my $grep_result;
+my @grep_result;
+my %grep_result;
+$grep_result = do { my $grep_result_119;
 my @grep_lines_119 = ();
 my @grep_filenames_119 = ();
 if (-e "src/main.rs") {
@@ -75,7 +81,10 @@ $CHILD_ERROR = scalar @grep_filtered_119 > 0 ? 0 : 1;
 print "Lines containing 'fn':\n";
 print $grep_result;
 if ( !( ($grep_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $sed_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $sed_result;
+my @sed_result;
+my %sed_result;
+$sed_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_120 = q{};
     my $output_printed_120;
     my $pipeline_success_120 = 1;
@@ -104,7 +113,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $awk_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $awk_result;
+my @awk_result;
+my %awk_result;
+$awk_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_121 = q{};
     my $output_printed_121;
     my $pipeline_success_121 = 1;
@@ -134,7 +146,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $sort_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $sort_result;
+my @sort_result;
+my %sort_result;
+$sort_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_122 = q{};
     my $output_printed_122;
     my $pipeline_success_122 = 1;
@@ -155,7 +170,10 @@ my $sort_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
 print "Sorted words:\n";
 print $sort_result;
 if ( !( ($sort_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $uniq_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $uniq_result;
+my @uniq_result;
+my %uniq_result;
+$uniq_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_123 = q{};
     my $output_printed_123;
     my $pipeline_success_123 = 1;
@@ -181,19 +199,22 @@ my $uniq_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
 print "Unique words:\n";
 print $uniq_result;
 if ( !( ($uniq_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $line_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $word_count;
+my @word_count;
+my %word_count;
+$word_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_124 = q{};
     my $output_printed_124;
     my $pipeline_success_124 = 1;
-    $output_124 .= "line1\nline2\nline3";
+    $output_124 .= 'Hello World' . "\n";
     if ( !($output_124 =~ m{\n\z}msx) ) { $output_124 .= "\n"; }
     $CHILD_ERROR = 0;
     if ($CHILD_ERROR != 0) { $pipeline_success_124 = 0; }
     $output_124 = do {
             my $_wc_data = $output_124;
-            my $_wc_lines = () = $_wc_data =~ /\n/gsxm;
+            my $_wc_words = scalar split /\s+/msx, $_wc_data;
             my $_wc_result = q{};
-            $_wc_result .= sprintf q{%d}, $_wc_lines;
+            $_wc_result .= sprintf q{%d}, $_wc_words;
             $_wc_result .= "\n";
             $_wc_result;
         };
@@ -201,19 +222,22 @@ my $line_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     $output_124 =~ s/\n+\z//msx;
     $output_124;
 }; $_pipeline_result; };
-my $word_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $line_count;
+my @line_count;
+my %line_count;
+$line_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_125 = q{};
     my $output_printed_125;
     my $pipeline_success_125 = 1;
-    $output_125 .= 'Hello World' . "\n";
+    $output_125 .= "line1\nline2\nline3";
     if ( !($output_125 =~ m{\n\z}msx) ) { $output_125 .= "\n"; }
     $CHILD_ERROR = 0;
     if ($CHILD_ERROR != 0) { $pipeline_success_125 = 0; }
     $output_125 = do {
             my $_wc_data = $output_125;
-            my $_wc_words = scalar split /\s+/msx, $_wc_data;
+            my $_wc_lines = () = $_wc_data =~ /\n/gsxm;
             my $_wc_result = q{};
-            $_wc_result .= sprintf q{%d}, $_wc_words;
+            $_wc_result .= sprintf q{%d}, $_wc_lines;
             $_wc_result .= "\n";
             $_wc_result;
         };
@@ -237,7 +261,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $head_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $head_result;
+my @head_result;
+my %head_result;
+$head_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     do { my $output_126 = q{};
 my $output_printed_126;
 do {
@@ -272,7 +299,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $tail_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $tail_result;
+my @tail_result;
+my %tail_result;
+$tail_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     do { my $output_128 = q{};
 my $output_printed_128;
 do {
@@ -310,7 +340,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $cut_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $cut_result;
+my @cut_result;
+my %cut_result;
+$cut_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_130 = q{};
     my $output_printed_130;
     my $pipeline_success_130 = 1;
@@ -368,7 +401,10 @@ c\n";
     close $original_stdout
       or die "Close failed: $OS_ERROR\n";
 };
-my $paste_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $paste_result;
+my @paste_result;
+my %paste_result;
+$paste_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_132 = q{};
     my $output_printed_132;
     my $pipeline_success_132 = 1;
@@ -475,7 +511,10 @@ date\n";
     close $original_stdout
       or die "Close failed: $OS_ERROR\n";
 };
-my $comm_result = do { my @file1_lines;
+my $comm_result;
+my @comm_result;
+my %comm_result;
+$comm_result = do { my @file1_lines;
 my @file2_lines;
 if (open my $fh1, '<', 'file1.txt') {
     while (my $line = <$fh1>) {
@@ -508,7 +547,10 @@ $comm_output };
 print "Common lines:\n";
 print $comm_result;
 if ( !( ($comm_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $diff_result = do { my $diff_exit_code = 0;
+my $diff_result;
+my @diff_result;
+my %diff_result;
+$diff_result = do { my $diff_exit_code = 0;
 my $diff_output = q{};
 {
     my $diff_cmd = 'diff';
@@ -530,7 +572,10 @@ $diff_output;
 print "File differences:\n";
 print $diff_result;
 if ( !( ($diff_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $tr_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $tr_result;
+my @tr_result;
+my %tr_result;
+$tr_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $input_data = ("HELLO WORLD") . "\n";
     my $set1_134 = 'A-Z';
 my $set2_134 = 'a-z';
@@ -589,7 +634,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $xargs_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $xargs_result;
+my @xargs_result;
+my %xargs_result;
+$xargs_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_135 = q{};
     my $output_printed_135;
     my $pipeline_success_135 = 1;

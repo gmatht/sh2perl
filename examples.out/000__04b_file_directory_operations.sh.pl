@@ -13,7 +13,10 @@ our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04b_file_directory_operations.sh';
 print "=== File and Directory Operations ===\n";
-my $file_list = do {
+my $file_list;
+my @file_list;
+my %file_list;
+$file_list = do {
     my @ls_files_45 = ();
     if ( -f q{.} ) {
         push @ls_files_45, q{.};
@@ -29,10 +32,14 @@ my $file_list = do {
     }
     (@ls_files_45 ? join("\n", @ls_files_45) . "\n" : q{});
 };
+;
 print "File listing:\n";
 print $file_list;
 if ( !( ($file_list) =~ m{\n\z}msx ) ) { print "\n"; }
-my $found_files = do {
+my $found_files;
+my @found_files;
+my %found_files;
+$found_files = do {
     require File::Find;
     my @find_results;
     File::Find::find(sub { if (-f $_ && $_ =~ /^.*\.sh$/msx) { push @find_results, $File::Find::name; } }, q{.});

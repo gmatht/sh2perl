@@ -26,7 +26,10 @@ do {
     close $original_stdout
       or die "Close failed: $OS_ERROR\n";
 };
-my $sha256_result = do {
+my $sha256_result;
+my @sha256_result;
+my %sha256_result;
+$sha256_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha256_hex(
@@ -48,6 +51,7 @@ my $sha256_result = do {
     }
     join("\n", @results) . "\n";
 };
+;
 do {
     my $output = "SHA256 result: $sha256_result";
     print $output;
@@ -56,7 +60,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $sha512_result = do {
+my $sha512_result;
+my @sha512_result;
+my %sha512_result;
+$sha512_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha512_hex(
@@ -78,6 +85,7 @@ my $sha512_result = do {
     }
     join("\n", @results) . "\n";
 };
+;
 do {
     my $output = "SHA512 result: $sha512_result";
     print $output;
@@ -86,7 +94,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $strings_result;
+my @strings_result;
+my %strings_result;
+$strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_110 = q{};
     my $output_printed_110;
     my $pipeline_success_110 = 1;

@@ -752,6 +752,16 @@ impl Generator {
                     }
                 }
                 AssignmentOperator::PlusAssign => {
+                    if !self.declared_locals.contains(&assignment.variable)
+                        && !self.function_level_vars.contains(&assignment.variable)
+                    {
+                        output.push_str(&self.indent());
+                        output.push_str(&format!("my ${};", assignment.variable));
+                        output.push_str(
+                            "\n",
+                        );
+                        self.declared_locals.insert(assignment.variable.clone());
+                    }
                     // For ArraySlice values like `${primes[@]:0:1}`, the old env-var
                     // chain dropped them entirely.  Emit a no-op comment to match.
                     if matches!(&assignment.value, Word::ArraySlice(_, _, _, _)) {
@@ -1890,6 +1900,7 @@ impl Generator {
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_digest_sha(left) || self.command_needs_digest_sha(right)
             }
+            Command::Assignment(assign) => self.word_needs_digest_sha(&assign.value),
             Command::Redirect(redirect_cmd) => self.command_needs_digest_sha(&redirect_cmd.command),
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {
@@ -2137,6 +2148,7 @@ impl Generator {
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_capture_tiny(left) || self.command_needs_capture_tiny(right)
             }
+            Command::Assignment(assign) => self.word_needs_capture_tiny(&assign.value),
             Command::Redirect(redirect_cmd) => {
                 self.command_needs_capture_tiny(&redirect_cmd.command)
             }

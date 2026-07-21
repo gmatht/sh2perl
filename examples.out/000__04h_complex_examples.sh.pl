@@ -30,7 +30,10 @@ my @current_user;
 my %current_user;
 
 print "=== Complex Backtick Examples ===\n";
-my $nested_result = ("Three wells: " . (do { my $_chomp_temp = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $nested_result;
+my @nested_result;
+my %nested_result;
+$nested_result = ("Three wells: " . (do { my $_chomp_temp = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     do { my $output_111 = q{};
 my $output_printed_111;
 my $head_line_count = 0;
@@ -54,7 +57,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $count;
+my @count;
+my %count;
+$count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_112 = q{};
     my $output_printed_112;
     my $pipeline_success_112 = 1;
@@ -149,7 +155,7 @@ sub get_file_size {
     return;
 }
 get_file_size('000__01_file_directory_operations.sh');
-my @files = ((grep { !/\//msx } glob '*.sh'), (glob 'examples/*.sh'));
+my @files = (do { my $_result = `ls -1 *.sh examples/*.sh 2>/dev/null`; chomp $_result; $CHILD_ERROR = $? >> 8; split("\n", $_result); });
 print "Shell scripts found: " . scalar(@files) . "\n";
 $CHILD_ERROR = 0;
 my $file;
@@ -189,11 +195,17 @@ date\n";
     close $original_stdout
       or die "Close failed: $OS_ERROR\n";
 };
-my $process_result = do { my $command = "bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
+my $process_result;
+my @process_result;
+my %process_result;
+$process_result = do { my $command = "bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
 print "Process substitution result:\n";
 print $process_result;
 if ( !( ($process_result) =~ m{\n\z}msx ) ) { print "\n"; }
-my $here_string_result = do { my $input_data = "hello world"; my $set1_116 = 'a-z';
+my $here_string_result;
+my @here_string_result;
+my %here_string_result;
+$here_string_result = do { my $input_data = "hello world"; my $set1_116 = 'a-z';
 my $set2_116 = 'A-Z';
 my $input_116 = $input_data;
 # Expand character ranges for tr command
@@ -249,7 +261,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $perl_result = do {
+my $perl_result;
+my @perl_result;
+my %perl_result;
+$perl_result = do {
     my $result;
     my $eval_success = eval {
         $result = capture_stdout( sub { print "Hello from Perl\n" } );
