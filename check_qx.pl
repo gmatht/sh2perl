@@ -58,11 +58,30 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         }
     }
 
-    # Pattern 2 (qx{\$var} indirect check) is intentionally DISABLED.
-    # Pattern 2 was too aggressive: it flagged legitimate shell fallbacks where the
-    # translator correctly determined that a complex command inside backticks
-    # (e.g. `cp file1 file2 && echo success`) cannot practically be converted to
-    # native Perl. Only Pattern 1 (direct qx{builtin ...}) is kept.
+    # Pattern 2: qx{\$var} where var was assigned a command string containing a builtin.
+    # Search backwards from the qx{} call to find the MOST RECENT assignment to that
+    # variable, so variable reuse (e.g. \$command for both \`ls -la\` and \`find ...\`) is
+    # handled correctly.
+    while ($code =~ /qx\{(\$\w+)\}/g) {
+        my $var = $1;
+        my $pos = pos($code);
+        my $before = substr($code, 0, $pos);
+        # Find the last (most recent) assignment to this variable before the qx{} call
+        my $last_assign = '';
+        while ($before =~ /my\s+\Q$var\E\s*=\s*(?:q\{([^}]*)\}|"([^"]*)"|'([^']*)')/sg) {
+            $last_assign = $+;
+        }
+        next if $last_assign eq '';
+        next if $is_exempt->($last_assign);
+        for my $b (@builtins) {
+            if ($last_assign =~ /\b\Q$b\E\b/) {
+                my $line_num = ($before =~ tr/\n//) + 1;
+                print "QX VIOLATION: $basename uses qx{$var} where $var contains builtin '$b'\n";
+                $violations++;
+                last;
+            }
+        }
+    }
 
     # Pattern 3: system('builtin') or system("builtin")
     for my $b (@builtins) {
