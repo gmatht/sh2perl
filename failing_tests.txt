@@ -1,19 +1,10 @@
+000__04b_file_directory_operations.sh	Failed due to: stdout mismatch
+000__04h_complex_examples.sh	Failed due to: exit code mismatch, stdout mismatch
+000__07_find_path_commands.sh	Failed due to: stdout mismatch
+058_advanced_bash_idioms.sh	Failed due to: stdout mismatch
 063_12_complex_eval.sh	Failed due to: exit code mismatch, stdout mismatch
 063_15_complex_function_definition.sh	Failed due to: exit code mismatch, stdout mismatch
 063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
 064_07_complex_array_operations.sh	Failed due to: stdout mismatch
 064_22_function_returning_complex_data_structures.sh	Failed due to: stdout mismatch
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
-000__03_file_manipulation_commands.sh	QX violation: qx{$cp_cmd} where $cp_cmd contains builtin 'cp'
-000__03_file_manipulation_commands.sh	QX violation: qx{$mkdir_cmd} where $mkdir_cmd contains builtin 'mkdir'
-000__04b_file_directory_operations.sh	QX violation: qx{$command} where $command contains builtin 'find'
-000__04e_file_manipulation.sh	QX violation: qx{$cp_cmd} where $cp_cmd contains builtin 'cp'
-000__04e_file_manipulation.sh	QX violation: qx{$mkdir_cmd} where $mkdir_cmd contains builtin 'mkdir'
-000__04h_complex_examples.sh	QX violation: qx{$command} where $command contains builtin 'wc'
-000__07_find_path_commands.sh	QX violation: qx{$command} where $command contains builtin 'find'
-003_pipeline.sh	QX violation: qx{$command} where $command contains builtin 'find'
-058_advanced_bash_idioms.sh	QX violation: qx{$command} where $command contains builtin 'find'
-058_advanced_bash_idioms.sh	QX violation: qx{$command} where $command contains builtin 'find'
-test_find.sh	QX violation: qx{$command} where $command contains builtin 'find'
-test_simple_function.sh	QX violation: qx{$command} where $command contains builtin 'wc'
-test_system_builtin.sh	QX violation: qx{$command} where $command contains builtin 'find'

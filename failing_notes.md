@@ -45,7 +45,7 @@ Fixed wc with input redirect (`wc -c < "$file"`) in command substitution:
 the native wc handler now returns the count without a trailing newline,
 matching bash's command substitution behavior (stripping trailing newlines).
 
-## Still failing tests (10)
+## Still failing tests (9)
 
 ### 000__04b_file_directory_operations.sh
 Uses `ls -a` and `find . -name "*.sh" -type f` in backtick command
@@ -69,19 +69,22 @@ Uses `find . -maxdepth 1 -type f | wc -l` and `find . -maxdepth 1 -type d | wc -
 in command substitution. The native find and wc implementations may produce
 different output formatting or ordering than the real commands.
 
-### 063_12_complex_eval.sh
-`eval "result=\$(( \${var:-0} + ... ))"` — the eval string can now be parsed
-(was previously "could not parse") but the generated Perl incorrectly translates
-`${var:-0}` to `${$var:-0}` (Perl dereference syntax) instead of
-`(defined $var ? $var : 0)`. The arithmetic expression converter does not
-understand bash's parameter expansion default-value syntax (`:-`, `:=`, etc.)
-and treats `${...}` as Perl's complex expression syntax.
+### 063_12_complex_eval.sh (FIXED)
+Fixed `${var:-0}` parameter expansion default-value syntax inside `$(( ... ))`
+arithmetic expressions. Added `convert_param_expansion_in_arith()` and a
+pre-processing phase in `convert_arithmetic_to_perl_impl()` that handles
+`${var:-default}`, `${var:=default}`, `${var:+default}`, and
+`${array[key]:-default}` patterns before the general variable conversion.
+Also fixed auto-declaration to properly detect array variables (`my @array`
+instead of `my $array`) and use `$array[$key]` (indexed) vs `$array{$key}`
+(associative) access based on `associative_arrays`.
 
 ### 063_15_complex_function_definition.sh
 `eval "$name() { $body }"` — eval with dynamic arguments (using function
-parameters `$name` and `$body`) is not supported. The eval handler falls
-through to "dynamic arguments not supported" comment, and the function
-generation produces unbalanced braces.
+parameters `$name` and `$body`) is not supported. The eval handler now
+generates code that runs the eval via `system('bash', '-c', ...)` at runtime,
+but the function definition is lost after the bash process exits, so
+subsequent calls to the dynamically-defined function fail.
 
 ### 063_hard_to_parse.sh
 Multiple parsing issues: complex nested parameter expansions, `${!prefix@}`
