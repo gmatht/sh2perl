@@ -19,5 +19,4 @@
 064_22_function_returning_complex_data_structures.sh	Failed due to: exit code mismatch, stdout mismatch
 064_23_complex_error_handling_traps.sh	Failed due to: stdout mismatch
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
-070_cmp_basic.sh	Failed due to: exit code mismatch, stdout mismatch
 test_system_builtin.sh	Failed due to: stdout mismatch

@@ -175,7 +175,21 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
     });
 
     if has_non_array_env {
-        for (var, value) in &cmd.env_vars {
+        // Sort env_vars so that variables referenced by other variables come first.
+        // This ensures dependencies are declared before they are used.
+        let mut env_vec: Vec<(&String, &Word)> = cmd.env_vars.iter().collect();
+        env_vec.sort_by(|(a_key, a_val), (b_key, _b_val)| {
+            let a_refs_b = env_var_refs_var(a_val, b_key);
+            let b_refs_a = env_var_refs_var(_b_val, a_key);
+            if a_refs_b && !b_refs_a {
+                std::cmp::Ordering::Greater  // a depends on b, so b comes first
+            } else if b_refs_a && !a_refs_b {
+                std::cmp::Ordering::Less     // b depends on a, so a comes first
+            } else {
+                std::cmp::Ordering::Equal    // no dependency, keep BTreeMap order
+            }
+        });
+        for &(var, value) in &env_vec {
             // Check if this is an associative array assignment like map[foo]=bar
             if let Some((array_name, key)) = generator.extract_array_key(var) {
                 let val = generator.perl_string_literal(value);
@@ -2125,4 +2139,34 @@ fn generate_cartesian_product_for_echo(generator: &mut Generator, args: &[Word])
     output.push_str("print join(\" \", @all_combinations) . \"\\n\";\n");
 
     output
+}
+
+/// Check if a variable's value references another env var.
+/// This is used to sort env_vars so that dependencies are declared before they are used.
+fn env_var_refs_var(value: &Word, var_name: &str) -> bool {
+    match value {
+        Word::Literal(s, _) => s.contains(var_name),
+        Word::StringInterpolation(interp, _) => {
+            for part in &interp.parts {
+                match part {
+                    StringPart::Variable(v) => {
+                        if v == var_name {
+                            return true;
+                        }
+                    }
+                    StringPart::ParameterExpansion(pe) => {
+                        if pe.variable == var_name || pe.variable.contains(var_name) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        Word::ParameterExpansion(pe, _) => {
+            pe.variable == var_name || pe.variable.contains(var_name)
+        }
+        _ => false,
+    }
 }
