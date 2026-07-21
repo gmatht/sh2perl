@@ -1985,22 +1985,54 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     result.push_str("'}");
                     result
                 }
-            } else {
-                // Indexed array access with variable/expression key: arr[i] -> $arr[$i]
+            } else if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+                || generator.associative_arrays.contains(map_name)
+            {
+                // Indexed array access with variable/expression key.
+                // If the key looks like ${varname} (shell variable dereference),
+                // strip the ${ } wrapper so we use just $varname as the index.
+                let clean_key = if key.starts_with("${") && key.ends_with('}') {
+                    &key[2..key.len()-1]
+                } else if key.starts_with('$') {
+                    key
+                } else {
+                    key
+                };
                 format!(
                     "${}[{}]",
                     map_name,
-                    generator.convert_arithmetic_to_perl(key)
+                    generator.convert_arithmetic_to_perl(clean_key)
                 )
+            } else {
+                // Undeclared variable - bash would expand to empty string
+                "q{}".to_string()
             }
         }
         Word::MapKeys(map_name, _) => {
             // Handle map keys like !map[@] -> keys %map
-            format!("keys %{}", map_name)
+            // If the variable is not declared, return empty string
+            // (matching bash behavior for undefined variables) to avoid
+            // strict vars errors for accessing undeclared %hash.
+            if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+            {
+                format!("keys %{}", map_name)
+            } else {
+                // Undeclared variable - bash would expand to nothing
+                "q{}".to_string()
+            }
         }
         Word::MapLength(map_name, _) => {
             // Handle array length like #arr[@] -> scalar(@arr)
-            format!("scalar(@{})", map_name)
+            if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+            {
+                format!("scalar(@{})", map_name)
+            } else {
+                // Undeclared variable - bash would treat it as empty (length 0)
+                "0".to_string()
+            }
         }
         Word::ArraySlice(array_name, offset, length, _) => {
             // Handle array slicing like arr[@]:1:3 -> @arr[1..3]
@@ -2593,8 +2625,13 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
             } else if var_name.starts_with("__CMD_SUBST_") && var_name.ends_with("__") {
                 // Command substitution placeholder — leave untouched
                 var_name.to_string()
-            } else {
+            } else if generator.declared_locals.contains(var_name)
+                || generator.function_level_vars.contains(var_name)
+            {
                 format!("${}", var_name)
+            } else {
+                // Undeclared variable — use $ENV to avoid strict vars errors
+                format!("$ENV{{{}}}", var_name)
             }
         })
         .to_string();

@@ -234,6 +234,8 @@ impl Generator {
         // Pre-analysis pass: identify constants needed for magic numbers
         self.analyze_constants_needed(ast);
 
+
+
         // In inline mode, skip the script header and just generate the command code
         if self.inline_mode {
             for command in ast {

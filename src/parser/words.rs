@@ -961,6 +961,16 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         return Ok(Word::MapKeys(map_name.to_string(), None));
                     }
                 }
+            } else if braced_content.starts_with('!')
+                && (braced_content.ends_with('@') || braced_content.ends_with('*'))
+                && !braced_content.contains('[')
+                && !braced_content.contains(']')
+            {
+                // This is ${!prefix@} or ${!prefix*} - indirect expansion.
+                // In bash this expands to all variable names starting with prefix.
+                // Generate as keys %prefix for Perl.
+                let var_name = &braced_content[1..braced_content.len()-1];
+                return Ok(Word::MapKeys(var_name.to_string(), None));
             } else if braced_content.contains(":-") {
                 eprintln!(
                     "DEBUG parse_variable_expansion: found :- in braced_content='{}'",
@@ -1224,6 +1234,16 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         return Ok(Word::MapKeys(map_name.to_string(), None));
                     }
                 }
+            } else if prefixed.starts_with('!')
+                && (prefixed.ends_with('@') || prefixed.ends_with('*'))
+                && !prefixed.contains('[')
+                && !prefixed.contains(']')
+            {
+                // ${!prefix@} or ${!prefix*} - indirect expansion.
+                // In bash this expands to all variable names starting with prefix.
+                // Generate as keys %prefix for Perl.
+                let var_name = &prefixed[1..prefixed.len()-1];
+                return Ok(Word::MapKeys(var_name.to_string(), None));
             }
             Ok(Word::Variable(prefixed, true, None))
         }
