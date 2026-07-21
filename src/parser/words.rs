@@ -2047,11 +2047,58 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                     });
                 }
 
-                // Check if there is a substitution operator after the bracket
+                // Check if there is an operator after the bracket
                 let rest = &content[bracket_end + 1..];
-                // If there's a / after ], this is probably ${arr[1]/pattern/replacement}
-                if rest.starts_with('/') {
-                    // This is substitution on an array element
+
+                // Handle operators on array elements (rest contains the operator + pattern)
+                if rest.starts_with("##") {
+                    let pattern = &rest[2..];
+                    return Ok(ParameterExpansion {
+                        variable: format!("{}[{}]", var_name, key),
+                        operator: ParameterExpansionOperator::RemoveLongestPrefix(pattern.to_string()),
+                        is_mutable: true,
+                    });
+                } else if rest.starts_with('#') {
+                    let pattern = &rest[1..];
+                    return Ok(ParameterExpansion {
+                        variable: format!("{}[{}]", var_name, key),
+                        operator: ParameterExpansionOperator::RemoveShortestPrefix(pattern.to_string()),
+                        is_mutable: true,
+                    });
+                } else if rest.starts_with("%%") {
+                    let pattern = &rest[2..];
+                    return Ok(ParameterExpansion {
+                        variable: format!("{}[{}]", var_name, key),
+                        operator: ParameterExpansionOperator::RemoveLongestSuffix(pattern.to_string()),
+                        is_mutable: true,
+                    });
+                } else if rest.starts_with('%') {
+                    let pattern = &rest[1..];
+                    return Ok(ParameterExpansion {
+                        variable: format!("{}[{}]", var_name, key),
+                        operator: ParameterExpansionOperator::RemoveShortestSuffix(pattern.to_string()),
+                        is_mutable: true,
+                    });
+                } else if rest == "^^" {
+                    return Ok(ParameterExpansion {
+                        variable: format!("{}[{}]", var_name, key),
+                        operator: ParameterExpansionOperator::UppercaseAll,
+                        is_mutable: true,
+                    });
+                } else if rest == ",," {
+                    return Ok(ParameterExpansion {
+                        variable: format!("{}[{}]", var_name, key),
+                        operator: ParameterExpansionOperator::LowercaseAll,
+                        is_mutable: true,
+                    });
+                } else if rest == "^" {
+                    return Ok(ParameterExpansion {
+                        variable: format!("{}[{}]", var_name, key),
+                        operator: ParameterExpansionOperator::UppercaseFirst,
+                        is_mutable: true,
+                    });
+                } else if rest.starts_with('/') {
+                    // This is ${arr[1]/pattern/replacement} - substitution on an array element
                     // We'll handle this later - for now, just treat as array access
                 }
 

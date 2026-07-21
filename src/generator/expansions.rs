@@ -303,7 +303,7 @@ pub fn generate_parameter_expansion_impl(
 /// Convert a parameter expansion default value to Perl code.
 /// If the default contains command substitutions (`$(...)` or backtick), parse and
 /// convert them; otherwise emit a string literal.
-fn default_value_to_perl(generator: &mut Generator, default: &str) -> String {
+pub(crate) fn default_value_to_perl(generator: &mut Generator, default: &str) -> String {
     // Check for nested ${...} parameter expansion
     if default.starts_with("${") && default.ends_with('}') {
         let inner = &default[2..default.len() - 1];
@@ -334,7 +334,7 @@ fn default_value_to_perl(generator: &mut Generator, default: &str) -> String {
 
 // Helper methods for regex escaping
 /// Convert a shell glob pattern to a Perl regex with non-greedy `*` (for shortest match)
-fn glob_to_perl_regex_nongreedy(pattern: &str) -> String {
+pub(crate) fn glob_to_perl_regex_nongreedy(pattern: &str) -> String {
     let mut result = String::new();
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
@@ -371,7 +371,7 @@ fn glob_to_perl_regex_nongreedy(pattern: &str) -> String {
 }
 
 /// Convert a shell glob pattern to a Perl regex with greedy `*` (for longest match)
-fn glob_to_perl_regex_greedy(pattern: &str) -> String {
+pub(crate) fn glob_to_perl_regex_greedy(pattern: &str) -> String {
     let mut result = String::new();
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
