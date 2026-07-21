@@ -8,8 +8,29 @@ use warnings;
 my @builtins = qw(
     find ls grep sed awk sort uniq head tail cat echo printf
     touch mkdir rmdir rm cp mv chmod chown ln basename dirname
-    date sleep wc kill ps cd pwd perl
+    date sleep wc kill ps cd pwd perl diff
 );
+
+# Read exemptions from allowed_qx_calls.txt (same file the Rust check uses).
+# Each line is a shell-command prefix that is allowed to use qx{}/system().
+my @exemptions;
+if (open my $fh, '<', 'allowed_qx_calls.txt') {
+    while (<$fh>) {
+        chomp;
+        s/#.*//;    # strip comments
+        next if /^\s*$/;
+        push @exemptions, $_;
+    }
+    close $fh;
+}
+
+my $is_exempt = sub {
+    my ($cmd) = @_;
+    for my $pat (@exemptions) {
+        return 1 if $cmd =~ /^\Q$pat\E/;
+    }
+    return 0;
+};
 
 my $violations = 0;
 
@@ -23,11 +44,17 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
     $basename =~ s/\.pl$//;
 
     # Pattern 1: direct qx{builtin ...}
-    for my $b (@builtins) {
-        if ($code =~ /qx\{[^}]*\b\Q$b\E\b/) {
-            print "QX VIOLATION: $basename has qx{} call with builtin '$b'\n";
-            $violations++;
-            last;
+    # First extract the full qx body, then check if it contains a builtin.
+    while ($code =~ /qx\{([^}]*)\}/g) {
+        my $qx_body = $1;
+        next if $qx_body =~ /^\$/;  # skip variable indirection (handled in Pattern 2)
+        next if $is_exempt->($qx_body);
+        for my $b (@builtins) {
+            if ($qx_body =~ /\b\Q$b\E\b/) {
+                print "QX VIOLATION: $basename has qx{} call with builtin '$b'\n";
+                $violations++;
+                last;
+            }
         }
     }
 
@@ -36,7 +63,9 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         my $var = $1;
         my $before = substr($code, 0, pos($code));
         for my $b (@builtins) {
-            if ($before =~ /my\s+\Q$var\E\s*=\s*(?:q\{[^}]*\b\Q$b\E\b|"[^"]*\b\Q$b\E\b|'[^']*\b\Q$b\E\b)/s) {
+            if ($before =~ /my\s+\Q$var\E\s*=\s*(?:q\{([^}]*\b\Q$b\E\b[^}]*)\}|"([^"]*\b\Q$b\E\b[^"]*)"|'([^']*\b\Q$b\E\b[^']*)')/s) {
+                my $cmd_str = $+;
+                next if $is_exempt->($cmd_str);
                 print "QX VIOLATION: $basename uses qx{$var} where $var contains builtin '$b'\n";
                 $violations++;
                 last;
