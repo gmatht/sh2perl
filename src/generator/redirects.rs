@@ -1008,6 +1008,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
             // Handle declare command
             let mut is_assoc = false;
             let mut is_array = false;
+            let mut is_print = false;
             for arg in &cmd.args {
                 match arg {
                     Word::Literal(opt, _) => {
@@ -1015,40 +1016,77 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         if opt.starts_with('-') {
                             is_assoc = opt.as_str() == "-A";
                             is_array = opt.as_str() == "-a";
+                            if opt.contains('p') {
+                                is_print = true;
+                            }
                             continue;
                         }
-                        // Check if it's an assignment (var=value)
-                        if opt.contains('=') {
-                            let parts: Vec<&str> = opt.splitn(2, '=').collect();
-                            if parts.len() == 2 {
-                                let var = parts[0];
-                                let value = parts[1];
-                                if !generator.declared_locals.contains(var) {
-                                    let perl_value = shell_value_to_perl(value);
-                                    output.push_str(&generator.indent());
-                                    if is_assoc {
-                                        output.push_str(&format!("my %{} = ({});\n", var, perl_value));
-                                    } else if is_array {
-                                        output.push_str(&format!("my @{} = ({});\n", var, perl_value));
-                                    } else {
-                                        output.push_str(&format!("my ${} = {};\n", var, perl_value));
-                                    }
-                                    generator.declared_locals.insert(var.to_string());
-                                }
+                        // Handle declare -p (print variable definition)
+                        if is_print {
+                            let var = opt;
+                            if generator.associative_arrays.contains(var) {
+                                // Print associative array in bash-compatible format
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("do {{\n"));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("    my $output = \"declare -A {}=(\";\n", var));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("    for my $key (sort keys %{}) {{\n", var));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("        $output .= \"[$key]=\\\"\" . ${}{{$key}} . \"\\\" \";\n", var));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("    }}\n"));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("    $output =~ s/ $//;\n"));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("    $output .= \" )\";\n"));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("    print \"$output\\n\";\n"));
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("}};\n"));
+                            } else if generator.declared_locals.contains(var) {
+                                // Print scalar variable
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("print \"declare -- {}=${{}}\\\n\", ${};\n", var, var));
+                            } else {
+                                // Variable not declared, just print empty
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("print \"declare -- {}\\\n\";\n", var));
                             }
                         } else {
-                            // Just declaration without assignment
-                            if !generator.declared_locals.contains(opt) {
-                                output.push_str(&generator.indent());
-                                if is_assoc {
-                                    output.push_str(&format!("my %{} = ();\n", opt));
-                                    generator.associative_arrays.insert(opt.clone());
-                                } else if is_array {
-                                    output.push_str(&format!("my @{} = ();\n", opt));
-                                } else {
-                                    output.push_str(&format!("my ${};\n", opt));
+                            // Check if it's an assignment (var=value)
+                            if opt.contains('=') {
+                                let parts: Vec<&str> = opt.splitn(2, '=').collect();
+                                if parts.len() == 2 {
+                                    let var = parts[0];
+                                    let value = parts[1];
+                                    if !generator.declared_locals.contains(var) {
+                                        let perl_value = shell_value_to_perl(value);
+                                        output.push_str(&generator.indent());
+                                        if is_assoc {
+                                            output.push_str(&format!("my %{} = ({});\n", var, perl_value));
+                                        } else if is_array {
+                                            output.push_str(&format!("my @{} = ({});\n", var, perl_value));
+                                        } else {
+                                            output.push_str(&format!("my ${} = {};\n", var, perl_value));
+                                        }
+                                        generator.declared_locals.insert(var.to_string());
+                                    }
                                 }
-                                generator.declared_locals.insert(opt.clone());
+                            } else {
+                                // Just declaration without assignment
+                                if !generator.declared_locals.contains(opt) {
+                                    output.push_str(&generator.indent());
+                                    if is_assoc {
+                                        output.push_str(&format!("my %{} = ();\n", opt));
+                                        generator.associative_arrays.insert(opt.clone());
+                                    } else if is_array {
+                                        output.push_str(&format!("my @{} = ();\n", opt));
+                                    } else {
+                                        output.push_str(&format!("my ${};\n", opt));
+                                    }
+                                    generator.declared_locals.insert(opt.clone());
+                                }
                             }
                         }
                     }
@@ -1285,16 +1323,33 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
             // In bash double-quoted strings, \$ and \${ are literal $ and ${
             let unescaped = eval_str.replace("\\$", "$");
             if is_static {
-                match crate::parser::commands::parse_pipeline_from_text(&unescaped) {
-                    Ok(parsed_cmd) => {
-                        let generated = generator.generate_command(&parsed_cmd);
-                        output.push_str(&generated);
+                match crate::parser::commands::parse(&unescaped) {
+                    Ok(parsed_commands) => {
+                        if parsed_commands.len() == 1 {
+                            let generated = generator.generate_command(&parsed_commands[0]);
+                            output.push_str(&generated);
+                        } else {
+                            // Multiple commands - generate each one
+                            for cmd in &parsed_commands {
+                                let generated = generator.generate_command(cmd);
+                                output.push_str(&generated);
+                            }
+                        }
                     }
                     Err(_) => {
-                        output.push_str(&format!(
-                            "# Builtin command 'eval' could not parse: {}\n",
-                            eval_str
-                        ));
+                        // Fall back to parse_pipeline_from_text
+                        match crate::parser::commands::parse_pipeline_from_text(&unescaped) {
+                            Ok(parsed_cmd) => {
+                                let generated = generator.generate_command(&parsed_cmd);
+                                output.push_str(&generated);
+                            }
+                            Err(_) => {
+                                output.push_str(&format!(
+                                    "# Builtin command 'eval' could not parse: {}\n",
+                                    eval_str
+                                ));
+                            }
+                        }
                     }
                 }
             } else {

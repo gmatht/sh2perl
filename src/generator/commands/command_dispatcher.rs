@@ -755,8 +755,16 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&format!("my ${} = ", paste_var));
                             result.push_str(&paste_output);
                             result.push_str(";\n");
-                            result.push_str(&generator.indent());
-                            result.push_str(&format!("print ${};\n", paste_var));
+                            // Set $output for pipeline chaining (used by pipeline wrapper which does $output_N = $output)
+                            if generator.current_pipeline_output_id().is_some() {
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("$output = ${};\n", paste_var));
+                            }
+                            // Only print directly when not inside a pipeline (no active pipeline output id)
+                            if generator.current_pipeline_output_id().is_none() {
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("print ${};\n", paste_var));
+                            }
 
                             return result;
                         }
