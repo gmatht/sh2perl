@@ -505,3 +505,114 @@ pub fn parse_ast_pattern_list(pattern_text: &str) -> Option<Vec<String>> {
         Some(patterns)
     }
 }
+
+/// Load exemption patterns from a file (one shell-command prefix per line, "#" comments).
+pub fn load_qx_exemptions(path: &str) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => {
+            Vec::new()
+        }
+    }
+}
+
+/// Check that generated Perl code does not contain qx{{}} calls for known
+/// builtin commands, unless the command matches an exemption pattern.
+pub fn check_perl_no_qx_builtins(perl_code: &str, exemptions: &[String]) -> Result<(), String> {
+    use regex::Regex;
+
+    let builtin_commands = [
+        "find", "ls", "grep", "sed", "awk", "sort", "uniq", "head", "tail", "cat", "echo",
+        "printf", "touch", "mkdir", "rmdir", "rm", "cp", "mv", "chmod", "chown", "ln", "readlink",
+        "realpath", "basename", "dirname", "date", "sleep", "kill", "ps", "jobs", "fg", "bg",
+        "wait", "nohup", "cd", "pwd", "pushd", "popd", "dirs", "hash", "type", "which", "whereis",
+        "man", "info", "help", "history", "alias", "unalias", "set", "unset", "export", "readonly",
+        "declare", "local", "read", "printf", "echo", "test", "[", "[[", "let", "expr", "bc", "dc",
+        "seq", "factor", "yes", "true", "false", "strings", ":", "exit", "return", "break",
+        "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl",
+    ];
+
+    let is_exempt = |cmd: &str| -> bool {
+        exemptions.iter().any(|pat| cmd.trim().starts_with(pat.as_str()))
+    };
+
+    let mut violations = Vec::new();
+
+    // Pattern 1: direct qx{command here}
+    let direct_qx = Regex::new(r"qx\{([^}]*)\}").unwrap();
+    for cap in direct_qx.captures_iter(perl_code) {
+        let qx_body = cap.get(1).map_or("", |m| m.as_str()).trim();
+        if qx_body.is_empty() || qx_body.starts_with('$') {
+            continue;
+        }
+        if is_exempt(qx_body) {
+            continue;
+        }
+        for b in &builtin_commands {
+            if let Ok(re) = Regex::new(&format!(r"\b{}\b", regex::escape(b))) {
+                if re.is_match(&qx_body.to_lowercase()) {
+                    let line_num = perl_code[..cap.get(0).unwrap().start()].matches('\n').count() + 1;
+                    violations.push(format!(
+                        "Line {}: Builtin command '{}' is using qx{{}} call instead of native Perl",
+                        line_num, b
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    // Pattern 2: my $v = q{...}; ... qx{$v}
+    let assign_re = Regex::new(
+        r#"my\s+(\$\w+)\s*=\s*(?:q\{([^}]*)\}|"([^"]*)"|'([^']*)')"#
+    ).unwrap();
+    let mut assignments: Vec<(String, String)> = Vec::new();
+    for cap in assign_re.captures_iter(perl_code) {
+        if let Some(vname) = cap.get(1) {
+            let value = cap.get(2).or_else(|| cap.get(3)).or_else(|| cap.get(4))
+                .map_or("", |m| m.as_str()).to_string();
+            if !value.is_empty() {
+                assignments.push((vname.as_str().to_string(), value));
+            }
+        }
+    }
+
+    let var_qx = Regex::new(r"qx\{(\$\w+)\}").unwrap();
+    for cap in var_qx.captures_iter(perl_code) {
+        let var_ref = cap.get(1).map_or("", |m| m.as_str());
+        let line_num = perl_code[..cap.get(0).unwrap().start()].matches('\n').count() + 1;
+        for (vname, cmd_str) in &assignments {
+            if vname == var_ref {
+                if is_exempt(cmd_str) {
+                    break;
+                }
+                for b in &builtin_commands {
+                    if let Ok(re) = Regex::new(&format!(r"\b{}\b", regex::escape(b))) {
+                        if re.is_match(&cmd_str.to_lowercase()) {
+                            violations.push(format!(
+                                "Line {}: Builtin command '{}' is using qx{{}} via '{}' instead of native Perl",
+                                line_num, b, var_ref
+                            ));
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "QX_BUILTIN violations:\n{}",
+            violations.join("\n")
+        ))
+    }
+}
