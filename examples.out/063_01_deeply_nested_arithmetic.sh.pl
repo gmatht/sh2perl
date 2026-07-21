@@ -12,6 +12,9 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '063_01_deeply_nested_arithmetic.sh';
+my $result;
+my @result;
+my %result;
 my $a;
 my $b;
 my $c;
@@ -26,7 +29,7 @@ my $k;
 my $l;
 my $m;
 my $n;
-my $result = eval { int( ($a + $b) * ($c - $d) / ($e % $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ) } // "";
+$result = eval { int( ($a + $b) * ($c - $d) / ($e % $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ) } // "";
 do {
     my $output = "Deeply nested arithmetic result: $result";
     print $output;

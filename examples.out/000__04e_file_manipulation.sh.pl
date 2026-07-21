@@ -6,7 +6,6 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
 use locale;
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
-use File::Copy qw(copy move);
 use POSIX qw(time);
 
 my $main_exit_code = 0;
@@ -27,7 +26,10 @@ do {
     close $original_stdout
       or die "Close failed: $OS_ERROR\n";
 };
-my $cp_result = do {
+my $cp_result;
+my @cp_result;
+my %cp_result;
+$cp_result = do {
     my $left_result_66 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
@@ -133,7 +135,10 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "No test files found\n";
 }
 $main_exit_code = 0;
-my $mv_result = do {
+my $mv_result;
+my @mv_result;
+my %mv_result;
+$mv_result = do {
     my $left_result_76 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
@@ -262,7 +267,10 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "No test files found\n";
 }
 $main_exit_code = 0;
-my $rm_result = do {
+my $rm_result;
+my @rm_result;
+my %rm_result;
+$rm_result = do {
     my $left_result_86 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
@@ -394,7 +402,10 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "No test files found\n";
 }
 $main_exit_code = 0;
-my $mkdir_result = do {
+my $mkdir_result;
+my @mkdir_result;
+my %mkdir_result;
+$mkdir_result = do {
     my $left_result_96 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
@@ -508,7 +519,10 @@ if ( !defined $ls_success || $ls_success == 0 ) {
         print "Directory not found\n";
 }
 $main_exit_code = 0;
-my $touch_result = do {
+my $touch_result;
+my @touch_result;
+my %touch_result;
+$touch_result = do {
     my $left_result_107 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {

@@ -5,7 +5,6 @@ use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
 use IPC::Open3;
-my $DATE_SNAPSHOT = time;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
@@ -14,7 +13,10 @@ our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04d_system_utilities.sh';
 print "=== System Utilities ===\n";
-my $formatted_date = do {
+my $formatted_date;
+my @formatted_date;
+my %formatted_date;
+$formatted_date = do {
 require POSIX; POSIX::strftime('%Y-%m-%d', localtime(time())) . "\n"
 };
 do {
@@ -25,11 +27,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $sleep_duration = do {
-    my $_chomp_temp = ("1");
-    chomp $_chomp_temp;
-    $_chomp_temp;
-};
+my $sleep_duration;
+my @sleep_duration;
+my %sleep_duration;
+$sleep_duration = ("1");
 do {
     my $output = "Sleeping for $sleep_duration seconds...";
     print $output;
@@ -39,7 +40,10 @@ do {
 };
 $CHILD_ERROR = 0;
 require Time::HiRes; Time::HiRes::sleep($sleep_duration);
-my $yes_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $yes_result;
+my @yes_result;
+my %yes_result;
+$yes_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     do { my $output_65 = q{};
 my $output_printed_65;
 my $head_line_count = 0;

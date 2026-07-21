@@ -12,7 +12,10 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__07_find_path_commands.sh';
-my $found_files = do {
+my $found_files;
+my @found_files;
+my %found_files;
+$found_files = do {
     require File::Find;
     my @find_results;
     File::Find::find(sub { if (-f $_ && $_ =~ /^.*\.sh$/msx) { push @find_results, $File::Find::name; } }, q{.});

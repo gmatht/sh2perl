@@ -5,7 +5,6 @@ use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use locale;
 use IPC::Open3;
-my $DATE_SNAPSHOT = time;
 
 my $main_exit_code = 0;
 my $ls_success     = 0;
@@ -37,10 +36,16 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $current_date = do {
+my $current_date;
+my @current_date;
+my %current_date;
+$current_date = do {
 require POSIX; POSIX::strftime('%Y%m', localtime(time())) . "\n"
 };
-my $current_dir = do {
+my $current_dir;
+my @current_dir;
+my %current_dir;
+$current_dir = do {
     my $basename_path = do { use Cwd; getcwd(); };
     $basename_path =~ s{.*/}{}msx;
     chomp $basename_path;

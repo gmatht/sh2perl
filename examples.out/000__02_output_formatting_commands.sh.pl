@@ -27,11 +27,10 @@ our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__02_output_formatting_commands.sh';
 print "=== Output and Formatting Commands ===\n";
-my $echo_result = do {
-    my $_chomp_temp = ("Hello from backticks");
-    chomp $_chomp_temp;
-    $_chomp_temp;
-};
+my $echo_result;
+my @echo_result;
+my %echo_result;
+$echo_result = ("Hello from backticks");
 do {
     my $output = "Echo result: $echo_result";
     print $output;
@@ -40,12 +39,11 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $printf_result = do {
-    my $_chomp_temp = sprintf("Number: %d, String: %s\n", '42', "test");
+my $printf_result;
+my @printf_result;
+my %printf_result;
+$printf_result = sprintf("Number: %d, String: %s\n", '42', "test");
 ;
-    chomp $_chomp_temp;
-    $_chomp_temp;
-};
 do {
     my $output = "Printf result: $printf_result";
     print $output;
@@ -69,7 +67,10 @@ do {
     close $original_stdout
       or die "Close failed: $OS_ERROR\n";
 };
-my $sha256_result = do {
+my $sha256_result;
+my @sha256_result;
+my %sha256_result;
+$sha256_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha256_hex(
@@ -91,6 +92,7 @@ my $sha256_result = do {
     }
     join("\n", @results) . "\n";
 };
+;
 do {
     my $output = "SHA256 result: $sha256_result";
     print $output;
@@ -99,7 +101,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $sha512_result = do {
+my $sha512_result;
+my @sha512_result;
+my %sha512_result;
+$sha512_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha512_hex(
@@ -121,6 +126,7 @@ my $sha512_result = do {
     }
     join("\n", @results) . "\n";
 };
+;
 do {
     my $output = "SHA512 result: $sha512_result";
     print $output;
@@ -129,7 +135,10 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $strings_result;
+my @strings_result;
+my %strings_result;
+$strings_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_0 = q{};
     my $output_printed_0;
     my $pipeline_success_0 = 1;
@@ -178,7 +187,10 @@ print "Strings result:\n";
 print $strings_result;
 if ( !( ($strings_result) =~ m{\n\z}msx ) ) { print "\n"; }
 print "=== I/O Redirection Commands ===\n";
-my $tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
+my $tee_result;
+my @tee_result;
+my %tee_result;
+$tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     my $output_1 = q{};
     my $output_printed_1;
     my $pipeline_success_1 = 1;
@@ -208,7 +220,10 @@ do {
 };
 $CHILD_ERROR = 0;
 print "=== Perl Command ===\n";
-my $perl_result = do {
+my $perl_result;
+my @perl_result;
+my %perl_result;
+$perl_result = do {
     my $result;
     my $eval_success = eval {
         $result = capture_stdout( sub { print "Hello from Perl\n" } );

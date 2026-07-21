@@ -17,7 +17,10 @@ $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== Case modification in parameter expansion ==\n";
-my $name = "world";
+my $name;
+my @name;
+my %name;
+$name = "world";
 do {
     my $output = uc(${name});
     print $output;
@@ -43,7 +46,10 @@ do {
 };
 $CHILD_ERROR = 0;
 print "== Advanced parameter expansion ==\n";
-my $path = "/tmp/file.txt";
+my $path;
+my @path;
+my %path;
+$path = "/tmp/file.txt";
 do {
     my $output = basename(${path});
     print $output;
@@ -67,7 +73,10 @@ $s2 = "abba";
 print $s2 =~ s/b/X/grs;
 if ( !( ($s2 =~ s/b/X/grs) =~ m{\n\z}msx ) ) { print "\n"; }
 print "== More parameter expansion ==\n";
-my $var = "hello world";
+my $var;
+my @var;
+my %var;
+$var = "hello world";
 print ${var} =~ s/^hello//r;
 if ( !( (${var} =~ s/^hello//r) =~ m{\n\z}msx ) ) { print "\n"; }
 do {

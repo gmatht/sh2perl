@@ -1,7 +1,3 @@
-049_local.sh	Failed due to: stdout mismatch
-051_primes.sh	error: PerlExecution timed out after 30.0 seconds
-055_factorize.sh	Failed due to: stdout mismatch
-058_advanced_bash_idioms.sh	Failed due to: stdout mismatch
 063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
-064_07_complex_array_operations.sh	Failed due to: stdout mismatch
+064_07_complex_array_operations.sh	Failed due to: exit code mismatch, stdout mismatch
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch

@@ -13,7 +13,10 @@ our $CHILD_ERROR;
 
 $PROGRAM_NAME = '062_01_ambiguous_operators.sh';
 print "Testing ambiguous operators...\n";
-my $result = eval { int(2**3**2) } // "";
+my $result;
+my @result;
+my %result;
+$result = eval { int(2**3**2) } // "";
 do {
     my $output = "2**3**2 = $result";
     print $output;
