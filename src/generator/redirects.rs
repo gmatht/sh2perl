@@ -1194,6 +1194,16 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                                 ));
                                                 i += 1;
                                             }
+                                            Word::Arithmetic(arith_expr, _) => {
+                                                let arith_word = Word::Arithmetic(arith_expr.clone(), None);
+                                                let perl_value = generator.word_to_perl(&arith_word);
+                                                output.push_str(&generator.indent());
+                                                output.push_str(&format!(
+                                                    "my ${} = {};\n",
+                                                    var, perl_value
+                                                ));
+                                                i += 1;
+                                            }
                                             _ => {
                                                 // Regular assignment without command substitution
                                                 let perl_value = shell_value_to_perl(value);

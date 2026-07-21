@@ -555,6 +555,21 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         continue;
                                     }
 
+                                    // Case 1b: value is empty and next arg is an Arithmetic expression
+                                    // The parser splits `local var=$((expr))` into Literal("var=") + Arithmetic
+                                    if value.is_empty()
+                                        && i + 1 < args.len()
+                                        && matches!(args[i + 1], Word::Arithmetic(_, _))
+                                    {
+                                        let perl_expr = generator.word_to_perl(&args[i + 1]);
+                                        output.push_str(&generator.indent());
+                                        output.push_str(&format!("my ${} = {};\n", var, perl_expr));
+                                        generator.declared_locals.insert(var.to_string());
+                                        generator.function_level_vars.insert(var.to_string());
+                                        i += 2; // consume Literal("var=") AND Arithmetic
+                                        continue;
+                                    }
+
                                     // Case 2: value contains a backtick (inline `cmd`)
                                     if value.contains('`') {
                                         let command_substitution =
