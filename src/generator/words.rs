@@ -362,25 +362,75 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     });
 
                     if has_here_string && !has_process_sub {
-                        // Convert `cmd <<< "string"` → `echo 'string' | cmd`.
-                        // Build the base command without the here-string redirect.
-                        let base_cmd_str =
-                            crate::generator::redirects::generate_bash_command_string(
-                                &redirect_cmd.command,
-                            );
-                        // Find the first here-string redirect target.
-                        let here_target = redirect_cmd
-                            .redirects
-                            .iter()
-                            .find(|r| matches!(r.operator, RedirectOperator::HereString))
-                            .map(|r| generator.perl_string_literal(&r.target))
-                            .unwrap_or_else(|| "''".to_string());
-                        // Emit: echo <string> | <cmd>
-                        format!(
-                            "do {{ my $here_input = {}; chomp(my $result = qx{{echo \"$here_input\" | {}}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                            here_target,
-                            base_cmd_str
-                        )
+                        // For commands we have native Perl support for (tr, grep),
+                        // generate native code instead of falling back to qx{echo ... | cmd}
+                        // which would trigger QX_BUILTIN violations.
+                        let native_here_result = match &*redirect_cmd.command {
+                            Command::Simple(simple_cmd) => {
+                                if let Word::Literal(name, _) = &simple_cmd.name {
+                                    match name.as_str() {
+                                        "tr" => {
+                                            let here_content = redirect_cmd
+                                                .redirects
+                                                .iter()
+                                                .find(|r| matches!(r.operator, RedirectOperator::HereString))
+                                                .and_then(|r| r.heredoc_body.as_ref())
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            let unique_id = generator.get_unique_id();
+                                            let input_data = format!("my $input_data = \"{}\";", here_content);
+                                            let tr_output = crate::generator::commands::tr::generate_tr_command_for_substitution(
+                                                generator, simple_cmd, "input_data", &unique_id.to_string(),
+                                            );
+                                            Some(format!("do {{ {} {} }}", input_data, tr_output))
+                                        }
+                                        "grep" => {
+                                            let here_content = redirect_cmd
+                                                .redirects
+                                                .iter()
+                                                .find(|r| matches!(r.operator, RedirectOperator::HereString))
+                                                .and_then(|r| r.heredoc_body.as_ref())
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            let unique_id = generator.get_unique_id();
+                                            let input_data = format!("my $input_data = \"{}\";", here_content);
+                                            let grep_output = crate::generator::commands::grep::generate_grep_command(
+                                                generator, simple_cmd, &format!("${}", "input_data"), &unique_id.to_string(), false,
+                                            );
+                                            Some(format!("do {{ {} {} }}", input_data, grep_output))
+                                        }
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(native_code) = native_here_result {
+                            native_code
+                        } else {
+                            // Convert `cmd <<< "string"` → `echo 'string' | cmd`.
+                            // Build the base command without the here-string redirect.
+                            let base_cmd_str =
+                                crate::generator::redirects::generate_bash_command_string(
+                                    &redirect_cmd.command,
+                                );
+                            // Find the first here-string redirect target.
+                            let here_target = redirect_cmd
+                                .redirects
+                                .iter()
+                                .find(|r| matches!(r.operator, RedirectOperator::HereString))
+                                .map(|r| generator.perl_string_literal(&r.target))
+                                .unwrap_or_else(|| "''".to_string());
+                            // Emit: echo <string> | <cmd>
+                            format!(
+                                "do {{ my $here_input = {}; chomp(my $result = qx{{echo \"$here_input\" | {}}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                here_target,
+                                base_cmd_str
+                            )
+                        }
                     } else if has_process_sub {
                         // Process substitutions (<(cmd) / >(cmd)) require bash, not /bin/sh.
                         // Run the entire command under `bash -c '...'`, using single-quote
