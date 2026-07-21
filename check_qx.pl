@@ -14,7 +14,7 @@ my @builtins = qw(
 # Read exemptions from allowed_qx_calls.txt (same file the Rust check uses).
 # Each line is a shell-command prefix that is allowed to use qx{}/system().
 my @exemptions;
-if (open my $fh, '<', 'allowed_qx_calls.txt') {
+if (open my $fh, '<', '../allowed_qx_calls.txt') {
     while (<$fh>) {
         chomp;
         s/#.*//;    # strip comments

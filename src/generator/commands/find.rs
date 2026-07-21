@@ -1,43 +1,55 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-fn escape_glob_pattern(pattern: &str) -> String {
-    let mut result = String::new();
-    let chars: Vec<char> = pattern.chars().collect();
-
-    for (i, c) in chars.iter().enumerate() {
-        match c {
-            '*' => {
-                if i == 0 {
-                    // At start of pattern, * means "any characters"
-                    result.push_str(".*");
-                } else {
-                    // In middle/end, * means "any characters"
-                    result.push_str(".*");
+/// Extract a simple literal value from a Word, stripping surrounding quotes
+/// if present. Handles both Word::Literal and Word::StringInterpolation
+/// containing a single Literal part.
+fn extract_literal_from_word(word: &Word) -> Option<String> {
+    match word {
+        Word::Literal(s, _) => {
+            Some(s.trim_matches('"').trim_matches('\'').to_string())
+        }
+        Word::StringInterpolation(interp, _) => {
+            if interp.parts.len() == 1 {
+                if let StringPart::Literal(s) = &interp.parts[0] {
+                    return Some(s.trim_matches('"').trim_matches('\'').to_string());
                 }
             }
-            '?' => result.push_str("."),
-            '.' => result.push_str("[.]"),
-            '[' => result.push_str("\\["),
-            ']' => result.push_str("\\]"),
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Convert a glob pattern (like "*.sh") to a Perl regex pattern.
+fn escape_glob_to_regex(pattern: &str) -> String {
+    let mut result = String::new();
+    result.push('^');
+    for c in pattern.chars() {
+        match c {
+            '*' => result.push_str(".*"),
+            '?' => result.push('.'),
+            '.' => result.push_str("\\."),
+            '[' => result.push_str("["),
+            ']' => result.push_str("]"),
             '(' => result.push_str("\\("),
             ')' => result.push_str("\\)"),
             '+' => result.push_str("\\+"),
             '^' => result.push_str("\\^"),
-            '$' => result.push_str("\\$"),
+            '$' => result.push_str("$"),
             '|' => result.push_str("\\|"),
             '{' => result.push_str("\\{"),
             '}' => result.push_str("\\}"),
             '/' => result.push_str("\\/"),
-            _ => result.push(*c),
+            '\\' => result.push_str("\\\\"),
+            _ => result.push(c),
         }
     }
-
-    // Add end anchor for proper matching
     result.push('$');
     result
 }
 
+/// Parse common find flags from a SimpleCommand. Returns (start_dir, name_pattern, file_type, maxdepth).
 pub fn generate_find_command(
     generator: &mut Generator,
     cmd: &SimpleCommand,
@@ -46,112 +58,220 @@ pub fn generate_find_command(
 ) -> String {
     let mut output = String::new();
 
-    // Check if -ls is present - if so, use system fallback for better compatibility
-    let has_ls = cmd.args.iter().any(|arg| {
-        if let Word::Literal(s, _) = arg {
-            s == "-ls"
-        } else {
-            false
-        }
-    });
+    // Parse find arguments
+    let mut start_dir = String::from(".");
+    let mut name_pattern: Option<String> = None;
+    let mut file_type: Option<String> = None;
+    let mut maxdepth: Option<String> = None;
 
-    if has_ls {
-        return generate_system_find_fallback(generator, cmd, generate_output, input_var);
+    let mut args_iter = cmd.args.iter();
+    while let Some(arg) = args_iter.next() {
+        if let Some(lit) = extract_literal_from_word(arg) {
+            match lit.as_str() {
+                "-name" => {
+                    if let Some(next_arg) = args_iter.next() {
+                        name_pattern = extract_literal_from_word(next_arg);
+                    }
+                }
+                "-type" => {
+                    if let Some(next_arg) = args_iter.next() {
+                        file_type = extract_literal_from_word(next_arg);
+                    }
+                }
+                "-maxdepth" => {
+                    if let Some(next_arg) = args_iter.next() {
+                        maxdepth = extract_literal_from_word(next_arg);
+                    }
+                }
+                s if s.starts_with('-') => {
+                    // Skip other flags
+                }
+                _ => {
+                    // First non-flag argument is the start directory
+                    if start_dir == "." || start_dir == "'./'" {
+                        start_dir = generator.perl_string_literal(arg);
+                    }
+                }
+            }
+        }
     }
 
-    eprintln!(
-        "DEBUG: generate_find_command called with generate_output: {}, input_var: '{}'",
-        generate_output, input_var
-    );
+    // Build the Perl code
+    output.push_str(&generator.indent());
+    output.push_str("require File::Find;\n");
+
+    // Build the wanted function
+    let mut wanted_lines = Vec::new();
+
+    // Add type filter
+    if let Some(ref ftype) = file_type {
+        let test = match ftype.as_str() {
+            "f" => "-f",
+            "d" => "-d",
+            "l" => "-l",
+            _ => "-e",
+        };
+        wanted_lines.push(format!("    next unless {} $_;", test));
+    }
+
+    // Add name filter
+    if let Some(ref pat) = name_pattern {
+        let regex = escape_glob_to_regex(pat);
+        wanted_lines.push(format!("    next unless $_ =~ /{}/msx;", regex));
+    }
+
+    // Add maxdepth handling
+    if let Some(ref depth) = maxdepth {
+        if let Ok(d) = depth.parse::<usize>() {
+            wanted_lines.push(format!(
+                "    my $depth = ($File::Find::dir =~ tr/\\///) + 1; next if $depth > {};",
+                d
+            ));
+        }
+    }
+
+    // Add the result collection
     if generate_output && !input_var.is_empty() {
-        eprintln!(
-            "DEBUG: Using generate_find_for_substitution with input_var: '{}'",
+        // Store results in the output variable
+        wanted_lines.push(format!(
+            "    push @{}, $File::Find::name;",
             input_var
-        );
-        return generate_find_for_substitution(generator, cmd, input_var);
-    }
+        ));
 
-    eprintln!("DEBUG: Using system find fallback instead");
-    generate_system_find_fallback(generator, cmd, generate_output, input_var)
-}
-
-fn generate_system_find_fallback(
-    generator: &mut Generator,
-    cmd: &SimpleCommand,
-    generate_output: bool,
-    input_var: &str,
-) -> String {
-    let mut output = String::new();
-
-    // Build the find command arguments for open3
-    let mut find_args = Vec::new();
-    for arg in &cmd.args {
-        match arg {
-            Word::Literal(s, _) => {
-                let word = Word::Literal(s.clone(), Default::default());
-                find_args.push(generator.perl_string_literal(&word));
-            }
-            Word::StringInterpolation(interp, _) => {
-                // Use the convert_string_interpolation_to_perl function directly
-                find_args.push(generator.convert_string_interpolation_to_perl(interp));
-            }
-            _ => {
-                // For other word types, convert to Perl
-                find_args.push(generator.perl_string_literal(arg));
-            }
-        }
-    }
-
-    if generate_output {
-        // For pipeline context, capture output to variable
         output.push_str(&generator.indent());
-        let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
-        let formatted_args = find_args.join(", ");
+        output.push_str(&format!("my @{} = ();\n", input_var));
+
+        let start_dir_expr = if start_dir == "." || start_dir == "'./'" { "'./'" } else { &start_dir };
+        output.push_str(&generator.indent());
         output.push_str(&format!(
-            "my ({}, {}, {});
-my {} = open3({}, {}, {}, 'find', {});
-close {} or croak 'Close failed: $OS_ERROR';
-${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
-close {} or croak 'Close failed: $OS_ERROR';
-waitpid {}, 0;\n",
-            in_var,
-            out_var,
-            err_var,
-            pid_var,
-            in_var,
-            out_var,
-            err_var,
-            formatted_args,
-            in_var,
-            input_var,
-            out_var,
-            out_var,
-            pid_var
+            "File::Find::find(sub {{ {} }}, {});\n",
+            wanted_lines.join(" "),
+            start_dir_expr
+        ));
+
+        output.push_str(&generator.indent());
+        output.push_str(&format!(
+            "@{} = sort @{};\n",
+            input_var, input_var
+        ));
+        output.push_str(&generator.indent());
+        output.push_str(&format!(
+            "${} = join \"\\n\", @{};\n",
+            input_var, input_var
         ));
         output.push_str(&generator.indent());
         output.push_str(&format!("chomp ${};\n", input_var));
     } else {
-        // For standalone commands, execute directly
+        // Print results directly
+        wanted_lines.push("    print \"$File::Find::name\\n\";".to_string());
+
+        let start_dir_expr = if start_dir == "." || start_dir == "'./'" { "'./'" } else { &start_dir };
         output.push_str(&generator.indent());
-        let formatted_args = find_args.join(", ");
-        output.push_str(&format!("system 'find', {};\n", formatted_args));
+        output.push_str(&format!(
+            "File::Find::find(sub {{ {} }}, {});\n",
+            wanted_lines.join(" "),
+            start_dir_expr
+        ));
     }
 
     output
 }
 
+/// Generate native Perl find for substitution (backtick/capture) context.
+/// Returns a do-block expression that evaluates to the find output.
 pub fn generate_find_for_substitution(
     generator: &mut Generator,
     cmd: &SimpleCommand,
     _input_var: &str,
 ) -> String {
-    // For command substitution, defer to the real `find` command so its
-    // traversal order and filtering match the shell exactly.
-    let command = Command::Simple(cmd.clone());
-    let command_str = generator.generate_command_string_for_system(&command);
-    let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+    // Parse find arguments
+    let mut start_dir = String::from(".");
+    let mut name_pattern: Option<String> = None;
+    let mut file_type: Option<String> = None;
+    let mut maxdepth: Option<String> = None;
+
+    let mut args_iter = cmd.args.iter();
+    while let Some(arg) = args_iter.next() {
+        if let Some(lit) = extract_literal_from_word(arg) {
+            match lit.as_str() {
+                "-name" => {
+                    if let Some(next_arg) = args_iter.next() {
+                        name_pattern = extract_literal_from_word(next_arg);
+                    }
+                }
+                "-type" => {
+                    if let Some(next_arg) = args_iter.next() {
+                        file_type = extract_literal_from_word(next_arg);
+                    }
+                }
+                "-maxdepth" => {
+                    if let Some(next_arg) = args_iter.next() {
+                        maxdepth = extract_literal_from_word(next_arg);
+                    }
+                }
+                s if s.starts_with('-') => {
+                    // Skip other flags
+                }
+                _ => {
+                    // First non-flag argument is the start directory
+                    if start_dir == "." || start_dir == "'./'" {
+                        start_dir = generator.perl_string_literal(arg);
+                    }
+                }
+            }
+        }
+    }
+
+    let start_dir_expr = if start_dir == "." || start_dir == "'./'" {
+        "'./'".to_string()
+    } else {
+        start_dir.clone()
+    };
+
+    // Build conditions
+    let mut conditions = Vec::new();
+
+    // Type filter
+    if let Some(ref ftype) = file_type {
+        let test = match ftype.as_str() {
+            "f" => "-f $_",
+            "d" => "-d $_",
+            "l" => "-l $_",
+            _ => "-e $_",
+        };
+        conditions.push(test.to_string());
+    }
+
+    // Name filter (convert glob pattern to regex)
+    if let Some(ref pat) = name_pattern {
+        let regex = escape_glob_to_regex(pat);
+        conditions.push(format!("$_ =~ /{}/msx", regex));
+    }
+
+    let condition_code = if conditions.is_empty() {
+        String::from("1")
+    } else {
+        conditions.join(" && ")
+    };
+
+    // Maxdepth
+    let maxdepth_code = if let Some(ref depth) = maxdepth {
+        if let Ok(d) = depth.parse::<usize>() {
+            format!(
+                "my $maxdepth = {}; my $depth = ($File::Find::dir =~ tr/\\///) + 1; return if $depth > $maxdepth;",
+                d
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     format!(
-        "do {{ my $command = {}; my $result = qx{{$command}}; $CHILD_ERROR = $? >> 8; $result; }}",
-        command_lit
+        "do {{\n    require File::Find;\n    my @find_results;\n    {maxdepth_code}\n    File::Find::find(sub {{ if ({condition_code}) {{ push @find_results, $File::Find::name; }} }}, {start_dir});\n    @find_results = sort @find_results;\n    my $result = join \"\\n\", @find_results;\n    if ($result ne q{{}}) {{ $result .= \"\\n\"; }}\n    $CHILD_ERROR = 0;\n    $result;\n}}",
+        condition_code = condition_code,
+        start_dir = start_dir_expr,
+        maxdepth_code = maxdepth_code,
     )
 }

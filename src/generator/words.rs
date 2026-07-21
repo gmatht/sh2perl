@@ -446,19 +446,131 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             command_lit
                         )
                     } else {
-                        let command_str =
-                            crate::generator::redirects::generate_bash_command_string(cmd);
-                        // Use force_interp so that Perl variables (e.g. $file) in the
-                        // redirect target are interpolated before the command is passed
-                        // to the shell.  This mirrors how bash expands $var in
-                        // `cmd < "$var"`.
-                        let command_lit =
-                            generator.perl_string_literal_force_interp(&Word::literal(command_str));
+                        // Check if the inner command is a known builtin with a simple
+                        // input redirect. If so, use native Perl code instead of qx{}.
+                        let has_native_handler = match &*redirect_cmd.command {
+                            Command::Simple(simple_cmd) => {
+                                if let Word::Literal(name, _) = &simple_cmd.name {
+                                    // Only handle simple input redirects (no here-strings,
+                                    // process substitutions, or other complex redirects)
+                                    let all_input = redirect_cmd.redirects.iter().all(|r| {
+                                        matches!(r.operator, RedirectOperator::Input)
+                                    });
+                                    all_input && match name.as_str() {
+                                        "wc" => true,
+                                        _ => false,
+                                    }
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        };
 
-                        format!(
-                            "do {{ my $command = {}; chomp(my $result = qx{{$command}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                            command_lit
-                        )
+                        if has_native_handler {
+                            // Use native handler for the inner command.
+                            if let Command::Simple(simple_cmd) = &*redirect_cmd.command {
+                                if let Word::Literal(name, _) = &simple_cmd.name {
+                                    match name.as_str() {
+                                        "wc" => {
+                                            // Generate inline Perl to read the file and count.
+                                            // First, get the file path from the input redirect.
+                                            let file_expr = redirect_cmd
+                                                .redirects
+                                                .iter()
+                                                .find(|r| matches!(r.operator, RedirectOperator::Input))
+                                                .map(|r| generator.perl_string_literal(&r.target))
+                                                .unwrap_or_else(|| "q{}".to_string());
+
+                                            // Parse wc flags
+                                            let mut count_lines = false;
+                                            let mut count_words = false;
+                                            let mut count_bytes = false;
+                                            let mut count_chars = false;
+                                            for arg in &simple_cmd.args {
+                                                if let Word::Literal(s, _) = arg {
+                                                    for ch in s.chars().skip(1) {
+                                                        match ch {
+                                                            'l' => count_lines = true,
+                                                            'w' => count_words = true,
+                                                            'c' => count_bytes = true,
+                                                            'm' => count_chars = true,
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if !count_lines && !count_words && !count_chars && !count_bytes {
+                                                count_lines = true;
+                                                count_words = true;
+                                                count_bytes = true;
+                                            }
+
+                                            let mut wc_code = String::from("do {\n");
+                                            wc_code.push_str(&format!("    my $wc_file = {};\n", file_expr));
+                                            wc_code.push_str("    open my $fh, '<', $wc_file or croak \"Cannot open $wc_file: $OS_ERROR\\n\";\n");
+                                            wc_code.push_str("    my $content = do { local $INPUT_RECORD_SEPARATOR = undef; <$fh> };\n");
+                                            wc_code.push_str("    close $fh or croak \"Close failed: $OS_ERROR\\n\";\n");
+
+                                            let mut parts = Vec::new();
+                                            if count_lines {
+                                                wc_code.push_str("    my $wc_lines = () = $content =~ /\\n/gsxm;\n");
+                                                parts.push("$wc_lines".to_string());
+                                            }
+                                            if count_words {
+                                                wc_code.push_str("    my $wc_words = scalar split /\\s+/msx, $content;\n");
+                                                parts.push("$wc_words".to_string());
+                                            }
+                                            if count_bytes {
+                                                wc_code.push_str("    my $wc_bytes = length($content);\n");
+                                                parts.push("$wc_bytes".to_string());
+                                            }
+                                            if count_chars {
+                                                wc_code.push_str("    my $wc_chars = length($content);\n");
+                                                parts.push("$wc_chars".to_string());
+                                            }
+
+                                            // For command substitution, do NOT include trailing newline
+                                            // (bash strips trailing newlines from command substitution)
+                                            // For command substitution, do NOT include trailing newline
+                                            // (bash strips trailing newlines from command substitution)
+                                            if parts.len() > 1 {
+                                                let parts_joined = parts.join(", ");
+                                                wc_code.push_str(&format!("    my $result = join(q{{ }}, ({}));\n", parts_joined));
+                                                wc_code.push_str("    $result;\n");
+                                            } else if parts.len() == 1 {
+                                                let part = &parts[0];
+                                                let line = format!("    {};\n", part);
+                                                wc_code.push_str(&line);
+                                            } else {
+                                                wc_code.push_str("    q{}\n;\n");
+                                            }
+                                            wc_code.push_str("}");
+                                            wc_code
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                } else {
+                                    unreachable!()
+                                }
+                            } else {
+                                unreachable!()
+                            }
+                        } else {
+                            let command_str =
+                                crate::generator::redirects::generate_bash_command_string(cmd);
+                            // Use force_interp so that Perl variables (e.g. $file) in the
+                            // redirect target are interpolated before the command is passed
+                            // to the shell.  This mirrors how bash expands $var in
+                            // `cmd < "$var"`.
+                            let command_lit =
+                                generator.perl_string_literal_force_interp(&Word::literal(command_str));
+
+                            format!(
+                                "do {{ my $command = {}; chomp(my $result = qx{{$command}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                command_lit
+                            )
+                        }
                     }
                 }
                 Command::Simple(simple_cmd) => {
@@ -477,16 +589,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // The generate_ls_for_substitution already returns the joined string
                             perl_code
                         } else if name == "find" {
-                            // Use the find command handler for proper conversion
-                            let perl_code = crate::generator::commands::find::generate_find_command(
+                            // Use the find command substitution handler for proper conversion
+                            let perl_code = crate::generator::commands::find::generate_find_for_substitution(
                                 generator,
                                 simple_cmd,
-                                true,
-                                "found_files",
+                                "",
                             );
 
                             // For backtick commands, we need to return the value, not print it
-                            // The generate_find_command already returns the joined string
                             perl_code
                         } else if name == "head" {
                             // Use the shell command directly so file and flag handling stays faithful
@@ -1488,17 +1598,41 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
                                 indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "mkdir" {
-                            // `mkdir` is shell-sensitive here because the command
-                            // substitution must preserve the real exit code and stderr.
-                            let mkdir_cmd = generator.generate_command_string_for_system(
-                                &Command::Simple(simple_cmd.clone()),
-                            );
-                            let mkdir_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(mkdir_cmd));
-                            format!(
-                                "do {{ my $mkdir_cmd = {}; my $mkdir_output = qx{{$mkdir_cmd}}; $CHILD_ERROR = $? >> 8; $mkdir_output; }}",
-                                mkdir_lit
-                            )
+                            // Use native Perl mkdir implementation for command substitution
+                            let mkdir_code =
+                                crate::generator::commands::mkdir::generate_mkdir_command(
+                                    generator, simple_cmd,
+                                );
+                            let lines: Vec<&str> =
+                                mkdir_code.trim_end_matches('\n').lines().collect();
+                            let min_indent = lines
+                                .iter()
+                                .filter(|line| !line.trim().is_empty())
+                                .map(|line| line.len() - line.trim_start().len())
+                                .min()
+                                .unwrap_or(0);
+                            let mut formatted_lines = Vec::new();
+                            let base_eval_indent = 12;
+                            for line in lines {
+                                let trimmed = line.trim_start();
+                                if !trimmed.is_empty() {
+                                    let orig_indent = line.len() - trimmed.len();
+                                    let relative_indent = orig_indent.saturating_sub(min_indent);
+                                    formatted_lines.push(format!(
+                                        "{}{}",
+                                        " ".repeat(base_eval_indent + relative_indent),
+                                        trimmed
+                                    ));
+                                }
+                            }
+                            let formatted_code = formatted_lines
+                                .join("\n");
+                            let indent1 = "    ".to_string();
+                            let indent1_do = "        ".to_string();
+                            let indent2 = "            ".to_string();
+                            format!("do {{\n{}$CHILD_ERROR = 0;\n{}my $eval_result = eval {{\n{}\n{}$CHILD_ERROR = 0;\n{}1;\n{}}};\n{}if ( !$eval_result ) {{\n{}    $CHILD_ERROR = 256;\n{}}}\n{}q{{}};\n}}", 
+                                indent1_do, indent1_do, formatted_code.trim_end(), indent2, indent2, 
+                                indent1_do, indent1_do, indent1_do, indent1_do, indent1_do)
                         } else if name == "touch" {
                             // Use native Perl touch implementation for command substitution
 
