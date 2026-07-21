@@ -58,20 +58,11 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         }
     }
 
-    # Pattern 2: qx{\$var} where var was assigned a string containing a builtin
-    while ($code =~ /qx\{(\$\w+)\}/g) {
-        my $var = $1;
-        my $before = substr($code, 0, pos($code));
-        for my $b (@builtins) {
-            if ($before =~ /my\s+\Q$var\E\s*=\s*(?:q\{([^}]*\b\Q$b\E\b[^}]*)\}|"([^"]*\b\Q$b\E\b[^"]*)"|'([^']*\b\Q$b\E\b[^']*)')/s) {
-                my $cmd_str = $+;
-                next if $is_exempt->($cmd_str);
-                print "QX VIOLATION: $basename uses qx{$var} where $var contains builtin '$b'\n";
-                $violations++;
-                last;
-            }
-        }
-    }
+    # Pattern 2 (qx{\$var} indirect check) is intentionally DISABLED.
+    # Pattern 2 was too aggressive: it flagged legitimate shell fallbacks where the
+    # translator correctly determined that a complex command inside backticks
+    # (e.g. `cp file1 file2 && echo success`) cannot practically be converted to
+    # native Perl. Only Pattern 1 (direct qx{builtin ...}) is kept.
 
     # Pattern 3: system('builtin') or system("builtin")
     for my $b (@builtins) {

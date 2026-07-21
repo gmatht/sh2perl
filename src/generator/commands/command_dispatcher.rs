@@ -716,6 +716,27 @@ pub fn generate_command_impl_with_input(
                         }
                     }
 
+                    // Special handling for cmp command with process substitution
+                    if cmd_name == "cmp" && !process_sub_files.is_empty() {
+                        if process_sub_files.len() >= 2 {
+                            let file1 = &process_sub_files[0];
+                            let file2 = &process_sub_files[1];
+
+                            // Build arguments: first the original args (flags), then the temp file vars
+                            let mut args: Vec<String> = cmd.args.iter()
+                                .map(|arg| generator.perl_string_literal(arg))
+                                .collect();
+                            args.push(format!("${}", file1.0));
+                            args.push(format!("${}", file2.0));
+                            let args_str = args.join(", ");
+
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("$main_exit_code = system('cmp', {}) >> 8;\n", args_str));
+
+                            return result;
+                        }
+                    }
+
                     // Special handling for paste command with process substitution
                     if cmd_name == "paste" && !process_sub_files.is_empty() {
                         //                         eprintln!("DEBUG: Handling paste command with {} process substitution files", process_sub_files.len());

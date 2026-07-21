@@ -204,6 +204,14 @@ $CHILD_ERROR = 0;
     if ($expanded_set1_141 =~ /A-Z/msx) {
     $expanded_set1_141 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
     }
+    # Handle [:upper:] POSIX class in set1
+    if ($expanded_set1_141 =~ /\[:upper:\]/msx) {
+    $expanded_set1_141 =~ s/\[:upper:\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    # Handle [:lower:] POSIX class in set1
+    if ($expanded_set1_141 =~ /\[:lower:\]/msx) {
+    $expanded_set1_141 =~ s/\[:lower:\]/abcdefghijklmnopqrstuvwxyz/msx;
+    }
     # Handle a-z range in set2
     if ($expanded_set2_141 =~ /a-z/msx) {
     $expanded_set2_141 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
@@ -211,6 +219,14 @@ $CHILD_ERROR = 0;
     # Handle A-Z range in set2
     if ($expanded_set2_141 =~ /A-Z/msx) {
     $expanded_set2_141 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    # Handle [:upper:] POSIX class in set2
+    if ($expanded_set2_141 =~ /\[:upper:\]/msx) {
+    $expanded_set2_141 =~ s/\[:upper:\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    # Handle [:lower:] POSIX class in set2
+    if ($expanded_set2_141 =~ /\[:lower:\]/msx) {
+    $expanded_set2_141 =~ s/\[:lower:\]/abcdefghijklmnopqrstuvwxyz/msx;
     }
     my $tr_result_140_1 = q{};
     for my $char ( split //msx, $input_141 ) {

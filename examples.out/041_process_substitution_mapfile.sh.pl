@@ -21,7 +21,7 @@ my $temp_file_ps_fh_1 = q{/tmp} . '/process_sub_fh_1.tmp';
 my $output_ps_fh_1;
 {
 my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', q{printf 'x\ny\n'});
+my $pid = open3($in, $out, $err, 'bash', '-c', 'printf "x\\\\ny\\\\n"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_1 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';

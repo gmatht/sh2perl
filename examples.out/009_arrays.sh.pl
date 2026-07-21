@@ -29,7 +29,6 @@ print "\n";
 $CHILD_ERROR = 0;
 print "== Associative arrays ==\n";
 my %map = ();
-# declare map not implemented
 $map{"answer"} = '42';
 $map{"foo"} = 'bar';
 $map{"two"} = "1 + 1";
@@ -38,30 +37,30 @@ if ( !( ($map{'foo'}) =~ m{\n\z}msx ) ) { print "\n"; }
 print $map{'answer'};
 if ( !( ($map{'answer'}) =~ m{\n\z}msx ) ) { print "\n"; }
 {
-    my $output_1 = q{};
-    my $output_printed_1;
-    my $pipeline_success_1 = 1;
-        $output_1 = q{};
-    my @output_1_items = (keys %map);
-    for my $k (@output_1_items) {
-    $output_1 .= "$k => " . $map{$k}. "\n";
+    my $output_151 = q{};
+    my $output_printed_151;
+    my $pipeline_success_151 = 1;
+        $output_151 = q{};
+    my @output_151_items = (keys %map);
+    for my $k (@output_151_items) {
+    $output_151 .= "$k => " . $map{$k}. "\n";
     }
 
-        my @sort_lines_1_1 = split /\n/msx, $output_1;
-    my @sort_sorted_1_1 = sort @sort_lines_1_1;
-    my $output_1_1 = join "\n", @sort_sorted_1_1;
-    if ($output_1_1 ne q{} && !($output_1_1 =~ m{\n\z}msx)) {
-    $output_1_1 .= "\n";
+        my @sort_lines_151_1 = split /\n/msx, $output_151;
+    my @sort_sorted_151_1 = sort @sort_lines_151_1;
+    my $output_151_1 = join "\n", @sort_sorted_151_1;
+    if ($output_151_1 ne q{} && !($output_151_1 =~ m{\n\z}msx)) {
+    $output_151_1 .= "\n";
     }
-    $output_1 = $output_1_1;
-    $output_1 = $output_1_1;
-    if ($output_1 ne q{} && !defined $output_printed_1) {
-        print $output_1;
-        if (!($output_1 =~ m{\n\z}msx)) {
+    $output_151 = $output_151_1;
+    $output_151 = $output_151_1;
+    if ($output_151 ne q{} && !defined $output_printed_151) {
+        print $output_151;
+        if (!($output_151 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_1 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_151 ) { $main_exit_code = 1; }
     exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 
