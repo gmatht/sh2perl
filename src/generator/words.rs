@@ -2459,6 +2459,8 @@ pub fn convert_arithmetic_to_perl_impl(_generator: &Generator, expr: &str) -> St
         })
         .to_string();
 
-    // Wrap with int() to match bash integer arithmetic semantics
-    format!("int({})", result)
+    // Wrap with int() to match bash integer arithmetic semantics.
+    // Use eval {} // "" to handle division/modulo by zero (bash leaves
+    // the variable unset/empty on arithmetic error instead of dying).
+    format!("eval {{ int({}) }} // \"\"", result)
 }
