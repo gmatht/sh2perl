@@ -8,7 +8,7 @@ use warnings;
 my @builtins = qw(
     find ls grep sed awk sort uniq head tail cat echo printf
     touch mkdir rmdir rm cp mv chmod chown ln basename dirname
-    date sleep wc kill ps cd pwd perl diff
+    date sleep wc kill ps cd pwd perl
 );
 
 # Read exemptions from allowed_qx_calls.txt (same file the Rust check uses).
