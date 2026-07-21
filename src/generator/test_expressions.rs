@@ -30,17 +30,55 @@ fn convert_arith_subexprs(s: &str, generator: &Generator) -> String {
 
 // Helper function to convert shell variables to Perl equivalents
 fn convert_shell_var_to_perl(var: &str) -> String {
-    match var {
+    let mut s = var.trim().to_string();
+    // Strip surrounding quotes if present
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        s = s[1..s.len()-1].to_string();
+    }
+    // Convert any $(...) command substitutions to qx{...}
+    let s = if s.contains("$(") && !s.contains("$((") {
+        let mut result = String::new();
+        let mut depth = 0i32;
+        let mut start = None;
+        for ch in s.chars() {
+            if ch == '$' && start.is_none() {
+                start = Some(result.len());
+                result.push(ch);
+            } else if ch == '(' && start.is_some() {
+                depth += 1;
+                result.push(ch);
+            } else if ch == ')' && start.is_some() {
+                depth -= 1;
+                result.push(ch);
+                if depth == 0 {
+                    // Found matching $(...) - extract and replace
+                    let cmd_start = start.unwrap() + 2;
+                    let cmd_end = result.len() - 1;
+                    let cmd: String = result[cmd_start..cmd_end].to_string();
+                    let replacement = format!("qx'{}'", cmd);
+                    result.truncate(start.unwrap());
+                    result.push_str(&replacement);
+                    start = None;
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        result
+    } else {
+        s
+    };
+    match s.as_str() {
         "$#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
         "$@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
         "$*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
-        _ if var.starts_with('$') => {
+        _ if s.starts_with('$') => {
             // Regular variable - just return as is for now
-            var.to_string()
+            s
         }
         _ => {
             // Not a variable - return as is
-            var.to_string()
+            s
         }
     }
 }
