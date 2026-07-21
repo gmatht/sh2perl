@@ -151,8 +151,8 @@ get_system_info() {
     info["hostname"]="$(hostname)"
     info["user"]="$USER"
     
-    # Return as associative array (bash 4+)
-    declare -p info
+    # Output key=value pairs sorted by key (declare -p is bash-specific and unsupported)
+    for key in "${!info[@]}"; do echo "info[$key]=${info[$key]}"; done | sort
 }
 
 # 23. Complex error handling with traps
