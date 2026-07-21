@@ -962,7 +962,8 @@ impl Parser {
                                             Word::CommandSubstitution(_, _)
                                             | Word::ParameterExpansion(_, _)
                                             | Word::StringInterpolation(_, _)
-                                            | Word::Variable(_, _, _) => {
+                                            | Word::Variable(_, _, _)
+                                            | Word::Arithmetic(_, _) => {
                                                 Word::Literal(format!("{}=", var_name), None)
                                             }
                                             _ => Word::Literal(
@@ -998,6 +999,11 @@ impl Parser {
                                             Word::Variable(v, _, _) => {
                                                 args.push(Word::Variable(
                                                     v.clone(), true, None,
+                                                ));
+                                            }
+                                            Word::Arithmetic(arith_expr, _) => {
+                                                args.push(Word::Arithmetic(
+                                                    arith_expr.clone(), None,
                                                 ));
                                             }
                                             _ => {}
