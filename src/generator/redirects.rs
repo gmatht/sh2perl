@@ -1057,7 +1057,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         if !generator.declared_locals.contains(name) {
                             let elements_perl: Vec<String> = elements
                                 .iter()
-                                .map(|e| format!("'{}'", e.replace("'", "\\'")))
+                                .map(|e| generator.array_element_to_perl(e))
                                 .collect();
                             output.push_str(&generator.indent());
                             if is_assoc {
