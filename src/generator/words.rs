@@ -2577,6 +2577,49 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
 
     let mut result = expr.to_string();
 
+    // Phase 0a: replace bash array-length syntax ${#var[@]} with scalar(@var)
+    // Use placeholders to protect against later variable conversion.
+    let mut arr_len_replacements: Vec<(String, String)> = Vec::new();
+    {
+        let re = regex::Regex::new(r"\$\{#([a-zA-Z_][a-zA-Z0-9_]*)\[@\]\}").unwrap();
+        let mut idx = 0usize;
+        for caps in re.captures_iter(&result.clone()) {
+            let full_match = caps.get(0).unwrap().as_str().to_string();
+            let var_name = caps.get(1).unwrap().as_str().to_string();
+            let placeholder = format!("__ARR_LEN_{}__", idx);
+            let perl_expr = format!("scalar(@{})", var_name);
+            arr_len_replacements.push((full_match, placeholder.clone()));
+            arr_len_replacements.push((placeholder, perl_expr));
+            idx += 1;
+        }
+    }
+    // Replace ${#var} (string length) with length($var) — also use placeholders
+    let mut str_len_replacements: Vec<(String, String)> = Vec::new();
+    {
+        let re = regex::Regex::new(r"\$\{#([a-zA-Z_][a-zA-Z0-9_]*)\}").unwrap();
+        let mut idx = 0usize;
+        for caps in re.captures_iter(&result.clone()) {
+            let full_match = caps.get(0).unwrap().as_str().to_string();
+            let var_name = caps.get(1).unwrap().as_str().to_string();
+            let placeholder = format!("__STR_LEN_{}__", idx);
+            let perl_expr = format!("length(${})", var_name);
+            str_len_replacements.push((full_match, placeholder.clone()));
+            str_len_replacements.push((placeholder, perl_expr));
+            idx += 1;
+        }
+    }
+    // Apply all replacements: first replace patterns with placeholders
+    for (pattern, replacement) in &arr_len_replacements {
+        if pattern.starts_with("${") {
+            result = result.replace(pattern as &str, replacement as &str);
+        }
+    }
+    for (pattern, replacement) in &str_len_replacements {
+        if pattern.starts_with("${") {
+            result = result.replace(pattern as &str, replacement as &str);
+        }
+    }
+
     // Phase 0: extract $(...) command substitutions and replace with placeholders
     let mut cmd_subst_replacements: Vec<(String, String)> = Vec::new();
     let mut i = 0;
@@ -2625,6 +2668,18 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
             } else if var_name.starts_with("__CMD_SUBST_") && var_name.ends_with("__") {
                 // Command substitution placeholder — leave untouched
                 var_name.to_string()
+            } else if matches!(
+                var_name,
+                "scalar" | "length" | "keys" | "values" | "int"
+                    | "join" | "split" | "grep" | "map" | "sort"
+                    | "defined" | "undef" | "substr" | "reverse"
+                    | "pop" | "push" | "shift" | "unshift"
+                    | "sprintf" | "index"
+            ) {
+                // Perl builtin function — leave as-is.
+                // Only include truly unambiguous Perl builtins that are
+                // unlikely to appear as bash variable names.
+                var_name.to_string()
             } else if generator.declared_locals.contains(var_name)
                 || generator.function_level_vars.contains(var_name)
             {
@@ -2643,6 +2698,29 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
             format!("${}", &caps[1])
         })
         .to_string();
+
+    // Step 3a: restore length placeholders back to actual Perl expressions.
+    // The placeholder may have been wrapped in $ENV{...} by the variable
+    // converter if it was treated as an undeclared variable. Handle both forms.
+    let mut result = result;
+    for (placeholder, perl_expr) in &arr_len_replacements {
+        if !placeholder.starts_with("${") {
+            // Replace $ENV{placeholder} form first
+            let env_form = format!("$ENV{{{}}}", placeholder);
+            result = result.replace(&env_form, perl_expr as &str);
+            // Then replace bare placeholder form
+            result = result.replace(placeholder as &str, perl_expr as &str);
+        }
+    }
+    for (placeholder, perl_expr) in &str_len_replacements {
+        if !placeholder.starts_with("${") {
+            // Replace $ENV{placeholder} form first
+            let env_form = format!("$ENV{{{}}}", placeholder);
+            result = result.replace(&env_form, perl_expr as &str);
+            // Then replace bare placeholder form
+            result = result.replace(placeholder as &str, perl_expr as &str);
+        }
+    }
 
     // Step 4: restore command substitution placeholders
     let mut result = result;

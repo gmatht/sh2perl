@@ -1102,7 +1102,10 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             if parts.len() == 2 {
                                 let var = parts[0];
                                 let value = parts[1];
-                                if !generator.declared_locals.contains(var) {
+                                // `local` always creates a new local variable, shadowing any global.
+                                // Only skip if this variable was already declared as local in
+                                // the current function scope (function_level_vars).
+                                if !generator.function_level_vars.contains(var) {
                                     // Check if the next argument is a CommandSubstitution
                                     if i + 1 < cmd.args.len() {
                                         match &cmd.args[i + 1] {
@@ -1171,6 +1174,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                             .push_str(&format!("my ${} = {};\n", var, perl_value));
                                     }
                                     generator.declared_locals.insert(var.to_string());
+                                    generator.function_level_vars.insert(var.to_string());
                                 }
                             }
                         } else {
