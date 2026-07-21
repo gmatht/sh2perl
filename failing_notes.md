@@ -41,7 +41,17 @@ this would be `uc($input)` but the translator does not yet recognise the
 `tr a-z A-Z` pattern. Exempting `echo` is the pragmatic fix until the generator
 is improved.
 
-## Still failing tests (23)
+### Parser: recognize `$?` and other special shell variables in string interpolation (qd. 2026-07-21)
+Added `?`, `-`, `!`, `$` to the set of special single-character shell variables
+recognized inside double-quoted string interpolation in `src/parser/words.rs`.
+Previously only `#`, `@`, `*` were recognized. This fixes the translation of
+`echo "exit: $?"` which was emitting literal `$?` (Perl's full wait status,
+e.g. 256) instead of `${ \($? >> 8\)}` (which gives the shell-compatible exit
+code of 1).
+
+Fixed tests: 070_cmp_basic.sh
+
+## Still failing tests (22)
 
 ### 058_advanced_bash_idioms.sh
 Complex script combining many feature interactions. QX violations for find/
@@ -119,10 +129,6 @@ Extended glob patterns `*.{txt,log,dat}` brace expansion not expanded correctly.
 
 ### 064_hard_to_generate.sh
 Complex script combining many hard-to-generate features.
-
-### 070_cmp_basic.sh
-`cmp` command with process substitution: temp files created but not passed to
-`cmp` — generated `system('cmp')` instead of `system('cmp', $tmp1, $tmp2)`.
 
 ### test_system_builtin.sh
 `find . -name '*.txt'` output is directory-dependent. The test mixes `ls -la`
