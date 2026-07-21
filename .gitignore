@@ -28,3 +28,8 @@ logs/
 .idea/
 .vscode/
 __tmp_direct_exec.pl
+
+# Stray files from test runs or command-line accidents
+kip first SKIP bytes of both inputs
+examples/final_result.txt
+examples/users.txt
