@@ -16,12 +16,14 @@ instead.
 ## Remaining Failing Tests (5)
 
 ### 063_15_complex_function_definition.sh
-`eval "$name() { $body }"` — eval with dynamic arguments (using function
-parameters `$name` and `$body`) cannot define a persistent function because
-the eval runs in a subprocess via `system('bash', '-c', ...)`. The function
-definition is lost after the bash process exits, so subsequent calls to the
-dynamically-defined function fail. A proper fix would require intercepting
-the eval pattern and generating a real Perl subroutine at compile time.
+`eval "$name() { $body }"` — both `$name` and `$body` are runtime function
+arguments (not compile-time constants), so the translator cannot generate
+a static Perl `sub` at compile time. The `system('bash', '-c', "eval ...")`
+fallback is the only option, but the function definition is lost when the
+subprocess exits. This is a fundamental limitation — bash can persist the
+function because eval runs in the same process, but the translator would
+need to keep a persistent bash process alive via IPC::Open3 and forward
+subsequent calls to it, which is impractical for this edge case.
 
 ### 063_hard_to_parse.sh
 Multiple parsing and generation issues: undeclared variables (`$file`, `@array`),
