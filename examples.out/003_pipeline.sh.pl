@@ -47,16 +47,14 @@ $PROGRAM_NAME = '003_pipeline.sh';
     $output_136 = $grep_result_136_1;
     $output_136 = $grep_result_136_1;
 
-        use IPC::Open3;
-    my @wc_args_136_2 = ('-l');
-    my ($wc_in_136_2, $wc_out_136_2, $wc_err_136_2);
-    my $wc_pid_136_2 = open3($wc_in_136_2, $wc_out_136_2, $wc_err_136_2, 'wc', @wc_args_136_2);
-    print {$wc_in_136_2} $output_136;
-    close $wc_in_136_2 or die "Close failed: $OS_ERROR\n";
-    my $output_136_2 = do { local $/ = undef; <$wc_out_136_2> };
-    if ($output_136_2 eq q{}) { $output_136_2 = "0\n"; }
-    close $wc_out_136_2 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_136_2, 0;
+        my $output_136_2 = do {
+    my $_wc_data = $output_136;
+    my $_wc_lines = () = $_wc_data =~ /\n/gsxm;
+    my $_wc_result = q{};
+    $_wc_result .= sprintf q{%d}, $_wc_lines;
+    $_wc_result .= "\n";
+    $_wc_result;
+    };
     $output_136 = $output_136_2;
     if ($output_136 ne q{} && !defined $output_printed_136) {
         print $output_136;

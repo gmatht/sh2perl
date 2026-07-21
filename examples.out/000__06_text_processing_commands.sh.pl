@@ -13,8 +13,8 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__06_text_processing_commands.sh';
-my $MAGIC_3 = 3;
 my $MAGIC_5 = 5;
+my $MAGIC_3 = 3;
 
 print "=== Text Processing Commands ===\n";
 my $file_content = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
@@ -189,16 +189,14 @@ my $line_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     if ( !($output_124 =~ m{\n\z}msx) ) { $output_124 .= "\n"; }
     $CHILD_ERROR = 0;
     if ($CHILD_ERROR != 0) { $pipeline_success_124 = 0; }
-    use IPC::Open3;
-    my @wc_args_124_1 = ('-l');
-    my ($wc_in_124_1, $wc_out_124_1, $wc_err_124_1);
-    my $wc_pid_124_1 = open3($wc_in_124_1, $wc_out_124_1, $wc_err_124_1, 'wc', @wc_args_124_1);
-    print {$wc_in_124_1} $output_124;
-    close $wc_in_124_1 or die "Close failed: $OS_ERROR\n";
-    $output_124 = do { local $/ = undef; <$wc_out_124_1> };
-    if ($output_124 eq q{}) { $output_124 = "0\n"; }
-    close $wc_out_124_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_124_1, 0;
+    $output_124 = do {
+            my $_wc_data = $output_124;
+            my $_wc_lines = () = $_wc_data =~ /\n/gsxm;
+            my $_wc_result = q{};
+            $_wc_result .= sprintf q{%d}, $_wc_lines;
+            $_wc_result .= "\n";
+            $_wc_result;
+        };
     if ( !$pipeline_success_124 ) { $main_exit_code = 1; }
     $output_124 =~ s/\n+\z//msx;
     $output_124;
@@ -211,15 +209,14 @@ my $word_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     if ( !($output_125 =~ m{\n\z}msx) ) { $output_125 .= "\n"; }
     $CHILD_ERROR = 0;
     if ($CHILD_ERROR != 0) { $pipeline_success_125 = 0; }
-    use IPC::Open3;
-    my @wc_args_125_1 = ('-w');
-    my ($wc_in_125_1, $wc_out_125_1, $wc_err_125_1);
-    my $wc_pid_125_1 = open3($wc_in_125_1, $wc_out_125_1, $wc_err_125_1, 'wc', @wc_args_125_1);
-    print {$wc_in_125_1} $output_125;
-    close $wc_in_125_1 or die "Close failed: $OS_ERROR\n";
-    $output_125 = do { local $/ = undef; <$wc_out_125_1> };
-    close $wc_out_125_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_125_1, 0;
+    $output_125 = do {
+            my $_wc_data = $output_125;
+            my $_wc_words = scalar split /\s+/msx, $_wc_data;
+            my $_wc_result = q{};
+            $_wc_result .= sprintf q{%d}, $_wc_words;
+            $_wc_result .= "\n";
+            $_wc_result;
+        };
     if ( !$pipeline_success_125 ) { $main_exit_code = 1; }
     $output_125 =~ s/\n+\z//msx;
     $output_125;

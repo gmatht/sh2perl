@@ -73,16 +73,14 @@ my $count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     };
     ;
     if ($CHILD_ERROR != 0) { $pipeline_success_112 = 0; }
-    use IPC::Open3;
-    my @wc_args_112_1 = ('-l');
-    my ($wc_in_112_1, $wc_out_112_1, $wc_err_112_1);
-    my $wc_pid_112_1 = open3($wc_in_112_1, $wc_out_112_1, $wc_err_112_1, 'wc', @wc_args_112_1);
-    print {$wc_in_112_1} $output_112;
-    close $wc_in_112_1 or die "Close failed: $OS_ERROR\n";
-    $output_112 = do { local $/ = undef; <$wc_out_112_1> };
-    if ($output_112 eq q{}) { $output_112 = "0\n"; }
-    close $wc_out_112_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_112_1, 0;
+    $output_112 = do {
+            my $_wc_data = $output_112;
+            my $_wc_lines = () = $_wc_data =~ /\n/gsxm;
+            my $_wc_result = q{};
+            $_wc_result .= sprintf q{%d}, $_wc_lines;
+            $_wc_result .= "\n";
+            $_wc_result;
+        };
     if ( !$pipeline_success_112 ) { $main_exit_code = 1; }
     $output_112 =~ s/\n+\z//msx;
     $output_112;
