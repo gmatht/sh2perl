@@ -17,9 +17,7 @@ my $result1 = do { my $command = 'ls -la'; my $result = qx{$command}; $CHILD_ERR
 my $result2 = do {
     require File::Find;
     my @find_results;
-
     File::Find::find(sub { if ($_ =~ /^.*\.txt$/msx) { push @find_results, $File::Find::name; } }, q{.});
-    @find_results = sort @find_results;
     my $result = join "\n", @find_results;
     if ($result ne q{}) { $result .= "\n"; }
     $CHILD_ERROR = 0;

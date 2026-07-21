@@ -17,11 +17,23 @@ sub get_file_size {
     my $file = $_[0];
     my $size = do {
     my $wc_file = "$file";
-    open my $fh, '<', $wc_file or croak "Cannot open $wc_file: $OS_ERROR\n";
-    my $content = do { local $INPUT_RECORD_SEPARATOR = undef; <$fh> };
-    close $fh or croak "Close failed: $OS_ERROR\n";
-    my $wc_bytes = length($content);
-    $wc_bytes;
+    my $wc_file_opened = 0;
+    my $content = do {
+        my $result = q{};
+        if (open my $fh, '<', $wc_file) {
+            $wc_file_opened = 1;
+            local $INPUT_RECORD_SEPARATOR = undef;
+            $result = <$fh>;
+            close $fh or warn "Close failed: $OS_ERROR\n";
+        } else {
+            warn "Cannot open $wc_file: $OS_ERROR\n";
+        }
+        $result;
+    };
+    $wc_file_opened ? do {
+        my $wc_bytes = length($content);
+        $wc_bytes;
+    } : q{};
 };
     do {
     my $output = "File $file has $size bytes";

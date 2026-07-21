@@ -508,43 +508,53 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
 
                                             let mut wc_code = String::from("do {\n");
                                             wc_code.push_str(&format!("    my $wc_file = {};\n", file_expr));
-                                            wc_code.push_str("    open my $fh, '<', $wc_file or croak \"Cannot open $wc_file: $OS_ERROR\\n\";\n");
-                                            wc_code.push_str("    my $content = do { local $INPUT_RECORD_SEPARATOR = undef; <$fh> };\n");
-                                            wc_code.push_str("    close $fh or croak \"Close failed: $OS_ERROR\\n\";\n");
+                                            wc_code.push_str("    my $wc_file_opened = 0;\n");
+                                            wc_code.push_str("    my $content = do {\n");
+                                            wc_code.push_str("        my $result = q{};\n");
+                                            wc_code.push_str("        if (open my $fh, '<', $wc_file) {\n");
+                                            wc_code.push_str("            $wc_file_opened = 1;\n");
+                                            wc_code.push_str("            local $INPUT_RECORD_SEPARATOR = undef;\n");
+                                            wc_code.push_str("            $result = <$fh>;\n");
+                                            wc_code.push_str("            close $fh or warn \"Close failed: $OS_ERROR\\n\";\n");
+                                            wc_code.push_str("        } else {\n");
+                                            wc_code.push_str("            warn \"Cannot open $wc_file: $OS_ERROR\\n\";\n");
+                                            wc_code.push_str("        }\n");
+                                            wc_code.push_str("        $result;\n");
+                                            wc_code.push_str("    };\n");
+                                            wc_code.push_str("    $wc_file_opened ? do {\n");
 
                                             let mut parts = Vec::new();
                                             if count_lines {
-                                                wc_code.push_str("    my $wc_lines = () = $content =~ /\\n/gsxm;\n");
+                                                wc_code.push_str("        my $wc_lines = () = $content =~ /\\n/gsxm;\n");
                                                 parts.push("$wc_lines".to_string());
                                             }
                                             if count_words {
-                                                wc_code.push_str("    my $wc_words = scalar split /\\s+/msx, $content;\n");
+                                                wc_code.push_str("        my $wc_words = scalar split /\\s+/msx, $content;\n");
                                                 parts.push("$wc_words".to_string());
                                             }
                                             if count_bytes {
-                                                wc_code.push_str("    my $wc_bytes = length($content);\n");
+                                                wc_code.push_str("        my $wc_bytes = length($content);\n");
                                                 parts.push("$wc_bytes".to_string());
                                             }
                                             if count_chars {
-                                                wc_code.push_str("    my $wc_chars = length($content);\n");
+                                                wc_code.push_str("        my $wc_chars = length($content);\n");
                                                 parts.push("$wc_chars".to_string());
                                             }
 
                                             // For command substitution, do NOT include trailing newline
                                             // (bash strips trailing newlines from command substitution)
-                                            // For command substitution, do NOT include trailing newline
-                                            // (bash strips trailing newlines from command substitution)
                                             if parts.len() > 1 {
                                                 let parts_joined = parts.join(", ");
-                                                wc_code.push_str(&format!("    my $result = join(q{{ }}, ({}));\n", parts_joined));
-                                                wc_code.push_str("    $result;\n");
+                                                wc_code.push_str(&format!("        my $result = join(q{{ }}, ({}));\n", parts_joined));
+                                                wc_code.push_str("        $result;\n");
                                             } else if parts.len() == 1 {
                                                 let part = &parts[0];
-                                                let line = format!("    {};\n", part);
+                                                let line = format!("        {};\n", part);
                                                 wc_code.push_str(&line);
                                             } else {
-                                                wc_code.push_str("    q{}\n;\n");
+                                                wc_code.push_str("        q{};\n");
                                             }
+                                            wc_code.push_str("    } : q{};\n");
                                             wc_code.push_str("}");
                                             wc_code
                                         }
@@ -2545,11 +2555,11 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 let map_name = &pe.variable[1..]; // Remove ! prefix
                                 parts.push(format!("keys %{}", map_name));
                             } else {
-                                // ${arr[@]} -> join(" ", @arr) or join(" ", sort values %map) for string context
-                                // Use sort to make output deterministic (Perl hash order is randomized)
+                                // ${arr[@]} -> join(" ", @arr) or join(" ", values %map) for string context
+                                // Use values to match bash hash order (as close as possible)
                                 let array_name = &pe.variable;
                                 if generator.associative_arrays.contains(array_name) {
-                                    parts.push(format!("(join(\" \", sort values %{}))", array_name));
+                                    parts.push(format!("(join(\" \", values %{}))", array_name));
                                 } else {
                                     parts.push(format!("(join(\" \", @{}))", array_name));
                                 }

@@ -2,7 +2,6 @@
 000__04h_complex_examples.sh	Failed due to: exit code mismatch, stdout mismatch
 000__07_find_path_commands.sh	Failed due to: stdout mismatch
 058_advanced_bash_idioms.sh	Failed due to: stdout mismatch
-063_12_complex_eval.sh	Failed due to: exit code mismatch, stdout mismatch
 063_15_complex_function_definition.sh	Failed due to: exit code mismatch, stdout mismatch
 063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
 064_07_complex_array_operations.sh	Failed due to: stdout mismatch

@@ -82,7 +82,7 @@ pub fn generate_wc_command_with_output(
     // Collect lines/words/chars
     let read_input = if let Some(ref filename) = file_arg {
         format!(
-            "do {{ local $INPUT_RECORD_SEPARATOR = undef; open my $fh, '<', '{}' or croak \"Cannot open file: $OS_ERROR\"; my $c = <$fh>; close $fh; $c }}",
+            "do {{ local $INPUT_RECORD_SEPARATOR = undef; if (open my $fh, '<', '{}') {{ my $c = <$fh>; close $fh or warn \"Close failed: $OS_ERROR\"; $c }} else {{ warn \"Cannot open file: $OS_ERROR\"; q{{}} }} }}",
             filename.replace('\'', "'\\''")
         )
     } else if input_var.is_empty() {

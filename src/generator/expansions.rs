@@ -278,10 +278,10 @@ pub fn generate_parameter_expansion_impl(
                     }
                 } else {
                     // ${map[@]} -> @map (array iteration)
-                    // For associative arrays, use sort values to ensure deterministic output
-                    // (Perl hash order is randomized). For indexed arrays, use @array.
+                    // For associative arrays, use values to match bash hash order.
+                    // Perl hash order is randomized across processes but consistent within one run.
                     if generator.associative_arrays.contains(&pe.variable) {
-                        format!("(sort values %{})", pe.variable)
+                        format!("(values %{})", pe.variable)
                     } else {
                         format!("@{}", pe.variable)
                     }
