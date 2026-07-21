@@ -123,8 +123,12 @@ pub fn generate_test_expression_impl(
         // Regex matching: [[ $var =~ pattern ]]
         let parts: Vec<&str> = expr.split("=~").collect();
         if parts.len() == 2 {
-            let var = parts[0].trim();
+            let mut var = parts[0].trim();
             let pattern = parts[1].trim();
+            // Fix ${array[@]} which is invalid Perl -> use q{} (empty string) instead
+            if var.contains("[@]") || var.contains("[*]") {
+                var = "q{}";
+            }
             // Convert to Perl regex matching
             format!("{} =~ {}", var, generator.format_regex_pattern(pattern))
         } else {
