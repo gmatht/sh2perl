@@ -13,23 +13,7 @@ our $CHILD_ERROR;
 
 $PROGRAM_NAME = 'test_system_builtin.sh';
 print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
-my $result1 = do {
-    my @ls_files_358 = ();
-    if ( -f q{.} ) {
-        push @ls_files_358, q{.};
-    }
-    elsif ( -d q{.} ) {
-        if ( opendir my $dh, q{.} ) {
-            while ( my $file = readdir $dh ) {
-                push @ls_files_358, $file;
-            }
-            closedir $dh;
-            @ls_files_358 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_358;
-        }
-    }
-    @ls_files_358 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_358;
-    (@ls_files_358 ? join("\n", @ls_files_358) . "\n" : q{});
-};
+my $result1 = do { my $command = 'ls -la'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
 my $result2 = do { my $command = q{find . -name '*.txt'}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
 print "Results:\n";
 print $result1;
