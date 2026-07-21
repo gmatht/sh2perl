@@ -43,7 +43,7 @@ while ( $i < $MAGIC_10 ) {
     }
 };
     $CHILD_ERROR = 0;
-    $i = $i + 1;
+    $i = int($i + 1);
 }
 
 sub greet {

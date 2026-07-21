@@ -1551,7 +1551,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
 
                 let next_char = content[i..].chars().next().unwrap();
-                if next_char == '#' || next_char == '@' || next_char == '*' {
+                if next_char == '#' || next_char == '@' || next_char == '*' || next_char == '?' || next_char == '-' || next_char == '!' || next_char == '$' {
                     // Special shell variable
                     parts.push(StringPart::Variable(next_char.to_string()));
                     i += 1;
@@ -1647,7 +1647,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
 
                 let next_char = content[i..].chars().next().unwrap();
-                if next_char == '#' || next_char == '@' || next_char == '*' {
+                if next_char == '#' || next_char == '@' || next_char == '*' || next_char == '?' || next_char == '-' || next_char == '!' || next_char == '$' {
                     parts.push(StringPart::Variable(next_char.to_string()));
                     i += 1;
                 } else if next_char.is_alphanumeric() || next_char == '_' {
