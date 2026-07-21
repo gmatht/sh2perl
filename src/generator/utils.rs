@@ -392,6 +392,64 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 format!("'{}'", escaped)
             }
         }
+        Word::MapAccess(map_name, key, _) => {
+            // Array/map access like arr[1] or map[foo]
+            if key.parse::<usize>().is_ok() {
+                format!("${}[{}]", map_name, key)
+            } else if generator.associative_arrays.contains(map_name) {
+                if key.starts_with('$') {
+                    let mut result = String::from("$");
+                    result.push_str(map_name);
+                    result.push('{');
+                    result.push_str(key);
+                    result.push('}');
+                    result
+                } else {
+                    let mut result = String::from("$");
+                    result.push_str(map_name);
+                    result.push_str("{'");
+                    result.push_str(&key.replace("'", "\\'"));
+                    result.push_str("'}");
+                    result
+                }
+            } else if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+                || generator.associative_arrays.contains(map_name)
+            {
+                format!(
+                    "${}[{}]",
+                    map_name,
+                    generator.convert_arithmetic_to_perl(key)
+                )
+            } else {
+                "q{}".to_string()
+            }
+        }
+        Word::MapKeys(map_name, _) => {
+            if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+            {
+                format!("keys %{}", map_name)
+            } else {
+                "q{}".to_string()
+            }
+        }
+        Word::MapLength(map_name, _) => {
+            if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+            {
+                format!("scalar(@{})", map_name)
+            } else {
+                "0".to_string()
+            }
+        }
+        Word::ArraySlice(array_name, offset, length, _) => {
+            if let Some(length_str) = length {
+                format!("@{}[{}..{}]", array_name, offset, length_str)
+            } else {
+                format!("@{}[{}..]", array_name, offset)
+            }
+        }
         _ => format!("{:?}", word),
     }
 }
@@ -714,6 +772,56 @@ pub fn strip_shell_quotes_and_convert_to_perl_impl(
                 format!("'{}'", escaped)
             }
         }
+        Word::MapAccess(map_name, key, _) => {
+            if key.parse::<usize>().is_ok() {
+                format!("${}[{}]", map_name, key)
+            } else if generator.associative_arrays.contains(map_name) {
+                if key.starts_with('$') {
+                    let mut result = String::from("$");
+                    result.push_str(map_name);
+                    result.push('{');
+                    result.push_str(key);
+                    result.push('}');
+                    result
+                } else {
+                    let mut result = String::from("$");
+                    result.push_str(map_name);
+                    result.push_str("{'");
+                    result.push_str(&key.replace("'", "\\'"));
+                    result.push_str("'}");
+                    result
+                }
+            } else if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+                || generator.associative_arrays.contains(map_name)
+            {
+                format!(
+                    "${}[{}]",
+                    map_name,
+                    generator.convert_arithmetic_to_perl(key)
+                )
+            } else {
+                "q{}".to_string()
+            }
+        }
+        Word::MapKeys(map_name, _) => {
+            if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+            {
+                format!("keys %{}", map_name)
+            } else {
+                "q{}".to_string()
+            }
+        }
+        Word::MapLength(map_name, _) => {
+            if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+            {
+                format!("scalar(@{})", map_name)
+            } else {
+                "0".to_string()
+            }
+        }
         _ => format!("{:?}", word),
     }
 }
@@ -780,6 +888,56 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
             } else {
                 let escaped = expanded.replace('\\', "\\\\").replace("'", "\\'");
                 format!("'{}'", escaped)
+            }
+        }
+        Word::MapAccess(map_name, key, _) => {
+            if key.parse::<usize>().is_ok() {
+                format!("${}[{}]", map_name, key)
+            } else if generator.associative_arrays.contains(map_name) {
+                if key.starts_with('$') {
+                    let mut result = String::from("$");
+                    result.push_str(map_name);
+                    result.push('{');
+                    result.push_str(key);
+                    result.push('}');
+                    result
+                } else {
+                    let mut result = String::from("$");
+                    result.push_str(map_name);
+                    result.push_str("{'");
+                    result.push_str(&key.replace("'", "\\'"));
+                    result.push_str("'}");
+                    result
+                }
+            } else if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+                || generator.associative_arrays.contains(map_name)
+            {
+                format!(
+                    "${}[{}]",
+                    map_name,
+                    generator.convert_arithmetic_to_perl(key)
+                )
+            } else {
+                "q{}".to_string()
+            }
+        }
+        Word::MapKeys(map_name, _) => {
+            if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+            {
+                format!("keys %{}", map_name)
+            } else {
+                "q{}".to_string()
+            }
+        }
+        Word::MapLength(map_name, _) => {
+            if generator.declared_locals.contains(map_name)
+                || generator.function_level_vars.contains(map_name)
+            {
+                format!("scalar(@{})", map_name)
+            } else {
+                "0".to_string()
             }
         }
         _ => format!("{:?}", word),

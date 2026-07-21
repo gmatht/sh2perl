@@ -2,6 +2,18 @@
 
 ## Tests fixed in this session
 
+### Generator/parser: array index keys with commas, ${!prefix@} indirect expansion, and undeclared vars
+Fixed the `parse_index_suffix` function to use the full text of the `TestBracket`
+token (which can include extra characters due to logos fallback behavior when
+`CasePattern` partially matches `[0,`).  Fixed `${!prefix@}` parsing in both the
+`DollarBrace` and `DollarBraceBang` branches to produce `MapKeys` instead of
+`Variable("!prefix@")`.  Updated `perl_string_literal_impl` (and its sibling
+functions) to check `declared_locals`/`function_level_vars` before emitting
+`$array[idx]`, `keys %hash`, or `scalar(@arr)`; undeclared variables now safely
+produce `""` or `0`, matching bash's undefined-variable semantics.
+
+Fixed tests: 063_02_complex_array_assignments.sh
+
 ### Generator: handle here-strings with tr/grep natively instead of qx{echo} fallback
 Modified the command-substitution handling in `words.rs` for `Command::Redirect`
 with here-strings: when the base command is `tr` or `grep`, generate native Perl
@@ -71,11 +83,6 @@ Variable name collision: `$result` in function body refers to global
 command-substitution translation for `` `echo "$param1" | sed "s/old/new/g"` ``.
 The `local result=$(cmd)` pattern generates code where the assignment target
 is a different variable than the one used later.
-
-### 063_02_complex_array_assignments.sh
-Several issues: (1) `$index` undeclared, (2) `$!prefix@` bareword from
-`${!prefix@}` expansion not translated correctly, (3) `matrix[0,0]` key
-loses leading `0` (parsed as `,0`), (4) `@array` undeclared.
 
 ### 063_09_complex_function_parameter_handling.sh
 `let` command (bash builtin for arithmetic) is passed to `system('let', ...)`

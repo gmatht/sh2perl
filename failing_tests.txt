@@ -1,4 +1,3 @@
-000__04h_complex_examples.sh	QX_BUILTIN violations:
 058_advanced_bash_idioms.sh	Failed due to: exit code mismatch, stdout mismatch
 062_hard_to_lex.sh	Failed due to: stdout mismatch
 063_02_complex_array_assignments.sh	Failed due to: exit code mismatch, stdout mismatch

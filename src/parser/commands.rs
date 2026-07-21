@@ -477,12 +477,24 @@ impl Parser {
         loop {
             match self.lexer.peek() {
                 Some(Token::TestBracket) => {
-                    suffix.push('[');
+                    // Push the full text of the token (which may include
+                    // characters beyond just '[' due to logos fallback
+                    // behavior when CasePattern partially matches).
+                    if let Some(text) = self.lexer.get_current_text() {
+                        suffix.push_str(&text);
+                    } else {
+                        suffix.push('[');
+                    }
                     self.lexer.next();
                     depth += 1;
                 }
                 Some(Token::TestBracketClose) => {
-                    suffix.push(']');
+                    // Similarly push the full text of the closing bracket.
+                    if let Some(text) = self.lexer.get_current_text() {
+                        suffix.push_str(&text);
+                    } else {
+                        suffix.push(']');
+                    }
                     self.lexer.next();
                     if depth == 0 {
                         return Err(ParserError::InvalidSyntax(
@@ -1301,6 +1313,7 @@ impl Parser {
         };
 
         // Check if there's a command following this assignment
+        // Track whether the next token is on the same logical line.
         self.lexer.skip_whitespace_and_comments();
         if let Some(Token::Identifier) = self.lexer.peek() {
             // There's a command following, parse it as a command with environment variables
