@@ -12,14 +12,19 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '037_pattern_matching_extglob.sh';
+my $f2;
+my @f2;
+my %f2;
+my $f1;
+my @f1;
+my %f1;
+
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== extglob ==\n";
 # extglob option enabled
-my $f1;
 $f1 = "file.js";
-my $f2;
 $f2 = "thing.min.js";
 if ($f1 =~ /^(?!.*[.]min).*[.]js$/msx) {
         print 'f1-ok' . "\n";

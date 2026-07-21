@@ -35,6 +35,8 @@ do {
 };
 $CHILD_ERROR = 0;
 my $s2;
+my @s2;
+my %s2;
 $s2 = "abba";
 print $s2 =~ s/b/X/grs;
 if ( !( ($s2 =~ s/b/X/grs) =~ m{\n\z}msx ) ) { print "\n"; }

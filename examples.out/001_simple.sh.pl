@@ -15,7 +15,7 @@ $PROGRAM_NAME = '001_simple.sh';
 my $MAX_LOOP_5 = 5;
 
 print "Hello, World!\n";
-if ((-f"test.txt")) {
+if ((-f "test.txt")) {
     print "File exists\n";
 }
 my $i;

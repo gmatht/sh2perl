@@ -12,11 +12,14 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '036_pattern_matching_basic.sh';
+my $s;
+my @s;
+my %s;
+
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== [[ pattern and regex ]]\n";
-my $s;
 $s = "file.txt";
 if ($s =~ /^.*[.]txt$/msx) {
         print 'pattern-match' . "\n";

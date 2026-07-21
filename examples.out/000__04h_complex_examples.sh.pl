@@ -25,6 +25,10 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04h_complex_examples.sh';
+my $current_user;
+my @current_user;
+my %current_user;
+
 print "=== Complex Backtick Examples ===\n";
 my $nested_result = ("Three wells: " . (do { my $_chomp_temp = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     do { my $output_111 = q{};
@@ -93,7 +97,6 @@ do {
     }
 };
 $CHILD_ERROR = 0;
-my $current_user;
 $current_user = ('root');
 if ("$current_user" eq "root") {
     print "Running as root\n";
@@ -102,6 +105,8 @@ else {
     print "Not running as root\n";
 }
 my $system_name;
+my @system_name;
+my %system_name;
 $system_name = 'Darwin';
 if ($system_name =~ /^Linux$/msx) {
         print "Running on Linux\n";
