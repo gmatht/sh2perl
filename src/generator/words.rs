@@ -2074,8 +2074,50 @@ pub fn brace_item_to_word_impl(_generator: &Generator, item: &BraceItem) -> Word
             Word::literal(expanded)
         }
         BraceItem::Sequence(seq) => Word::literal(seq.join(" ")),
-        BraceItem::Nested(_) => todo!(),
-        BraceItem::Compound(_) => todo!(),
+        BraceItem::Nested(inner) => {
+            // Recursively expand the nested brace expansion
+            Word::BraceExpansion(*inner.clone(), None)
+        }
+        BraceItem::Compound(items) => {
+            // Compound items are concatenated together
+            let mut result = String::new();
+            for item in items {
+                match item {
+                    BraceItem::Literal(s) => result.push_str(s),
+                    BraceItem::Range(range) => {
+                        result.push_str(&expand_range(range));
+                    }
+                    BraceItem::Sequence(seq) => {
+                        result.push_str(&seq.join(","));
+                    }
+                    BraceItem::Nested(inner) => {
+                        result.push('{');
+                        for (i, it) in inner.items.iter().enumerate() {
+                            if i > 0 {
+                                result.push(',');
+                            }
+                            match it {
+                                BraceItem::Literal(s) => result.push_str(s),
+                                BraceItem::Range(range) => {
+                                    result.push_str(&range.start);
+                                    result.push_str("..");
+                                    result.push_str(&range.end);
+                                    if let Some(ref step) = range.step {
+                                        result.push_str("..");
+                                        result.push_str(step);
+                                    }
+                                }
+                                BraceItem::Sequence(seq) => result.push_str(&seq.join(",")),
+                                _ => {}
+                            }
+                        }
+                        result.push('}');
+                    }
+                    BraceItem::Compound(_) => {}
+                }
+            }
+            Word::literal(result)
+        }
     }
 }
 
@@ -2264,10 +2306,11 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 let map_name = &pe.variable[1..]; // Remove ! prefix
                                 parts.push(format!("keys %{}", map_name));
                             } else {
-                                // ${arr[@]} -> join(" ", @arr) or join(" ", values %map) for string context
+                                // ${arr[@]} -> join(" ", @arr) or join(" ", sort values %map) for string context
+                                // Use sort to make output deterministic (Perl hash order is randomized)
                                 let array_name = &pe.variable;
                                 if generator.associative_arrays.contains(array_name) {
-                                    parts.push(format!("(join(\" \", values %{}))", array_name));
+                                    parts.push(format!("(join(\" \", sort values %{}))", array_name));
                                 } else {
                                     parts.push(format!("(join(\" \", @{}))", array_name));
                                 }

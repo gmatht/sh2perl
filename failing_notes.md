@@ -2,6 +2,35 @@
 
 ## Tests fixed in this session
 
+### Generator: support `Nested` and `Compound` BraceItem variants (qd. 2026-07-21)
+Implemented `brace_item_to_word_impl()` handling for `BraceItem::Nested` and
+`BraceItem::Compound` in `src/generator/words.rs`. Previously these had
+`todo!()` calls, causing panics when brace expansions contained nested braces
+(e.g. `{src/{main,test}}`). The fix:
+
+- `Nested(inner)`: recursively converts the inner `BraceExpansion` to a
+  `Word::BraceExpansion` so it gets expanded by the normal brace expansion logic.
+- `Compound(items)`: concatenates all items (literals, ranges, nested braces)
+  into a single literal word.
+- Added `Word::BraceExpansion` handler in `perl_string_literal_impl` (and
+  `strip_shell_quotes_and_convert_to_perl_impl` and
+  `strip_shell_quotes_for_regex_impl`) in `src/generator/utils.rs` so that
+  brace expansions are properly expanded instead of falling through to the
+  Debug-format catch-all.
+
+Fixed tests: 064_12_brace_expansion_nested_sequences.sh
+
+### Generator: sort associative array values for deterministic ${map[@]} expansion (qd. 2026-07-21)
+Changed `${map[@]}` expansion for associative arrays to emit
+`join(" ", sort values %map)` instead of `join(" ", values %map)` in
+string-interpolation context (`src/generator/words.rs`), and
+`(sort values %map)` instead of bare `@map` in standalone
+`generate_parameter_expansion_impl` (`src/generator/expansions.rs`).
+Perl hash order is randomized since 5.18, making `values %hash` non-deterministic;
+`sort values` fixes the flakiness.
+
+## Previously fixed tests
+
 ### `(( ... ))` arithmetic evaluation command implemented (qd. 2026-07-21)
 Implemented `parse_double_paren_command()` in `src/parser/commands.rs` to
 properly parse `(( ... ))` bash arithmetic evaluation commands. Previously the
@@ -87,7 +116,7 @@ the same mixed-range logic.
 
 Fixed tests: 064_02_nested_brace_expansions.sh
 
-## Still failing tests (19)
+## Still failing tests (18)
 
 ### 058_advanced_bash_idioms.sh
 Complex script combining many feature interactions. QX violations for find/
@@ -126,19 +155,15 @@ Unmatched right curly bracket caused by incorrect brace/block generation when
 Deliberately hard-to-parse shell constructs.
 
 ### 064_07_complex_array_operations.sh
-**FLAKY** — Perl hash randomization (since 5.18) causes `values %config` to
-return values in random order on each run. Bash's `${config[@]}` order is
-deterministic for a given bash version but differs from Perl's. The test
-sometimes passes (when the random order happens to match) and sometimes fails.
-A deterministic fix would require sorting keys or tracking insertion order.
+Perl hash randomization (since 5.18) causes `values %config` to return values
+in random order on each run. Fixed by using `sort values %config` to make the
+output deterministic, but sorted order differs from bash's hash order for this
+specific set of keys (bash: `8080 localhost admin`, Perl sorted: `8080 admin localhost`).
+A more complete fix would require maintaining key insertion order and iterating
+in that order instead of using `values %`.
 
 ### 064_09_process_substitution_pipeline.sh
 Process substitution temp files not correctly created/passed.
-
-### 064_12_brace_expansion_nested_sequences.sh
-Nested/mixed brace expansions produce invalid Perl. The `BraceExpansion` word
-type is not handled by `perl_string_literal_impl` (falls through to Debug format).
-Additionally nested brace items (`Nested`, `Compound`) have `todo!()` calls.
 
 ### 064_14_nested_command_substitution_arithmetic.sh
 `$(( $(wc -l < /etc/passwd) + $(wc -l < /etc/group) ))` — inner `$(...)`
