@@ -6,4 +6,6 @@ config["user"]="admin"
 config["host"]="localhost"
 config["port"]="8080"
 
-echo "Config: ${config[@]}"
+# Sort values to avoid hash-order non-determinism between bash and Perl
+IFS=$'\n' sorted=($(sort <<<"${config[*]}"))
+echo "Config: ${sorted[@]}"
