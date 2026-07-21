@@ -69,7 +69,25 @@ a variable's word value references another env var.
 
 Fixed tests: 064_13_complex_string_manipulation.sh
 
-## Still failing tests (20)
+### Generator: preserve argument order in `generate_cartesian_product_for_echo` (qd. 2026-07-21)
+Fixed `generate_cartesian_product_for_echo` in `src/generator/commands/simple_commands.rs`
+to preserve the original argument order when multiple brace expansions appear together
+in an echo command. The previous code collected all non-brace arguments separately and
+prepended them before all brace-expansion values, which reordered the parts.
+
+The fix groups consecutive args (literals and brace expansions) into compound words
+that produce the cartesian product, while standalone non-brace args (like a prefix
+string before the first brace expansion) are printed once as a prefix. Additionally,
+range expansion in brace groups with mixed items (e.g. `{1..10,20}`) is now disabled
+to match bash behavior — bash only expands ranges when the brace group is a single
+pure range (`{1..10}`), not when mixed with other items.
+
+Also fixed `handle_brace_expansion_for_echo` in `src/generator/commands/echo.rs` with
+the same mixed-range logic.
+
+Fixed tests: 064_02_nested_brace_expansions.sh
+
+## Still failing tests (19)
 
 ### 058_advanced_bash_idioms.sh
 Complex script combining many feature interactions. QX violations for find/
@@ -92,22 +110,20 @@ arithmetic expression, causing `use strict` compilation errors.
 
 ### 063_02_complex_array_assignments.sh
 `$index` and `@array` not declared. Variables used in MapAccess keys need array
-declarations.
+declarations. Multi-dimensional array keys like `[0,0]` have lost the leading `0`.
 
 ### 063_09_complex_function_parameter_handling.sh
 eval-related syntax error.
 
 ### 063_12_complex_eval.sh
-`eval` result is undefined — stdout mismatch.
+`eval` result is undefined — stdout mismatch. `eval` with dynamic arguments not supported.
 
 ### 063_15_complex_function_definition.sh
-Unmatched right curly bracket caused by incorrect brace/block generation.
+Unmatched right curly bracket caused by incorrect brace/block generation when
+`eval` inside a function body is not supported.
 
 ### 063_hard_to_parse.sh
 Deliberately hard-to-parse shell constructs.
-
-### 064_02_nested_brace_expansions.sh
-Nested brace expansions produce incorrect expansion — stdout mismatch.
 
 ### 064_07_complex_array_operations.sh
 **FLAKY** — Perl hash randomization (since 5.18) causes `values %config` to
@@ -120,17 +136,22 @@ A deterministic fix would require sorting keys or tracking insertion order.
 Process substitution temp files not correctly created/passed.
 
 ### 064_12_brace_expansion_nested_sequences.sh
-Nested/mixed brace expansions produce invalid Perl.
+Nested/mixed brace expansions produce invalid Perl. The `BraceExpansion` word
+type is not handled by `perl_string_literal_impl` (falls through to Debug format).
+Additionally nested brace items (`Nested`, `Compound`) have `todo!()` calls.
 
 ### 064_14_nested_command_substitution_arithmetic.sh
 `$(( $(wc -l < /etc/passwd) + $(wc -l < /etc/group) ))` — inner `$(...)`
-treated as literal text.
+treated as literal text inside the arithmetic expression.
 
 ### 064_18_array_slicing_manipulation.sh
-Array slicing `${arr[@]:offset:length}` not correctly translated.
+Array slicing `${arr[@]:offset:length}` not correctly translated — the literal
+pattern is kept as-is in the Perl output instead of being converted to a Perl
+array slice.
 
 ### 064_19_complex_pattern_matching_extended_globs.sh
 Extended glob patterns `*.{txt,log,dat}` brace expansion not expanded correctly.
+The `*.` prefix is separated from the brace expansion items.
 
 ### 064_22_function_returning_complex_data_structures.sh
 `declare -A info` and `declare -p info` not translated.

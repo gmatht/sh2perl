@@ -345,9 +345,15 @@ pub fn handle_brace_expansion_for_echo(
 ) -> String {
     let mut items = Vec::new();
 
+    // In bash, a brace expansion with a single Range item is the only
+    // case where ranges are actually expanded. When there are multiple
+    // items (e.g. {1..10,20,30..40}), all items are treated as literals.
+    let is_single_range = expansion.items.len() == 1
+        && matches!(expansion.items.first(), Some(BraceItem::Range(_)));
+
     for item in &expansion.items {
         match item {
-            BraceItem::Range(range) => {
+            BraceItem::Range(range) if is_single_range => {
                 // Handle numeric ranges like {1..5} or {00..04..2}
                 if let (Ok(start), Ok(end)) = (range.start.parse::<i32>(), range.end.parse::<i32>())
                 {
@@ -408,6 +414,10 @@ pub fn handle_brace_expansion_for_echo(
                         }
                     }
                 }
+            }
+            BraceItem::Range(_) => {
+                // Mixed brace group: treat range as literal string
+                items.push(crate::generator::commands::simple_commands::item_to_bracket_text(item));
             }
             BraceItem::Literal(literal) => {
                 items.push(literal.clone());

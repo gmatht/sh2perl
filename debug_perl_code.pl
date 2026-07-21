@@ -11,30 +11,39 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = 'test_system_builtin.sh';
-print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
-my $result1 = do {
-    my @ls_files_358 = ();
-    if ( -f q{.} ) {
-        push @ls_files_358, q{.};
+$PROGRAM_NAME = '064_03_complex_parameter_expansion.sh';
+my $name = "John Doe";
+do {
+    my $output = "Hello " . $name =~ s/ /_/grs;
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
     }
-    elsif ( -d q{.} ) {
-        if ( opendir my $dh, q{.} ) {
-            while ( my $file = readdir $dh ) {
-                push @ls_files_358, $file;
-            }
-            closedir $dh;
-            @ls_files_358 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_358;
-        }
-    }
-    @ls_files_358 = map { my $isdir = (-d $_ || -d ( q{.} . q{/} . $_ )); ($isdir ? 'd ' : '- ') . $_ } @ls_files_358;
-    (@ls_files_358 ? join("\n", @ls_files_358) . "\n" : q{});
 };
-my $result2 = do { my $command = q{find . -name '*.txt'}; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
-print "Results:\n";
-print $result1;
-if ( !( ($result1) =~ m{\n\z}msx ) ) { print "\n"; }
-print $result2;
-if ( !( ($result2) =~ m{\n\z}msx ) ) { print "\n"; }
+$CHILD_ERROR = 0;
+do {
+    my $output = "Length: " . length($name);
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+do {
+    my $output = "First: " . substr($name, 0, 4);
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
+do {
+    my $output = "Last: " . substr($name, -3);
+    print $output;
+    if ( !( $output =~ m{\n\z}msx ) ) {
+        print "\n";
+    }
+};
+$CHILD_ERROR = 0;
 
 exit $main_exit_code;
