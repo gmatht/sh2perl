@@ -1,9 +1,15 @@
-000__04b_file_directory_operations.sh	Failed due to: stdout mismatch
-000__04h_complex_examples.sh	Failed due to: exit code mismatch, stdout mismatch
-000__07_find_path_commands.sh	Failed due to: stdout mismatch
-058_advanced_bash_idioms.sh	Failed due to: stdout mismatch
-063_15_complex_function_definition.sh	Failed due to: exit code mismatch, stdout mismatch
-063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
-064_07_complex_array_operations.sh	Failed due to: stdout mismatch
-064_22_function_returning_complex_data_structures.sh	Failed due to: stdout mismatch
-064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
+000__05_system_utilities.sh
+000__06_text_processing_commands.sh
+017_grep_context.sh
+018_grep_params.sh
+040_process_substitution_comm.sh
+041_process_substitution_mapfile.sh
+043_home.sh
+062_02_complex_parameter_expansions.sh
+062_03_complex_heredocs.sh
+063_02_complex_array_assignments.sh
+063_15_complex_function_definition.sh
+063_hard_to_parse.sh
+064_07_complex_array_operations.sh
+064_10_nested_function_definitions.sh
+064_hard_to_generate.sh
