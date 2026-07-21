@@ -12,12 +12,15 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '038_pattern_matching_nocase.sh';
+my $word;
+my @word;
+my %word;
+
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== nocasematch ==\n";
 # nocasematch option enabled
-my $word;
 $word = "Foo";
 if ($word =~ /^foo$/msxi) {
         print 'ci-match' . "\n";

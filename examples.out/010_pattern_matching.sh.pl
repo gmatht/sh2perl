@@ -12,11 +12,23 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '010_pattern_matching.sh';
+my $word;
+my @word;
+my %word;
+my $f1;
+my @f1;
+my %f1;
+my $s;
+my @s;
+my %s;
+my $f2;
+my @f2;
+my %f2;
+
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== [[ pattern and regex ]]\n";
-my $s;
 $s = "file.txt";
 if ($s =~ /^.*[.]txt$/msx) {
         print 'pattern-match' . "\n";
@@ -34,9 +46,7 @@ if ($s =~ /^file[.][a-z]+$/msx) {
 }
 print "== extglob ==\n";
 # extglob option enabled
-my $f1;
 $f1 = "file.js";
-my $f2;
 $f2 = "thing.min.js";
 if ($f1 =~ /^(?!.*[.]min).*[.]js$/msx) {
         print 'f1-ok' . "\n";
@@ -51,7 +61,6 @@ if (!($f2 =~ /^(?!.*[.]min).*[.]js$/msx)) {
 }
 print "== nocasematch ==\n";
 # nocasematch option enabled
-my $word;
 $word = "Foo";
 if ($word =~ /foo/msxi) {
         print 'ci-match' . "\n";
