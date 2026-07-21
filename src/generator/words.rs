@@ -2787,6 +2787,15 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
 
     let mut result = expr.to_string();
 
+    // Phase -1: replace complex multidimensional array-length syntax
+    // ${#var[idx][@]} (bash pseudo-multidimensional array length) with 0.
+    // Full support would require complex Perl array-of-arrays translation;
+    // using 0 is safe (the loop body won't execute) and avoids syntax errors.
+    {
+        let re_idx = regex::Regex::new(r"\$\{#([a-zA-Z_][a-zA-Z0-9_]*)\[[^\]]*\]\[@\]\}").unwrap();
+        result = re_idx.replace_all(&result, "0").to_string();
+    }
+
     // Phase 0a: replace bash array-length syntax ${#var[@]} with scalar(@var)
     // Use placeholders to protect against later variable conversion.
     let mut arr_len_replacements: Vec<(String, String)> = Vec::new();

@@ -54,6 +54,11 @@ pub fn generate_test_expression_impl(
     let expr = &preprocessed;
     let modifiers = &test_expr.modifiers;
 
+    // Helper closure: check if expr starts with an operator optionally followed by " or $
+    let starts_with_op = |expr: &str, op: &str| -> bool {
+        expr.starts_with(op) || expr.starts_with(&format!(r#"{}""#, op)) || expr.starts_with(&format!("{}$", op))
+    };
+
     // Parse the expression to determine the type of test.
     // Order matters: logical operators (-a, -o) must be checked FIRST because
     // they combine sub-expressions that may themselves contain comparison operators.
@@ -129,8 +134,20 @@ pub fn generate_test_expression_impl(
             if var.contains("[@]") || var.contains("[*]") {
                 var = "q{}";
             }
-            // Convert to Perl regex matching
-            format!("{} =~ {}", var, generator.format_regex_pattern(pattern))
+            // Convert to Perl regex matching, using $ENV{var} for undeclared variables
+            let var_ref = if var.starts_with('$') && !var.starts_with("$ENV") {
+                let var_name = var.trim_start_matches('$').trim_start_matches('{').trim_end_matches('}');
+                if !generator.declared_locals.contains(var_name)
+                    && !generator.function_level_vars.contains(var_name)
+                {
+                    format!("$ENV{{{}}}", var_name)
+                } else {
+                    var.to_string()
+                }
+            } else {
+                var.to_string()
+            };
+            format!("{} =~ {}", var_ref, generator.format_regex_pattern(pattern))
         } else {
             "0".to_string()
         }
@@ -336,45 +353,105 @@ pub fn generate_test_expression_impl(
         } else {
             "0".to_string()
         }
-    } else if expr.contains(" -z ") || expr.starts_with("-z ") {
+    } else if expr.contains(" -z ") || starts_with_op(expr, "-z") {
         // String is empty: [[ -z $var ]]
-        let var = expr.replace("-z ", "").trim().to_string();
+        let var = if expr.starts_with("-z ") {
+            expr.replacen("-z ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-z""#) || expr.starts_with("-z$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-z ", "", 1).trim().to_string()
+        };
         format!("{} eq q{{}}", var)
-    } else if expr.contains(" -n ") || expr.starts_with("-n ") {
+    } else if expr.contains(" -n ") || starts_with_op(expr, "-n") {
         // String is not empty: [[ -n $var ]]
-        let var = expr.replace("-n ", "").trim().to_string();
+        let var = if expr.starts_with("-n ") {
+            expr.replacen("-n ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-n""#) || expr.starts_with("-n$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-n ", "", 1).trim().to_string()
+        };
         format!("{} ne q{{}}", var)
-    } else if expr.contains(" -f ") || expr.starts_with("-f ") {
+    } else if expr.contains(" -f ") || starts_with_op(expr, "-f") {
         // File exists and is regular file: [[ -f $var ]]
-        let var = expr.replace("-f ", "").trim().to_string();
+        let var = if expr.starts_with("-f ") {
+            expr.replacen("-f ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-f""#) || expr.starts_with("-f$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-f ", "", 1).trim().to_string()
+        };
         format!("(-f {})", var)
-    } else if expr.contains(" -d ") || expr.starts_with("-d ") {
+    } else if expr.contains(" -d ") || starts_with_op(expr, "-d") {
         // File exists and is directory: [[ -d $var ]]
-        let var = expr.replace("-d ", "").trim().to_string();
+        let var = if expr.starts_with("-d ") {
+            expr.replacen("-d ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-d""#) || expr.starts_with("-d$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-d ", "", 1).trim().to_string()
+        };
         format!("(-d {})", var)
-    } else if expr.contains(" -e ") || expr.starts_with("-e ") {
+    } else if expr.contains(" -e ") || starts_with_op(expr, "-e") {
         // File exists: [[ -e $var ]]
-        let var = expr.replace("-e ", "").trim().to_string();
+        let var = if expr.starts_with("-e ") {
+            expr.replacen("-e ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-e""#) || expr.starts_with("-e$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-e ", "", 1).trim().to_string()
+        };
         format!("(-e {})", var)
-    } else if expr.contains(" -r ") || expr.starts_with("-r ") {
+    } else if expr.contains(" -r ") || starts_with_op(expr, "-r") {
         // File is readable: [[ -r $var ]]
-        let var = expr.replace("-r ", "").trim().to_string();
+        let var = if expr.starts_with("-r ") {
+            expr.replacen("-r ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-r""#) || expr.starts_with("-r$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-r ", "", 1).trim().to_string()
+        };
         format!("(-r {})", var)
-    } else if expr.contains(" -w ") || expr.starts_with("-w ") {
+    } else if expr.contains(" -w ") || starts_with_op(expr, "-w") {
         // File is writable: [[ -w $var ]]
-        let var = expr.replace("-w ", "").trim().to_string();
+        let var = if expr.starts_with("-w ") {
+            expr.replacen("-w ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-w""#) || expr.starts_with("-w$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-w ", "", 1).trim().to_string()
+        };
         format!("(-w {})", var)
-    } else if expr.contains(" -x ") || expr.starts_with("-x ") {
+    } else if expr.contains(" -x ") || starts_with_op(expr, "-x") {
         // File is executable: [[ -x $var ]]
-        let var = expr.replace("-x ", "").trim().to_string();
+        let var = if expr.starts_with("-x ") {
+            expr.replacen("-x ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-x""#) || expr.starts_with("-x$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-x ", "", 1).trim().to_string()
+        };
         format!("(-x {})", var)
-    } else if expr.contains(" -s ") || expr.starts_with("-s ") {
+    } else if expr.contains(" -s ") || starts_with_op(expr, "-s") {
         // File exists and has size greater than 0: [[ -s $var ]]
-        let var = expr.replace("-s ", "").trim().to_string();
+        let var = if expr.starts_with("-s ") {
+            expr.replacen("-s ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-s""#) || expr.starts_with("-s$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-s ", "", 1).trim().to_string()
+        };
         format!("((-s {}) > 0)", var)
-    } else if expr.contains(" -L ") || expr.starts_with("-L ") {
+    } else if expr.contains(" -L ") || starts_with_op(expr, "-L") {
         // File exists and is symbolic link: [[ -L $var ]]
-        let var = expr.replace("-L ", "").trim().to_string();
+        let var = if expr.starts_with("-L ") {
+            expr.replacen("-L ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-L""#) || expr.starts_with("-L$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-L ", "", 1).trim().to_string()
+        };
         format!("(-l {})", var)
     } else {
         // Default case: treat as a simple boolean expression
@@ -387,7 +464,60 @@ pub fn generate_test_expression_impl(
             result = result.replace(&value_str, const_name);
         }
 
-        if result.trim().starts_with('$') {
+        // Check for $(...) command substitution patterns and convert to Perl qx{}
+        // This handles cases like [ "$(cmd)" ] where the command substitution
+        // was parsed as literal text inside the test expression.
+        if result.contains("$(") && !result.contains("$((") {
+            // Extract the command inside $(...) and wrap in qx{}
+            let trimmed = result.trim();
+            // Remove surrounding quotes if any
+            let inner = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            {
+                &trimmed[1..trimmed.len()-1]
+            } else {
+                trimmed
+            };
+            // Replace $(cmd) with qx'cmd' (single-quote delimiters to prevent
+            // Perl interpolation of shell variable references like $var)
+            let mut qx_expr = inner.to_string();
+            // Simple replacement: find $( and matching )
+            let mut depth = 0i32;
+            let mut start = None;
+            let mut result_chars: Vec<char> = Vec::new();
+            for ch in qx_expr.chars() {
+                if ch == '$' && start.is_none() {
+                    start = Some(result_chars.len());
+                    result_chars.push(ch);
+                } else if ch == '(' && start.is_some() {
+                    depth += 1;
+                    result_chars.push(ch);
+                } else if ch == ')' && start.is_some() {
+                    depth -= 1;
+                    result_chars.push(ch);
+                    if depth == 0 {
+                        // Found matching $(...) - replace from start to here with qx'...'
+                        let cmd_start = start.unwrap() + 2; // skip $(
+                        let cmd_end = result_chars.len() - 1; // skip )
+                        let cmd: String = result_chars[cmd_start..cmd_end].iter().collect();
+                        // Replace $(cmd) with qx'cmd'
+                        // Use qx'...' (single-quote delimiters) so that
+                        // shell variables like $var are NOT interpolated
+                        // by Perl but are passed literally to the shell.
+                        let replacement = format!("qx'{}'", cmd);
+                        result_chars.truncate(start.unwrap());
+                        for c in replacement.chars() {
+                            result_chars.push(c);
+                        }
+                        start = None;
+                    }
+                } else {
+                    result_chars.push(ch);
+                }
+            }
+            let final_expr: String = result_chars.iter().collect();
+            format!("({} ne q{{}})", final_expr)
+        } else if result.trim().starts_with('$') {
             format!("({} ne q{{}})", result.trim())
         } else {
             format!("({})", result)
