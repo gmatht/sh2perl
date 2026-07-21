@@ -15,10 +15,10 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '070_cmp_basic.sh';
-my $MAGIC_10 = 10;
-my $MAGIC_5  = 5;
 my $MAGIC_6  = 6;
+my $MAGIC_5  = 5;
 my $MAGIC_3  = 3;
+my $MAGIC_10 = 10;
 
 do {
     open my $original_stdout, '>&', STDOUT
