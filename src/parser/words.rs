@@ -212,6 +212,16 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 _ => break,
             }
         }
+        // If the next token is a BraceOpen, merge the combined literal as
+        // a prefix of the brace expansion so that `*.{txt,log,dat}` becomes
+        // a BraceExpansion with prefix "*." and items ["txt","log","dat"].
+        if matches!(lexer.peek(), Some(Token::BraceOpen)) {
+            let brace_word = parse_brace_expansion(lexer)?;
+            if let Word::BraceExpansion(mut be, _) = brace_word {
+                be.prefix = Some(combined);
+                return Ok(Word::BraceExpansion(be, None));
+            }
+        }
         // Skip inline whitespace after consuming the word
         lexer.skip_inline_whitespace_and_comments();
         return Ok(Word::Literal(combined, None));
@@ -1473,6 +1483,10 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 parts.push(StringPart::Literal("`".to_string()));
                 i = cmd_start;
             }
+        } else if i + 1 < content.len() && content[i..].starts_with("\\$") {
+            // Escaped dollar sign \$ -> literal $
+            current_literal.push('$');
+            i += 2;
         } else if content[i..].starts_with("$") {
             // We found a variable reference (or a literal $ that's not a variable)
             // First, add any accumulated literal text
