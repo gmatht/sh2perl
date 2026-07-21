@@ -1,8 +1,21 @@
-063_09_complex_function_parameter_handling.sh	Failed due to: stdout mismatch
-063_12_complex_eval.sh	Failed due to: stdout mismatch
-063_15_complex_function_definition.sh	Failed due to: exit code mismatch, stdout mismatch
-063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
-064_07_complex_array_operations.sh	Failed due to: stdout mismatch
-064_09_process_substitution_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
-064_22_function_returning_complex_data_structures.sh	Failed due to: exit code mismatch, stdout mismatch
-064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
+012_process_substitution.sh
+042_process_substitution_advanced.sh
+063_12_complex_eval.sh
+063_15_complex_function_definition.sh
+063_hard_to_parse.sh
+064_07_complex_array_operations.sh
+064_22_function_returning_complex_data_structures.sh
+064_hard_to_generate.sh
+000__03_file_manipulation_commands.sh
+000__03_file_manipulation_commands.sh
+000__04b_file_directory_operations.sh
+000__04e_file_manipulation.sh
+000__04e_file_manipulation.sh
+000__04h_complex_examples.sh
+000__07_find_path_commands.sh
+003_pipeline.sh
+058_advanced_bash_idioms.sh
+058_advanced_bash_idioms.sh
+test_find.sh
+test_simple_function.sh
+test_system_builtin.sh
