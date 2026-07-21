@@ -2449,7 +2449,7 @@ pub fn convert_string_interpolation_to_perl_impl(
                     }
                     _ => {
                         // Handle other cases
-                        if pe.variable.contains('[') && pe.variable.contains(']') {
+                        let expr = if pe.variable.contains('[') && pe.variable.contains(']') {
                             if let Some(bracket_start) = pe.variable.find('[') {
                                 if let Some(bracket_end) = pe.variable.rfind(']') {
                                     let var_name = &pe.variable[..bracket_start];
@@ -2458,7 +2458,7 @@ pub fn convert_string_interpolation_to_perl_impl(
                                     // Check if the key is numeric (indexed array) or string (associative array)
                                     if key.parse::<usize>().is_ok() {
                                         // Indexed array access: arr[1] -> $arr[1]
-                                        parts.push(format!("${}[{}]", var_name, key));
+                                        format!("${}[{}]", var_name, key)
                                     } else if generator.associative_arrays.contains(var_name) {
                                         // Associative array access: map[foo] -> $map{'foo'}
                                         // or map[$k] -> $map{$k}
@@ -2469,7 +2469,7 @@ pub fn convert_string_interpolation_to_perl_impl(
                                             result.push('{');
                                             result.push_str(key);
                                             result.push('}');
-                                            parts.push(result);
+                                            result
                                         } else {
                                             // Literal string key: map[foo] -> $map{'foo'}
                                             let mut result = String::from("$");
@@ -2477,26 +2477,73 @@ pub fn convert_string_interpolation_to_perl_impl(
                                             result.push_str("{'");
                                             result.push_str(&key.replace("'", "\\'"));
                                             result.push_str("'}");
-                                            parts.push(result);
+                                            result
                                         }
                                     } else {
                                         // Indexed array access with variable/expression key: arr[i] -> $arr[$i]
-                                        parts.push(format!(
+                                        format!(
                                             "${}[{}]",
                                             var_name,
                                             generator.convert_arithmetic_to_perl(key)
-                                        ));
+                                        )
                                     }
                                 } else {
-                                    parts.push(format!("${{{}}}", pe.variable));
+                                    format!("${{{}}}", pe.variable)
                                 }
                             } else {
-                                parts.push(format!("${{{}}}", pe.variable));
+                                format!("${{{}}}", pe.variable)
                             }
                         } else {
                             // Simple variable reference - use the proper parameter expansion generation
-                            parts.push(generator.generate_parameter_expansion(pe));
-                        }
+                            generator.generate_parameter_expansion(pe)
+                        };
+
+                        // Apply operator transformation if present
+                        let result = match &pe.operator {
+                            ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
+                                let regex = super::expansions::glob_to_perl_regex_nongreedy(pattern);
+                                format!("({} =~ s/^{}//r)", expr, regex)
+                            }
+                            ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
+                                let regex = super::expansions::glob_to_perl_regex_greedy(pattern);
+                                format!("({} =~ s/^{}//sr)", expr, regex)
+                            }
+                            ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
+                                let regex = super::expansions::glob_to_perl_regex_nongreedy(pattern);
+                                format!("({} =~ s/{}$//r)", expr, regex)
+                            }
+                            ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
+                                let regex = super::expansions::glob_to_perl_regex_greedy(pattern);
+                                format!("({} =~ s/{}$//sr)", expr, regex)
+                            }
+                            ParameterExpansionOperator::UppercaseAll => {
+                                format!("uc({})", expr)
+                            }
+                            ParameterExpansionOperator::LowercaseAll => {
+                                format!("lc({})", expr)
+                            }
+                            ParameterExpansionOperator::UppercaseFirst => {
+                                format!("ucfirst({})", expr)
+                            }
+                            ParameterExpansionOperator::Basename => {
+                                format!("( ( {} ) =~ s|^.*/||sr )", expr)
+                            }
+                            ParameterExpansionOperator::Dirname => {
+                                format!("( ( {} ) =~ s|/[^/]*$||sr )", expr)
+                            }
+                            ParameterExpansionOperator::DefaultValue(default) => {
+                                let default_expr = super::expansions::default_value_to_perl(generator, default);
+                                format!(
+                                    "(defined {} && {} ne q{{}} ? {} : {})",
+                                    expr, expr, expr, default_expr
+                                )
+                            }
+                            // For operators already handled above (ArraySlice) or None,
+                            // or operators that don't apply to scalar expressions (like SubstituteAll
+                            // on array elements which should be handled separately), use expr directly.
+                            _ => expr,
+                        };
+                        parts.push(result);
                     }
                 }
             }

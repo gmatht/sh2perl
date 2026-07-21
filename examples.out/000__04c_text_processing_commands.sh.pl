@@ -13,8 +13,8 @@ my $__set_e        = 0;
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04c_text_processing_commands.sh';
-my $MAGIC_3 = 3;
 my $MAGIC_5 = 5;
+my $MAGIC_3 = 3;
 
 print "=== Text Processing Commands ===\n";
 my $file_content = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
@@ -189,16 +189,14 @@ my $line_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     if ( !($output_53 =~ m{\n\z}msx) ) { $output_53 .= "\n"; }
     $CHILD_ERROR = 0;
     if ($CHILD_ERROR != 0) { $pipeline_success_53 = 0; }
-    use IPC::Open3;
-    my @wc_args_53_1 = ('-l');
-    my ($wc_in_53_1, $wc_out_53_1, $wc_err_53_1);
-    my $wc_pid_53_1 = open3($wc_in_53_1, $wc_out_53_1, $wc_err_53_1, 'wc', @wc_args_53_1);
-    print {$wc_in_53_1} $output_53;
-    close $wc_in_53_1 or die "Close failed: $OS_ERROR\n";
-    $output_53 = do { local $/ = undef; <$wc_out_53_1> };
-    if ($output_53 eq q{}) { $output_53 = "0\n"; }
-    close $wc_out_53_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_53_1, 0;
+    $output_53 = do {
+            my $_wc_data = $output_53;
+            my $_wc_lines = () = $_wc_data =~ /\n/gsxm;
+            my $_wc_result = q{};
+            $_wc_result .= sprintf q{%d}, $_wc_lines;
+            $_wc_result .= "\n";
+            $_wc_result;
+        };
     if ( !$pipeline_success_53 ) { $main_exit_code = 1; }
     $output_53 =~ s/\n+\z//msx;
     $output_53;
@@ -211,15 +209,14 @@ my $word_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     if ( !($output_54 =~ m{\n\z}msx) ) { $output_54 .= "\n"; }
     $CHILD_ERROR = 0;
     if ($CHILD_ERROR != 0) { $pipeline_success_54 = 0; }
-    use IPC::Open3;
-    my @wc_args_54_1 = ('-w');
-    my ($wc_in_54_1, $wc_out_54_1, $wc_err_54_1);
-    my $wc_pid_54_1 = open3($wc_in_54_1, $wc_out_54_1, $wc_err_54_1, 'wc', @wc_args_54_1);
-    print {$wc_in_54_1} $output_54;
-    close $wc_in_54_1 or die "Close failed: $OS_ERROR\n";
-    $output_54 = do { local $/ = undef; <$wc_out_54_1> };
-    close $wc_out_54_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_54_1, 0;
+    $output_54 = do {
+            my $_wc_data = $output_54;
+            my $_wc_words = scalar split /\s+/msx, $_wc_data;
+            my $_wc_result = q{};
+            $_wc_result .= sprintf q{%d}, $_wc_words;
+            $_wc_result .= "\n";
+            $_wc_result;
+        };
     if ( !$pipeline_success_54 ) { $main_exit_code = 1; }
     $output_54 =~ s/\n+\z//msx;
     $output_54;

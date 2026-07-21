@@ -719,16 +719,14 @@ $CHILD_ERROR = scalar @grep_filtered_209 > 0 ? 0 : 1;
     $output_210 = $grep_result_210_0;
     $output_210 = $grep_result_210_0;
 
-        use IPC::Open3;
-    my @wc_args_210_1 = ('-l');
-    my ($wc_in_210_1, $wc_out_210_1, $wc_err_210_1);
-    my $wc_pid_210_1 = open3($wc_in_210_1, $wc_out_210_1, $wc_err_210_1, 'wc', @wc_args_210_1);
-    print {$wc_in_210_1} $output_210;
-    close $wc_in_210_1 or die "Close failed: $OS_ERROR\n";
-    my $output_210_1 = do { local $/ = undef; <$wc_out_210_1> };
-    if ($output_210_1 eq q{}) { $output_210_1 = "0\n"; }
-    close $wc_out_210_1 or die "Close failed: $OS_ERROR\n";
-    waitpid $wc_pid_210_1, 0;
+        my $output_210_1 = do {
+    my $_wc_data = $output_210;
+    my $_wc_lines = () = $_wc_data =~ /\n/gsxm;
+    my $_wc_result = q{};
+    $_wc_result .= sprintf q{%d}, $_wc_lines;
+    $_wc_result .= "\n";
+    $_wc_result;
+    };
     $output_210 = $output_210_1;
     if ($output_210 ne q{} && !defined $output_printed_210) {
         print $output_210;
