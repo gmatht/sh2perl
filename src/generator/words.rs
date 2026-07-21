@@ -2854,6 +2854,29 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
         }
     }
 
+    // Phase 0b: handle parameter expansions in arithmetic expressions
+    // Patterns like ${var:-default}, ${var:=default}, ${var:+default}, ${array[idx]:-default}
+    // need to be converted before the general variable conversion mangles them.
+    // Process innermost first by repeatedly replacing innermost ${...} (no nested ${)
+    // with placeholders, then restore in reverse order (outermost first) so that
+    // outer replacements which reference inner placeholders resolve correctly.
+    let mut param_expand_replacements: Vec<(String, String)> = Vec::new();
+    loop {
+        let before = result.clone();
+        // Match innermost ${...} (no nested ${) — i.e. ${...} with no `{` or `}` inside
+        let inner_brace_re = Regex::new(r"\$\{([^{}]+)\}").unwrap();
+        result = inner_brace_re.replace_all(&result, |caps: &regex::Captures| {
+            let content = &caps[1];
+            let placeholder = format!("__PARAM_EXPAND_{}__", param_expand_replacements.len());
+            let perl = convert_param_expansion_in_arith(content, generator);
+            param_expand_replacements.push((placeholder.clone(), perl));
+            placeholder
+        }).to_string();
+        if result == before {
+            break;
+        }
+    }
+
     // Step 1: protect already-`$`-prefixed variables
     let dollar_var_regex = Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
     let protected = dollar_var_regex
@@ -2873,6 +2896,10 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
             } else if var_name.starts_with("__CMD_SUBST_") && var_name.ends_with("__") {
                 // Command substitution placeholder — leave untouched
                 var_name.to_string()
+            } else if var_name.starts_with("__PARAM_EXPAND_") && var_name.ends_with("__") {
+                // Parameter expansion placeholder — leave untouched
+                var_name.to_string()
+
             } else if matches!(
                 var_name,
                 "scalar" | "length" | "keys" | "values" | "int"
@@ -2927,7 +2954,13 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
         }
     }
 
-    // Step 4: restore command substitution placeholders
+    // Step 4a: restore parameter expansion placeholders in REVERSE order
+    // (outermost first, so inner placeholders inside outer replacements resolve correctly)
+    for (placeholder, perl) in param_expand_replacements.iter().rev() {
+        result = result.replace(placeholder as &str, perl as &str);
+    }
+
+    // Step 4b: restore command substitution placeholders
     let mut result = result;
     for (placeholder, perl_code) in &cmd_subst_replacements {
         result = result.replace(placeholder, perl_code);
@@ -2937,4 +2970,90 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
     // Use eval {} // "" to handle division/modulo by zero (bash leaves
     // the variable unset/empty on arithmetic error instead of dying).
     format!("eval {{ int({}) }} // \"\"", result)
+}
+
+/// Convert a simple parameter expansion content to Perl for use in arithmetic expressions.
+/// Called from `convert_arithmetic_to_perl_impl` to handle `${var:-default}` etc.
+fn convert_param_expansion_in_arith(content: &str, generator: &Generator) -> String {
+    // Handle ${var:-default} — use default if var is unset or empty
+    if let Some(colon_idx) = content.find(":-") {
+        let var_part = &content[..colon_idx];
+        let default = &content[colon_idx + 2..];
+        // Simple identifier: ${var:-default}
+        if var_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            let ref_str = if generator.declared_locals.contains(var_part)
+                || generator.function_level_vars.contains(var_part)
+            {
+                format!("${}", var_part)
+            } else {
+                format!("$ENV{{{}}}", var_part)
+            };
+            return format!("(defined {} && {} ne q{{}} ? {} : {})", ref_str, ref_str, ref_str, default);
+        }
+        // Array access: ${array[key]:-default} where key has no ${...} (already innermost)
+        if let Some(open_idx) = var_part.find('[') {
+            if let Some(close_idx) = var_part.rfind(']') {
+                let array_name = &var_part[..open_idx];
+                let key = &var_part[open_idx + 1..close_idx];
+                // Use curly braces for associative arrays, square brackets for indexed arrays
+                if generator.associative_arrays.contains(array_name) {
+                    let ref_str = format!("${}{{{}}}", array_name, key);
+                    return format!("(defined {} && {} ne q{{}} ? {} : {})", ref_str, ref_str, ref_str, default);
+                } else {
+                    let ref_str = format!("${}[{}]", array_name, key);
+                    return format!("(defined {} && {} ne q{{}} ? {} : {})", ref_str, ref_str, ref_str, default);
+                }
+            }
+        }
+    }
+    // Handle ${var:=default} — assign default if var is unset or empty
+    if let Some(colon_idx) = content.find(":=") {
+        let var_part = &content[..colon_idx];
+        let default = &content[colon_idx + 2..];
+        if var_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            let ref_str = if generator.declared_locals.contains(var_part)
+                || generator.function_level_vars.contains(var_part)
+            {
+                format!("${}", var_part)
+            } else {
+                format!("$ENV{{{}}}", var_part)
+            };
+            let assign_ref = if generator.declared_locals.contains(var_part)
+                || generator.function_level_vars.contains(var_part)
+            {
+                format!("${}", var_part)
+            } else {
+                format!("$ENV{{{}}}", var_part)
+            };
+            return format!("(defined {} && {} ne q{{}} ? {} : do {{ {} = {}; {} }})",
+                ref_str, ref_str, ref_str, assign_ref, default, ref_str);
+        }
+    }
+    // Handle ${var:+default} — use default if var is set and non-empty
+    if let Some(colon_idx) = content.find(":+") {
+        let var_part = &content[..colon_idx];
+        let default = &content[colon_idx + 2..];
+        if var_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            let ref_str = if generator.declared_locals.contains(var_part)
+                || generator.function_level_vars.contains(var_part)
+            {
+                format!("${}", var_part)
+            } else {
+                format!("$ENV{{{}}}", var_part)
+            };
+            return format!("(defined {} && {} ne q{{}} ? {} : q{{}})", ref_str, ref_str, default);
+        }
+    }
+    // Handle ${var} (simple variable with braces)
+    if content.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if generator.declared_locals.contains(content)
+            || generator.function_level_vars.contains(content)
+        {
+            return format!("${}", content);
+        } else {
+            return format!("$ENV{{{}}}", content);
+        }
+    }
+    // Fall back to original form wrapped in braces (let later phases handle it)
+    format!("${{{}}}", content)
 }

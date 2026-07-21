@@ -671,6 +671,8 @@ impl Generator {
             if let Word::Arithmetic(arith_expr, _) = &assignment.value {
                 // Extract bare identifiers from the arithmetic expression
                 let re = regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b").unwrap();
+                // Also detect array accesses like ${name[idx]} or ${name[idx]:-default}
+                let array_re = regex::Regex::new(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\[").unwrap();
                 for cap in re.captures_iter(&arith_expr.expression) {
                     let var_name = &cap[1];
                     // Skip Perl keywords and operators
@@ -680,9 +682,24 @@ impl Generator {
                     if !self.declared_locals.contains(var_name)
                         && !self.function_level_vars.contains(var_name)
                     {
-                        output.push_str(&self.indent());
-                        output.push_str(&format!("my ${};\n", var_name));
-                        self.declared_locals.insert(var_name.to_string());
+                        // Check if THIS specific variable is used as an array (has subscript like ${array[idx]})
+                        let array_pattern = format!("${{{}[", var_name);
+                        let is_array = arith_expr.expression.contains(&array_pattern);
+                        if is_array {
+                            if self.associative_arrays.contains(var_name) {
+                                output.push_str(&self.indent());
+                                output.push_str(&format!("my %{};\n", var_name));
+                                self.declared_locals.insert(var_name.to_string());
+                            } else {
+                                output.push_str(&self.indent());
+                                output.push_str(&format!("my @{};\n", var_name));
+                                self.declared_locals.insert(var_name.to_string());
+                            }
+                        } else {
+                            output.push_str(&self.indent());
+                            output.push_str(&format!("my ${};\n", var_name));
+                            self.declared_locals.insert(var_name.to_string());
+                        }
                     }
                 }
             }

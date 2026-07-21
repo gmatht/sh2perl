@@ -1353,9 +1353,50 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     }
                 }
             } else {
+                // Dynamic eval: execute via bash at runtime.
+                // Build the eval string by concatenating all argument parts
+                // (both Literal and Variable parts) and pass to bash -c.
+                let mut parts_perl = Vec::new();
+                for arg in &cmd.args {
+                    if let Word::StringInterpolation(si, _) = arg {
+                        for part in &si.parts {
+                            match part {
+                                StringPart::Literal(s) => {
+                                    // Escape for Perl double-quoted string
+                                    let escaped = s
+                                        .replace("\\", "\\\\")
+                                        .replace("\"", "\\\"")
+                                        .replace("\n", "\\n")
+                                        .replace("\r", "\\r");
+                                    parts_perl.push(format!("\"{}\"", escaped));
+                                }
+                                StringPart::Variable(v) => {
+                                    parts_perl.push(format!("${}", v));
+                                }
+                                StringPart::ParameterExpansion(pe) => {
+                                    parts_perl.push(generator.generate_parameter_expansion(pe));
+                                }
+                                _ => {
+                                    // Fallback: use string representation
+                                    parts_perl.push(format!("q{{}}"));
+                                }
+                            }
+                        }
+                    } else if let Word::Literal(s, _) = arg {
+                        let escaped = s
+                            .replace("\\", "\\\\")
+                            .replace("\"", "\\\"")
+                            .replace("\n", "\\n")
+                            .replace("\r", "\\r");
+                        parts_perl.push(format!("\"{}\"", escaped));
+                    } else {
+                        parts_perl.push(generator.word_to_perl(arg));
+                    }
+                }
+                let concat_expr = parts_perl.join(" . ");
                 output.push_str(&format!(
-                    "# Builtin command 'eval' with dynamic arguments not supported: {}\n",
-                    eval_str
+                    "do {{ my $eval_input = {}; system('bash', '-c', \"eval \\\"$eval_input\\\"\"); $CHILD_ERROR = $? >> 8; }}\n",
+                    concat_expr
                 ));
             }
         }
