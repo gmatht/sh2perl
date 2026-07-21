@@ -54,6 +54,42 @@ pub fn generate_parameter_expansion_impl(
     match &pe.operator {
         ParameterExpansionOperator::None => {
             // ${var} - just the variable
+            // ${#var} - string length: ${#name} -> length($name)
+            if pe.variable.starts_with('#') && !pe.variable.contains('[') && !pe.variable.contains(']') {
+                let inner = &pe.variable[1..];
+                let ref_str = if generator.declared_locals.contains(inner)
+                    || generator.function_level_vars.contains(inner)
+                {
+                    format!("${}", inner)
+                } else {
+                    format!("$ENV{{{}}}", inner)
+                };
+                return format!("length({})", ref_str);
+            }
+            // ${var:offset} or ${var:offset:length} - substring
+            if pe.variable.contains(':') && !pe.variable.contains('[') && !pe.variable.contains(']')
+                && !pe.variable.starts_with(':')
+            {
+                if let Some(colon_pos) = pe.variable.find(':') {
+                    let var_name = &pe.variable[..colon_pos];
+                    let rest = &pe.variable[colon_pos + 1..];
+                    let ref_str = if generator.declared_locals.contains(var_name)
+                        || generator.function_level_vars.contains(var_name)
+                    {
+                        format!("${}", var_name)
+                    } else {
+                        format!("$ENV{{{}}}", var_name)
+                    };
+                    if let Some(second_colon) = rest.find(':') {
+                        let offset = rest[..second_colon].trim();
+                        let length = rest[second_colon + 1..].trim();
+                        return format!("substr({}, {}, {})", ref_str, offset, length);
+                    } else {
+                        let offset = rest.trim();
+                        return format!("substr({}, {})", ref_str, offset);
+                    }
+                }
+            }
             // Check if this contains array access patterns like arr[1] or map[foo]
             if pe.variable.contains('[') && pe.variable.contains(']') {
                 if let Some(bracket_start) = pe.variable.find('[') {
