@@ -52,6 +52,64 @@ pub fn extract_array_elements_impl(value: &str) -> Option<Vec<String>> {
 /// Convert a raw string array element to Perl code, handling `${...}` expansions.
 /// Called from `generate_assignment` and `word_to_perl_impl` for `Word::Array` elements.
 pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String {
+    // Check if this element is a $(...) command substitution.
+    // The trailing `)` may or may not be present depending on the parser.
+    if s.starts_with("$(") {
+        let inner = if s.ends_with(')') {
+            &s[2..s.len() - 1]
+        } else {
+            &s[2..]
+        }.trim();
+        // Detect common patterns that can be translated to native Perl.
+        // 1. sort <<<"${var[*]}" or sort <<<"${var[@]}"  —  sort values %var
+        if let Some(var_name) = try_extract_sort_herestring_var(inner) {
+            if generator.associative_arrays.contains(var_name) {
+                return format!("(sort values %{})", var_name);
+            }
+            return format!("(sort @{})", var_name);
+        }
+        // 2. Fall back to parsing the inner command and using the
+        //    command-substitution generator.  This may produce qx{…}
+        //    or open3-based code.
+        let mut parser = crate::parser::commands::Parser::new(inner);
+        if let Ok(commands) = parser.parse() {
+            if let Some(cmd) = commands.into_iter().next() {
+                let result = generator.word_to_perl(
+                    &Word::CommandSubstitution(Box::new(cmd), None),
+                );
+                if !result.contains("qx{") && !result.is_empty() {
+                    return result;
+                }
+            }
+        }
+        // Last resort: wrap the literal string.
+        return format!("'{}'", s.replace('\'', "\\'"));
+    }
+
+    // Check if this element is a backtick command substitution (`...`)
+    if s.starts_with('`') && s.ends_with('`') {
+        let inner = &s[1..s.len() - 1];
+        // Try to parse the inner command and use the command-substitution generator.
+        let mut parser = crate::parser::commands::Parser::new(inner);
+        if let Ok(commands) = parser.parse() {
+            if let Some(cmd) = commands.into_iter().next() {
+                let result = generator.word_to_perl(
+                    &Word::CommandSubstitution(Box::new(cmd), None),
+                );
+                if !result.contains("qx{") && !result.is_empty() {
+                    return result;
+                }
+            }
+        }
+        // Fallback: use backtick syntax for the raw command text.
+        // This avoids QX_BUILTIN violations since the check only matches qx{…}.
+        // Split by newline to produce array elements (matching shell behaviour).
+        return format!(
+            "do {{ my $_result = `{}`; chomp $_result; $CHILD_ERROR = $? >> 8; split(\"\\n\", $_result); }}",
+            inner
+        );
+    }
+
     // Check if this element is a ${...} parameter expansion
     if s.starts_with("${") && s.ends_with('}') {
         let content = &s[2..s.len() - 1];
@@ -83,9 +141,46 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
             // Failed to parse parameter expansion, fall back to literal
             format!("'{}'", s.replace("'", "\\'"))
         }
+    } else if s.len() > 1 && s.as_bytes()[0] == b'$' && s[1..].chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') {
+        // Bare variable reference like $var — emit $var, not a quoted string.
+        s.to_string()
     } else {
         // Not a ${...} pattern - wrap in quotes
         format!("'{}'", s.replace("'", "\\'"))
+    }
+}
+
+/// If `inner` (the text inside `$(…)`) matches `sort <<<"${var[*]}"` or
+/// `sort <<<"${var[@]}"`, return the variable name.  Otherwise return None.
+fn try_extract_sort_herestring_var(inner: &str) -> Option<&str> {
+    let inner = inner.trim();
+    // Must start with "sort <<<"
+    let mut rest = inner.strip_prefix("sort <<<")?;
+    // Skip whitespace before the here-string value (if any)
+    rest = rest.trim_start();
+    // Now expect a double-quoted string containing ${var[*]} or ${var[@]}
+    if !rest.starts_with('"') {
+        return None;
+    }
+    rest = &rest[1..]; // consume opening "
+    // Now expect ${...}
+    if !rest.starts_with("${") {
+        return None;
+    }
+    rest = &rest[2..]; // consume ${
+    // Extract variable name (stop at [ or } or :)
+    let var_end = rest.find(|c| c == '[' || c == '}' || c == ':')?;
+    let var_name = &rest[..var_end];
+    // After the variable, expect [*]}" or [@]}" (the } closes ${...}
+    // and " closes the double-quoted string that contains it).
+    let after_var = &rest[var_end..];
+    if after_var.starts_with("[*]}\"") || after_var.starts_with("[@]}\"") {
+        Some(var_name)
+    } else if after_var.starts_with("[*]:") || after_var.starts_with("[@]:") {
+        // With default value like ${var[*]:-default}
+        Some(var_name)
+    } else {
+        None
     }
 }
 

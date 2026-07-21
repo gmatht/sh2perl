@@ -1318,10 +1318,43 @@ impl Parser {
             parse_word(&mut self.lexer)?
         };
 
-        // Check if there's a command following this assignment
-        // Track whether the next token is on the same logical line.
-        self.lexer.skip_whitespace_and_comments();
+        // Check if there's a command following this assignment.
+        // Use skip_inline to NOT skip newlines — a newline separates
+        // the assignment from any following command.
+        self.lexer.skip_inline_whitespace_and_comments();
         if let Some(Token::Identifier) = self.lexer.peek() {
+            // Check whether the identifier is actually another assignment
+            // (has `=`, `+=`, etc. after it) rather than a command name.
+            let mut pos = 1usize;
+            while matches!(
+                self.lexer.peek_n(pos),
+                Some(Token::Space | Token::Tab | Token::Comment)
+            ) {
+                pos += 1;
+            }
+            let is_next_assignment =
+                Self::is_assignment_operator(self.lexer.peek_n(pos).cloned())
+                || self.has_indexed_assignment_after_identifier(pos);
+
+            if is_next_assignment {
+                // The next identifier is another assignment, not a command.
+                // Return the current one as a standalone Assignment and let
+                // the outer parse loop handle the remaining assignments.
+                return Ok(Command::Assignment(Assignment {
+                    variable: var_name,
+                    value: value_word,
+                    operator: match assignment_op {
+                        Token::Assign => AssignmentOperator::Assign,
+                        Token::PlusAssign => AssignmentOperator::PlusAssign,
+                        Token::MinusAssign => AssignmentOperator::MinusAssign,
+                        Token::StarAssign => AssignmentOperator::StarAssign,
+                        Token::SlashAssign => AssignmentOperator::SlashAssign,
+                        Token::PercentAssign => AssignmentOperator::PercentAssign,
+                        _ => AssignmentOperator::Assign,
+                    },
+                }));
+            }
+
             // There's a command following, parse it as a command with environment variables
             let mut env_vars = BTreeMap::new();
             env_vars.insert(var_name, value_word);
