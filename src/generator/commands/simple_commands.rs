@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::generator::utils::get_temp_dir;
+use crate::generator::utils::{extract_array_key_impl, get_temp_dir};
 use crate::generator::Generator;
 use crate::Parser;
 use std::collections::{BTreeMap, HashMap};
@@ -1274,7 +1274,24 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     _ => {
                         // Handle other value types
                         let val = generator.perl_string_literal(value);
-                        if !generator.declared_locals.contains(var) {
+                        // Check if the variable is an array/map access like matrix[0,2]
+                        if let Some((array_name, key)) = crate::generator::utils::extract_array_key_impl(var) {
+                            let key_expr = if key.chars().all(|ch| ch.is_ascii_digit()) {
+                                key
+                            } else {
+                                let trimmed = key.trim_matches('"').trim_matches('\'');
+                                format!("\"{}\"", generator.escape_perl_string(trimmed))
+                            };
+                            let sigil = if key_expr.starts_with('"') { '{' } else { '[' };
+                            let close = if sigil == '{' { '}' } else { ']' };
+                            if !generator.declared_locals.contains(&array_name) {
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("my %{} = ();\n", array_name));
+                                generator.declared_locals.insert(array_name.clone());
+                            }
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("${}{}{}{} = {};\n", array_name, sigil, key_expr, close, val));
+                        } else if !generator.declared_locals.contains(var) {
                             output.push_str(&generator.indent());
                             output.push_str(&format!("my ${} = {};\n", var, val));
                             generator.declared_locals.insert(var.clone());
