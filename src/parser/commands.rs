@@ -257,6 +257,9 @@ impl Parser {
                     })
                 }
                 // Bash arithmetic evaluation: (( ... ))
+                Some(Token::ArithmeticEval) => {
+                    self.parse_double_paren_command()?
+                }
                 Some(Token::ParenOpen)
                     if matches!(self.lexer.peek_n(1), Some(Token::ParenOpen)) =>
                 {
@@ -510,6 +513,9 @@ impl Parser {
             Some(Token::While) => parse_while_loop(self),
             Some(Token::For) => parse_for_loop(self),
             Some(Token::Function) => parse_function(self),
+            Some(Token::ArithmeticEval) => {
+                self.parse_double_paren_command()
+            }
             Some(Token::ParenOpen) if matches!(self.lexer.peek_n(1), Some(Token::ParenOpen)) => {
                 self.parse_double_paren_command()
             }
@@ -1397,10 +1403,158 @@ impl Parser {
     }
 
     fn parse_double_paren_command(&mut self) -> Result<Command, ParserError> {
-        // TODO: Implement double paren command parsing
-        Err(ParserError::InvalidSyntax(
-            "Double paren commands not yet implemented".to_string(),
-        ))
+        // Parse (( ... )) arithmetic evaluation command
+        // Consume the (( token
+        match self.lexer.peek() {
+            Some(Token::ArithmeticEval) => {
+                self.lexer.next();
+            }
+            Some(Token::ParenOpen) => {
+                self.lexer.next(); // consume first (
+                if matches!(self.lexer.peek(), Some(Token::ParenOpen)) {
+                    self.lexer.next(); // consume second (
+                } else {
+                    return Err(ParserError::InvalidSyntax(
+                        "Expected (( for arithmetic evaluation".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(ParserError::InvalidSyntax(
+                    "Expected (( for arithmetic evaluation".to_string(),
+                ));
+            }
+        }
+
+        // Collect the raw content inside (( ... ))
+        let mut content = String::new();
+        let mut paren_depth = 1;
+
+        loop {
+            match self.lexer.peek() {
+                Some(Token::ArithmeticEvalClose) => {
+                    self.lexer.next();
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        break;
+                    }
+                    content.push_str("))");
+                }
+                Some(Token::ArithmeticEval) => {
+                    self.lexer.next();
+                    paren_depth += 1;
+                    content.push_str("((");
+                }
+                Some(Token::Newline) | Some(Token::CarriageReturn) => {
+                    // Skip newlines inside the arithmetic expression
+                    self.lexer.next();
+                }
+                None => {
+                    return Err(ParserError::UnexpectedEOF);
+                }
+                _ => {
+                    if let Some(text) = self.lexer.get_current_text() {
+                        content.push_str(&text);
+                    }
+                    self.lexer.next();
+                }
+            }
+        }
+
+        let content = content.trim().to_string();
+
+        if content.is_empty() {
+            // Empty (( )) is valid in bash (sets exit code 1)
+            // Generate a simple false command
+            return Ok(Command::Simple(SimpleCommand {
+                name: Word::Literal("false".to_string(), None),
+                args: vec![],
+                redirects: vec![],
+                env_vars: BTreeMap::new(),
+                stdout_used: true,
+                stderr_used: true,
+            }));
+        }
+
+        // Split by comma to get individual expressions
+        let expressions = split_arithmetic_expressions(&content);
+
+        if expressions.len() == 1 {
+            let expr = expressions[0].trim();
+            if let Some((var_name, value_expr)) = parse_arithmetic_assignment(expr) {
+                return Ok(Command::Assignment(Assignment {
+                    variable: var_name.to_string(),
+                    value: Word::Arithmetic(
+                        ArithmeticExpression {
+                            expression: value_expr.to_string(),
+                            tokens: vec![],
+                        },
+                        None,
+                    ),
+                    operator: AssignmentOperator::Assign,
+                }));
+            } else {
+                // For non-assignment expressions like ((i++)),
+                // create a simple command that evaluates the expression
+                return Ok(Command::Simple(SimpleCommand {
+                    name: Word::Literal("let".to_string(), None),
+                    args: vec![Word::Literal(expr.to_string(), None)],
+                    redirects: vec![],
+                    env_vars: BTreeMap::new(),
+                    stdout_used: true,
+                    stderr_used: true,
+                }));
+            }
+        }
+
+        // Multiple comma-separated expressions
+        let mut commands: Vec<Command> = Vec::new();
+        for expr in &expressions {
+            let expr = expr.trim();
+            if expr.is_empty() {
+                continue;
+            }
+            if let Some((var_name, value_expr)) = parse_arithmetic_assignment(expr) {
+                commands.push(Command::Assignment(Assignment {
+                    variable: var_name.to_string(),
+                    value: Word::Arithmetic(
+                        ArithmeticExpression {
+                            expression: value_expr.to_string(),
+                            tokens: vec![],
+                        },
+                        None,
+                    ),
+                    operator: AssignmentOperator::Assign,
+                }));
+            } else {
+                commands.push(Command::Simple(SimpleCommand {
+                    name: Word::Literal("let".to_string(), None),
+                    args: vec![Word::Literal(expr.to_string(), None)],
+                    redirects: vec![],
+                    env_vars: BTreeMap::new(),
+                    stdout_used: true,
+                    stderr_used: true,
+                }));
+            }
+        }
+
+        if commands.is_empty() {
+            return Ok(Command::Simple(SimpleCommand {
+                name: Word::Literal("true".to_string(), None),
+                args: vec![],
+                redirects: vec![],
+                env_vars: BTreeMap::new(),
+                stdout_used: true,
+                stderr_used: true,
+            }));
+        }
+
+        if commands.len() == 1 {
+            return Ok(commands.remove(0));
+        }
+
+        // Wrap multiple expressions in a block
+        Ok(Command::Block(Block { commands }))
     }
 
     fn parse_shopt_command(&mut self) -> Result<Command, ParserError> {
@@ -1975,6 +2129,71 @@ fn is_builtin_command(name: &str) -> bool {
 }
 
 // Helper function to parse a pipeline from text
+/// Split arithmetic expression by commas, respecting parentheses.
+fn split_arithmetic_expressions(content: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut current = String::new();
+    for ch in content.chars() {
+        match ch {
+            '(' | '[' | '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    let remaining = current.trim().to_string();
+    if !remaining.is_empty() {
+        parts.push(remaining);
+    }
+    parts
+}
+
+/// Parse an arithmetic assignment expression like "i = 1 + 2" into variable name and value.
+/// Returns None if the expression is not a simple assignment.
+fn parse_arithmetic_assignment<'a>(expr: &'a str) -> Option<(&'a str, &'a str)> {
+    // Find the first `=` that is not part of ==, !=, <=, >=, +=, -=, *=, /=, %=
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' {
+            // Check if this is a compound operator
+            if i > 0 {
+                let prev = bytes[i - 1];
+                if prev == b'<' || prev == b'>' || prev == b'!' || prev == b'+' || prev == b'-' || prev == b'*' || prev == b'/' || prev == b'%' {
+                    i += 1;
+                    continue;
+                }
+            }
+            // Check for ==
+            if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                i += 2;
+                continue;
+            }
+            // Found assignment =
+            let var_name = expr[..i].trim();
+            let value_expr = expr[i + 1..].trim();
+            if !var_name.is_empty() && !value_expr.is_empty() {
+                return Some((var_name, value_expr));
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
 pub fn parse_pipeline_from_text(text: &str) -> Result<Command, ParserError> {
     use crate::lexer::{Lexer, Token};
 

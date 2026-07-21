@@ -2146,9 +2146,14 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 current_string.push_str(&format!("$_[{}]", index - 1));
                             }
                         // Perl arrays are 0-indexed
+                        } else if var == "?" {
+                            // Shell's $? is the exit code (0-255), but Perl's $? is
+                            // the raw 16-bit wait status (exit_code << 8).  Translate
+                            // to $? >> 8 which gives the shell-compatible exit code.
+                            current_string.push_str("${\\($? >> 8)}");
                         } else if generator.declared_locals.contains(var)
                             || generator.function_level_vars.contains(var)
-                            || matches!(var.as_str(), "#" | "@" | "*" | "-" | "?" | "!" | "0")
+                            || matches!(var.as_str(), "#" | "@" | "*" | "-" | "!" | "0")
                         {
                             // Regular declared variable - add directly for interpolation
                             current_string.push_str(&format!("${}", var));
@@ -2368,9 +2373,12 @@ pub fn convert_arithmetic_to_perl_impl(_generator: &Generator, expr: &str) -> St
 
     // Step 3: restore sentinels to `$name`
     let restore_regex = Regex::new(r"__DOLLAR_([a-zA-Z_][a-zA-Z0-9_]*)__").unwrap();
-    restore_regex
+    let result = restore_regex
         .replace_all(&converted, |caps: &regex::Captures| {
             format!("${}", &caps[1])
         })
-        .to_string()
+        .to_string();
+
+    // Wrap with int() to match bash integer arithmetic semantics
+    format!("int({})", result)
 }

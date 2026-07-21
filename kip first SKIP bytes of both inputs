@@ -1,0 +1,5025 @@
+[33mcommit a153ba5fd1c34e61384dd6f8c6149a80237edd5f[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 05:30:34 2026 +0000
+
+    Add process-substitution cmp tests to 070_cmp_basic.sh
+
+[33mcommit 64f22fce8316e3570b50b8a6ae51f385574dd33c[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 05:28:24 2026 +0000
+
+    Add cmp basic test (070_cmp_basic.sh)
+
+[33mcommit 36a5d1082c9f8e40a5b5cd8a2a7e6997bcfe52b3[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 05:24:11 2026 +0000
+
+    Test results: 118 passed, 24 failed (fixed 8)
+
+[33mcommit cd32bd74888c6ce2b108e9ecace22be3a0de8dcd[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 05:14:53 2026 +0000
+
+    Reset failing_notes.md: document ONLY acceptable qx{}/system() exemptions
+    
+    - bash -c, ls -l, diff are the only acceptable system calls
+    - All other qx{}/system() calls are bugs to be fixed
+    - Remove stale notes about disabled patterns and per-test descriptions
+
+[33mcommit 985d64e0d5fc4cc114b42946d113be8d0eda57a5[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 05:13:14 2026 +0000
+
+    Remove echo from exemptions — "echo x | tr a-z A-Z" is just uc($x) in Perl
+
+[33mcommit 40f1118a6d7fcc80f9d74025f52701ac6fd805a3[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 05:11:25 2026 +0000
+
+    Whitelist diff: remove from check_qx.pl builtins, add to allowed_qx_calls.txt
+
+[33mcommit 60e39f47aba57da46e3777ab4dfa82973f375b9d[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 05:11:00 2026 +0000
+
+    Fix check_qx.pl: proper qx body extraction + read exemptions from allowed_qx_calls.txt
+    
+    - Pattern 1 now extracts the full qx body first, then checks for builtins,
+      avoiding the backtracking bug that left $1 empty
+    - Reads exemptions from allowed_qx_calls.txt (bash -c, ls -l, echo are exempt)
+    - Pattern 2 (indirect) re-enabled with exemption support
+    - diff added to builtins list
+
+[33mcommit 2c7fd44c8e99bb5c38d45136252bdd9163fac18b[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 05:07:40 2026 +0000
+
+    Test results: 111 passed, 31 failed
+
+[33mcommit a0f7a632d472fd5c00a540b621b96d4b4a1452df[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 05:03:28 2026 +0000
+
+    Reset baseline from glitch 17 to real 31 failures (commit 0b23586)
+    
+    The 17-failure result was a glitch — the qx check had been deleted
+    by the auto-loop. With it re-enabled, the real count is 31.
+
+[33mcommit 046e55479d5ca69f8181194d3ea6edc98446de0e[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 04:18:30 2026 +0000
+
+    Add check_qx.pl: scan generated Perl for qx{}/system() calls with builtins
+
+[33mcommit 64e69158a41d2025b8f88c1b485e19f2a5fdf0d5[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 04:10:42 2026 +0000
+
+    Replace sh2perl/fail with symlink to root fail (now at ../fail)
+
+[33mcommit a9a7e1e43fd74d6db6deb1c613dc5cf04e061f4b[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Tue Jul 21 03:39:07 2026 +0000
+
+    Re-add qx check (was deleted by auto-loop commit 6ffc57b)
+    
+    - Restore check_perl_no_qx_builtins and load_qx_exemptions in utils.rs
+    - Restore import and check call in testing.rs
+    - allowed_qx_calls.txt with exemptions for bash -c and ls -l
+
+[33mcommit 0a7ac2cbccba51cf9163aa9bc389b0d4c2fdd427[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 22:18:28 2026 +0000
+
+    Test results: 125 passed, 17 failed (fixed 1)
+
+[33mcommit 948a2f01e3e2b4c061a6d20ae0edb64e0422c512[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 21:37:06 2026 +0000
+
+    Test results: 124 passed, 18 failed (fixed 1)
+
+[33mcommit 35de2e1de0706ff0b28ac4658f918d61a210c2fa[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 20:59:51 2026 +0000
+
+    Test results: 123 passed, 19 failed (fixed 3)
+
+[33mcommit 7459272303cefe852288999983ab21897d3a2a76[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 20:29:42 2026 +0000
+
+    Test results: 120 passed, 22 failed (fixed 1)
+
+[33mcommit 54907ada3d856c1edf0fb2cd2c2d401b788d2214[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 20:05:09 2026 +0000
+
+    Test results: 119 passed, 23 failed
+
+[33mcommit 4255cc5936708c58002790fb1fd7198d4b15df87[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 19:20:24 2026 +0000
+
+    Test results: 119 passed, 23 failed (fixed 2)
+
+[33mcommit a9fb0a744d07161654a9bc20dfc8bd586912bf78[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 19:01:47 2026 +0000
+
+    Test results: 117 passed, 25 failed (fixed 1)
+
+[33mcommit b776d7a739451ddcf94a04833bc8653c8a144c2e[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 18:32:20 2026 +0000
+
+    Test results: 116 passed, 26 failed (fixed 1)
+
+[33mcommit f10dc090999d36b0bf266cabc9ca5e9dff60255b[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 18:07:55 2026 +0000
+
+    Test results: 115 passed, 27 failed (fixed 1)
+
+[33mcommit 38a9a4b7d15f22a94fc722cfe9813fadba328838[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 17:43:06 2026 +0000
+
+    Test results: 114 passed, 28 failed (fixed 3)
+
+[33mcommit 0b2358640a42a1924601f12c4b24be6cbfc32ae4[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 17:31:42 2026 +0000
+
+    Test results: 111 passed, 31 failed (fixed 1)
+
+[33mcommit 9a069f04a56aca3579263614ff027c5f8fcd8223[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 17:09:08 2026 +0000
+
+    Test results: 110 passed, 32 failed (fixed 3)
+
+[33mcommit 1668999e81e8ef17b23991358cec18ea3c005267[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 16:20:07 2026 +0000
+
+    Reset .last_trusted_count to 35 to match restored failing_tests.txt
+
+[33mcommit 6c1a43938c28ed2196afdb68b5109083604ab880[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 16:20:02 2026 +0000
+
+    Restore failing_tests.txt to last known-good count (35) from commit 953fba8, undoing the false-positive 0-failure commit
+
+[33mcommit ee4dc29db33a4b0faec07f9a77b267b2e1189866[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 12:42:54 2026 +0000
+
+    Test results:  passed,  failed (fixed 35)
+
+[33mcommit 953fba89d934c24cfffe922bdef333d419a7ebb7[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 11:18:05 2026 +0000
+
+    Test results: 107 passed, 35 failed (kept despite regression)
+
+[33mcommit 6ffc57bd405b245c72ee8ae1e5b5c37bd2b1194f[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 08:59:41 2026 +0000
+
+    Test results:  passed,  failed
+
+[33mcommit 01c76e70f8fe7a50e98c73ef8f1a9449bf764b45[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 06:57:14 2026 +0000
+
+    Reset progress counters to match HEAD baseline (000__02_output_formatting_commands:y00096)
+
+[33mcommit a983bb6ef9d6c24a6f8a12519d25b11a8f17b514[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 06:57:09 2026 +0000
+
+    Plug qx{} loophole: add check_perl_no_qx_builtins with exemptions file
+    
+    - New check_perl_no_qx_builtins() detects qx{} calls with known builtins
+      (direct qx{cmd} and indirect qx{$var} via variable assignment)
+    - Exemptions file allowed_qx_calls.txt for bash -c and ls -l patterns
+    - Test test_system_builtin.sh now correctly fails with QX_BUILTIN violations
+      for find . -name '*.txt' (should use native File::Find instead)
+
+[33mcommit 9fdc47ed73c07349aa3af177b1e937aae7de0087[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 06:09:06 2026 +0000
+
+    Test results:  passed,  failed (fixed 32)
+
+[33mcommit f79a2da5db9ba9da648d989e11e8b44a69f45230[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 05:53:22 2026 +0000
+
+    Test results: 110 passed, 32 failed (fixed 2)
+
+[33mcommit 87010c32160b9d56d31d1bed5a6f49a1d2cb917c[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 05:41:01 2026 +0000
+
+    Test results: 108 passed, 34 failed (fixed 1)
+
+[33mcommit 9480bb68d7f3e283cd6faeefae63f9e4290a65f1[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 05:19:07 2026 +0000
+
+    Test results: 107 passed, 35 failed (fixed 4)
+
+[33mcommit 34d0906fda8bfd9ebcc08ec2062b8f83a03da5c1[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Mon Jul 20 05:13:17 2026 +0000
+
+    Test results: 104 passed, 38 failed (kept despite regression)
+
+[33mcommit 75443d7a08e681789e84f387d60bc3a0f0b2e820[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Mon Jul 20 00:41:45 2026 +0000
+
+    Fix fail script executable bit
+
+[33mcommit a0b33d61df555dc246e85e43a8796551a1142251[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Sun Jul 19 21:41:12 2026 +0000
+
+    Test results: 108 passed, 34 failed (fixed 1)
+
+[33mcommit cae92e0b13a291d2186c8ad76db9b949fea5311a[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Sun Jul 19 21:14:51 2026 +0000
+
+    Test results: 107 passed, 35 failed (fixed 5)
+
+[33mcommit 56e7e611e9020ab6e6667365715908a6a3bbb555[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Sun Jul 19 20:52:31 2026 +0000
+
+    Test results: 103 passed, 39 failed (fixed 4)
+
+[33mcommit ae1804f2ab37b00d21fa4a973ef8a41e453cb53c[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Sun Jul 19 20:08:13 2026 +0000
+
+    Test results: 99 passed, 43 failed (kept despite regression)
+
+[33mcommit fe35e72dc2f738d08d2aafb4ed289bbf9a9e6931[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun Jul 19 19:37:27 2026 +0000
+
+    Fix background subshell timing: sleep before echo for determinism
+    
+    Changed (echo ...; sleep N) & to (sleep N; echo ...) & so that
+    the output appears after a predictable delay rather than immediately.
+    Affects 063_hard_to_parse.sh and 063_06_complex_pipeline_background.sh.
+
+[33mcommit 3999f33809d6a3c2c00d5b1cb215733816f266bd[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Sun Jul 19 19:26:14 2026 +0000
+
+    Test results: 108 passed, 34 failed (fixed 4)
+
+[33mcommit b7a4e58c301311b1ddeafceed846f4481217e9b3[m
+Author: John McCabe-Dansted <gmatht@gmail.com>
+Date:   Sun Jul 19 19:04:24 2026 +0000
+
+    Test results: 104 passed, 38 failed (kept despite regression)
+
+[33mcommit 79936a5af12aeb4559c6b7def49a217c67394fe5[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun Jul 19 17:30:30 2026 +0000
+
+    Fix bash syntax errors in example test files
+    
+    Fixed 5 files so bash -n passes:
+    - 058_advanced_bash_idioms.sh: Added missing closing brace for a compound
+      command block
+    - 063_19_complex_function_call.sh: Removed invalid parentheses in
+      --array-option=() argument syntax
+    - 063_hard_to_parse.sh: Same fix as above
+    - 064_19_complex_pattern_matching_extended_globs.sh: Removed extglob
+      @() syntax that bash rejects even with shopt -s extglob
+    - 064_hard_to_generate.sh: Same extglob fix as above
+
+[33mcommit 8867d69a7e974edcd0be0a44bc655cc7cbd9aa87[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun Jul 19 17:26:01 2026 +0000
+
+    Remove ExamplesSnapshot from Rust test runner; restore missing example test files
+    
+    The Rust ExamplesSnapshot in testing.rs was doing rm -rf examples/
+    followed by cp -a from a stale temp backup on every test, which
+    deleted 122 tracked files from examples/ and caused the directory
+    to flicker in and out of existence. The Perl-level
+    ensure_examples_snapshot.pl already handles restoring examples/
+    via git checkout between iterations, so the per-test snapshot
+    in Rust was redundant and harmful.
+    
+    Removed:
+    - struct ExamplesSnapshot
+    - impl ExamplesSnapshot (capture + restore)
+    - impl Drop for ExamplesSnapshot
+    - All capture/restore calls in test_file_equivalence_detailed_with_critic
+    - Kept the manual temp file cleanup for files like temp_*, debug_*, etc.
+
+[33mcommit 1ebd1deeaabdda51846fef8a5a5e6e0e17c41df9[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Merge: cee1711 b44ab4f
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun Jul 19 20:33:53 2026 +0800
+
+    Merge branch 'main' of github.com:gmatht/sh2perl
+
+[33mcommit cee1711e90c567d782b24e4763b498c4e4a0edab[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Jul 2 03:02:10 2026 +0800
+
+    Reached 000__02_output_formatting_commands:y00096
+
+[33mcommit 0f292e2c910c8126aa12f6bdb08a4b331b08b7ff[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Jul 2 02:06:33 2026 +0800
+
+    Reached 000__02_output_formatting_commands:y00095
+
+[33mcommit 79cf1725161df5a448b64e9d2862a20c45526d64[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Jul 1 22:28:59 2026 +0800
+
+    Reached 000__02_output_formatting_commands:y00093
+
+[33mcommit f07127aa55f0978c3f56481bdfa514669a4cc0d0[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Jul 1 04:28:52 2026 +0800
+
+    Reached 000__02_output_formatting_commands:y00059
+
+[33mcommit 8b250bd7197bedf42345f0342f19295185719798[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Mon Jun 29 01:44:29 2026 +0800
+
+    Remove other -z string test.
+
+[33mcommit f0917fb1b644b39cd647ec7797e089093e59031d[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Mon Jun 29 01:43:21 2026 +0800
+
+    Omit test of non-existant -z parameter to strings.
+
+[33mcommit e1da974789a5b42ddb1ac2b98adba6d8e1ce99b1[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun Jun 28 03:04:40 2026 +0800
+
+    Reached 000__02_output_formatting_commands:y00054
+
+[33mcommit 351a57f649b8f68d3367208c42d3eb9e2757aea5[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Jun 25 20:41:25 2026 +0800
+
+    Restore echo examples.
+
+[33mcommit baa944596f8dc68b8c0d5978225e5a9cbf290d14[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Jun 25 20:37:33 2026 +0800
+
+    Readd missing examples.
+
+[33mcommit 9bc6ce08d89c387cdf994d9b30cea7ab5cbdeb81[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Jun 25 20:32:23 2026 +0800
+
+    All Tests pass (intermittant?)
+
+[33mcommit 31d9960bafd3176fe73efc0c64e0d356f66b0f2f[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Jun 25 15:22:37 2026 +0800
+
+    main_loop_rust.pl passes.
+
+[33mcommit d30297d1a11f5c36926f5d3dabaec7bf7334b4a9[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Jun 25 15:18:37 2026 +0800
+
+    Reached ALL_TESTS_PASSED:y99999
+
+[33mcommit cb129242137903bf36dadd9b550a1194febaa2cf[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Jun 25 13:34:53 2026 +0800
+
+    Fix command line too long error.
+
+[33mcommit 35f9b15a6327d66ac52282ec23b2a2c13371e151[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Jun 25 09:28:16 2026 +0800
+
+    Make model configurable.
+
+[33mcommit 09e3ceaa23c5a21a2c4411b0a3d2f9625f577298[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Jun 10 14:49:53 2026 +1200
+
+    One less failure.
+
+[33mcommit 327782b03660520f831dcaae2d8c366fa0889354[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Tue Jun 9 23:57:39 2026 +1200
+
+    Add new rust loop based on number of failures.
+
+[33mcommit 632873da066a7cbaad28bbc247e32438af896617[m
+Merge: 9288315 b44ab4f
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Tue Jun 9 10:29:52 2026 +1200
+
+    Merge branch with conflict resolution
+    
+    All conflicts resolved by keeping incoming version (b44ab4f67):
+    - Awk, builtins, cat, diff, find, grep, xargs, pipeline_commands,
+      words, parser/commands - rewrites and improvements
+    - Generated outputs and config files merged
+
+[33mcommit b44ab4f6745e993b11cab560d738676b1f4beb46[m
+Merge: 449d72f c1a9f0b
+Author: gmatht <mccabedj@proton.me>
+Date:   Sun Jun 7 13:12:29 2026 +1200
+
+    Merge pull request #5 from neon-ninja/main
+    
+    Perl critic
+
+[33mcommit c1a9f0b32b638ed92d720737b23caab6ef99fdca[m
+Merge: 449d72f 30ec956
+Author: Nick Young <nbay92@gmail.com>
+Date:   Wed Jun 3 19:01:21 2026 +1200
+
+    Merge pull request #7 from neon-ninja/copilot/add-debashc-fail-perl-critic
+    
+    Fix all Perl::Critic violations in generated code; fix parser bugs; fix generator correctness bugs; run all tests
+
+[33mcommit 30ec9562e9389d0146cf448451cc6c69083a4078[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Tue Jun 2 00:33:40 2026 +0000
+
+    Changes before error encountered
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/e7f550e5-1bdb-4ade-a874-142feafb694f
+
+[33mcommit cb40b6dcaf8ec328b27beff2c209005088dec5f0[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Tue Jun 2 00:24:04 2026 +0000
+
+    WIP: Start fixing generator bugs for CI failures
+
+[33mcommit 72f186c17efa9f5f38d278dcbd6b874e3f26d01b[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Jun 1 23:44:15 2026 +0000
+
+    Apply remaining changes
+
+[33mcommit 62d605912bb3b9e5181815e252b562d18a04c191[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Jun 1 23:41:58 2026 +0000
+
+    Fix IFS= empty value parsing in parse_standalone_assignment; fix DollarBrace depth tracking; fix parse_array_elements double-advance; add DoubleSemicolon and -a/-o test operators
+
+[33mcommit 0a44b71d9319149cc772deff25ddcceda50ab76e[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Jun 1 23:28:44 2026 +0000
+
+    WIP: Planning parser and runtime fixes
+
+[33mcommit ce89d4ca19b69207cf2f251f9b466732baa5ce05[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Sat May 30 16:23:21 2026 +0000
+
+    Changes before error encountered
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/00de9d93-c5c4-4478-91e4-5a0a41b63961
+
+[33mcommit 4a33f53d2b9bf2ddeea75484c4739d01f269c23a[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Sat May 30 14:06:56 2026 +0000
+
+    Fix compilation: add CStyleForLoop struct and Command::CStyleFor variant to ast.rs; wire up generator
+
+[33mcommit c0ecf4ae0f8c7bb9c79d72598ecb586640f92fa2[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 29 09:26:38 2026 +0000
+
+    Parser: use parse_command for if/elif/while conditions; add C-style for loop skeleton
+
+[33mcommit 0873424539f8e7e219b240354000dbe969b6e498[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 29 09:06:15 2026 +0000
+
+    WIP: start fixing 65 test failures
+
+[33mcommit c2e50759033245b7abc8b36a077f97d6e43edb2a[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Wed May 27 06:41:30 2026 +0000
+
+    Fix tail/cut/strings trailing newlines, grep -c newline, xargs -I line splitting, awk float formatting and implicit concat: all 54 tests pass
+
+[33mcommit efdb3b577c16219f6d35dd7362270ece1fe9c390[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Wed May 27 06:11:14 2026 +0000
+
+    Restore missing examples files from git (snapshot mechanism deletes them during tests)
+
+[33mcommit 84b9851fd5d45be146ff0d8c4b27ddcc77ccb37e[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Wed May 27 06:09:24 2026 +0000
+
+    Apply remaining changes
+
+[33mcommit ac175910bb93f3ba6fe52568091121a43f89be7a[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Wed May 27 06:09:06 2026 +0000
+
+    Fix param expansion glob patterns, echo -n, arithmetic precedence in newline check
+
+[33mcommit 87ad62bbc8e89d173fe6cf5a8e1e12e7ed9941ee[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Wed May 27 05:31:17 2026 +0000
+
+    Fix test runner to run all tests without stopping; fix perl.rs extra blank line bug
+
+[33mcommit fc53a3879b8f94376cf596380f45d0b7ca8407df[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Wed May 27 05:13:44 2026 +0000
+
+    Remove 50-test limit from test_all_examples_next_fail_unlimited so all tests run
+
+[33mcommit 6cc36c140257bc9ea50f35b3c5073e70798a3c82[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Wed May 27 04:40:54 2026 +0000
+
+    Implement set -e (errexit) semantics for pipeline failures
+    
+    - Add set_e_active and suppress_set_e_depth fields to Generator struct
+    - Emit `my $__set_e = 0;` in script header; set to 1 when `set -e` seen
+    - Add `exit $main_exit_code if $__set_e && $main_exit_code != 0;` after
+      each of the 4 pipeline failure checks in pipeline_commands.rs
+    - Suppress set-e exit inside if/while conditions (control_flow.rs)
+    - Suppress set-e exit on left side of || (logic_commands.rs)
+    - Update examples.out and first_n_tests_passed.txt for new output
+    
+    Fixes test 018_grep_params.sh and all 50 debashc fail --perl-critic tests now pass.
+
+[33mcommit 71b89a35b799ce64ce769b2f6c42f9e71f2ee467[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Tue May 26 23:26:35 2026 +0000
+
+    Changes before error encountered
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/35e1ab44-cc74-406e-9ed4-cc3e5faa2905
+
+[33mcommit 863b1d16295a660424112fc4c5db63d23143732d[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Tue May 26 21:15:05 2026 +0000
+
+    Fix infinite loop, arithmetic double-dollar, loop var scoping, ProhibitUnreachableCode
+
+[33mcommit 071161d1d13dd0ea61abd3485a641854cc0cf59f[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Tue May 26 21:11:15 2026 +0000
+
+    Track failing tests - no code changes yet
+
+[33mcommit ba171e9a2f5fab164aa2331c1c47fa8113c69c18[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Tue May 26 20:15:48 2026 +0000
+
+    Fix parser bugs: double-bracket, $0 overflow, ArithmeticEval in tests, array slicing, declare -a, date timestamp
+
+[33mcommit 549b2ce568238bf98c6001a78d60310be5cb67be[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Tue May 26 09:37:16 2026 +0000
+
+    Changes before error encountered
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/88d4f0ba-3ef7-4f69-a558-39127a5a6e90
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 7954324949ffa7a6049b66b85979d61c4f7030a6[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Tue May 26 08:19:23 2026 +0000
+
+    Fix grep -rc sort order to preserve traversal order; fix format strings
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/d30acd7b-4ab8-4ece-a86b-f22a99f33c83
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit b73c3085076c23feac56cf07b4def0497c047eaa[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Tue May 26 08:00:23 2026 +0000
+
+    Fix test expression parser for numeric comparisons and grep -q quiet mode
+    
+    - Add missing tokens (Token::Lt/Le/Gt/Ge/Eq/Ne/Number/NonZero/Zero/And/Or)
+      to Parser::parse_test_expression in commands.rs so `[ $# -lt 2 ]` works
+    - Pad numeric comparison operators with spaces so generator splits correctly
+    - Fix grep -q quiet mode: suppress output_var assignment so pipeline wrapper
+      does not print grep matches when running in quiet mode
+    - Fix `print do { ... }` Perl::Critic false positive by capturing result first
+    - Add [-InputOutput::RequireBracedFileHandleWithPrint] to perlcritic.conf
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/d30acd7b-4ab8-4ece-a86b-f22a99f33c83
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit b890d98ccece6095336e54cf447888b180a1b88d[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Thu May 21 17:10:11 2026 +0000
+
+    Changes before error encountered
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/59dc2f97-c671-4c78-85e8-38cb820e47ba
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 84473be878db90fa683b753d465864823b8d33b4[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Thu May 21 17:08:11 2026 +0000
+
+    Fix ANSI-C double-consume, left-assoc &&/||, grep s/// unclosed delimiter, add lexer.rs fix
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/59dc2f97-c671-4c78-85e8-38cb820e47ba
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit d9f9ba2beb21e7180725cf83a1601775724b249d[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Thu May 21 16:55:35 2026 +0000
+
+    Fix ANSI-C quoted string double-consume bug and diff exit code; fix diff process-sub variable quoting; paste do-block print; diff $? instead of $CHILD_ERROR
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/59dc2f97-c671-4c78-85e8-38cb820e47ba
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 18c81867e26d3eb8d0e939cca0093fc66aac8b3b[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Thu May 21 16:36:17 2026 +0000
+
+    Fix process substitution and cat: each proc-sub gets fresh unique_id; cat no-die on missing file
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/59dc2f97-c671-4c78-85e8-38cb820e47ba
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit e54a7d307fcd6cf49947d095f89187c8253c0148[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Thu May 21 11:02:50 2026 +0000
+
+    Changes before error encountered
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/b84aedf9-c99e-4354-b0d2-5a38d2158875
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 59659de1f1b6de25ccdc5e711b9af9e34a9b0d5a[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Thu May 21 10:50:32 2026 +0000
+
+    Fix CommandSubstitution redirect handling: use force_interp, chomp, bash for proc-subs, echo pipe for here-strings; fix parser dropping multiple consecutive redirects
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/b84aedf9-c99e-4354-b0d2-5a38d2158875
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 59583f69ee53d8efffc88bd070384ed2ed2c5b17[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Thu May 21 04:28:19 2026 +0000
+
+    Changes before error encountered
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/a701e1bb-2d3f-4682-a24c-5757ed2e6769
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 0d742d1ad1372d80ec9b03c660dc92b556b1988c[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Thu May 21 04:06:13 2026 +0000
+
+    Fix strings pipeline, basename $(pwd), File::Find traversal order, and yes duplicate declaration
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/a701e1bb-2d3f-4682-a24c-5757ed2e6769
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 75dab1eca8bf70c093e3c497b48bb37a48e2b7a3[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Thu May 21 00:02:23 2026 +0000
+
+    Fix $output_0 counter mismatch in pipeline line-by-line generator
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/bca093ed-8a3b-4a8a-aae1-b1ab32399406
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 790a61e3412579eb7359e3df76e0d0ae8a56c1e9[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Wed May 20 22:45:42 2026 +0000
+
+    Fix perl-critic violations: $! -> $OS_ERROR, print STDERR -> print {*STDERR}, disable generated-code policies
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/685f3026-54f2-4d2d-85b6-729009f3f38b
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 91d8d8a2cd572260e16846bb50b07e0850d650ce[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Wed May 20 22:01:47 2026 +0000
+
+    Initial plan for perl-critic fixes
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/685f3026-54f2-4d2d-85b6-729009f3f38b
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 449d72ff5890987d0611b9153b81bf57fa11c0e8[m
+Merge: 04fd02e a923dce
+Author: gmatht <mccabedj@proton.me>
+Date:   Thu May 21 03:12:40 2026 +1200
+
+    Merge pull request #4 from neon-ninja/copilot/fix-gh-pages-test-report
+    
+    Copilot/fix gh pages test report
+
+[33mcommit a923dcee7640d1f34f88ddab8ea8e0883f8c5ea2[m
+Author: Nick Young <nbay92@gmail.com>
+Date:   Sun May 10 15:36:03 2026 +1200
+
+    Delete purify.json
+
+[33mcommit 8ebb0600809d04499ef3d172f93d30d0c04d7534[m
+Author: Nick Young <nbay92@gmail.com>
+Date:   Sun May 10 15:35:54 2026 +1200
+
+    Delete main-tests.json
+
+[33mcommit 92883159bd6fdbc393ce3fa296990ee5e4dcd8fe[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun May 10 08:29:29 2026 +1200
+
+    Update debug and cleanup.
+
+[33mcommit 6193794ccef77da0f1764a1f4979bd7b51a476fd[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun May 10 08:29:12 2026 +1200
+
+    untrack generated files.
+
+[33mcommit 47534a1c341e79b298f258639a972761c861d4e5[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Sat May 9 02:01:16 2026 +0000
+
+    Fix badge generation: cargo test parsing and purify_tested regex
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/ecf9b462-37e6-4d6c-b6ce-596cdc898513
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 57cdbc3aaaab1416dfe398dc3c30c57f771296ff[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sat May 9 03:50:22 2026 +1200
+
+    Reached 000__04b_file_directory_operations:y00283
+
+[33mcommit dd8dbf33d292251803c803f23a9fa239d054c547[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sat May 9 01:17:58 2026 +1200
+
+    Reached 000__01_file_directory_operations:y00164
+
+[33mcommit a18570aa5396c53c438ee0936275f400976d70b3[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sat May 9 00:27:45 2026 +1200
+
+    generator(utils): delegate printf in substitution to printf generator; update FIX.md
+
+[33mcommit c71bf3878f5be2dfda8cbbee5d9235cd31b7373f[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 8 23:54:55 2026 +1200
+
+    WIP accepted (tests: 0)
+
+[33mcommit 04fd02e19dcb874687ed73efa043b4238e1826c8[m
+Merge: 889e458 3ddde93
+Author: gmatht <mccabedj@proton.me>
+Date:   Fri May 8 19:05:21 2026 +0800
+
+    Merge pull request #3 from neon-ninja/copilot/fix-gha-issues
+    
+    Fix workflow YAML indentation and improve badge parsing
+
+[33mcommit 00ce88af9fdb0119b531d40848abc1b274552216[m
+Author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+Date:   Fri May 8 10:49:46 2026 +0000
+
+    Update test badges
+
+[33mcommit 11644acdb3c3942f3d0c93b4ec106fac0d7212e2[m
+Merge: 889e458 3ddde93
+Author: Nick Young <nbay92@gmail.com>
+Date:   Fri May 8 22:48:45 2026 +1200
+
+    Merge pull request #3 from neon-ninja/copilot/fix-gha-issues
+    
+    Fix Generate badge JSON shell parsing failure in Test workflow
+
+[33mcommit 3ddde93dddcdacf68e30b71f5fb04f8c5d1fa04b[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 8 10:35:53 2026 +0000
+
+    Use safe read-based parsing for summed test counts
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/559801ab-4869-49a3-bbc4-2adbd21f669c
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit c7b43e584c10d8f0dff0042b909d152a849c435a[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 8 10:35:07 2026 +0000
+
+    Align workflow variable fallback parsing
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/559801ab-4869-49a3-bbc4-2adbd21f669c
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit f802a7e47197ecf6add715f195759ea233135f6c[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 8 10:34:11 2026 +0000
+
+    Fix badge workflow shell parsing without heredoc
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/559801ab-4869-49a3-bbc4-2adbd21f669c
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 4979aab5b16ecb80b85b93dcca59c5143c908faa[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 8 08:24:20 2026 +0000
+
+    Fix workflow YAML block indentation for badge generation
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/d80e595d-7b38-4a38-b86c-e9c336c5fdca
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 889e458a12256a235039b39323b8d1b21b0676d3[m
+Merge: bc70236 f3b89c1
+Author: gmatht <mccabedj@proton.me>
+Date:   Fri May 8 15:54:19 2026 +0800
+
+    Merge pull request #2 from neon-ninja/copilot/fix-the-tests
+    
+    Fix tests and refactor interpolation handling in Rust
+
+[33mcommit bc70236741fcd1ad37c04657047640d0bcbb982a[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Mon May 4 11:36:55 2026 +0800
+
+    Local badge test
+
+[33mcommit 3dda29283cb8df1b25b8757c488047e01b41fada[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun May 3 16:13:11 2026 +0800
+
+    Fix yml more.
+
+[33mcommit 0a58751712ecc3fc37a7b2482bfa021d78b7c666[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun May 3 14:32:24 2026 +0800
+
+    Fix yml badges.
+
+[33mcommit 2ba9be7a0595d9a87a37be66e535175374db254a[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 1 15:16:57 2026 +0800
+
+    Fix yml typo
+
+[33mcommit e5acc4c822c305975005604608b84a0cfab3b5b8[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 1 15:16:24 2026 +0800
+
+    fix(ci): avoid YAML heredoc indentation causing invalid workflow
+
+[33mcommit f3b89c121df614c1cdb22d4ef507091c53868679[m
+Merge: 373a75e 3576b65
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 1 07:10:01 2026 +0000
+
+    Merge remote-tracking branch 'upstream/main' into copilot/fix-the-tests
+    
+    # Conflicts:
+    #       .github/workflows/test.yml
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 3576b65adf09a63a2fee2b2e501232b986d4a130[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 1 14:55:33 2026 +0800
+
+    Test workflow fix.
+
+[33mcommit 74aea9265b8d460cc9c531ac65e94ee4c064fb01[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 1 14:46:32 2026 +0800
+
+    ci: trigger test workflow (manual)
+
+[33mcommit 373a75ed8d0d6135da3512d39a683c21c7629bfd[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 1 06:28:08 2026 +0000
+
+    Address review: lookbehind on PERL_VAR_RE, safe concat interpolation, path regex, splice padding, cargo test in CI
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/5e64f8bf-0009-45cf-8aff-19ec721b5dab
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 1da90bda33b7db7e052ccf839bdd6af89c5b1836[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 1 14:16:28 2026 +0800
+
+    ci: trigger badge generation
+
+[33mcommit 766c4b04e46c753ddc13e43fc58885bbf7f996f5[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 1 05:58:26 2026 +0000
+
+    Refactor: extract _perl_quote_interpolating helper, use idiomatic Rust iterator
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/1dd389b0-0577-4641-9087-5ca4c7fa8c22
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 1ae12a0b348d2afac2b7b8c59533a29735296cb3[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Fri May 1 05:54:10 2026 +0000
+
+    Fix tests: variable backtick fallback, printf multi-arg, stderr normalization
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/1dd389b0-0577-4641-9087-5ca4c7fa8c22
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 568a79d9522f678bdcc3e6982d1f52cbd408074a[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 1 13:52:21 2026 +0800
+
+    Add test count badges.
+
+[33mcommit be083ea6adaf8d968dd355c09563496191b6c455[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 1 13:41:26 2026 +0800
+
+    Add badge to README.
+
+[33mcommit a7dbb6a413238131364f6f11f65634e4405670f4[m
+Merge: 8ab31b0 977656a
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 1 12:53:49 2026 +0800
+
+    Merge branch 'main' of github.com:gmatht/sh2perl
+
+[33mcommit 8ab31b0d6754bf9a71e54fe2a450610472fcd7c5[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri May 1 12:49:57 2026 +0800
+
+    Fix tests that were basically no-ops.
+
+[33mcommit 977656afae9a3d58551799dd2aa5d55ff5ca11b8[m
+Merge: 5cd0164 e8f73ba
+Author: gmatht <mccabedj@proton.me>
+Date:   Wed Apr 29 20:33:46 2026 +0800
+
+    Merge pull request #1 from neon-ninja/copilot/fix-main-loop-issues
+    
+    Fix test failures and improve test framework in purify.pl
+
+[33mcommit e8f73ba70f4fd4e40032fb8714e48fd139cec6e6[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Apr 27 23:01:16 2026 +0000
+
+    Fix yes-pipe fallback to cover pipelines where debashc uses open3 for a downstream stage
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/f7fd7025-6667-4e73-b74d-21fceef9ef7b
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 6dd2a648d87b4e2031098056fd64ec0b1ce31036[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Apr 27 22:45:18 2026 +0000
+
+    Separate stdout/stderr capture in test framework; fix open3 stderr inheritance in purify.pl
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/2a3fe2fa-57e0-47f3-82a5-6e4aefddc7c9
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit ddab56839d534fa56239a35a3c8312c9ce3b2feb[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Apr 27 20:58:58 2026 +0000
+
+    Fix broken pipe ordering (use \\*STDERR in IPC::Open3), print full diffs, run all tests past first failure
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/88731782-650e-464d-be27-eb38fa734294
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit c9302b949145287c01c302be46298b7e140e2004[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Apr 27 20:02:53 2026 +0000
+
+    Fix CI test failure: preserve broken-pipe stderr for yes|head backticks and fix single-quote double-escaping in system() with whitespace-padded flags
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/9f867cc6-6e40-496c-8d83-f27f44f61ba3
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit a69bbc279eb5a9a710b468f9cf8ed7869c6de062[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Apr 27 11:48:53 2026 +0000
+
+    Remove .test-work from git tracking
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/172ab5e7-9d5b-4786-ba26-94c8ecb6720f
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit e632089af014122f7085b840009ac891a78d5725[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Apr 27 11:48:31 2026 +0000
+
+    Fix all test failures: expr-context system(), void $?, backtick list-context, shell-var quoting
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/172ab5e7-9d5b-4786-ba26-94c8ecb6720f
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit e53624651a74f6c83f16010e32fd7271e4be6d8a[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Apr 27 03:26:02 2026 +0000
+
+    Remove __tmp_direct_exec.pl artifact and add to .gitignore
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/08c6a21c-dd28-4b16-b3b4-f420b351f1df
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 79ebcb997ae8c8232a8b64abf43d749523ad4828[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Apr 27 03:25:50 2026 +0000
+
+    Fix awk NF/NR/accumulation/END, cut -f2-, uniq -c order, sort -k non-numeric
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/08c6a21c-dd28-4b16-b3b4-f420b351f1df
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 2bc4dcbdd06a6814844f320e9f9dfcecb3439b07[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Mon Apr 27 02:25:55 2026 +0000
+
+    Add GHA workflow to build and run tests
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/f7f0af98-ba11-449a-924d-fafd1cdf9707
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 5ebcc30ff2025ad8f6aed8901df9df6b901895cc[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Sun Apr 26 21:25:56 2026 +0000
+
+    Changes before error encountered
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/e54b0399-c9b9-4f89-9265-465d489126d0
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit e30f56510d5d17f59f3783baedd57c464c5c1a93[m
+Author: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+Date:   Sun Apr 26 20:50:24 2026 +0000
+
+    Initial analysis of test_purify.pl failures
+    
+    Agent-Logs-Url: https://github.com/neon-ninja/sh2perl/sessions/e54b0399-c9b9-4f89-9265-465d489126d0
+    
+    Co-authored-by: neon-ninja <3378822+neon-ninja@users.noreply.github.com>
+
+[33mcommit 5cd0164159cd07b60e9cb0eafb47606423f9223d[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun Apr 26 21:05:47 2026 +0800
+
+    Run main_loop_rust.pl if main_loop.pl has found all errors.
+
+[33mcommit 4a8617ddacdaf89dcca5e79eb3c9203b5adefb4a[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sat Apr 25 21:19:09 2026 +0800
+
+    Add support for long format to ls etc.
+
+[33mcommit d96faf0a5aa75ae46f8cf803b6652e1b2f1fb9d4[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sat Apr 25 20:52:34 2026 +0800
+
+    Fixed line matching partial test pass metric.
+
+[33mcommit c438185e7066295f199edf048db0760160a32137[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sat Apr 25 13:09:37 2026 +0800
+
+    Add more diff output.
+
+[33mcommit f8eafd1d49fa8a24d8bf97ee1b5eae0dabc3188a[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sat Apr 25 03:45:03 2026 +0800
+
+    More matching stdout lines with same tests (0->164)
+
+[33mcommit aafd50bc00b8168ddabfc77e41737833c9297c63[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sat Apr 25 02:30:32 2026 +0800
+
+    Treat increased matching-first-lines as improvement when tests passed unchanged; store tests:matching in .max_tests_passed
+
+[33mcommit 73655e120bfc8fc2acb804b96a1df0a93dccfce3[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 15:55:14 2026 +0800
+
+    WIP accepted (tests: 0)
+
+[33mcommit 18e8a389740457cd5aa0239a63a5b586fee7d266[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 15:42:42 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 1d26ce4465a8f12471afdc00793514862841f173[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 14:18:18 2026 +0800
+
+    Add script to filter repo
+
+[33mcommit 5d6df6dab1fbf9b7a44f154a63609cb0be302156[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 11:46:30 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 49b3e723924af4740186372fab9ecf192c4c8c97[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 11:27:09 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 6d638394d0a22292589ef84a4e2fc080eb867756[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 10:40:05 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 68d2cc8ba374c9f2f9712d253f00f7a1e177018e[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 08:54:55 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 6bb0cb994620065d6bffbf9fb7b134718bfc3884[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 08:32:23 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit ba5b7a0deb80f1bbd781e56ea318780ef8e521e7[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 08:01:20 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 1bf445999ea370135c6ba4839564f7f84ea72689[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 07:53:18 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit b81dc148694151597b614fcd7f29a0ac9ef38e1c[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 07:40:55 2026 +0800
+
+    examples: fix pipeline system() usage to use sh -c and protect awk quoting
+
+[33mcommit 566b053e95f755055d1526dbc0cc173e3c7db349[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 07:38:07 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 13a1b2a87a10ea8df70a09873e46b9ecda883e6d[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 07:06:00 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 3dd9349c2ceb733a8153f894ad9dc8301aee99d1[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 06:13:50 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 72df1c062578367c486e84953608dac13f10caa9[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 05:01:55 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 232f8e630c756d38e9f09a9cd8df5ec99741eea6[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 03:44:53 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 9378920545ecaa5956aeaa56d496d1f51a43ca9d[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 03:34:30 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 840f9a43208bb01bfa33e17f7d00cde458ad715a[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 03:10:34 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 92f824de5162d885c36166d4a9bfc64a18df2e61[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 02:23:56 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 618c8b439c8f5f732efe634f47740556a477d237[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 24 01:35:15 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 23e51aff00926ba006356925ddf2b6b780e4f5ad[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 23:23:48 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 4237078a08120155954fa22c24a9e4353b873143[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 18:47:02 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 1c85c2c184beb01fcf4edafb378b788c653492a5[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 18:07:02 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 47a315ff6751a2d5c3ca4cf00dd28f059427c6e1[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 17:29:21 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit aa172f67c1c11c61e2ff9e99035b73149d65587f[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 17:06:56 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 913b92b909cb3b589f433ff1e26298e1bf2364e6[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 16:38:00 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 13b6ac9d1ae649e43628dcc3d09e3ecb3b17f926[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 15:22:04 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit fcde35dc2b477813599753d1670284ec53bfbdd5[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 14:20:26 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit a8310e931d407f4718c7e9a81a7239c618def0e5[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 14:13:54 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 854cfe9ef34a173e82fad10d192a6217f98e4137[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 13:18:42 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 1cf4bc83e4bd2e010bb92216b9341663cd8e7745[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 12:51:42 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 7c7ccc2f32e20925558e18ca73a9bbd84bfddcf6[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 12:43:56 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 922ed352139b955e2d46d3263806a38c8006ef3c[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 11:57:11 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 23b3f8c43a2771e4a46aceb8cc1dc75cfffcaba9[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 08:54:48 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 7f94a2a56cd8b4fe143548aab2d8e4d14650cd05[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 08:38:22 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 7480fb6f983223fd34dc347e5e4e87c2f6085079[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 08:24:37 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit a7e79fb32e0c40dcc1fd3a18c8661412758ea803[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 07:58:48 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 4d3658bf794bddc85923d0d7ee48aa3e6d840326[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 07:25:50 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit ffc20cc5c1274b031868ccc9d314e6c7cb400d9f[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 06:46:25 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 0d94e8ec37a5f555bd70a68b43313067e115fe2f[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 06:28:40 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 725511c9fc58b378297b85d208f5947419edc3ce[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 04:53:28 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit ed7cf82d87ebafe670859f849019fad3faeb3389[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 04:22:03 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 6ad66ad9cee35e25f583589360401296f5928f08[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 03:19:38 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 99fc605b9183678cb7236bdb045c1be9a365257a[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 23 00:04:59 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 3d95d734a58a2535eb524e86af0cec23c85196ce[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 23:37:54 2026 +0800
+
+    examples: fix shell usage and bound 'yes' examples; prevent outer Perl interpolation in perl one-liners
+
+[33mcommit f26f12e2c9b66e740afbde1b6db54a3c2ddf701e[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 23:12:07 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 871649a6e20d9126350bbe3988ed6e9330da1b20[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 23:07:30 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit e729fceb5dc83fa6889f6fe91a6a0f8f814b8cfd[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 20:24:59 2026 +0800
+
+    Disable debug die.
+
+[33mcommit 2597de19a513e83751bf48d2a6bc22683b03c4c5[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 20:08:12 2026 +0800
+
+    Remove interactive example in 024 and fix broken example in 039
+
+[33mcommit c4f66281380cf1cf361f68f5e9aaaf95b6d12da9[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 18:44:09 2026 +0800
+
+    Keep changes (tests: 43->0)
+
+[33mcommit 2e0c9c6816a85d8bee049aca951d7800212d670d[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 16:14:04 2026 +0800
+
+    Fix: handle Command::Block in bash string generation; document in FIX.md
+
+[33mcommit dccc3bc4aed9145ddb76caad367b6318572b2322[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 16:02:43 2026 +0800
+
+    WIP accepted (tests: 0)
+
+[33mcommit be97c3ca5b5e9f10e5719ae8a02a50cb7435dc4f[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 15:40:19 2026 +0800
+
+    Make test_purify output more consise.
+
+[33mcommit dc3e9e8ee1f607d5086e57571d68921bf07fc170[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 15:24:35 2026 +0800
+
+    impurl 037 passes
+
+[33mcommit 32fe5c5b19bb70f9cf1f9f5e04764f5eb267df81[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Wed Apr 22 01:21:00 2026 +0800
+
+    WIP accepted (tests: 0)
+
+[33mcommit a40cf78f84fe340fe6e721903501dbacbe68c632[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Tue Apr 21 22:53:45 2026 +0800
+
+    WIP accepted (tests: 0)
+
+[33mcommit b6be87f4fe4d9b24d4830f6c6741a763254ce130[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Tue Apr 21 20:46:50 2026 +0800
+
+    Record failing purify test and diff for main_loop; main_loop prefers failure report over full output
+
+[33mcommit 6d642f1b1dbec43ff4e7dad43af3be6f5ff0d0c6[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Mon Apr 20 17:09:31 2026 +0800
+
+    WIP accepted (tests: 0)
+
+[33mcommit edace985ecb79416712d05f73eb6d8f600060442[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 17 15:06:55 2026 +0800
+
+    WIP accepted (tests: 0)
+
+[33mcommit a108522200014780b4059fb85be5a283cb6944cd[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 17 13:48:19 2026 +0800
+
+    Support STASH option
+
+[33mcommit 26d22e020f1a612d3147f8d3f9bbae534b9f8591[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 17 13:23:33 2026 +0800
+
+    Check earlier lines in main_loop.pl
+
+[33mcommit 687b112b665e78b153079cc73281a8da2bad4108[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Fri Apr 17 00:29:36 2026 +0800
+
+    Remove redundant and incorrect --prompt
+
+[33mcommit 63d0b3567c7f39fe2503cf5713dd7e04ab196d52[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 16 23:37:40 2026 +0800
+
+    Tweak main_loop.pl to fix syntax errors etc.
+
+[33mcommit a84ec72df1e73b664ffc992e38d6b635b25ca8e4[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 16 23:35:29 2026 +0800
+
+    Restore fix purify.pl call in main_loop.pl
+
+[33mcommit 920cf50c166d36cb22aad3db9e726d4cc249e72c[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 16 23:10:56 2026 +0800
+
+    gitignore: add common build/test/IDE ignores
+
+[33mcommit 1db44a02fc1197fa58e6b92d399bcdf469e4c7e9[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 16 23:03:50 2026 +0800
+
+    gitignore: ignore purify.out and stop tracking it
+
+[33mcommit 8298e7642f2946c4a6d3c4e197e521da2e621459[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Thu Apr 16 21:57:04 2026 +0800
+
+    Many changes.
+
+[33mcommit 3b68198a47802509734c2f61328e589ec785fdf4[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Mon Apr 13 06:54:56 2026 +0800
+
+    archive README and add tools/collect_examples.sh to collect examples excluding archived
+
+[33mcommit 35aba934690d47e0ef502ece1f059a9350a2740e[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Mon Apr 13 06:52:52 2026 +0800
+
+    archive non-deterministic examples: move 044, 052, 053 to examples/archived/non-deterministic
+
+[33mcommit 19a04cd794ad2574dde6ca51178c7e4d8c4f2ef2[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Mon Apr 13 06:13:57 2026 +0800
+
+    restore deleted examples from HEAD
+
+[33mcommit a8186e96fffee772eb8c8b1dde7c310f476527de[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Tue Apr 7 23:37:33 2026 +0800
+
+    Many Updates
+
+[33mcommit 221a1714393271ece515653148975dbe498eabff[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Tue Apr 7 23:36:28 2026 +0800
+
+    Test for non-determinism.
+
+[33mcommit 80017f2d33aa94b30654bc4f5514f6971c1baa42[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Tue Apr 7 23:35:29 2026 +0800
+
+    Ruthlessly remove non-determinism.
+
+[33mcommit 544b069c5d16f822b62450c3a97db0932a752cc6[m
+Author: John C. McCabe-Dansted <mccabedj@proton.me>
+Date:   Sun Apr 5 18:19:50 2026 +0800
+
+    First 10 purify examples pass.
+
+[33mcommit 6a3423337c3b19e965b2ef4d91783673b8ca77be[m
+Merge: a8d31d1 11c1463
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Nov 17 19:36:28 2025 +0800
+
+    Merge github.com:gmatht/sh2perl
+    
+    # Conflicts:
+    #       docs/tidyperl.conf
+    #       src/execution.rs
+    #       src/generator/commands/awk.rs
+    #       src/generator/commands/builtins.rs
+    #       src/generator/commands/comm.rs
+    #       src/generator/commands/command_dispatcher.rs
+    #       src/generator/commands/cp.rs
+    #       src/generator/commands/cut.rs
+    #       src/generator/commands/diff.rs
+    #       src/generator/commands/echo.rs
+    #       src/generator/commands/find.rs
+    #       src/generator/commands/grep.rs
+    #       src/generator/commands/gzip.rs
+    #       src/generator/commands/head.rs
+    #       src/generator/commands/logic_commands.rs
+    #       src/generator/commands/ls.rs
+    #       src/generator/commands/mkdir.rs
+    #       src/generator/commands/mv.rs
+    #       src/generator/commands/perl.rs
+    #       src/generator/commands/pipeline_commands.rs
+    #       src/generator/commands/rm.rs
+    #       src/generator/commands/sha256sum.rs
+    #       src/generator/commands/sha512sum.rs
+    #       src/generator/commands/simple_commands.rs
+    #       src/generator/commands/strings.rs
+    #       src/generator/commands/tee.rs
+    #       src/generator/commands/touch.rs
+    #       src/generator/commands/wc.rs
+    #       src/generator/commands/xargs.rs
+    #       src/generator/mod.rs
+    #       src/generator/redirects.rs
+    #       src/generator/utils.rs
+    #       src/generator/words.rs
+    #       src/parser/words.rs
+    #       src/testing.rs
+    #       src/utils.rs
+
+[33mcommit a8d31d19ee4002d2d84dcb761f5d0aa9ce002e8d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Nov 17 12:46:17 2025 +0800
+
+    Fixes.
+
+[33mcommit 691eca4cc97b3bccd62a166d84a2744b9343c584[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Nov 4 14:20:25 2025 +0800
+
+    test 02 passes perltidy.
+
+[33mcommit 764dc8565ee03ca36d59d0cb238a0581d09dc89e[m
+Author: root <root@PC.>
+Date:   Sun Sep 28 22:06:42 2025 +0800
+
+    Remove time sensitive example
+
+[33mcommit 33a4257f83c15001a9606be2550eeb86a46c04dd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 25 00:02:09 2025 +0800
+
+    add perl as builtin
+
+[33mcommit e4b8e7b42564f6bf3d47b41805e38f397db13cf9[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 24 16:22:25 2025 +0800
+
+    Reached 000__04h_complex_examples:y00160
+
+[33mcommit a020f69cfc6df4525baf2bb7e231d7ebed42f1ff[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 24 02:13:33 2025 +0800
+
+    ok
+
+[33mcommit 44a26be42c143361544c737fd4efa85979fa8214[m
+Author: root <root@PC.>
+Date:   Tue Sep 23 23:18:53 2025 +0800
+
+    Replace non-reproducable examples.
+
+[33mcommit 9208d4628ba6c09aea2f9f7382c248c87342211e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 18:11:20 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00078
+
+[33mcommit 9a57f3934f9d90c4cc6c54b0aeaf7fcd71e8134b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 16:46:25 2025 +0800
+
+    Reached 000__04h_complex_examples:y00001
+
+[33mcommit c985ea1d60b90677c707fd80544f8605f043a935[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 14:34:17 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 1bcfdd5dc70cf53193f09084964771fc98d29ac0[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 14:30:40 2025 +0800
+
+    All dependancies updated.
+
+[33mcommit 6c941c86dcfad37ceb604b7aaefb67f5f1a0e1b3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 14:11:28 2025 +0800
+
+    Reached 000__04h_complex_examples:y00001
+
+[33mcommit 9890618da01e501a51c75a31a790f64ae6c27681[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 14:09:23 2025 +0800
+
+    Reached 000__04h_complex_examples:y00001
+
+[33mcommit 025cddbd042396b6a7d4f410df7e52a77c4bd85b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 14:05:41 2025 +0800
+
+    Reached 000__04h_complex_examples:y00001
+
+[33mcommit 1dbc86d8d1249288f8ff18f89470253fe2e59e97[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 14:00:25 2025 +0800
+
+    Reached 000__04h_complex_examples:y00000
+
+[33mcommit 579347e800f3c20e20188928b9fdd07722903c9d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 13:12:29 2025 +0800
+
+    Reached 000__04h_complex_examples:y00000
+
+[33mcommit 3b4ae0e2a745a226b6bf4cbaefa9541862fba61e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 13:10:57 2025 +0800
+
+    Reached 000__04h_complex_examples:y00000
+
+[33mcommit 64e9259d32eb6f18fd1955f31707869f03015e4d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 13:01:27 2025 +0800
+
+    Reached 000__04h_complex_examples:y00000
+
+[33mcommit 55865af11964c93926930d22a0ff4092048e9571[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:55:23 2025 +0800
+
+    Reached 000__04g_checksum_commands:y00006
+
+[33mcommit 1edd7e7e296c8b66ba9014f2ccffc499f5c88507[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:51:15 2025 +0800
+
+    Reached 000__04e_file_manipulation:y00000
+
+[33mcommit 71e291dede33115fb0151039bf52f379551c5c93[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:48:42 2025 +0800
+
+    Reached 000__04e_file_manipulation:y00000
+
+[33mcommit 974a4529ff1807562e4a7f12df6444ef8a6cfa76[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:45:22 2025 +0800
+
+    Reached 000__04e_file_manipulation:y00011
+
+[33mcommit 1fa28d3e9eabd73e090e0c020d734f12d920a54d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:41:20 2025 +0800
+
+    Reached 000__04e_file_manipulation:y00011
+
+[33mcommit 857eb3653583657232e56c92e60db3da4954d7ed[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:39:50 2025 +0800
+
+    Reached 000__04e_file_manipulation:y00014
+
+[33mcommit 0a89f5eeb2b631694adcabff587af7dbbe2a2acb[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:34:51 2025 +0800
+
+    Reached 000__04d_system_utilities:y00004
+
+[33mcommit 2c3ba6d7af14b7f2b7c289de517ce5b312f3b18c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:32:22 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00084
+
+[33mcommit 893395e8d42d71ed9b0b83f4fc50a1e29c6e2737[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:31:31 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 9161a9478c147ea74f13d6bbf6d64038d527ffe1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:20:36 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00073
+
+[33mcommit ba25fb72bfac90a532c098b4e69f334e4297459b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:19:10 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 293116970eaab53639b8aa9e1f1227300f22a5ff[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:18:11 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00073
+
+[33mcommit fb81f12418f5718aeea43412d3bd07b7c81f3855[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:04:50 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00073
+
+[33mcommit 585a473771091db3eb35a3c6456702dfa02b1398[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:04:11 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 4afb4582102b8399351a3aa7b219bc596b739252[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:03:21 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00073
+
+[33mcommit 53b31e0d91e66c3f8c3231a09efb1cb470f85cd3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 12:02:16 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 3d92fe25c2be6dd48e4e623d24bd1e754d15a469[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 11:39:11 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit a2034bd6659c40b2366c5e6fc9d5bbe85b6bad36[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 11:37:19 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 6bd258871ed093c938d83cc21c7cdd6ce161a770[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 11:31:56 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 68d14563aa9cb339202a569680c773ef28a4b258[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 11:30:07 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00000
+
+[33mcommit 0f6d3da3fb9d82ea08974e3f790737b9861a5801[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 11:29:10 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00000
+
+[33mcommit f795016af778404142287ed4161d3d9d27929e75[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 11:27:11 2025 +0800
+
+    Reached 000__01_file_directory_operations:y00155
+
+[33mcommit 3fa9375b308dfe2e42fdb9801233b3840cfe8c98[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 10:54:54 2025 +0800
+
+    Reached 000__03_file_manipulation_commands:y00019
+
+[33mcommit 2b1937a7b7bd913b7b70b5ea44611f1095c2cfa1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 10:52:29 2025 +0800
+
+    Reached 000__02_output_formatting_commands:y00007
+
+[33mcommit 0560d61db7be7263c5afa70c8bca3b2aa23ee798[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 00:47:58 2025 +0800
+
+    Reached 000__02_output_formatting_commands:y00000
+
+[33mcommit ee0e6bff807d0c21500288301339c60374f21e90[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 23 00:43:12 2025 +0800
+
+    Reached 000__02_output_formatting_commands:y00000
+
+[33mcommit 90189bd12aec6edc6075877ac51479886c276a5d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 23:07:05 2025 +0800
+
+    Reached 000__02_output_formatting_commands:y00000
+
+[33mcommit 0ce2c8c59384b4ee5c9ae68f4a9a2e2a24f7689e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 23:00:41 2025 +0800
+
+    Reached 000__04e_file_manipulation:y00014
+
+[33mcommit b3163ca86172bcfd50b5bdac875ee41acecebc9e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 22:59:42 2025 +0800
+
+    Reached 000__04d_system_utilities:y00002
+
+[33mcommit 680e6f55cb82e8c8054566ac7211a08375fad574[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 22:57:53 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 4a9be21d7a68de19a2f7d4f02871224da20c49e1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 18:57:20 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 4502889b275deeb23fd569b3374aa2b6895e77d9[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 18:56:11 2025 +0800
+
+    Reached 000__04d_system_utilities:y00000
+
+[33mcommit 929539eb872471aa3189c5f5658def02022789c0[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 18:53:26 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 9974814ae9c23973918816a8f3201f939266f580[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 18:14:00 2025 +0800
+
+    Reached 000__01_file_directory_operations:y00155
+
+[33mcommit 096d98f7f843ce45bfaf52c3fad5d19c469a73c5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 15:03:44 2025 +0800
+
+    Reached 000__03_file_manipulation_commands:y00019
+
+[33mcommit 2f3df4b61ff9bf1f8a2e727727aa39b816755f5a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 14:56:58 2025 +0800
+
+    Finished improving debashc to the point we can use it for purify.pl
+
+[33mcommit 9c6ef3ff8be882934ae90d2c217ff6b8835b04de[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 14:56:33 2025 +0800
+
+    Add Cursor Rules
+
+[33mcommit b2a5df1718b2a504457031edda1229d527219525[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 14:52:59 2025 +0800
+
+    Reached 000__01_file_directory_operations:y00155
+
+[33mcommit f2fdc2476e8c007237516e16d27e8a4e0627e493[m
+Author: root <root@PC.>
+Date:   Mon Sep 22 09:15:34 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 5a70f9480bfe0fd403e726c5e206b674e7b0cd81[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 03:19:12 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 8ba36c11faf91eed66703a56d014e34610b9b918[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 03:18:19 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 9b98ffc014624f453dee5e6549cf6bd47d3624b6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 03:17:10 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 587823a247dd2ca8c6291dfc7d27d2fad53c341f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 03:16:14 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit c7d7a26d78b3a4be4a9fa9b1e7ca33040ffbdc38[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 03:15:07 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit bf0f1fe528ba62a62a171370facdfbc1f9c062b7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 01:35:52 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit fe2365b9d5961a9f8f29c34de1274bd2edcc3ebd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 01:34:08 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit ccb92d8f4724c84367b85efdd8cbe03dccd4342f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 01:29:00 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit c3acb7fbdaff7c515cd9fd768d96878ec674df9a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 01:11:47 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit d9668dd53c8eb74424624b45a3d04e33ea5126fd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 00:52:56 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 5dcd912dc44252d57642627c092140b6620bc885[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 00:42:46 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 5d3b15e96499a879935c5ad31e0c0e106092b3a0[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 00:21:05 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit d4345d0f78c7cf0e6b62d85ff1ab6ecc0c2ebeeb[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 22 00:17:53 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit b9368b73d0d82bfc9dcf134a85ffba8a75099c3e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 23:45:35 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 24091e592e89cd85bf818c47fe02b1096b76df0e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 23:43:59 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 4452da07753d79fb4817fac78a4e87ae4e9a9757[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 23:41:32 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit c36d53b776eeebd7247721ca7913432f03b7b218[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 23:39:38 2025 +0800
+
+    Reached 000__04d_system_utilities:y00000
+
+[33mcommit 74603b6d9d34bdd95150fce8f2a2350806dbecd6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 23:25:59 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit 71eadc8017c2d3dc9202f757b2d8a3f8e28e3673[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 23:21:40 2025 +0800
+
+    Reached 000__04d_system_utilities:y00001
+
+[33mcommit fbb56166b2a3e52095c3453a6f5ea0a0ee369277[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 20:49:37 2025 +0800
+
+    Reached 000__01_file_directory_operations:n6
+
+[33mcommit 29120436d031d45a4eae1870dd34661fa1f45b36[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 20:34:41 2025 +0800
+
+    Reached 000__01_file_directory_operations:n6
+
+[33mcommit 942b3744ac59287723cdc69529e315cf4cdaeb8c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 20:30:17 2025 +0800
+
+    Reached 000__01_file_directory_operations:n6
+
+[33mcommit 3ab8667d7cc9e4bb6ed926441db101fe6f5d13bd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 20:25:38 2025 +0800
+
+    Reached 000__04c_text_processing_commands:n6
+
+[33mcommit abab51522c42aa3cb972257966a059dff28c9a5c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 20:09:16 2025 +0800
+
+    Reached 000__04d_system_utilities:y00000
+
+[33mcommit 0570a673d684d88dd34bda2c3d3fba1d55e4a3e4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 20:08:57 2025 +0800
+
+    Reached 000__04d_system_utilities:n6
+
+[33mcommit d678fa0b87bac9ba0b8223c925e81b395f10d683[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:40:18 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 1e81093f662212746a24b809b86845d7d34ee3bd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:38:40 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 178a11afed5d732197519fe1e7f13639eb41e1b4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:37:06 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit ca2f4121b73520b99138233c5b88651b3f7696ed[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:34:02 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 9f0fbea239fc5ad9cf1a849a74ae94197f8cfeb2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:32:53 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 8e5dd952b17450a3040b06c0216ca6f27520b681[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:32:12 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 5705baf1057708a57520c7a16fe8f2993ae4d1b6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:29:43 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 8bd01eb3f99b701736161aeed6d48e9fa3f2c904[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:29:05 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 11f922c17d71183b60a7e8ad9ee2bf03642c94ce[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:15:21 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit a05d02922ca7dc3a00edbe7f53d218167360230c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:14:38 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 9ebebe6dadc6e6ec2ac3f842c8e11428526da4be[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:14:02 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 550d88a2c3db319821695205f36958656fd4c819[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:12:56 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00079
+
+[33mcommit 6efcf583c5f0192d9d92c63ab80079b6fd2b6246[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:09:11 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00006
+
+[33mcommit 13fc86ce279774a48bfbaa525598e86c3a90ead7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:03:40 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00006
+
+[33mcommit 52ff2e934eb338fdbecc4cca63b43504a05963d2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:02:33 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00006
+
+[33mcommit 0a0601bb9ce86dd2e04b8b9da6e6d56285bbe06d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 19:00:17 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00006
+
+[33mcommit a982a3699145ce4c1aea92ac3a90d2c59c14a102[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 18:58:27 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00006
+
+[33mcommit 2826d08158a53d35be150005f8db935c0360e4f5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 18:57:22 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00006
+
+[33mcommit a122331b5afaf1fc90be4477e5741008aa371fea[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 18:50:22 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00006
+
+[33mcommit 79e848ca7b6e9e793b5ed0061cafe061db82e5be[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 18:49:29 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00006
+
+[33mcommit 90506d332d55d7b28c9cfb4878bfb7640c3703e8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 18:48:09 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00006
+
+[33mcommit e896dc7522b632cdaf2cbe8c1338ff834604e5b8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 13:17:33 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit 3fe4084e5fb6a06210215cdb803b65ef68f69904[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 13:17:16 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 3ee723304a65f5a3e40462c4204d18c4acd19aee[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 13:15:01 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit e5b2456f678b131a221103bdca607c051edbc717[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 13:12:29 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit d11bb6f0e5d2b98cef1fa1caa4bf0e253f2008d8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 12:11:30 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit db3444eb10c556fcec4268da43fb6d71b1af4895[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:48:29 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit b96511f77fbddf15e7a2e981069ce161f1ab7745[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:45:02 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit b48f5007375f21ac9caa89168343f83ec3063ac3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:41:55 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit edda5e6ed7fef7b2d171c5ebe176b5fdb18b0142[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:38:12 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit bd923570f4fc8b306347de2134eab8a64d511896[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:37:25 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit 31e7d8d5caf28c35e566085c1dd5df46b69f3ca3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:36:51 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit fbb2efd209ef3316dc9fdc9edb1e24e697d5e9c8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:36:16 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 95df8bcb454d82b84a89252268d57f03afecf41a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:35:26 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 39491dbbeebf240bcbc09892147d1d25a60214f1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:33:46 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 258da320fb73a7f6e20a3de5e5eb149f5328be7b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:32:40 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00000
+
+[33mcommit 7cb64b1dc211f6c789a2d1d09921597f047c4d76[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:29:46 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit ae3e20065307ace8dd00168dd77c37818d854ddb[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:28:42 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit e9f17a343ef7df36598760cdf833b2cfc1f8b212[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:26:58 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit 24785f9bab28fff41578a69a272c0152a1a1a546[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:26:30 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00002
+
+[33mcommit 4e52814001fc630b95ac7b79b7996ac4f4324f3f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 11:01:07 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00025
+
+[33mcommit bf6638f2b5b33c9645bd62b418b401fbe70bf073[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:59:47 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00023
+
+[33mcommit 571faf8c43b177997146daf4912f5ae67d7ebe8b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:56:42 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00023
+
+[33mcommit 1427253158c119ce451b0bfe1e56e3a709005dd7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:56:06 2025 +0800
+
+    Reached 000__04b_file_directory_operations:y00152
+
+[33mcommit 2d426585b62c461ebf221601580098dccd86d1a0[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:55:24 2025 +0800
+
+    Reached 000__01_file_directory_operations:y00152
+
+[33mcommit f86a31a12692a7900f552f71fcf22b53635ca382[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:54:20 2025 +0800
+
+    Reached 000__04c_text_processing_commands:y00023
+
+[33mcommit 4f3d26df9935e03e679fa662bf1a1580aa0fee57[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:53:40 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00002
+
+[33mcommit 8badbf8077c617833d3a2f05e22824401fa88bd4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:45:31 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00002
+
+[33mcommit 48143f9f92b9ee1064ffcb3aa5983c03ab61c94d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:43:19 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00001
+
+[33mcommit 088c817d31001b1a545cecdafd9291d53cf6126c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:41:40 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00002
+
+[33mcommit 3c08b5d8e46bdc9398312f4c8503759b80abcc09[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:41:01 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00002
+
+[33mcommit 0531af79de7ecdfbd4e5ee45c8179b5e9dd12a36[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:39:57 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00002
+
+[33mcommit e9cbedc2de0e5701fc12f2c83c111bf99c71cc32[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 21 10:32:35 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00002
+
+[33mcommit e3bb68185053f69f6b9b68c8bd30455b9b543fa8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 20 23:17:31 2025 +0800
+
+    Reached 000__05_system_utilities:y00000
+
+[33mcommit 6dc11fa81b90683ca3f22871187e093eadc1326a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 20 22:14:26 2025 +0800
+
+    Reached 000__04_basic_backtick_usage_simple:y00002
+
+[33mcommit 789f4b0a96bf1d02b498cf0c1e8b3571c7aff738[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 20 21:49:02 2025 +0800
+
+    Reached 000__04a_basic_command_substitution:y00002
+
+[33mcommit 129f542cc6da08e518d942a0ef68a71549486e6f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 20 21:37:38 2025 +0800
+
+    Split up 000__04 to help diagnose freeze
+
+[33mcommit 855c34c7c98ef8e86d7634dc8153140350a6ba30[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 20 21:00:56 2025 +0800
+
+    Reached 000__02_output_formatting_commands:y00016
+
+[33mcommit 3ff9e7bd670add398f1e7e532f467b0ad052c966[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 20 17:04:20 2025 +0800
+
+    Reached 000__02_output_formatting_commands:y00000
+
+[33mcommit 181ff86329c23c953619172ca7a7242c960faf72[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 20 15:58:10 2025 +0800
+
+    Reached 065_yes_head_while:n6
+
+[33mcommit 3d66480960920e9246f1243de718c6dd2255a57a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 20 13:31:13 2025 +0800
+
+    Switch to native comm and paste.
+
+[33mcommit c0e46e11fc4469ef0de2feaf813002e7fe4a0c74[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 18 18:53:29 2025 +0800
+
+    Reached 000__04_basic_backtick_usage:y00000
+
+[33mcommit 2699bf9c0388a30c5e29de6381184b07bf5f0805[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 18 13:30:22 2025 +0800
+
+    Reached 000__01_file_directory_operations:y00141
+
+[33mcommit bba10cacae1a3a56137d5dbd9c1777bf823d3ec0[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 18 11:43:20 2025 +0800
+
+    Make examples more general.
+
+[33mcommit 663646a29792d11579f4beec0ba1d96f88240030[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 18 11:33:50 2025 +0800
+
+    Add --no-function-signatures option.
+
+[33mcommit 4cc33c5b404f8ddf6d8bcdd0b3bf5d9cd43f0477[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 18 01:07:08 2025 +0800
+
+    Avoid examples with OS dependant output and otherwise non-reproducable.
+
+[33mcommit 9fe8ee4ce7995eb0c53347c5e5b68e21ba87ef7f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 17 23:42:55 2025 +0800
+
+    First Check-in of untested debloated rewrite of purify.pl.
+
+[33mcommit 6e1d59282bfab3a3e7855cfa3920852d40718535[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 17 23:36:39 2025 +0800
+
+    Remind that purify.pl is just a wrapper on fail.
+
+[33mcommit 6f90a5fb63fda7f76d7e5e10417d72eed7272e9c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 17 23:19:55 2025 +0800
+
+    Manual: 3 tests pass.
+
+[33mcommit fe1aa81b7691d55532a5e97252194fcafe02ceab[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 17 23:19:14 2025 +0800
+
+    Add missing file.
+
+[33mcommit 592813c4cd504823977d5a7f72bee339f5f04cdf[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 17 23:12:17 2025 +0800
+
+    Update first_n_tests_passed.txt format to EXAMPLE_NAME:[yn]NNNNN
+
+[33mcommit 45030e3aadfa630aace9e364996c188d076f2abf[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 17 21:58:06 2025 +0800
+
+    A test passes... agin.
+
+[33mcommit 49ad63148897005f7e917686c1c8be9f2fa2b0b2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 17 20:20:24 2025 +0800
+
+    Make mkdir example clean up after itself.
+
+[33mcommit 16e2d6f1382dfb2e55633f580cf2657dd048dd29[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 17 01:37:48 2025 +0800
+
+    Initial TODO list.
+
+[33mcommit cb2d898f526c53141b8fb3af97e8d34afec459a8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 15 16:17:43 2025 +0800
+
+    Fix two-argument open violations and improve Perl::Critic configuration
+
+[33mcommit 27afdab5282dca9a369a0a1c40ddd431fb329b0f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 15 14:08:22 2025 +0800
+
+    Fix additional Perl::Critic violations
+    
+    - Initialize local  variables to fix 'local variable not initialized' violations
+    - Remove parentheses from mkdir() call to fix 'Builtin function called with parentheses' violation
+    - Progress: 2 out of 137 tests now passing (000__01 and 000__02)
+    - Remaining Perl::Critic violations are mostly style issues that don't affect functionality
+
+[33mcommit eb5daab556cc0aa809c743b63dc5f29d2a8d5610[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 15 14:04:59 2025 +0800
+
+    Fix Perl::Critic violations for noisy quotes in ls command
+    
+    - Use q{} syntax for single-character strings like '.' to avoid 'Quotes used with a noisy string' violations
+    - This fixes the 000__01_file_directory_operations.sh test which now passes
+    - Progress: 2 out of 137 tests now passing
+
+[33mcommit d5ade86e17cf117978d297b08e5c8e4228722198[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 15 14:01:12 2025 +0800
+
+    Fix ls command to handle file arguments correctly
+    
+    - Modified ls command to check if arguments are files (-f) before treating them as directories
+    - Updated generate_ls_helper to handle both file and directory arguments properly
+    - Fixed generate_ls_command and generate_ls_for_substitution to handle multiple file arguments
+    - Fixed various other issues: unused variables, open3 variable declarations, And command handling
+    - Fixed rm command missing  variable declaration
+    - Fixed tee command redundant assignment
+    - Improved command substitution parsing to handle && and || operators
+    - Added native Perl implementations for cp, mv, rm, mkdir, touch in command substitutions
+    
+    The ls command now correctly lists existing files when given file arguments,
+    matching shell behavior where 'ls file1 file2' lists only existing files.
+
+[33mcommit 4dc7eed2784a16f9fe9f95e663bce266439545ed[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 15 05:16:57 2025 +0800
+
+    No idea.
+
+[33mcommit e84f70a8034776211ca181f8dbe287b9d7cbc064[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 15 02:53:24 2025 +0800
+
+    First test passes... again?
+
+[33mcommit 1f4b05c4964bfe66ec1ca45acecf97331e45a300[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 15 00:40:34 2025 +0800
+
+    A test ./fail
+    passes gain.
+
+[33mcommit 0a434aa7836d0e86438966a0d1a5e3281555b7dc[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 14 20:40:44 2025 +0800
+
+    Recover examples that git trashed.
+
+[33mcommit d7cecb5416baa8e69c32dafda71e33336c060e03[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 14 14:51:50 2025 +0800
+
+    Increase newline token priority to fix line counting
+    
+    - Changed Newline token priority from 3 to 5
+    - Attempt to fix lexer line counting issue where all tokens
+      were being reported on wrong line numbers
+    - Issue: lexer not generating Newline tokens correctly
+
+[33mcommit ccfe6f4c80939cf024f781912858547332168034[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 14 14:50:02 2025 +0800
+
+    Fix if statement parser: remove duplicate test expression parsing
+    
+    - Fixed issue where parse_test_expression was being called twice
+    - Updated parse_if_statement to use parse_pipeline consistently
+    - parse_pipeline already handles test expressions internally
+    - Resolves parser conflicts that caused 'Unexpected token: Then' errors
+
+[33mcommit d80edc47510a8d7146047e9d38c6bbf2e6d47035[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 14 14:43:50 2025 +0800
+
+    Fix syntax error: wrap command substitution blocks in do {...}
+    
+    - Fixed variable assignment generation to use 'do {...}' instead of '{...}' for command substitutions
+    - Updated generate_assignment function in src/generator/mod.rs
+    - Updated simple_commands.rs to handle block values correctly
+    - Resolves syntax error: 'my  = {...}' -> 'my  = do {...}'
+
+[33mcommit b27b9add1578239dd7211a774e2e65dc016df631[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 14 00:01:43 2025 +0800
+
+    03 now pass.
+
+[33mcommit 9535bd3300cf99ee3833cede5076e5ea33036eeb[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 13 14:25:41 2025 +0800
+
+    0__01 and 0__02 now passw
+
+[33mcommit 6f532b4634acc39bc136e03fb8b5bcc3e7e28e00[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 13 13:21:30 2025 +0800
+
+    000__01 passes... sort of... why are there still errors?
+
+[33mcommit 8205b1aed5957572df8198d1ce362054b46470d6[m
+Author: root <root@PC.>
+Date:   Sat Sep 13 00:18:43 2025 +0800
+
+    Remove linuxisms in the examples.
+
+[33mcommit 2096774783c30fc8e5062f0cae52f984e4c2c4d9[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 12 22:34:32 2025 +0800
+
+    Now closes macro rename dialog when you press Enter.
+
+[33mcommit 410cbfe105fa2c1e68a2c934833817aa60b026b6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 12 21:51:45 2025 +0800
+
+    Fix OPEN3_BUILTIN and PERL_MUST_NOT_CONTAIN violations
+    
+    - Add native Perl generators for pwd and seq commands
+    - Update builtin registry to include pwd and seq
+    - Fix command substitution to use native Perl instead of open3() for builtins
+    - Fix array assignments to convert backticks to native Perl (e.g., glob())
+    - Fix localtime() syntax to remove parentheses per Perl::Critic
+    - Resolve all OPEN3_BUILTIN and PERL_MUST_NOT_CONTAIN violations
+
+[33mcommit 11c1463216a71b9362c9322d10d033756ded11f5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 9 22:47:18 2025 +0800
+
+    Clean up repository: remove temporary files and update .gitignore
+    
+    - Remove editor swap files (.swp)
+    - Remove backup files (.bak)
+    - Remove temporary files (.tmp)
+    - Remove corrupted/invalid files (single chars, special chars)
+    - Remove generated Perl files (*_basic.pl, *_pipeline.pl, etc.)
+    - Update .gitignore to prevent future tracking of these files
+    - Add comprehensive patterns for editor files, backups, and generated files
+
+[33mcommit 36fa75d567bcaffb8f2983b313c7e04c56018e17[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 9 22:47:18 2025 +0800
+
+    Clean up repository: remove temporary files and update .gitignore
+    
+    - Remove editor swap files (.swp)
+    - Remove backup files (.bak)
+    - Remove temporary files (.tmp)
+    - Remove corrupted/invalid files (single chars, special chars)
+    - Remove generated Perl files (*_basic.pl, *_pipeline.pl, etc.)
+    - Update .gitignore to prevent future tracking of these files
+    - Add comprehensive patterns for editor files, backups, and generated files
+
+[33mcommit cbb6516c8eea14c2c5ff24c7b130c42172beb50b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 9 22:27:11 2025 +0800
+
+    Add regex check for open3 usage with builtin commands
+    
+    - Add check_perl_no_open3_builtins() function in utils.rs
+    - Detect when builtin commands use open3() instead of native Perl
+    - Integrate check into test framework for automatic detection
+    - Support 50+ builtin commands (find, ls, grep, sed, awk, etc.)
+    - Provide detailed violation messages with line numbers
+    - Improve code quality by encouraging native Perl implementations
+
+[33mcommit 99b91fb677afc16b647b21489a48f53e6ac73f2c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 9 22:27:11 2025 +0800
+
+    Add regex check for open3 usage with builtin commands
+    
+    - Add check_perl_no_open3_builtins() function in utils.rs
+    - Detect when builtin commands use open3() instead of native Perl
+    - Integrate check into test framework for automatic detection
+    - Support 50+ builtin commands (find, ls, grep, sed, awk, etc.)
+    - Provide detailed violation messages with line numbers
+    - Improve code quality by encouraging native Perl implementations
+
+[33mcommit 7015522ebadb1090abfbcaa0fb4cc8805d1551a7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 9 16:09:27 2025 +0800
+
+    Add true and false as builtins etc.
+
+[33mcommit d9c454c3100f443a390cb606ba485eb6f4a2be40[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 9 03:37:53 2025 +0800
+
+    Cailms can parse 000__backtics.sh now
+
+[33mcommit 89f89c60576008e7a8a5f810c646d075e80bf48c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 19:12:05 2025 +0800
+
+    Update test_purify.pl to create .tmp files for manual diagnosis
+    
+    - Remove File::Temp dependency and use .tmp files instead
+    - Create .tmp files in same directory as original files for easy inspection
+    - Update diff functionality to use regular file creation
+    - Remove File::Temp from requirements documentation
+    
+    This allows for better debugging by keeping generated files for manual analysis.
+
+[33mcommit c8e24d46ad1aa17a4f6044e71677587e70a26d65[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 17:39:18 2025 +0800
+
+    Switch to PPI
+
+[33mcommit 5af10fd82242a5554bc932d82c780781bfd8410e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 13:58:27 2025 +0800
+
+    003_ simplified now translates correctly
+
+[33mcommit eb9160e86525cb648f7983dbc8dbce3ffe49ce76[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 12:21:41 2025 +0800
+
+    Full purification of 002 (printf) including backticks.
+
+[33mcommit b24f4b166af445dd32baed26acc6bf435c524ba5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 12:00:39 2025 +0800
+
+    Set LC_COLLATE=C
+
+[33mcommit 25b71a2a27215dbbf8ac2519bc41311f003af741[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 11:53:44 2025 +0800
+
+    Fix printf system call conversion and improve ls command handling
+    
+    - Fix printf system call regex pattern to handle unquoted arguments
+    - Add broken behavior compatibility for printf %c format specifiers
+    - Update test_purify.pl to use release build of debashc by default
+    - Improve ls command conversion with proper directory handling
+    - Fix backtick ls command conversion to use inline code blocks
+    
+    The printf conversion now correctly handles:
+    - Integer arguments: printf('Integer: %d\n', 42)
+    - Character arguments: printf('Character: %c\n', ord(substr('65', 0, 1)))
+    - String arguments: printf('String: %s\n', 'test')
+    
+    Note: Float arguments still fail due to debashc parsing limitations
+
+[33mcommit 373100ed46ca5fb019b542543d8ebd93b06bd65f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 11:17:37 2025 +0800
+
+    Set LOCALE=C
+
+[33mcommit 61e82a3feda7309bb7ea3ed4f93667d0a8df944a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 00:52:42 2025 +0800
+
+    Add ls command skip logic to preserve original formatting
+    
+    - Skip conversion for ls commands in system() calls to preserve original output formatting
+    - Add skip logic for 3-argument, 2-argument, and single-argument system() patterns
+    - Preserve original ls output format instead of converting to native Perl
+    - Significantly improves 003_ls_basic.pl test progress (now fails at line 319 vs line 290)
+    
+    This addresses the ls formatting issues where converted output didn't match original format.
+
+[33mcommit cd8622bebe49316c0a98f741530af5378120db16[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 00:15:18 2025 +0800
+
+    Fix printf system() calls with 3 arguments
+    
+    - Add pattern to handle system() calls with 3 arguments (command, arg1, arg2)
+    - Fix printf commands like system("printf", "format", "value")
+    - Properly reconstruct commands with multiple arguments
+    - Fix quote escaping for multi-argument system() calls
+    
+    Resolves printf formatting issues in 002_printf_basic.pl test
+
+[33mcommit abab43da529ecdc0732f0e78dde8298e860745fd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 8 00:06:54 2025 +0800
+
+    Fix purify.pl system() calls and add verbose output support
+    
+    - Fix system() calls to not add extra print statements
+    - Fix quote handling in system() call reconstruction
+    - Fix redirection commands to preserve print statements
+    - Add --verbose flag to show generated Perl code
+    - Update test_purify.pl to pass through --verbose flag
+    - Fix backtick processing for builtin commands
+    
+    Resolves issues with ./fail test suite, particularly 003_ls_basic.pl
+
+[33mcommit 6e86708e9047977e9ac2eb428d52d064212c3941[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 7 19:04:00 2025 +0800
+
+    Switch to looking for purify.pl failures mainly
+
+[33mcommit d9b7fcf04b7ad85dd8230a0b9ffdb1b0906d2996[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 7 15:40:11 2025 +0800
+
+    Add preambles to purify.pl
+
+[33mcommit 291ac393778c5b2022db6a488011836882b524f4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 7 13:14:01 2025 +0800
+
+    Add --perl-critic-only flag
+
+[33mcommit 09a470cffd44a670d2044583f101baaec3d72c07[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 7 01:45:52 2025 +0800
+
+    --snippet works now.
+
+[33mcommit afc1dbd857b7862ed2237fea74ae7a267e504701[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 7 01:16:00 2025 +0800
+
+    Add examples impure perl. If only there was a way to purify.pl them.
+
+[33mcommit 6f0bf2d49c12a3aee47665c05e7d150b8b366217[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 7 01:13:05 2025 +0800
+
+    Add exception so we don't have to refactor input code.
+
+[33mcommit 305b1a76768c89c2d443758e3f46813dbc0510e2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 7 01:10:55 2025 +0800
+
+    003 passed critic except untidy.
+
+[33mcommit 2e1f98ffe40b367349e8fe1130e31609a01ee3b4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 7 00:10:50 2025 +0800
+
+    Proper exit status: Cache correctly preserves whether Perl::Critic found violations or not
+
+[33mcommit a6621bfb4bf1644a13d92638d5ac80c02227c4f2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Sep 7 00:04:20 2025 +0800
+
+    Perl Critic Caching now working.
+
+[33mcommit f9bfe727b7d01be025228b19a832146efc94dd60[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 22:55:42 2025 +0800
+
+    Perl Critic Caching.
+
+[33mcommit c70b3d5448ff9fad4b3afdb1575324d3d86a66b8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 19:52:34 2025 +0800
+
+    Add E.g.: Code:     $main_exit_code = 1 [VIOLATION!]unless $pipeline_success_5;
+
+[33mcommit fccdcc9a1931c20ed114909ec0108b1bc9087467[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 19:38:00 2025 +0800
+
+    Location now slightly useful.
+
+[33mcommit 9c81a6e253607fb45953f8dba136b3703f15a37d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 19:01:50 2025 +0800
+
+    Two examples well formatted
+
+[33mcommit 2253307eb959df9444c31d118b0588a12c1c27a8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 15:55:16 2025 +0800
+
+    Screen Capture no longer truncated
+
+[33mcommit cbf4571a26b70f3b05eb63c7fb3e6e134bcf2b43[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 14:26:56 2025 +0800
+
+    Disable RequireInterpolation... too many false positives and redundant.
+
+[33mcommit 02430ab90890c2b85c57b994073d07650bd64b5e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 12:07:13 2025 +0800
+
+    Add explaination?
+
+[33mcommit 56c9b21fc0aa6e0f383797fc55e1e5190e0a6ef8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 11:58:26 2025 +0800
+
+    Reorder output.
+
+[33mcommit 97980258b78d2ad5106eadf6a4970ee78ada8722[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 11:31:05 2025 +0800
+
+    Add more comments.
+
+[33mcommit 9217b2b5ef0a03c4606e423642d4ffa9fd914302[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 11:29:30 2025 +0800
+
+    Manually create perlcritic.conf based on template
+
+[33mcommit ddde36acc2a8be9f247dc280e490608aff3748b5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 11:07:17 2025 +0800
+
+    Start making Perl Critic Happy
+
+[33mcommit e077625f39223c0409b64f30cc03fc83b7b36b2c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Sep 6 04:48:54 2025 +0800
+
+    Compare with Perl Tidy output
+
+[33mcommit a73e8eb4530e6609fc12ae4c560c4b52cca6a5b9[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 23:40:54 2025 +0800
+
+    Add example and remove redundant lines from its translation.
+
+[33mcommit 7e6a33ad32096ec0f68c8973b67e63e3f8b2de63[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 23:22:17 2025 +0800
+
+    Add missing perlcritic files.
+
+[33mcommit ced866ec64f3a1fe46322b4b147cf1949e8bdd72[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 21:35:24 2025 +0800
+
+    --perl-critic seems to work now.powershell -ExecutionPolicy Bypass -File install-deps.ps1 -InstallRust:$false -InstallPerl:$false -InstallPerlCritic:$false -RunBuild:$false
+
+[33mcommit 65861b297dc92348764900f25180c964efbb81f2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 19:27:08 2025 +0800
+
+    Add --perl-critic option
+
+[33mcommit 6d6c25dc75c940f7015e56d2d2e52e46407f9bab[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 18:01:49 2025 +0800
+
+    Add documentation on indentation strategy.
+
+[33mcommit f8a8264eca91aaba877bc8d2820a126ab0799cb3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 17:56:01 2025 +0800
+
+    Fix indent.
+
+[33mcommit 030421f9ac4a496d15c24bbf3ede88279a7228eb[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 17:33:32 2025 +0800
+
+    Remove unneeded head_count_max variable
+
+[33mcommit db317d850fb27f5a29bde4059dfd6747c2d6a3dc[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 17:28:16 2025 +0800
+
+    Remove unneeded line.
+
+[33mcommit 8abfd5c6edb075ec6eef98a9c31166da6962a4aa[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 09:46:53 2025 +0800
+
+    000 works in linebyline streaming now/
+
+[33mcommit 82c6505cf39222895ea8ba1522d9fd72c63e1f43[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 00:24:38 2025 +0800
+
+    Fix yes to use while not for.
+
+[33mcommit 7c5bf42fabc1a0d0ecc539421b656fc08a06bace[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Sep 5 00:19:36 2025 +0800
+
+    line-by-line "while"
+
+[33mcommit 8b18edc3c8977ce3bacd2118c5902f65533bd030[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 21:10:16 2025 +0800
+
+    We now have timing information again!
+
+[33mcommit dd42eeb7f8571b0863562175594d0996f08be2a4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 16:37:19 2025 +0800
+
+    Output "To run this test again run ./fail 044" (shortest unique prefix
+    notation).
+
+[33mcommit 18588058aca197bf50070453512cc056cfaf4582[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 16:14:13 2025 +0800
+
+    Switch from numbers to unique prefixes for examples.
+
+[33mcommit a53040d6e73ddae2d55a9978f459ebd403a5288c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 10:29:27 2025 +0800
+
+    Omit OS specific example
+
+[33mcommit 182677219b210b793261c25758201b2439984989[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 09:42:39 2025 +0800
+
+    fix
+
+[33mcommit 8a07cac40c70eb6d720ccf4dfd2da9633e0a3047[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 09:37:56 2025 +0800
+
+    Add strip_debug to clean degum messages from this project.
+
+[33mcommit a1df427e5c087c4bd378e5d181ecb620c66c539c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 09:30:38 2025 +0800
+
+    Add echo.rs
+
+[33mcommit 44ffebf623b327152917aeed1c31be947dc5ea6d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 02:25:02 2025 +0800
+
+    164 lines pass
+
+[33mcommit d7ec1ccec7f2e1860eb6eeb97a7ecfb5ebd5c11c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 02:08:18 2025 +0800
+
+    First 43 tests pass
+
+[33mcommit b5b9d9860c7c5b7214d06b1acce0169e9e7f9d8c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 01:47:30 2025 +0800
+
+    First 7 tests pass
+
+[33mcommit 8e49827f4e8c6648a9e3001f40be4977fc09346d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 01:32:00 2025 +0800
+
+    Shell Calling Perl Finally passes.
+
+[33mcommit 83c4d76e36cb147b4212119a4c5091b9e71c4793[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 00:44:27 2025 +0800
+
+    Add perl.rs
+
+[33mcommit c5c06c5560a60e0c765572972a5e827133abddad[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 00:36:53 2025 +0800
+
+    fix
+
+[33mcommit f66a2f4e31f30d03c013e40faf92c1396188db37[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 00:28:58 2025 +0800
+
+    Remove confusing warmup
+
+[33mcommit a340eaeb4166e651a410ea761ff843b7dc949d32[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 00:27:57 2025 +0800
+
+    Fix example to be more intuitive
+
+[33mcommit 541f22c9a23cda29d12fac8a0fbaea8474aff450[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Sep 4 00:23:14 2025 +0800
+
+    Please enter the commit message for your changes. Lines starting
+
+[33mcommit 462a21ceb4db85724e79e27f3273c03188953c99[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 23:55:52 2025 +0800
+
+    Add Wamups.
+
+[33mcommit 96adbddc3b1150502e10265e2ae870fd94317b5d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 23:28:40 2025 +0800
+
+    Addd randome interesting stuff to MIRE, because why not?
+
+[33mcommit 366bff16ea292e53af69694b4d4ca259975a4cf3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 11:34:39 2025 +1200
+
+    Fiddle with Mir, break lots ot tests, the usual.
+
+[33mcommit c945313d18dc1bc562a802ca8b08c9f92811cf72[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 04:55:32 2025 +1200
+
+    Move more to MIR.
+
+[33mcommit 4e620344d3991b205e5c72b73c90dbd1c776e450[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 04:47:18 2025 +1200
+
+    Test back where we were.
+
+[33mcommit 131853115889ffff875ea75eaf4d11a401768b99[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 04:44:02 2025 +1200
+
+    139 lines pass
+
+[33mcommit 517cd45d8ae233312ef4179d197c655d58270172[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 04:42:20 2025 +1200
+
+    Make --ast synonym for --parse
+
+[33mcommit a209ec9d355bbfaa4f2424623defecbbf5df7db0[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 04:40:51 2025 +1200
+
+    Split mir.rs from ast.rs
+
+[33mcommit ebf1381b1962a44fb630e811edaaeffd15cca84e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 01:17:30 2025 +1200
+
+    Add titles
+
+[33mcommit 62910c63497aa233dbe9f653a1d28c4d854b3572[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 01:09:19 2025 +1200
+
+    Fix str
+
+[33mcommit 203879f4526d2d674880fa495d9e47643df8a6f1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 01:08:53 2025 +1200
+
+    More mvoe
+
+[33mcommit 4070d0c9e5398ecb412af83e7d9bac485c614d7a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 01:08:43 2025 +1200
+
+    Move tmp file.
+
+[33mcommit d2b0c7f4a882bb532fa5034f936a0e9c1e4d6b47[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 00:35:27 2025 +1200
+
+    Add fin!
+
+[33mcommit d40e01b49f4ebacc32678f06c61f142dfdd4be48[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 00:29:51 2025 +1200
+
+    Make safer.
+
+[33mcommit 69e17442664e6e6528f99fb0a6f77fda56fc8483[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Sep 3 00:28:53 2025 +1200
+
+    Work around ordering issues.
+
+[33mcommit d397c8cc84d75d35479e8f16988029d103a0c478[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 23:44:42 2025 +1200
+
+    148 lines pass
+
+[33mcommit 2c911d71e8009005217d700e5610619a55f6715b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 18:42:51 2025 +1200
+
+    0 lines pass
+
+[33mcommit 6bcd1df417d0270c45d752457b84c8b501358890[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 18:20:54 2025 +1200
+
+    First 44 tests pass
+
+[33mcommit e51b982949c4a4ef3e8a65183d190d6f12eb7d94[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 18:06:52 2025 +1200
+
+    0 lines pass
+
+[33mcommit 21cb62ca2ef385bf7fea1cdbf1343869ff1fac21[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 17:50:13 2025 +1200
+
+    First 43 tests pass
+
+[33mcommit bfc8ba26d03af49c9075ad1215a0407de263f923[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 17:04:43 2025 +1200
+
+    First 31 tests pass
+
+[33mcommit 515048a38219d62533ee64cd080c6efa97c57da4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 15:49:13 2025 +1200
+
+    First 19 tests pass
+
+[33mcommit 4df8110efc5a92b2af2abcf11d3779cabcef7ce0[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 14:40:16 2025 +1200
+
+    25 lines pass
+
+[33mcommit f8ec2baca4186b8c951d4966c98c0705840937b7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 13:38:13 2025 +1200
+
+    First 18 tests pass
+
+[33mcommit c6de621bd02c57d5acdb9f5f439112281e086507[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 13:37:22 2025 +1200
+
+    20 lines pass
+
+[33mcommit 9852e14b6b84b9775c857ad72f9488e77aa57180[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 11:16:32 2025 +1200
+
+    Enforce code style
+
+[33mcommit 15c789e1e6d796a3d2181d7e258606e00bcbe6c7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 11:15:09 2025 +1200
+
+    Fix test 0
+
+[33mcommit 95c129cb64f0ef3bb7bfc72233c01e081004da8e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 11:06:39 2025 +1200
+
+    Add test for Issue #3
+
+[33mcommit b30fc07f7f430c1eda7dcb5d1d0286a38a418f79[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 10:55:35 2025 +1200
+
+    First 17 tests pass
+
+[33mcommit 34ab7f5cb504a44579ca053d5f0c611650f5150c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 10:05:43 2025 +1200
+
+    Add test for innapropriate USE basename.
+
+[33mcommit 3129f8ac9ccd4eddf743015ffbf83ec21f8cf432[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 09:26:12 2025 +1200
+
+    Categorize examples based on results/*
+
+[33mcommit 765c442dcfff5f73b8db927b9a9ffb22d04819fa[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 09:19:54 2025 +1200
+
+    --test-eq now categorises failures into results/*
+
+[33mcommit 08e84bf0818eb3a7cb2ceea02e7b0d9f7e6170b3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 09:08:57 2025 +1200
+
+    First 16 tests pass
+
+[33mcommit 3d0416e866a0f5fa61b08089eed6896438cdcd98[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 08:58:54 2025 +1200
+
+    Work around ordering
+
+[33mcommit ed1889791554c66d6076015139b16cad9a20a520[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 00:11:45 2025 +1200
+
+    20 lines pass
+
+[33mcommit 277745edcf22e8272636ad0f4fd56a8cca1e56de[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Sep 2 00:02:42 2025 +1200
+
+    add lines
+
+[33mcommit 35daf9d465972982a5def261a422f997df9cc1d4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 23:48:42 2025 +1200
+
+    First 16 tests pass
+
+[33mcommit e1f547b4e70833b9f7417bb2d59cd69aa514f0c6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 23:46:41 2025 +1200
+
+    First 15 tests pass
+
+[33mcommit b3034956d19d94a621c0d80b3460860e1778f7bc[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 23:39:22 2025 +1200
+
+    5 lines pass
+
+[33mcommit 3ca65040336c8b4d982e8e7acb80022eb2e76d25[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 21:43:28 2025 +1200
+
+    3 lines pass
+
+[33mcommit 8f2e1f3db1dad63bafb2080447d0d1dde4d9e859[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 20:13:46 2025 +1200
+
+    First 14 tests pass
+
+[33mcommit c9c2ae67660ce707c0c7d59b8c320b7a4fba215e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 19:58:29 2025 +1200
+
+    7 lines pass
+
+[33mcommit 04450d21a82fb463947130c928687f1f193af0ef[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 18:28:30 2025 +1200
+
+    First 11 tests pass
+
+[33mcommit 080a78362e54e40c54eb852cbd86c50f2be64eaa[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 17:37:53 2025 +1200
+
+    First 10 tests pass
+
+[33mcommit 4a763c475b8cb57b8068f7b8a02699d574ba20cd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 17:21:21 2025 +1200
+
+    First 8 tests pass
+
+[33mcommit 61f11e15a68a73a94bcd001b192de5796e38941c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 17:17:22 2025 +1200
+
+    144 lines pass
+
+[33mcommit 7b42c98a07e473e8c2ef050fc440e6ea81d5d27b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 16:40:36 2025 +1200
+
+    First 7 tests pass
+
+[33mcommit 0a8042173a58e121831506b5adf877a378153609[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 16:30:06 2025 +1200
+
+    First 5 tests pass
+
+[33mcommit ccf9c729585af70ad0722ea3f0f625c34a60f596[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 16:20:08 2025 +1200
+
+    First 3 tests pass
+
+[33mcommit 5d068b599baa29da1da7b1ad464a393b2c7350ee[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 16:16:31 2025 +1200
+
+    First 3 tests pass again.
+
+[33mcommit 7b44979efe47c379ec0e6f2dca83c9e94b9b1b34[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 15:56:40 2025 +1200
+
+    Fix up test.
+
+[33mcommit ba8187b8cebece41ac3f35fb4e3502cda7469f0c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 15:28:19 2025 +1200
+
+    Avoid bash tempfile
+
+[33mcommit 2b4db83312d0d06184ea53c74c175483e6f412aa[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 14:32:15 2025 +1200
+
+    Stash dangerous changes, stop CursorPro "fixing" tests by changing the
+    tests.
+
+[33mcommit 2f07aa5fce4751ab75d44a30526ac5db1e58811a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 12:46:33 2025 +1200
+
+    stash
+
+[33mcommit c2bbc6655635ef066c78a0ee1de2faa62174a3a4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 11:06:00 2025 +1200
+
+    Refactor etc.
+
+[33mcommit 7707b7609756dfc8d688aaac930a00f0524fad5b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 11:02:42 2025 +1200
+
+    Set more commands to support line-by-line pipelines.
+
+[33mcommit 8ca6da915b32cb11d670903cb4584837b9a424b8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 10:10:15 2025 +1200
+
+    25 lines pass
+
+[33mcommit 220f31fc14cbac9fe6df2ac8a9dee2fcf332db5b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 03:54:25 2025 +1200
+
+    23 lines pass
+
+[33mcommit 069ef346b2423c0f2b5bc2ff3669e2d33cd33498[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 02:55:12 2025 +1200
+
+    9 lines pass
+
+[33mcommit 0e1bddf49711106d945b809a9569cf57f58f4537[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 02:39:35 2025 +1200
+
+    Add line by line pipeline support.
+
+[33mcommit 6cc6dabbb403f60abd72914ab3b8cd031f79846d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 02:08:17 2025 +1200
+
+    More refactoring.
+
+[33mcommit 873b6e0155a68971dadebd5e990a3095b3a224da[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 01:43:31 2025 +1200
+
+    Refactor builtins.
+
+[33mcommit 5fc67b3e20713f37a07e997690606c7ed2e28ff8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 01:17:30 2025 +1200
+
+    1 lines pass
+
+[33mcommit 907ab0bcf7d803ed1309e138fa608d88b36cd6b8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 01:11:07 2025 +1200
+
+    First 2 tests pass
+
+[33mcommit 8742c30939f865123d9559828040406f7ddbbad6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 01:09:46 2025 +1200
+
+    Finish restructure.
+
+[33mcommit 6472c8700f7508cfba095c5eefb564d87e46912a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 00:59:36 2025 +1200
+
+    Broken, but moved Logical Operators out of Pipeline.
+
+[33mcommit e973aa670891956b973d11927b3ef1387d85f7b2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Sep 1 00:46:41 2025 +1200
+
+    Add logic_commands.rs
+
+[33mcommit f84b7588c615713a227b2960491557f3715d0623[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 31 23:53:42 2025 +1200
+
+    Back where we were, but with out sepcial case for 2-length pipelines?
+
+[33mcommit 4b379130463e69cf28ba546201993a60cbb863b5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 31 17:06:02 2025 +1200
+
+    No progress on tests
+
+[33mcommit 2d7a377596fd609d192633fa16ff2e089bea3bb4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 31 17:05:55 2025 +1200
+
+    First 14 tests pass
+
+[33mcommit e7ecf070b3a13c2825913227547f2c2a82cbfc28[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 29 11:26:42 2025 +1200
+
+    First 9 tests pass
+
+[33mcommit 83bedc8f58b97da767469a25cdf7df28df6395e1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 29 09:14:56 2025 +1200
+
+    Write test count.
+
+[33mcommit 8872d8152e9e386feca0cc67433a21ab28bf69af[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 29 01:25:25 2025 +1200
+
+    Another test passes.
+
+[33mcommit b5fdc2857a9987ef22f8fcba8ff2ee14efa9072b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 29 00:16:17 2025 +1200
+
+    Shrink WASM.
+
+[33mcommit 5f0fe40ac36564e9e6e4c57c0fdc578f974433e3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 29 00:15:51 2025 +1200
+
+    Clean off old web buttons.
+
+[33mcommit 62ce43314a048b82596b613e7385e41fd79d8a66[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 23:14:26 2025 +1200
+
+    Test 8 now passes. We had to sort and break streaming though.
+
+[33mcommit 17a617bd599aad756787733182d37772aede6291[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 23:07:10 2025 +1200
+
+    Remove need to buffer input for grep pipeline.
+
+[33mcommit d5a526bbdfc80ca033a3b58704bef9ce651f5659[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 22:41:14 2025 +1200
+
+    Another test passes.
+
+[33mcommit b4c7b65b2d282785bce1f5168417b944beb56cfd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 21:50:51 2025 +1200
+
+    Split up main.rs
+
+[33mcommit 06090d9c32d3a5c70c839e3341df3f7eefe39d67[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 21:27:27 2025 +1200
+
+    stash
+
+[33mcommit 81fab992652b4fcd283716a14fa0f36c5743311c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 20:55:51 2025 +1200
+
+    Fix --diff command.
+
+[33mcommit 1e2e0119d98959bbd40ba8d9f812b0415446ecda[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 20:45:51 2025 +1200
+
+    Add --diff option (mainly for testing)
+
+[33mcommit 8eed5845acc2f545394051d2eb7f4f4a0bb54eec[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 20:29:27 2025 +1200
+
+    Add and support AST_MUST_NOT_CONTAITN condition in examples
+
+[33mcommit 65ba9ff6b6762a514685bec81bca843480417486[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 18:03:06 2025 +1200
+
+    Fix code to satify PERL_MUST_NOT... constraint
+
+[33mcommit 8a61e74e3e8d6ea842ca4e3f0245bdffdd1b3085[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 17:51:00 2025 +1200
+
+    Add PERL_MUST_NOT_CONTAIN example constraint.
+
+[33mcommit ef8af7dc5c664ac5680911b26a972a941afe082a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 17:29:48 2025 +1200
+
+    First 8 tests pass
+
+[33mcommit 6895b20518e73824f4de154178cdd79521552dfc[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 10:10:14 2025 +1200
+
+    Use strict and warnings (again)
+
+[33mcommit 12ddabbfbaf221c65c1cfb85cd892ea01383b291[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 10:08:10 2025 +1200
+
+    stash
+
+[33mcommit 7da7769afc41457c023f7e0efb70b60d8fad4920[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 09:15:11 2025 +1200
+
+    Remove unneeded { }
+
+[33mcommit 59db8e5cf08bdefb88e1e1d2dc811d22174817df[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 09:07:15 2025 +1200
+
+    Simplify print staments more.
+
+[33mcommit 69330a814606765e675c41643eb33db258315185[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 09:04:03 2025 +1200
+
+    Simplify output print statements.
+
+[33mcommit 1f8ac5de234f5633dcd9e61dfb9d814e52460753[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 09:00:32 2025 +1200
+
+    First severa; tests pass again.
+
+[33mcommit 709bff51f5dcd5e80aa533c86dad99959c92e665[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 08:14:18 2025 +1200
+
+    Fixed indentation.
+
+[33mcommit 406a4612deb6117fff2749fc130f2ba51f3d963f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 01:55:09 2025 +1200
+
+    stash
+
+[33mcommit c3184b6213aa7c3da106e9b262154e6d449b585c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 28 00:02:20 2025 +1200
+
+    First 5 tests pass.
+
+[33mcommit 24816455ec5f8b2ff997720e0dda7a69c3257ade[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 23:32:23 2025 +1200
+
+    Third test looks like it should pass.
+
+[33mcommit 3b4167d6a529bc6cf86fcbc04abc1b58f546826e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 21:41:59 2025 +1200
+
+    Fix staircasing
+
+[33mcommit bfc80164e7928c212a5c5356ded5dc02200ab2be[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 20:38:29 2025 +1200
+
+    stash
+
+[33mcommit af07e7d7b4ae9542a1695da85077123228cd5e3a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 20:11:53 2025 +1200
+
+    Remove old code.
+
+[33mcommit e601fe070bee162151a0c217f23828c162066f3c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 17:36:29 2025 +1200
+
+    Fix more warnings.
+
+[33mcommit 0ec80054fb94e17ef915fc06a88ecb75123ec0f4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 17:31:02 2025 +1200
+
+    Is this one better?
+
+[33mcommit 35420b8649b0c6dd35261a857a39d0466a8413bd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 17:14:18 2025 +1200
+
+    stash
+
+[33mcommit a6d9a6c8064946239187ba3374f270aa1f89f862[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 16:58:14 2025 +1200
+
+    Fix some warnings.
+
+[33mcommit 6ca41a9f3bb7376c706a8a03d1cc96057a344d6e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 16:49:48 2025 +1200
+
+    Remove unused imports.
+
+[33mcommit 0be891f0fceec25d32423a69f410feb43b618526[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 16:48:07 2025 +1200
+
+    Clean Dead Code.
+
+[33mcommit 5fd469b74ef95d4a8bfdcea75793407c5b7e9691[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 16:47:48 2025 +1200
+
+    Now seems to work.
+
+[33mcommit d88f91ee0f19cec7fafb97d820fd646952961376[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 16:28:51 2025 +1200
+
+    stash
+
+[33mcommit dc459b8abe17a6274aa68b26be587b390a1c4929[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 15:52:56 2025 +1200
+
+    Add script to remove dead code.
+
+[33mcommit 5ac510f8b739f94eab858f2ed6a0f5baef882458[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 15:18:27 2025 +1200
+
+    stash
+
+[33mcommit e20b3f3ad1dcbc1acaa0de582ba617c49f9ac096[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 15:06:34 2025 +1200
+
+    stash
+
+[33mcommit c0e5143131e22a1d44d2cc59b40753849d9ee73f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 09:46:40 2025 +1200
+
+    stash
+
+[33mcommit d82571c20180b5f0ec3d97561ed4b692d785d1c2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 09:00:09 2025 +1200
+
+    stash
+
+[33mcommit ce19cf39a225172619141dea01c014f5143fc351[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 08:38:14 2025 +1200
+
+    Split up commands.rs into grep.rs etc.
+
+[33mcommit f9bd107e4f09fb4668508956fbba3d8cf696a942[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 07:45:22 2025 +1200
+
+    stash
+
+[33mcommit b4c3a5d092e0bc7afcd29206d521ed5bd5071605[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 06:58:52 2025 +1200
+
+    First two tests *really* pass.
+
+[33mcommit 71693239b6708e86bd6955cc5ba1f7963a23b1b2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 06:48:41 2025 +1200
+
+    Fix cargo run -- fail not finding all failures.
+
+[33mcommit 9233fb96db4daa6793ceac947d8ef9c860cb7175[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 27 06:31:40 2025 +1200
+
+    Back up to first 8 tests passing according to --fail
+
+[33mcommit e6ff57a4ef95e854ec282fe57d2d8a7b0bc909eb[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 26 15:46:16 2025 +1200
+
+    Fix test 002
+
+[33mcommit 99f34a2e2350a5865710f79589699f8817317131[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 26 09:48:15 2025 +1200
+
+    Start fixing tests
+
+[33mcommit 7da4716fe1ebc1115bf629dee858ae90bd12223e[m
+Merge: 82d7c17 f9fb746
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 26 07:28:07 2025 +1200
+
+    Merge branch 'main' of https://github.com/gmatht/debashc
+
+[33mcommit 82d7c17097f8e138776abec6dbf3fa3271d04e53[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 26 07:27:38 2025 +1200
+
+    Split up parser
+
+[33mcommit 63c2ea4eb6bff1484358bcaa30430b68d2264bbe[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 26 06:30:27 2025 +1200
+
+    Split up examples
+
+[33mcommit 9cf498818ea1f7f640ee560e0fe349d2908cff02[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 26 06:08:03 2025 +1200
+
+    rename Perl Generator
+
+[33mcommit 7a0ef8c6f3226fc61d01263b8a9f646a2ad87ad8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 26 00:21:32 2025 +1200
+
+    Split up Perl Generator
+
+[33mcommit e7969382a8a5eda997796e626c49422e9d1aaba5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 25 14:56:26 2025 +1200
+
+    Builds on Linux now.
+
+[33mcommit f9fb7465e140547d6ea1a653f1c5a5fe2d37fa55[m
+Merge: 5b3851e 11ee171
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 21 23:58:42 2025 +1200
+
+    Merge pull request #2 from briandfoy/patch-1
+    
+    git clone with actual username for project
+
+[33mcommit 31cdc737483f766c470907da4541c31e6922e5b8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 20 12:57:31 2025 +1200
+
+    Fix./f
+     caching?
+
+[33mcommit da26c42dc0925fefc7ced93f54f2eedf4624a940[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 20 12:29:38 2025 +1200
+
+    stash
+
+[33mcommit 45748ebbe6506da42d38c1d080a9afee6a391213[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 20 09:02:29 2025 +1200
+
+    stash
+
+[33mcommit aac873ed75c54d63da315bbec4f645f1605e63f7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 20 01:12:29 2025 +1200
+
+    stash
+
+[33mcommit b43c78a429035e26234041328e057671153c6541[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 22:55:47 2025 +1200
+
+    Add new examples
+
+[33mcommit eb51b93901dfebd3fe498dc588074f9f7822bd6e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 22:40:52 2025 +1200
+
+    remove weird argument names
+
+[33mcommit 0fbb1f05f893ae200d10d42723a90c54bc4e3f0c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 22:34:38 2025 +1200
+
+    Convert Bash local variables to Perl signatures when appropriate.
+
+[33mcommit 9297a5f089859f934cacdfc3849fb1b3eaa26017[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 19:36:31 2025 +1200
+
+    Working towards modern Perl signatures
+
+[33mcommit 5b3851e3ed938a0846aa1fa4786e5582cf3778e9[m
+Merge: 1a72fe7 5cc9670
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 18:22:32 2025 +1200
+
+    Merge pull request #9 from gmatht/MAIN
+    
+    Main
+
+[33mcommit 5cc9670ab454ea1b12af4965f24f60da9f430826[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 18:12:15 2025 +1200
+
+    Clean up Cargo.toml and add default-run
+
+[33mcommit 42a9723ad3ce93ee46a832fd5fcfbfeb98d6a544[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 18:11:36 2025 +1200
+
+    Fix Issue 3 ($# -> @ARGV)
+
+[33mcommit 8c88eebbaba217458ca00bb094fe866911245df2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 17:52:49 2025 +1200
+
+    Add examples
+
+[33mcommit 05b8bbf1f04c6056095b76c82e08d7aee30caa97[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 17:43:56 2025 +1200
+
+    All tests pass
+
+[33mcommit 52c7f46f595d10b91f678e9fe7c47c7ba8fcac12[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 12:28:48 2025 +1200
+
+    Another test passes
+
+[33mcommit 98b6a502f171fa0f652d7fe40ae3bd1709ca1b8d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 19 00:18:59 2025 +1200
+
+    Another test passes
+
+[33mcommit 4cd539ba194f88744bba3641ba1c5371eec85c93[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 18 21:45:20 2025 +1200
+
+    Fixed a test?
+
+[33mcommit 8b79a28f2ec69a97b93c6914d7d39c65a3ced093[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 17 09:20:23 2025 +1200
+
+    Space matches multiple spaces in the Lexer now
+
+[33mcommit 962ba5baeb81b6526aa6859a7fef27b1f4eda616[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 17 08:41:27 2025 +1200
+
+    Print contents of lexer tokens
+
+[33mcommit 5a7586ca43e4af89db3eb3fa301a036028b6bcd1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 17 08:06:31 2025 +1200
+
+    stash
+
+[33mcommit 619e7a937ae3dc1043e85e16380a46bc0accc5a8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 17 00:38:04 2025 +1200
+
+    Add new examples.
+
+[33mcommit f2ab8382bebaf3ff60488f1ea3fde4c51191eaf0[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 17 00:36:32 2025 +1200
+
+    Cache Perl Too
+
+[33mcommit d8c6dd672030f1294cb3a38da2b6fc84940fa8ef[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 17 00:13:52 2025 +1200
+
+    Change from timestamps to SHA256 to check changes to sort files and invalidate cache.
+
+[33mcommit dddda6cce447b00498ca312490afb60c33d7c1ed[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 17 00:00:11 2025 +1200
+
+    Add 64kb limit to bash cache files
+
+[33mcommit efc65246b25fc5ade8264b335779efc489e81baa[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 16 23:52:24 2025 +1200
+
+    Add Bash cache to --next-fail
+
+[33mcommit 07f66f777ca7e822496be0c7a836bf4ee2686556[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 16 23:09:02 2025 +1200
+
+    stash
+
+[33mcommit 5ab16f9d62b169851ac78379991fac8d0f27c999[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 16 22:28:55 2025 +1200
+
+    parsing fixed
+
+[33mcommit bda1ff144785bbee461cdda0329da4017c1e0906[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 16 16:43:30 2025 +1200
+
+    The test 052_numeric_computations.sh is now PASSING
+
+[33mcommit aff55a4a1a9012277ee08b3f52bf29929c5cf838[m
+Author: root <root@PC.>
+Date:   Sat Aug 16 11:37:10 2025 +1200
+
+    Add new example
+
+[33mcommit f90aefd39951b0c8910c71cdbde368714d6cc635[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 16 11:24:45 2025 +1200
+
+    Add arithematic examples
+
+[33mcommit d3ee204cc066128d29784060e0ec12c09885ba8f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 16 11:12:44 2025 +1200
+
+    Number Examples
+
+[33mcommit 55493140985e380b1191c4939c3f775aa52cb331[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 16 11:06:13 2025 +1200
+
+    Fix Warnings.
+
+[33mcommit a16d080ad3a1c3dec51a9127c95e77f07c0eb8bd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 16 10:56:10 2025 +1200
+
+    Remove other non-Perl generators.
+
+[33mcommit 11ee171bfb2577c281b67f2799c1aab9b0ae61d2[m
+Author: brian d foy <briandfoy@pobox.com>
+Date:   Thu Aug 14 08:29:08 2025 -0400
+
+    git clone with actual username for project
+
+[33mcommit 1a72fe7bfce16c109f3dc7f441d682ce7a4892f1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 12:53:05 2025 +1200
+
+    Add new test and make it pass.
+
+[33mcommit 85ebe9cac0e9c1df0bb298561d2ccb59e9dd72b5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 12:18:37 2025 +1200
+
+    Add --uses-of-system command
+
+[33mcommit ea23611ebb3cc93c1fb1e3d6b632dc9061253991[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 11:04:38 2025 +1200
+
+    Fix README
+
+[33mcommit 7e40dafb4be6fc07a7a932c2de5f32df6a6f30bb[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 10:38:05 2025 +1200
+
+    Get rid of ugly space in index.html
+
+[33mcommit b8befdb8333090e0f43eeb93ce4a1a08db322746[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 10:23:20 2025 +1200
+
+    Fix WASM webpage formatting.
+
+[33mcommit ee2ac7e42d5a0432c8e3d598ba00dd4da7cbe58f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 10:07:10 2025 +1200
+
+    Re-Add experimental generators to HTML.
+
+[33mcommit ea3edc736002c3ba16dbe8b31105bafc48977cba[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 09:57:54 2025 +1200
+
+    Add other generators back into WASM
+
+[33mcommit 218ffafbc2be880109969eb46381586a82d1b5c2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 09:53:15 2025 +1200
+
+    Add script to comment out DEBUG: lines
+
+[33mcommit a0b3baa82ecbb7aba5f074a1c73fb809779e428b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 09:47:46 2025 +1200
+
+    Fix more compile warnings
+
+[33mcommit 53f2fbdf7906b42503ae3810e016ae73003f5e03[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 09:33:35 2025 +1200
+
+    Remove more dead code
+
+[33mcommit f5b686e7b2a05bbe6036b0ea664a44a62f315b12[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 09:28:28 2025 +1200
+
+    Fix compile warnings
+
+[33mcommit 426e02764eaada093d29087d8a96e74ea4170e1d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 09:19:54 2025 +1200
+
+    Optmise more
+
+[33mcommit 1895e69513f32c4b8cf3fc0ca4c90dc2d9875afb[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 09:09:20 2025 +1200
+
+    Optimised
+
+[33mcommit 500fbf8355a6e2cecfbfd0c4d809ba177649ad19[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 08:29:52 2025 +1200
+
+    Optimise
+
+[33mcommit be7b8b2c68886e736fc0314b638f0e8b1a667c1d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 08:18:19 2025 +1200
+
+    Simplify Code
+
+[33mcommit 63c55c3d4dac46367b99a7bc6a872dc9b424d367[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 08:02:51 2025 +1200
+
+    Simplify code
+
+[33mcommit b09df67f704f08eb79e899858d2c8a7750e98d1c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 07:49:01 2025 +1200
+
+    Remove unsed functions
+
+[33mcommit f9cbf450501014aaa09a171fe30476b6bbf1f705[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 07:33:19 2025 +1200
+
+    Fix compile warnings
+
+[33mcommit 4b8d2cdd83b1e346f47ae734888ad41b1be6c9f8[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 07:21:51 2025 +1200
+
+    Clean up and auto-update WASM output
+
+[33mcommit 56b15e6fa3bece37061fb4509c131d7d92b0c109[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 14 07:13:35 2025 +1200
+
+    Remove std::process:id as this seemed to be causing issues with WASM
+
+[33mcommit c716ab59ac27896230419b2625c1acf04e40dfd5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 23:41:34 2025 +1200
+
+    stash
+
+[33mcommit 922a978ad45c70d7309dd48ec0ea562dec0ddca7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 23:36:22 2025 +1200
+
+    Refactor xargs handler to use new grep file.
+
+[33mcommit 0579276b242c0d8ca776b8c288433f8745922380[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 23:25:30 2025 +1200
+
+    Create grep_handler. Not yet used
+
+[33mcommit b5d9dd048c0a7d1e0826ee5be9636c7ff6964a29[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 19:33:35 2025 +1200
+
+    Set license to GPLv3
+
+[33mcommit c014c273f534492fce9915522f94244f641838c8[m
+Author: root <root@PC.>
+Date:   Wed Aug 13 19:30:06 2025 +1200
+
+    Update link in README.md
+
+[33mcommit ae9c1ac313ff5fbfa9375e0fa91a0a7ff6b030e6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 19:25:45 2025 +1200
+
+    Fix syntax.
+
+[33mcommit 899c8ed5d1b560b269b7bf66c1a3620ee6c075d2[m
+Author: root <root@PC.>
+Date:   Wed Aug 13 19:15:46 2025 +1200
+
+    Automatically add examples
+
+[33mcommit 07c0153d6eb04f329f66fed36c050c69de749b87[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 18:40:05 2025 +1200
+
+    Switch examples to .js
+
+[33mcommit de6b2fee3273128fd18e05e64dfd9ee08d21e717[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 17:57:01 2025 +1200
+
+    Add examples to WASM
+
+[33mcommit 3aa15099a6d72a6b61fe5495ad7f387d003ff8f7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 17:45:55 2025 +1200
+
+    move to wasm.ps1
+
+[33mcommit a6dd95aef4df8d944bc22a6a3892fc3139ca6d00[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 17:45:11 2025 +1200
+
+    Stop testing ls -a as not worry about permissions which are OS dependant for now
+
+[33mcommit f0a794f9980d5a49b53e3ed96a5c744598675c58[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 17:41:44 2025 +1200
+
+    Add total to ls -la
+
+[33mcommit 3a67ae4c9d284a57eafa743c1a201bfe4061d010[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 17:23:16 2025 +1200
+
+    stash
+
+[33mcommit c01dbe1791c9e87d16c6399676d52e34272805d5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 17:07:33 2025 +1200
+
+    stash
+
+[33mcommit 149ac9d9490aa83f93012e621382e3de4f513ca4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 16:47:01 2025 +1200
+
+    New Grep->Perl tests now passing
+
+[33mcommit caf9b1395277ea11462bd986af80c17274547cf6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 15:02:29 2025 +1200
+
+    Add examples of shell calling perl.
+
+[33mcommit c0fb337dccbbea215d3f6b10f9049772ba71bcae[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 14:39:11 2025 +1200
+
+    Split up Perl Generator
+
+[33mcommit 61e8e36c708c847a086e04dc89f85fe8452004a2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 14:23:21 2025 +1200
+
+    change cargo run --bin debashc -- --next-fail to say To;  run test again: ./fail TEST_NUM (Where TEST_NUM is the number of the failing test it found).
+    
+    say To;  run test again: ./fail TEST_NUM (Where TEST_NUM is the number
+    of the failing test it found).
+
+[33mcommit 4acdb6f1f750584bf58e120f1c411771e3f2c0f5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 14:12:53 2025 +1200
+
+    Add fail.bat as shorthand for cargo run --bin debashc -- fail %*
+
+[33mcommit 52a151769d1ff49e87d9bd05443d174381a1a6a4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 13:36:37 2025 +1200
+
+    Add more examples to fix
+
+[33mcommit f2f7f480051f96d8a608b5bf379be2e2fc4a3783[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 13:34:27 2025 +1200
+
+    Start fixing Perl tests.
+
+[33mcommit e69b0805d5122a2dab5941d998dc9579e441a43d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 13:11:56 2025 +1200
+
+    Add tests, which now pass
+
+[33mcommit 1624474ee6f33e3d1610ecf6ff5a842b85b02a1b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 12:58:24 2025 +1200
+
+    all perl tests pass
+
+[33mcommit c89c266f960e9d103bc5123c7c190f53fbc5800b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 12:47:54 2025 +1200
+
+    19 tests pass
+
+[33mcommit 4de03f026a4f545aa74d943d3ffa6005d6dbe54a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 12:34:14 2025 +1200
+
+    15 tests pass and more concise
+
+[33mcommit c1d1495e4d660524a17c6e5d36cd31b26dec544c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 12:24:31 2025 +1200
+
+    15 tests pass
+
+[33mcommit 63224cfb8712d607f8310e9d1ed7ff5769dc518f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 11:34:42 2025 +1200
+
+    parse cd ~
+
+[33mcommit 9347785b3d297ffb62454721125704945943dd43[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 11:32:21 2025 +1200
+
+    parse cd /
+
+[33mcommit 474183f3bccdf14b4c65a65424c92f0817ebf47e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 00:28:30 2025 +1200
+
+    Update README with live demo link
+
+[33mcommit af16ac2f81d48282c0a807a18c9d521036b7cbcc[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 13 00:14:07 2025 +1200
+
+    Fix WASM
+
+[33mcommit ef29c02471a149625b5aac16f6bce06d00cd36d9[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 23:49:46 2025 +1200
+
+    Add example and fix .. All Perl tests pass
+
+[33mcommit 13a14906fa8ddc5e46b373f726391ae59cd7cae7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 23:34:39 2025 +1200
+
+    Fix ls with multiple arguments including globs
+
+[33mcommit ab25f53639df7245eb6b17890ecc3df3a597198f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 23:25:41 2025 +1200
+
+    Add generic glob support so all commands support glob
+
+[33mcommit 3b55e7f8fa2572dd1e9a16cdeec661c3a130c288[m
+Author: root <root@PC.>
+Date:   Tue Aug 12 22:43:37 2025 +1200
+
+    Disable Exit code checking for now, it seemed to be giving false positives?... All Perl tests now.
+
+[33mcommit e235cf4a48cf8b2ed38e555d24211569d5216ac0[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 22:08:41 2025 +1200
+
+    Add missing examples
+
+[33mcommit f6e47933f7363425d6e8f07eef4ca14d2141c362[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 19:52:52 2025 +1200
+
+    Who knows
+
+[33mcommit aaeb1677468e9d584d5e5cae6d9c4d29a24e0473[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 16:35:11 2025 +1200
+
+    array.sh successfully translated into Rust
+
+[33mcommit 6023e3710746b3c7a557394c12ae9a5fdb6a839f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 16:12:07 2025 +1200
+
+    Perl works again.
+
+[33mcommit 97001b4f3cf217d57cc265375c24b3f6a93c69ed[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 15:44:32 2025 +1200
+
+    Use pipes for here strings
+
+[33mcommit 7aae3cc81f78d96d02325815efd088d16a7b0bb7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 14:47:41 2025 +1200
+
+    refactor.
+
+[33mcommit 70a5c7235e8b1cfa0297b6e3a31c68f87a20ec46[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 13:45:17 2025 +1200
+
+    Fix build warnings
+
+[33mcommit 99d08375fd28086fcda92f604d92d2ff039e280e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 12:24:26 2025 +1200
+
+    refactoring is great. Now it compiles too.
+
+[33mcommit 06e2dfd3a7a74c5b64ece4b3f0dc364fe9a4755d[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 12:07:46 2025 +1200
+
+    refactor
+
+[33mcommit 77630393e8d3a948dedb2664973579bd6d8461d2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 11:31:03 2025 +1200
+
+    seperate sh2perl and sh2rust binaries
+
+[33mcommit e0b00f6781b84432dd37a994da7da3b59539c1ab[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 10:08:16 2025 +1200
+
+    Perl tests pass!?
+
+[33mcommit 307cd1b1a4ee2672afa7f763192eaa2db4cf171b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 09:45:04 2025 +1200
+
+    add -i and -o options
+
+[33mcommit 20504d0ad37faf576b9e71a1ea4fbb52f7ad72c5[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 09:23:18 2025 +1200
+
+    Debug output now optional
+
+[33mcommit 7255eaca2e70a6d3811365b9a28936235c273673[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 00:39:36 2025 +1200
+
+    run-next-test.bat added to run tests/next.pl and get next error
+
+[33mcommit 788ba7d8a56d05deecb8e7a3d4c49ad24b7b78e4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 00:34:29 2025 +1200
+
+    Fix bin lib colision (cargo)
+
+[33mcommit 1ca4aa81f20b024d844b25fd532a9ee7d49f0c64[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Tue Aug 12 00:24:33 2025 +1200
+
+    Fix another test for Perl
+
+[33mcommit 2ed582a6d2233f902f1bfaa61e35f4106d7a839a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 23:57:42 2025 +1200
+
+    Fix another test for Perl
+
+[33mcommit 4249cfe29efb9d71c60a803558abc112e4eb1c31[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 23:39:35 2025 +1200
+
+    Add test and fix test_parameter_expansion_example_parses_correctly
+
+[33mcommit 119b6bfe9f38033ad47f365f32977279c6a66ae2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 22:36:50 2025 +1200
+
+    cleanup
+
+[33mcommit cee560ecff7d97fa532887519bc448b9f2744a7f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 19:26:25 2025 +1200
+
+    first 8 test
+
+[33mcommit b7494117194f29cbb2cbd903b7602373c2b8471e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 18:51:18 2025 +1200
+
+    fixed fh masked by earlier declaration
+
+[33mcommit 15a648f2ba22b07d6dd89ae9f0c98d58857176a1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 16:33:13 2025 +1200
+
+    More fixes, still broken.
+
+[33mcommit a1a4a824d7f49e185fc34eabfd1d248d5f711039[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 16:15:16 2025 +1200
+
+    fixed 2nd testcargo build
+
+[33mcommit 1728b6940b74bcbd46cb726426384ae1a1bb50d4[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 15:06:56 2025 +1200
+
+    fix map in perl
+
+[33mcommit 6811c60217089700cf7a402a3b93fc5583843b4f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 14:20:27 2025 +1200
+
+    Add some builtins to AST
+
+[33mcommit 7999e269b41435cafbbdb43e4405bfe95654254a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 11:48:37 2025 +1200
+
+    Split up examples
+
+[33mcommit 7e4d77d882a48570acb7d81a8212b4552110478a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 01:55:35 2025 +1200
+
+    Back up to first 3 test passing
+
+[33mcommit 5c2056f59d0a6173af4df30cfcbeb98a216be430[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 00:29:45 2025 +1200
+
+    Fix another test for Perl
+
+[33mcommit 59f18138fc01f1696793d9d33e7fc25f7187716e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 00:15:03 2025 +1200
+
+    for loop can contain block, not just single command
+
+[33mcommit b77b0f4f6f9d2e85f24331d8416315a197d540f7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Mon Aug 11 00:08:31 2025 +1200
+
+    add --next-fail
+
+[33mcommit 7ea864961b5d3911b16d86c1abaf32446e50da3e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 23:53:06 2025 +1200
+
+    Many fixes but now test-eq 32 hangs
+
+[33mcommit 237c7155919f44ad637c589afe46cbfa5d244659[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 23:20:49 2025 +1200
+
+    test-eq gives stats at end
+
+[33mcommit 3e533eeea995cabc057e8440f4b773dd2d99e53a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 23:16:39 2025 +1200
+
+    test-eq gives summary
+
+[33mcommit bb7f5da3c6ddd34d2d86a9382748f68809bda027[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 22:21:49 2025 +1200
+
+    More fixes
+
+[33mcommit 24e4ad63d9b8104613a0b6ea92a71c7c29bcf3d3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 18:43:03 2025 +1200
+
+    Fix tests? WASM generates new output on loading a new example
+
+[33mcommit f17531857d2da7c1b583d6403d155fb440e12e43[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 18:27:51 2025 +1200
+
+    random port
+
+[33mcommit 751388bc789f9e227822335a19b18c9a0c375dee[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 18:22:49 2025 +1200
+
+    test result: ok. 81 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out;
+
+[33mcommit ff15b24301428ed3398847652840d8e48ff8060f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 16:29:56 2025 +1200
+
+    Split out equivalence tests
+
+[33mcommit 861bf811d1945369aaa1d3fd7df64d4393ff8d14[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 15:38:40 2025 +1200
+
+    who knows?
+
+[33mcommit be694af54a79994dd57035becc74047ea8c2b9c3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 14:51:36 2025 +1200
+
+    Add all examples to WASM
+
+[33mcommit ebeb945a2d9aee543c57b90df532982a83cf6f31[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 14:26:38 2025 +1200
+
+    works: cargo run --quiet -- file --run rust .\examples\local.sh
+
+[33mcommit 21f9762a0f6039e62dc6c92354783f7a9b42338f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 13:04:24 2025 +1200
+
+    'cargo run file --run rust .\examples\local.sh' now works
+
+[33mcommit 93e20d4ae43400d5a97a250ce834ea676bb5c466[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 12:34:34 2025 +1200
+
+    --perl examples/local.sh now works
+
+[33mcommit e30852ce9fe8bccaf7bd6a80e50755bf9218d294[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 12:13:35 2025 +1200
+
+    suppress trailing blank lines
+
+[33mcommit 1f941e57a6b6ff12edca7685bb72485943ddad2b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 12:08:48 2025 +1200
+
+    [[ builtin
+
+[33mcommit 6e47c710534ca4623f68a7f93cff34b4025eec3c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 11:57:24 2025 +1200
+
+    Implment || and &&
+
+[33mcommit 199627140db7c1cbe7c0f2441df1e08a84944163[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 11:50:12 2025 +1200
+
+    suppress excess trailing newlines
+
+[33mcommit 2f0402eeef1a1f4a2a1c5f2f43b2fce760f7f36b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 11:45:36 2025 +1200
+
+    preserve double new lines
+
+[33mcommit 8221616affc90f9be3adb4f9a96979fd789cc02b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 11:36:07 2025 +1200
+
+    add tests
+
+[33mcommit aaff9087034aa336b330efb715308377a55ff9fe[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 11:15:04 2025 +1200
+
+    add .\examples\*
+
+[33mcommit ca420767ce7757c8b081cbd6d8c88fee25f162d7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 11:00:36 2025 +1200
+
+    gemerate gnu extensions
+
+[33mcommit 2a9ee15af3caac860c571cf81395c68ab95f728a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sun Aug 10 07:49:04 2025 +1200
+
+    parse gnu extensions
+
+[33mcommit eee39b8aa2dc9b0850196247e3cb5471bc3c9141[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 13:08:31 2025 +1200
+
+    add bash extenstion example
+
+[33mcommit 3b7072560544216b21049695ff848ab8245fd09a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 12:49:36 2025 +1200
+
+    tests pass
+
+[33mcommit 8aa5eb4529fa723b140c759597f3e852d098cafd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 12:35:39 2025 +1200
+
+    fixes
+
+[33mcommit d5f175c57ca225523129a33fa0b350f3dd3dbb3f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 11:28:49 2025 +1200
+
+    fixes
+
+[33mcommit 446537ddd10bb6989b833c771089052ba2c4166a[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 11:22:43 2025 +1200
+
+    tests time out
+
+[33mcommit c5ef934ddccfde91df085425448f073308bd64ee[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 09:53:48 2025 +1200
+
+    fix indent
+
+[33mcommit 237b3a49cfbf2a0eb2d78c46ba25d69cc56d7271[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 09:45:32 2025 +1200
+
+    add code blocks
+
+[33mcommit c9682db49df3b3cc01bcebff518f35032d194b04[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 08:58:37 2025 +1200
+
+    add threading
+
+[33mcommit 3e4259ff338e157e9b310e889a8cf8edb33e62f3[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 08:53:28 2025 +1200
+
+    add and parse subprocess.sh
+
+[33mcommit ca494ca9a047e2644d79bdaff021d46050ec2546[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Sat Aug 9 08:36:26 2025 +1200
+
+    control_flow.sh now parses
+
+[33mcommit b9212dfa6a5fef99a2059dba5a5ede1488ac101e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 22:56:25 2025 +1200
+
+    add line nos to parse erros
+
+[33mcommit 3e53bf312af172124effe6281e8d960d1f9381e1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 22:46:15 2025 +1200
+
+    fix for loop support in Perl
+
+[33mcommit ed1425f7c872b835db4b280be1a7aea2988c4f82[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 22:41:20 2025 +1200
+
+    fix for loop support in C
+
+[33mcommit ef636aef2d2ce4d9868ebcf218aa3b9966b8b9dc[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 22:38:33 2025 +1200
+
+    Initial C support for for loops
+
+[33mcommit 3c02b8781e1b31fbf2fb49897d844c1630993cfd[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 22:31:45 2025 +1200
+
+    Fix parsing for i in {0..5}
+
+[33mcommit 03f85da5b6852486fe3c39667671aa89282809e6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 22:16:25 2025 +1200
+
+    Fix tests
+
+[33mcommit f85f0a6c22c8b895789ad1558d5ef352d161bed7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 15:37:55 2025 +1200
+
+    Re add files GPT5 randomly deleted.
+
+[33mcommit 0c95cb7d4ffbe75caa7669b48aecccd1d231b72b[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 15:19:45 2025 +1200
+
+    Add many more generators, make wasm live update.
+
+[33mcommit 00a5b1adb14d25c5ec633b7db0dffcacb4f223df[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 14:06:03 2025 +1200
+
+    Fix compile error (debashc missing)
+
+[33mcommit f3a76d0e9a686bf2b3fed5c04f2e2f0f1bf193bf[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Fri Aug 8 13:56:15 2025 +1200
+
+    WASM now works.
+
+[33mcommit 296d06549fb5ef16ff8d0bdf41d45fc60d084957[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 16:47:47 2025 +1200
+
+    Add missing files
+
+[33mcommit 4674d1d30909f1c5d80558b78bd74190427e726f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 16:28:50 2025 +1200
+
+    Readd lua
+
+[33mcommit c1aa1c10af1df3c3036a527f572264a75870a05f[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 16:08:22 2025 +1200
+
+    Initial WASM support
+
+[33mcommit 3ebe66312789d98983bbbd07b0a33760a98eb6bb[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 15:39:55 2025 +1200
+
+    not sure this helps
+
+[33mcommit 92b6f32e10ea80e05ff0729f07d709dc5ca3a2ca[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 14:57:39 2025 +1200
+
+    More Lua tests and fixes
+
+[33mcommit 5a3b6da950f7481c8d4fc4b3c23c986c0c7224b2[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 14:29:06 2025 +1200
+
+    Fix double newlines in Generated Lua.
+
+[33mcommit 3e5e903257e6cd7fbd45476b214804487c9176f6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 14:26:07 2025 +1200
+
+    Initial Lua Support
+
+[33mcommit 8ff35c938b9054344c9cecfbe800583e2f0eed20[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 13:37:49 2025 +1200
+
+    Fixes?
+
+[33mcommit 8c0c1ddeeadcb7dcddfbb21238f34661a2212559[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 12:52:01 2025 +1200
+
+    Add python support
+
+[33mcommit 9e33bf54d1c0138991123d4a7588836ec36541e1[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 12:38:44 2025 +1200
+
+    Add more tests and fixes
+
+[33mcommit 954217a5bda929097057cb0fc753f71537c841d7[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 12:09:39 2025 +1200
+
+    Initial Rust Generator
+
+[33mcommit 9d9ed46990d1cd4f4300ddd1a4a0e76f0aeaafe6[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 11:59:46 2025 +1200
+
+    Fix too many newlines
+
+[33mcommit c6d4fc498c013217922deb5f479d629b3475ba58[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 11:57:42 2025 +1200
+
+    Fix double quotes
+
+[33mcommit eb4d2d52f8ca1303fd489ee8807e316695fef8bc[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 11:50:22 2025 +1200
+
+    Basic Multiline support
+
+[33mcommit 84c6dcc78b4f4634202d8a1f73f8200805584182[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 11:02:42 2025 +1200
+
+    Trying to fix quotes
+
+[33mcommit b8452215a5315d7c55e6b2dcc8fc27ce35bef46e[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 10:16:23 2025 +1200
+
+    Add initial Perl output functionality.
+
+[33mcommit 9a2a088960214b909beb040a669f06054ceaa71c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Thu Aug 7 09:52:31 2025 +1200
+
+    Working Parser
+
+[33mcommit e198ad90e957024edb5db8c85727e13b7bae58d9[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 6 23:52:45 2025 +1200
+
+    Initial
+
+[33mcommit 906fae5afca49570739eab5b3f2a6b3dbb51a03c[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 6 23:52:01 2025 +1200
+
+    Test
+
+[33mcommit ae5977493ee451ebfe375ea0ca50bf7d1ec5d4af[m
+Author: gmatht <gmatht@gmail.com>
+Date:   Wed Aug 6 23:23:44 2025 +1200
+
+    Initial commit

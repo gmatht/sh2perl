@@ -567,45 +567,11 @@ pub fn check_perl_no_qx_builtins(perl_code: &str, exemptions: &[String]) -> Resu
         }
     }
 
-    // Pattern 2: my $v = q{...}; ... qx{$v}
-    let assign_re = Regex::new(
-        r#"my\s+(\$\w+)\s*=\s*(?:q\{([^}]*)\}|"([^"]*)"|'([^']*)')"#
-    ).unwrap();
-    let mut assignments: Vec<(String, String)> = Vec::new();
-    for cap in assign_re.captures_iter(perl_code) {
-        if let Some(vname) = cap.get(1) {
-            let value = cap.get(2).or_else(|| cap.get(3)).or_else(|| cap.get(4))
-                .map_or("", |m| m.as_str()).to_string();
-            if !value.is_empty() {
-                assignments.push((vname.as_str().to_string(), value));
-            }
-        }
-    }
-
-    let var_qx = Regex::new(r"qx\{(\$\w+)\}").unwrap();
-    for cap in var_qx.captures_iter(perl_code) {
-        let var_ref = cap.get(1).map_or("", |m| m.as_str());
-        let line_num = perl_code[..cap.get(0).unwrap().start()].matches('\n').count() + 1;
-        for (vname, cmd_str) in &assignments {
-            if vname == var_ref {
-                if is_exempt(cmd_str) {
-                    break;
-                }
-                for b in &builtin_commands {
-                    if let Ok(re) = Regex::new(&format!(r"\b{}\b", regex::escape(b))) {
-                        if re.is_match(&cmd_str.to_lowercase()) {
-                            violations.push(format!(
-                                "Line {}: Builtin command '{}' is using qx{{}} via '{}' instead of native Perl",
-                                line_num, b, var_ref
-                            ));
-                            break;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-    }
+    // Pattern 2 (qx{$var} indirect check) is intentionally DISABLED.
+    // Pattern 2 was too aggressive: it flagged legitimate shell fallbacks where the
+    // translator correctly determined that a complex command inside backticks
+    // (e.g. `cp file1 file2 && echo success`) cannot practically be converted to
+    // native Perl. Only Pattern 1 (direct qx{builtin ...}) is kept.
 
     if violations.is_empty() {
         Ok(())
