@@ -2566,8 +2566,12 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 expression_parts.push("-".to_string());
                 lexer.next();
             }
-            Some(Token::Star) | Some(Token::Percent) => {
+            Some(Token::Star) => {
                 expression_parts.push("*".to_string());
+                lexer.next();
+            }
+            Some(Token::Percent) => {
+                expression_parts.push("%".to_string());
                 lexer.next();
             }
             Some(Token::Slash) => {

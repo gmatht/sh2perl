@@ -36,7 +36,7 @@ my $temp_file_ps_fh_2 = q{/tmp} . '/process_sub_fh_2.tmp';
 my $output_ps_fh_2;
 {
 my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', q{printf 'a\nb\n'});
+my $pid = open3($in, $out, $err, 'bash', '-c', 'printf "a\\\\nb\\\\n"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_2 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -53,7 +53,7 @@ my $temp_file_ps_fh_3 = q{/tmp} . '/process_sub_fh_3.tmp';
 my $output_ps_fh_3;
 {
 my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', q{printf 'b\nc\n'});
+my $pid = open3($in, $out, $err, 'bash', '-c', 'printf "b\\\\nc\\\\n"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_3 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -100,7 +100,7 @@ my $temp_file_ps_fh_4 = q{/tmp} . '/process_sub_fh_4.tmp';
 my $output_ps_fh_4;
 {
 my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', q{printf 'x\ny\n'});
+my $pid = open3($in, $out, $err, 'bash', '-c', 'printf "x\\\\ny\\\\n"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_4 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -222,7 +222,7 @@ my $temp_file_ps_fh_7 = q{/tmp} . '/process_sub_fh_7.tmp';
 my $output_ps_fh_7;
 {
 my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e name1\\nname2');
+my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e "name1\\\\nname2"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_7 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -239,7 +239,7 @@ my $temp_file_ps_fh_8 = q{/tmp} . '/process_sub_fh_8.tmp';
 my $output_ps_fh_8;
 {
 my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e value1\\nvalue2');
+my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e "value1\\\\nvalue2"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_8 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';

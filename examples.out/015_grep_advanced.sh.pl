@@ -178,6 +178,14 @@ $CHILD_ERROR = scalar @grep_filtered_172 > 0 ? 0 : 1;
     if ($expanded_set1_174 =~ /A-Z/msx) {
     $expanded_set1_174 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
     }
+    # Handle [:upper:] POSIX class in set1
+    if ($expanded_set1_174 =~ /\[:upper:\]/msx) {
+    $expanded_set1_174 =~ s/\[:upper:\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    # Handle [:lower:] POSIX class in set1
+    if ($expanded_set1_174 =~ /\[:lower:\]/msx) {
+    $expanded_set1_174 =~ s/\[:lower:\]/abcdefghijklmnopqrstuvwxyz/msx;
+    }
     # Handle a-z range in set2
     if ($expanded_set2_174 =~ /a-z/msx) {
     $expanded_set2_174 =~ s/a-z/abcdefghijklmnopqrstuvwxyz/msx;
@@ -185,6 +193,14 @@ $CHILD_ERROR = scalar @grep_filtered_172 > 0 ? 0 : 1;
     # Handle A-Z range in set2
     if ($expanded_set2_174 =~ /A-Z/msx) {
     $expanded_set2_174 =~ s/A-Z/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    # Handle [:upper:] POSIX class in set2
+    if ($expanded_set2_174 =~ /\[:upper:\]/msx) {
+    $expanded_set2_174 =~ s/\[:upper:\]/ABCDEFGHIJKLMNOPQRSTUVWXYZ/msx;
+    }
+    # Handle [:lower:] POSIX class in set2
+    if ($expanded_set2_174 =~ /\[:lower:\]/msx) {
+    $expanded_set2_174 =~ s/\[:lower:\]/abcdefghijklmnopqrstuvwxyz/msx;
     }
     my $tr_result_173_1 = q{};
     for my $char ( split //msx, $input_174 ) {

@@ -114,7 +114,7 @@ my $temp_file_ps_fh_3 = q{/tmp} . '/process_sub_fh_3.tmp';
 my $output_ps_fh_3;
 {
 my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e name1\\nname2');
+my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e "name1\\\\nname2"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_3 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -131,7 +131,7 @@ my $temp_file_ps_fh_4 = q{/tmp} . '/process_sub_fh_4.tmp';
 my $output_ps_fh_4;
 {
 my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e value1\\nvalue2');
+my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e "value1\\\\nvalue2"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_4 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';

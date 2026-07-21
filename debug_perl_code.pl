@@ -11,17 +11,21 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '064_24_advanced_parameter_expansion.sh';
-my $input = (defined $_[0] && $_[0] ne q{} ? $_[0] : 'default_value');
-my $sanitized = $input =~ s/\[\^a-zA-Z0-9\]/_/grs;
-my $uppercase = uc(${sanitized});
-do {
-    my $output = "Input: '$input' -> Sanitized: '$sanitized' -> Uppercase: '$uppercase'";
+$PROGRAM_NAME = 'test_simple_function.sh';
+
+sub get_file_size {
+    my $file = $_[0];
+    my $size = do { my $command = "wc -c < \"$file\""; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
+    do {
+    my $output = "File $file has $size bytes";
     print $output;
     if ( !( $output =~ m{\n\z}msx ) ) {
         print "\n";
     }
 };
-$CHILD_ERROR = 0;
+    $CHILD_ERROR = 0;
+    return;
+}
+get_file_size('test_simple_function.sh');
 
 exit $main_exit_code;

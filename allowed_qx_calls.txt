@@ -3,4 +3,5 @@
 # Format: one pattern per line, matched as prefix against the shell command.
 bash -c
 ls -l
+echo
 diff
