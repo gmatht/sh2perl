@@ -7,17 +7,9 @@
 - 000__04h_complex_examples.sh — passing
 - 000__07_find_path_commands.sh — passing
 - 058_advanced_bash_idioms.sh — passing
+- 063_15_complex_function_definition.sh — passing (fixed: added Word::Arithmetic handling in local declaration parser and generator)
 
-## Still failing tests (4)
-
-### 063_15_complex_function_definition.sh
-`eval "$name() { $body }"` — both `$name` and `$body` are runtime function
-arguments, so the translator cannot generate a static Perl `sub` at compile
-time. The `system('bash', '-c', "eval ...")` fallback defines the function
-in a subprocess that immediately exits, so subsequent calls to the
-dynamically-defined function fail. A proper fix would require intercepting
-the eval pattern and generating a real Perl subroutine that wraps the bash
-body, plus changing the command dispatcher to call it instead of `system()`.
+## Still failing tests (3)
 
 ### 063_hard_to_parse.sh
 Multiple issues:
@@ -31,20 +23,13 @@ Fixing these requires either hoisting all variable declarations to the top
 or handling `$(...)` inside test expressions.
 
 ### 064_07_complex_array_operations.sh
-Perl hash randomization causes `values %config` to return values in a
-non-deterministic order, while bash's `"${config[@]}"` gives a specific
-(deterministic) hash-bucket order. Replicating bash's hash function
-(`h = h * 127 + c` with per-table-size bucket selection) is impractical
-because the table size depends on the number of entries and is not exposed.
-A fix would require either maintaining the original key-insertion order
-(by changing `env_vars` from `BTreeMap` to an ordered structure) and
-iterating in that order, or using a tied hash with a fixed traversal order.
+The test uses `IFS=$'\n' sorted=($(sort <<<"${config[*]}"))` to sort config values,
+but the parser/generator does not handle process substitution with here-strings
+inside array assignments. The generated Perl is completely invalid (`@sorted =
+('\$(sort', '<<<\${config[*]}))', 'echo', ...)`). Fixing requires handling the
+`<<<` here-string token inside process substitution in array assignment context.
 
 ### 064_hard_to_generate.sh
-Complex script combining many hard-to-generate features: process substitution
-with nested pipelines, command substitutions in arithmetic, here-documents
-with variable interpolation, extended glob patterns, nested function
-definitions, and array slicing. Multiple undeclared variable errors and
-scoping issues in the generated Perl code. The subshell variable-localization
-code (`my $var = $var if defined $var;`) fails for variables that are arrays
-or hashes, causing "Global symbol requires explicit package name" errors.
+Complex script combining many hard-to-generate features. The generated Perl
+has multiple undeclared variable errors (`$config`, `$numbers`, `$output_*`)
+and the subshell variable-localization code fails for array/hash variables.
