@@ -7,6 +7,16 @@ pub fn generate_cut_command(
     input_var: &str,
     _command_index: usize,
 ) -> String {
+    generate_cut_command_with_output(generator, cmd, input_var, _command_index, "")
+}
+
+pub fn generate_cut_command_with_output(
+    generator: &mut Generator,
+    cmd: &SimpleCommand,
+    input_var: &str,
+    _command_index: usize,
+    output_var: &str,
+) -> String {
     let mut output = String::new();
     // (debug logging removed)
 
@@ -68,6 +78,28 @@ pub fn generate_cut_command(
         i += 1;
     }
 
+    // Collect file arguments (non-option args)
+    let mut file_args: Vec<Word> = Vec::new();
+    let mut i_arg = 0;
+    while i_arg < cmd.args.len() {
+        if let Word::Literal(arg, _) = &cmd.args[i_arg] {
+            if arg.starts_with("-") {
+                // Skip options and their values
+                if arg == "-d" && i_arg + 1 < cmd.args.len() {
+                    i_arg += 1; // skip the delimiter value
+                } else if arg.starts_with("-f") {
+                    if arg.len() == 2 && i_arg + 1 < cmd.args.len() {
+                        i_arg += 1; // skip the field value
+                    }
+                }
+            } else {
+                // Non-option argument = file argument
+                file_args.push(cmd.args[i_arg].clone());
+            }
+        }
+        i_arg += 1;
+    }
+
     // Build regex pattern for split; default is tab
     let delim_for_regex = if let Some(ref w) = delimiter_word {
         generator.strip_shell_quotes_for_regex(w)
@@ -80,10 +112,31 @@ pub fn generate_cut_command(
     let delim_for_join_raw = crate::generator::utils::decode_shell_escapes_impl(&delim_for_regex);
     let join_lit = generator.perl_string_literal(&Word::literal(delim_for_join_raw));
 
+    let effective_input = if input_var.is_empty() && !file_args.is_empty() {
+        // Read from file arguments
+        let temp_var = format!("cut_input_{}", generator.get_unique_id());
+        let first_file = generator.word_to_perl(&file_args[0]);
+        output.push_str(&format!(
+            "my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; my $fh; open $fh, \'<\', {} or croak \"Cannot open {}: $OS_ERROR\\n\"; <$fh> }};\n",
+            temp_var, first_file, first_file
+        ));
+        temp_var
+    } else if input_var.is_empty() {
+        // No file arguments and no input variable - read from STDIN
+        let temp_var = format!("cut_input_{}", generator.get_unique_id());
+        output.push_str(&format!(
+            "my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <STDIN> }};\n",
+            temp_var
+        ));
+        temp_var
+    } else {
+        input_var.to_string()
+    };
+
     let unique_id = generator.get_unique_id();
     output.push_str(&format!(
         "my @lines_{} = split /\\n/msx, ${};\n",
-        unique_id, input_var
+        unique_id, effective_input
     ));
     output.push_str(&format!("my @result_{};\n", unique_id));
     output.push_str(&format!("foreach my $line (@lines_{}) {{\n", unique_id));
@@ -132,14 +185,24 @@ pub fn generate_cut_command(
     }
 
     output.push_str("}\n");
-    output.push_str(&format!(
-        "${} = join \"\\n\", @result_{};\n",
-        input_var, unique_id
-    ));
-    output.push_str(&format!(
-        "if (${} ne q{{}} && !(${}  =~ m{{\\n\\z}}msx)) {{ ${} .= \"\\n\"; }}\n",
-        input_var, input_var, input_var
-    ));
+    let result_var = if !output_var.is_empty() {
+        output_var.to_string()
+    } else if !input_var.is_empty() {
+        input_var.to_string()
+    } else {
+        // Both empty - use a temp var (shouldn't normally happen)
+        format!("cut_result_{}", generator.get_unique_id())
+    };
+    if !result_var.is_empty() {
+        output.push_str(&format!(
+            "${} = join \"\\n\", @result_{};\n",
+            result_var, unique_id
+        ));
+        output.push_str(&format!(
+            "if (${} ne q{{}} && !(${}  =~ m{{\\n\\z}}msx)) {{ ${} .= \"\\n\"; }}\n",
+            result_var, result_var, result_var
+        ));
+    }
     output.push_str("\n");
 
     output

@@ -664,8 +664,7 @@ pub fn generate_generic_builtin(
             }
         }
         "cut" => {
-            // For now, use the existing signature but we should standardize this
-            crate::generator::commands::cut::generate_cut_command(generator, cmd, input_var, 0)
+            crate::generator::commands::cut::generate_cut_command_with_output(generator, cmd, input_var, 0, output_var)
         }
         "paste" => {
             // For now, use the existing signature but we should standardize this

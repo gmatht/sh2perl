@@ -1628,6 +1628,25 @@ impl Generator {
                 }
                 false
             }
+            Command::Function(func) => {
+                for cmd in &func.body.commands {
+                    if self.command_needs_ipc_open3(cmd) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Command::BuiltinCommand(cmd) => {
+                cmd.args.iter().any(|word| self.word_needs_ipc_open3(word))
+            }
+            Command::Block(block) => {
+                for cmd in &block.commands {
+                    if self.command_needs_ipc_open3(cmd) {
+                        return true;
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
