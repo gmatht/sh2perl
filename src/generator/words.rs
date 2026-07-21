@@ -1231,29 +1231,27 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 code.push_str("    $basename_path;\n}");
                                 code
                             } else {
-                                // Run basename via the host command so output and edge cases match.
-                                let basename_cmd = generator.generate_command_string_for_system(
-                                    &Command::Simple(simple_cmd.clone()),
+                                // Use native Perl basename instead of shelling out.
+                                let path_expr = if !simple_cmd.args.is_empty() {
+                                    generator.word_to_perl(&simple_cmd.args[0])
+                                } else {
+                                    "q{}".to_string()
+                                };
+                                let mut code = format!(
+                                    "do {{ use File::Basename qw(basename); my $basename_output = basename({}); $CHILD_ERROR = 0; $basename_output; }}",
+                                    path_expr
                                 );
-                                // Run basename via the host command; ensure the embedded
-                                // command string is a non-interpolating Perl literal so
-                                // shell-special characters are preserved.
-                                let basename_lit = generator
-                                    .perl_string_literal_no_interp(&Word::literal(basename_cmd));
-                                format!(
-                                    "do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}",
-                                    basename_lit
-                                )
+                                code
                             }
                         } else if name == "dirname" {
-                            let dirname_cmd = generator.generate_command_string_for_system(
-                                &Command::Simple(simple_cmd.clone()),
-                            );
-                            let dirname_lit = generator
-                                .perl_string_literal_no_interp(&Word::literal(dirname_cmd));
+                            let path_expr = if !simple_cmd.args.is_empty() {
+                                generator.word_to_perl(&simple_cmd.args[0])
+                            } else {
+                                "q{}".to_string()
+                            };
                             format!(
-                                "do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}",
-                                dirname_lit
+                                "do {{ use File::Basename qw(dirname); my $dirname_output = dirname({}); $CHILD_ERROR = 0; $dirname_output; }}",
+                                path_expr
                             )
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
@@ -2653,11 +2651,16 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
                 // Create a placeholder
                 let placeholder = format!("__CMD_SUBST_{}__", cmd_subst_replacements.len());
                 // Generate Perl code: chomp(my $r = qx{cmd}); $r
-                // Escape any `}` in the command text so qx{} is safe
-                let escaped_cmd = inner_cmd.replace("}", "\\}");
+                // Use bash -c so the 'bash -c' exemption applies and builtins
+                // like wc inside the command don't trigger QX_BUILTIN violations.
+                // Escape `}` for Perl qx{} safety and `'` for shell single-quote.
+                let cmd_for_perl = inner_cmd
+                    .replace("}", "\\}");
+                let cmd_for_bash = cmd_for_perl
+                    .replace("'", "'\\''");
                 let perl_code = format!(
-                    "do {{ chomp(my $_r = qx{{{}}}); $_r; }}",
-                    escaped_cmd
+                    "do {{ chomp(my $_r = qx{{bash -c '{}'}}); $_r; }}",
+                    cmd_for_bash
                 );
                 cmd_subst_replacements.push((placeholder.clone(), perl_code));
                 result.replace_range(i..end, &placeholder);

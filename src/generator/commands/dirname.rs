@@ -9,15 +9,17 @@ pub fn generate_dirname_command(
     let mut output = String::new();
 
     if !cmd.args.is_empty() {
-        let command = Command::Simple(cmd.clone());
-        let command_str = generator.generate_command_string_for_system(&command);
-        let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+        let path_str = generator.word_to_perl(&cmd.args[0]);
 
-        output.push_str(&format!("my $dirname_cmd = {};\n", command_lit));
-        output.push_str("my $dirname_output = qx{$dirname_cmd};\n");
-        output.push_str("$CHILD_ERROR = $? >> 8;\n");
+        if !generator.declared_locals.contains("dirname_loaded_file_basename") {
+            output.push_str("use File::Basename qw(dirname);\n");
+            generator.declared_locals.insert("dirname_loaded_file_basename".to_string());
+        }
+
+        output.push_str(&format!("my $dirname_output = dirname({});\n", path_str));
+        output.push_str("$CHILD_ERROR = 0;\n");
         if input_var.is_empty() {
-            output.push_str("print $dirname_output;\n");
+            output.push_str(&format!("print $dirname_output, \"\\n\";\n"));
         } else {
             output.push_str(&format!("${} = $dirname_output;\n", input_var));
         }

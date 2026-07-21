@@ -11,19 +11,32 @@ pub fn generate_basename_command(
 
     // basename command syntax: basename path [suffix]
     if let Some(path) = cmd.args.first() {
-        let command = Command::Simple(cmd.clone());
-        let command_str = generator.generate_command_string_for_system(&command);
-        let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+        let path_str = generator.word_to_perl(path);
+        let suffix_str = if cmd.args.len() > 1 {
+            Some(generator.word_to_perl(&cmd.args[1]))
+        } else {
+            None
+        };
 
-        output.push_str(&format!("my $basename_cmd = {};\n", command_lit));
-        output.push_str("my $basename_output = qx{$basename_cmd};\n");
-        output.push_str("$CHILD_ERROR = $? >> 8;\n");
+        if !generator.declared_locals.contains("basename_loaded_file_basename") {
+            output.push_str("use File::Basename qw(basename);\n");
+            generator.declared_locals.insert("basename_loaded_file_basename".to_string());
+        }
+
+        let basename_expr = if let Some(suffix) = &suffix_str {
+            format!("basename({}, {})", path_str, suffix)
+        } else {
+            format!("basename({})", path_str)
+        };
+
+        output.push_str(&format!("my $basename_output = {};\n", basename_expr));
+        output.push_str("$CHILD_ERROR = 0;\n");
         if !output_var.is_empty() {
             output.push_str(&format!("${} = $basename_output;\n", output_var));
         } else if !input_var.is_empty() {
             output.push_str(&format!("${} = $basename_output;\n", input_var));
         } else {
-            output.push_str("print $basename_output;\n");
+            output.push_str(&format!("print $basename_output, \"\\n\";\n"));
         }
     } else if !input_var.is_empty() {
         // Use pipeline input when no arguments provided
