@@ -1,6 +1,71 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
+/// Escape double-quote characters that are NOT inside `$(...)` or `${...}` constructs.
+/// This is needed when wrapping a shell string in double quotes: double-quotes inside
+/// command substitutions or parameter expansions must be preserved as-is (they are
+/// part of the nested shell syntax), while top-level double-quotes must be escaped.
+fn escape_shell_double_quotes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        match ch {
+            '$' => {
+                result.push('$');
+                // Check if followed by ( or {
+                if let Some(&(_, next)) = chars.peek() {
+                    if next == '(' || next == '{' {
+                        // Copy the $ and the opening paren/brace
+                        result.push(next);
+                        chars.next();
+                        // Track depth to find the matching close
+                        if next == '(' {
+                            let mut depth = 1;
+                            while let Some(&(_, c)) = chars.peek() {
+                                result.push(c);
+                                chars.next();
+                                match c {
+                                    '(' => depth += 1,
+                                    ')' => {
+                                        depth -= 1;
+                                        if depth == 0 { break; }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            // ${...} construct
+                            let mut depth = 1;
+                            while let Some(&(_, c)) = chars.peek() {
+                                result.push(c);
+                                chars.next();
+                                match c {
+                                    '{' => depth += 1,
+                                    '}' => {
+                                        depth -= 1;
+                                        if depth == 0 { break; }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            '"' => {
+                // Top-level double quote — escape it
+                result.push_str("\\\"");
+            }
+            '\\' => {
+                // Escape backslash
+                result.push_str("\\\\");
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
 // Helper function to convert Word to bash string representation for system commands
 pub fn word_to_bash_string_for_system(generator: &mut Generator, word: &Word) -> String {
     match word {
@@ -84,6 +149,15 @@ pub fn word_to_bash_string_for_system(generator: &mut Generator, word: &Word) ->
                         has_var = true;
                         result.push_str(&format!("${{{}}}", pe.variable))
                     }
+                    StringPart::CommandSubstitution(cmd) => {
+                        has_var = true;
+                        let command = generator.generate_command_string_for_system(cmd);
+                        result.push_str(&format!("$({})", command));
+                    }
+                    StringPart::Arithmetic(arith) => {
+                        has_var = true;
+                        result.push_str(&format!("$(({}))", arith.expression));
+                    }
                     _ => {
                         // For other complex parts, mark as variable-like to
                         // be conservative and preserve expansion semantics
@@ -101,8 +175,10 @@ pub fn word_to_bash_string_for_system(generator: &mut Generator, word: &Word) ->
                 // We must emit a double-quoted string so the inner shell will
                 // perform expansions. Escape double-quotes and backslashes but
                 // do NOT escape $ or ${} sequences.
-                let escaped = result.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("\"{}\"", escaped)
+                // Also preserve double-quotes inside $(...) and ${...} constructs
+                // (nested command substitutions and variable expansions).
+                let escaped = escape_shell_double_quotes(&result);
+                format!("\"{}\"", escaped) 
             } else if result.contains(' ')
                 || result.contains('\n')
                 || result.contains('\r')

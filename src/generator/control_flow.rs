@@ -11,6 +11,23 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
         Command::Simple(cmd) if cmd.name == "[" || cmd.name == "test" => {
             generator.generate_test_command(cmd, &mut output);
         }
+        Command::Simple(cmd) if cmd.name == "let" => {
+            // Generate arithmetic expression directly without assigning
+            // to $main_exit_code, so the program exit code is not
+            // polluted by the let condition.
+            let mut parts = Vec::new();
+            for arg in &cmd.args {
+                let expr = match arg {
+                    Word::Literal(s, _) => s.clone(),
+                    _ => generator.word_to_perl(arg),
+                };
+                let perl_expr = generator.convert_arithmetic_to_perl(&expr);
+                // convert_arithmetic_to_perl already wraps the expression
+                // in eval { int(...) } // "", so use it directly.
+                parts.push(perl_expr);
+            }
+            output.push_str(&parts.join(" && "));
+        }
         Command::TestExpression(test_expr) => {
             let test_result = generator.generate_test_expression(test_expr);
             output.push_str(&test_result);
@@ -28,20 +45,12 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             let cond = cond
                 .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                 .to_string();
-            // For `let` commands, the generated code already produces a
-            // truthy value (1 for true, 0 for false) that Perl's if() can
-            // use directly.  Negating would flip the logic.
-            let is_let_command = matches!(&*if_stmt.condition, Command::Simple(cmd) if cmd.name == "let");
-            if is_let_command {
-                output.push_str(&cond);
-            } else {
-                // Negate the condition for shell functions:
-                // shell returns 0 for success, non-zero for failure.
-                // In Perl 0 is falsy, so we write
-                // `if (!cond()) { ... }` to match shell semantics
-                // where `if func; then` enters when func returns 0.
-                output.push_str(&format!("!({})", cond));
-            }
+            // Negate the condition for shell functions:
+            // shell returns 0 for success, non-zero for failure.
+            // In Perl 0 is falsy, so we write
+            // `if (!cond()) { ... }` to match shell semantics
+            // where `if func; then` enters when func returns 0.
+            output.push_str(&format!("!({})", cond));
         }
     }
     output.push_str(") {\n");
