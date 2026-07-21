@@ -1,10 +1,4 @@
-000__03_file_manipulation_commands.sh	QX_BUILTIN violations:
-000__04b_file_directory_operations.sh	QX_BUILTIN violations:
-000__04e_file_manipulation.sh	QX_BUILTIN violations:
-000__04h_complex_examples.sh	QX_BUILTIN violations:
-000__07_find_path_commands.sh	QX_BUILTIN violations:
-003_pipeline.sh	QX_BUILTIN violations:
-058_advanced_bash_idioms.sh	QX_BUILTIN violations:
+058_advanced_bash_idioms.sh	Failed due to: exit code mismatch, stdout mismatch
 062_10_simple_pipeline.sh	Failed due to: stdout mismatch
 062_hard_to_lex.sh	Failed due to: stdout mismatch
 063_01_deeply_nested_arithmetic.sh	Failed due to: exit code mismatch, stdout mismatch
@@ -16,6 +10,7 @@
 064_02_nested_brace_expansions.sh	Failed due to: stdout mismatch
 064_03_complex_parameter_expansion.sh	Failed due to: exit code mismatch, stdout mismatch
 064_06_nested_arithmetic_expressions.sh	Failed due to: stdout mismatch
+064_07_complex_array_operations.sh	Failed due to: stdout mismatch
 064_09_process_substitution_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
 064_10_nested_function_definitions.sh	Failed due to: exit code mismatch, stdout mismatch
 064_12_brace_expansion_nested_sequences.sh	Failed due to: exit code mismatch, stdout mismatch
@@ -26,6 +21,4 @@
 064_22_function_returning_complex_data_structures.sh	Failed due to: exit code mismatch, stdout mismatch
 064_23_complex_error_handling_traps.sh	Failed due to: stdout mismatch
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
-999_pwd.sh	QX_BUILTIN violations:
-test_find.sh	QX_BUILTIN violations:
-test_system_builtin.sh	QX_BUILTIN violations:
+test_system_builtin.sh	Failed due to: stdout mismatch
