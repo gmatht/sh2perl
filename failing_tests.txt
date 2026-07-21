@@ -1,6 +1,5 @@
 058_advanced_bash_idioms.sh	Failed due to: exit code mismatch, stdout mismatch
 062_hard_to_lex.sh	Failed due to: stdout mismatch
-063_02_complex_array_assignments.sh	Failed due to: exit code mismatch, stdout mismatch
 063_09_complex_function_parameter_handling.sh	error: PerlExecution timed out after 30.0 seconds
 063_12_complex_eval.sh	Failed due to: stdout mismatch
 063_15_complex_function_definition.sh	Failed due to: exit code mismatch, stdout mismatch

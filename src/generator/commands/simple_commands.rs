@@ -536,7 +536,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             if parts.len() == 2 {
                                 let var = parts[0];
                                 let value = parts[1];
-                                if !generator.declared_locals.contains(var) {
+                                // `local` always creates a new local variable, shadowing any global.
+                                // Only skip if this variable was already declared as local in
+                                // the current function scope (function_level_vars).
+                                if !generator.function_level_vars.contains(var) {
                                     // Case 1: value is empty and next arg is a CommandSubstitution
                                     // This is how the parser encodes `local var=$(cmd)`
                                     if value.is_empty()
@@ -547,6 +550,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         output.push_str(&generator.indent());
                                         output.push_str(&format!("my ${} = {};\n", var, perl_cmd));
                                         generator.declared_locals.insert(var.to_string());
+                                        generator.function_level_vars.insert(var.to_string());
                                         i += 2; // consume Literal("var=") AND CommandSubstitution
                                         continue;
                                     }
@@ -633,17 +637,20 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             ));
                                         }
                                         generator.declared_locals.insert(var.to_string());
+                                        generator.function_level_vars.insert(var.to_string());
                                     } else if !value.is_empty() {
                                         // Case 3: plain literal value
                                         output.push_str(&generator.indent());
                                         output.push_str(&format!("my ${} = {};\n", var, value));
                                         generator.declared_locals.insert(var.to_string());
+                                        generator.function_level_vars.insert(var.to_string());
                                     } else {
                                         // Case 4: empty value with no following CommandSubstitution
                                         // (just declare the variable without a value)
                                         output.push_str(&generator.indent());
                                         output.push_str(&format!("my ${};\n", var));
                                         generator.declared_locals.insert(var.to_string());
+                                        generator.function_level_vars.insert(var.to_string());
                                     }
                                 }
                             }
@@ -1318,6 +1325,22 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             let dir = generator.perl_string_literal(&cmd.args[0]);
                             output.push_str(&generator.indent());
                             output.push_str(&format!("chdir({});\n", dir));
+                        }
+                    }
+                    "let" => {
+                        // let is a bash builtin for arithmetic evaluation.
+                        // Convert each argument to a Perl arithmetic expression.
+                        for arg in cmd.args.iter() {
+                            let expr = match arg {
+                                Word::Literal(s, _) => s.clone(),
+                                _ => generator.word_to_perl(arg),
+                            };
+                            let perl_expr = generator.convert_arithmetic_to_perl(&expr);
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!(
+                                "$main_exit_code = {};\n",
+                                perl_expr
+                            ));
                         }
                     }
                     "wc" => {
