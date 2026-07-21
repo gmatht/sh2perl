@@ -255,25 +255,26 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             // Special handling for pwd in command substitution
                             "do { use Cwd; getcwd(); }".to_string()
                         } else if name == "basename" {
-                            // Run basename via the host command so output and edge cases match.
-                            let basename_cmd = generator.generate_command_string_for_system(
-                                &Command::Simple(simple_cmd.clone()),
-                            );
-                            let basename_lit = generator
-                                .perl_string_literal_no_interp(&Word::literal(basename_cmd));
+                            // Use native Perl basename instead of shelling out.
+                            let path_expr = if !simple_cmd.args.is_empty() {
+                                generator.word_to_perl(&simple_cmd.args[0])
+                            } else {
+                                "q{}".to_string()
+                            };
                             format!(
-                                "do {{ my $basename_cmd = {}; my $basename_output = qx{{$basename_cmd}}; $CHILD_ERROR = $? >> 8; $basename_output; }}",
-                                basename_lit
+                                "do {{ use File::Basename qw(basename); my $basename_output = basename({}); $CHILD_ERROR = 0; $basename_output; }}",
+                                path_expr
                             )
                         } else if name == "dirname" {
-                            let dirname_cmd = generator.generate_command_string_for_system(
-                                &Command::Simple(simple_cmd.clone()),
-                            );
-                            let dirname_lit = generator
-                                .perl_string_literal_no_interp(&Word::literal(dirname_cmd));
+                            // Use native Perl dirname instead of shelling out.
+                            let path_expr = if !simple_cmd.args.is_empty() {
+                                generator.word_to_perl(&simple_cmd.args[0])
+                            } else {
+                                "q{}".to_string()
+                            };
                             format!(
-                                "do {{ my $dirname_cmd = {}; my $dirname_output = qx{{$dirname_cmd}}; $CHILD_ERROR = $? >> 8; $dirname_output; }}",
-                                dirname_lit
+                                "do {{ use File::Basename qw(dirname); my $dirname_output = dirname({}); $CHILD_ERROR = 0; $dirname_output; }}",
+                                path_expr
                             )
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
