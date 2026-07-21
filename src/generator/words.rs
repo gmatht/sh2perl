@@ -327,7 +327,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
         Word::Array(name, elements, _) => {
             let elements_str = elements
                 .iter()
-                .map(|e| format!("'{}'", e.replace("'", "\\'")))
+                .map(|e| generator.array_element_to_perl(e))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("@{} = ({});", name, elements_str)

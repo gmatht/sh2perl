@@ -550,47 +550,14 @@ impl Generator {
 
         // Handle array assignments (value is a Word::Array) separately from scalar assignments.
         if let Word::Array(name, elements, _) = &assignment.value {
-            // Process each element with backtick-to-native-Perl conversion
-            // (same logic as in simple_commands.rs for env var array assignments)
+            // Process each element, handling `${...}` expansions, backtick-to-native-Perl conversion,
+            // and other special patterns.
             let elements_perl: Vec<String> = elements
                 .iter()
                 .map(|s| {
-                    // Check if this element contains backticks (command substitution)
-                    if s.contains('`') {
-                        // Extract the command from backticks and convert to native Perl
-                        if s.starts_with('`') && s.ends_with('`') {
-                            let cmd_text = &s[1..s.len()-1]; // Remove backticks
-                            // For now, handle common cases like `ls -1 examples/*.sh 2>/dev/null`
-                            if cmd_text.starts_with("ls ") {
-                                // Convert ls command to native Perl glob
-                                let args = cmd_text.strip_prefix("ls ").unwrap_or("");
-                                if args.contains("*.sh") {
-                                    // Handle multiple glob patterns
-                                    let patterns: Vec<&str> = args.split_whitespace()
-                                        .filter(|arg| arg.contains("*.sh"))
-                                        .collect();
-                                    if patterns.len() == 1 {
-                                        format!("glob '{}'", patterns[0])
-                                    } else {
-                                        // Multiple patterns - need to handle them separately
-                                        format!("(grep {{ !/\\//msx }} glob '*.sh'), (glob 'examples/*.sh')")
-                                    }
-                                } else {
-                                    // Fallback for other ls commands
-                                    format!("do {{ use File::Find; my @files; find(sub {{ push @files, $File::Find::name if -f }}, '.'); @files }}")
-                                }
-                            } else {
-                                // For other commands, use open3 to capture output
-                                format!("'{}'", s.replace("'", "\\'"))
-                            }
-                        } else {
-                            // Element contains backticks but not at start/end - treat as literal
-                            format!("\"{}\"", s.replace("\\", "\\\\").replace("\"", "\\\""))
-                        }
-                    } else {
-                        // Normal string element
-                        format!("'{}'", s.replace("'", "\\'"))
-                    }
+                    // Use array_element_to_perl which handles ${...} patterns
+                    // (like ${numbers[@]:3:4} -> @numbers[3..6])
+                    self.array_element_to_perl(s)
                 })
                 .collect();
             match assignment.operator {
@@ -645,6 +612,26 @@ impl Generator {
                     output.push_str(&self.indent());
                     output.push_str(&format!("my ${};\n", assignment.variable));
                     self.declared_locals.insert(assignment.variable.clone());
+                }
+            }
+
+            // Auto-declare bare variables used in arithmetic expressions (like `a`, `b` in $((a + b)))
+            if let Word::Arithmetic(arith_expr, _) = &assignment.value {
+                // Extract bare identifiers from the arithmetic expression
+                let re = regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b").unwrap();
+                for cap in re.captures_iter(&arith_expr.expression) {
+                    let var_name = &cap[1];
+                    // Skip Perl keywords and operators
+                    if matches!(var_name, "if" | "else" | "for" | "while" | "do" | "not" | "and" | "or" | "xor" | "sub" | "my" | "local" | "our" | "defined" | "undef" | "int" | "length" | "substr" | "keys" | "values" | "scalar" | "join" | "split" | "grep" | "map" | "sort") {
+                        continue;
+                    }
+                    if !self.declared_locals.contains(var_name)
+                        && !self.function_level_vars.contains(var_name)
+                    {
+                        output.push_str(&self.indent());
+                        output.push_str(&format!("my ${};\n", var_name));
+                        self.declared_locals.insert(var_name.to_string());
+                    }
                 }
             }
 
@@ -776,6 +763,12 @@ impl Generator {
 
     pub fn extract_array_elements(&self, value: &str) -> Option<Vec<String>> {
         utils::extract_array_elements_impl(value)
+    }
+
+    /// Convert a raw string array element (from a `Word::Array`) to Perl code,
+    /// handling `${...}` expansions like `${numbers[@]:3:4}` -> `@numbers[3..6]`.
+    pub fn array_element_to_perl(&mut self, s: &str) -> String {
+        utils::array_element_to_perl_impl(self, s)
     }
 
     pub fn perl_string_literal(&mut self, word: &Word) -> String {
