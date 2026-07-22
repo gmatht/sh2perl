@@ -14,6 +14,7 @@
 - 000__04h_complex_examples.sh — passing (fixed: backtick command substitutions in array elements now execute via backtick syntax)
 - 000__07_find_path_commands.sh — passing
 - 063_15_complex_function_definition.sh — passing
+- 063_11_complex_while_loop.sh — passing (fixed: `local -A` inside function bodies now correctly declares `my %var = ();` even if `$var` was previously used)
 
 ## Still failing tests (2)
 
@@ -41,6 +42,8 @@ Remaining issues:
 Partially fixed:
 - Fixed: `$(...)` command substitutions inside test expression operands now
   convert to `qx{...}`.
+- Fixed: `local -A info` inside `get_system_info` now correctly declares
+  `my %info = ();` (previously skipped due to `$info` being in declared_locals).
 
 Remaining issues:
 1. Complex nested subshells with process substitution generate incorrect Perl.
