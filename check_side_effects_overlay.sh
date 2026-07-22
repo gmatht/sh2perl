@@ -1,91 +1,69 @@
 #!/bin/bash
-# check_side_effects_overlay.sh — compare file-system side effects using overlayfs
-# Usage: sudo check_side_effects_overlay.sh <test.sh>
-#
-# Sets up an overlay mount over the sh2perl directory, runs the test (bash then Perl),
-# and compares what files each version creates/modifies/deletes in the working directory.
-
-set -e
-
-if [ "$EUID" -ne 0 ]; then
-    echo "This script needs root for overlayfs mounts. Run with: sudo $0 <test.sh>"
-    exit 1
-fi
+# check_side_effects_overlay.sh — compare file-system side effects using fuse-overlayfs
+# Usage: bash check_side_effects_overlay.sh <test.sh>
 
 TEST="$1"
-if [ -z "$TEST" ]; then
-    echo "Usage: $0 <test.sh>"
-    exit 1
-fi
+[ -n "$TEST" ] || { echo "Usage: $0 <test.sh>"; exit 1; }
 
 SRC="/nvme/ai/sh2loop/sh2perl"
 DEBASHC="$SRC/target/debug/debashc"
-BASENAME=$(basename "$TEST" .sh)
 VIOLATIONS=0
 
 for MODE in bash perl; do
     echo "=== $MODE ==="
+    UPPER=$(mktemp -d /tmp/ov_up_XXXX)
+    WORK=$(mktemp -d /tmp/ov_wk_XXXX)
+    VIEW=$(mktemp -d /tmp/ov_vi_XXXX)
 
-    UPPER=$(mktemp -d /tmp/ov_upper_XXXX)
-    WORK=$(mktemp -d /tmp/ov_work_XXXX)
-    VIEW=$(mktemp -d /tmp/ov_view_XXXX)
+    fuse-overlayfs -o lowerdir="$SRC",upperdir="$UPPER",workdir="$WORK" "$VIEW" 2>/dev/null
 
-    mount -t overlay overlay -o lowerdir="$SRC",upperdir="$UPPER",workdir="$WORK" "$VIEW"
+    cd "$VIEW"
 
     if [ "$MODE" = "bash" ]; then
-        cd "$VIEW"
-        bash "$VIEW/$TEST" 2>&1 || true
+        bash "$TEST" 2>&1 || true
     else
-        # Generate Perl code
-        cd "$SRC"
-        PERL_CODE=$($DEBASHC parse --perl "$SRC/$TEST" 2>/dev/null | sed -n '/^#!/,/^===/p' | head -n -1)
-        cd "$VIEW"
-        echo "$PERL_CODE" > /tmp/test_$$.pl
-        perl /tmp/test_$$.pl 2>&1 || true
-        rm -f /tmp/test_$$.pl
+        PERL_CODE=$("$DEBASHC" parse --perl "$VIEW/$TEST" 2>/dev/null | sed -n '/^#!/,/^===/p' | head -n -1)
+        if [ -n "${PERL_CODE:-}" ]; then
+            echo "$PERL_CODE" | timeout 30 perl - 2>&1 || true
+        else
+            echo "  (Perl generation returned no code)"
+        fi
     fi
 
-    # List changes in upper layer
-    CHANGES=$(find "$UPPER" -type f -not -path "*/\.*" | sed "s|$UPPER||")
-    CHANGE_COUNT=$(echo "$CHANGES" | grep -c . || true)
-    echo "  Changes: $CHANGE_COUNT"
-    if [ $CHANGE_COUNT -gt 0 ]; then
-        echo "$CHANGES" | head -10 | sed 's/^/    /'
-    fi
+    CHANGES=$(find "$UPPER" -type f ! -name ".*" 2>/dev/null | sed "s|$UPPER||" | sort -u || true)
+    CHANGE_COUNT=$(echo "$CHANGES" | grep -c . 2>/dev/null || true)
+    : "${CHANGE_COUNT:=0}"
+    echo "  Files changed: $CHANGE_COUNT"
+    [ "$CHANGE_COUNT" -gt 0 ] 2>/dev/null && echo "$CHANGES" | head -10 | sed 's/^/    /'
 
-    eval "${MODE}_changes=\"$CHANGES\""
-    eval "${MODE}_count=$CHANGE_COUNT"
+    eval "${MODE}_changes=\"\$CHANGES\""
 
-    cd /
-    umount "$VIEW"
-    rm -rf "$UPPER" "$WORK" "$VIEW"
+    cd /tmp
+    fusermount -u "$VIEW" 2>/dev/null || true
+    sleep 0.2
+    rm -rf "$UPPER" "$WORK" "$VIEW" 2>/dev/null || true
 done
 
 echo "=== Comparison ==="
-# Compare using comm
-BASH_FILE=$(mktemp)
-PERL_FILE=$(mktemp)
-echo "$bash_changes" | sort > "$BASH_FILE"
-echo "$perl_changes" | sort > "$PERL_FILE"
+BASH_FILE=$(mktemp /tmp/bc_XXXX)
+PERL_FILE=$(mktemp /tmp/pc_XXXX)
+echo "$bash_changes" | sort -u > "$BASH_FILE"
+echo "$perl_changes" | sort -u > "$PERL_FILE"
 
 BASH_ONLY=$(comm -23 "$BASH_FILE" "$PERL_FILE" | grep -c . || true)
 PERL_ONLY=$(comm -13 "$BASH_FILE" "$PERL_FILE" | grep -c . || true)
+: "${BASH_ONLY:=0}"
+: "${PERL_ONLY:=0}"
 
-if [ "$BASH_ONLY" -gt 0 ]; then
-    echo "  Bash-only changes:"
-    comm -23 "$BASH_FILE" "$PERL_FILE" | head -10 | sed 's/^/    /'
-fi
-if [ "$PERL_ONLY" -gt 0 ]; then
-    echo "  Perl-only changes:"
-    comm -13 "$BASH_FILE" "$PERL_FILE" | head -10 | sed 's/^/    /'
-fi
+[ "$BASH_ONLY" -gt 0 ] 2>/dev/null && echo "  Bash-only:" && comm -23 "$BASH_FILE" "$PERL_FILE" | head -10 | sed 's/^/    /'
+[ "$PERL_ONLY" -gt 0 ] 2>/dev/null && echo "  Perl-only:" && comm -13 "$BASH_FILE" "$PERL_FILE" | head -10 | sed 's/^/    /'
 
-if [ "$BASH_ONLY" -eq 0 ] && [ "$PERL_ONLY" -eq 0 ]; then
+if [ "$BASH_ONLY" = 0 ] && [ "$PERL_ONLY" = 0 ]; then
     echo "  OK: side effects match"
 else
-    echo "  FAIL: side effects differ ($BASH_ONLY bash-only, $PERL_ONLY perl-only)"
+    echo "  FAIL: side effects differ"
     VIOLATIONS=1
 fi
 
-rm -f "$BASH_FILE" "$PERL_FILE"
+rm -f "$BASH_FILE" "$PERL_FILE" 2>/dev/null
 exit $VIOLATIONS
