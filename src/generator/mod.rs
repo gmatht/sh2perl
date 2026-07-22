@@ -1772,7 +1772,23 @@ impl Generator {
             Command::And(left, right) | Command::Or(left, right) => {
                 self.command_needs_ipc_open3(left) || self.command_needs_ipc_open3(right)
             }
-            Command::Redirect(redirect_cmd) => self.command_needs_ipc_open3(&redirect_cmd.command),
+            Command::Redirect(redirect_cmd) => {
+                // Check the inner command
+                if self.command_needs_ipc_open3(&redirect_cmd.command) {
+                    return true;
+                }
+                // Also check redirects for process substitution (which uses open3 via bash -c)
+                for r in &redirect_cmd.redirects {
+                    if matches!(
+                        r.operator,
+                        crate::ast::RedirectOperator::ProcessSubstitutionInput(_)
+                            | crate::ast::RedirectOperator::ProcessSubstitutionOutput(_)
+                    ) {
+                        return true;
+                    }
+                }
+                false
+            }
             Command::Assignment(assign) => self.word_needs_ipc_open3(&assign.value),
             Command::For(for_loop) => {
                 for cmd in &for_loop.body.commands {

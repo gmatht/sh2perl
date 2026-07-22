@@ -182,66 +182,20 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 global_counter
             ));
 
-            if let Command::Pipeline(_) = cmd.as_ref() {
-                output.push_str(&format!("my ${};\n", output_var));
-                output.push_str(&format!("{{\n"));
-                output.push_str(&format!("    local *STDOUT;\n"));
-                output.push_str(&format!(
-                    "    open STDOUT, '>', \\${} or croak \"Cannot redirect STDOUT\";\n",
-                    output_var
-                ));
-                output.push_str(&format!("    {{\n"));
-
-                // If there's no current pipeline id visible, create one and push a guard
-                // so nested generators (redirect wrappers) can mark the pipeline as
-                // printed via $output_printed_<id> when they consume the captured temp.
-                if generator.current_pipeline_output_id().is_none() {
-                    let unique_id = generator.get_unique_id();
-                    // Declare minimal pipeline-scoped vars so nested snippets can set them
-                    output.push_str(&format!("    my $output_{} = q{{}};\n", unique_id));
-                    output.push_str(&format!("    my $output_printed_{};\n", unique_id));
-                    // Remember the declared local name to avoid duplicate declarations elsewhere
-                    generator
-                        .declared_locals
-                        .insert(format!("output_{}", unique_id));
-
-                    // Push guard for the lifetime of nested generation
-                    let _pipeline_guard =
-                        generator.push_pipeline_output_id_guard(unique_id.clone());
-
-                    // Use the Perl generator instead of bash execution
-                    let perl_code = generator.generate_command(cmd);
-                    for line in perl_code.lines() {
-                        if !line.trim().is_empty() {
-                            output.push_str(&format!("    {}\n", line));
-                        }
-                    }
-                    // _pipeline_guard is dropped here at end of this scope which pops the id
-                } else {
-                    // A pipeline id is already active; just generate the nested code
-                    let perl_code = generator.generate_command(cmd);
-                    for line in perl_code.lines() {
-                        if !line.trim().is_empty() {
-                            output.push_str(&format!("    {}\n", line));
-                        }
-                    }
-                }
-
-                output.push_str(&format!("    }}\n"));
-                output.push_str(&format!("}}\n"));
-            } else {
-                let cmd_str = generate_bash_command_string(cmd);
-                let cmd_literal = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-                output.push_str(&format!(
-                    "my ($in, $out, $err);
+            // Use open3 to run the command via bash -c, which correctly handles
+            // file arguments (instead of reading from stdin as the inline
+            // pipeline generation would).
+            let cmd_str = generate_bash_command_string(cmd);
+            let cmd_literal = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+            output.push_str(&format!(
+                "my ($in, $out, $err);
 my $pid = open3($in, $out, $err, 'bash', '-c', {});
 close $in or croak 'Close failed: $OS_ERROR';
 my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
 close $out or croak 'Close failed: $OS_ERROR';
 waitpid $pid, 0;\n",
-                    output_var, cmd_literal
-                ));
-            }
+                cmd_literal, output_var
+            ));
 
             output.push_str(&format!("use File::Path qw(make_path);\n"));
             output.push_str(&format!(
