@@ -194,7 +194,8 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
 
     // Check if the while loop condition uses variables that might need initialization
     // This is needed for shell compatibility where loop variables persist
-    let mut read_vars: Vec<String> = Vec::new();
+    let mut read_vars: Vec<String> = extract_read_vars_from_condition(&while_loop.condition);
+    // Also check in initial simple condition (for direct `while read` case)
     if let Command::Simple(cmd) = &*while_loop.condition {
         if let Word::Literal(name, _) = &cmd.name {
             if name == "read" {
@@ -202,16 +203,10 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 for arg in &cmd.args {
                     if let Word::Literal(s, _) = arg {
                         if s != "-r" && s != "-p" && s != "-n" && s != "-t" && !s.starts_with('-') {
-                            read_vars.push(s.clone());
+                            if !read_vars.contains(s) {
+                                read_vars.push(s.clone());
+                            }
                         }
-                    }
-                }
-                // Declare read variables before the loop
-                for var in &read_vars {
-                    if !generator.declared_locals.contains(var) {
-                        output.push_str(&generator.indent());
-                        output.push_str(&format!("my ${};\n", var));
-                        generator.declared_locals.insert(var.clone());
                     }
                 }
             }
@@ -257,6 +252,15 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                     .function_level_vars
                     .insert(var_name.as_str().to_string());
             }
+        }
+    }
+
+    // Declare read variables before the loop (for all condition types)
+    for var in &read_vars {
+        if !generator.declared_locals.contains(var) {
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my ${};\n", var));
+            generator.declared_locals.insert(var.clone());
         }
     }
 
@@ -1150,4 +1154,41 @@ fn flatten_conditions(cmd: &Command, conds: &mut Vec<Command>) {
             conds.push(other.clone());
         }
     }
+}
+
+/// Extract variable names from `read` commands in a command tree.
+/// Returns a list of variable names that should be declared before a while loop.
+fn extract_read_vars_from_condition(cmd: &Command) -> Vec<String> {
+    let mut vars = Vec::new();
+    match cmd {
+        Command::Simple(cmd) => {
+            if let Word::Literal(name, _) = &cmd.name {
+                if name == "read" {
+                    for arg in &cmd.args {
+                        if let Word::Literal(s, _) = arg {
+                            if s != "-r" && s != "-p" && s != "-n" && s != "-t" && !s.starts_with('-') {
+                                vars.push(s.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Command::And(left, right) | Command::Or(left, right) => {
+            vars.extend(extract_read_vars_from_condition(left));
+            vars.extend(extract_read_vars_from_condition(right));
+        }
+        Command::Block(block) => {
+            for cmd in &block.commands {
+                vars.extend(extract_read_vars_from_condition(cmd));
+            }
+        }
+        Command::Pipeline(pipeline) => {
+            for cmd in &pipeline.commands {
+                vars.extend(extract_read_vars_from_condition(cmd));
+            }
+        }
+        _ => {}
+    }
+    vars
 }
