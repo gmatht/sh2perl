@@ -29,7 +29,7 @@ creates **nothing** because the translation fails at the first step.
 
 | Test | Bash creates | Perl creates | Root cause |
 |------|-------------|-------------|------------|
-| 018_grep_params | `temp_file.txt`, `test_dir/`, `test_dir/file1.txt`, `test_dir/file2.txt` | nothing | `system()` fails |
+| 018_grep_params | `temp_file.txt` (file), `test_dir/` (directory), `test_dir/file1.txt`, `test_dir/file2.txt` | nothing | `system()` fails |
 | 063_14_complex_redirects | `comparison.txt` | nothing | same |
 | 063_20_final_complex_construct | `final_result.txt` | nothing | same |
 | 063_hard_to_parse | `comparison.txt`, `final_result.txt` | nothing | same |
