@@ -21,4 +21,7 @@ Multiple hard-to-generate features combined. Stdout mismatch due to:
 - Here-documents with variable interpolation
 - Nested function definitions
 - Sort ordering differences
-- Serialization of complex commands (If, While, For) for open3
+- Simple commands (echo, ls, find, etc.) inside backticks are run via
+  open3('bash', '-c', ...) instead of being translated to native Perl.
+  Complex control flow (If, While, For) gets native Perl; the cheat is on
+  the easy cases.
