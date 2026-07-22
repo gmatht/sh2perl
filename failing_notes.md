@@ -20,8 +20,5 @@ Multiple hard-to-generate features combined. Stdout mismatch due to:
 - Brace expansion with mixed ranges and sequences
 - Here-documents with variable interpolation
 - Nested function definitions
-- Sort ordering differences
-- Simple commands (echo, ls, find, etc.) inside backticks are run via
-  open3('bash', '-c', ...) instead of being translated to native Perl.
-  Complex control flow (If, While, For) gets native Perl; the cheat is on
-  the easy cases.
+- Simple commands inside backticks use open3('bash', '-c', ...) instead of
+  native Perl (complex control flow like If/While/For is correctly translated)
