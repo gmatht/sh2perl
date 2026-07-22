@@ -1228,18 +1228,20 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             }
                         } else {
                             // Just declaration without assignment
-                            if !generator.declared_locals.contains(var_name) {
-                                output.push_str(&generator.indent());
-                                if is_assoc {
-                                    output.push_str(&format!("my %{} = ();\n", var_name));
-                                    generator.associative_arrays.insert(var_name.clone());
-                                } else if is_array {
-                                    output.push_str(&format!("my @{} = ();\n", var_name));
-                                } else {
-                                    output.push_str(&format!("my ${};\n", var_name));
-                                }
-                                generator.declared_locals.insert(var_name.clone());
+                            // `local` always creates a new local variable, shadowing any global.
+                            // Always emit the my declaration even if the variable is already
+                            // in declared_locals (e.g., from an outer scope or a previous
+                            // declaration with a different type like $info vs %info).
+                            output.push_str(&generator.indent());
+                            if is_assoc {
+                                output.push_str(&format!("my %{} = ();\n", var_name));
+                                generator.associative_arrays.insert(var_name.clone());
+                            } else if is_array {
+                                output.push_str(&format!("my @{} = ();\n", var_name));
+                            } else {
+                                output.push_str(&format!("my ${};\n", var_name));
                             }
+                            generator.declared_locals.insert(var_name.clone());
                         }
                     }
                     Word::CommandSubstitution(cmd_sub, _) => {
