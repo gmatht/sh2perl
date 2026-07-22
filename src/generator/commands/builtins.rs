@@ -671,7 +671,9 @@ pub fn generate_generic_builtin(
             let paste_output =
                 crate::generator::commands::paste::generate_paste_command(generator, cmd, &[]);
             if output_var.is_empty() {
-                paste_output
+                // Standalone paste command: capture the do-block result and print it.
+                let paste_result_var = format!("paste_result_{}", generator.get_unique_id());
+                format!("my ${} = {};\nprint ${};\n", paste_result_var, paste_output, paste_result_var)
             } else {
                 format!("${} = {};\n", output_var, paste_output)
             }

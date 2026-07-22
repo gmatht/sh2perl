@@ -716,6 +716,13 @@ pub fn generate_command_impl_with_input(
                             );
                             result.push_str(&diff_output);
 
+                            if stderr_scope_opened {
+                                stderr_scope_opened = false;
+                                generator.indent_level -= 1;
+                                result.push_str(&generator.indent());
+                                result.push_str("};
+");
+                            }
                             return result;
                         }
                     }

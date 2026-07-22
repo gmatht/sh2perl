@@ -1,6 +1,20 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
+/// Convert a heredoc body to a Perl interpolating string literal (`"..."`).
+/// Unlike `perl_string_literal_no_interp`, this preserves `$` and `@` so that
+/// Perl will interpolate variable references (matching bash behaviour for
+/// unquoted heredocs like `<< EOF`).  Backslashes, double-quotes and control
+/// characters are still escaped so the Perl source is valid.
+fn heredoc_body_to_perl_interp(body: &str) -> String {
+    let escaped = body
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\t", "\\t")
+        .replace("\r", "\\r");
+    format!("\"{}\"", escaped)
+}
+
 fn cat_requires_shell(cmd: &SimpleCommand) -> bool {
     // If any argument looks like a shell operator (pipe) or an option (-...),
     // we must run via the shell instead of treating args as filenames.
@@ -97,8 +111,10 @@ pub fn generate_cat_command(
     }
 
     if has_heredoc {
-        // Collect heredoc content
+        // Collect heredoc content and determine if any delimiter was quoted
         let mut body = String::new();
+        let mut any_quoted = false;
+        let mut any_unquoted = false;
         for redir in redirects {
             if matches!(
                 redir.operator,
@@ -106,9 +122,24 @@ pub fn generate_cat_command(
             ) {
                 if let Some(content) = &redir.heredoc_body {
                     body.push_str(content);
+                    if redir.heredoc_quoted {
+                        any_quoted = true;
+                    } else {
+                        any_unquoted = true;
+                    }
                 }
             }
         }
+
+        // Use interpolating strings for unquoted heredocs, non-interpolating for quoted
+        // For mixed heredocs (shouldn't normally happen), use a reasonable default
+        let body_lit = if any_unquoted && !any_quoted {
+            // Only unquoted heredocs: use interpolating Perl string
+            heredoc_body_to_perl_interp(&body)
+        } else {
+            // Quoted (or mixed) heredocs: use non-interpolating Perl string
+            generator.perl_string_literal_no_interp(&Word::literal(body))
+        };
 
         if let Some(filename) = output_file {
             // Write heredoc content to the output file
@@ -119,7 +150,7 @@ pub fn generate_cat_command(
             ));
             output.push_str(&format!(
                 "print {{$fh_cat}} {};\n",
-                generator.perl_string_literal_no_interp(&Word::literal(body))
+                body_lit
             ));
             output.push_str(&format!(
                 "close $fh_cat or croak \"Close failed: $OS_ERROR\\n\";\n"
@@ -128,7 +159,6 @@ pub fn generate_cat_command(
             // No output redirect.
             // In a pipeline or command-substitution context, assign the heredoc
             // content to the target variable instead of printing directly.
-            let body_lit = generator.perl_string_literal_no_interp(&Word::literal(body));
             if target_var.is_empty() {
                 // Standalone command: print to stdout.
                 output.push_str(&format!("print {};\n", body_lit));

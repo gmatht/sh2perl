@@ -280,12 +280,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         generator.suppress_set_e_depth -= 1;
 
         // Execute right command if left command fails
-        // For diff commands, check $diff_exit_code; for others, check $CHILD_ERROR
-        let exit_code_var = if contains_diff_command(left) {
-            "$diff_exit_code"
-        } else {
-            "$CHILD_ERROR"
-        };
+        let exit_code_var = "$CHILD_ERROR";
 
         output.push_str(&generator.indent());
         output.push_str(&format!("if ({} != 0) {{\n", exit_code_var));

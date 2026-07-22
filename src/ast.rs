@@ -161,6 +161,9 @@ pub struct Redirect {
     pub operator: RedirectOperator,
     pub target: Word,
     pub heredoc_body: Option<String>,
+    /// Whether the heredoc delimiter was quoted (`<< 'EOF'` vs `<< EOF`).
+    /// When true, the body should NOT be interpolated.
+    pub heredoc_quoted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
