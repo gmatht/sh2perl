@@ -696,9 +696,9 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                                 expansion.prefix.as_deref().unwrap_or(""),
                                 s,
                                 expansion.suffix.as_deref().unwrap_or(""));
-                            // If the value contains glob metacharacters (*, ?, [), use glob()
+                            // If the value contains glob metacharacters (*, ?, [), use glob() with sort and fallback
                             if val.contains('*') || val.contains('?') || val.contains('[') {
-                                all_items.push(format!("glob(\"{}\")", val));
+                                all_items.push(format!("do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}", val, val));
                             } else {
                                 all_items.push(format!("\"{}\"", val));
                             }
@@ -710,9 +710,9 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                                     expansion.prefix.as_deref().unwrap_or(""),
                                     item,
                                     expansion.suffix.as_deref().unwrap_or(""));
-                                // If the value contains glob metacharacters (*, ?, [), use glob()
+                                // If the value contains glob metacharacters (*, ?, [), use glob() with sort and fallback
                                 if val.contains('*') || val.contains('?') || val.contains('[') {
-                                    all_items.push(format!("glob(\"{}\")", val));
+                                    all_items.push(format!("do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}", val, val));
                                 } else {
                                     all_items.push(format!("\"{}\"", val));
                                 }
@@ -730,7 +730,12 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                                     expansion.prefix.as_deref().unwrap_or(""),
                                     s,
                                     expansion.suffix.as_deref().unwrap_or(""));
-                                all_items.push(format!("\"{}\"", val));
+                                // If the value contains glob metacharacters (*, ?, [), use glob() with sort and fallback
+                                if val.contains('*') || val.contains('?') || val.contains('[') {
+                                    all_items.push(format!("do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}", val, val));
+                                } else {
+                                    all_items.push(format!("\"{}\"", val));
+                                }
                             },
                             BraceItem::Range(range) => {
                                 if let (Ok(start_num), Ok(end_num)) =
@@ -770,7 +775,7 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                                         item,
                                         expansion.suffix.as_deref().unwrap_or(""));
                                     if val.contains('*') || val.contains('?') || val.contains('[') {
-                                        all_items.push(format!("glob(\"{}\")", val));
+                                        all_items.push(format!("do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}", val, val));
                                     } else {
                                         all_items.push(format!("\"{}\"", val));
                                     }

@@ -14,8 +14,8 @@ my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04c_text_processing_commands.sh';
-my $MAGIC_3 = 3;
 my $MAGIC_5 = 5;
+my $MAGIC_3 = 3;
 
 print "=== Text Processing Commands ===\n";
 my $file_content;
