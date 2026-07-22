@@ -1,0 +1,26 @@
+# Perl::Critic configuration for sh2perl output
+# We relax policies that conflict with legitimate shell-translation patterns.
+
+# --- Explicitly excluded policies ---
+
+# system() is a legitimate fallback when native Perl translation isn't available
+[-BuiltinFunctions::ProhibitSystem]
+[-BuiltinFunctions::ProhibitExec]
+
+# qx{} and backticks are the same as system() — valid fallbacks
+[-InputOutput::ProhibitBacktickOperators]
+
+# open3() is used for IPC in command substitution
+[-InputOutput::ProhibitTwoArgumentOpen]
+
+# We use Carp::croak for error handling
+[-ErrorHandling::RequireCarping]
+
+# The generated code has long lines from string literals
+[-Miscellanea::ProhibitUnrestrictedNoCritic]
+
+# We interpolate variables in strings (it's generated Perl)
+[-ValuesAndExpressions::ProhibitInterpolationOfLiterals]
+
+# --- Severity settings ---
+severity = 3  # Only flag policies severity 3 and below (brutal = 5)
