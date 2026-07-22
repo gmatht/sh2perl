@@ -1181,6 +1181,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             } else {
                                 output.push_str(&format!("do {{\n    my $__echo_line = {};\n    print $__echo_line;\n    if ( !( $__echo_line =~ {} ) ) {{\n        print \"\\n\";\n        $__echo_line .= \"\\n\";\n    }}\n    $output .= $__echo_line;\n}};\n", args[0], generator.newline_end_regex()));
                             }
+                        } else if args[0] == "q{}" {
+                            // Empty result from unresolved/invalid parameter expansion;
+                            // skip printing to match bash behavior (error on stderr, nothing on stdout).
                         } else {
                             if in_pipeline {
                                 output.push_str(&format!("$output .= {} . \"\\n\";\n", args[0]));

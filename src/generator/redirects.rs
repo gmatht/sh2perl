@@ -1282,8 +1282,9 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
             // Wait for all background child processes to complete.
             // In shell, `wait` without arguments waits for all children.
             // In Perl, loop on wait() until it returns -1 (no more children).
+            // Note: after wait() returns -1, $? is set to -1, so guard against that.
             output.push_str("1 while wait() > -1;\n");
-            output.push_str("$CHILD_ERROR = $? >> 8;\n");
+            output.push_str("$CHILD_ERROR = $? == -1 ? 0 : $? >> 8;\n");
         }
         "eval" => {
             // The eval builtin concatenates its arguments and evaluates the
