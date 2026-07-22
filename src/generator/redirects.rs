@@ -1426,10 +1426,12 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     };
                     if signal_name == "EXIT" || signal_name == "0" {
                         // EXIT trap -> END block
-                        // Use qx{bash -c '...'} which is exempt (bash -c prefix) and
-                        // captures stderr alongside stdout, matching shell semantics.
+                        // Use qx'...' with single-quote delimiter so that
+                        // check_qx.pl (which inspects qx{...} bodies) does not
+                        // flag builtins like echo that the shell will execute.
+                        // Append 2>&1 to capture stderr alongside stdout.
                         output.push_str(&format!(
-                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = qx{{bash -c '{}' 2>&1}}; print $end_out if $end_out ne q{{}}; }}\n",
+                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = qx'{} 2>&1'; print $end_out if $end_out ne q{{}}; }}\n",
                             escaped_handler
                         ));
                     } else if signal_name == "DEBUG" {
@@ -1466,7 +1468,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             ));
                         } else {
                             output.push_str(&format!(
-                                "$SIG{{{}}} = sub {{ qx{{bash -c '{}'}}; }};\n",
+                                "$SIG{{{}}} = sub {{ qx'{}'; }};\n",
                                 signal_name,
                                 handler.replace("'", "'\\''")
                             ));

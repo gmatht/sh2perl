@@ -1,1 +1,1 @@
-ALL_TESTS_PASSED:y99999
+012_process_substitution:y00000
