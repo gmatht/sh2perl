@@ -25,7 +25,7 @@ my $output_ps_fh_1;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
     my $output_246 = q{};
     my $output_printed_246;
-    sprintf("a\nb\n");
+    printf("a\nb\n");
 if ($output_246 ne q{} && !$output_printed_246) {
     print $output_246;
 }
@@ -44,7 +44,7 @@ my $output_ps_fh_2;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
     my $output_248 = q{};
     my $output_printed_248;
-    sprintf("b\nc\n");
+    printf("b\nc\n");
 if ($output_248 ne q{} && !$output_printed_248) {
     print $output_248;
 }
