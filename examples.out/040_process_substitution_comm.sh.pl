@@ -21,14 +21,13 @@ print "== Process substitution with comm ==\n";
 my $temp_file_ps_fh_1 = q{/tmp} . '/process_sub_fh_1.tmp';
 my $output_ps_fh_1;
 {
-    local *STDOUT;
-    open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_246 = q{};
-    my $output_printed_246;
-    printf("a\nb\n");
-if ($output_246 ne q{} && !$output_printed_246) {
-    print $output_246;
-}
+my ($in, $out);
+my $pid = open3($in, $out, '>&STDERR', 'bash', '-c', 'printf "a\\\\nb\\\\n"');
+close $in or croak 'Close failed: $OS_ERROR';
+$output_ps_fh_1 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
+close $out or croak 'Close failed: $OS_ERROR';
+waitpid $pid, 0;
+$CHILD_ERROR = $? >> 8;
 }
 use File::Path qw(make_path);
 my $temp_dir_fh_1 = dirname($temp_file_ps_fh_1);
@@ -40,14 +39,13 @@ open STDIN, '<', $temp_file_ps_fh_1 or croak "Cannot open process substitution: 
 my $temp_file_ps_fh_2 = q{/tmp} . '/process_sub_fh_2.tmp';
 my $output_ps_fh_2;
 {
-    local *STDOUT;
-    open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_248 = q{};
-    my $output_printed_248;
-    printf("b\nc\n");
-if ($output_248 ne q{} && !$output_printed_248) {
-    print $output_248;
-}
+my ($in, $out);
+my $pid = open3($in, $out, '>&STDERR', 'bash', '-c', 'printf "b\\\\nc\\\\n"');
+close $in or croak 'Close failed: $OS_ERROR';
+$output_ps_fh_2 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
+close $out or croak 'Close failed: $OS_ERROR';
+waitpid $pid, 0;
+$CHILD_ERROR = $? >> 8;
 }
 use File::Path qw(make_path);
 my $temp_dir_fh_2 = dirname($temp_file_ps_fh_2);
