@@ -598,23 +598,20 @@ pub fn generate_generic_builtin(
         }
         "head" => {
             if input_var.is_empty() {
-                let command = Command::Simple(cmd.clone());
-                let command_str = generator.generate_command_string_for_system(&command);
-                // Emit non-interpolating literal for qx{} usage
-                let command_lit =
-                    generator.perl_string_literal_no_interp(&Word::literal(command_str));
+                // When there is no pipeline input (head reads from STDIN/files),
+                // use native Perl instead of qx{head} to avoid QX violations
+                // and to support streaming input from FIFOs (process substitution).
+                // Parse head options to determine number of lines.
+                let num_lines = crate::generator::commands::head::get_head_num_lines(cmd);
                 if output_var.is_empty() {
-                    // Return the head output rather than printing it so the
-                    // surrounding context (for example a redirect wrapper)
-                    // can decide how to handle the returned string.
                     format!(
-                        "do {{ my $head_cmd = {}; qx{{$head_cmd}}; }};\n",
-                        command_lit
+                        "do {{ my $__head_count = {}; while (<STDIN>) {{ print $_; last if --$__head_count <= 0; }} }};\n",
+                        num_lines
                     )
                 } else {
                     format!(
-                        "${} = do {{ my $head_cmd = {}; qx{{$head_cmd}}; }};\n",
-                        output_var, command_lit
+                        "do {{ my $__head_count = {}; my $__head_result = q{{}}; while (<STDIN>) {{ $__head_result .= $_; last if --$__head_count <= 0; }} ${} = $__head_result; }};\n",
+                        num_lines, output_var
                     )
                 }
             } else {

@@ -1,14 +1,8 @@
 use crate::ast::*;
 use crate::generator::Generator;
 
-pub fn generate_head_command(
-    _generator: &mut Generator,
-    cmd: &SimpleCommand,
-    input_var: &str,
-    _command_index: usize,
-) -> String {
-    let mut output = String::new();
-
+/// Parse head options and return the number of lines to display.
+pub fn get_head_num_lines(cmd: &SimpleCommand) -> usize {
     // head command syntax: head [options] [file...]
     let mut num_lines = 10; // Default to first 10 lines
 
@@ -43,6 +37,19 @@ pub fn generate_head_command(
         }
         i += 1;
     }
+    num_lines
+}
+
+pub fn generate_head_command(
+    _generator: &mut Generator,
+    cmd: &SimpleCommand,
+    input_var: &str,
+    _command_index: usize,
+) -> String {
+    let mut output = String::new();
+
+    // head command syntax: head [options] [file...]
+    let num_lines = get_head_num_lines(cmd);
 
     // Use line-by-line processing instead of arrays
     // Align variable declarations for perltidy compliance

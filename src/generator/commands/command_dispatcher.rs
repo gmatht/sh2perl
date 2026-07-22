@@ -160,6 +160,7 @@ pub fn generate_command_impl_with_input(
 
             // Handle redirects first and collect information
             let mut result = String::new();
+            let mut deferred_cleanup: Vec<String> = Vec::new();
             let mut has_here_string = false;
             let mut here_string_content = String::new();
             let mut process_sub_files = Vec::new();
@@ -201,159 +202,222 @@ pub fn generate_command_impl_with_input(
                             format!("{}/process_sub_{}.tmp", get_temp_dir(), global_counter);
                         let temp_var = format!("temp_file_ps_{}", global_counter);
 
-                        result.push_str(&generator.indent());
-                        result.push_str(&format!(
-                            "my ${} = {} . '/process_sub_{}.tmp';\n",
-                            temp_var,
-                            get_temp_dir(),
-                            global_counter
-                        ));
+                        // Decide whether to use FIFO or open3 approach.
+                        // Non-serializable commands (While, If, etc.) use FIFO to avoid hanging.
+                        let use_fifo = !command_can_be_serialized(cmd);
 
-                        // Execute the command and capture its output
-                        // Check if this is a complex command that should use Perl code generation
-                        let is_complex_command =
-                            matches!(**cmd, Command::Pipeline(_) | Command::Redirect(_));
+                        if use_fifo && !in_stdout_context {
+                            // For non-serializable commands (While loops, If, etc.) we use a
+                            // FIFO (named pipe) so the command runs in a background
+                            // child process and its output is streamed lazily.  This avoids
+                            // hanging on commands that produce infinite output (e.g.
+                            // head <(while true; do echo .; sleep 1; done)).
+                            let temp_dir_expr = get_temp_dir();
+                            let fifo_var = format!("fifo_ps_{}", global_counter);
+                            let child_var = format!("child_ps_{}", global_counter);
 
-                        if in_stdout_context || !command_can_be_serialized(cmd) {
-                            // If we're already in a STDOUT context, or if the command
-                            // cannot be serialized to a bash command string, generate
-                            // the actual Perl code (inline approach).
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("my $output_ps_{};\n", global_counter));
+                            result.push_str(&format!(
+                                "use POSIX qw(mkfifo);\n"));
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("{{\n"));
+                            result.push_str(&format!(
+                                "my ${} = {} . '/ps_fifo_$$_{}';\n",
+                                fifo_var, temp_dir_expr, global_counter
+                            ));
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("    local *STDOUT;\n"));
+                            result.push_str(&format!(
+                                "unlink ${};\n",
+                                fifo_var
+                            ));
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("    open STDOUT, '>', \\$output_ps_{} or croak \"Cannot redirect STDOUT\";\n", global_counter));
-                            // Ensure nested generators can see the pipeline id so they can
-                            // Always create a fresh unique_id for each process-substitution
-                            // block so that every <(…) gets its own $output_N / $output_printed_N
-                            // variables in its own scope.  Re-using the id from a sibling
-                            // process substitution (which happens when its guard is still live
-                            // in _process_sub_guards) causes the second block to skip the `my`
-                            // declarations and produces "Global symbol requires package name"
-                            // compile errors under strict.
+                            result.push_str(&format!(
+                                "mkfifo(${}, 0700) or croak \"mkfifo: $ERRNO\\n\";\n",
+                                fifo_var
+                            ));
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!(
+                                "my ${} = fork();\n",
+                                child_var
+                            ));
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!(
+                                "if (${} == 0) {{\n",
+                                child_var
+                            ));
+                            generator.indent_level += 1;
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!(
+                                "open STDOUT, '>', ${} or croak \"Cannot open fifo: $ERRNO\\n\";\n",
+                                fifo_var
+                            ));
+                            result.push_str(&generator.indent());
+                            result.push_str("select((select(STDOUT), $| = 1)[0]);\n");
                             {
-                                let unique_id = generator.get_unique_id();
-                                result.push_str(&generator.indent());
-                                result
-                                    .push_str(&format!("    my $output_{} = q{{}};\n", unique_id));
-                                result.push_str(&generator.indent());
-                                result
-                                    .push_str(&format!("    my $output_printed_{};\n", unique_id));
-                                generator
-                                    .declared_locals
-                                    .insert(format!("output_{}", unique_id));
-
-                                // The guard is scoped to this inner block: it will be dropped
-                                // (and the id popped) once we exit the block, so the next
-                                // sibling process substitution starts fresh.
-                                let _ps_guard =
-                                    generator.push_pipeline_output_id_guard(unique_id.clone());
-
                                 let perl_code = generator.generate_command(cmd);
                                 for line in perl_code.lines() {
                                     if !line.trim().is_empty() {
-                                        result.push_str(&format!("    {}\n", line));
+                                        result.push_str(&format!("{}\n", line));
                                     }
                                 }
-                                // When the inner command is a Pipeline, the pipeline
-                                // generator already emits a final print for the buffer.
-                                // Only emit our own print for non-pipeline commands so
-                                // we don't double-print the output.
-                                if !matches!(**cmd, Command::Pipeline(_)) {
-                                    result.push_str(&generator.indent());
-                                    result.push_str(&format!(
-                                        "if ($output_{} ne q{{}} && !$output_printed_{}) {{\n",
-                                        unique_id, unique_id
-                                    ));
-                                    result.push_str(&generator.indent());
-                                    result.push_str(&format!("    print $output_{};\n", unique_id));
-                                    result.push_str(&generator.indent());
-                                    result.push_str(&format!("}}\n"));
-                                }
-                                // _ps_guard drops here, popping the pipeline id
                             }
                             result.push_str(&generator.indent());
+                            result.push_str("close STDOUT;\n");
+                            result.push_str(&generator.indent());
+                            result.push_str("exit(0);\n");
+                            generator.indent_level -= 1;
+                            result.push_str(&generator.indent());
                             result.push_str(&format!("}}\n"));
+
+                            // Parent: redirect STDIN to the FIFO.
+                            // The base command (e.g. head) will read from STDIN,
+                            // which now reads from the FIFO fed by the child.
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!(
+                                "open STDIN, \'<\', ${} or croak \"Cannot open fifo: $ERRNO\\n\";\n",
+                                fifo_var
+                            ));
+
+                            // Deferred cleanup: close STDIN, wait for child, unlink FIFO.
+                            let cleanup_code = format!(
+                                "close STDIN;\nwaitpid(${}, 0);\nunlink ${};\n",
+                                child_var, fifo_var
+                            );
+                            deferred_cleanup.push(cleanup_code);
                         } else {
-                            // Use backticks via open3 for commands that can be serialized
-                            // to a bash command string (Simple, Pipeline, Subshell, Redirect).
-                            // This correctly handles file arguments (instead of reading from
-                            // stdin as the inline pipeline generation would).
-                            let cmd_str = generator.generate_command_string_for_system(cmd);
-                            let cmd_literal =
-                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-                            result.push_str(&generator.indent());
-                            result.push_str(&format!("my $output_ps_{};\n", global_counter));
-                            result.push_str(&generator.indent());
-                            result.push_str("{\n");
-                            result.push_str(&generator.indent());
-                            result.push_str("my ($in, $out);\n");
+                            // For serializable commands (or when in_stdout_context),
+                            // use the standard temp-file approach.
+
                             result.push_str(&generator.indent());
                             result.push_str(&format!(
-                                "my $pid = open3($in, $out, undef, 'bash', '-c', {});\n",
-                                cmd_literal
+                                "my ${} = {} . '/process_sub_{}.tmp';\n",
+                                temp_var,
+                                get_temp_dir(),
+                                global_counter
                             ));
-                            result.push_str(&generator.indent());
-                            result.push_str("close $in or croak 'Close failed: $OS_ERROR';\n");
-                            result.push_str(&generator.indent());
-                            result.push_str(&format!("$output_ps_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};\n", global_counter));
-                            result.push_str(&generator.indent());
-                            result.push_str("close $out or croak 'Close failed: $OS_ERROR';\n");
-                            result.push_str(&generator.indent());
-                            result.push_str("waitpid $pid, 0;\n$CHILD_ERROR = $? >> 8;\n");
-                            result.push_str(&generator.indent());
-                            result.push_str("}\n");
-                        }
 
-                        // Write the output to the temporary file
-                        let fh_var = format!("fh_ps_{}", global_counter);
-                        result.push_str(&generator.indent());
-                        result.push_str(&format!("use File::Path qw(make_path);\n"));
-                        result.push_str(&generator.indent());
-                        result.push_str(&format!(
-                            "my $temp_dir_{} = dirname(${});\n",
-                            global_counter, temp_var
-                        ));
-                        result.push_str(&generator.indent());
-                        result.push_str(&format!(
-                            "if (!-d $temp_dir_{}) {{ make_path($temp_dir_{}); }}\n",
-                            global_counter, global_counter
-                        ));
-                        result.push_str(&generator.indent());
-                        result.push_str(&format!("open my ${}, '>', ${} or croak \"Cannot create temp file: $ERRNO\\n\";\n", fh_var, temp_var));
-                        result.push_str(&generator.indent());
-                        result.push_str(&format!(
-                            "print {{${}}} $output_ps_{};\n",
-                            fh_var, global_counter
-                        ));
-                        result.push_str(&generator.indent());
-                        result.push_str(&format!(
-                            "close ${} or croak \"Close failed: $ERRNO\\n\";\n",
-                            fh_var
-                        ));
+                            if in_stdout_context || !command_can_be_serialized(cmd) {
+                                // If we're already in a STDOUT context, or if the command
+                                // cannot be serialized to a bash command string, generate
+                                // the actual Perl code (inline approach).
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("my $output_ps_{};\n", global_counter));
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("{{\n"));
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("    local *STDOUT;\n"));
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("    open STDOUT, '>', \\$output_ps_{} or croak \"Cannot redirect STDOUT\";\n", global_counter));
+                                {
+                                    let unique_id = generator.get_unique_id();
+                                    result.push_str(&generator.indent());
+                                    result
+                                        .push_str(&format!("    my $output_{} = q{{}};\n", unique_id));
+                                    result.push_str(&generator.indent());
+                                    result
+                                        .push_str(&format!("    my $output_printed_{};\n", unique_id));
+                                    generator
+                                        .declared_locals
+                                        .insert(format!("output_{}", unique_id));
 
-                        // Redirect STDIN to read from the process substitution output
-                        result.push_str(&generator.indent());
-                        result.push_str(&format!("open STDIN, \'<\', ${} or croak \"Cannot open process substitution: $ERRNO\\n\";\n", temp_var));
+                                    let _ps_guard =
+                                        generator.push_pipeline_output_id_guard(unique_id.clone());
 
-                        // If there is an active pipeline, feed the process-substitution
-                        // output into the pipeline buffer so the next command (e.g. sort)
-                        // can read it when it references $output_<id>.
-                        if let Some(pid) = generator.current_pipeline_output_id() {
+                                    let perl_code = generator.generate_command(cmd);
+                                    for line in perl_code.lines() {
+                                        if !line.trim().is_empty() {
+                                            result.push_str(&format!("    {}\n", line));
+                                        }
+                                    }
+                                    if !matches!(**cmd, Command::Pipeline(_)) {
+                                        result.push_str(&generator.indent());
+                                        result.push_str(&format!(
+                                            "if ($output_{} ne q{{}} && !$output_printed_{}) {{\n",
+                                            unique_id, unique_id
+                                        ));
+                                        result.push_str(&generator.indent());
+                                        result.push_str(&format!("    print $output_{};\n", unique_id));
+                                        result.push_str(&generator.indent());
+                                        result.push_str(&format!("}}\n"));
+                                    }
+                                }
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("}}\n"));
+                            } else {
+                                // Use backticks via open3 for commands that can be serialized
+                                // to a bash command string (Simple, Pipeline, Subshell, Redirect).
+                                let cmd_str = generator.generate_command_string_for_system(cmd);
+                                let cmd_literal =
+                                    generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("my $output_ps_{};\n", global_counter));
+                                result.push_str(&generator.indent());
+                                result.push_str("{\n");
+                                result.push_str(&generator.indent());
+                                result.push_str("my ($in, $out);\n");
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!(
+                                    "my $pid = open3($in, $out, undef, 'bash', '-c', {});\n",
+                                    cmd_literal
+                                ));
+                                result.push_str(&generator.indent());
+                                result.push_str("close $in or croak 'Close failed: $OS_ERROR';\n");
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("$output_ps_{} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};\n", global_counter));
+                                result.push_str(&generator.indent());
+                                result.push_str("close $out or croak 'Close failed: $OS_ERROR';\n");
+                                result.push_str(&generator.indent());
+                                result.push_str("waitpid $pid, 0;\n$CHILD_ERROR = $? >> 8;\n");
+                                result.push_str(&generator.indent());
+                                result.push_str("}\n");
+                            }
+
+                            // Write the output to the temporary file
+                            let fh_var = format!("fh_ps_{}", global_counter);
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("use File::Path qw(make_path);\n"));
                             result.push_str(&generator.indent());
                             result.push_str(&format!(
-                                "$output_{} = $output_ps_{};\n",
-                                pid, global_counter
+                                "my $temp_dir_{} = dirname(${});\n",
+                                global_counter, temp_var
+                            ));
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!(
+                                "if (!-d $temp_dir_{}) {{ make_path($temp_dir_{}); }}\n",
+                                global_counter, global_counter
+                            ));
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("open my ${}, '>', ${} or croak \"Cannot create temp file: $ERRNO\\n\";\n", fh_var, temp_var));
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!(
+                                "print {{${}}} $output_ps_{};\n",
+                                fh_var, global_counter
+                            ));
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!(
+                                "close ${} or croak \"Close failed: $ERRNO\\n\";\n",
+                                fh_var
+                            ));
+
+                            // Redirect STDIN to read from the process substitution output
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("open STDIN, \'<\', ${} or croak \"Cannot open process substitution: $ERRNO\\n\";\n", temp_var));
+
+                            // If there is an active pipeline, feed the process-substitution
+                            // output into the pipeline buffer so the next command (e.g. sort)
+                            // can read it when it references $output_<id>.
+                            if let Some(pid) = generator.current_pipeline_output_id() {
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!(
+                                    "$output_{} = $output_ps_{};\n",
+                                    pid, global_counter
+                                ));
+                            }
+
+                            process_sub_files.push((
+                                temp_var,
+                                format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter),
                             ));
                         }
-
-                        process_sub_files.push((
-                            temp_var,
-                            format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter),
-                        ));
                     }
                     _ => {
                         // Handle other redirect types, but not here-strings, output, append,
@@ -1193,10 +1257,16 @@ pub fn generate_command_impl_with_input(
                 result.push_str(&generator.indent());
                 result.push_str("};\n");
             }
-            if stderr_scope_opened {
+                        if stderr_scope_opened {
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());
-                result.push_str("};\n");
+                result.push_str("};
+");
+            }
+            // Emit deferred process-substitution cleanup code (close FIFO, wait for child, unlink)
+            for cleanup in &deferred_cleanup {
+                result.push_str(&generator.indent());
+                result.push_str(cleanup);
             }
             //             eprintln!("DEBUG: Final redirect result: {}", result);
             result
