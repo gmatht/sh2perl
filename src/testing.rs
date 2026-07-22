@@ -2317,6 +2317,7 @@ pub fn test_all_examples_next_fail(
     // All tests passed (only reached when running all tests, not a specific test)
     if target_example_index.is_none() {
         println!("\n\n");
+        println!("TESTS COMPLETED: {} passed, 0 failed out of {}", passed_tests, total_tests);
         println!("ALL TESTS PASSED! 🎉");
         println!("Total tests: {}", total_tests);
         println!("Passed: {} (100%)", passed_tests);
@@ -2934,6 +2935,7 @@ pub fn test_all_examples_next_fail_unlimited(
     // Print final summary
     println!("\n\n{}", "=".repeat(80));
     if failed_tests == 0 {
+        println!("TESTS COMPLETED: {} passed, 0 failed out of {}", passed_tests, total_tests);
         println!("ALL TESTS PASSED! 🎉");
         println!("Total tests: {}", total_tests);
         println!("Passed: {} (100%)", passed_tests);
