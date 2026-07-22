@@ -480,6 +480,15 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             output.push_str("}\n");
         }
         _ => {
+            // For `let` commands, the generated code now produces
+            // $CHILD_ERROR = ($main_exit_code = ...) ? 0 : 1 which follows
+            // bash exit-code convention (0 = success, 1 = failure).
+            // The while loop needs the Perl-truthy value (non-zero = enter),
+            // so we negate: while (!(...)) { ... }.
+            let is_let = matches!(
+                &*while_loop.condition,
+                Command::Simple(cmd) if cmd.name == "let"
+            );
             output.push_str(&format!("{} ( ", loop_keyword));
             generator.suppress_set_e_depth += 1;
             let mut cond = generator.generate_command(&while_loop.condition);
@@ -487,7 +496,11 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             let cond = cond
                 .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                 .to_string();
-            output.push_str(&cond);
+            if is_let {
+                output.push_str(&format!("!({})", cond));
+            } else {
+                output.push_str(&cond);
+            }
             output.push_str(" ) {\n");
             // Generate body
             generator.indent_level += 1;

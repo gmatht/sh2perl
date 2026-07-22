@@ -1397,7 +1397,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     }
                     "let" => {
                         // let is a bash builtin for arithmetic evaluation.
-                        // Convert each argument to a Perl arithmetic expression.
+                        // bash: `let expr` exits 0 if the last expression evaluates to
+                        // a non-zero value, and 1 if it evaluates to zero.
+                        // We must produce a SINGLE Perl statement so that callers that
+                        // embed this inside an expression (e.g. generate_combined_test_condition
+                        // wraps non-TestExpression in `!(...)`) do not get a syntax error.
+                        // The single statement sets both $main_exit_code and $CHILD_ERROR.
                         for arg in cmd.args.iter() {
                             let expr = match arg {
                                 Word::Literal(s, _) => s.clone(),
@@ -1406,7 +1411,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             let perl_expr = generator.convert_arithmetic_to_perl(&expr);
                             output.push_str(&generator.indent());
                             output.push_str(&format!(
-                                "$main_exit_code = {};\n",
+                                "$CHILD_ERROR = ($main_exit_code = {}) ? 0 : 1;\n",
                                 perl_expr
                             ));
                         }
