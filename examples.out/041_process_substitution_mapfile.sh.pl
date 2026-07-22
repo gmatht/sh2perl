@@ -34,6 +34,7 @@ if (!-d $temp_dir_fh_1) { make_path($temp_dir_fh_1); }
 open my $fh_ps_fh_1, '>', $temp_file_ps_fh_1 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_1} $output_ps_fh_1;
 close $fh_ps_fh_1 or croak "Close failed: $ERRNO\n";
+open STDIN, '<', $temp_file_ps_fh_1 or croak "Cannot open process substitution: $ERRNO\n";
 my @lines = ();
 if (open(my $mapfile_fh, '<', $temp_file_ps_fh_1)) {
     while (my $line = <$mapfile_fh>) {

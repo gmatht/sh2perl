@@ -155,7 +155,9 @@ sub get_file_size {
     return;
 }
 get_file_size('000__01_file_directory_operations.sh');
+my $files;
 my @files = (do { my $_result = `ls -1 *.sh examples/*.sh 2>/dev/null`; chomp $_result; $CHILD_ERROR = $? >> 8; split("\n", $_result); });
+my %files;
 print "Shell scripts found: " . scalar(@files) . "\n";
 $CHILD_ERROR = 0;
 my $file;
