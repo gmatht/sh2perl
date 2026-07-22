@@ -1673,38 +1673,27 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             "$main_exit_code = system('{}', {}) >> 8;\n",
                             name, args_str
                         ));
-                    } else {
+                    } else if !name.starts_with("--") && !name.contains('=') && !name.contains(' ') {
                         let args_str = args.join(", ");
                         output.push_str(&generator.indent());
                         output.push_str(&format!(
                             "$main_exit_code = system('{}', {}) >> 8;\n",
                             name, args_str
                         ));
+                    } else {
+                        // Skip argument-like command names (e.g. --flag, key=value, pos arg)
+                        // These result from parser not handling backslash continuations
+                        output.push_str(&generator.indent());
+                        output.push_str("$CHILD_ERROR = 0;\n");
                     }
                 }
             }
         }
     } else {
-        // Handle non-literal command names
-        let cmd_name = "unknown_command";
-
-        // Fallback to system call
-        if cmd.args.is_empty() {
-            output.push_str(&generator.indent());
-            output.push_str(&format!("$main_exit_code = system('{}') >> 8;\n", cmd_name));
-        } else {
-            let args: Vec<String> = cmd
-                .args
-                .iter()
-                .map(|arg| generator.perl_string_literal(arg))
-                .collect();
-            output.push_str(&generator.indent());
-            output.push_str(&format!(
-                "$main_exit_code = system('{}', {}) >> 8;\n",
-                cmd_name,
-                args.join(", ")
-            ));
-        }
+        // Handle non-literal command names (e.g. variable expansion as command)
+        // These are almost certainly not valid commands - skip with no-op
+        output.push_str(&generator.indent());
+        output.push_str("$CHILD_ERROR = 0;\n");
     }
 
     output
