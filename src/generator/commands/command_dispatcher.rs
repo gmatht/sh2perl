@@ -364,7 +364,7 @@ pub fn generate_command_impl_with_input(
                                 result.push_str("my ($in, $out);\n");
                                 result.push_str(&generator.indent());
                                 result.push_str(&format!(
-                                    "my $pid = open3($in, $out, undef, 'bash', '-c', {});\n",
+                                    "my $pid = open3($in, $out, '>&STDERR', 'bash', '-c', {});\n",
                                     cmd_literal
                                 ));
                                 result.push_str(&generator.indent());

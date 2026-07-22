@@ -539,9 +539,9 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                 .collect();
 
             // For simple commands, fall back to system command for now
-            let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+            let (in_var, out_var, _err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
             if args.is_empty() {
-                format!(" my ({}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
+                format!(" my ({}); my {} = open3({}, {}, '>&STDERR', '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
             } else {
                 let formatted_args = args
                     .iter()
@@ -552,7 +552,7 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!(" my ({}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, err_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                format!(" my ({}); my {} = open3({}, {}, '>&STDERR', '{}', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
             }
         }
         Command::Pipeline(pipeline) => {
@@ -631,10 +631,10 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
         }
         _ => {
             // For other command types, use system command fallback
-            let (in_var, out_var, err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
+            let (in_var, out_var, _err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
             let cmd_str = generator.generate_command_string_for_system(cmd);
             let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-            format!(" my ({}); my {} = open3({}, {}, {}, 'bash', '-c', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, err_var, cmd_lit, in_var, result_var, out_var, out_var, pid_var, result_var)
+            format!(" my ({}); my {} = open3({}, {}, '>&STDERR', 'bash', '-c', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, cmd_lit, in_var, result_var, out_var, out_var, pid_var, result_var)
         }
     }
 }

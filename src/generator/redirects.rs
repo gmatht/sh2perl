@@ -189,7 +189,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
             let cmd_literal = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
             output.push_str(&format!(
                 "my ($in, $out);
-my $pid = open3($in, $out, undef, 'bash', '-c', {});
+my $pid = open3($in, $out, '>&STDERR', 'bash', '-c', {});
 close $in or croak 'Close failed: $OS_ERROR';
 my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
 close $out or croak 'Close failed: $OS_ERROR';

@@ -250,14 +250,12 @@ fn generate_shell_command_substitution(generator: &mut Generator, cmd: &Command)
 
     let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
     format!(
-        "do {{\n{}    my ({}, {}, {});\n    my $pid = open3({}, {}, {}, 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    $result =~ s/\\n+\\z//msx;\n    $result;\n}}",
+        "do {{\n{}    my ({}, {});\n    my $pid = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    $result =~ s/\\n+\\z//msx;\n    $result;\n}}",
         env_setup,
         in_var,
         out_var,
-        err_var,
         in_var,
         out_var,
-        err_var,
         command_lit,
         in_var,
         out_var,
@@ -1766,10 +1764,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let (in_var, out_var, err_var, pid_var, result_var) =
                                 generator.get_unique_ipc_vars();
                             if args.is_empty() {
-                                format!("do {{\n    my ({}, {}, {});\n    my {} = open3({}, {}, {}, {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}\n}}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!("do {{\n    my ({}, {});\n    my {} = open3({}, {}, '>&STDERR', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}\n}}", in_var, out_var, pid_var, in_var, out_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                             } else {
                                 let formatted_args = args.join(", ");
-                                format!("do {{\n    my ({}, {}, {});\n    my {} = open3({}, {}, {}, {}, {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}\n}}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!("do {{\n    my ({}, {});\n    my {} = open3({}, {}, '>&STDERR', {}, {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}\n}}", in_var, out_var, pid_var, in_var, out_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         }
                     } else {
@@ -1784,10 +1782,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         let (in_var, out_var, err_var, pid_var, result_var) =
                             generator.get_unique_ipc_vars();
                         if args.is_empty() {
-                            format!("do {{\n    my ({}, {}, {});\n    my {} = open3({}, {}, {}, {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}\n}}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
+                            format!("do {{\n    my ({}, {});\n    my {} = open3({}, {}, '>&STDERR', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}\n}}", in_var, out_var, pid_var, in_var, out_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                         } else {
                             let formatted_args = args.join(", ");
-                            format!("do {{\n    my ({}, {}, {});\n    my {} = open3({}, {}, {}, {}, {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}\n}}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
+                            format!("do {{\n    my ({}, {});\n    my {} = open3({}, {}, '>&STDERR', {}, {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid {}, 0;\n    {}\n}}", in_var, out_var, pid_var, in_var, out_var, cmd_name, formatted_args, in_var, result_var, out_var, out_var, pid_var, result_var)
                         }
                     }
                 }
