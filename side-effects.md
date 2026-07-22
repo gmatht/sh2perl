@@ -50,14 +50,14 @@ This tries to **execute** the `.sh` file. But shell scripts are
 **not executable** (`-rw-rw-r--`). The `system()` call fails with
 "Permission denied" before the test logic ever runs.
 
-The correct fallback would be:
+The fix was applied at `simple_commands.rs:1552`:
 
 ```perl
 $main_exit_code = system('bash', 'examples/script.sh') >> 8;
 ```
 
-This passes the script as an argument to `bash`, which works regardless
-of the execute bit.
+This passes the script as an argument to `bash` instead of trying to
+execute it directly, which works regardless of the execute bit.
 
 ## Which Differences Are Real vs Non-Determinism
 

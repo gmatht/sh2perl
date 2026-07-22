@@ -1549,7 +1549,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     ));
                 } else if cmd.args.is_empty() {
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("$main_exit_code = system('{}') >> 8;\n", name));
+                    output.push_str(&format!("$main_exit_code = system('bash', '{}') >> 8;\n", name));
                 } else {
                     let args: Vec<String> = if name == "perl" {
                         // Special handling for perl command - embed Perl code directly instead of system call
