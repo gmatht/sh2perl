@@ -12,40 +12,28 @@ my $__set_e        = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '063_15_complex_function_definition.sh';
-my $MAGIC_20 = 20;
-my $MAGIC_10 = 10;
-my $MAGIC_3  = 3;
-my $MAGIC_7  = 7;
-
-
-sub complex_func {
-    my $x = "$_[0]";
-    my $y = "$_[1]";
-    my $result = eval { int( $x + $y ) } // "";
-    do {
-    my $__echo_line = "Sum: $result";
-    print $__echo_line;
-    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
-        print "\n";
-        $__echo_line .= "\n";
-    }
-    $output .= $__echo_line;
-};
+$PROGRAM_NAME = 'test_system_builtin.sh';
+print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
+my $result1;
+my @result1;
+my %result1;
+$result1 = do { my $command = 'ls -la'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
+my $result2;
+my @result2;
+my %result2;
+$result2 = do {
+    require File::Find;
+    my @find_results;
+    File::Find::find(sub { if ($_ =~ /^.*\.txt$/msx) { push @find_results, $File::Find::name; } }, q{.});
+    my $result = join "\n", @find_results;
+    if ($result ne q{}) { $result .= "\n"; }
     $CHILD_ERROR = 0;
-    do {
-    my $__echo_line = "Args: $x $y";
-    print $__echo_line;
-    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
-        print "\n";
-        $__echo_line .= "\n";
-    }
-    $output .= $__echo_line;
+    $result;
 };
-    $CHILD_ERROR = 0;
-    return;
-}
-complex_func(q{3}, q{7});
-complex_func('10', '20');
+print "Results:\n";
+print $result1;
+if ( !( ($result1) =~ m{\n\z}msx ) ) { print "\n"; }
+print $result2;
+if ( !( ($result2) =~ m{\n\z}msx ) ) { print "\n"; }
 
 exit $main_exit_code;
