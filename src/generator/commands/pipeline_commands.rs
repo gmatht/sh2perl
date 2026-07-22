@@ -162,24 +162,23 @@ fn generate_command_using_builtins(
                                 output.push_str(&echo_output);
                             } else {
                                 // For other commands, execute and capture output
-                                let (in_var, out_var, err_var, pid_var, _result_var) =
+                                let (in_var, out_var, _err_var, pid_var, _result_var) =
                                     generator.get_unique_ipc_vars();
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("\n"));
                                 output.push_str(&format!(
-                                    "my ({}, {}, {});\n",
-                                    in_var, out_var, err_var
+                                    "my ({}, {});\n",
+                                    in_var, out_var
                                 ));
                                 let cmd_str =
                                     generator.generate_command_string_for_system(cmd);
                                 let cmd_literal = generator
                                     .perl_string_literal_no_interp(&Word::literal(cmd_str));
                                 output.push_str(&format!(
-                                    "my {} = open3({}, {}, {}, 'bash', '-c', {});\n",
+                                    "my {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n",
                                     pid_var,
                                     in_var,
                                     out_var,
-                                    err_var,
                                     cmd_literal
                                 ));
                                 output.push_str(&format!(
@@ -200,20 +199,19 @@ fn generate_command_using_builtins(
                             }
                         } else {
                             // For other command types, execute and capture output
-                            let (in_var, out_var, err_var, pid_var, _result_var) =
+                            let (in_var, out_var, _err_var, pid_var, _result_var) =
                                 generator.get_unique_ipc_vars();
                             output.push_str(&generator.indent());
                             output.push_str(&format!("\n"));
                             output
-                                .push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
+                                .push_str(&format!("my ({}, {});\n", in_var, out_var));
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
                             output.push_str(&format!(
-                                "my {} = open3({}, {}, {}, 'bash', '-c', {});\n",
+                                "my {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n",
                                 pid_var,
                                 in_var,
                                 out_var,
-                                err_var,
                                 cmd_literal
                             ));
                             output.push_str(&format!(
@@ -234,19 +232,18 @@ fn generate_command_using_builtins(
                         }
                     } else {
                         // For non-simple commands, execute and capture output
-                        let (in_var, out_var, err_var, pid_var, _result_var) =
+                        let (in_var, out_var, _err_var, pid_var, _result_var) =
                             generator.get_unique_ipc_vars();
                         output.push_str(&generator.indent());
                         output.push_str(&format!("\n"));
-                        output.push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
+                        output.push_str(&format!("my ({}, {});\n", in_var, out_var));
                         let cmd_str = generator.generate_command_string_for_system(cmd);
                         let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
                         output.push_str(&format!(
-                            "my {} = open3({}, {}, {}, 'bash', '-c', {});\n",
+                            "my {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n",
                             pid_var,
                             in_var,
                             out_var,
-                            err_var,
                             cmd_literal
                         ));
                         output.push_str(&format!(
@@ -558,28 +555,28 @@ fn generate_command_using_builtins(
                 // Fall back to sh -c for other commands
                 let cmd_str = generator.generate_command_string_for_system(sub_cmd);
                 let perl_str = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-                let (in_v, out_v, err_v, pid_v, _) = generator.get_unique_ipc_vars();
+                let (in_v, out_v, _err_v, pid_v, _) = generator.get_unique_ipc_vars();
                 result.push_str(&format!(
-                    "my ({in_v}, {out_v}, {err_v});\nmy {pid_v} = open3({in_v}, {out_v}, {err_v}, 'sh', '-c', {perl_str});\nclose {in_v} or croak 'Close failed: $OS_ERROR';\n${output_var} .= do {{ local $INPUT_RECORD_SEPARATOR = undef; <{out_v}> }};\nclose {out_v} or croak 'Close failed: $OS_ERROR';\nwaitpid {pid_v}, 0;\n"
+                    "my ({in_v}, {out_v});\nmy {pid_v} = open3({in_v}, {out_v}, '>&STDERR', 'sh', '-c', {perl_str});\nclose {in_v} or croak 'Close failed: $OS_ERROR';\n${output_var} .= do {{ local $INPUT_RECORD_SEPARATOR = undef; <{out_v}> }};\nclose {out_v} or croak 'Close failed: $OS_ERROR';\nwaitpid {pid_v}, 0;\n"
                 ));
             }
             result
         }
         _ => {
             // Other non-simple commands - use system call fallback
-            let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+            let (in_var, out_var, _err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
             if input_var.is_empty() {
                 // First command in pipeline
                 let cmd_str = generator.generate_command_string_for_system(command);
                 let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
-                format!("\nmy ({});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
-                    in_var, pid_var, in_var, out_var, err_var, cmd_literal, in_var, out_var, output_var, out_var, pid_var)
+                format!("\nmy ({});\nmy {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
+                    in_var, pid_var, in_var, out_var, cmd_literal, in_var, out_var, output_var, out_var, pid_var)
             } else {
                 // Subsequent command - use double quotes so Perl interpolates $var
                 let pipe_cmd = format!("echo \"${{{}}}\" | {}", input_var, generator.generate_command_string_for_system(command));
                 let pipe_literal = generator.perl_string_literal_force_interp(&Word::literal(pipe_cmd));
-                format!("\nmy ({});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
-                    in_var, pid_var, in_var, out_var, err_var, pipe_literal, in_var, out_var, output_var, out_var, pid_var)
+                format!("\nmy ({});\nmy {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
+                    in_var, pid_var, in_var, out_var, pipe_literal, in_var, out_var, output_var, out_var, pid_var)
             }
         }
     }

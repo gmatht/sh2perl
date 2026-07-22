@@ -1008,12 +1008,12 @@ fn generate_system_call_fallback(
         .collect();
     let args_str = args_perl.join(", ");
 
-    let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+    let (in_var, out_var, _err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
     if input_var.is_empty() {
         // First command in pipeline - pass program name and args directly to open3
         format!(
-            "\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, '{}', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
-            in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var
+            "\nmy ({}, {});\nmy {} = open3({}, {}, '>&STDERR', '{}', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
+            in_var, out_var, pid_var, in_var, out_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var
         )
     } else {
         // Subsequent command - build a full shell command string and pass it as
@@ -1029,8 +1029,8 @@ fn generate_system_call_fallback(
             .replace("\n", "\\n");
         let command_lit = format!("\"echo \\\"${}\\\" | {}\"", input_var, escaped_cmd);
         format!(
-            "\nmy ({}, {}, {});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
-            in_var, out_var, err_var, pid_var, in_var, out_var, err_var, command_lit, in_var, output_var, out_var, out_var, pid_var
+            "\nmy ({}, {});\nmy {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
+            in_var, out_var, pid_var, in_var, out_var, command_lit, in_var, output_var, out_var, out_var, pid_var
         )
     }
 }
