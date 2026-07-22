@@ -28,14 +28,19 @@ Partially fixed:
   Added `Block` handling in `generate_while_loop_impl`.
 - Fixed: `$(...)` command substitutions inside test expression operands (e.g.
   `[ "$(wc -l < "$file")" -gt 10 ]`) now convert to `qx{...}`.
+- Fixed: Commands that look like arguments (starting with `--`, containing `=`
+  or spaces) are now treated as no-ops instead of generating failing `system()`
+  calls, improving exit code from 255 to 1.
 
 Remaining issues:
 1. Background commands via `fork()`/`exec()` may not work correctly in all cases.
 2. Several features like `trap`, `shopt`, `eval` with complex expansions, and
    brace expansion with ranges produce incorrect or incomplete Perl.
-3. Exit code is 255 instead of 0 due to failing `system()` calls for
-   unrecognized commands (translation of function call arguments with
-   backslash line continuations parsed incorrectly).
+3. Exit code is 1 instead of 0 due to pipeline failures from commands that
+   don't exist (like `diff <(sort file1.txt) <(sort file2.txt)` where files
+   are missing).
+4. Backslash line continuations are not handled by the parser, causing function
+   call arguments on continuation lines to be parsed as separate commands.
 
 ### 064_hard_to_generate.sh
 Partially fixed:
@@ -62,3 +67,7 @@ Remaining issues:
    "will not stay shared" warnings and may not capture variables correctly.
 6. Sort ordering in generated Perl differs from system `sort` command due to
    locale/collation differences.
+7. Brace expansion ranges in mixed groups (e.g. `{1..10,20,30..40}`) are
+   correctly treated as literals (matching bash behavior), but brace expansion
+   combined with other text (like `file_{a..z}_{...}.{txt,log,dat}`) produces
+   a cartesian product in bash that requires more sophisticated handling.

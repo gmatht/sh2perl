@@ -874,6 +874,16 @@ fn generate_system_call_fallback(
     input_var: &str,
     output_var: &str,
 ) -> String {
+    // Guard: if command_name looks like an argument (starts with --, or is
+    // a value assignment like --flag="value", or contains spaces which
+    // indicate it was a positional argument incorrectly parsed as a command),
+    // treat it as a no-op. This can happen when bash backslash continuations
+    // are not handled by the parser, causing arguments on continuation lines
+    // to be parsed as separate commands.
+    if command_name.starts_with("--") || command_name.contains('=') || command_name.contains(' ') {
+        return format!("$CHILD_ERROR = 0;\n");
+    }
+
     // Check if this is a function call with glob patterns
     if generator.declared_functions.contains(command_name) {
         let has_glob_patterns = cmd.args.iter().any(|arg| match arg {
