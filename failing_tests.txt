@@ -1,3 +1,28 @@
-063_11_complex_while_loop.sh	error: PerlExecution timed out after 30.0 seconds
-063_hard_to_parse.sh	error: PerlExecution timed out after 30.0 seconds
-064_hard_to_generate.sh	Failed due to: stdout mismatch
+000__03_file_manipulation_commands.sh
+000__04a_basic_command_substitution.sh
+000__04b_file_directory_operations.sh
+000__04c_text_processing_commands.sh
+000__04e_file_manipulation.sh
+000__04f_output_formatting.sh
+000__04h_complex_examples.sh
+000__06_text_processing_commands.sh
+002_control_flow.sh
+003_pipeline.sh
+004_test_quoted.sh
+005_args.sh
+006_misc.sh
+010_pattern_matching.sh
+011_brace_expansion.sh
+013_parameter_expansion.sh
+016_grep_basic.sh
+017_grep_context.sh
+018_grep_params.sh
+062_13_simple_test_expressions.sh
+062_14_complex_array_operations.sh
+063_hard_to_parse.sh
+064_hard_to_generate.sh
+077_backslash_continuation.sh
+079_heredoc_interpolation.sh
+080_process_sub_pipeline.sh
+083_process_sub_missing_files.sh
+073_trap_signal.sh
