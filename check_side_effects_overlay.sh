@@ -30,7 +30,7 @@ for MODE in bash perl; do
         fi
     fi
 
-    CHANGES=$(find "$UPPER" \( -type f -o -type d \) -not -name ".*" 2>/dev/null | grep -v "^$UPPER$" | sed "s|$UPPER||" | sort -u || true)
+    CHANGES=$(find "$UPPER" \( -type f -o -type d -o -type p -o -type l \) -not -name ".*" 2>/dev/null | grep -v "^$UPPER$" | sed "s|$UPPER||" | sort -u || true)
     CHANGE_COUNT=$(echo "$CHANGES" | grep -c . 2>/dev/null || true)
     : "${CHANGE_COUNT:=0}"
     echo "  Files changed: $CHANGE_COUNT"
