@@ -9,6 +9,7 @@ my @builtins = qw(
     find ls grep sed awk sort uniq head tail cat echo printf
     touch mkdir rmdir rm cp mv chmod chown ln basename dirname
     date sleep wc kill ps cd pwd perl
+    whoami uname hostname bc
 );
 
 # Read exemptions from allowed_qx_calls.txt (same file the Rust check uses).
@@ -120,7 +121,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         my @quoted_args = $open3_args =~ /'([^']*)'/g;
         # Skip the first 3 arguments which are always filehandle variables ($in, $out, $err)
         # The 4th argument (index 3) is the program/command
-        next if @quoted_args < 3;
+        next if @quoted_args < 1;
         my $prog = $quoted_args[0];
         # If the program is 'bash' and '-c' follows, check the INNER command for builtins.
         # The 'bash -c' wrapper itself is not the cheat — the cheat is wrapping a simple

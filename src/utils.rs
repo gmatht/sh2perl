@@ -381,6 +381,7 @@ pub fn check_perl_no_open3_builtins(perl_code: &str) -> Result<(), String> {
         "declare", "local", "read", "printf", "echo", "test", "[", "[[", "let", "expr", "bc", "dc",
         "seq", "factor", "yes", "true", "false", "strings", ":", "exit", "return", "break",
         "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl",
+        "whoami", "uname", "hostname", "bc",
     ];
 
     let mut violations = Vec::new();
@@ -445,6 +446,7 @@ pub fn check_perl_no_system_builtins(perl_code: &str) -> Result<(), String> {
         "declare", "local", "read", "printf", "echo", "test", "[", "[[", "let", "expr", "bc", "dc",
         "seq", "factor", "yes", "true", "false", "strings", ":", "exit", "return", "break",
         "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl",
+        "whoami", "uname", "hostname", "bc",
     ];
 
     let mut violations = Vec::new();
@@ -535,6 +537,7 @@ pub fn check_perl_no_qx_builtins(perl_code: &str, exemptions: &[String]) -> Resu
         "declare", "local", "read", "printf", "echo", "test", "[", "[[", "let", "expr", "bc", "dc",
         "seq", "factor", "yes", "true", "false", "strings", ":", "exit", "return", "break",
         "continue", "shift", "unshift", "pop", "push", "splice", "join", "split", "perl",
+        "whoami", "uname", "hostname", "bc",
     ];
 
     let is_exempt = |cmd: &str| -> bool {
