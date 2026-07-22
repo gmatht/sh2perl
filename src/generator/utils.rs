@@ -436,9 +436,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             let (in_var, out_var, err_var, pid_var, result_var) =
                                 generator.get_unique_ipc_vars();
                             if args.is_empty() {
-                                format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, name, in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!("do {{ my ({}, {}); my {} = open3({}, {}, '>&STDERR', '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, pid_var, in_var, out_var, name, in_var, result_var, out_var, out_var, pid_var, result_var)
                             } else {
-                                format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, '{}', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
+                                format!("do {{ my ({}, {}); my {} = open3({}, {}, '>&STDERR', '{}', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, pid_var, in_var, out_var, name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
                             }
                         }
                     } else {
@@ -453,9 +453,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         let (in_var, out_var, err_var, pid_var, result_var) =
                             generator.get_unique_ipc_vars();
                         if args.is_empty() {
-                            format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
+                            format!("do {{ my ({}, {}); my {} = open3({}, {}, '>&STDERR', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, pid_var, in_var, out_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
                         } else {
-                            format!("do {{ my ({}, {}, {}); my {} = open3({}, {}, {}, {}, {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
+                            format!("do {{ my ({}, {}); my {} = open3({}, {}, '>&STDERR', {}, {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, pid_var, in_var, out_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
                         }
                     }
                 }
@@ -474,7 +474,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     // not interpreted by the generated Perl code.
                     let cmd_str = generator.generate_command_string_for_system(cmd);
                     let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-                    format!(" my ({}, {}, {}); my {} = open3({}, {}, {}, 'bash', '-c', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, out_var, err_var, pid_var, in_var, out_var, err_var, cmd_lit, in_var, result_var, out_var, out_var, pid_var, result_var)
+                    format!(" my ({}, {}); my {} = open3({}, {}, '>&STDERR', 'bash', '-c', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, out_var, pid_var, in_var, out_var, cmd_lit, in_var, result_var, out_var, out_var, pid_var, result_var)
                 }
             }
         }
