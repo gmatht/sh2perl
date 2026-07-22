@@ -9,6 +9,7 @@ use IPC::Open3;
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = 'test_simple_function.sh';
@@ -36,11 +37,13 @@ sub get_file_size {
     } : q{};
 };
     do {
-    my $output = "File $file has $size bytes";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "File $file has $size bytes";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
     $CHILD_ERROR = 0;
     return;

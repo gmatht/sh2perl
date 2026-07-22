@@ -9,6 +9,7 @@ use IPC::Open3;
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '063_01_deeply_nested_arithmetic.sh';
@@ -31,11 +32,13 @@ my $m;
 my $n;
 $result = eval { int( ($a + $b) * ($c - $d) / ($e % $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ) } // "";
 do {
-    my $output = "Deeply nested arithmetic result: $result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Deeply nested arithmetic result: $result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 

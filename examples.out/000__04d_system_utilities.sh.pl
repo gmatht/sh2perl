@@ -9,6 +9,7 @@ use IPC::Open3;
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04d_system_utilities.sh';
@@ -20,11 +21,13 @@ $formatted_date = do {
 require POSIX; POSIX::strftime('%Y-%m-%d', localtime(time())) . "\n"
 };
 do {
-    my $output = "Formatted date: $formatted_date";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Formatted date: $formatted_date";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $sleep_duration;
@@ -32,11 +35,13 @@ my @sleep_duration;
 my %sleep_duration;
 $sleep_duration = ("1");
 do {
-    my $output = "Sleeping for $sleep_duration seconds...";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Sleeping for $sleep_duration seconds...";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 require Time::HiRes; Time::HiRes::sleep($sleep_duration);

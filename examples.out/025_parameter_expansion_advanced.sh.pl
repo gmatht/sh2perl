@@ -10,6 +10,7 @@ use IPC::Open3;
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '025_parameter_expansion_advanced.sh';
@@ -22,19 +23,23 @@ my @path;
 my %path;
 $path = "/tmp/file.txt";
 do {
-    my $output = basename(${path});
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = basename(${path});
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 do {
-    my $output = dirname(${path});
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = dirname(${path});
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $s2;

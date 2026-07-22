@@ -23,6 +23,7 @@ sub capture_stdout {
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__02_output_formatting_commands.sh';
@@ -32,11 +33,13 @@ my @echo_result;
 my %echo_result;
 $echo_result = ("Hello from backticks");
 do {
-    my $output = "Echo result: $echo_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Echo result: $echo_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $printf_result;
@@ -45,11 +48,13 @@ my %printf_result;
 $printf_result = sprintf("Number: %d, String: %s\n", '42', "test");
 ;
 do {
-    my $output = "Printf result: $printf_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Printf result: $printf_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 print "=== Compression Commands ===\n";
@@ -94,11 +99,13 @@ $sha256_result = do {
 };
 ;
 do {
-    my $output = "SHA256 result: $sha256_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "SHA256 result: $sha256_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $sha512_result;
@@ -128,11 +135,13 @@ $sha512_result = do {
 };
 ;
 do {
-    my $output = "SHA512 result: $sha512_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "SHA512 result: $sha512_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $strings_result;
@@ -212,11 +221,13 @@ $tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     $output_1;
 }; $_pipeline_result; };
 do {
-    my $output = "Tee result: $tee_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Tee result: $tee_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 print "=== Perl Command ===\n";
@@ -235,11 +246,13 @@ $perl_result = do {
     $result;
 };
 do {
-    my $output = "Perl result: $perl_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Perl result: $perl_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 if ( -e "test_checksum.txt" ) {

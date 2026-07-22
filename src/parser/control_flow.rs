@@ -529,7 +529,83 @@ pub fn parse_while_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     let body = Block {
         commands: body_commands,
     };
-    Ok(Command::While(WhileLoop { condition, body }))
+    Ok(Command::While(WhileLoop { condition, body, is_until: false }))
+}
+
+pub fn parse_until_loop(parser: &mut Parser) -> Result<Command, ParserError> {
+    parser.lexer.consume(Token::Until)?;
+    parser.lexer.skip_whitespace_and_comments();
+    let condition = Box::new(parser.parse_command()?);
+    match parser.lexer.peek() {
+        Some(Token::Semicolon) | Some(Token::Newline) | Some(Token::CarriageReturn) => {
+            parser.lexer.next();
+        }
+        _ => {}
+    }
+    while matches!(
+        parser.lexer.peek(),
+        Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
+    ) {
+        parser.lexer.next();
+    }
+    parser.lexer.consume(Token::Do)?;
+    while matches!(
+        parser.lexer.peek(),
+        Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
+    ) {
+        parser.lexer.next();
+    }
+    let mut body_commands = Vec::new();
+    loop {
+        while matches!(
+            parser.lexer.peek(),
+            Some(
+                Token::Space
+                    | Token::Tab
+                    | Token::Comment
+                    | Token::Newline
+                    | Token::CarriageReturn
+                    | Token::Semicolon
+            )
+        ) {
+            parser.lexer.next();
+        }
+        match parser.lexer.peek() {
+            Some(Token::Done) | None => break,
+            _ => {
+                let pre_pos = parser.lexer.current_position();
+                let command = parser.parse_command()?;
+                body_commands.push(command);
+                if parser.lexer.current_position() == pre_pos {
+                    if parser.lexer.next().is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    loop {
+        match parser.lexer.peek() {
+            Some(Token::Space)
+            | Some(Token::Tab)
+            | Some(Token::Comment)
+            | Some(Token::Newline | Token::CarriageReturn) => {
+                parser.lexer.next();
+                continue;
+            }
+            Some(Token::Semicolon) => {
+                parser.lexer.next();
+                continue;
+            }
+            _ => {}
+        }
+        break;
+    }
+    parser.lexer.consume(Token::Done)?;
+    let body = Block {
+        commands: body_commands,
+    };
+    Ok(Command::While(WhileLoop { condition, body, is_until: true }))
 }
 
 pub fn parse_for_loop(parser: &mut Parser) -> Result<Command, ParserError> {
@@ -1642,6 +1718,10 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                     }
                 }
                 expression_parts.push(format!("$(({}))", arith));
+            }
+            Some(Token::Slash) => {
+                expression_parts.push("/".to_string());
+                lexer.next();
             }
             Some(Token::Space) | Some(Token::Tab) => {
                 lexer.next(); // skip whitespace

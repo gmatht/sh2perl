@@ -9,6 +9,7 @@ use IPC::Open3;
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '037_pattern_matching_extglob.sh';
@@ -26,14 +27,14 @@ print "== extglob ==\n";
 # extglob option enabled
 $f1 = "file.js";
 $f2 = "thing.min.js";
-if ($f1 =~ /^(?!.*[.]min).*[.]js$/msx) {
+if ($f1 =~ /^(?!.*.*[.]min[.]js$).*[.]js$/msx) {
         print 'f1-ok' . "\n";
     $CHILD_ERROR = 0;
     $CHILD_ERROR = 0;
 } else {
     $CHILD_ERROR = 1;
 }
-if (!($f2 =~ /^(?!.*[.]min).*[.]js$/msx)) {
+if (!($f2 =~ /^(?!.*.*[.]min[.]js$).*[.]js$/msx)) {
         print 'f2-filtered' . "\n";
     $CHILD_ERROR = 0;
 }

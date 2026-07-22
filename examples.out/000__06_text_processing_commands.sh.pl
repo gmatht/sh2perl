@@ -10,11 +10,12 @@ use File::Path qw(make_path remove_tree);
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__06_text_processing_commands.sh';
-my $MAGIC_3 = 3;
 my $MAGIC_5 = 5;
+my $MAGIC_3 = 3;
 
 print "=== Text Processing Commands ===\n";
 my $file_content;
@@ -106,11 +107,13 @@ $sed_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     $output_120;
 }; $_pipeline_result; };
 do {
-    my $output = "Sed result: $sed_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Sed result: $sed_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $awk_result;
@@ -139,11 +142,13 @@ $awk_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     $output_121;
 }; $_pipeline_result; };
 do {
-    my $output = "Awk sum result: $awk_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Awk sum result: $awk_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $sort_result;
@@ -246,19 +251,23 @@ $line_count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     $output_125;
 }; $_pipeline_result; };
 do {
-    my $output = "Word count: $word_count";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Word count: $word_count";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 do {
-    my $output = "Line count: $line_count";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Line count: $line_count";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $head_result;
@@ -292,11 +301,13 @@ do {
 } };
 }; $_pipeline_result; };
 do {
-    my $output = "First 3 numbers: $head_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "First 3 numbers: $head_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $tail_result;
@@ -333,11 +344,13 @@ do {
 } };
 }; $_pipeline_result; };
 do {
-    my $output = "Last 3 numbers: $tail_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Last 3 numbers: $tail_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $cut_result;
@@ -368,11 +381,13 @@ $cut_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     $output_130;
 }; $_pipeline_result; };
 do {
-    my $output = "Second field: $cut_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Second field: $cut_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 do {
@@ -627,11 +642,13 @@ for my $char ( split //msx, $input_134 ) {
 $tr_result_133
 }; $_pipeline_result; };
 do {
-    my $output = "Lowercase: $tr_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Lowercase: $tr_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $xargs_result;

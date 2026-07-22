@@ -22,6 +22,7 @@ sub capture_stdout {
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04h_complex_examples.sh';
@@ -50,11 +51,13 @@ while (1) {
 $output_111 };
 }; $_pipeline_result; }; chomp $_chomp_temp; $_chomp_temp; }));
 do {
-    my $output = "Nested backticks: $nested_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Nested backticks: $nested_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $count;
@@ -96,11 +99,13 @@ $count = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     $output_112;
 }; $_pipeline_result; };
 do {
-    my $output = "File count: $count";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "File count: $count";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 $current_user = ('root');
@@ -145,11 +150,13 @@ sub get_file_size {
     } : q{};
 };
     do {
-    my $output = "File $file has $size bytes";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "File $file has $size bytes";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
     $CHILD_ERROR = 0;
     return;
@@ -163,11 +170,13 @@ $CHILD_ERROR = 0;
 my $file;
 for my $file (@files) {
     do {
-    my $output = "  - $file";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "  - $file";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
     $CHILD_ERROR = 0;
 }
@@ -256,11 +265,13 @@ for my $char ( split //msx, $input_116 ) {
 }
 $tr_result_115 };
 do {
-    my $output = "Here string result: $here_string_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Here string result: $here_string_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $perl_result;
@@ -278,11 +289,13 @@ $perl_result = do {
     $result;
 };
 do {
-    my $output = "Perl result: $perl_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Perl result: $perl_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 if ( -e "file1.txt" ) {

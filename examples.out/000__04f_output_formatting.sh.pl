@@ -10,6 +10,7 @@ use File::Path qw(make_path remove_tree);
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04f_output_formatting.sh';
@@ -19,11 +20,13 @@ my @echo_result;
 my %echo_result;
 $echo_result = ("Hello from backticks");
 do {
-    my $output = "Echo result: $echo_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Echo result: $echo_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $printf_result;
@@ -32,11 +35,13 @@ my %printf_result;
 $printf_result = sprintf("Number: %d, String: %s\n", '42', "test");
 ;
 do {
-    my $output = "Printf result: $printf_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Printf result: $printf_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $tee_result;
@@ -64,11 +69,13 @@ $tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
     $output_109;
 }; $_pipeline_result; };
 do {
-    my $output = "Tee result: $tee_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Tee result: $tee_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 if ( -e "test_tee.txt" ) {
