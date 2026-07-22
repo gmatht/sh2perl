@@ -850,7 +850,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         // For -e flag, we want to preserve the interpreted newlines, so don't escape them
                                         format!(
                                             "\"{}\"",
-                                            result.replace("\\", "\\\\").replace("\"", "\\\"")
+                                            result.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
                                         )
                                     } else {
                                         generator.convert_string_interpolation_to_perl(interp)
@@ -881,7 +881,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         // For -e flag, we want to preserve the interpreted newlines, so don't escape them
                                         format!(
                                             "\"{}\"",
-                                            interpreted.replace("\\", "\\\\").replace("\"", "\\\"")
+                                            interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
                                         )
                                     } else {
                                         // Escaped backticks should be treated as literal backticks, not command substitution
@@ -981,12 +981,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                 .replace("\\\\", "\\");
 
                                             // Return as a quoted string literal with proper escaping for Perl
-                                            // For -e flag, we want to preserve the interpreted newlines, so don't escape them
+                                            // For -e flag, escape newlines to prevent multiline string literals with indentation issues
                                             format!(
                                                 "\"{}\"",
                                                 interpreted
                                                     .replace("\\", "\\\\")
                                                     .replace("\"", "\\\"")
+                                                    .replace("\n", "\\n")
+                                                    .replace("\t", "\\t")
+                                                    .replace("\r", "\\r")
                                             )
                                         } else {
                                             generator.perl_string_literal(arg)
@@ -1067,7 +1070,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         // For -e flag, we want to preserve the interpreted newlines, so don't escape them
                                         format!(
                                             "\"{}\"",
-                                            result.replace("\\", "\\\\").replace("\"", "\\\"")
+                                            result.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
                                         )
                                     } else {
                                         generator.perl_string_literal(arg)
@@ -1112,7 +1115,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     // For -e flag, we want to preserve the interpreted newlines, so don't escape them
                                     format!(
                                         "\"{}\"",
-                                        interpreted.replace("\\", "\\\\").replace("\"", "\\\"")
+                                        interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
                                     )
                                 } else {
                                     // Escaped backticks should be treated as literal backticks, not command substitution
@@ -1807,10 +1810,15 @@ pub fn generate_echo_command(
                                         .replace("\\\\", "\\");
 
                                     // Return as a quoted string literal with proper escaping for Perl
-                                    // Only escape quotes and backslashes, preserve newlines and tabs as-is
+                                    // Escape newlines to prevent multiline string literals with indentation issues
                                     format!(
                                         "\"{}\"",
-                                        interpreted.replace("\\", "\\\\").replace("\"", "\\\"")
+                                        interpreted
+                                            .replace("\\", "\\\\")
+                                            .replace("\"", "\\\"")
+                                            .replace("\n", "\\n")
+                                            .replace("\t", "\\t")
+                                            .replace("\r", "\\r")
                                     )
                                 } else {
                                     generator.perl_string_literal(arg)
@@ -1908,7 +1916,7 @@ pub fn generate_echo_command(
                             // Only escape quotes and backslashes, preserve newlines and tabs as-is
                             format!(
                                 "\"{}\"",
-                                interpreted.replace("\\", "\\\\").replace("\"", "\\\"")
+                                interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
                             )
                         } else {
                             generator.perl_string_literal(arg)

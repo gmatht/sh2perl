@@ -395,9 +395,8 @@ do {
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'temp1.txt'
       or die "Cannot open file: $OS_ERROR\n";
-    print "1
-2
-3\n";
+    print "1\n2\n3" . "\n";
+    $CHILD_ERROR = 0;
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
@@ -408,9 +407,8 @@ do {
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'temp2.txt'
       or die "Cannot open file: $OS_ERROR\n";
-    print "a
-b
-c\n";
+    print "a\nb\nc" . "\n";
+    $CHILD_ERROR = 0;
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
@@ -506,9 +504,8 @@ do {
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'file1.txt'
       or die "Cannot open file: $OS_ERROR\n";
-    print "apple
-banana
-cherry\n";
+    print "apple\nbanana\ncherry" . "\n";
+    $CHILD_ERROR = 0;
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
@@ -519,9 +516,8 @@ do {
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'file2.txt'
       or die "Cannot open file: $OS_ERROR\n";
-    print "banana
-cherry
-date\n";
+    print "banana\ncherry\ndate" . "\n";
+    $CHILD_ERROR = 0;
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout

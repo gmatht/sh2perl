@@ -21,13 +21,14 @@ print "== readarray/mapfile ==\n";
 my $temp_file_ps_fh_1 = q{/tmp} . '/process_sub_fh_1.tmp';
 my $output_ps_fh_1;
 {
-my ($in, $out);
-my $pid = open3($in, $out, undef, 'bash', '-c', 'printf "x\\\\ny\\\\n"');
-close $in or croak 'Close failed: $OS_ERROR';
-$output_ps_fh_1 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
-close $out or croak 'Close failed: $OS_ERROR';
-waitpid $pid, 0;
-$CHILD_ERROR = $? >> 8;
+    local *STDOUT;
+    open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
+    my $output_250 = q{};
+    my $output_printed_250;
+    sprintf("x\ny\n");
+if ($output_250 ne q{} && !$output_printed_250) {
+    print $output_250;
+}
 }
 use File::Path qw(make_path);
 my $temp_dir_fh_1 = dirname($temp_file_ps_fh_1);

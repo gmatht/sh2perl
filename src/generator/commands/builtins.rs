@@ -882,6 +882,66 @@ pub fn generate_generic_builtin(
                 format!("exit 1;\n${} = q{};\n", output_var, "")
             }
         }
+        "whoami" => {
+            // whoami - print effective user name
+            if output_var.is_empty() {
+                "do { my $whoami_user = (getpwuid($<))[0]; print \"$whoami_user\\n\"; $CHILD_ERROR = 0; };\n".to_string()
+            } else {
+                format!("do {{ my $whoami_user = (getpwuid($<))[0]; ${} = $whoami_user . \"\\n\"; $CHILD_ERROR = 0; }};\n", output_var)
+            }
+        }
+        "uname" => {
+            // uname - print system information
+            let mut has_flags = false;
+            let mut flag_a = false;
+            let mut flag_s = false;
+            let mut flag_n = false;
+            let mut flag_r = false;
+            let mut flag_v = false;
+            let mut flag_m = false;
+            for arg in &cmd.args {
+                if let Word::Literal(s, _) = arg {
+                    if s.starts_with('-') {
+                        has_flags = true;
+                        if s.contains('a') { flag_a = true; }
+                        if s.contains('s') { flag_s = true; }
+                        if s.contains('n') { flag_n = true; }
+                        if s.contains('r') { flag_r = true; }
+                        if s.contains('v') { flag_v = true; }
+                        if s.contains('m') { flag_m = true; }
+                    }
+                }
+            }
+            if !has_flags || flag_s { flag_s = true; }
+            if flag_a { flag_s = true; flag_n = true; flag_r = true; flag_v = true; flag_m = true; }
+            if output_var.is_empty() {
+                let mut code = "do { use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); my @__parts; ".to_string();
+                if flag_s { code.push_str("push @__parts, $__sys; "); }
+                if flag_n { code.push_str("push @__parts, $__node; "); }
+                if flag_r { code.push_str("push @__parts, $__rel; "); }
+                if flag_v { code.push_str("push @__parts, $__ver; "); }
+                if flag_m { code.push_str("push @__parts, $__mach; "); }
+                code.push_str("print join(\" \", @__parts) . \"\\n\"; $CHILD_ERROR = 0; };\n");
+                code
+            } else {
+                let mut code = format!("do {{ use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); my @__parts; ");
+                if flag_s { code.push_str("push @__parts, $__sys; "); }
+                if flag_n { code.push_str("push @__parts, $__node; "); }
+                if flag_r { code.push_str("push @__parts, $__rel; "); }
+                if flag_v { code.push_str("push @__parts, $__ver; "); }
+                if flag_m { code.push_str("push @__parts, $__mach; "); }
+                code.push_str(&format!("${} = join(\" \", @__parts) . \"\\n\"; $CHILD_ERROR = 0; }};\n", output_var));
+                code
+            }
+        }
+        "hostname" => {
+            // hostname - print system hostname
+            if output_var.is_empty() {
+                "do { use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); print \"$__node\\n\"; $CHILD_ERROR = 0; };\n".to_string()
+            } else {
+                format!("do {{ use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); ${} = $__node . \"\\n\"; $CHILD_ERROR = 0; }};\n", output_var)
+            }
+        }
 
         _ => {
             // Fallback for unknown commands - use system call
