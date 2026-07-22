@@ -157,8 +157,10 @@ pub fn generate_printf_command(
                     output.push_str(&format!("    printf({});\n", format_string));
                     output.push_str(&format!("}}\n"));
                 } else {
-                    // In command-substitution contexts, return the formatted text.
-                    output.push_str(&format!("sprintf({});\n", format_string));
+                    // In command-substitution contexts, return the formatted text
+                    // via printf (so it goes to STDOUT) or sprintf (for expression context).
+                    let fn_name = if is_expression { "sprintf" } else { "printf" };
+                    output.push_str(&format!("{}({});\n", fn_name, format_string));
                 }
             } else {
                 // When args are present, decide whether to emulate shell printf's
@@ -205,19 +207,25 @@ pub fn generate_printf_command(
                 };
 
                 if specifier_count > 0 && args.len() > specifier_count {
-                    if specifier_count == 1 {
+                    let expr_body = if specifier_count == 1 {
                         // Map sprintf over each arg and join
-                        output.push_str(&format!("do {{\n    my $result = join('', map {{ sprintf {}, $_ }} ({}));\n    $result;\n}}\n", format_string, formatted_args));
+                        format!("do {{\n    my $result = join('', map {{ sprintf {}, $_ }} ({}));\n    $result;\n}}", format_string, formatted_args)
                     } else {
                         // Batch args into groups of specifier_count and pad final batch
-                        output.push_str(&format!(
-                            "do {{\n    my @__args = ({});\n    my $result = '';\n    while (@__args) {{\n        my @__batch = splice(@__args, 0, {});\n        push @__batch, ('') x ({} - scalar @__batch) if @__batch < {};\n        $result .= sprintf {}, @__batch;\n    }}\n    $result;\n}}\n",
+                        format!(
+                            "do {{\n    my @__args = ({});\n    my $result = '';\n    while (@__args) {{\n        my @__batch = splice(@__args, 0, {});\n        push @__batch, ('') x ({} - scalar @__batch) if @__batch < {};\n        $result .= sprintf {}, @__batch;\n    }}\n    $result;\n}}",
                             formatted_args,
                             specifier_count,
                             specifier_count,
                             specifier_count,
                             format_string
-                        ));
+                        )
+                    };
+                    if is_expression {
+                        output.push_str(&expr_body);
+                        output.push_str("\n");
+                    } else {
+                        output.push_str(&format!("print {};\n", expr_body));
                     }
                 } else {
                     // Emit a simple printf(format, args...)

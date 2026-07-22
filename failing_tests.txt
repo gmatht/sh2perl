@@ -1,16 +1,6 @@
 012_process_substitution.sh	Failed due to: stdout mismatch
-019_grep_regex.sh	Failed due to: stdout mismatch
 040_process_substitution_comm.sh	Failed due to: stdout mismatch
 041_process_substitution_mapfile.sh	Failed due to: stdout mismatch
-042_process_substitution_advanced.sh	Failed due to: stdout mismatch
 063_11_complex_while_loop.sh	error: PerlExecution timed out after 30.0 seconds
 063_hard_to_parse.sh	error: PerlExecution timed out after 30.0 seconds
-070_cmp_basic.sh	Failed due to: stdout mismatch
-083_process_sub_missing_files.sh	Failed due to: stdout mismatch
-064_14_nested_command_substitution_arithmetic.sh	QX violation: bash -c wraps builtin 'wc'
-064_14_nested_command_substitution_arithmetic.sh	QX violation: bash -c wraps builtin 'wc'
-064_23_complex_error_handling_traps.sh	QX violation: bash -c wraps builtin 'echo'
-064_hard_to_generate.sh	QX violation: bash -c wraps builtin 'wc'
-064_hard_to_generate.sh	QX violation: bash -c wraps builtin 'wc'
-064_hard_to_generate.sh	QX violation: bash -c wraps builtin 'echo'
-085_for_glob_pipe.sh	OPEN3 violation: open3() with builtin 'wc'
+085_for_glob_pipe.sh	Failed due to: stdout mismatch
