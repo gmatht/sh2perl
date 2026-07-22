@@ -295,10 +295,13 @@ pub fn generate_command_impl_with_input(
                                 global_counter
                             ));
 
-                            if in_stdout_context || !command_can_be_serialized(cmd) {
+                            if in_stdout_context || !command_can_be_serialized(cmd) || command_tree_is_native_builtin(cmd) {
                                 // If we're already in a STDOUT context, or if the command
                                 // cannot be serialized to a bash command string, generate
                                 // the actual Perl code (inline approach).
+                                // Also use inline Perl when the command consists entirely
+                                // of native builtins (e.g. echo, sort, printf) to avoid
+                                // OPEN3/QX violations.
                                 result.push_str(&generator.indent());
                                 result.push_str(&format!("my $output_ps_{};\n", global_counter));
                                 result.push_str(&generator.indent());
@@ -325,7 +328,12 @@ pub fn generate_command_impl_with_input(
                                     let perl_code = generator.generate_command(cmd);
                                     for line in perl_code.lines() {
                                         if !line.trim().is_empty() {
-                                            result.push_str(&format!("    {}\n", line));
+                                            // Inside process substitution, STDOUT is redirected to
+                                            // $output_ps_<N>. Commands that would use $output .= ...
+                                            // (in pipeline context) must use print instead so the
+                                            // output goes through the STDOUT redirection.
+                                            let adjusted = line.replace("$output .=", "print");
+                                            result.push_str(&format!("    {}\n", adjusted));
                                         }
                                     }
                                     if !matches!(**cmd, Command::Pipeline(_)) {
@@ -1292,4 +1300,76 @@ fn command_can_be_serialized(cmd: &Command) -> bool {
             | Command::Or(_, _)
             | Command::BlankLine
     )
+}
+
+/// Check whether a command name is a builtin that we have a native Perl
+/// implementation for.  When such a command appears inside a process
+/// substitution `<(...)` we can generate inline Perl instead of
+/// serializing to a bash command string (which would be flagged as a
+/// QX/OPEN3 violation by check_qx.pl).
+fn is_perl_native_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "echo"
+            | "printf"
+            | "sort"
+            | "wc"
+            | "grep"
+            | "sed"
+            | "awk"
+            | "head"
+            | "tail"
+            | "cat"
+            | "uniq"
+            | "tr"
+            | "cut"
+            | "paste"
+            | "comm"
+            | "diff"
+            | "find"
+            | "ls"
+            | "whoami"
+            | "uname"
+            | "hostname"
+            | "pwd"
+            | "date"
+            | "basename"
+            | "dirname"
+            | "seq"
+            | "which"
+            | "yes"
+            | "cp"
+            | "mv"
+            | "rm"
+            | "mkdir"
+            | "touch"
+            | "sleep"
+            | "sha256sum"
+            | "sha512sum"
+            | "strings"
+            | "tee"
+            | "time"
+    )
+}
+
+/// Recursively check if a command AST contains only simple commands
+/// whose names are known builtins with native Perl implementations.
+fn command_tree_is_native_builtin(cmd: &Command) -> bool {
+    match cmd {
+        Command::Simple(simple) => {
+            if let Word::Literal(name, _) = &simple.name {
+                is_perl_native_builtin(name)
+            } else {
+                false
+            }
+        }
+        Command::Pipeline(p) => p.commands.iter().all(|c| command_tree_is_native_builtin(c)),
+        Command::Redirect(r) => command_tree_is_native_builtin(&r.command),
+        Command::Subshell(s) => command_tree_is_native_builtin(s),
+        Command::Block(b) => b.commands.iter().all(|c| command_tree_is_native_builtin(c)),
+        Command::And(l, r) | Command::Or(l, r) => {
+            command_tree_is_native_builtin(l) && command_tree_is_native_builtin(r)
+        }
+        _ => false,
+    }
 }

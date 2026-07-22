@@ -124,6 +124,18 @@ fn generate_command_using_builtins(
                                 all_items.push(generator.word_to_perl(word));
                             }
                         }
+                        Word::Literal(s, _) => {
+                            // Handle glob patterns in for-loop items
+                            if s.contains('*') || s.contains('?') || s.contains('[') {
+                                all_items.push(format!(
+                                    "do {{ my @_g = sort glob('{}'); @_g ? @_g : ('{}') }}",
+                                    s.replace("'", "'\\''"),
+                                    s.replace("'", "'\\''")
+                                ));
+                            } else {
+                                all_items.push(generator.word_to_perl(word));
+                            }
+                        }
                         _ => all_items.push(generator.word_to_perl(word)),
                     }
                 }
@@ -158,18 +170,17 @@ fn generate_command_using_builtins(
                                     "my ({}, {}, {});\n",
                                     in_var, out_var, err_var
                                 ));
+                                let cmd_str =
+                                    generator.generate_command_string_for_system(cmd);
+                                let cmd_literal = generator
+                                    .perl_string_literal_no_interp(&Word::literal(cmd_str));
                                 output.push_str(&format!(
-                                    "my {} = open3({}, {}, {}, '{}');\n",
+                                    "my {} = open3({}, {}, {}, 'bash', '-c', {});\n",
                                     pid_var,
                                     in_var,
                                     out_var,
                                     err_var,
-                                    {
-                                        let cmd_str =
-                                            generator.generate_command_string_for_system(cmd);
-                                        generator
-                                            .perl_string_literal_no_interp(&Word::literal(cmd_str))
-                                    }
+                                    cmd_literal
                                 ));
                                 output.push_str(&format!(
                                     "close {} or croak 'Close failed: $OS_ERROR';\n",
@@ -195,16 +206,15 @@ fn generate_command_using_builtins(
                             output.push_str(&format!("\n"));
                             output
                                 .push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
+                            let cmd_str = generator.generate_command_string_for_system(cmd);
+                            let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
                             output.push_str(&format!(
-                                "my {} = open3({}, {}, {}, '{}');\n",
+                                "my {} = open3({}, {}, {}, 'bash', '-c', {});\n",
                                 pid_var,
                                 in_var,
                                 out_var,
                                 err_var,
-                                {
-                                    let cmd_str = generator.generate_command_string_for_system(cmd);
-                                    generator.perl_string_literal_no_interp(&Word::literal(cmd_str))
-                                }
+                                cmd_literal
                             ));
                             output.push_str(&format!(
                                 "close {} or croak 'Close failed: $OS_ERROR';\n",
@@ -229,16 +239,15 @@ fn generate_command_using_builtins(
                         output.push_str(&generator.indent());
                         output.push_str(&format!("\n"));
                         output.push_str(&format!("my ({}, {}, {});\n", in_var, out_var, err_var));
+                        let cmd_str = generator.generate_command_string_for_system(cmd);
+                        let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
                         output.push_str(&format!(
-                            "my {} = open3({}, {}, {}, '{}');\n",
+                            "my {} = open3({}, {}, {}, 'bash', '-c', {});\n",
                             pid_var,
                             in_var,
                             out_var,
                             err_var,
-                            {
-                                let cmd_str = generator.generate_command_string_for_system(cmd);
-                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str))
-                            }
+                            cmd_literal
                         ));
                         output.push_str(&format!(
                             "close {} or croak 'Close failed: $OS_ERROR';\n",
@@ -561,12 +570,16 @@ fn generate_command_using_builtins(
             let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
             if input_var.is_empty() {
                 // First command in pipeline
-                format!("\nmy ({});\nmy {} = open3({}, {}, {}, '{}');\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
-                    in_var, pid_var, in_var, out_var, err_var, { let cmd_str = generator.generate_command_string_for_system(command); generator.perl_string_literal_no_interp(&Word::literal(cmd_str)) }, in_var, out_var, output_var, out_var, pid_var)
+                let cmd_str = generator.generate_command_string_for_system(command);
+                let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
+                format!("\nmy ({});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
+                    in_var, pid_var, in_var, out_var, err_var, cmd_literal, in_var, out_var, output_var, out_var, pid_var)
             } else {
                 // Subsequent command - use double quotes so Perl interpolates $var
-                format!("\nmy ({});\nmy {} = open3({}, {}, {}, \"echo \\\"${}\\\" | {}\");\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
-                    in_var, pid_var, in_var, out_var, err_var, input_var, { let cmd_str = generator.generate_command_string_for_system(command); generator.perl_string_literal_no_interp(&Word::literal(cmd_str)) }, in_var, out_var, output_var, out_var, pid_var)
+                let pipe_cmd = format!("echo \"${{{}}}\" | {}", input_var, generator.generate_command_string_for_system(command));
+                let pipe_literal = generator.perl_string_literal_force_interp(&Word::literal(pipe_cmd));
+                format!("\nmy ({});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
+                    in_var, pid_var, in_var, out_var, err_var, pipe_literal, in_var, out_var, output_var, out_var, pid_var)
             }
         }
     }
