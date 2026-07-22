@@ -290,10 +290,10 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&generator.indent());
                             result.push_str("{\n");
                             result.push_str(&generator.indent());
-                            result.push_str("my ($in, $out, $err);\n");
+                            result.push_str("my ($in, $out);\n");
                             result.push_str(&generator.indent());
                             result.push_str(&format!(
-                                "my $pid = open3($in, $out, $err, 'bash', '-c', {});\n",
+                                "my $pid = open3($in, $out, undef, 'bash', '-c', {});\n",
                                 cmd_literal
                             ));
                             result.push_str(&generator.indent());
@@ -356,11 +356,18 @@ pub fn generate_command_impl_with_input(
                         ));
                     }
                     _ => {
-                        // Handle other redirect types, but not here-strings or output redirects
+                        // Handle other redirect types, but not here-strings, output, append,
+                        // or stderr redirects (which are handled later with proper scoping)
                         if !matches!(redirect.operator, RedirectOperator::HereString)
                             && !matches!(
                                 redirect.operator,
                                 RedirectOperator::Output | RedirectOperator::Append
+                            )
+                            && !matches!(
+                                redirect.operator,
+                                RedirectOperator::StderrOutput
+                                    | RedirectOperator::StderrAppend
+                                    | RedirectOperator::StderrInput
                             )
                         {
                             result.push_str(&generator.generate_redirect(redirect));
@@ -382,6 +389,17 @@ pub fn generate_command_impl_with_input(
                 result.insert_str(0, &format!("{}do {{\n", generator.indent()));
                 generator.indent_level += 1;
                 stderr_scope_opened = true;
+                // Generate stderr redirect inside the do block
+                for redirect in &all_redirects {
+                    match &redirect.operator {
+                        RedirectOperator::StderrOutput
+                        | RedirectOperator::StderrAppend
+                        | RedirectOperator::StderrInput => {
+                            result.push_str(&generator.generate_redirect(redirect));
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             // Now handle the base command with redirect context
@@ -692,6 +710,69 @@ pub fn generate_command_impl_with_input(
                             let file1 = &process_sub_files[0];
                             let file2 = &process_sub_files[1];
 
+                            // Check for output redirect (e.g. > comparison.txt)
+                            let output_redirect = all_redirects.iter().find(|r| {
+                                matches!(
+                                    r.operator,
+                                    RedirectOperator::Output | RedirectOperator::Append
+                                )
+                            });
+
+                            let mut output_redirect_target = None;
+                            if let Some(redirect) = output_redirect {
+                                let mode = if matches!(redirect.operator, RedirectOperator::Append) {
+                                    ">>"
+                                } else {
+                                    ">"
+                                };
+                                let target = generator.perl_string_literal(&redirect.target);
+                                output_redirect_target = Some((mode.to_string(), target));
+                            }
+
+                            // If there's an output redirect, wrap diff in a do block
+                            if let Some((ref mode, ref target)) = output_redirect_target {
+                                result.push_str(&generator.indent());
+                                result.push_str("do {\n");
+                                generator.indent_level += 1;
+                                result.push_str(&generator.indent());
+                                result.push_str("open my $original_stdout, '>&', STDOUT\n");
+                                result.push_str("      or die \"Cannot save STDOUT: $OS_ERROR\\n\";\n");
+                                result.push_str(&generator.indent());
+                                result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
+                                result.push_str("      or die \"Cannot open file: $OS_ERROR\\n\";\n");
+                            }
+
+                            // If there's a stderr redirect, add it inside the do block
+                            let stderr_redirect = all_redirects.iter().find(|r| {
+                                matches!(
+                                    r.operator,
+                                    RedirectOperator::StderrOutput
+                                )
+                            });
+                            if let Some(redirect) = stderr_redirect {
+                                let is_fd_dup = match &redirect.target {
+                                    Word::Literal(s, _) => !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
+                                    _ => false,
+                                };
+                                if is_fd_dup {
+                                    if let Word::Literal(s, _) = &redirect.target {
+                                        let fd_name = match s.as_str() {
+                                            "1" => "STDOUT",
+                                            "2" => "STDERR",
+                                            "0" => "STDIN",
+                                            _ => "STDOUT",
+                                        };
+                                        result.push_str(&generator.indent());
+                                        result.push_str("local *STDERR;\n");
+                                        result.push_str(&generator.indent());
+                                        result.push_str(&format!(
+                                            "open STDERR, '>&', {} or die \"Cannot dup stderr: $OS_ERROR\\n\";\n",
+                                            fd_name
+                                        ));
+                                    }
+                                }
+                            }
+
                             // Set environment variables for the diff command
                             result.push_str(&generator.indent());
                             result.push_str(&format!("$ENV{{DIFF_TEMP_FILE1}} = {};\n", file1.1));
@@ -720,6 +801,19 @@ pub fn generate_command_impl_with_input(
                                 true,
                             );
                             result.push_str(&diff_output);
+
+                            // Close the output redirect do block if we opened one
+                            if let Some((ref mode, ref target)) = output_redirect_target {
+                                result.push_str(&generator.indent());
+                                result.push_str("open STDOUT, '>&', $original_stdout\n");
+                                result.push_str("      or die \"Cannot restore STDOUT: $OS_ERROR\\n\";\n");
+                                result.push_str(&generator.indent());
+                                result.push_str("close $original_stdout\n");
+                                result.push_str("      or die \"Close failed: $OS_ERROR\\n\";\n");
+                                generator.indent_level -= 1;
+                                result.push_str(&generator.indent());
+                                result.push_str("};\n");
+                            }
 
                             if stderr_scope_opened {
                                 stderr_scope_opened = false;
@@ -822,6 +916,19 @@ pub fn generate_command_impl_with_input(
                     result.push_str(&generator.indent());
                     result.push_str("open STDOUT, '>', 'temp_file.txt'\n");
                     result.push_str("      or die \"Cannot open file: $OS_ERROR\\n\";\n");
+                }
+                // Add stderr redirect inside the output redirect do block
+                if has_stderr_redirect {
+                    for redirect in &all_redirects {
+                        match &redirect.operator {
+                            RedirectOperator::StderrOutput
+                            | RedirectOperator::StderrAppend
+                            | RedirectOperator::StderrInput => {
+                                result.push_str(&generator.generate_redirect(redirect));
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
 
