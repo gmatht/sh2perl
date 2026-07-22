@@ -14,7 +14,7 @@
 - 000__04h_complex_examples.sh — passing (fixed: backtick command substitutions in array elements now execute via backtick syntax)
 - 000__07_find_path_commands.sh — passing
 - 063_15_complex_function_definition.sh — passing
-- 063_11_complex_while_loop.sh — passing (fixed: `local -A` inside function bodies now correctly declares `my %var = ();` even if `$var` was previously used)
+- 063_11_complex_while_loop.sh — passing (fixed: added STDIN redirect after process substitution temp file creation, so the while loop reads from the process substitution output instead of hanging on STDIN)
 
 ## Still failing tests (2)
 
@@ -30,13 +30,12 @@ Partially fixed:
   `[ "$(wc -l < "$file")" -gt 10 ]`) now convert to `qx{...}`.
 
 Remaining issues:
-1. Process substitution redirect (`done < <(cmd)`) writes to a temp file but
-   the while body's `read` command reads from STDIN instead of the temp file.
-2. Background commands via `fork()`/`exec()` may not work correctly in all cases.
-3. Several features like `trap`, `shopt`, `eval` with complex expansions, and
+1. Background commands via `fork()`/`exec()` may not work correctly in all cases.
+2. Several features like `trap`, `shopt`, `eval` with complex expansions, and
    brace expansion with ranges produce incorrect or incomplete Perl.
-4. Exit code is 255 instead of 0 due to failing `system()` calls for
-   unrecognized commands (translation of function call arguments).
+3. Exit code is 255 instead of 0 due to failing `system()` calls for
+   unrecognized commands (translation of function call arguments with
+   backslash line continuations parsed incorrectly).
 
 ### 064_hard_to_generate.sh
 Partially fixed:
@@ -44,6 +43,13 @@ Partially fixed:
   convert to `qx{...}`.
 - Fixed: `local -A info` inside `get_system_info` now correctly declares
   `my %info = ();` (previously skipped due to `$info` being in declared_locals).
+- Fixed: Undeclared variable errors (`Global symbol ... requires explicit
+  package name`) by:
+  - Making the subshell generator skip internal temporary variables
+    (output_N, tmp_redirect_N, etc.) when creating local copies.
+  - Using the correct sigil (`%` instead of `$`) for associative arrays.
+  - Declaring all three forms (`$var`, `@var`, `%var`) when an array
+    assignment is first seen.
 
 Remaining issues:
 1. Complex nested subshells with process substitution generate incorrect Perl.
@@ -52,7 +58,7 @@ Remaining issues:
 3. Here-documents with variable interpolation produce literal text instead of
    interpolated output.
 4. Process substitution in pipelines (`paste <(...) <(...)`) is not handled.
-5. Several undeclared variable errors (`Global symbol "$tmp_redirect_3" requires
-   explicit package name`) due to incorrect variable scoping in generated code.
-6. Nested function definitions (`inner_func` inside `outer_func`) produce
+5. Nested function definitions (`inner_func` inside `outer_func`) produce
    "will not stay shared" warnings and may not capture variables correctly.
+6. Sort ordering in generated Perl differs from system `sort` command due to
+   locale/collation differences.

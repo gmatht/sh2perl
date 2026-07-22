@@ -14,12 +14,34 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
     output.push_str(&generator.indent());
     output.push_str("local %ENV = %ENV;\n");
 
-    // Create local copies of all declared variables to isolate subshell scope.
+    // Create local copies of declared variables to isolate subshell scope.
     // Initialize each from the outer variable so the subshell inherits the
     // current value just like a real bash subshell does.
+    // Skip internal generator temporary variables (output_N, tmp_redirect_N,
+    // temp_file_ps_*, etc.) as they are scoped inside closed blocks and are
+    // not visible at this level.
     for var_name in &generator.declared_locals {
-        output.push_str(&generator.indent());
-        output.push_str(&format!("my ${} = ${};\n", var_name, var_name));
+        // Skip internal generator variables that match temporary patterns
+        if var_name.starts_with("output_")
+            || var_name.starts_with("tmp_redirect_")
+            || var_name.starts_with("temp_file_ps_")
+            || var_name.starts_with("output_ps_")
+            || var_name.starts_with("fh_ps_")
+            || var_name == "CHILD_ERROR"
+            || var_name == "main_exit_code"
+            || var_name == "ls_success"
+            || var_name == "__set_e"
+        {
+            continue;
+        }
+        // Associative arrays need % sigil instead of $
+        if generator.associative_arrays.contains(var_name) {
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my %{} = %{};\n", var_name, var_name));
+        } else {
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my ${} = ${};\n", var_name, var_name));
+        }
     }
 
     // Emit the subshell body. Ensure the block returns an empty string
