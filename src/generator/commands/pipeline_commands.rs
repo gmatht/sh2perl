@@ -2399,7 +2399,7 @@ fn generate_buffered_pipeline(
                     // re-indent it line-by-line (which would corrupt multi-line
                     // string literals like q[...]).
                     output.push_str(&generator.indent());
-                    output.push_str("my $output;\n");
+                    output.push_str("$output = q{};\n");
                     output.push_str(&generator.indent());
                     output.push_str(&generator.generate_command(command));
                     output.push_str(&generator.indent());

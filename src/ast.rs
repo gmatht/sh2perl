@@ -104,6 +104,7 @@ pub struct CaseClause {
 pub struct WhileLoop {
     pub condition: Box<Command>,
     pub body: Block,
+    pub is_until: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

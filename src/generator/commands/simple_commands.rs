@@ -1174,10 +1174,19 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             _ => false,
                         }) || args[0].contains('$');
 
+                        let in_pipeline = generator.current_pipeline_output_id().is_some();
                         if has_variables {
-                            output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if ( !( $output =~ {} ) ) {{\n        print \"\\n\";\n    }}\n}};\n", args[0], generator.newline_end_regex()));
+                            if in_pipeline {
+                                output.push_str(&format!("do {{\n    my $__echo_line = {};\n    if ( !( $__echo_line =~ {} ) ) {{\n        $__echo_line .= \"\\n\";\n    }}\n    $output .= $__echo_line;\n}};\n", args[0], generator.newline_end_regex()));
+                            } else {
+                                output.push_str(&format!("do {{\n    my $__echo_line = {};\n    print $__echo_line;\n    if ( !( $__echo_line =~ {} ) ) {{\n        print \"\\n\";\n        $__echo_line .= \"\\n\";\n    }}\n    $output .= $__echo_line;\n}};\n", args[0], generator.newline_end_regex()));
+                            }
                         } else {
-                            output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
+                            if in_pipeline {
+                                output.push_str(&format!("$output .= {} . \"\\n\";\n", args[0]));
+                            } else {
+                                output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
+                            }
                         }
 
                         // echo as a builtin succeeded
@@ -1212,16 +1221,33 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 .any(|part| matches!(part, crate::ast::StringPart::Variable(_))),
                             _ => false,
                         });
+                        let in_pipeline = generator.current_pipeline_output_id().is_some();
                         if has_variables {
                             if has_n_flag {
-                                output.push_str(&format!("print {};\n", args_str));
+                                if in_pipeline {
+                                    output.push_str(&format!("$output .= {};\n", args_str));
+                                } else {
+                                    output.push_str(&format!("print {};\n", args_str));
+                                }
                             } else {
-                                output.push_str(&format!("do {{\n    my $output = {};\n    print $output;\n    if (!($output =~ /\\n$/msx)) {{\n        print \"\\n\";\n    }}\n}};\n", args_str));
+                                if in_pipeline {
+                                    output.push_str(&format!("do {{\n    my $__echo_line = {};\n    if (!($__echo_line =~ /\\n$/msx)) {{\n        $__echo_line .= \"\\n\";\n    }}\n    $output .= $__echo_line;\n}};\n", args_str));
+                                } else {
+                                    output.push_str(&format!("do {{\n    my $__echo_line = {};\n    print $__echo_line;\n    if (!($__echo_line =~ /\\n$/msx)) {{\n        print \"\\n\";\n        $__echo_line .= \"\\n\";\n    }}\n    $output .= $__echo_line;\n}};\n", args_str));
+                                }
                             }
                         } else if has_n_flag {
-                            output.push_str(&format!("print {};\n", args_str));
+                            if in_pipeline {
+                                output.push_str(&format!("$output .= {};\n", args_str));
+                            } else {
+                                output.push_str(&format!("print {};\n", args_str));
+                            }
                         } else {
-                            output.push_str(&format!("print {} . \"\\n\";\n", args_str));
+                            if in_pipeline {
+                                output.push_str(&format!("$output .= {} . \"\\n\";\n", args_str));
+                            } else {
+                                output.push_str(&format!("print {} . \"\\n\";\n", args_str));
+                            }
                         }
 
                         // echo as a builtin succeeded

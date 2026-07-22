@@ -1,5 +1,14 @@
 # Failing Test Notes
 
+## Fixed since last update
+- 086_if_condition_pipe.sh: Fixed test expression parser double-advance bugs
+  and missing spaces in file test operators
+- 088_while_read_ifs_sort.sh: Fixed echo output capture in pipeline context
+- 091_while_pipe_var.sh: Fixed echo output capture in pipeline context
+- 094_until_loop.sh: Added parse_until_loop function and generation support
+- 010_pattern_matching.sh: Fixed extglob regex generation (wrong anchor)
+- 037_pattern_matching_extglob.sh: Fixed extglob regex generation (wrong anchor)
+
 ## Remaining Combined Failures
 
 ### 063_hard_to_parse.sh

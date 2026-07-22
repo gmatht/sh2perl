@@ -11,6 +11,7 @@ use POSIX qw(time);
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__03_file_manipulation_commands.sh';
@@ -61,11 +62,13 @@ $cp_result = do {
     }
 };
 do {
-    my $output = "Copy result: $cp_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Copy result: $cp_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 do {
@@ -196,11 +199,13 @@ $mv_result = do {
     }
 };
 do {
-    my $output = "Move result: $mv_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Move result: $mv_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 do {
@@ -334,11 +339,13 @@ $rm_result = do {
     }
 };
 do {
-    my $output = "Remove result: $rm_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Remove result: $rm_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 do {
@@ -443,11 +450,13 @@ $mkdir_result = do {
     }
 };
 do {
-    my $output = "Mkdir result: $mkdir_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Mkdir result: $mkdir_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 if ( -e "test_dir/file" ) {
@@ -600,11 +609,13 @@ $touch_result = do {
     }
 };
 do {
-    my $output = "Touch result: $touch_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "Touch result: $touch_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 print "\n";

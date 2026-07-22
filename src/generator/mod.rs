@@ -348,6 +348,7 @@ impl Generator {
         output.push_str("my $main_exit_code = 0;\n");
         output.push_str("my $ls_success     = 0;\n");
         output.push_str("my $__set_e        = 0;\n");
+        output.push_str("my $output         = q{};\n");
 
         // Add global CHILD_ERROR variable for command substitution
         output.push_str("our $CHILD_ERROR;\n\n");

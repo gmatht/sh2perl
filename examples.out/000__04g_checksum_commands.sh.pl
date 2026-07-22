@@ -11,6 +11,7 @@ use File::Path    qw(make_path remove_tree);
 my $main_exit_code = 0;
 my $ls_success     = 0;
 my $__set_e        = 0;
+my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04g_checksum_commands.sh';
@@ -53,11 +54,13 @@ $sha256_result = do {
 };
 ;
 do {
-    my $output = "SHA256 result: $sha256_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "SHA256 result: $sha256_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $sha512_result;
@@ -87,11 +90,13 @@ $sha512_result = do {
 };
 ;
 do {
-    my $output = "SHA512 result: $sha512_result";
-    print $output;
-    if ( !( $output =~ m{\n\z}msx ) ) {
+    my $__echo_line = "SHA512 result: $sha512_result";
+    print $__echo_line;
+    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
         print "\n";
+        $__echo_line .= "\n";
     }
+    $output .= $__echo_line;
 };
 $CHILD_ERROR = 0;
 my $strings_result;
