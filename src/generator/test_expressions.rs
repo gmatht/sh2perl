@@ -413,83 +413,107 @@ pub fn generate_test_expression_impl(
         format!("{} ne q{{}}", var)
     } else if expr.contains(" -f ") || starts_with_op(expr, "-f") {
         // File exists and is regular file: [[ -f $var ]]
-        let var = if expr.starts_with("-f ") {
+        let mut var = if expr.starts_with("-f ") {
             expr.replacen("-f ", "", 1).trim().to_string()
         } else if expr.starts_with(r#"-f""#) || expr.starts_with("-f$") {
             expr[2..].trim().to_string()
         } else {
             expr.replacen("-f ", "", 1).trim().to_string()
         };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
         format!("(-f {})", var)
     } else if expr.contains(" -d ") || starts_with_op(expr, "-d") {
         // File exists and is directory: [[ -d $var ]]
-        let var = if expr.starts_with("-d ") {
+        let mut var = if expr.starts_with("-d ") {
             expr.replacen("-d ", "", 1).trim().to_string()
         } else if expr.starts_with(r#"-d""#) || expr.starts_with("-d$") {
             expr[2..].trim().to_string()
         } else {
             expr.replacen("-d ", "", 1).trim().to_string()
         };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
         format!("(-d {})", var)
     } else if expr.contains(" -e ") || starts_with_op(expr, "-e") {
         // File exists: [[ -e $var ]]
-        let var = if expr.starts_with("-e ") {
+        let mut var = if expr.starts_with("-e ") {
             expr.replacen("-e ", "", 1).trim().to_string()
         } else if expr.starts_with(r#"-e""#) || expr.starts_with("-e$") {
             expr[2..].trim().to_string()
         } else {
             expr.replacen("-e ", "", 1).trim().to_string()
         };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
         format!("(-e {})", var)
     } else if expr.contains(" -r ") || starts_with_op(expr, "-r") {
         // File is readable: [[ -r $var ]]
-        let var = if expr.starts_with("-r ") {
+        let mut var = if expr.starts_with("-r ") {
             expr.replacen("-r ", "", 1).trim().to_string()
         } else if expr.starts_with(r#"-r""#) || expr.starts_with("-r$") {
             expr[2..].trim().to_string()
         } else {
             expr.replacen("-r ", "", 1).trim().to_string()
         };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
         format!("(-r {})", var)
     } else if expr.contains(" -w ") || starts_with_op(expr, "-w") {
         // File is writable: [[ -w $var ]]
-        let var = if expr.starts_with("-w ") {
+        let mut var = if expr.starts_with("-w ") {
             expr.replacen("-w ", "", 1).trim().to_string()
         } else if expr.starts_with(r#"-w""#) || expr.starts_with("-w$") {
             expr[2..].trim().to_string()
         } else {
             expr.replacen("-w ", "", 1).trim().to_string()
         };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
         format!("(-w {})", var)
     } else if expr.contains(" -x ") || starts_with_op(expr, "-x") {
         // File is executable: [[ -x $var ]]
-        let var = if expr.starts_with("-x ") {
+        let mut var = if expr.starts_with("-x ") {
             expr.replacen("-x ", "", 1).trim().to_string()
         } else if expr.starts_with(r#"-x""#) || expr.starts_with("-x$") {
             expr[2..].trim().to_string()
         } else {
             expr.replacen("-x ", "", 1).trim().to_string()
         };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
         format!("(-x {})", var)
     } else if expr.contains(" -s ") || starts_with_op(expr, "-s") {
         // File exists and has size greater than 0: [[ -s $var ]]
-        let var = if expr.starts_with("-s ") {
+        let mut var = if expr.starts_with("-s ") {
             expr.replacen("-s ", "", 1).trim().to_string()
         } else if expr.starts_with(r#"-s""#) || expr.starts_with("-s$") {
             expr[2..].trim().to_string()
         } else {
             expr.replacen("-s ", "", 1).trim().to_string()
         };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
         format!("((-s {}) > 0)", var)
     } else if expr.contains(" -L ") || starts_with_op(expr, "-L") {
         // File exists and is symbolic link: [[ -L $var ]]
-        let var = if expr.starts_with("-L ") {
+        let mut var = if expr.starts_with("-L ") {
             expr.replacen("-L ", "", 1).trim().to_string()
         } else if expr.starts_with(r#"-L""#) || expr.starts_with("-L$") {
             expr[2..].trim().to_string()
         } else {
             expr.replacen("-L ", "", 1).trim().to_string()
         };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
         format!("(-l {})", var)
     } else {
         // Default case: treat as a simple boolean expression
@@ -637,8 +661,8 @@ pub fn convert_extglob_to_perl_regex_impl(generator: &Generator, pattern: &str) 
 
                     //                     eprintln!("DEBUG: negated_regex: '{}', after_regex: '{}'", negated_regex, after_regex);
 
-                    // Create negative lookahead: (?!negated_pattern)after_pattern
-                    result = format!("(?!{}){}", negated_regex, after_regex);
+                    // Create negative lookahead: ^(?!.*negated_regex$).*after_regex$
+                    result = format!("^(?!.*{}{}$).*{}$", negated_regex, after_regex, after_regex);
                     //                     eprintln!("DEBUG: Final result: '{}'", result);
                     return result;
                 } else {
@@ -663,8 +687,8 @@ pub fn convert_extglob_to_perl_regex_impl(generator: &Generator, pattern: &str) 
 
                         //                         eprintln!("DEBUG: negated_regex: '{}', after_regex: '{}'", negated_regex, after_regex);
 
-                        // Create negative lookahead with after pattern: ^(?!negated_pattern).*after_pattern$
-                        result = format!("^(?!{}).*{}$", negated_regex, after_regex);
+                        // Create negative lookahead with after pattern: ^(?!.*negated_regex$).*after_regex$
+                        result = format!("^(?!.*{}{}$).*{}$", negated_regex, after_regex, after_regex);
                         //                         eprintln!("DEBUG: Final result: '{}'", result);
                         return result;
                     } else {

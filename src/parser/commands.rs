@@ -4,7 +4,7 @@ use crate::parser::assignments::parse_array_elements;
 use crate::parser::control_flow::{
     parse_block, parse_break_statement, parse_case_statement, parse_continue_statement,
     parse_for_loop, parse_function, parse_if_statement, parse_posix_function,
-    parse_return_statement, parse_while_loop,
+    parse_return_statement, parse_until_loop, parse_while_loop,
 };
 use crate::parser::errors::ParserError;
 use crate::parser::redirects::parse_redirect;
@@ -208,6 +208,7 @@ impl Parser {
                 Some(Token::If) => parse_if_statement(self)?,
                 Some(Token::Case) => parse_case_statement(self)?,
                 Some(Token::While) => parse_while_loop(self)?,
+                Some(Token::Until) => parse_until_loop(self)?,
                 Some(Token::For) => parse_for_loop(self)?,
                 Some(Token::Function) => parse_function(self)?,
                 Some(Token::Break) => parse_break_statement(self)?,
@@ -523,6 +524,7 @@ impl Parser {
             Some(Token::If) => parse_if_statement(self),
             Some(Token::Case) => parse_case_statement(self),
             Some(Token::While) => parse_while_loop(self),
+            Some(Token::Until) => parse_until_loop(self),
             Some(Token::For) => parse_for_loop(self),
             Some(Token::Function) => parse_function(self),
             Some(Token::ArithmeticEval) => {
@@ -1705,35 +1707,35 @@ impl Parser {
                     }
                 }
                 Some(Token::File) => {
-                    expression_parts.push("-f".to_string());
+                    expression_parts.push("-f ".to_string());
                     self.lexer.next();
                 }
                 Some(Token::Directory) => {
-                    expression_parts.push("-d".to_string());
+                    expression_parts.push("-d ".to_string());
                     self.lexer.next();
                 }
                 Some(Token::Exists) => {
-                    expression_parts.push("-e".to_string());
+                    expression_parts.push("-e ".to_string());
                     self.lexer.next();
                 }
                 Some(Token::Readable) => {
-                    expression_parts.push("-r".to_string());
+                    expression_parts.push("-r ".to_string());
                     self.lexer.next();
                 }
                 Some(Token::Writable) => {
-                    expression_parts.push("-w".to_string());
+                    expression_parts.push("-w ".to_string());
                     self.lexer.next();
                 }
                 Some(Token::Executable) => {
-                    expression_parts.push("-x".to_string());
+                    expression_parts.push("-x ".to_string());
                     self.lexer.next();
                 }
                 Some(Token::Size) => {
-                    expression_parts.push("-s".to_string());
+                    expression_parts.push("-s ".to_string());
                     self.lexer.next();
                 }
                 Some(Token::Symlink) => {
-                    expression_parts.push("-L".to_string());
+                    expression_parts.push("-L ".to_string());
                     self.lexer.next();
                 }
                 Some(Token::Equality) => {
@@ -1766,7 +1768,6 @@ impl Parser {
                 }
                 Some(Token::CasePattern) => {
                     expression_parts.push(self.lexer.get_raw_token_text()?);
-                    self.lexer.next();
                 }
                 Some(Token::Caret) => {
                     expression_parts.push("^".to_string());
@@ -1845,7 +1846,6 @@ impl Parser {
                 Some(Token::DoubleQuotedString) | Some(Token::SingleQuotedString) => {
                     let string_text = self.lexer.get_string_text()?;
                     expression_parts.push(string_text);
-                    self.lexer.next(); // consume the string token
                 }
                 Some(Token::Space) | Some(Token::Tab) => {
                     self.lexer.next(); // skip whitespace
@@ -1853,12 +1853,10 @@ impl Parser {
                 Some(Token::Identifier) => {
                     let identifier = self.lexer.get_identifier_text()?;
                     expression_parts.push(identifier);
-                    self.lexer.next();
                 }
                 Some(Token::RegexPattern) => {
                     let pattern_text = self.lexer.get_raw_token_text()?;
                     expression_parts.push(pattern_text);
-                    self.lexer.next();
                 }
                 Some(Token::Tilde) => {
                     // Handle tilde expansion: ~ or ~/path
@@ -1902,7 +1900,6 @@ impl Parser {
                 Some(Token::Number) => {
                     let num = self.lexer.get_number_text()?;
                     expression_parts.push(num);
-                    self.lexer.next();
                 }
                 Some(Token::NonZero) => {
                     expression_parts.push(" -n ".to_string());

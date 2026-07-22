@@ -1,12 +1,4 @@
-000__04d_system_utilities.sh
-055_factorize.sh
-062_15_complex_local_variables.sh
-062_hard_to_lex.sh
-063_01_deeply_nested_arithmetic.sh
-063_02_complex_array_assignments.sh
-063_03_nested_command_substitutions.sh
-063_04_complex_parameter_expansion.sh
-086_if_condition_pipe.sh
-088_while_read_ifs_sort.sh
-091_while_pipe_var.sh
-094_until_loop.sh
+086_if_condition_pipe.sh	Failed due to: exit code mismatch, stdout mismatch
+088_while_read_ifs_sort.sh	Failed due to: stdout mismatch
+091_while_pipe_var.sh	Failed due to: stdout mismatch
+094_until_loop.sh	error: Failed to parser examples/094_until_loop.sh: UnexpectedToken { token: Until, line: 1, col: 10 }

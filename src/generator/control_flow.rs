@@ -192,6 +192,8 @@ pub fn generate_case_statement_impl(
 pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoop) -> String {
     let mut output = String::new();
 
+    let loop_keyword = if while_loop.is_until { "until" } else { "while" };
+
     // Check if the while loop condition uses variables that might need initialization
     // This is needed for shell compatibility where loop variables persist
     let mut read_vars: Vec<String> = extract_read_vars_from_condition(&while_loop.condition);
@@ -273,7 +275,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             } else {
                 r"\s+".to_string()
             };
-            output.push_str(&format!("while ( my $L = <> ) {{\n"));
+            output.push_str(&format!("{} ( my $L = <> ) {{\n", loop_keyword));
             output.push_str(&format!("    chomp $L;\n"));
             output.push_str(&format!("    my @_fields = split /{}/msx, $L;\n", ifs_sep));
             for (i, var) in read_vars.iter().enumerate() {
@@ -292,7 +294,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
     // with explicit condition checks via last unless/last if.
     match &*while_loop.condition {
         Command::And(_, _) | Command::Or(_, _) => {
-            output.push_str("while (1) {\n");
+            output.push_str(&format!("{} (1) {{\n", loop_keyword));
             generator.indent_level += 1;
             // Flatten the And/Or tree and generate each condition as a last check
             let mut conds = Vec::new();
@@ -349,8 +351,8 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
         Command::Block(block) => {
             // Block conditions arise when env vars are assigned before a command
             // (e.g. `IFS= read -r line && ...`). Generate each command in the block
-            // as a step in a while (1) loop, checking exit code after each.
-            output.push_str("while (1) {\n");
+            // as a step in a while (1)/until(1) loop, checking exit code after each.
+            output.push_str(&format!("{} (1) {{\n", loop_keyword));
             generator.indent_level += 1;
             // Generate all commands except the last one as plain statements
             let len = block.commands.len();
@@ -450,7 +452,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             output.push_str("}\n");
         }
         Command::Simple(cmd) if cmd.name == "[" || cmd.name == "test" => {
-            output.push_str("while ( ");
+            output.push_str(&format!("{} ( ", loop_keyword));
             generator.generate_test_command(cmd, &mut output);
             output.push_str(" ) {\n");
             // Generate body
@@ -461,7 +463,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             output.push_str("}\n");
         }
         Command::TestExpression(test_expr) => {
-            output.push_str("while ( ");
+            output.push_str(&format!("{} ( ", loop_keyword));
             let test_result = generator.generate_test_expression(test_expr);
             // Remove outer parentheses if present to avoid double parentheses
             if test_result.starts_with('(') && test_result.ends_with(')') {
@@ -478,7 +480,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             output.push_str("}\n");
         }
         _ => {
-            output.push_str("while ( ");
+            output.push_str(&format!("{} ( ", loop_keyword));
             generator.suppress_set_e_depth += 1;
             let mut cond = generator.generate_command(&while_loop.condition);
             generator.suppress_set_e_depth -= 1;
