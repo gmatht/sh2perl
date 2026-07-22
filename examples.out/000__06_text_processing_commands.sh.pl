@@ -433,7 +433,8 @@ $paste_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
             $paste_output .= "$line1\t$line2\n";
         }
         $paste_output
-        };
+        }
+    ;
     if ($CHILD_ERROR != 0) { $pipeline_success_132 = 0; }
     my @sed_lines_132 = split /\n/msx, $output_132;
     my @sed_result_132;
@@ -550,8 +551,7 @@ if ( !( ($comm_result) =~ m{\n\z}msx ) ) { print "\n"; }
 my $diff_result;
 my @diff_result;
 my %diff_result;
-$diff_result = do { my $diff_exit_code = 0;
-my $diff_output = q{};
+$diff_result = do { my $diff_output = q{};
 {
     my $diff_cmd = 'diff';
     my @diff_args = ('file1.txt', 'file2.txt');
@@ -560,11 +560,11 @@ my $diff_output = q{};
         local $INPUT_RECORD_SEPARATOR = undef;
         $diff_output = <$diff_fh>;
         close $diff_fh;
-        $diff_exit_code = $? >> 8;
+        $CHILD_ERROR = $? >> 8;
     } else {
         carp "Cannot execute diff command: $OS_ERROR";
         $diff_output = q{};
-        $diff_exit_code = 1;
+        $CHILD_ERROR = 1;
     }
 }
 $diff_output;

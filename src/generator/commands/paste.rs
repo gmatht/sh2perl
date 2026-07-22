@@ -79,7 +79,7 @@ pub fn generate_paste_command(
             // Return the computed string as the last expression of the do block
             result.push_str(&generator.indent());
             result.push_str("$paste_output");
-            result.push_str(&format!("\n{}}};\n", generator.indent()));
+            result.push_str(&format!("\n{}}}\n", generator.indent()));
         }
     } else {
         // pipeline-state debug removed
@@ -251,7 +251,7 @@ pub fn generate_paste_command(
             result.push_str("}\n");
             // Return the computed string as the last expression of the do block
             result.push_str("$paste_output");
-            result.push_str(&format!("\n{}}};\n", generator.indent()));
+            result.push_str(&format!("\n{}}}\n", generator.indent()));
         } else if perl_args.len() >= 2 {
             // No '-' handling needed - fall back to file-based paste for two args
             let paste_id = generator.get_unique_file_handle();
@@ -316,7 +316,7 @@ pub fn generate_paste_command(
             result.push_str("}\n");
             result.push_str(&generator.indent());
             result.push_str("$paste_output");
-            result.push_str(&format!("\n{}}}", generator.indent()));
+            result.push_str(&format!("\n{}}}\n", generator.indent()));
         } else if !perl_args.is_empty() {
             // Fall back to running paste via the shell but capture its output
             // and return it as the value of the expression. Use the generator's

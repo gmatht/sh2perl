@@ -95,6 +95,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
             operator: RedirectOperator::ProcessSubstitutionInput(Box::new(inner_cmd)),
             target: Word::literal("".to_string()), // Not used for process substitution
             heredoc_body: None,
+            heredoc_quoted: false,
         });
     }
 
@@ -119,6 +120,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
             operator: RedirectOperator::ProcessSubstitutionInput(Box::new(inner_cmd)),
             target: Word::literal("".to_string()), // Not used for process substitution
             heredoc_body: None,
+            heredoc_quoted: false,
         });
     }
 
@@ -156,6 +158,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
                                     operator,
                                     target,
                                     heredoc_body: None,
+                                    heredoc_quoted: false,
                                 });
                             }
                         }
@@ -173,28 +176,68 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
         operator,
         target,
         heredoc_body,
+        heredoc_quoted: false,
     })
 }
 
 /// Parse the body of a heredoc (or heredoc-tabs) redirect.
 /// `target` must be the delimiter word.
-pub fn parse_heredoc_body(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, ParserError> {
-    // Reuse the existing parse_heredoc function
-    parse_heredoc(lexer, target)
+/// Returns `(body, quoted)` where `quoted` indicates the delimiter was quoted (`<< 'EOF'`).
+pub fn parse_heredoc_body(lexer: &mut Lexer, target: &Word) -> Result<(Option<String>, bool), ParserError> {
+    // Determine if the delimiter was quoted by examining the raw input
+    // at the delimiter position. The delimiter text is stored without quotes,
+    // so we scan backwards from the heredoc body start to find the delimiter
+    // in the raw input and check if it was quoted.
+    let quoted = detect_heredoc_quoted(lexer, target);
+    let body = parse_heredoc(lexer, target)?;
+    Ok((body, quoted))
 }
 
 /// Full redirect parsing: header + heredoc body (if applicable).
 pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
     let header = parse_redirect_header(lexer)?;
     if matches!(&header.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs) {
-        let body = parse_heredoc_body(lexer, &header.target)?;
+        let (body, quoted) = parse_heredoc_body(lexer, &header.target)?;
         Ok(Redirect {
             heredoc_body: body,
+            heredoc_quoted: quoted,
             ..header
         })
     } else {
         Ok(header)
     }
+}
+
+/// Detect whether the heredoc delimiter was quoted (`<< 'EOF'`) by examining
+/// the raw input.  Scans backwards from the first newline after the current
+/// position to find the delimiter and checks for surrounding quote characters.
+fn detect_heredoc_quoted(lexer: &Lexer, target: &Word) -> bool {
+    let delim = match target {
+        Word::Literal(s, _) => s.clone(),
+        _ => return false,
+    };
+    if delim.is_empty() {
+        return false;
+    }
+    // Find the first newline after the current token position — this marks
+    // the start of the heredoc body.  The delimiter must be before this newline.
+    let start_pos = if let Some((cur_pos, _)) = lexer.get_span() {
+        match lexer.input[cur_pos..].find('\n') {
+            Some(nl_offset) => cur_pos + nl_offset,
+            None => lexer.input.len(),
+        }
+    } else {
+        return false;
+    };
+    // Search the entire line before start_pos for a quoted delimiter.
+    let input = &lexer.input;
+    // Find the beginning of the line containing the delimiter (search backwards from start_pos)
+    let line_start = input[..start_pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let line = &input[line_start..start_pos];
+    // Look for 'delim' or "delim" (with quotes)
+    let single_quoted = format!("'{}'", delim);
+    let double_quoted = format!("\"{}\"", delim);
+    line.contains(&single_quoted) || line.contains(&double_quoted)
 }
 
 fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, ParserError> {
@@ -318,6 +361,7 @@ pub fn parse_process_substitution(
         operator,
         target: Word::literal("".to_string()), // Not used for process substitution
         heredoc_body: None,
+        heredoc_quoted: false,
     })
 }
 

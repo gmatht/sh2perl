@@ -202,7 +202,6 @@ close $fh_ps_fh_6 or croak "Close failed: $ERRNO\n";
 open STDIN, '<', $temp_file_ps_fh_6 or croak "Cannot open process substitution: $ERRNO\n";
 $ENV{DIFF_TEMP_FILE1} = q{/tmp} . '/process_sub_fh_5.tmp';
 $ENV{DIFF_TEMP_FILE2} = q{/tmp} . '/process_sub_fh_6.tmp';
-my $diff_exit_code = 0;
 my $diff_output = q{};
 {
     my $diff_cmd = 'diff';
@@ -212,15 +211,15 @@ my $diff_output = q{};
         local $INPUT_RECORD_SEPARATOR = undef;
         $diff_output = <$diff_fh>;
         close $diff_fh;
-        $diff_exit_code = $? >> 8;
+        $CHILD_ERROR = $? >> 8;
     } else {
         carp "Cannot execute diff command: $OS_ERROR";
         $diff_output = q{};
-        $diff_exit_code = 1;
+        $CHILD_ERROR = 1;
     }
 }
 print $diff_output;
-if ($diff_exit_code != 0) {
+if ($CHILD_ERROR != 0) {
         print "Files differ\n";
 }
 my $temp_file_ps_fh_7 = q{/tmp} . '/process_sub_fh_7.tmp';
@@ -284,7 +283,7 @@ for my $i (0..$max_lines-1) {
     $paste_output .= "$line1\t$line2\n";
 }
 $paste_output
-};
+}
 ;
 print $paste_result_167;
 
