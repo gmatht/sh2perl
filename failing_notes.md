@@ -50,7 +50,20 @@ Error handling when files referenced in process substitution don't exist.
 ## Remaining Combined Failures
 
 ### 063_hard_to_parse.sh
-Multiple hard-to-parse constructs combined. Timeouts.
+Multiple hard-to-parse constructs combined. No longer times out (timeout fixed by
+proper `read` variable assignment and EOF handling in while-loop conditions),
+but still has exit code and stdout mismatches due to:
+- Complex process substitution with nested subshells
+- eval with complex expansions
+- Brace expansion with ranges
+- Backslash line continuations
+- trap/shopt commands
+- Background processes via fork/exec
 
 ### 064_hard_to_generate.sh
-Multiple hard-to-generate features combined. Stdout mismatch.
+Multiple hard-to-generate features combined. Stdout mismatch due to:
+- Complex nested subshells with process substitution
+- Brace expansion with mixed ranges and sequences
+- Here-documents with variable interpolation
+- Nested function definitions
+- Sort ordering differences
