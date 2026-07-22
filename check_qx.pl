@@ -48,16 +48,28 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
     while ($code =~ /qx\{([^}]*)\}/g) {
         my $qx_body = $1;
         next if $qx_body =~ /^\$/;  # skip variable indirection (handled in Pattern 2)
-        next if $is_exempt->($qx_body);
-        for my $b (@builtins) {
-            if ($qx_body =~ /\b\Q$b\E\b/) {
-                print "  FAIL: $basename.sh [perl] — QX violation: qx{} call with builtin '$b'\n";
-                $violations++;
-                last;
+        # If the body wraps in bash -c, check the INNER command for builtins
+        if ($qx_body =~ /^bash -c ['"]?(.*?)['"]?\s/) {
+            my $inner = $1;
+            next if $is_exempt->($inner);
+            for my $b (@builtins) {
+                if ($inner =~ /\b\Q$b\E\b/) {
+                    print "  FAIL: $basename.sh [perl] — QX violation: bash -c wraps builtin '$b'\n";
+                    $violations++;
+                    last;
+                }
+            }
+        } else {
+            next if $is_exempt->($qx_body);
+            for my $b (@builtins) {
+                if ($qx_body =~ /\b\Q$b\E\b/) {
+                    print "  FAIL: $basename.sh [perl] — QX violation: qx{} call with builtin '$b'\n";
+                    $violations++;
+                    last;
+                }
             }
         }
     }
-
     # Pattern 2: qx{\$var} where var was assigned a command string containing a builtin.
     # Search backwards from the qx{} call to find the MOST RECENT assignment to that
     # variable, so variable reuse (e.g. \$command for both \`ls -la\` and \`find ...\`) is
@@ -72,6 +84,10 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
             $last_assign = $+;
         }
         next if $last_assign eq '';
+        # Unwrap bash -c wrapper to check the inner command
+        if ($last_assign =~ /^bash -c ['"]?(.*?)['"]?\s*/) {
+            $last_assign = $1;
+        }
         next if $is_exempt->($last_assign);
         for my $b (@builtins) {
             if ($last_assign =~ /\b\Q$b\E\b/) {
@@ -104,23 +120,30 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         my @quoted_args = $open3_args =~ /'([^']*)'/g;
         # Skip the first 3 arguments which are always filehandle variables ($in, $out, $err)
         # The 4th argument (index 3) is the program/command
-        next if @quoted_args < 4;
-        my $prog = $quoted_args[3];
-        # If the program is 'bash' and '-c' follows, reconstruct the full command string
-        my $full_cmd;
-        if ($prog eq 'bash' && @quoted_args >= 5 && $quoted_args[4] eq '-c') {
-            # The command is bash -c <cmd>
-            my $cmd_str = $quoted_args[5];
-            $full_cmd = "bash -c $cmd_str";
+        next if @quoted_args < 3;
+        my $prog = $quoted_args[0];
+        # If the program is 'bash' and '-c' follows, check the INNER command for builtins.
+        # The 'bash -c' wrapper itself is not the cheat — the cheat is wrapping a simple
+        # command like `echo` or `printf` in bash -c instead of translating it natively.
+        if ($prog eq 'bash' && @quoted_args >= 3 && $quoted_args[1] eq '-c') {
+            my $cmd_str = $quoted_args[2];
+            # Skip if the inner command starts with an exemption (e.g. eval is genuinely hard)
+            next if $is_exempt->($cmd_str);
+            for my $b (@builtins) {
+                if ($cmd_str =~ /\b\Q$b\E\b/) {
+                    print "  FAIL: $basename.sh [perl] — OPEN3 violation: bash -c wrapping builtin '$b'\n";
+                    $violations++;
+                    last;
+                }
+            }
         } else {
-            $full_cmd = $prog;
-        }
-        next if $is_exempt->($full_cmd);
-        for my $b (@builtins) {
-            if ($full_cmd =~ /\b\Q$b\E\b/) {
-                print "  FAIL: $basename.sh [perl] — OPEN3 violation: open3() with builtin '$b'\n";
-                $violations++;
-                last;
+            next if $is_exempt->($prog);
+            for my $b (@builtins) {
+                if ($prog =~ /\b\Q$b\E\b/) {
+                    print "  FAIL: $basename.sh [perl] — OPEN3 violation: open3() with builtin '$b'\n";
+                    $violations++;
+                    last;
+                }
             }
         }
     }
