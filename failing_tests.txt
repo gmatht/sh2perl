@@ -1,4 +1,3 @@
-086_if_condition_pipe.sh	Failed due to: exit code mismatch, stdout mismatch
-088_while_read_ifs_sort.sh	Failed due to: stdout mismatch
-091_while_pipe_var.sh	Failed due to: stdout mismatch
-094_until_loop.sh	error: Failed to parser examples/094_until_loop.sh: UnexpectedToken { token: Until, line: 1, col: 10 }
+063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
+064_hard_to_generate.sh	Failed due to: stdout mismatch
+096_head_procsub.sh	error: PerlExecution timed out after 30.0 seconds

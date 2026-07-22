@@ -8,6 +8,8 @@
 - 094_until_loop.sh: Added parse_until_loop function and generation support
 - 010_pattern_matching.sh: Fixed extglob regex generation (wrong anchor)
 - 037_pattern_matching_extglob.sh: Fixed extglob regex generation (wrong anchor)
+- 096_head_procsub.sh: Fixed process substitution with infinite loops
+  (used FIFO+fork approach instead of inline capture that hung)
 
 ## Remaining Combined Failures
 

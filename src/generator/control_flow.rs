@@ -696,7 +696,12 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                                 expansion.prefix.as_deref().unwrap_or(""),
                                 s,
                                 expansion.suffix.as_deref().unwrap_or(""));
-                            all_items.push(format!("\"{}\"", val));
+                            // If the value contains glob metacharacters (*, ?, [), use glob()
+                            if val.contains('*') || val.contains('?') || val.contains('[') {
+                                all_items.push(format!("glob(\"{}\")", val));
+                            } else {
+                                all_items.push(format!("\"{}\"", val));
+                            }
                         }
                         BraceItem::Sequence(seq) => {
                             // Convert {a,b,c} to separate quoted items, include prefix/suffix
@@ -705,7 +710,12 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                                     expansion.prefix.as_deref().unwrap_or(""),
                                     item,
                                     expansion.suffix.as_deref().unwrap_or(""));
-                                all_items.push(format!("\"{}\"", val));
+                                // If the value contains glob metacharacters (*, ?, [), use glob()
+                                if val.contains('*') || val.contains('?') || val.contains('[') {
+                                    all_items.push(format!("glob(\"{}\")", val));
+                                } else {
+                                    all_items.push(format!("\"{}\"", val));
+                                }
                             }
                         }
                         BraceItem::Nested(_) => todo!(),
@@ -759,7 +769,11 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                                         expansion.prefix.as_deref().unwrap_or(""),
                                         item,
                                         expansion.suffix.as_deref().unwrap_or(""));
-                                    all_items.push(format!("\"{}\"", val));
+                                    if val.contains('*') || val.contains('?') || val.contains('[') {
+                                        all_items.push(format!("glob(\"{}\")", val));
+                                    } else {
+                                        all_items.push(format!("\"{}\"", val));
+                                    }
                                 }
                             }
                             BraceItem::Nested(_) => todo!(),
