@@ -520,15 +520,14 @@ pub fn test_file_equivalence_with_critic(
                 cmd.env("TZ", "UTC");
                 cmd.env("PWD", &examples_dir);
                 // Set HOSTNAME to match bash's HOSTNAME variable (which is available
-                // as a shell variable but not necessarily exported to the environment)
-                if std::env::var("HOSTNAME").is_err() {
-                    // HOSTNAME not in environment, get it from the system
-                    if let Ok(output) = std::process::Command::new("hostname").output() {
-                        if let Ok(hostname_str) = String::from_utf8(output.stdout) {
-                            let hostname = hostname_str.trim().to_string();
-                            if !hostname.is_empty() {
-                                cmd.env("HOSTNAME", &hostname);
-                            }
+                // as a shell variable but not necessarily exported to the environment).
+                // Always query the system hostname so the Perl child gets the same
+                // value as bash, regardless of whether HOSTNAME is in the parent env.
+                if let Ok(output) = std::process::Command::new("hostname").output() {
+                    if let Ok(hostname_str) = String::from_utf8(output.stdout) {
+                        let hostname = hostname_str.trim().to_string();
+                        if !hostname.is_empty() {
+                            cmd.env("HOSTNAME", &hostname);
                         }
                     }
                 }
@@ -1205,15 +1204,14 @@ pub fn test_file_equivalence_detailed_with_critic(
                 cmd.env("TZ", "UTC");
                 cmd.env("PWD", &examples_dir);
                 // Set HOSTNAME to match bash's HOSTNAME variable (which is available
-                // as a shell variable but not necessarily exported to the environment)
-                if std::env::var("HOSTNAME").is_err() {
-                    // HOSTNAME not in environment, get it from the system
-                    if let Ok(output) = std::process::Command::new("hostname").output() {
-                        if let Ok(hostname_str) = String::from_utf8(output.stdout) {
-                            let hostname = hostname_str.trim().to_string();
-                            if !hostname.is_empty() {
-                                cmd.env("HOSTNAME", &hostname);
-                            }
+                // as a shell variable but not necessarily exported to the environment).
+                // Always query the system hostname so the Perl child gets the same
+                // value as bash, regardless of whether HOSTNAME is in the parent env.
+                if let Ok(output) = std::process::Command::new("hostname").output() {
+                    if let Ok(hostname_str) = String::from_utf8(output.stdout) {
+                        let hostname = hostname_str.trim().to_string();
+                        if !hostname.is_empty() {
+                            cmd.env("HOSTNAME", &hostname);
                         }
                     }
                 }
