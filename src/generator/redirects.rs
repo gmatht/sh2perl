@@ -1473,14 +1473,25 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         ));
                     } else if !signal_name.is_empty() {
                         // Other signals: INT, TERM, etc.
-                        let escaped_handler_for_perl = handler
-                            .replace("\\", "\\\\")
-                            .replace("\"", "\\\"")
-                            .replace("$", "\\$");
-                        output.push_str(&format!(
-                            "$SIG{{{}}} = sub {{ system '{}'; }};\n",
-                            signal_name, escaped_handler
-                        ));
+                        // Use native Perl for echo commands; qx{bash -c ...} otherwise.
+                        let handler_trimmed = handler.trim();
+                        if let Some(echo_text) = handler_trimmed.strip_prefix("echo ") {
+                            let msg = echo_text.trim_matches('"').trim();
+                            let escaped_msg = msg
+                                .replace("\\", "\\\\")
+                                .replace("\"", "\\\"")
+                                .replace("$", "\\$");
+                            output.push_str(&format!(
+                                "$SIG{{{}}} = sub {{ print \"{}\\n\"; }};\n",
+                                signal_name, escaped_msg
+                            ));
+                        } else {
+                            output.push_str(&format!(
+                                "$SIG{{{}}} = sub {{ qx{{bash -c '{}'}}; }};\n",
+                                signal_name,
+                                handler.replace("'", "'\\''")
+                            ));
+                        }
                     } else {
                         output.push_str(&format!(
                             "# Builtin command 'trap' not implemented for signal {}\n",

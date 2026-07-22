@@ -400,6 +400,26 @@ impl Lexer {
             }
         }
 
+        // Post-process: remove backslash-newline continuations.
+        // A `\` immediately followed by `\n` is a line continuation;
+        // skip both tokens so the parser sees them as whitespace.
+        {
+            let mut i = 0;
+            while i < tokens.len() {
+                let is_backslash = matches!(tokens[i].0, Token::_Backslash | Token::Escape);
+                if is_backslash
+                    && i + 1 < tokens.len()
+                    && matches!(tokens[i + 1].0, Token::Newline | Token::CarriageReturn)
+                {
+                    tokens.remove(i);      // remove backslash
+                    tokens.remove(i);      // remove newline (indices shifted)
+                    // Don't increment i — the next token is now at position i
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
         // Post-process: re-parse DoubleQuotedString tokens to properly
         // handle $(...) and ${...} nesting. Logos's regex splits on every
         // " even inside $(...)/${...}, so we manually scan from each

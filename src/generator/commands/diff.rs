@@ -12,8 +12,6 @@ pub fn generate_diff_command(
 
     // Always use diff.exe instead of built-in implementation
     output.push_str(&generator.indent());
-    output.push_str("my $diff_exit_code = 0;\n");
-    output.push_str(&generator.indent());
     output.push_str("my $diff_output = q{};\n");
 
     // Build the diff command arguments
@@ -44,7 +42,7 @@ pub fn generate_diff_command(
         // close on a pipe filehandle reaps the child; $? holds the exit status.
         output.push_str("close $diff_fh;\n");
         output.push_str(&generator.indent());
-        output.push_str("$diff_exit_code = $? >> 8;\n");
+        output.push_str("$CHILD_ERROR = $? >> 8;\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("} else {\n");
@@ -54,7 +52,7 @@ pub fn generate_diff_command(
         output.push_str(&generator.indent());
         output.push_str("$diff_output = q{};\n");
         output.push_str(&generator.indent());
-        output.push_str("$diff_exit_code = 1;\n");
+        output.push_str("$CHILD_ERROR = 1;\n");
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
