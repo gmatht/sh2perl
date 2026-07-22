@@ -12,14 +12,12 @@ my $ls_success     = 0;
 my $__set_e        = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '083_process_sub_missing_files.sh';
-print "start\n";
-do {
+$PROGRAM_NAME = '063_14_complex_redirects.sh';
 my $temp_file_ps_fh_1 = q{/tmp} . '/process_sub_fh_1.tmp';
 my $output_ps_fh_1;
 {
-my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'echo a');
+my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', 'sort file1.txt');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_1 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -36,8 +34,8 @@ open STDIN, '<', $temp_file_ps_fh_1 or croak "Cannot open process substitution: 
 my $temp_file_ps_fh_2 = q{/tmp} . '/process_sub_fh_2.tmp';
 my $output_ps_fh_2;
 {
-my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'echo b');
+my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', 'sort file2.txt');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_2 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -51,8 +49,13 @@ open my $fh_ps_fh_2, '>', $temp_file_ps_fh_2 or croak "Cannot create temp file: 
 print {$fh_ps_fh_2} $output_ps_fh_2;
 close $fh_ps_fh_2 or croak "Close failed: $ERRNO\n";
 open STDIN, '<', $temp_file_ps_fh_2 or croak "Cannot open process substitution: $ERRNO\n";
-local *STDERR;
-open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
+do {
+    open my $original_stdout, '>&', STDOUT
+      or die "Cannot save STDOUT: $OS_ERROR\n";
+    open STDOUT, '>', 'comparison.txt'
+      or die "Cannot open file: $OS_ERROR\n";
+    local *STDERR;
+    open STDERR, '>&', STDOUT or die "Cannot dup stderr: $OS_ERROR\n";
     $ENV{DIFF_TEMP_FILE1} = q{/tmp} . '/process_sub_fh_1.tmp';
     $ENV{DIFF_TEMP_FILE2} = q{/tmp} . '/process_sub_fh_2.tmp';
     my $diff_output = q{};
@@ -72,10 +75,10 @@ open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
         }
     }
     print $diff_output;
+    open STDOUT, '>&', $original_stdout
+      or die "Cannot restore STDOUT: $OS_ERROR\n";
+    close $original_stdout
+      or die "Close failed: $OS_ERROR\n";
 };
-if ($CHILD_ERROR != 0) {
-    1;
-}
-print "end\n";
 
 exit $main_exit_code;

@@ -188,8 +188,8 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
             let cmd_str = generate_bash_command_string(cmd);
             let cmd_literal = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
             output.push_str(&format!(
-                "my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', {});
+                "my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', {});
 close $in or croak 'Close failed: $OS_ERROR';
 my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <$out> }};
 close $out or croak 'Close failed: $OS_ERROR';
@@ -236,13 +236,37 @@ waitpid $pid, 0;\n",
             output.push_str("# Here-string handling moved to command dispatcher\n");
         }
         RedirectOperator::StderrOutput => {
-            // Stderr redirection: command 2> file
-            let target = generator.perl_string_literal(&redirect.target);
-            output.push_str("local *STDERR;\n");
-            output.push_str(&format!(
-                "open STDERR, '>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
-                target
-            ));
+            // Stderr redirection: command 2> file or 2>&1 (dup stderr to fd)
+            // Check if the target is a bare number (fd duplication like 2>&1)
+            let is_fd_dup = match &redirect.target {
+                Word::Literal(s, _) => !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
+                _ => false,
+            };
+            if is_fd_dup {
+                // Duplicate stderr to the given file descriptor
+                // For example, 2>&1 -> open STDERR, '>&', STDOUT
+                if let Word::Literal(s, _) = &redirect.target {
+                    let fd_name = match s.as_str() {
+                        "1" => "STDOUT",
+                        "2" => "STDERR",
+                        "0" => "STDIN",
+                        _ => "STDOUT",
+                    };
+                    output.push_str("local *STDERR;\n");
+                    output.push_str(&format!(
+                        "open STDERR, '>&', {} or die \"Cannot dup stderr: $OS_ERROR\\n\";\n",
+                        fd_name
+                    ));
+                }
+            } else {
+                // Regular stderr redirect to a file
+                let target = generator.perl_string_literal(&redirect.target);
+                output.push_str("local *STDERR;\n");
+                output.push_str(&format!(
+                    "open STDERR, '>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
+                    target
+                ));
+            }
         }
         RedirectOperator::StderrAppend => {
             // Stderr append: command 2>> file

@@ -35,8 +35,8 @@ print "== Process substitution with comm ==\n";
 my $temp_file_ps_fh_2 = q{/tmp} . '/process_sub_fh_2.tmp';
 my $output_ps_fh_2;
 {
-my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'printf "a\\\\nb\\\\n"');
+my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', 'printf "a\\\\nb\\\\n"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_2 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -53,8 +53,8 @@ open STDIN, '<', $temp_file_ps_fh_2 or croak "Cannot open process substitution: 
 my $temp_file_ps_fh_3 = q{/tmp} . '/process_sub_fh_3.tmp';
 my $output_ps_fh_3;
 {
-my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'printf "b\\\\nc\\\\n"');
+my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', 'printf "b\\\\nc\\\\n"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_3 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -101,8 +101,8 @@ print "== readarray/mapfile ==\n";
 my $temp_file_ps_fh_4 = q{/tmp} . '/process_sub_fh_4.tmp';
 my $output_ps_fh_4;
 {
-my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'printf "x\\\\ny\\\\n"');
+my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', 'printf "x\\\\ny\\\\n"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_4 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -131,31 +131,13 @@ print "== More process substitution examples ==\n";
 my $temp_file_ps_fh_5 = q{/tmp} . '/process_sub_fh_5.tmp';
 my $output_ps_fh_5;
 {
-    local *STDOUT;
-    open STDOUT, '>', \$output_ps_fh_5 or croak "Cannot redirect STDOUT";
-    my $output_165 = q{};
-    my $output_printed_165;
-    {
-        my $pipeline_success_165 = 1;
-        $output_165 .= "a\nc\nb";
-    if ( !($output_165 =~ m{\n\z}msx) ) { $output_165 .= "\n"; }
-    $CHILD_ERROR = 0;
-            my @sort_lines_165_1 = split /\n/msx, $output_165;
-        my @sort_sorted_165_1 = sort @sort_lines_165_1;
-        my $output_165_1 = join "\n", @sort_sorted_165_1;
-        if ($output_165_1 ne q{} && !($output_165_1 =~ m{\n\z}msx)) {
-        $output_165_1 .= "\n";
-        }
-        $output_165 = $output_165_1;
-        $output_165 = $output_165_1;
-        if ($output_165 ne q{} && !defined $output_printed_165) {
-            print $output_165;
-            if (!($output_165 =~ m{\n\z}msx)) {
-                print "\n";
-            }
-        }
-        if ( !$pipeline_success_165 ) { $main_exit_code = 1; }
-        }
+my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', 'echo -e "a\\\\nc\\\\nb" | sort');
+close $in or croak 'Close failed: $OS_ERROR';
+$output_ps_fh_5 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
+close $out or croak 'Close failed: $OS_ERROR';
+waitpid $pid, 0;
+$CHILD_ERROR = $? >> 8;
 }
 use File::Path qw(make_path);
 my $temp_dir_fh_5 = dirname($temp_file_ps_fh_5);
@@ -167,31 +149,13 @@ open STDIN, '<', $temp_file_ps_fh_5 or croak "Cannot open process substitution: 
 my $temp_file_ps_fh_6 = q{/tmp} . '/process_sub_fh_6.tmp';
 my $output_ps_fh_6;
 {
-    local *STDOUT;
-    open STDOUT, '>', \$output_ps_fh_6 or croak "Cannot redirect STDOUT";
-    my $output_166 = q{};
-    my $output_printed_166;
-    {
-        my $pipeline_success_166 = 1;
-        $output_166 .= "a\nb\nd";
-    if ( !($output_166 =~ m{\n\z}msx) ) { $output_166 .= "\n"; }
-    $CHILD_ERROR = 0;
-            my @sort_lines_166_1 = split /\n/msx, $output_166;
-        my @sort_sorted_166_1 = sort @sort_lines_166_1;
-        my $output_166_1 = join "\n", @sort_sorted_166_1;
-        if ($output_166_1 ne q{} && !($output_166_1 =~ m{\n\z}msx)) {
-        $output_166_1 .= "\n";
-        }
-        $output_166 = $output_166_1;
-        $output_166 = $output_166_1;
-        if ($output_166 ne q{} && !defined $output_printed_166) {
-            print $output_166;
-            if (!($output_166 =~ m{\n\z}msx)) {
-                print "\n";
-            }
-        }
-        if ( !$pipeline_success_166 ) { $main_exit_code = 1; }
-        }
+my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', 'echo -e "a\\\\nb\\\\nd" | sort');
+close $in or croak 'Close failed: $OS_ERROR';
+$output_ps_fh_6 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
+close $out or croak 'Close failed: $OS_ERROR';
+waitpid $pid, 0;
+$CHILD_ERROR = $? >> 8;
 }
 use File::Path qw(make_path);
 my $temp_dir_fh_6 = dirname($temp_file_ps_fh_6);
@@ -225,8 +189,8 @@ if ($CHILD_ERROR != 0) {
 my $temp_file_ps_fh_7 = q{/tmp} . '/process_sub_fh_7.tmp';
 my $output_ps_fh_7;
 {
-my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e "name1\\\\nname2"');
+my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', 'echo -e "name1\\\\nname2"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_7 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -243,8 +207,8 @@ open STDIN, '<', $temp_file_ps_fh_7 or croak "Cannot open process substitution: 
 my $temp_file_ps_fh_8 = q{/tmp} . '/process_sub_fh_8.tmp';
 my $output_ps_fh_8;
 {
-my ($in, $out, $err);
-my $pid = open3($in, $out, $err, 'bash', '-c', 'echo -e "value1\\\\nvalue2"');
+my ($in, $out);
+my $pid = open3($in, $out, undef, 'bash', '-c', 'echo -e "value1\\\\nvalue2"');
 close $in or croak 'Close failed: $OS_ERROR';
 $output_ps_fh_8 = do { local $INPUT_RECORD_SEPARATOR = undef; <$out> };
 close $out or croak 'Close failed: $OS_ERROR';
@@ -258,7 +222,7 @@ open my $fh_ps_fh_8, '>', $temp_file_ps_fh_8 or croak "Cannot create temp file: 
 print {$fh_ps_fh_8} $output_ps_fh_8;
 close $fh_ps_fh_8 or croak "Close failed: $ERRNO\n";
 open STDIN, '<', $temp_file_ps_fh_8 or croak "Cannot open process substitution: $ERRNO\n";
-my $paste_result_167 = do {
+my $paste_result_165 = do {
 my @paste_file1_lines_fh_9;
 my @paste_file2_lines_fh_9;
 if (open my $fh1, '<', $temp_file_ps_fh_7) {
@@ -285,6 +249,6 @@ for my $i (0..$max_lines-1) {
 $paste_output
 }
 ;
-print $paste_result_167;
+print $paste_result_165;
 
 exit $main_exit_code;
