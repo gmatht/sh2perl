@@ -173,8 +173,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&format!("push @{}, {};\n", var, elem));
                 }
             } else {
-                // First declaration - use my @
+                // First declaration - use my @, also declare scalar and hash forms
+                output.push_str(&format!("my ${};\n", var));
                 output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
+                output.push_str(&format!("my %{};\n", var));
                 generator.declared_locals.insert((*var).clone());
             }
             // Mark array as declared
@@ -191,7 +193,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         output.push_str(&format!("push @{}, {};\n", var, elem));
                     }
                 } else {
+                    output.push_str(&format!("my ${};\n", var));
                     output.push_str(&format!("my @{} = ({});\n", var, elements_perl.join(", ")));
+                    output.push_str(&format!("my %{};\n", var));
                     generator.declared_locals.insert((*var).clone());
                 }
             }

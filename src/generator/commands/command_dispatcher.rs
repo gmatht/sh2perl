@@ -330,6 +330,10 @@ pub fn generate_command_impl_with_input(
                             fh_var
                         ));
 
+                        // Redirect STDIN to read from the process substitution output
+                        result.push_str(&generator.indent());
+                        result.push_str(&format!("open STDIN, \'<\', ${} or croak \"Cannot open process substitution: $ERRNO\\n\";\n", temp_var));
+
                         // If there is an active pipeline, feed the process-substitution
                         // output into the pipeline buffer so the next command (e.g. sort)
                         // can read it when it references $output_<id>.

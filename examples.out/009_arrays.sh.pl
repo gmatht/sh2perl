@@ -16,7 +16,9 @@ $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
 print "== Indexed arrays ==\n";
+my $arr;
 my @arr = ('one', 'two', 'three');
+my %arr;
 print $arr[1];
 if ( !( ($arr[1]) =~ m{\n\z}msx ) ) { print "\n"; }
 print scalar(@arr) . "\n";

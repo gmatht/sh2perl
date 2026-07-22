@@ -49,6 +49,7 @@ if (!-d $temp_dir_fh_2) { make_path($temp_dir_fh_2); }
 open my $fh_ps_fh_2, '>', $temp_file_ps_fh_2 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_2} $output_ps_fh_2;
 close $fh_ps_fh_2 or croak "Close failed: $ERRNO\n";
+open STDIN, '<', $temp_file_ps_fh_2 or croak "Cannot open process substitution: $ERRNO\n";
 my $temp_file_ps_fh_3 = q{/tmp} . '/process_sub_fh_3.tmp';
 my $output_ps_fh_3;
 {
@@ -66,6 +67,7 @@ if (!-d $temp_dir_fh_3) { make_path($temp_dir_fh_3); }
 open my $fh_ps_fh_3, '>', $temp_file_ps_fh_3 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_3} $output_ps_fh_3;
 close $fh_ps_fh_3 or croak "Close failed: $ERRNO\n";
+open STDIN, '<', $temp_file_ps_fh_3 or croak "Cannot open process substitution: $ERRNO\n";
 my @file1_lines;
 my @file2_lines;
 if (open(my $fh1, '<', $temp_file_ps_fh_2)) {
@@ -113,6 +115,7 @@ if (!-d $temp_dir_fh_4) { make_path($temp_dir_fh_4); }
 open my $fh_ps_fh_4, '>', $temp_file_ps_fh_4 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_4} $output_ps_fh_4;
 close $fh_ps_fh_4 or croak "Close failed: $ERRNO\n";
+open STDIN, '<', $temp_file_ps_fh_4 or croak "Cannot open process substitution: $ERRNO\n";
 my @lines = ();
 if (open(my $mapfile_fh, '<', $temp_file_ps_fh_4)) {
     while (my $line = <$mapfile_fh>) {
@@ -160,6 +163,7 @@ if (!-d $temp_dir_fh_5) { make_path($temp_dir_fh_5); }
 open my $fh_ps_fh_5, '>', $temp_file_ps_fh_5 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_5} $output_ps_fh_5;
 close $fh_ps_fh_5 or croak "Close failed: $ERRNO\n";
+open STDIN, '<', $temp_file_ps_fh_5 or croak "Cannot open process substitution: $ERRNO\n";
 my $temp_file_ps_fh_6 = q{/tmp} . '/process_sub_fh_6.tmp';
 my $output_ps_fh_6;
 {
@@ -195,6 +199,7 @@ if (!-d $temp_dir_fh_6) { make_path($temp_dir_fh_6); }
 open my $fh_ps_fh_6, '>', $temp_file_ps_fh_6 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_6} $output_ps_fh_6;
 close $fh_ps_fh_6 or croak "Close failed: $ERRNO\n";
+open STDIN, '<', $temp_file_ps_fh_6 or croak "Cannot open process substitution: $ERRNO\n";
 $ENV{DIFF_TEMP_FILE1} = q{/tmp} . '/process_sub_fh_5.tmp';
 $ENV{DIFF_TEMP_FILE2} = q{/tmp} . '/process_sub_fh_6.tmp';
 my $diff_exit_code = 0;
@@ -235,6 +240,7 @@ if (!-d $temp_dir_fh_7) { make_path($temp_dir_fh_7); }
 open my $fh_ps_fh_7, '>', $temp_file_ps_fh_7 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_7} $output_ps_fh_7;
 close $fh_ps_fh_7 or croak "Close failed: $ERRNO\n";
+open STDIN, '<', $temp_file_ps_fh_7 or croak "Cannot open process substitution: $ERRNO\n";
 my $temp_file_ps_fh_8 = q{/tmp} . '/process_sub_fh_8.tmp';
 my $output_ps_fh_8;
 {
@@ -252,6 +258,7 @@ if (!-d $temp_dir_fh_8) { make_path($temp_dir_fh_8); }
 open my $fh_ps_fh_8, '>', $temp_file_ps_fh_8 or croak "Cannot create temp file: $ERRNO\n";
 print {$fh_ps_fh_8} $output_ps_fh_8;
 close $fh_ps_fh_8 or croak "Close failed: $ERRNO\n";
+open STDIN, '<', $temp_file_ps_fh_8 or croak "Cannot open process substitution: $ERRNO\n";
 my $paste_result_167 = do {
 my @paste_file1_lines_fh_9;
 my @paste_file2_lines_fh_9;

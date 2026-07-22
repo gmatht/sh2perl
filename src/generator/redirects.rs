@@ -262,6 +262,9 @@ waitpid $pid, 0;\n",
                 fh_var
             ));
 
+            // Redirect STDIN to read from the process substitution output
+            output.push_str(&format!("open STDIN, \'<\', ${} or croak \"Cannot open process substitution: $ERRNO\\n\";\n", temp_var));
+
             generator.process_sub_files.insert(
                 format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter),
                 temp_var.clone(),

@@ -67,6 +67,10 @@ pub struct Generator {
     /// (via `declare -A` or `local -A`).  Used to emit Perl hash syntax
     /// `$map{key}` instead of array syntax `$map[key]`.
     pub associative_arrays: HashSet<String>,
+    /// Set of variable names that were declared as indexed arrays
+    /// (via `declare -a` or `local -a` or simple array assignment like `arr=(...)`).
+    /// Used to emit Perl array syntax `@arr` instead of `$arr`.
+    pub indexed_arrays: HashSet<String>,
 }
 
 /// RAII guard that pops the pipeline_output_stack when dropped.
@@ -131,6 +135,7 @@ impl Generator {
             set_e_active: false,
             suppress_set_e_depth: 0,
             associative_arrays: HashSet::new(),
+            indexed_arrays: HashSet::new(),
         }
     }
 
@@ -154,6 +159,7 @@ impl Generator {
             set_e_active: false,
             suppress_set_e_depth: 0,
             associative_arrays: HashSet::new(),
+            indexed_arrays: HashSet::new(),
         }
     }
 
@@ -177,6 +183,7 @@ impl Generator {
             set_e_active: false,
             suppress_set_e_depth: 0,
             associative_arrays: HashSet::new(),
+            indexed_arrays: HashSet::new(),
         }
     }
 
@@ -625,8 +632,13 @@ impl Generator {
                     if !self.declared_locals.contains(name)
                         && !self.function_level_vars.contains(name)
                     {
+                        // Declare all three forms (scalar, array, hash) for consistency
+                        output.push_str(&self.indent());
+                        output.push_str(&format!("my ${};\n", name));
                         output.push_str(&self.indent());
                         output.push_str(&format!("my @{} = ({});\n", name, elements_perl.join(", ")));
+                        output.push_str(&self.indent());
+                        output.push_str(&format!("my %{};\n", name));
                         self.declared_locals.insert(name.clone());
                     } else {
                         output.push_str(&self.indent());
@@ -638,7 +650,11 @@ impl Generator {
                         && !self.function_level_vars.contains(name)
                     {
                         output.push_str(&self.indent());
+                        output.push_str(&format!("my ${};\n", name));
+                        output.push_str(&self.indent());
                         output.push_str(&format!("my @{} = ();\n", name));
+                        output.push_str(&self.indent());
+                        output.push_str(&format!("my %{};\n", name));
                         self.declared_locals.insert(name.clone());
                     }
                     output.push_str(&self.indent());
