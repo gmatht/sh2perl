@@ -1,8 +1,3 @@
 063_11_complex_while_loop.sh	error: PerlExecution timed out after 30.0 seconds
 063_hard_to_parse.sh	error: PerlExecution timed out after 30.0 seconds
 064_hard_to_generate.sh	Failed due to: stdout mismatch
-077_backslash_continuation.sh	Failed due to: stdout mismatch
-079_heredoc_interpolation.sh	Failed due to: stdout mismatch
-080_process_sub_pipeline.sh	Failed due to: exit code mismatch, stdout mismatch
-083_process_sub_missing_files.sh	Failed due to: exit code mismatch, stdout mismatch
-073_trap_signal.sh	SYSTEM violation: system() call with builtin 'echo'

@@ -214,8 +214,10 @@ pub fn generate_command_impl_with_input(
                         let is_complex_command =
                             matches!(**cmd, Command::Pipeline(_) | Command::Redirect(_));
 
-                        if in_stdout_context || is_complex_command {
-                            // If we're already in a STDOUT context, or if this is a complex command, generate the actual Perl code
+                        if in_stdout_context || !command_can_be_serialized(cmd) {
+                            // If we're already in a STDOUT context, or if the command
+                            // cannot be serialized to a bash command string, generate
+                            // the actual Perl code (inline approach).
                             result.push_str(&generator.indent());
                             result.push_str(&format!("my $output_ps_{};\n", global_counter));
                             result.push_str(&generator.indent());
@@ -276,7 +278,10 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&generator.indent());
                             result.push_str(&format!("}}\n"));
                         } else {
-                            // Use backticks when not in STDOUT context for simple commands
+                            // Use backticks via open3 for commands that can be serialized
+                            // to a bash command string (Simple, Pipeline, Subshell, Redirect).
+                            // This correctly handles file arguments (instead of reading from
+                            // stdin as the inline pipeline generation would).
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_literal =
                                 generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
@@ -1090,4 +1095,20 @@ pub fn generate_command_impl_with_input(
             result
         }
     }
+}
+
+/// Check if a command can be serialized to a simple bash command string
+/// for use with open3/bash -c in process substitution.
+fn command_can_be_serialized(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Simple(_)
+            | Command::Pipeline(_)
+            | Command::Subshell(_)
+            | Command::Redirect(_)
+            | Command::Block(_)
+            | Command::And(_, _)
+            | Command::Or(_, _)
+            | Command::BlankLine
+    )
 }
