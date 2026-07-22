@@ -834,12 +834,37 @@ pub fn generate_generic_builtin(
         }
         "read" => {
             // Handle read command - read from input_var if available, otherwise from STDIN
+            // Extract variable names from cmd.args (skip flags like -r, -p, -n, -t, -d, -s, -u, -a)
+            let vars: Vec<String> = cmd.args.iter().filter_map(|arg| {
+                if let Word::Literal(s, _) = arg {
+                    if !s.starts_with('-') {
+                        return Some(s.clone());
+                    }
+                }
+                None
+            }).collect();
+            
             if input_var.is_empty() {
                 // No input variable, read from STDIN
-                format!("my $L = <>;\nchomp $L;\n")
+                if let Some(var_name) = vars.first() {
+                    // Assign directly to the named variable without 'my' so the value is
+                    // visible in the enclosing scope (e.g. inside a `do` block inside a
+                    // while(1) loop). The caller must ensure the variable is already declared.
+                    format!(
+                        "${} = <>;\nchomp ${};\n$CHILD_ERROR = defined(${}) ? 0 : 1;\n",
+                        var_name, var_name, var_name
+                    )
+                } else {
+                    // No variable name given, use $L as fallback
+                    format!("my $L = <>;\nchomp $L;\n$CHILD_ERROR = defined($L) ? 0 : 1;\n")
+                }
             } else {
                 // Read from input variable (pipeline context)
-                format!("my $L = ${};\n", input_var)
+                if let Some(var_name) = vars.first() {
+                    format!("${} = ${};\n$CHILD_ERROR = 0;\n", var_name, input_var)
+                } else {
+                    format!("my $L = ${};\n", input_var)
+                }
             }
         }
         "true" => {
