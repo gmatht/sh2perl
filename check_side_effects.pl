@@ -9,7 +9,7 @@ use Cwd qw(abs_path);
 # check_side_effects.pl — compare file-system side effects of bash vs Perl
 # Usage: check_side_effects.pl <test.sh>
 
-my $WATCH_DIRS = ['/tmp'];
+my $WATCH_DIRS = ['.'];  # watch sh2perl/ (examples, examples.out, etc.)
 my $debashc = './target/debug/debashc';
 my $violations = 0;
 
@@ -67,7 +67,7 @@ sub capture_side_effects {
             return ("PERL GENERATION FAILED");
         }
         # Strip everything before the first #!
-        my ($perl_code) = $raw =~ /(^#!.*\z)/ms;
+        my ($perl_code) = $raw =~ /(^#!.*?)^===/ms;
         return ("NO PERL CODE") unless defined $perl_code && length $perl_code > 10;
 
         my $tmp_dir = tempdir(CLEANUP => 1);
@@ -80,8 +80,18 @@ sub capture_side_effects {
 
     my $after = snapshot($WATCH_DIRS);
     my @changes = diff_snapshot($before, $after);
-    # Remove changes in our own temp directories
-    @changes = grep { !m{/tmp/[^/]+/check_side\.pl} && !m{/tmp/\w+\.pl} } @changes;
+    # Remove expected changes (test runner artifacts, generated .pl files)
+    @changes = grep {
+        !m{/check_side\.pl$} &&
+        !m{/failing_tests\.txt$} &&
+        !m{/\.last_trusted_count$} &&
+        !m{/first_n_tests_passed\.txt$} &&
+        !m{/command_cache\.json$} &&
+        !m{/fix_history\.log$} &&
+        !m{/crash_output\.log$} &&
+        !m{/debug_perl_code\.pl$} &&
+        !m{/examples\.out/.*\.pl$}
+    } @changes;
     return @changes;
 }
 
