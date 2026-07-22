@@ -1,2 +1,3 @@
-063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
+063_11_complex_while_loop.sh	error: PerlExecution timed out after 30.0 seconds
+063_hard_to_parse.sh	error: PerlExecution timed out after 30.0 seconds
 064_hard_to_generate.sh	Failed due to: exit code mismatch, stdout mismatch
