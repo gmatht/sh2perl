@@ -352,11 +352,12 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
             // For loops need to be handled as Perl code, not system commands
             generator.generate_for_loop(for_loop)
         }
-        Command::Redirect(_redirect_cmd) => {
-            // For RedirectCommand with process substitution, we can't generate a simple shell command
-            // Instead, we should not be called for these commands
-            eprintln!("WARNING: generate_command_string_for_system called with RedirectCommand");
-            "echo 'RedirectCommand cannot be converted to shell command'".to_string()
+        Command::Redirect(redirect_cmd) => {
+            // For RedirectCommand, delegate to generate_bash_command_string which
+            // handles redirects (including process substitution) correctly.
+            crate::generator::redirects::generate_bash_command_string(
+                &Command::Redirect(redirect_cmd.clone()),
+            )
         }
         _ => {
             // For complex commands that can't be converted to simple shell commands,
