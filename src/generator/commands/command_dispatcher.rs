@@ -295,13 +295,10 @@ pub fn generate_command_impl_with_input(
                                 global_counter
                             ));
 
-                            if in_stdout_context || !command_can_be_serialized(cmd) || command_tree_is_native_builtin(cmd) {
+                            if in_stdout_context || !command_can_be_serialized(cmd) {
                                 // If we're already in a STDOUT context, or if the command
                                 // cannot be serialized to a bash command string, generate
                                 // the actual Perl code (inline approach).
-                                // Also use inline Perl when the command consists entirely
-                                // of native builtins (e.g. echo, sort, printf) to avoid
-                                // OPEN3/QX violations.
                                 result.push_str(&generator.indent());
                                 result.push_str(&format!("my $output_ps_{};\n", global_counter));
                                 result.push_str(&generator.indent());
