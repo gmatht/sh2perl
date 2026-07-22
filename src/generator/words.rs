@@ -1103,7 +1103,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 .map(|redirect| {
                                     let file_name = generator.word_to_perl(&redirect.target);
                                     format!(
-                                        "my ${} = do {{\n    local $INPUT_RECORD_SEPARATOR = undef;\n    open my $fh, '<', {}\n        or croak \"Cannot open file: $OS_ERROR\";\n    my $content = <$fh>;\n    close $fh\n        or croak \"Close failed: $OS_ERROR\";\n    $content\n}};\n",
+                                        "my ${} = do {{\n    local $INPUT_RECORD_SEPARATOR = undef;\n    if (open my $fh, '<', {}) {{\n        my $content = <$fh>;\n        close $fh or warn \"Close failed: $OS_ERROR\";\n        $content;\n    }} else {{\n        warn \"Cannot open file: $OS_ERROR\";\n        q{{}};\n    }}\n}};\n",
                                         input_var, file_name
                                     )
                                 })

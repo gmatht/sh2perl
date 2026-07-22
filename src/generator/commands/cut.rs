@@ -117,7 +117,7 @@ pub fn generate_cut_command_with_output(
         let temp_var = format!("cut_input_{}", generator.get_unique_id());
         let first_file = generator.word_to_perl(&file_args[0]);
         output.push_str(&format!(
-            "my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; my $fh; open $fh, \'<\', {} or croak \"Cannot open {}: $OS_ERROR\\n\"; <$fh> }};\n",
+            "my ${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; my $fh; if (open $fh, \'<\', {}) {{ <$fh> }} else {{ warn \"Cannot open {}: $OS_ERROR\\n\"; q{{}} }} }};\n",
             temp_var, first_file, first_file
         ));
         temp_var
