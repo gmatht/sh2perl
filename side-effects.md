@@ -20,7 +20,7 @@ because bash is doing the actual work in both cases.
 
 | Test | Bash creates | Perl creates | Why |
 |------|-------------|-------------|-----|
-| 018_grep_params.sh | `temp_file.txt`, `test_dir/` | nothing | Perl `system()` fails |
+| 018_grep_params.sh | `temp_file.txt`, `test_dir/`, `test_dir/file1.txt`, `test_dir/file2.txt` | nothing | Perl `system()` fails |
 | 063_14_complex_redirects.sh | `comparison.txt` | nothing | same |
 | 063_20_final_complex_construct.sh | `final_result.txt` | nothing | same |
 | 063_hard_to_parse.sh | `comparison.txt`, `final_result.txt` | nothing | same |
