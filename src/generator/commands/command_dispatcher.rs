@@ -709,6 +709,10 @@ pub fn generate_command_impl_with_input(
                             let rest = lines[1];
                             result.push_str(rest);
                             result.push_str(&format!("    print ${};\n", output_var));
+                            // Ensure a trailing newline for standalone commands (here-string adds one in bash)
+                            result.push_str(&format!("    if (!(${} =~ {} || ${} eq q{{}})) {{\n", output_var, generator.newline_end_regex(), output_var));
+                            result.push_str(&format!("        print \"\\n\";\n"));
+                            result.push_str(&format!("    }}\n"));
                         } else {
                             // Fallback: just append the code as-is
                             result.push_str(&specific_output);
