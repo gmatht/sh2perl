@@ -366,7 +366,7 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                 "WARNING: generate_command_string_for_system called with complex command: {:?}",
                 cmd
             );
-            "echo \"Complex command cannot be converted to shell command\"".to_string()
+            ": \"Complex command cannot be converted to shell command\"".to_string()
         }
     }
 }

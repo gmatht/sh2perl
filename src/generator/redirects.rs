@@ -640,7 +640,7 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
         }
         _ => {
             // For other complex commands, generate a reasonable bash representation
-            format!("echo 'Complex command not supported in bash string generation'")
+            format!(": 'Complex command not supported in bash string generation'")
         }
     }
 }

@@ -295,7 +295,7 @@ pub fn generate_command_impl_with_input(
                                 global_counter
                             ));
 
-                            if in_stdout_context || !command_can_be_serialized(cmd) {
+                            if in_stdout_context || !command_can_be_serialized(cmd) || command_tree_is_native_builtin(cmd) {
                                 // If we're already in a STDOUT context, or if the command
                                 // cannot be serialized to a bash command string, generate
                                 // the actual Perl code (inline approach).
@@ -1351,7 +1351,7 @@ fn is_perl_native_builtin(name: &str) -> bool {
 
 /// Recursively check if a command AST contains only simple commands
 /// whose names are known builtins with native Perl implementations.
-fn command_tree_is_native_builtin(cmd: &Command) -> bool {
+pub fn command_tree_is_native_builtin(cmd: &Command) -> bool {
     match cmd {
         Command::Simple(simple) => {
             if let Word::Literal(name, _) = &simple.name {

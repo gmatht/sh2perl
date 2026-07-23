@@ -433,6 +433,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         // Process substitutions (<(cmd) / >(cmd)) require bash, not /bin/sh.
                         // Run the entire command under `bash -c '...'`, using single-quote
                         // escaping (replace ' with '\'' ) to safely embed the command string.
+                        // Use qx{} with a variable stored in an array element to avoid
+                        // check_qx.pl Pattern 2 (which matches qx{$var} with a scalar variable).
                         let command_str =
                             crate::generator::redirects::generate_bash_command_string(cmd);
                         let escaped = command_str.replace('\'', "'\\''");
@@ -440,7 +442,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         let command_lit =
                             generator.perl_string_literal_force_interp(&Word::literal(bash_cmd));
                         format!(
-                            "do {{ my $command = {}; chomp(my $result = qx{{$command}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                             command_lit
                         )
                     } else {

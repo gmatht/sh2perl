@@ -1,3 +1,4 @@
+use super::command_dispatcher::command_tree_is_native_builtin;
 use crate::ast::*;
 use crate::generator::Generator;
 
@@ -123,7 +124,7 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
     output.push_str(&generator.indent());
     output.push_str("# Child process executes the background command\n");
 
-    if prefer_shell_fallback {
+    if prefer_shell_fallback && !command_tree_is_native_builtin(command) {
         // Prefer preserving the original exec argument list for simple
         // invocations like `sh -c '...'` to avoid creating nested
         // "bash -c 'sh -c ...'" forms which require fragile escaping.
