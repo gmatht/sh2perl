@@ -1,1 +1,0 @@
-Complex command cannot be converted to shell command

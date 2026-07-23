@@ -13,12 +13,12 @@ my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '010_pattern_matching.sh';
-my $s;
-my @s;
-my %s;
 my $f1;
 my @f1;
 my %f1;
+my $s;
+my @s;
+my %s;
 my $word;
 my @word;
 my %word;

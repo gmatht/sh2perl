@@ -1255,7 +1255,7 @@ pub fn test_file_equivalence_detailed_with_critic(
             let tmp_file = tmp_file.clone();
             eprintln!("DEBUG: Starting Perl execution with timeout manager");
             execute_with_timeout(OperationType::PerlExecution, move || {
-                let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                let mut child = match cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
                     Ok(c) => {
                         eprintln!("DEBUG: Successfully spawned Perl process");
                         c
