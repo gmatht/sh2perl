@@ -1391,13 +1391,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         if cmd.args.is_empty() {
                             // cd with no arguments goes to home directory
                             output.push_str(&generator.indent());
-                            output.push_str("chdir($ENV{HOME} || $ENV{USERPROFILE} || '.';\n");
+                            output.push_str("chdir($ENV{HOME} || $ENV{USERPROFILE} || '.');\n");
                         } else {
                             // cd with directory argument
                             let dir = generator.perl_string_literal(&cmd.args[0]);
                             output.push_str(&generator.indent());
                             output.push_str(&format!("chdir({});\n", dir));
                         }
+                        output.push_str(&generator.indent());
+                        output.push_str("$CHILD_ERROR = 0;\n");
                     }
                     "let" => {
                         // let is a bash builtin for arithmetic evaluation.
@@ -1447,6 +1449,59 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         );
                         output.push_str(&generator.indent());
                         output.push_str(&format!("print ${};\n", output_var));
+                    }
+                    "chmod" => {
+                        // Standalone chmod -> route to generic builtin handler
+                        let unique_index = generator.get_unique_id();
+                        output.push_str(
+                            &crate::generator::commands::builtins::generate_generic_builtin(
+                                generator,
+                                cmd,
+                                "",
+                                "",
+                                &unique_index,
+                                false,
+                            ),
+                        );
+                    }
+                    "chown" => {
+                        let unique_index = generator.get_unique_id();
+                        output.push_str(
+                            &crate::generator::commands::builtins::generate_generic_builtin(
+                                generator,
+                                cmd,
+                                "",
+                                "",
+                                &unique_index,
+                                false,
+                            ),
+                        );
+                    }
+                    "ln" => {
+                        let unique_index = generator.get_unique_id();
+                        output.push_str(
+                            &crate::generator::commands::builtins::generate_generic_builtin(
+                                generator,
+                                cmd,
+                                "",
+                                "",
+                                &unique_index,
+                                false,
+                            ),
+                        );
+                    }
+                    "rmdir" => {
+                        let unique_index = generator.get_unique_id();
+                        output.push_str(
+                            &crate::generator::commands::builtins::generate_generic_builtin(
+                                generator,
+                                cmd,
+                                "",
+                                "",
+                                &unique_index,
+                                false,
+                            ),
+                        );
                     }
                     _ => {
                         // Route other builtins to the builtins system

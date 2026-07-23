@@ -40,30 +40,30 @@ if ( !( ($map{'foo'}) =~ m{\n\z}msx ) ) { print "\n"; }
 print $map{'answer'};
 if ( !( ($map{'answer'}) =~ m{\n\z}msx ) ) { print "\n"; }
 {
-    my $output_153 = q{};
-    my $output_printed_153;
-    my $pipeline_success_153 = 1;
-        $output_153 = q{};
-    my @output_153_items = (keys %map);
-    for my $k (@output_153_items) {
-    $output_153 .= "$k => " . $map{$k}. "\n";
+    my $output_154 = q{};
+    my $output_printed_154;
+    my $pipeline_success_154 = 1;
+        $output_154 = q{};
+    my @output_154_items = (keys %map);
+    for my $k (@output_154_items) {
+    $output_154 .= "$k => " . $map{$k}. "\n";
     }
 
-        my @sort_lines_153_1 = split /\n/msx, $output_153;
-    my @sort_sorted_153_1 = sort @sort_lines_153_1;
-    my $output_153_1 = join "\n", @sort_sorted_153_1;
-    if ($output_153_1 ne q{} && !($output_153_1 =~ m{\n\z}msx)) {
-    $output_153_1 .= "\n";
+        my @sort_lines_154_1 = split /\n/msx, $output_154;
+    my @sort_sorted_154_1 = sort @sort_lines_154_1;
+    my $output_154_1 = join "\n", @sort_sorted_154_1;
+    if ($output_154_1 ne q{} && !($output_154_1 =~ m{\n\z}msx)) {
+    $output_154_1 .= "\n";
     }
-    $output_153 = $output_153_1;
-    $output_153 = $output_153_1;
-    if ($output_153 ne q{} && !defined $output_printed_153) {
-        print $output_153;
-        if (!($output_153 =~ m{\n\z}msx)) {
+    $output_154 = $output_154_1;
+    $output_154 = $output_154_1;
+    if ($output_154 ne q{} && !defined $output_printed_154) {
+        print $output_154;
+        if (!($output_154 =~ m{\n\z}msx)) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_153 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_154 ) { $main_exit_code = 1; }
     exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
 

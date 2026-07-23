@@ -18,20 +18,20 @@ my $file_list;
 my @file_list;
 my %file_list;
 $file_list = do {
-    my @ls_files_45 = ();
+    my @ls_files_46 = ();
     if ( -f q{.} ) {
-        push @ls_files_45, q{.};
+        push @ls_files_46, q{.};
     }
     elsif ( -d q{.} ) {
         if ( opendir my $dh, q{.} ) {
             while ( my $file = readdir $dh ) {
-                push @ls_files_45, $file;
+                push @ls_files_46, $file;
             }
             closedir $dh;
-            @ls_files_45 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_45;
+            @ls_files_46 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_46;
         }
     }
-    (@ls_files_45 ? join("\n", @ls_files_45) . "\n" : q{});
+    (@ls_files_46 ? join("\n", @ls_files_46) . "\n" : q{});
 };
 ;
 print "File listing:\n";

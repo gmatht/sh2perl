@@ -23,11 +23,11 @@ my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_246 = q{};
-    my $output_printed_246;
+    my $output_247 = q{};
+    my $output_printed_247;
     printf("a\nb\n");
-if ($output_246 ne q{} && !$output_printed_246) {
-    print $output_246;
+if ($output_247 ne q{} && !$output_printed_247) {
+    print $output_247;
 }
 }
 use File::Path qw(make_path);
@@ -42,11 +42,11 @@ my $output_ps_fh_2;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_248 = q{};
-    my $output_printed_248;
+    my $output_249 = q{};
+    my $output_printed_249;
     printf("b\nc\n");
-if ($output_248 ne q{} && !$output_printed_248) {
-    print $output_248;
+if ($output_249 ne q{} && !$output_printed_249) {
+    print $output_249;
 }
 }
 use File::Path qw(make_path);

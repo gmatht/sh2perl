@@ -48,25 +48,25 @@ my $tee_result;
 my @tee_result;
 my %tee_result;
 $tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
-    my $output_109 = q{};
-    my $output_printed_109;
-    my $pipeline_success_109 = 1;
-    $output_109 .= 'test output' . "\n";
-    if ( !($output_109 =~ m{\n\z}msx) ) { $output_109 .= "\n"; }
+    my $output_110 = q{};
+    my $output_printed_110;
+    my $pipeline_success_110 = 1;
+    $output_110 .= 'test output' . "\n";
+    if ( !($output_110 =~ m{\n\z}msx) ) { $output_110 .= "\n"; }
     $CHILD_ERROR = 0;
-    if ($CHILD_ERROR != 0) { $pipeline_success_109 = 0; }
+    if ($CHILD_ERROR != 0) { $pipeline_success_110 = 0; }
     use Carp qw(carp croak);
     if ( open my $fh, '>', 'test_tee.txt' ) {
-        print {$fh} $output_109;
+        print {$fh} $output_110;
         close $fh or croak "Close failed: $ERRNO";
     }
     else {
         carp "tee: Cannot open 'test_tee.txt': $ERRNO";
     }
-    $output_109 = $output_109;
-    if ( !$pipeline_success_109 ) { $main_exit_code = 1; }
-    $output_109 =~ s/\n+\z//msx;
-    $output_109;
+    $output_110 = $output_110;
+    if ( !$pipeline_success_110 ) { $main_exit_code = 1; }
+    $output_110 =~ s/\n+\z//msx;
+    $output_110;
 }; $_pipeline_result; };
 do {
     my $__echo_line = "Tee result: $tee_result";

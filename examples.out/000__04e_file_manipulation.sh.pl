@@ -31,7 +31,7 @@ my $cp_result;
 my @cp_result;
 my %cp_result;
 $cp_result = do {
-    my $left_result_66 = do {
+    my $left_result_67 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
             use File::Copy qw(copy);
@@ -52,8 +52,8 @@ $cp_result = do {
         q{};
 };
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_66 = do { ("Copy successful") };
-        $left_result_66 . $right_result_66;
+        my $right_result_67 = do { ("Copy successful") };
+        $left_result_67 . $right_result_67;
     } else {
         q{};
     }
@@ -71,60 +71,60 @@ $CHILD_ERROR = 0;
 do {
 local *STDERR;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
-    my @ls_files_67 = ();
-    my $ls_all_found_68 = 1;
-    my @ls_inputs_69 = ();
-    push @ls_inputs_69, 'test_file.txt';
-    push @ls_inputs_69, 'test_file_copy.txt';
-    push @ls_inputs_69, 'test_file_moved.txt';
-    my @ls_files_70 = ();
-    my @ls_dirs_71 = ();
-    my $ls_show_headers_72 = scalar(@ls_inputs_69) > 1;
-    for my $ls_item_73 (@ls_inputs_69) {
-        if ( -f $ls_item_73 ) {
-            push @ls_files_70, $ls_item_73;
+    my @ls_files_68 = ();
+    my $ls_all_found_69 = 1;
+    my @ls_inputs_70 = ();
+    push @ls_inputs_70, 'test_file.txt';
+    push @ls_inputs_70, 'test_file_copy.txt';
+    push @ls_inputs_70, 'test_file_moved.txt';
+    my @ls_files_71 = ();
+    my @ls_dirs_72 = ();
+    my $ls_show_headers_73 = scalar(@ls_inputs_70) > 1;
+    for my $ls_item_74 (@ls_inputs_70) {
+        if ( -f $ls_item_74 ) {
+            push @ls_files_71, $ls_item_74;
         }
-        elsif ( -d $ls_item_73 ) {
-            push @ls_dirs_71, $ls_item_73;
+        elsif ( -d $ls_item_74 ) {
+            push @ls_dirs_72, $ls_item_74;
         }
         else {
-            $ls_all_found_68 = 0;
+            $ls_all_found_69 = 0;
         }
     }
-    @ls_files_70 = sort { $a cmp $b } @ls_files_70;
-    @ls_dirs_71 = sort { $a cmp $b } @ls_dirs_71;
-    if (@ls_files_70) {
-        push @ls_files_67, join("\n", @ls_files_70);
+    @ls_files_71 = sort { $a cmp $b } @ls_files_71;
+    @ls_dirs_72 = sort { $a cmp $b } @ls_dirs_72;
+    if (@ls_files_71) {
+        push @ls_files_68, join("\n", @ls_files_71);
     }
-    for my $ls_dir_74 (@ls_dirs_71) {
-        my @ls_dir_entries_75 = ();
-        if ( opendir my $dh, $ls_dir_74 ) {
+    for my $ls_dir_75 (@ls_dirs_72) {
+        my @ls_dir_entries_76 = ();
+        if ( opendir my $dh, $ls_dir_75 ) {
             while ( my $file = readdir $dh ) {
                 next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-                push @ls_dir_entries_75, $file;
+                push @ls_dir_entries_76, $file;
             }
             closedir $dh;
-            @ls_dir_entries_75 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_75;
-            if ( $ls_show_headers_72 ) {
-                if ( @ls_dir_entries_75 ) {
-                    push @ls_files_67, $ls_dir_74 . ":\n" . join("\n", @ls_dir_entries_75);
+            @ls_dir_entries_76 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_76;
+            if ( $ls_show_headers_73 ) {
+                if ( @ls_dir_entries_76 ) {
+                    push @ls_files_68, $ls_dir_75 . ":\n" . join("\n", @ls_dir_entries_76);
                 } else {
-                    push @ls_files_67, $ls_dir_74 . ':';
+                    push @ls_files_68, $ls_dir_75 . ':';
                 }
             }
-            elsif ( @ls_dir_entries_75 ) {
-                push @ls_files_67, join("\n", @ls_dir_entries_75);
+            elsif ( @ls_dir_entries_76 ) {
+                push @ls_files_68, join("\n", @ls_dir_entries_76);
             }
         }
         else {
-            $ls_all_found_68 = 0;
+            $ls_all_found_69 = 0;
         }
     }
-    if (@ls_files_67) {
-        print join "\n\n", @ls_files_67;
+    if (@ls_files_68) {
+        print join "\n\n", @ls_files_68;
         print "\n";
     }
-    if ( $ls_all_found_68 ) {
+    if ( $ls_all_found_69 ) {
         local $CHILD_ERROR = 0;
         $ls_success = 1;
     }
@@ -142,7 +142,7 @@ my $mv_result;
 my @mv_result;
 my %mv_result;
 $mv_result = do {
-    my $left_result_76 = do {
+    my $left_result_77 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
             my $err;
@@ -186,8 +186,8 @@ $mv_result = do {
         q{};
 };
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_76 = do { ("Move successful") };
-        $left_result_76 . $right_result_76;
+        my $right_result_77 = do { ("Move successful") };
+        $left_result_77 . $right_result_77;
     } else {
         q{};
     }
@@ -205,60 +205,60 @@ $CHILD_ERROR = 0;
 do {
 local *STDERR;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
-    my @ls_files_77 = ();
-    my $ls_all_found_78 = 1;
-    my @ls_inputs_79 = ();
-    push @ls_inputs_79, 'test_file.txt';
-    push @ls_inputs_79, 'test_file_copy.txt';
-    push @ls_inputs_79, 'test_file_moved.txt';
-    my @ls_files_80 = ();
-    my @ls_dirs_81 = ();
-    my $ls_show_headers_82 = scalar(@ls_inputs_79) > 1;
-    for my $ls_item_83 (@ls_inputs_79) {
-        if ( -f $ls_item_83 ) {
-            push @ls_files_80, $ls_item_83;
+    my @ls_files_78 = ();
+    my $ls_all_found_79 = 1;
+    my @ls_inputs_80 = ();
+    push @ls_inputs_80, 'test_file.txt';
+    push @ls_inputs_80, 'test_file_copy.txt';
+    push @ls_inputs_80, 'test_file_moved.txt';
+    my @ls_files_81 = ();
+    my @ls_dirs_82 = ();
+    my $ls_show_headers_83 = scalar(@ls_inputs_80) > 1;
+    for my $ls_item_84 (@ls_inputs_80) {
+        if ( -f $ls_item_84 ) {
+            push @ls_files_81, $ls_item_84;
         }
-        elsif ( -d $ls_item_83 ) {
-            push @ls_dirs_81, $ls_item_83;
+        elsif ( -d $ls_item_84 ) {
+            push @ls_dirs_82, $ls_item_84;
         }
         else {
-            $ls_all_found_78 = 0;
+            $ls_all_found_79 = 0;
         }
     }
-    @ls_files_80 = sort { $a cmp $b } @ls_files_80;
-    @ls_dirs_81 = sort { $a cmp $b } @ls_dirs_81;
-    if (@ls_files_80) {
-        push @ls_files_77, join("\n", @ls_files_80);
+    @ls_files_81 = sort { $a cmp $b } @ls_files_81;
+    @ls_dirs_82 = sort { $a cmp $b } @ls_dirs_82;
+    if (@ls_files_81) {
+        push @ls_files_78, join("\n", @ls_files_81);
     }
-    for my $ls_dir_84 (@ls_dirs_81) {
-        my @ls_dir_entries_85 = ();
-        if ( opendir my $dh, $ls_dir_84 ) {
+    for my $ls_dir_85 (@ls_dirs_82) {
+        my @ls_dir_entries_86 = ();
+        if ( opendir my $dh, $ls_dir_85 ) {
             while ( my $file = readdir $dh ) {
                 next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-                push @ls_dir_entries_85, $file;
+                push @ls_dir_entries_86, $file;
             }
             closedir $dh;
-            @ls_dir_entries_85 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_85;
-            if ( $ls_show_headers_82 ) {
-                if ( @ls_dir_entries_85 ) {
-                    push @ls_files_77, $ls_dir_84 . ":\n" . join("\n", @ls_dir_entries_85);
+            @ls_dir_entries_86 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_86;
+            if ( $ls_show_headers_83 ) {
+                if ( @ls_dir_entries_86 ) {
+                    push @ls_files_78, $ls_dir_85 . ":\n" . join("\n", @ls_dir_entries_86);
                 } else {
-                    push @ls_files_77, $ls_dir_84 . ':';
+                    push @ls_files_78, $ls_dir_85 . ':';
                 }
             }
-            elsif ( @ls_dir_entries_85 ) {
-                push @ls_files_77, join("\n", @ls_dir_entries_85);
+            elsif ( @ls_dir_entries_86 ) {
+                push @ls_files_78, join("\n", @ls_dir_entries_86);
             }
         }
         else {
-            $ls_all_found_78 = 0;
+            $ls_all_found_79 = 0;
         }
     }
-    if (@ls_files_77) {
-        print join "\n\n", @ls_files_77;
+    if (@ls_files_78) {
+        print join "\n\n", @ls_files_78;
         print "\n";
     }
-    if ( $ls_all_found_78 ) {
+    if ( $ls_all_found_79 ) {
         local $CHILD_ERROR = 0;
         $ls_success = 1;
     }
@@ -276,7 +276,7 @@ my $rm_result;
 my @rm_result;
 my %rm_result;
 $rm_result = do {
-    my $left_result_86 = do {
+    my $left_result_87 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
             if ( -e "test_file.txt" ) {
@@ -323,8 +323,8 @@ $rm_result = do {
         q{};
 };
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_86 = do { ("Remove successful") };
-        $left_result_86 . $right_result_86;
+        my $right_result_87 = do { ("Remove successful") };
+        $left_result_87 . $right_result_87;
     } else {
         q{};
     }
@@ -342,60 +342,60 @@ $CHILD_ERROR = 0;
 do {
 local *STDERR;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
-    my @ls_files_87 = ();
-    my $ls_all_found_88 = 1;
-    my @ls_inputs_89 = ();
-    push @ls_inputs_89, 'test_file.txt';
-    push @ls_inputs_89, 'test_file_copy.txt';
-    push @ls_inputs_89, 'test_file_moved.txt';
-    my @ls_files_90 = ();
-    my @ls_dirs_91 = ();
-    my $ls_show_headers_92 = scalar(@ls_inputs_89) > 1;
-    for my $ls_item_93 (@ls_inputs_89) {
-        if ( -f $ls_item_93 ) {
-            push @ls_files_90, $ls_item_93;
+    my @ls_files_88 = ();
+    my $ls_all_found_89 = 1;
+    my @ls_inputs_90 = ();
+    push @ls_inputs_90, 'test_file.txt';
+    push @ls_inputs_90, 'test_file_copy.txt';
+    push @ls_inputs_90, 'test_file_moved.txt';
+    my @ls_files_91 = ();
+    my @ls_dirs_92 = ();
+    my $ls_show_headers_93 = scalar(@ls_inputs_90) > 1;
+    for my $ls_item_94 (@ls_inputs_90) {
+        if ( -f $ls_item_94 ) {
+            push @ls_files_91, $ls_item_94;
         }
-        elsif ( -d $ls_item_93 ) {
-            push @ls_dirs_91, $ls_item_93;
+        elsif ( -d $ls_item_94 ) {
+            push @ls_dirs_92, $ls_item_94;
         }
         else {
-            $ls_all_found_88 = 0;
+            $ls_all_found_89 = 0;
         }
     }
-    @ls_files_90 = sort { $a cmp $b } @ls_files_90;
-    @ls_dirs_91 = sort { $a cmp $b } @ls_dirs_91;
-    if (@ls_files_90) {
-        push @ls_files_87, join("\n", @ls_files_90);
+    @ls_files_91 = sort { $a cmp $b } @ls_files_91;
+    @ls_dirs_92 = sort { $a cmp $b } @ls_dirs_92;
+    if (@ls_files_91) {
+        push @ls_files_88, join("\n", @ls_files_91);
     }
-    for my $ls_dir_94 (@ls_dirs_91) {
-        my @ls_dir_entries_95 = ();
-        if ( opendir my $dh, $ls_dir_94 ) {
+    for my $ls_dir_95 (@ls_dirs_92) {
+        my @ls_dir_entries_96 = ();
+        if ( opendir my $dh, $ls_dir_95 ) {
             while ( my $file = readdir $dh ) {
                 next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-                push @ls_dir_entries_95, $file;
+                push @ls_dir_entries_96, $file;
             }
             closedir $dh;
-            @ls_dir_entries_95 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_95;
-            if ( $ls_show_headers_92 ) {
-                if ( @ls_dir_entries_95 ) {
-                    push @ls_files_87, $ls_dir_94 . ":\n" . join("\n", @ls_dir_entries_95);
+            @ls_dir_entries_96 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_96;
+            if ( $ls_show_headers_93 ) {
+                if ( @ls_dir_entries_96 ) {
+                    push @ls_files_88, $ls_dir_95 . ":\n" . join("\n", @ls_dir_entries_96);
                 } else {
-                    push @ls_files_87, $ls_dir_94 . ':';
+                    push @ls_files_88, $ls_dir_95 . ':';
                 }
             }
-            elsif ( @ls_dir_entries_95 ) {
-                push @ls_files_87, join("\n", @ls_dir_entries_95);
+            elsif ( @ls_dir_entries_96 ) {
+                push @ls_files_88, join("\n", @ls_dir_entries_96);
             }
         }
         else {
-            $ls_all_found_88 = 0;
+            $ls_all_found_89 = 0;
         }
     }
-    if (@ls_files_87) {
-        print join "\n\n", @ls_files_87;
+    if (@ls_files_88) {
+        print join "\n\n", @ls_files_88;
         print "\n";
     }
-    if ( $ls_all_found_88 ) {
+    if ( $ls_all_found_89 ) {
         local $CHILD_ERROR = 0;
         $ls_success = 1;
     }
@@ -413,7 +413,7 @@ my $mkdir_result;
 my @mkdir_result;
 my %mkdir_result;
 $mkdir_result = do {
-    my $left_result_96 = do {
+    my $left_result_97 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
             use File::Path qw(make_path);
@@ -431,8 +431,8 @@ $mkdir_result = do {
         q{};
 };
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_96 = do { ("Directory created") };
-        $left_result_96 . $right_result_96;
+        my $right_result_97 = do { ("Directory created") };
+        $left_result_97 . $right_result_97;
     } else {
         q{};
     }
@@ -463,58 +463,58 @@ else {
 do {
 local *STDERR;
 open STDERR, '>', '/dev/null' or croak "Cannot open file: $OS_ERROR\n";
-    my @ls_files_98 = ();
-    my $ls_all_found_99 = 1;
-    my @ls_inputs_100 = ();
-    push @ls_inputs_100, 'test_dir';
-    my @ls_files_101 = ();
-    my @ls_dirs_102 = ();
-    my $ls_show_headers_103 = scalar(@ls_inputs_100) > 1;
-    for my $ls_item_104 (@ls_inputs_100) {
-        if ( -f $ls_item_104 ) {
-            push @ls_files_101, $ls_item_104;
+    my @ls_files_99 = ();
+    my $ls_all_found_100 = 1;
+    my @ls_inputs_101 = ();
+    push @ls_inputs_101, 'test_dir';
+    my @ls_files_102 = ();
+    my @ls_dirs_103 = ();
+    my $ls_show_headers_104 = scalar(@ls_inputs_101) > 1;
+    for my $ls_item_105 (@ls_inputs_101) {
+        if ( -f $ls_item_105 ) {
+            push @ls_files_102, $ls_item_105;
         }
-        elsif ( -d $ls_item_104 ) {
-            push @ls_dirs_102, $ls_item_104;
+        elsif ( -d $ls_item_105 ) {
+            push @ls_dirs_103, $ls_item_105;
         }
         else {
-            $ls_all_found_99 = 0;
+            $ls_all_found_100 = 0;
         }
     }
-    @ls_files_101 = sort { $a cmp $b } @ls_files_101;
-    @ls_dirs_102 = sort { $a cmp $b } @ls_dirs_102;
-    if (@ls_files_101) {
-        push @ls_files_98, join("\n", @ls_files_101);
+    @ls_files_102 = sort { $a cmp $b } @ls_files_102;
+    @ls_dirs_103 = sort { $a cmp $b } @ls_dirs_103;
+    if (@ls_files_102) {
+        push @ls_files_99, join("\n", @ls_files_102);
     }
-    for my $ls_dir_105 (@ls_dirs_102) {
-        my @ls_dir_entries_106 = ();
-        if ( opendir my $dh, $ls_dir_105 ) {
+    for my $ls_dir_106 (@ls_dirs_103) {
+        my @ls_dir_entries_107 = ();
+        if ( opendir my $dh, $ls_dir_106 ) {
             while ( my $file = readdir $dh ) {
                 next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;
-                push @ls_dir_entries_106, $file;
+                push @ls_dir_entries_107, $file;
             }
             closedir $dh;
-            @ls_dir_entries_106 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_106;
-            if ( $ls_show_headers_103 ) {
-                if ( @ls_dir_entries_106 ) {
-                    push @ls_files_98, $ls_dir_105 . ":\n" . join("\n", @ls_dir_entries_106);
+            @ls_dir_entries_107 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_dir_entries_107;
+            if ( $ls_show_headers_104 ) {
+                if ( @ls_dir_entries_107 ) {
+                    push @ls_files_99, $ls_dir_106 . ":\n" . join("\n", @ls_dir_entries_107);
                 } else {
-                    push @ls_files_98, $ls_dir_105 . ':';
+                    push @ls_files_99, $ls_dir_106 . ':';
                 }
             }
-            elsif ( @ls_dir_entries_106 ) {
-                push @ls_files_98, join("\n", @ls_dir_entries_106);
+            elsif ( @ls_dir_entries_107 ) {
+                push @ls_files_99, join("\n", @ls_dir_entries_107);
             }
         }
         else {
-            $ls_all_found_99 = 0;
+            $ls_all_found_100 = 0;
         }
     }
-    if (@ls_files_98) {
-        print join "\n", @ls_files_98;
+    if (@ls_files_99) {
+        print join "\n", @ls_files_99;
         print "\n";
     }
-    if ( $ls_all_found_99 ) {
+    if ( $ls_all_found_100 ) {
         local $CHILD_ERROR = 0;
         $ls_success = 1;
     }
@@ -532,7 +532,7 @@ my $touch_result;
 my @touch_result;
 my %touch_result;
 $touch_result = do {
-    my $left_result_107 = do {
+    my $left_result_108 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
             if ( -e "test_file.txt" ) {
@@ -557,8 +557,8 @@ $touch_result = do {
         q{};
 };
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_107 = do { ("File touched") };
-        $left_result_107 . $right_result_107;
+        my $right_result_108 = do { ("File touched") };
+        $left_result_108 . $right_result_108;
     } else {
         q{};
     }

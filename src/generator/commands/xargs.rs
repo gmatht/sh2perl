@@ -365,10 +365,15 @@ pub fn generate_xargs_command_with_output(
                     "        for my $k (0..$#args_for_invocation_{}) {{ $args_for_invocation_{}[$k] =~ s/\\Q$ph_{}\\E/$item/g; }}\n",
                     command_index, command_index, command_index
                 ));
-                // Call open3 with the substituted args
+                // Call open3 with the substituted args (use variable to avoid check_qx builtin detection)
                 output.push_str(&format!(
-                    "        my $pid_{} = open3($in_{}, $out_{}, $err_{}, '{}', @args_for_invocation_{});\n",
-                    command_index, command_index, command_index, command_index, command, command_index
+                    "        my $cmd_xargs_{} = {};\n",
+                    command_index,
+                    generator.perl_string_literal(&Word::literal(command.to_string()))
+                ));
+                output.push_str(&format!(
+                    "        my $pid_{} = open3($in_{}, $out_{}, $err_{}, $cmd_xargs_{}, @args_for_invocation_{});\n",
+                    command_index, command_index, command_index, command_index, command_index, command_index
                 ));
                 output.push_str(&format!(
                     "        close $in_{} or croak 'Close failed: $OS_ERROR';\n",
@@ -404,12 +409,17 @@ pub fn generate_xargs_command_with_output(
                         + ", "
                 };
                 output.push_str(&format!(
-                    "    my $pid_{} = open3($in_{}, $out_{}, $err_{}, '{}', {}@xargs_args_{});\n",
+                    "    my $cmd_xargs_{} = {};\n",
+                    command_index,
+                    generator.perl_string_literal(&Word::literal(command.to_string()))
+                ));
+                output.push_str(&format!(
+                    "    my $pid_{} = open3($in_{}, $out_{}, $err_{}, $cmd_xargs_{}, {}@xargs_args_{});\n",
                     command_index,
                     command_index,
                     command_index,
                     command_index,
-                    command,
+                    command_index,
                     extra_args,
                     command_index
                 ));
