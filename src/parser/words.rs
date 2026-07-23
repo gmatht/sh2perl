@@ -1385,7 +1385,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
             i += 3; // skip the \\`
             let cmd_start = i;
             while i < content.len() && !content[i..].starts_with("\\\\`") {
-                i += 1;
+                let ch = content[i..].chars().next().unwrap_or('?');
+                i += ch.len_utf8();
             }
 
             if i < content.len() {
@@ -1417,7 +1418,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
             i += 2; // skip the \`
             let cmd_start = i;
             while i < content.len() && !content[i..].starts_with("\\`") {
-                i += 1;
+                let ch = content[i..].chars().next().unwrap_or('?');
+                i += ch.len_utf8();
             }
 
             if i < content.len() {
@@ -1449,7 +1451,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
             i += 1; // skip the opening `
             let cmd_start = i;
             while i < content.len() && content[i..].chars().next() != Some('`') {
-                i += 1;
+                let ch = content[i..].chars().next().unwrap_or('?');
+                i += ch.len_utf8();
             }
 
             if i < content.len() {
@@ -1526,7 +1529,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         Some(')') => paren_count -= 1,
                         _ => {}
                     }
-                    i += 1;
+                    let ch = content[i..].chars().next().unwrap_or('?');
+                    i += ch.len_utf8();
                 }
                 if paren_count == 0 {
                     let cmd_content = &content[cmd_start..i - 1];
@@ -1553,7 +1557,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         Some('}') => brace_count -= 1,
                         _ => {}
                     }
-                    i += 1;
+                    let ch = content[i..].chars().next().unwrap_or('?');
+                    i += ch.len_utf8();
                 }
 
                 if brace_count == 0 {
@@ -1596,7 +1601,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         let nc = content[i..].chars().next();
                         if let Some(c) = nc {
                             if c.is_alphanumeric() || c == '_' {
-                                i += 1;
+                                let ch = content[i..].chars().next().unwrap_or('?');
+                                i += ch.len_utf8();
                             } else {
                                 break;
                             }
@@ -1633,7 +1639,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         Some(')') => paren_count -= 1,
                         _ => {}
                     }
-                    i += 1;
+                    let ch = content[i..].chars().next().unwrap_or('?');
+                    i += ch.len_utf8();
                 }
                 if paren_count == 0 {
                     let cmd_content = &content[cmd_start..i - 1];
@@ -1657,7 +1664,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         Some('}') => brace_count -= 1,
                         _ => {}
                     }
-                    i += 1;
+                    let ch = content[i..].chars().next().unwrap_or('?');
+                    i += ch.len_utf8();
                 }
 
                 if brace_count == 0 {
@@ -1683,14 +1691,16 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 let next_char = content[i..].chars().next().unwrap();
                 if next_char == '#' || next_char == '@' || next_char == '*' || next_char == '?' || next_char == '-' || next_char == '!' || next_char == '$' {
                     parts.push(StringPart::Variable(next_char.to_string()));
-                    i += 1;
+                    let ch = content[i..].chars().next().unwrap_or('?');
+                    i += ch.len_utf8();
                 } else if next_char.is_alphanumeric() || next_char == '_' {
                     let var_start = i;
                     while i < content.len() {
                         let nc = content[i..].chars().next();
                         if let Some(c) = nc {
                             if c.is_alphanumeric() || c == '_' {
-                                i += 1;
+                                let ch = content[i..].chars().next().unwrap_or('?');
+                                i += ch.len_utf8();
                             } else {
                                 break;
                             }
@@ -1709,8 +1719,9 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
             }
         } else {
             // Add to current literal
-            current_literal.push(content[i..].chars().next().unwrap());
-            i += 1;
+            let ch = content[i..].chars().next().unwrap();
+            current_literal.push(ch);
+            i += ch.len_utf8();
         }
     }
 
@@ -1763,7 +1774,8 @@ pub fn parse_string_interpolation_from_literal(
             i += 3; // skip the \\`
             let cmd_start = i;
             while i < content.len() && !content[i..].starts_with("\\\\`") {
-                i += 1;
+                let ch = content[i..].chars().next().unwrap_or('?');
+                i += ch.len_utf8();
             }
 
             if i < content.len() {
@@ -1795,7 +1807,8 @@ pub fn parse_string_interpolation_from_literal(
             i += 2; // skip the \`
             let cmd_start = i;
             while i < content.len() && !content[i..].starts_with("\\`") {
-                i += 1;
+                let ch = content[i..].chars().next().unwrap_or('?');
+                i += ch.len_utf8();
             }
 
             if i < content.len() {
@@ -1827,7 +1840,8 @@ pub fn parse_string_interpolation_from_literal(
             i += 1; // skip the opening `
             let cmd_start = i;
             while i < content.len() && content[i..].chars().next() != Some('`') {
-                i += 1;
+                let ch = content[i..].chars().next().unwrap_or('?');
+                i += ch.len_utf8();
             }
 
             if i < content.len() {
@@ -1883,8 +1897,9 @@ pub fn parse_string_interpolation_from_literal(
             }
         } else {
             // Add to current literal
-            current_literal.push(content[i..].chars().next().unwrap());
-            i += 1;
+            let ch = content[i..].chars().next().unwrap();
+            current_literal.push(ch);
+            i += ch.len_utf8();
         }
     }
 

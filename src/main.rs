@@ -230,8 +230,8 @@ fn main_with_args(args: Vec<String>) {
                     let commands = match Parser::new(&content).parse() {
                         Ok(c) => c,
                         Err(e) => {
-                            println!("Parse error: {}", e);
-                            return;
+                            eprintln!("Parse error: {}", e);
+                            std::process::exit(1);
                         }
                     };
 
@@ -665,8 +665,8 @@ fn main_with_args(args: Vec<String>) {
                         let commands = match Parser::new(&content).parse() {
                             Ok(c) => c,
                             Err(e) => {
-                                println!("Parse error: {}", e);
-                                return;
+                                eprintln!("Parse error: {}", e);
+                                std::process::exit(1);
                             }
                         };
 
@@ -719,8 +719,8 @@ fn main_with_args(args: Vec<String>) {
                         let commands = match Parser::new(&content).parse() {
                             Ok(c) => c,
                             Err(e) => {
-                                println!("Parse error: {}", e);
-                                return;
+                                eprintln!("Parse error: {}", e);
+                                std::process::exit(1);
                             }
                         };
 
@@ -955,8 +955,8 @@ fn main_with_args(args: Vec<String>) {
                             let commands = match Parser::new(&content).parse() {
                                 Ok(c) => c,
                                 Err(e) => {
-                                    println!("Parse error: {}", e);
-                                    return;
+                                    eprintln!("Parse error: {}", e);
+                                    std::process::exit(1);
                                 }
                             };
 
@@ -1327,8 +1327,9 @@ fn main_with_args(args: Vec<String>) {
                             }
                         }
                         Err(e) => {
-                            println!("Parse error: {}", e);
-                            println!("Use '{} --help' for usage information", args[0]);
+                            eprintln!("Parse error: {}", e);
+                            eprintln!("Use '{} --help' for usage information", args[0]);
+                            std::process::exit(1);
                         }
                     }
 
