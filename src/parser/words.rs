@@ -425,7 +425,8 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
             Ok(Word::Literal(combined, None))
         }
-        Some(Token::Character)
+        Some(Token::Assign)
+        | Some(Token::Character)
         | Some(Token::NonZero)
         | Some(Token::SymlinkH)
         | Some(Token::PipeFile)
@@ -760,7 +761,8 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
 
             Ok(Word::Literal(combined, None))
         }
-        Some(Token::Character)
+        Some(Token::Assign)
+        | Some(Token::Character)
         | Some(Token::NonZero)
         | Some(Token::SymlinkH)
         | Some(Token::PipeFile)

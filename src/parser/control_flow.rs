@@ -1726,6 +1726,32 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
             Some(Token::Space) | Some(Token::Tab) => {
                 lexer.next(); // skip whitespace
             }
+            // Handle redirect tokens inside test expressions as literal characters
+            Some(Token::RedirectIn) | Some(Token::RedirectOut) | Some(Token::RedirectAppend)
+            | Some(Token::RedirectInOut) | Some(Token::RedirectAll)
+            | Some(Token::RedirectAllAppend) | Some(Token::RedirectInErr)
+            | Some(Token::RedirectOutErr) | Some(Token::RedirectOutClobber) => {
+                let text = lexer.get_raw_token_text().unwrap_or_default();
+                expression_parts.push(text);
+            }
+            // Handle missing test operator tokens
+            Some(Token::Socket) => { expression_parts.push("-S".to_string()); lexer.next(); }
+            Some(Token::SymlinkH) => { expression_parts.push("-h".to_string()); lexer.next(); }
+            Some(Token::PipeFile) => { expression_parts.push("-p".to_string()); lexer.next(); }
+            Some(Token::Block) => { expression_parts.push("-b".to_string()); lexer.next(); }
+            Some(Token::Character) => { expression_parts.push("-c".to_string()); lexer.next(); }
+            Some(Token::SetGid) => { expression_parts.push("-g".to_string()); lexer.next(); }
+            Some(Token::Sticky) => { expression_parts.push("-k".to_string()); lexer.next(); }
+            Some(Token::SetUid) => { expression_parts.push("-u".to_string()); lexer.next(); }
+            Some(Token::Owned) => { expression_parts.push("-O".to_string()); lexer.next(); }
+            Some(Token::GroupOwned) => { expression_parts.push("-G".to_string()); lexer.next(); }
+            Some(Token::Modified) => { expression_parts.push("-N".to_string()); lexer.next(); }
+            Some(Token::NewerThan) => { expression_parts.push("-nt".to_string()); lexer.next(); }
+            Some(Token::OlderThan) => { expression_parts.push("-ot".to_string()); lexer.next(); }
+            Some(Token::SameFile) => { expression_parts.push("-ef".to_string()); lexer.next(); }
+            Some(Token::NonZero) => { expression_parts.push("-n".to_string()); lexer.next(); }
+            Some(Token::Zero) => { expression_parts.push("-z".to_string()); lexer.next(); }
+            Some(Token::At) => { expression_parts.push("@".to_string()); lexer.next(); }
             None => {
                 return Err(ParserError::InvalidSyntax(
                     "Unexpected end of input in test expression".to_string(),

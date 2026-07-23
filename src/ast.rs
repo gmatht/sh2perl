@@ -41,6 +41,7 @@ pub enum Command {
     Redirect(RedirectCommand),
     Assignment(Assignment), // Variable assignment like i=value
     CStyleFor(CStyleForLoop),
+    Not(Box<Command>),        // Negation: ! cmd
     Break(Option<String>),    // Optional loop level
     Continue(Option<String>), // Optional loop level
     Return(Option<Word>),     // Optional return value

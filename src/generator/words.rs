@@ -226,6 +226,7 @@ fn collect_shell_vars_from_command(command: &Command, vars: &mut HashSet<String>
                 vars.insert(cap[1].to_string());
             }
         }
+        Command::Not(cmd) => collect_shell_vars_from_command(cmd, vars),
         Command::ShoptCommand(_)
         | Command::Break(_)
         | Command::Continue(_)

@@ -1349,6 +1349,7 @@ impl Generator {
                     scan_command(test_self, l);
                     scan_command(test_self, r);
                 }
+                Command::Not(c) => scan_command(test_self, c),
                 Command::Redirect(r) => scan_command(test_self, &r.command),
                 Command::Background(c) => scan_command(test_self, c),
                 Command::TestExpression(te) => {
@@ -1685,6 +1686,7 @@ impl Generator {
                 }
                 false
             }
+            Command::Not(cmd) => self.command_needs_file_find(cmd),
             Command::Subshell(sub_cmd) => {
                 if self.command_needs_file_find(sub_cmd) {
                     return true;

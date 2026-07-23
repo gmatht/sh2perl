@@ -307,6 +307,13 @@ impl Parser {
                         self.parse_test_expression()?
                     }
                 }
+                Some(Token::Bang) => {
+                    // ! at the start of a command is the negation operator
+                    // Consume it and parse the rest of the command as a negated pipeline
+                    self.lexer.next(); // consume !
+                    let cmd = self.parse_pipeline()?;
+                    Command::Not(Box::new(cmd))
+                }
                 Some(Token::Semicolon) => {
                     // Skip semicolon and continue parsing
                     self.lexer.next();
@@ -527,6 +534,9 @@ impl Parser {
             Some(Token::Until) => parse_until_loop(self),
             Some(Token::For) => parse_for_loop(self),
             Some(Token::Function) => parse_function(self),
+            Some(Token::Break) => parse_break_statement(self),
+            Some(Token::Continue) => parse_continue_statement(self),
+            Some(Token::Return) => parse_return_statement(self),
             Some(Token::ArithmeticEval) => {
                 self.parse_double_paren_command()
             }
@@ -541,6 +551,11 @@ impl Parser {
                 self.parse_test_expression()
             }
             Some(Token::TestBracket) => self.parse_test_expression(),
+            Some(Token::Bang) => {
+                self.lexer.next(); // consume !
+                let cmd = self.parse_pipeline_segment()?;
+                Ok(Command::Not(Box::new(cmd)))
+            }
             _ => self.parse_simple_command(),
         }
     }
@@ -1067,6 +1082,8 @@ impl Parser {
                         | Token::RedirectInErr
                         | Token::RedirectOutErr
                         | Token::RedirectInOut
+                        | Token::RedirectAll
+                        | Token::RedirectAllAppend
                         | Token::Heredoc
                         | Token::HeredocTabs
                         | Token::HereString => {
@@ -1082,6 +1099,8 @@ impl Parser {
                                     | Token::RedirectInErr
                                     | Token::RedirectOutErr
                                     | Token::RedirectInOut
+                                    | Token::RedirectAll
+                                    | Token::RedirectAllAppend
                                     | Token::Heredoc
                                     | Token::HeredocTabs
                                     | Token::HereString => {
@@ -1153,6 +1172,8 @@ impl Parser {
                 | Token::RedirectInErr
                 | Token::RedirectOutErr
                 | Token::RedirectInOut
+                | Token::RedirectAll
+                | Token::RedirectAllAppend
                 | Token::Heredoc
                 | Token::HeredocTabs
                 | Token::HereString => {
@@ -1168,6 +1189,8 @@ impl Parser {
                             | Token::RedirectInErr
                             | Token::RedirectOutErr
                             | Token::RedirectInOut
+                            | Token::RedirectAll
+                            | Token::RedirectAllAppend
                             | Token::Heredoc
                             | Token::HeredocTabs
                             | Token::HereString => {
@@ -1967,6 +1990,31 @@ impl Parser {
                         _ => expression_parts.push("-".to_string()),
                     }
                 }
+                // Handle redirect tokens inside test expressions as literal characters
+                // (e.g., `\>` for string comparison in `[ ]`)
+                Some(Token::RedirectIn) | Some(Token::RedirectOut) | Some(Token::RedirectAppend)
+                | Some(Token::RedirectInOut) | Some(Token::RedirectAll)
+                | Some(Token::RedirectAllAppend) | Some(Token::RedirectInErr)
+                | Some(Token::RedirectOutErr) | Some(Token::RedirectOutClobber) => {
+                    let text = self.lexer.get_raw_token_text().unwrap_or_default();
+                    expression_parts.push(text);
+                }
+                // Handle missing test operator tokens
+                Some(Token::Socket) => { expression_parts.push(" -S ".to_string()); self.lexer.next(); }
+                Some(Token::SymlinkH) => { expression_parts.push(" -h ".to_string()); self.lexer.next(); }
+                Some(Token::PipeFile) => { expression_parts.push(" -p ".to_string()); self.lexer.next(); }
+                Some(Token::Block) => { expression_parts.push(" -b ".to_string()); self.lexer.next(); }
+                Some(Token::Character) => { expression_parts.push(" -c ".to_string()); self.lexer.next(); }
+                Some(Token::SetGid) => { expression_parts.push(" -g ".to_string()); self.lexer.next(); }
+                Some(Token::Sticky) => { expression_parts.push(" -k ".to_string()); self.lexer.next(); }
+                Some(Token::SetUid) => { expression_parts.push(" -u ".to_string()); self.lexer.next(); }
+                Some(Token::Owned) => { expression_parts.push(" -O ".to_string()); self.lexer.next(); }
+                Some(Token::GroupOwned) => { expression_parts.push(" -G ".to_string()); self.lexer.next(); }
+                Some(Token::Modified) => { expression_parts.push(" -N ".to_string()); self.lexer.next(); }
+                Some(Token::NewerThan) => { expression_parts.push(" -nt ".to_string()); self.lexer.next(); }
+                Some(Token::OlderThan) => { expression_parts.push(" -ot ".to_string()); self.lexer.next(); }
+                Some(Token::SameFile) => { expression_parts.push(" -ef ".to_string()); self.lexer.next(); }
+                Some(Token::At) => { expression_parts.push("@".to_string()); self.lexer.next(); }
                 None => {
                     return Err(ParserError::InvalidSyntax(
                         "Unexpected end of input in test expression".to_string(),
