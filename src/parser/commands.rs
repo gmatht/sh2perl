@@ -51,6 +51,7 @@ impl Parser {
         }
 
         while !self.lexer.is_eof() {
+
             let _current_token = self.lexer.peek();
 
             if self.lexer.is_eof() {
@@ -139,6 +140,7 @@ impl Parser {
     }
 
     pub fn parse_command(&mut self) -> Result<Command, ParserError> {
+
         // Skip whitespace and comments, but NOT newlines
         // Newlines need to be handled as command separators
         while let Some(token) = self.lexer.peek() {
@@ -556,6 +558,31 @@ impl Parser {
                 let cmd = self.parse_pipeline_segment()?;
                 Ok(Command::Not(Box::new(cmd)))
             }
+            Some(Token::Identifier) => {
+                // Check for implicit function definition: name() { ... }
+                let paren1 = self.lexer.peek_n(1);
+                let paren2 = self.lexer.peek_n(2);
+                if matches!(paren1, Some(Token::ParenOpen))
+                    && matches!(paren2, Some(Token::ParenClose))
+                {
+                    // Check if the next non-whitespace token is a brace
+                    let mut pos = 3;
+                    while pos < 10
+                        && matches!(
+                            self.lexer.peek_n(pos),
+                            Some(
+                                Token::Space | Token::Tab | Token::Comment | Token::Newline
+                            )
+                        )
+                    {
+                        pos += 1;
+                    }
+                    if matches!(self.lexer.peek_n(pos), Some(Token::BraceOpen)) {
+                        return parse_posix_function(self);
+                    }
+                }
+                self.parse_simple_command()
+            }
             _ => self.parse_simple_command(),
         }
     }
@@ -618,8 +645,12 @@ impl Parser {
                 }
                 Token::And | Token::Or => {
                     let is_and = matches!(token, Token::And);
-                    self.lexer.next();
+                            self.lexer.next();
                     self.lexer.skip_whitespace_and_comments();
+                    if let Some((start, _end)) = self.lexer.get_span() {
+                        let (line, col) = self.lexer.offset_to_line_col(start);
+                        eprintln!("DEBUG After operator, token at {}:{} = {:?}", line, col, self.lexer.peek());
+                    }
 
                     // Build the left side for this operator:
                     // - If pipe_commands is non-empty, flush it (and optionally wrap
@@ -886,6 +917,45 @@ impl Parser {
                     }
                 }
                 _ => break,
+            }
+        }
+
+        // Check for implicit function definition: identifier() { ... }
+        // This must happen before parsing the command name, so we can
+        // delegate to parse_posix_function while the identifier is still
+        // the current token.
+        if let Some(Token::Identifier) = self.lexer.peek() {
+            let paren1 = self.lexer.peek_n(1);
+            let paren2 = self.lexer.peek_n(2);
+            if matches!(paren1, Some(Token::ParenOpen))
+                && matches!(paren2, Some(Token::ParenClose))
+            {
+                let mut pos = 3;
+                while pos < 10
+                    && matches!(
+                        self.lexer.peek_n(pos),
+                        Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
+                    )
+                {
+                    pos += 1;
+                }
+                if matches!(self.lexer.peek_n(pos), Some(Token::BraceOpen)) {
+                    // Wrap env var assignments and the function in a block
+                    if !env_vars.is_empty() {
+                        let func = parse_posix_function(self)?;
+                        let mut commands = Vec::new();
+                        for (var_name, value) in env_vars {
+                            commands.push(Command::Assignment(Assignment {
+                                variable: var_name,
+                                value,
+                                operator: AssignmentOperator::Assign,
+                            }));
+                        }
+                        commands.push(func);
+                        return Ok(Command::Block(Block { commands }));
+                    }
+                    return parse_posix_function(self);
+                }
             }
         }
 
@@ -1920,8 +1990,8 @@ impl Parser {
                     expression_parts.push(" -ne ".to_string());
                     self.lexer.next();
                 }
-                Some(Token::Number) => {
-                    let num = self.lexer.get_number_text()?;
+                Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) | Some(Token::HexNumber) => {
+                    let num = self.lexer.get_raw_token_text()?;
                     expression_parts.push(num);
                 }
                 Some(Token::NonZero) => {
@@ -2015,6 +2085,67 @@ impl Parser {
                 Some(Token::OlderThan) => { expression_parts.push(" -ot ".to_string()); self.lexer.next(); }
                 Some(Token::SameFile) => { expression_parts.push(" -ef ".to_string()); self.lexer.next(); }
                 Some(Token::At) => { expression_parts.push("@".to_string()); self.lexer.next(); }
+                Some(Token::Colon) => { expression_parts.push(":".to_string()); self.lexer.next(); }
+                Some(Token::Pipe) => { expression_parts.push("|".to_string()); self.lexer.next(); }
+                Some(Token::DollarParen) => {
+                    // Handle $() command substitution inside test expressions
+                    let mut sub = "$(".to_string();
+                    self.lexer.next(); // consume $(
+                    let mut depth = 1usize;
+                    loop {
+                        match self.lexer.peek() {
+                            Some(Token::DollarParen) => {
+                                sub.push_str(&self.lexer.get_raw_token_text()?);
+                                depth += 1;
+                            }
+                            Some(Token::ParenClose) => {
+                                sub.push(')');
+                                self.lexer.next();
+                                depth -= 1;
+                                if depth == 0 { break; }
+                            }
+                            Some(_) => {
+                                sub.push_str(&self.lexer.get_raw_token_text()?);
+                            }
+                            None => return Err(ParserError::InvalidSyntax(
+                                "Unexpected end of input in command substitution".to_string(),
+                            )),
+                        }
+                    }
+                    expression_parts.push(sub);
+                }
+                Some(Token::BacktickString) => {
+                    let text = self.lexer.get_raw_token_text()?;
+                    expression_parts.push(text);
+                }
+                Some(Token::LongOption) => {
+                    let text = self.lexer.get_raw_token_text()?;
+                    expression_parts.push(text);
+                }
+                Some(Token::True) => {
+                    expression_parts.push("true".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::False) => {
+                    expression_parts.push("false".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::DollarQuestion) => {
+                    expression_parts.push("$?".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::DollarDollar) => {
+                    expression_parts.push("$$".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::DollarBang) => {
+                    expression_parts.push("$!".to_string());
+                    self.lexer.next();
+                }
+                Some(Token::DollarMinus) => {
+                    expression_parts.push("$-".to_string());
+                    self.lexer.next();
+                }
                 None => {
                     return Err(ParserError::InvalidSyntax(
                         "Unexpected end of input in test expression".to_string(),
