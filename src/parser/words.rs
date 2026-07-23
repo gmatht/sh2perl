@@ -179,6 +179,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::Plus)
             | Some(Token::Minus)
             | Some(Token::Escape)
+            | Some(Token::EscapedDoubleQuote)
             | Some(Token::Colon)
             | Some(Token::Star)
             | Some(Token::Percent)
@@ -197,6 +198,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
+                | Some(Token::EscapedDoubleQuote)
                 | Some(Token::Colon)
                 | Some(Token::Star)
                 | Some(Token::Percent)
@@ -494,7 +496,12 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
                 | Some(Token::Select) | Some(Token::Function) | Some(Token::Bang)
-                | Some(Token::Let) => {
+                | Some(Token::Let) | Some(Token::Break) | Some(Token::Continue)
+                | Some(Token::Return) | Some(Token::Exit) | Some(Token::Shift)
+                | Some(Token::Eval) | Some(Token::Exec) | Some(Token::Source)
+                | Some(Token::Trap) | Some(Token::Wait) | Some(Token::Unset)
+                | Some(Token::Set) | Some(Token::Export) | Some(Token::Readonly)
+                | Some(Token::Declare) | Some(Token::Typeset) | Some(Token::Local) => {
                     let text = lexer.get_current_text().unwrap_or_default();
                     lexer.next();
                     Ok(Word::Literal(text, None))
@@ -551,6 +558,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::Plus)
             | Some(Token::Minus)
             | Some(Token::Escape)
+            | Some(Token::EscapedDoubleQuote)
             | Some(Token::Colon)
             | Some(Token::Star)
             | Some(Token::Percent)
@@ -569,6 +577,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
+                | Some(Token::EscapedDoubleQuote)
                 | Some(Token::Colon)
                 | Some(Token::Star)
                 | Some(Token::Percent)
@@ -856,7 +865,12 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
                 | Some(Token::Select) | Some(Token::Function) | Some(Token::Bang)
-                | Some(Token::Let) => {
+                | Some(Token::Let) | Some(Token::Break) | Some(Token::Continue)
+                | Some(Token::Return) | Some(Token::Exit) | Some(Token::Shift)
+                | Some(Token::Eval) | Some(Token::Exec) | Some(Token::Source)
+                | Some(Token::Trap) | Some(Token::Wait) | Some(Token::Unset)
+                | Some(Token::Set) | Some(Token::Export) | Some(Token::Readonly)
+                | Some(Token::Declare) | Some(Token::Typeset) | Some(Token::Local) => {
                     let text = lexer.get_current_text().unwrap_or_default();
                     lexer.next();
                     Ok(Word::Literal(text, None))
@@ -2735,6 +2749,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Token::Caret
                 | Token::Tilde
                 | Token::Escape
+                | Token::EscapedDoubleQuote
                 | Token::HexNumber
                 | Token::Semicolon
                 | Token::NonZero

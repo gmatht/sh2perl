@@ -878,7 +878,7 @@ impl Parser {
                                 });
                                 env_vars.insert(var_name, compound_word);
                             }
-                            self.lexer.skip_whitespace_and_comments();
+                            self.lexer.skip_inline_whitespace_and_comments();
                         }
                         Some(Token::Assign) => {
                             let var_name = self.parse_assignment_target()?;
@@ -904,7 +904,7 @@ impl Parser {
                                 let value_word = parse_word(&mut self.lexer)?;
                                 env_vars.insert(var_name, value_word);
                             }
-                            self.lexer.skip_whitespace_and_comments();
+                            self.lexer.skip_inline_whitespace_and_comments();
                         }
                         Some(Token::MinusAssign)
                         | Some(Token::StarAssign)
@@ -956,6 +956,80 @@ impl Parser {
                     }
                     return parse_posix_function(self);
                 }
+            }
+        }
+
+        // If there are env vars and the next token is not a valid command name,
+        // return these as standalone assignments instead of trying to parse
+        // a command name that doesn't exist.
+        if !env_vars.is_empty() {
+            let is_command_following = matches!(
+                self.lexer.peek(),
+                Some(Token::Identifier)
+                    | Some(Token::DoubleQuotedString)
+                    | Some(Token::SingleQuotedString)
+                    | Some(Token::Dollar)
+                    | Some(Token::DollarBrace)
+                    | Some(Token::DollarParen)
+                    | Some(Token::BacktickString)
+                    | Some(Token::Arithmetic)
+                    | Some(Token::ArithmeticEval)
+                    | Some(Token::TestBracket)
+                    | Some(Token::Bang)
+                    | Some(Token::Tilde)
+                    | Some(Token::Number)
+                    | Some(Token::Float)
+                    | Some(Token::PaddedNumber)
+                    | Some(Token::HexNumber)
+                    | Some(Token::Slash)
+                    | Some(Token::Dot)
+                    | Some(Token::Range)
+                    | Some(Token::Minus)
+                    | Some(Token::Plus)
+                    | Some(Token::Star)
+                    | Some(Token::Percent)
+                    | Some(Token::Escape)
+                    | Some(Token::EscapedDoubleQuote)
+                    | Some(Token::Colon)
+                    | Some(Token::Comma)
+                    | Some(Token::If)
+                    | Some(Token::Case)
+                    | Some(Token::While)
+                    | Some(Token::Until)
+                    | Some(Token::For)
+                    | Some(Token::Function)
+                    | Some(Token::BraceOpen)
+                    | Some(Token::ParenOpen)
+                    | Some(Token::Set)
+                    | Some(Token::Unset)
+                    | Some(Token::Export)
+                    | Some(Token::Readonly)
+                    | Some(Token::Declare)
+                    | Some(Token::Typeset)
+                    | Some(Token::Local)
+                    | Some(Token::Shift)
+                    | Some(Token::Eval)
+                    | Some(Token::Exec)
+                    | Some(Token::Source)
+                    | Some(Token::Trap)
+                    | Some(Token::Wait)
+                    | Some(Token::Exit)
+                    | Some(Token::True)
+                    | Some(Token::False)
+            );
+            if !is_command_following {
+                // No command following - return standalone assignments
+                let mut commands: Vec<Command> = env_vars.into_iter().map(|(variable, value)| {
+                    Command::Assignment(Assignment {
+                        variable,
+                        value,
+                        operator: AssignmentOperator::Assign,
+                    })
+                }).collect();
+                if commands.len() == 1 {
+                    return Ok(commands.remove(0));
+                }
+                return Ok(Command::Block(Block { commands }));
             }
         }
 
@@ -1113,6 +1187,7 @@ impl Parser {
                             | Token::And
                             | Token::Or
                             | Token::Semicolon
+                            | Token::DoubleSemicolon
                             | Token::Background => break,
                             _ => {
                                 args.push(parse_word_no_newline_skip(&mut self.lexer)?);
@@ -1191,6 +1266,7 @@ impl Parser {
                         | Token::And
                         | Token::Or
                         | Token::Semicolon
+                        | Token::DoubleSemicolon
                         | Token::Background => {
                             break;
                         }
@@ -1300,7 +1376,8 @@ impl Parser {
                 | Token::TypeFlag
                 | Token::Plus
                 | Token::Minus
-                | Token::Escape => {
+                | Token::Escape
+                | Token::EscapedDoubleQuote => {
                     // These are valid argument tokens
                     args.push(parse_word_no_newline_skip(&mut self.lexer)?);
 
@@ -1870,7 +1947,7 @@ impl Parser {
                     expression_parts.push("+".to_string());
                     self.lexer.next();
                 }
-                Some(Token::Escape) => {
+                Some(Token::Escape) | Some(Token::EscapedDoubleQuote) => {
                     expression_parts.push("\\".to_string());
                     self.lexer.next();
                 }

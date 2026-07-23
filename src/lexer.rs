@@ -357,6 +357,12 @@ pub enum Token {
     DoubleQuote,
     #[token("\\", priority = 2)]
     Escape,
+    // Escaped double-quote: \" — must have higher priority than Escape
+    // so logos matches the full \" sequence before individual tokens.
+    // This prevents DoubleQuotedString regex from seeing the " and
+    // attempting a greedy match that fails inside ${...} expansions.
+    #[regex(r#"\\""#, priority = 6)]
+    EscapedDoubleQuote,
     #[regex(r"\n", priority = 5)]
     Newline,
     #[token("\r")]
@@ -402,7 +408,7 @@ impl Lexer {
             match token_result {
                 Ok(token) => tokens.push((token, span.start, span.end)),
                 Err(_) => {
-                    // Skip invalid tokens
+                    // Skip invalid tokens (logos couldn't match anything)
                     continue;
                 }
             }

@@ -321,11 +321,39 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
     // Skip whitespace after 'case'
     parser.lexer.skip_whitespace_and_comments();
 
-    // Parse the word to match against
-    let word = parse_word(&mut parser.lexer)?;
-
-    // Skip whitespace before 'in'
-    parser.lexer.skip_whitespace_and_comments();
+    // Parse the word to match against — can be a complex expression
+    // like `$1-\`uname -s\`` which is lexed as multiple tokens.
+    // Collect all parts until we see the `in` keyword.
+    let mut word_parts: Vec<Word> = Vec::new();
+    loop {
+        parser.lexer.skip_whitespace_and_comments();
+        if matches!(parser.lexer.peek(), Some(Token::In)) {
+            break;
+        }
+        let part = parse_word(&mut parser.lexer)?;
+        word_parts.push(part);
+    }
+    let word = if word_parts.is_empty() {
+        Word::literal(String::new())
+    } else if word_parts.len() == 1 {
+        word_parts.remove(0)
+    } else {
+        // Combine multiple parts into a string interpolation
+        let mut parts = Vec::new();
+        for w in word_parts {
+            match w {
+                Word::Literal(s, _) => parts.push(StringPart::Literal(s)),
+                Word::Variable(v, _, _) => parts.push(StringPart::Variable(v)),
+                Word::CommandSubstitution(cmd, _) => parts.push(StringPart::CommandSubstitution(cmd)),
+                Word::StringInterpolation(interp, _) => parts.extend(interp.parts),
+                Word::ParameterExpansion(pe, _) => {
+                    parts.push(StringPart::ParameterExpansion(pe));
+                }
+                other => parts.push(StringPart::Literal(other.to_string())),
+            }
+        }
+        Word::StringInterpolation(StringInterpolation { parts }, None)
+    };
 
     // Consume 'in'
     parser.lexer.consume(Token::In)?;
@@ -1684,7 +1712,7 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                 expression_parts.push("+".to_string());
                 lexer.next();
             }
-            Some(Token::Escape) => {
+            Some(Token::Escape) | Some(Token::EscapedDoubleQuote) => {
                 expression_parts.push("\\".to_string());
                 lexer.next();
             }
