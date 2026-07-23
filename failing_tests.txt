@@ -1,3 +1,0 @@
-063_11_complex_while_loop.sh	error: PerlExecution timed out after 30.0 seconds
-063_hard_to_parse.sh	error: PerlExecution timed out after 30.0 seconds
-051_primes.sh	bash/sh -c wrapping builtin 'echo'
