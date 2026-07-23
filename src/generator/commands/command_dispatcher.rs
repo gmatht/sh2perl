@@ -84,6 +84,19 @@ pub fn generate_command_impl_with_input(
             );
             generator.generate_assignment(assignment)
         }
+        Command::Not(cmd) => {
+            // Negation: ! cmd  ->  ! (perl_code)
+            let inner = generator.generate_command(cmd);
+            let inner_trimmed = inner.trim();
+            if inner_trimmed.is_empty() {
+                String::new()
+            } else if inner_trimmed.starts_with("!") {
+                // Double negation: !! cmd
+                format!("!(!({}))\n", inner_trimmed)
+            } else {
+                format!("!({})\n", inner_trimmed)
+            }
+        }
         Command::BlankLine => "\n".to_string(),
         Command::Redirect(_redirect_cmd) => {
             //             eprintln!("DEBUG: Processing Redirect command with {} redirects", redirect_cmd.redirects.len());

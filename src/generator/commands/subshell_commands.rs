@@ -76,6 +76,7 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
             Command::Pipeline(p) => p.commands.iter().any(|c| contains_background(c)),
             Command::And(l, r) => contains_background(&*l) || contains_background(&*r),
             Command::Or(l, r) => contains_background(&*l) || contains_background(&*r),
+            Command::Not(c) => contains_background(c),
             Command::Redirect(r) => contains_background(&*r.command),
             Command::If(ifc) => {
                 contains_background(&*ifc.condition)
