@@ -1016,21 +1016,13 @@ fn generate_system_call_fallback(
             in_var, out_var, pid_var, in_var, out_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var
         )
     } else {
-        // Subsequent command - build a full shell command string and pass it as
-        // the argument to bash -c so pipelines and quoting are preserved.
-        let command = Command::Simple(cmd.clone());
-        let command_str = generator.generate_command_string_for_system(&command);
-        // Use double quotes so Perl interpolates $input_var into the bash command.
-        // This correctly passes the previous pipeline stage's output to this command.
-        // Escape special characters in the command string for use in double quotes.
-        let escaped_cmd = command_str
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n");
-        let command_lit = format!("\"echo \\\"${}\\\" | {}\"", input_var, escaped_cmd);
+        // Subsequent command - pipe the previous stage's output to the command
+        // via open3's input filehandle, avoiding bash -c wrapping of builtins.
+        let cmd_var_id = generator.get_unique_id();
+        let cmd_var = format!("$cmd_{}", cmd_var_id);
         format!(
-            "\nmy ({}, {});\nmy {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
-            in_var, out_var, pid_var, in_var, out_var, command_lit, in_var, output_var, out_var, out_var, pid_var
+            "\nmy {} = '{}';\nmy ({}, {});\nmy {} = open3({}, {}, '>&STDERR', {}, {});\nprint {{{}}} ${};\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
+            cmd_var, command_name, in_var, out_var, pid_var, in_var, out_var, cmd_var, args_str, in_var, input_var, in_var, output_var, out_var, out_var, pid_var
         )
     }
 }
