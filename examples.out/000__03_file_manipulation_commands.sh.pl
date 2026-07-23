@@ -558,18 +558,8 @@ else {
     local $CHILD_ERROR = 1;
     croak "rm: ", "test_dir/file", ": No such file or directory\n";
 }
-if ( -d 'test_dir' ) {
-    if ( rmdir 'test_dir' ) {
-    }
-                else {
-        carp "rmdir: failed to remove 'test_dir': $ERRNO\n";
-        $CHILD_ERROR = 1;
-    }
-}
-else {
-        carp "rmdir: failed to remove 'test_dir': $ERRNO\n";
-        $CHILD_ERROR = 1;
-}
+rmdir ('test_dir') or warn "rmdir failed: $OS_ERROR\n";
+$CHILD_ERROR = 0;
 print "\n";
 $CHILD_ERROR = 0;
 print "=== touch command ===\n";
@@ -577,7 +567,7 @@ my $touch_result;
 my @touch_result;
 my %touch_result;
 $touch_result = do {
-    my $left_result_43 = do {
+    my $left_result_44 = do {
         $CHILD_ERROR = 0;
         my $eval_result = eval {
             if ( -e "test_file.txt" ) {
@@ -602,8 +592,8 @@ $touch_result = do {
         q{};
 };
     if ( $CHILD_ERROR == 0 ) {
-        my $right_result_43 = do { ("File touched") };
-        $left_result_43 . $right_result_43;
+        my $right_result_44 = do { ("File touched") };
+        $left_result_44 . $right_result_44;
     } else {
         q{};
     }

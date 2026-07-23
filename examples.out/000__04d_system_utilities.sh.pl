@@ -49,20 +49,20 @@ my $yes_result;
 my @yes_result;
 my %yes_result;
 $yes_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
-    do { my $output_65 = q{};
-my $output_printed_65;
+    do { my $output_66 = q{};
+my $output_printed_66;
 my $head_line_count = 0;
 while (1) {
     my $line = 'Hello';
     if ($head_line_count < 3) {
-    $output_65 .= $line . "\n";
+    $output_66 .= $line . "\n";
     ++$head_line_count;
     } else {
     $line = q{}; # Clear line to prevent printing
     last; # Break out of the yes loop when head limit is reached
     }
 }
-$output_65 };
+$output_66 };
 }; $_pipeline_result; };
 print "Yes command result:\n";
 print $yes_result;
