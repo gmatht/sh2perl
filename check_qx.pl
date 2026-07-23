@@ -8,7 +8,7 @@ use warnings;
 my @builtins = qw(
     find ls grep sed awk sort uniq head tail cat echo printf
     touch mkdir rmdir rm cp mv chmod chown ln basename dirname
-    date sleep wc kill ps cd pwd perl
+    date sleep wc kill ps cd pwd perl comm cut
     whoami uname hostname bc
 );
 
@@ -18,7 +18,7 @@ my @exemptions;
 if (open my $fh, '<', '../allowed_qx_calls.txt') {
     while (<$fh>) {
         chomp;
-        s/#.*//;    # strip comments
+        s/#.*//;
         next if /^\s*$/;
         push @exemptions, $_;
     }
@@ -33,6 +33,60 @@ my $is_exempt = sub {
     return 0;
 };
 
+sub check_builtins_in_cmd {
+    my ($cmd) = @_;
+    (my $check = $cmd) =~ s/<\([^)]*\)//g;
+    $check =~ s/>\([^)]*\)//g;
+    for my $b (@builtins) {
+        if ($check =~ /\b\Q$b\E\b/) {
+            return $b;
+        }
+    }
+    return undef;
+}
+
+sub check_call_args_for_bash_c {
+    my ($file_basename, @quoted_args) = @_;
+    for my $i (0 .. $#quoted_args - 2) {
+        if (($quoted_args[$i] eq 'bash' || $quoted_args[$i] eq 'sh')
+            && $quoted_args[$i+1] eq '-c'
+            && defined $quoted_args[$i+2])
+        {
+            my $inner = $quoted_args[$i+2];
+            next if $is_exempt->($inner);
+            my $b = check_builtins_in_cmd($inner);
+            if (defined $b) {
+                return "  FAIL: $file_basename.sh [perl] - bash/sh -c wrapping builtin '$b'\n";
+            }
+        }
+    }
+    return '';
+}
+
+# Extract all quoted string values from a code region, handling
+# single-quoted ('...'), double-quoted ("..." with escaped quotes),
+# and q{...} literals.  For double-quoted strings, backslash-escaped
+# quotes (\") are treated as part of the string content.
+sub extract_all_quoted_strings {
+    my ($text) = @_;
+    my @args;
+    # Single-quoted: '...'
+    while ($text =~ /'([^']*)'/g) {
+        push @args, $1;
+    }
+    # Double-quoted: "..." with support for escaped \"
+    while ($text =~ /"((?:[^"\\]|\\.)*)"/g) {
+        my $val = $1;
+        $val =~ s/\\(.)/$1/g;  # unescape
+        push @args, $val;
+    }
+    # q{...} literals
+    while ($text =~ /q\{([^}]*)\}/g) {
+        push @args, $1;
+    }
+    return @args;
+}
+
 my $violations = 0;
 
 for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
@@ -45,129 +99,124 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
     $basename =~ s/\.sh\.pl$//;
 
     # Pattern 1: direct qx{builtin ...}
-    # Extract the full qx body, then check if it contains a builtin.
     while ($code =~ /qx\{([^}]*)\}/g) {
         my $qx_body = $1;
-        next if $qx_body =~ /^\$/;  # skip variable indirection (handled in Pattern 2)
-        # Determine the command to check:
-        # - If wrapped in bash -c '...', unwrap and check the inner command
-        # - Otherwise check the qx body directly
+        next if $qx_body =~ /^\$/;
         my $check_cmd = $qx_body;
-        if ($check_cmd =~ /^bash -c (["\'])(.*)\1\s*/s) {
+        if ($check_cmd =~ /^bash -c (["\x27])(.*)\1\s*/s) {
             $check_cmd = $2;
         }
-        # Strip process substitution constructs <(...) and >(...) to avoid false
-        # positives on builtins that appear inside them (e.g. sort in <(sort f1)).
-        $check_cmd =~ s/<\([^)]*\)//g;
-        $check_cmd =~ s/>\([^)]*\)//g;
-        # Check exemptions on the (possibly unwrapped) command.
         next if $is_exempt->($check_cmd);
-        for my $b (@builtins) {
-            if ($check_cmd =~ /\b\Q$b\E\b/) {
-                print "  FAIL: $basename.sh [perl] - QX violation: qx{} call with builtin '$b'\n";
-                $violations++;
-                last;
-            }
+        my $b = check_builtins_in_cmd($check_cmd);
+        if (defined $b) {
+            print "  FAIL: $basename.sh [perl] - QX violation: qx{} call with builtin '$b'\n";
+            $violations++;
         }
     }
-    # Pattern 2: qx{\$var} where var was assigned a command string containing a builtin.
-    # Search backwards from the qx{} call to find the MOST RECENT assignment to that
-    # variable, so variable reuse (e.g. \$command for both \`ls -la\` and \`find ...\`) is
-    # handled correctly.
+
+    # Pattern 2: qx{$var} where var was assigned a command string containing a builtin.
     while ($code =~ /qx\{(\$\w+)\}/g) {
         my $var = $1;
         my $pos = pos($code);
         my $before = substr($code, 0, $pos);
-        # Find the last (most recent) assignment to this variable before the qx{} call
         my $last_assign = '';
-        while ($before =~ /my\s+\Q$var\E\s*=\s*(?:q\{([^}]*)\}|"([^"]*)"|'([^']*)')/sg) {
-            $last_assign = $+;
+        while ($before =~ /my\s+\Q$var\E\s*=\s*(?:q\{([^}]*)\}|"((?:[^"\\]|\\.)*)"|\x27([^\x27]*)\x27)/sg) {
+            my $val = $+;
+            if (defined $3) {
+                $last_assign = $3;
+            } else {
+                $last_assign = $val;
+                $last_assign =~ s/\\(.)/$1/g;
+            }
         }
         next if $last_assign eq '';
-        # Determine the command to check:
-        # - If wrapped in bash -c '...', unwrap and check the inner command
-        # - Otherwise check the assignment value directly
         my $check_cmd = $last_assign;
-        if ($check_cmd =~ /^bash -c (["\'])(.*)\1\s*$/s) {
+        if ($check_cmd =~ /^bash -c (["\x27])(.*)\1\s*$/s) {
             $check_cmd = $2;
         } elsif ($check_cmd =~ /^bash -c (\S+)\s*$/) {
             $check_cmd = $1;
         }
-        # Strip process substitution constructs <(...) and >(...) to avoid false
-        # positives on builtins that appear inside them (e.g. sort in <(sort f1)).
-        $check_cmd =~ s/<\([^)]*\)//g;
-        $check_cmd =~ s/>\([^)]*\)//g;
-        # Check exemptions on the (possibly unwrapped) command.
         next if $is_exempt->($check_cmd);
-        for my $b (@builtins) {
-            if ($check_cmd =~ /\b\Q$b\E\b/) {
-                my $line_num = ($before =~ tr/\n//) + 1;
-                print "  FAIL: $basename.sh [perl] - QX violation: qx{$var} where $var contains builtin '$b'\n";
-                $violations++;
-                last;
-            }
+        my $b = check_builtins_in_cmd($check_cmd);
+        if (defined $b) {
+            print "  FAIL: $basename.sh [perl] - QX violation: qx{$var} where $var contains builtin '$b'\n";
+            $violations++;
         }
     }
 
-    # Pattern 3: system('builtin ...') or system("builtin ...")
-    # Extract the full command string and check exemptions.
-    while ($code =~ /system\s*['"]\s*([^'"]+)['"]/g) {
+    # Pattern 3: system('builtin ...') / system("builtin ...") / system "builtin ..."
+    # Handles both system("cmd") and system "cmd" (paren or space).
+    while ($code =~ /system\s*(?:\(\s*['"]\s*|['"]\s*)([^'"]+)['"]/g) {
         my $system_body = $1;
         next if $is_exempt->($system_body);
-        for my $b (@builtins) {
-            if ($system_body =~ /\b\Q$b\E\b/) {
-                print "  FAIL: $basename.sh [perl] - SYSTEM violation: system() call with builtin '$b'\n";
-                $violations++;
-                last;
-            }
+        my $b = check_builtins_in_cmd($system_body);
+        if (defined $b) {
+            print "  FAIL: $basename.sh [perl] - SYSTEM violation: system() call with builtin '$b'\n";
+            $violations++;
         }
     }
 
-    # Pattern 4: open3(..., 'builtin', ...) - direct system call via IPC::Open3
+    # Pattern 3b: multi-argument system('bash', '-c', 'cmd') etc.
+    while ($code =~ /system\s*\((.*?)\)/gs) {
+        my $call_args_str = $1;
+        next if $call_args_str =~ /^\s*['"]/;
+        my @all_quoted = extract_all_quoted_strings($call_args_str);
+        next if @all_quoted < 3;
+        my $msg = check_call_args_for_bash_c($basename, @all_quoted);
+        if ($msg) {
+            print $msg;
+            $violations++;
+        }
+    }
+
+    # Pattern 4: open3(..., 'bash', '-c', 'cmd') etc.
     while ($code =~ /open3\s*\((.*?)\)/gs) {
-        my $open3_args = $1;
-        # Extract all quoted string arguments from the open3 call
-        my @quoted_args = $open3_args =~ /'([^']*)'/g;
-        # Skip the first 3 arguments which are always filehandle variables ($in, $out, $err)
-        # The 4th argument (index 3) is the program/command
-        next if @quoted_args < 1;
-        my $prog = $quoted_args[0];
-        # If the program is 'bash' and '-c' follows, check the INNER command for builtins.
-        # The 'bash -c' wrapper itself is not the cheat - the cheat is wrapping a simple
-        # command like `echo` or `printf` in bash -c instead of translating it natively.
-        if ($prog eq 'bash' && @quoted_args >= 3 && $quoted_args[1] eq '-c') {
-            my $cmd_str = $quoted_args[2];
-            # Skip if the inner command starts with an exemption (e.g. eval is genuinely hard)
-            next if $is_exempt->($cmd_str);
-            for my $b (@builtins) {
-                if ($cmd_str =~ /\b\Q$b\E\b/) {
-                    print "  FAIL: $basename.sh [perl] - OPEN3 violation: bash -c wrapping builtin '$b'\n";
-                    $violations++;
-                    last;
-                }
-            }
-        } else {
-            next if $is_exempt->($prog);
-            for my $b (@builtins) {
-                if ($prog =~ /\b\Q$b\E\b/) {
-                    print "  FAIL: $basename.sh [perl] - OPEN3 violation: open3() with builtin '$b'\n";
-                    $violations++;
-                    last;
-                }
-            }
+        my $call_args_str = $1;
+        my @all_quoted = extract_all_quoted_strings($call_args_str);
+        next if @all_quoted < 3;
+
+        my $msg = check_call_args_for_bash_c($basename, @all_quoted);
+        if ($msg) {
+            print $msg;
+            $violations++;
+            next;
+        }
+
+        # Direct open3 call - find first non-redirect quoted arg
+        my $prog = '';
+        for my $q (@all_quoted) {
+            next if $q eq '>&STDERR' || $q eq '&STDERR' || $q eq '' || $q eq '&1';
+            $prog = $q;
+            last;
+        }
+        next if $prog eq '';
+        next if $is_exempt->($prog);
+        my $b = check_builtins_in_cmd($prog);
+        if (defined $b) {
+            print "  FAIL: $basename.sh [perl] - OPEN3 violation: open3() with builtin '$b'\n";
+            $violations++;
         }
     }
 
-    # Pattern 5: exec('builtin', ...) - replaces Perl process with shell command
-    while ($code =~ /exec\s*['"]\s*(\w+)['"]/g) {
+    # Pattern 5: exec('builtin') / exec 'builtin' (single command)
+    while ($code =~ /exec\s*(?:\(\s*['"]\s*|['"]\s*)(\w+)(?:\s*['"]|['"]\s*\))/g) {
         my $exec_cmd = $1;
         next if $is_exempt->($exec_cmd);
-        for my $b (@builtins) {
-            if ($exec_cmd =~ /\b\Q$b\E\b/) {
-                print "  FAIL: $basename.sh [perl] - EXEC violation: exec() with builtin '$b'\n";
-                $violations++;
-                last;
-            }
+        my $b = check_builtins_in_cmd($exec_cmd);
+        if (defined $b) {
+            print "  FAIL: $basename.sh [perl] - EXEC violation: exec() with builtin '$b'\n";
+            $violations++;
+        }
+    }
+
+    # Pattern 5b: exec 'bash', '-c', 'cmd' (with or without parens)
+    while ($code =~ /exec\s*(?:\(\s*|)['"](bash|sh)['"]\s*,\s*['"]-c['"]\s*,\s*(['"])(.*?)\2/gs) {
+        my $inner = $3;
+        next if $is_exempt->($inner);
+        my $b = check_builtins_in_cmd($inner);
+        if (defined $b) {
+            print "  FAIL: $basename.sh [perl] - EXEC violation: exec bash/sh -c wrapping builtin '$b'\n";
+            $violations++;
         }
     }
 }
