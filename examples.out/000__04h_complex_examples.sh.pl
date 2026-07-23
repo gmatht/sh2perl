@@ -207,7 +207,7 @@ do {
 my $process_result;
 my @process_result;
 my %process_result;
-$process_result = do { my $command = "bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"; chomp(my $result = qx{$command}); $CHILD_ERROR = $? >> 8; $result; };
+$process_result = do { my @_qx_cmd = ("bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"); chomp(my $result = qx{$_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
 print "Process substitution result:\n";
 print $process_result;
 if ( !( ($process_result) =~ m{\n\z}msx ) ) { print "\n"; }
