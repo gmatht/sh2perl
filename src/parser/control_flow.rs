@@ -1042,6 +1042,9 @@ pub fn parse_posix_function(parser: &mut Parser) -> Result<Command, ParserError>
     // Get the function name
     let name = parser.lexer.get_identifier_text()?;
 
+    // Allow whitespace between function name and parentheses
+    parser.lexer.skip_whitespace_and_comments();
+
     // Consume the opening parenthesis
     parser.lexer.consume(Token::ParenOpen)?;
 

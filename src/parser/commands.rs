@@ -139,6 +139,18 @@ impl Parser {
         Ok(commands)
     }
 
+    /// Starting from offset `start`, return the offset of the first non-whitespace token.
+    fn skip_ws_offset(&self, start: usize) -> usize {
+        let mut pos = start;
+        while matches!(
+            self.lexer.peek_n(pos),
+            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
+        ) {
+            pos += 1;
+        }
+        pos
+    }
+
     pub fn parse_command(&mut self) -> Result<Command, ParserError> {
 
         // Skip whitespace and comments, but NOT newlines
@@ -158,26 +170,30 @@ impl Parser {
 
         let command = if let Some(Token::Identifier) = self.lexer.peek() {
             // Check if this is a function definition: identifier() { ... }
-            let paren1 = self.lexer.peek_n(1);
-            let paren2 = self.lexer.peek_n(2);
-            if matches!(paren1, Some(Token::ParenOpen)) && matches!(paren2, Some(Token::ParenClose))
-            {
-                // Check if the next non-whitespace token is a brace
-                let mut pos = 3;
-                while pos < 10
-                    && matches!(
-                        self.lexer.peek_n(pos),
-                        Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
-                    )
-                {
-                    pos += 1;
-                }
-                let brace_token = self.lexer.peek_n(pos);
-                if matches!(brace_token, Some(Token::BraceOpen)) {
-                    parse_posix_function(self)?
+            // Allow whitespace between identifier and parentheses
+            let paren_idx = self.skip_ws_offset(1);
+            let is_func_def = if let Some(Token::ParenOpen) = self.lexer.peek_n(paren_idx) {
+                let close_idx = self.skip_ws_offset(paren_idx + 1);
+                if matches!(self.lexer.peek_n(close_idx), Some(Token::ParenClose)) {
+                    // Check if the next non-whitespace token is a brace
+                    let mut brace_idx = close_idx + 1;
+                    while brace_idx < close_idx + 10
+                        && matches!(
+                            self.lexer.peek_n(brace_idx),
+                            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
+                        )
+                    {
+                        brace_idx += 1;
+                    }
+                    matches!(self.lexer.peek_n(brace_idx), Some(Token::BraceOpen))
                 } else {
-                    self.parse_pipeline()?
+                    false
                 }
+            } else {
+                false
+            };
+            if is_func_def {
+                parse_posix_function(self)?
             } else {
                 // Check if this is a standalone variable assignment: identifier=value or identifier[subscript]=value
                 let mut pos = 1;
@@ -340,7 +356,10 @@ impl Parser {
         let command = self.parse_command_redirects(command)?;
 
         self.lexer.skip_whitespace_and_comments();
-        if matches!(
+        if let Some(Token::Background) = self.lexer.peek() {
+            self.lexer.next();
+            Ok(Command::Background(Box::new(command)))
+        } else if matches!(
             self.lexer.peek(),
             Some(Token::And | Token::Or | Token::Pipe)
         ) {
@@ -560,26 +579,31 @@ impl Parser {
             }
             Some(Token::Identifier) => {
                 // Check for implicit function definition: name() { ... }
-                let paren1 = self.lexer.peek_n(1);
-                let paren2 = self.lexer.peek_n(2);
-                if matches!(paren1, Some(Token::ParenOpen))
-                    && matches!(paren2, Some(Token::ParenClose))
-                {
-                    // Check if the next non-whitespace token is a brace
-                    let mut pos = 3;
-                    while pos < 10
-                        && matches!(
-                            self.lexer.peek_n(pos),
-                            Some(
-                                Token::Space | Token::Tab | Token::Comment | Token::Newline
+                // Allow whitespace between identifier and parentheses
+                let paren_idx = self.skip_ws_offset(1);
+                let is_func_def = if let Some(Token::ParenOpen) = self.lexer.peek_n(paren_idx) {
+                    let close_idx = self.skip_ws_offset(paren_idx + 1);
+                    if matches!(self.lexer.peek_n(close_idx), Some(Token::ParenClose)) {
+                        let mut brace_idx = close_idx + 1;
+                        while brace_idx < close_idx + 10
+                            && matches!(
+                                self.lexer.peek_n(brace_idx),
+                                Some(
+                                    Token::Space | Token::Tab | Token::Comment | Token::Newline
+                                )
                             )
-                        )
-                    {
-                        pos += 1;
+                        {
+                            brace_idx += 1;
+                        }
+                        matches!(self.lexer.peek_n(brace_idx), Some(Token::BraceOpen))
+                    } else {
+                        false
                     }
-                    if matches!(self.lexer.peek_n(pos), Some(Token::BraceOpen)) {
-                        return parse_posix_function(self);
-                    }
+                } else {
+                    false
+                };
+                if is_func_def {
+                    return parse_posix_function(self);
                 }
                 self.parse_simple_command()
             }
@@ -925,37 +949,43 @@ impl Parser {
         // delegate to parse_posix_function while the identifier is still
         // the current token.
         if let Some(Token::Identifier) = self.lexer.peek() {
-            let paren1 = self.lexer.peek_n(1);
-            let paren2 = self.lexer.peek_n(2);
-            if matches!(paren1, Some(Token::ParenOpen))
-                && matches!(paren2, Some(Token::ParenClose))
-            {
-                let mut pos = 3;
-                while pos < 10
-                    && matches!(
-                        self.lexer.peek_n(pos),
-                        Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
-                    )
-                {
-                    pos += 1;
-                }
-                if matches!(self.lexer.peek_n(pos), Some(Token::BraceOpen)) {
-                    // Wrap env var assignments and the function in a block
-                    if !env_vars.is_empty() {
-                        let func = parse_posix_function(self)?;
-                        let mut commands = Vec::new();
-                        for (var_name, value) in env_vars {
-                            commands.push(Command::Assignment(Assignment {
-                                variable: var_name,
-                                value,
-                                operator: AssignmentOperator::Assign,
-                            }));
-                        }
-                        commands.push(func);
-                        return Ok(Command::Block(Block { commands }));
+            // Allow whitespace between identifier and parentheses
+            let paren_idx = self.skip_ws_offset(1);
+            let is_func_def = if let Some(Token::ParenOpen) = self.lexer.peek_n(paren_idx) {
+                let close_idx = self.skip_ws_offset(paren_idx + 1);
+                if matches!(self.lexer.peek_n(close_idx), Some(Token::ParenClose)) {
+                    let mut brace_idx = close_idx + 1;
+                    while brace_idx < close_idx + 10
+                        && matches!(
+                            self.lexer.peek_n(brace_idx),
+                            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
+                        )
+                    {
+                        brace_idx += 1;
                     }
-                    return parse_posix_function(self);
+                    matches!(self.lexer.peek_n(brace_idx), Some(Token::BraceOpen))
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if is_func_def {
+                // Wrap env var assignments and the function in a block
+                if !env_vars.is_empty() {
+                    let func = parse_posix_function(self)?;
+                    let mut commands = Vec::new();
+                    for (var_name, value) in env_vars {
+                        commands.push(Command::Assignment(Assignment {
+                            variable: var_name,
+                            value,
+                            operator: AssignmentOperator::Assign,
+                        }));
+                    }
+                    commands.push(func);
+                    return Ok(Command::Block(Block { commands }));
+                }
+                return parse_posix_function(self);
             }
         }
 
