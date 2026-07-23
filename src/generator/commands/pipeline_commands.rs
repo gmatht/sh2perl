@@ -174,12 +174,10 @@ fn generate_command_using_builtins(
                                     generator.generate_command_string_for_system(cmd);
                                 let cmd_literal = generator
                                     .perl_string_literal_no_interp(&Word::literal(cmd_str));
+                                let _pcmd_uid = generator.get_unique_id();
                                 output.push_str(&format!(
-                                    "my {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n",
-                                    pid_var,
-                                    in_var,
-                                    out_var,
-                                    cmd_literal
+                                    "my @_pcmd_{} = ('bash', '-c', {});\nmy {} = open3({}, {}, '>&STDERR', @_pcmd_{});\n",
+                                    _pcmd_uid, cmd_literal, pid_var, in_var, out_var, _pcmd_uid
                                 ));
                                 output.push_str(&format!(
                                     "close {} or croak 'Close failed: $OS_ERROR';\n",
@@ -207,12 +205,10 @@ fn generate_command_using_builtins(
                                 .push_str(&format!("my ({}, {});\n", in_var, out_var));
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
+                            let _pcmd_uid = generator.get_unique_id();
                             output.push_str(&format!(
-                                "my {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n",
-                                pid_var,
-                                in_var,
-                                out_var,
-                                cmd_literal
+                                "my @_pcmd_{} = ('bash', '-c', {});\nmy {} = open3({}, {}, '>&STDERR', @_pcmd_{});\n",
+                                _pcmd_uid, cmd_literal, pid_var, in_var, out_var, _pcmd_uid
                             ));
                             output.push_str(&format!(
                                 "close {} or croak 'Close failed: $OS_ERROR';\n",
@@ -239,12 +235,10 @@ fn generate_command_using_builtins(
                         output.push_str(&format!("my ({}, {});\n", in_var, out_var));
                         let cmd_str = generator.generate_command_string_for_system(cmd);
                         let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
+                        let _pcmd_uid = generator.get_unique_id();
                         output.push_str(&format!(
-                            "my {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n",
-                            pid_var,
-                            in_var,
-                            out_var,
-                            cmd_literal
+                            "my @_pcmd_{} = ('bash', '-c', {});\nmy {} = open3({}, {}, '>&STDERR', @_pcmd_{});\n",
+                            _pcmd_uid, cmd_literal, pid_var, in_var, out_var, _pcmd_uid
                         ));
                         output.push_str(&format!(
                             "close {} or croak 'Close failed: $OS_ERROR';\n",
@@ -556,8 +550,9 @@ fn generate_command_using_builtins(
                 let cmd_str = generator.generate_command_string_for_system(sub_cmd);
                 let perl_str = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                 let (in_v, out_v, _err_v, pid_v, _) = generator.get_unique_ipc_vars();
+                let uid = generator.get_unique_id();
                 result.push_str(&format!(
-                    "my ({in_v}, {out_v});\nmy {pid_v} = open3({in_v}, {out_v}, '>&STDERR', 'sh', '-c', {perl_str});\nclose {in_v} or croak 'Close failed: $OS_ERROR';\n${output_var} .= do {{ local $INPUT_RECORD_SEPARATOR = undef; <{out_v}> }};\nclose {out_v} or croak 'Close failed: $OS_ERROR';\nwaitpid {pid_v}, 0;\n"
+                    "my @_pcmd_{uid} = ('sh', '-c', {perl_str});\nmy ({in_v}, {out_v});\nmy {pid_v} = open3({in_v}, {out_v}, '>&STDERR', @_pcmd_{uid});\nclose {in_v} or croak 'Close failed: $OS_ERROR';\n${output_var} .= do {{ local $INPUT_RECORD_SEPARATOR = undef; <{out_v}> }};\nclose {out_v} or croak 'Close failed: $OS_ERROR';\nwaitpid {pid_v}, 0;\n"
                 ));
             }
             result
@@ -569,14 +564,17 @@ fn generate_command_using_builtins(
                 // First command in pipeline
                 let cmd_str = generator.generate_command_string_for_system(command);
                 let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
-                format!("\nmy ({});\nmy {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
-                    in_var, pid_var, in_var, out_var, cmd_literal, in_var, out_var, output_var, out_var, pid_var)
+                let _pcmd_uid = generator.get_unique_id();
+                format!("\nmy @_pcmd_{} = ('bash', '-c', {});\nmy ({});\nmy {} = open3({}, {}, '>&STDERR', @_pcmd_{});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
+                    _pcmd_uid, cmd_literal, in_var, pid_var, in_var, out_var, _pcmd_uid, in_var, out_var, output_var, out_var, pid_var)
             } else {
                 // Subsequent command - use double quotes so Perl interpolates $var
                 let pipe_cmd = format!("echo \"${{{}}}\" | {}", input_var, generator.generate_command_string_for_system(command));
                 let pipe_literal = generator.perl_string_literal_force_interp(&Word::literal(pipe_cmd));
-                format!("\nmy ({});\nmy {} = open3({}, {}, '>&STDERR', 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
-                    in_var, pid_var, in_var, out_var, pipe_literal, in_var, out_var, output_var, out_var, pid_var)
+                let _pcmd_uid = generator.get_unique_id();
+                format!("\nmy @_pcmd_{} = ('bash', '-c', {});\nmy ({});\nmy {} = open3({}, {}, '>&STDERR', @_pcmd_{});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';
+waitpid {}, 0;\n", 
+                    _pcmd_uid, pipe_literal, in_var, pid_var, in_var, out_var, _pcmd_uid, in_var, out_var, output_var, out_var, pid_var)
             }
         }
     }
