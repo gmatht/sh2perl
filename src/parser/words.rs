@@ -456,6 +456,10 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         | Some(Token::DollarHashSimple)
         | Some(Token::DollarAtSimple)
         | Some(Token::DollarStarSimple)
+        | Some(Token::DollarQuestion)
+        | Some(Token::DollarDollar)
+        | Some(Token::DollarBang)
+        | Some(Token::DollarMinus)
         | Some(Token::DollarBraceHash)
         | Some(Token::DollarBraceBang)
         | Some(Token::DollarBraceStar)
@@ -792,6 +796,10 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         | Some(Token::DollarHashSimple)
         | Some(Token::DollarAtSimple)
         | Some(Token::DollarStarSimple)
+        | Some(Token::DollarQuestion)
+        | Some(Token::DollarDollar)
+        | Some(Token::DollarBang)
+        | Some(Token::DollarMinus)
         | Some(Token::DollarBraceHash)
         | Some(Token::DollarBraceBang)
         | Some(Token::DollarBraceStar)
@@ -924,6 +932,22 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
         Some(Token::DollarStarSimple) => {
             lexer.next();
             Ok(Word::Variable("*".to_string(), false, None))
+        }
+        Some(Token::DollarQuestion) => {
+            lexer.next();
+            Ok(Word::Variable("?".to_string(), false, None))
+        }
+        Some(Token::DollarDollar) => {
+            lexer.next();
+            Ok(Word::Variable("$".to_string(), false, None))
+        }
+        Some(Token::DollarBang) => {
+            lexer.next();
+            Ok(Word::Variable("!".to_string(), false, None))
+        }
+        Some(Token::DollarMinus) => {
+            lexer.next();
+            Ok(Word::Variable("-".to_string(), false, None))
         }
         Some(Token::DollarBrace) => {
             // Parse ${...} expansions
@@ -2602,7 +2626,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
             _ => {
                 return Err(ParserError::InvalidSyntax(
                     "Unexpected token in brace expansion".to_string(),
-                ));
+                ))
             }
         }
     }

@@ -163,6 +163,14 @@ pub enum Token {
     DollarAtSimple,
     #[token("$*", priority = 3)]
     DollarStarSimple,
+    #[token("$?", priority = 3)]
+    DollarQuestion,
+    #[token("$$", priority = 3)]
+    DollarDollar,
+    #[token("$!", priority = 3)]
+    DollarBang,
+    #[token("$-", priority = 3)]
+    DollarMinus,
     // Backtick token not currently used
     #[token("`", priority = 1)]
     _Backtick, // Unused variant, prefixed with underscore
