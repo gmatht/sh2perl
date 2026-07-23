@@ -770,6 +770,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 &output_var,
             );
             output.push_str(&sort_output);
+            // If there's an active pipeline output, assign the sort result to it
+            if let Some(pid) = generator.current_pipeline_output_id() {
+                output.push_str(&format!("$output_{} = ${};", pid, output_var));
+            }
         } else if name == "echo" {
             // Use the echo command generator for non-pipeline echo commands
             if generator.inline_mode {
