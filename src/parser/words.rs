@@ -485,11 +485,33 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             let text = lexer.capture_parenthetical_text()?;
             Ok(Word::Literal(text, None))
         }
-        _ => {
-            let current_pos = lexer.current_position();
-            let (line, col) = lexer.offset_to_line_col(current_pos);
-            let token = lexer.peek().unwrap_or(Token::Identifier).to_owned();
-            Err(ParserError::UnexpectedToken { token, line, col })
+        token => {
+            // If we encounter a shell keyword token in argument position,
+            // treat it as a literal word rather than failing.
+            match token {
+                Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
+                | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
+                | Some(Token::While) | Some(Token::Until) | Some(Token::For)
+                | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
+                | Some(Token::Select) | Some(Token::Function) | Some(Token::Bang)
+                | Some(Token::Let) => {
+                    let text = lexer.get_current_text().unwrap_or_default();
+                    lexer.next();
+                    Ok(Word::Literal(text, None))
+                }
+                _ => {
+                    let token = token.unwrap_or(Token::Identifier);
+                    // Use the actual byte offset of the current token for error position
+                    if let Some((_, start, _)) = lexer.tokens.get(lexer.current) {
+                        let (line, col) = lexer.offset_to_line_col(*start);
+                        Err(ParserError::UnexpectedToken { token, line, col })
+                    } else {
+                        let current_pos = lexer.current_position();
+                        let (line, col) = lexer.offset_to_line_col(current_pos);
+                        Err(ParserError::UnexpectedToken { token, line, col })
+                    }
+                }
+            }
         }
     };
 
@@ -825,11 +847,33 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             let text = lexer.capture_parenthetical_text()?;
             Ok(Word::Literal(text, None))
         }
-        _ => {
-            let current_pos = lexer.current_position();
-            let (line, col) = lexer.offset_to_line_col(current_pos);
-            let token = lexer.peek().unwrap_or(Token::Identifier).to_owned();
-            Err(ParserError::UnexpectedToken { token, line, col })
+        token => {
+            // If we encounter a shell keyword token in argument position,
+            // treat it as a literal word rather than failing.
+            match token {
+                Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
+                | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
+                | Some(Token::While) | Some(Token::Until) | Some(Token::For)
+                | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
+                | Some(Token::Select) | Some(Token::Function) | Some(Token::Bang)
+                | Some(Token::Let) => {
+                    let text = lexer.get_current_text().unwrap_or_default();
+                    lexer.next();
+                    Ok(Word::Literal(text, None))
+                }
+                _ => {
+                    let token = token.unwrap_or(Token::Identifier);
+                    // Use the actual byte offset of the current token for error position
+                    if let Some((_, start, _)) = lexer.tokens.get(lexer.current) {
+                        let (line, col) = lexer.offset_to_line_col(*start);
+                        Err(ParserError::UnexpectedToken { token, line, col })
+                    } else {
+                        let current_pos = lexer.current_position();
+                        let (line, col) = lexer.offset_to_line_col(current_pos);
+                        Err(ParserError::UnexpectedToken { token, line, col })
+                    }
+                }
+            }
         }
     };
 
@@ -1185,6 +1229,38 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 } else {
                     Ok(Word::Variable(braced_content, true, None))
                 }
+            } else if braced_content.contains("#") && !braced_content.contains("##") {
+                let parts: Vec<&str> = braced_content.splitn(2, "#").collect();
+                if parts.len() == 2 {
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: parts[0].to_string(),
+                            operator: ParameterExpansionOperator::RemoveShortestPrefix(
+                                parts[1].to_string(),
+                            ),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
+            } else if braced_content.contains("%") && !braced_content.contains("%%") && !braced_content.ends_with("%/*") {
+                let parts: Vec<&str> = braced_content.splitn(2, "%").collect();
+                if parts.len() == 2 {
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: parts[0].to_string(),
+                            operator: ParameterExpansionOperator::RemoveShortestSuffix(
+                                parts[1].to_string(),
+                            ),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
             } else if braced_content.contains("//") {
                 let parts: Vec<&str> = braced_content.split("//").collect();
                 if parts.len() == 3 {
@@ -1284,8 +1360,57 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
             lexer.next();
             if matches!(lexer.peek(), Some(Token::BraceClose)) {
                 lexer.next();
+                Ok(Word::Variable("@".to_string(), true, None))
+            } else {
+                // ${@...} with additional operators — build content and analyze
+                let mut content = String::from("@");
+                let rest = parse_braced_variable_name(lexer)?;
+                if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                    lexer.next();
+                }
+                content.push_str(&rest);
+                // Analyze the content using the same logic as the DollarBrace branch
+                // (inline analysis, same as lines ~1030-1275)
+                if content.contains(":-") {
+                    let colon_pos = content.find(":-").unwrap();
+                    let var_name = &content[..colon_pos];
+                    let default_val = &content[colon_pos + 2..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else if content.contains(":=") {
+                    let colon_pos = content.find(":=").unwrap();
+                    let var_name = &content[..colon_pos];
+                    let default_val = &content[colon_pos + 2..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else if content.contains(":+") {
+                    let colon_pos = content.find(":+").unwrap();
+                    let var_name = &content[..colon_pos];
+                    let alt_val = &content[colon_pos + 2..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(content, true, None))
+                }
             }
-            Ok(Word::Variable("@".to_string(), true, None))
         }
         Some(Token::DollarBraceHashStar) => {
             lexer.next();
@@ -2786,6 +2911,39 @@ fn parse_braced_variable_name(lexer: &mut Lexer) -> Result<String, ParserError> 
                         break;
                     } else {
                         let text = lexer.get_text(start, end);
+                        content.push_str(&text);
+                        lexer.next();
+                    }
+                }
+                Some(Token::Comment) => {
+                    // A `#` inside ${...} is a parameter expansion operator (${var#pattern},
+                    // ${var##pattern}), not a comment start.  The logos lexer, however,
+                    // tokenises `#...` as a Comment.  Check whether the comment text
+                    // contains the closing `}` we are looking for and, if so, split on it.
+                    let text = lexer.get_text(start, end);
+                    if let Some(pos) = text.find('}') {
+                        // Only push the part before the `}`
+                        content.push_str(&text[..pos]);
+                        brace_depth -= 1;
+                        lexer.next(); // consume the Comment token
+                        if brace_depth == 0 {
+                            break;
+                        }
+                        // The remainder of the comment after `}` may contain more `}` chars
+                        // (unusual but handle gracefully)
+                        let remaining = &text[pos + 1..];
+                        for ch in remaining.chars() {
+                            if ch == '}' {
+                                brace_depth -= 1;
+                                if brace_depth == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                        if brace_depth == 0 {
+                            break;
+                        }
+                    } else {
                         content.push_str(&text);
                         lexer.next();
                     }
