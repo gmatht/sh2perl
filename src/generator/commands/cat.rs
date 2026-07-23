@@ -18,6 +18,7 @@ fn heredoc_body_to_perl_interp(body: &str) -> String {
 fn cat_requires_shell(cmd: &SimpleCommand) -> bool {
     // If any argument looks like a shell operator (pipe) or an option (-...),
     // we must run via the shell instead of treating args as filenames.
+    // Variables and string interpolations are handled natively by open().
     cmd.args.iter().any(|arg| match arg {
         Word::Literal(text, _) => {
             // If the literal is exactly a pipe token or starts with an option dash,
@@ -38,13 +39,13 @@ fn cat_requires_shell(cmd: &SimpleCommand) -> bool {
                         text.starts_with('-')
                     }
                 } else {
-                    true
+                    false // Non-literal interpolation (e.g. variables) - handle natively
                 }
             } else {
-                true
+                false // Multi-part interpolation - handle natively
             }
         }
-        _ => true,
+        _ => false, // Variables and other word types - handle natively via open()
     })
 }
 
