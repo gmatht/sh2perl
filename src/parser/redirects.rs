@@ -124,6 +124,29 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
         });
     }
 
+    // Check for process substitution output syntax: >(...)
+    // This occurs after a redirect like `exec 1> >(tee ...)` where the `>`
+    // is the redirect and `>(...)` is the process substitution target.
+    if matches!(operator, RedirectOperator::Output | RedirectOperator::StderrOutput)
+        && matches!(lexer.peek(), Some(Token::RedirectOut))
+        && matches!(lexer.peek_n(1), Some(Token::ParenOpen))
+    {
+        lexer.next(); // consume the extra '>' (start of >(...))
+        let inner_text = lexer.capture_parenthetical_text()?;
+
+        // Parse the inner command text to extract command name and arguments
+        let inner_cmd = parse_command_from_text(lexer, &inner_text)?;
+
+        // Return a process substitution redirect
+        return Ok(Redirect {
+            fd,
+            operator: RedirectOperator::ProcessSubstitutionOutput(Box::new(inner_cmd)),
+            target: Word::literal("".to_string()), // Not used for process substitution
+            heredoc_body: None,
+            heredoc_quoted: false,
+        });
+    }
+
     // For here-strings, parse the string content as the target
     let target = if matches!(operator, RedirectOperator::HereString) {
         // For here-strings, parse the string content that follows
