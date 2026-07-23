@@ -45,7 +45,7 @@ pub fn run_shell_script(filename: &str) -> Result<std::process::Output, String> 
         cmd.env("TZ", "UTC");
         cmd.arg(&script_name);
 
-        let child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        let child = match cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
             Ok(child) => child,
             Err(e) => {
                 return Err(format!("Failed to start bash script: {}", e));
@@ -67,7 +67,7 @@ pub fn run_perl_script(script_path: &str) -> Result<std::process::Output, String
         let mut cmd = Command::new("perl");
         cmd.arg(&script_path);
 
-        let child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        let child = match cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
             Ok(child) => child,
             Err(e) => {
                 return Err(format!("Failed to start Perl script: {}", e));
