@@ -45,26 +45,27 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
     $basename =~ s/\.sh\.pl$//;
 
     # Pattern 1: direct qx{builtin ...}
-    # First extract the full qx body, then check if it contains a builtin.
+    # Extract the full qx body, then check if it contains a builtin.
     while ($code =~ /qx\{([^}]*)\}/g) {
         my $qx_body = $1;
         next if $qx_body =~ /^\$/;  # skip variable indirection (handled in Pattern 2)
-        # If the body wraps in bash -c, check the INNER command for builtins
-        if ($qx_body =~ /^bash -c ['"]?(.*?)['"]?\s/) {
-            my $inner = $1;
-            next if $is_exempt->($inner);
+        # Check the whole qx body against exemptions first.
+        # If the entire command is exempt (e.g. starts with 'bash -c'), trust it.
+        next if $is_exempt->($qx_body);
+        # If the body wraps in bash -c, unwrap and check the inner command for builtins.
+        if ($qx_body =~ /^bash -c (["\'])(.*)\1\s*/s) {
+            my $inner = $2;
             for my $b (@builtins) {
                 if ($inner =~ /\b\Q$b\E\b/) {
-                    print "  FAIL: $basename.sh [perl] — QX violation: bash -c wraps builtin '$b'\n";
+                    print "  FAIL: $basename.sh [perl] - QX violation: bash -c wraps builtin '$b'\n";
                     $violations++;
                     last;
                 }
             }
         } else {
-            next if $is_exempt->($qx_body);
             for my $b (@builtins) {
                 if ($qx_body =~ /\b\Q$b\E\b/) {
-                    print "  FAIL: $basename.sh [perl] — QX violation: qx{} call with builtin '$b'\n";
+                    print "  FAIL: $basename.sh [perl] - QX violation: qx{} call with builtin '$b'\n";
                     $violations++;
                     last;
                 }
@@ -85,15 +86,19 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
             $last_assign = $+;
         }
         next if $last_assign eq '';
-        # Unwrap bash -c wrapper to check the inner command
-        if ($last_assign =~ /^bash -c ['"]?(.*?)['"]?\s*/) {
+        # Check the original assignment value against exemptions first.
+        # If the whole command is exempt (e.g. starts with 'bash -c'), trust it.
+        next if $is_exempt->($last_assign);
+        # Unwrap bash -c wrapper to check the inner command for builtins.
+        if ($last_assign =~ /^bash -c (["\'])(.*)\1\s*$/s) {
+            $last_assign = $2;
+        } elsif ($last_assign =~ /^bash -c (\S+)\s*$/) {
             $last_assign = $1;
         }
-        next if $is_exempt->($last_assign);
         for my $b (@builtins) {
             if ($last_assign =~ /\b\Q$b\E\b/) {
                 my $line_num = ($before =~ tr/\n//) + 1;
-                print "  FAIL: $basename.sh [perl] — QX violation: qx{$var} where $var contains builtin '$b'\n";
+                print "  FAIL: $basename.sh [perl] - QX violation: qx{$var} where $var contains builtin '$b'\n";
                 $violations++;
                 last;
             }
@@ -107,14 +112,14 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         next if $is_exempt->($system_body);
         for my $b (@builtins) {
             if ($system_body =~ /\b\Q$b\E\b/) {
-                print "  FAIL: $basename.sh [perl] — SYSTEM violation: system() call with builtin '$b'\n";
+                print "  FAIL: $basename.sh [perl] - SYSTEM violation: system() call with builtin '$b'\n";
                 $violations++;
                 last;
             }
         }
     }
 
-    # Pattern 4: open3(..., 'builtin', ...) — direct system call via IPC::Open3
+    # Pattern 4: open3(..., 'builtin', ...) - direct system call via IPC::Open3
     while ($code =~ /open3\s*\((.*?)\)/gs) {
         my $open3_args = $1;
         # Extract all quoted string arguments from the open3 call
@@ -124,7 +129,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         next if @quoted_args < 1;
         my $prog = $quoted_args[0];
         # If the program is 'bash' and '-c' follows, check the INNER command for builtins.
-        # The 'bash -c' wrapper itself is not the cheat — the cheat is wrapping a simple
+        # The 'bash -c' wrapper itself is not the cheat - the cheat is wrapping a simple
         # command like `echo` or `printf` in bash -c instead of translating it natively.
         if ($prog eq 'bash' && @quoted_args >= 3 && $quoted_args[1] eq '-c') {
             my $cmd_str = $quoted_args[2];
@@ -132,7 +137,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
             next if $is_exempt->($cmd_str);
             for my $b (@builtins) {
                 if ($cmd_str =~ /\b\Q$b\E\b/) {
-                    print "  FAIL: $basename.sh [perl] — OPEN3 violation: bash -c wrapping builtin '$b'\n";
+                    print "  FAIL: $basename.sh [perl] - OPEN3 violation: bash -c wrapping builtin '$b'\n";
                     $violations++;
                     last;
                 }
@@ -141,7 +146,7 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
             next if $is_exempt->($prog);
             for my $b (@builtins) {
                 if ($prog =~ /\b\Q$b\E\b/) {
-                    print "  FAIL: $basename.sh [perl] — OPEN3 violation: open3() with builtin '$b'\n";
+                    print "  FAIL: $basename.sh [perl] - OPEN3 violation: open3() with builtin '$b'\n";
                     $violations++;
                     last;
                 }
@@ -149,13 +154,13 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
         }
     }
 
-    # Pattern 5: exec('builtin', ...) — replaces Perl process with shell command
+    # Pattern 5: exec('builtin', ...) - replaces Perl process with shell command
     while ($code =~ /exec\s*['"]\s*(\w+)['"]/g) {
         my $exec_cmd = $1;
         next if $is_exempt->($exec_cmd);
         for my $b (@builtins) {
             if ($exec_cmd =~ /\b\Q$b\E\b/) {
-                print "  FAIL: $basename.sh [perl] — EXEC violation: exec() with builtin '$b'\n";
+                print "  FAIL: $basename.sh [perl] - EXEC violation: exec() with builtin '$b'\n";
                 $violations++;
                 last;
             }
