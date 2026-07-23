@@ -49,26 +49,24 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
     while ($code =~ /qx\{([^}]*)\}/g) {
         my $qx_body = $1;
         next if $qx_body =~ /^\$/;  # skip variable indirection (handled in Pattern 2)
-        # Check the whole qx body against exemptions first.
-        # If the entire command is exempt (e.g. starts with 'bash -c'), trust it.
-        next if $is_exempt->($qx_body);
-        # If the body wraps in bash -c, unwrap and check the inner command for builtins.
-        if ($qx_body =~ /^bash -c (["\'])(.*)\1\s*/s) {
-            my $inner = $2;
-            for my $b (@builtins) {
-                if ($inner =~ /\b\Q$b\E\b/) {
-                    print "  FAIL: $basename.sh [perl] - QX violation: bash -c wraps builtin '$b'\n";
-                    $violations++;
-                    last;
-                }
-            }
-        } else {
-            for my $b (@builtins) {
-                if ($qx_body =~ /\b\Q$b\E\b/) {
-                    print "  FAIL: $basename.sh [perl] - QX violation: qx{} call with builtin '$b'\n";
-                    $violations++;
-                    last;
-                }
+        # Determine the command to check:
+        # - If wrapped in bash -c '...', unwrap and check the inner command
+        # - Otherwise check the qx body directly
+        my $check_cmd = $qx_body;
+        if ($check_cmd =~ /^bash -c (["\'])(.*)\1\s*/s) {
+            $check_cmd = $2;
+        }
+        # Strip process substitution constructs <(...) and >(...) to avoid false
+        # positives on builtins that appear inside them (e.g. sort in <(sort f1)).
+        $check_cmd =~ s/<\([^)]*\)//g;
+        $check_cmd =~ s/>\([^)]*\)//g;
+        # Check exemptions on the (possibly unwrapped) command.
+        next if $is_exempt->($check_cmd);
+        for my $b (@builtins) {
+            if ($check_cmd =~ /\b\Q$b\E\b/) {
+                print "  FAIL: $basename.sh [perl] - QX violation: qx{} call with builtin '$b'\n";
+                $violations++;
+                last;
             }
         }
     }
@@ -86,17 +84,23 @@ for my $file (@ARGV ? @ARGV : glob('examples.out/*.pl')) {
             $last_assign = $+;
         }
         next if $last_assign eq '';
-        # Check the original assignment value against exemptions first.
-        # If the whole command is exempt (e.g. starts with 'bash -c'), trust it.
-        next if $is_exempt->($last_assign);
-        # Unwrap bash -c wrapper to check the inner command for builtins.
-        if ($last_assign =~ /^bash -c (["\'])(.*)\1\s*$/s) {
-            $last_assign = $2;
-        } elsif ($last_assign =~ /^bash -c (\S+)\s*$/) {
-            $last_assign = $1;
+        # Determine the command to check:
+        # - If wrapped in bash -c '...', unwrap and check the inner command
+        # - Otherwise check the assignment value directly
+        my $check_cmd = $last_assign;
+        if ($check_cmd =~ /^bash -c (["\'])(.*)\1\s*$/s) {
+            $check_cmd = $2;
+        } elsif ($check_cmd =~ /^bash -c (\S+)\s*$/) {
+            $check_cmd = $1;
         }
+        # Strip process substitution constructs <(...) and >(...) to avoid false
+        # positives on builtins that appear inside them (e.g. sort in <(sort f1)).
+        $check_cmd =~ s/<\([^)]*\)//g;
+        $check_cmd =~ s/>\([^)]*\)//g;
+        # Check exemptions on the (possibly unwrapped) command.
+        next if $is_exempt->($check_cmd);
         for my $b (@builtins) {
-            if ($last_assign =~ /\b\Q$b\E\b/) {
+            if ($check_cmd =~ /\b\Q$b\E\b/) {
                 my $line_num = ($before =~ tr/\n//) + 1;
                 print "  FAIL: $basename.sh [perl] - QX violation: qx{$var} where $var contains builtin '$b'\n";
                 $violations++;
