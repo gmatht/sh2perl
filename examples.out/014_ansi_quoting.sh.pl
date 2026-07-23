@@ -13,8 +13,8 @@ my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '014_ansi_quoting.sh';
-my $MAGIC_30 = 30;
 my $MAGIC_25 = 25;
+my $MAGIC_30 = 30;
 
 $__set_e = 1;
 # set uo not implemented
