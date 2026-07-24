@@ -19,12 +19,12 @@ my %f1;
 my $f2;
 my @f2;
 my %f2;
-my $s;
-my @s;
-my %s;
 my $word;
 my @word;
 my %word;
+my $s;
+my @s;
+my %s;
 
 $__set_e = 1;
 # set uo not implemented
