@@ -3,6 +3,7 @@ use crate::lexer::{Lexer, Token};
 use crate::parser::errors::ParserError;
 use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::parse_word;
+use logos::Logos;
 use std::collections::{BTreeMap, HashMap};
 
 /// Parse the redirect header (operator + target) but do NOT parse the heredoc
@@ -274,11 +275,6 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
     };
 
     // Find the start of the heredoc body in the raw input.
-    // The body begins after the first newline following the command line.
-    // We locate this newline from the raw input WITHOUT consuming any tokens,
-    // because tokens before the newline may belong to a pipeline (e.g.
-    // `cat << EOF | grep ... | sed ...`) and must remain in the token stream
-    // for later pipeline parsing.
     let start_pos = if let Some((cur_pos, _)) = lexer.get_span() {
         match lexer.input[cur_pos..].find('\n') {
             Some(nl_offset) => cur_pos + nl_offset + 1,
@@ -288,8 +284,6 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         return Ok(Some(String::new()));
     };
 
-    // Save the current lexer position; we will only advance past tokens
-    // that lie within the heredoc body (i.e. at or after start_pos).
     let saved_lexer_current = lexer.current;
 
     // Read the raw input line by line until we find the delimiter
@@ -298,22 +292,15 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
     let input = &lexer.input;
 
     while current_pos < input.len() {
-        // Find the end of the current line
         let line_end = input[current_pos..]
             .find('\n')
             .map(|i| current_pos + i)
             .unwrap_or(input.len());
         let line = &input[current_pos..line_end];
-
-        // Check if this line is the delimiter (exact match, possibly with whitespace)
         if line.trim() == delim {
             break;
         }
-
-        // Add the line to the body
         body.push_str(line);
-
-        // Add newline if there was one in the original input
         if line_end < input.len() && input.as_bytes()[line_end] == b'\n' {
             body.push('\n');
             current_pos = line_end + 1;
@@ -323,19 +310,36 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
     }
 
     // Compute the byte position right after the delimiter line.
-    // current_pos is at the start of the delimiter; find the end of this line.
     let body_end = if let Some(nl_pos) = input[current_pos..].find('\n') {
-        // Include the newline after the delimiter.
         current_pos + nl_pos + 1
     } else {
-        // No newline after delimiter — end of input.
         input.len()
     };
 
-    // Remove the heredoc body tokens from the token stream entirely.
-    // Tokens before start_pos (pipeline operators like `|`, `grep`, etc.)
-    // must remain for later pipeline parsing, so we only remove the range
-    // [body_start_idx, body_end_idx) of tokens whose start >= start_pos.
+    // --- Fix: properly handle tokens that span across heredoc boundaries ---
+    //
+    // Logos tokenizes the entire input without understanding heredocs, so a `'`
+    // inside the heredoc body can start a SingleQuotedString that swallows
+    // content past the heredoc delimiter.  We remove all body tokens and then
+    // re-tokenize any content after body_end that was consumed by spanning tokens.
+
+    // Step 1: truncate tokens that start before start_pos but end after it.
+    let mut scan_back = saved_lexer_current.saturating_sub(1);
+    loop {
+        if let Some(tok) = lexer.tokens.get(scan_back) {
+            if tok.2 > start_pos && tok.1 < start_pos {
+                lexer.tokens[scan_back].2 = start_pos;
+            }
+            if scan_back == 0 {
+                break;
+            }
+            scan_back -= 1;
+        } else {
+            break;
+        }
+    }
+
+    // Step 2: find first token with start >= start_pos.
     let mut body_start_idx = saved_lexer_current;
     while body_start_idx < lexer.tokens.len() {
         if lexer.tokens[body_start_idx].1 >= start_pos {
@@ -343,17 +347,69 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         }
         body_start_idx += 1;
     }
-    let mut body_end_idx = body_start_idx;
-    while body_end_idx < lexer.tokens.len() {
-        if lexer.tokens[body_end_idx].1 >= body_end {
+
+    // Step 3: scan tokens until we find one with start >= body_end.
+    let mut span_end = body_start_idx;
+    while span_end < lexer.tokens.len() {
+        if lexer.tokens[span_end].1 >= body_end {
             break;
         }
-        body_end_idx += 1;
+        span_end += 1;
     }
-    // Remove the body tokens.  lexer.current is unchanged (still pointing at
-    // pipeline tokens before start_pos), so pipeline parsing can proceed.
-    if body_end_idx > body_start_idx {
-        lexer.tokens.drain(body_start_idx..body_end_idx);
+
+    // The next surviving token starts at body_end or later.
+    let next_start = if span_end < lexer.tokens.len() {
+        lexer.tokens[span_end].1
+    } else {
+        input.len()
+    };
+
+    // Remove all tokens in [body_start_idx, span_end).
+    if lexer.current >= body_start_idx && lexer.current < span_end {
+        lexer.current = body_start_idx;
+    }
+    let remove_len = span_end - body_start_idx;
+    if remove_len > 0 {
+        lexer.tokens.drain(body_start_idx..span_end);
+        if lexer.current >= span_end {
+            lexer.current = lexer.current.saturating_sub(remove_len);
+        }
+        // After drain, the token at body_start_idx is the old span_end token
+    }
+
+    // Step 4: re-tokenize gap between body_end and next surviving token.
+    // This content was consumed by spanning tokens (e.g. SingleQuotedStrings
+    // that started inside the body).  Using logos to re-tokenize works here
+    // because logos sees the standalone content without the preceding `'` that
+    // originally caused the spanning.
+    if next_start > body_end {
+        let gap_text = &input[body_end..next_start];
+        if !gap_text.is_empty() && gap_text.bytes().any(|b| !b.is_ascii_whitespace()) {
+            let mut gap_lexer = Token::lexer(gap_text);
+            let mut gap_tokens: Vec<(Token, usize, usize)> = Vec::new();
+            while let Some(token_result) = gap_lexer.next() {
+                let span = gap_lexer.span();
+                match token_result {
+                    Ok(tok) => {
+                        gap_tokens.push((
+                            tok,
+                            body_end + span.start,
+                            body_end + span.end,
+                        ));
+                    }
+                    Err(_) => continue,
+                }
+            }
+            // Insert the re-tokenized gap content.
+            let insert_at = body_start_idx;
+            for (j, gt) in gap_tokens.iter().enumerate() {
+                lexer.tokens.insert(insert_at + j, gt.clone());
+            }
+            // Advance lexer.current past the newly inserted tokens if needed
+            if lexer.current >= insert_at {
+                lexer.current += gap_tokens.len();
+            }
+        }
     }
 
     //     eprintln!("DEBUG: Final heredoc body: '{}'", body);
