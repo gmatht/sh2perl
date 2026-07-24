@@ -17,7 +17,7 @@ print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
 my $result1;
 my @result1;
 my %result1;
-$result1 = do { my $command = 'ls -la'; my $result = qx{$command}; $CHILD_ERROR = $? >> 8; $result; };
+$result1 = do { my @_qx_cmd = ('ls -la'); my $result = qx{$_qx_cmd[0]}; $CHILD_ERROR = $? >> 8; $result; };
 my $result2;
 my @result2;
 my %result2;
