@@ -372,6 +372,7 @@ impl Parser {
     fn parse_command_redirects(&mut self, command: Command) -> Result<Command, ParserError> {
         // Check if there are redirects following the command
         let mut redirects = Vec::new();
+        let mut had_heredoc = false;
 
         // Parse redirects until we hit a command separator or other non-redirect token.
         // Skip inline whitespace between redirects so sequences like `cmd <(a) <(b)`
@@ -401,10 +402,55 @@ impl Parser {
                 | Token::RedirectOutClobber
                 | Token::RedirectAll
                 | Token::RedirectAllAppend => {
+                    let is_heredoc = matches!(token, Token::Heredoc | Token::HeredocTabs);
                     redirects.push(parse_redirect(&mut self.lexer)?);
+                    if is_heredoc {
+                        had_heredoc = true;
+                    }
                     self.lexer.skip_inline_whitespace_and_comments();
                 }
                 _ => break,
+            }
+        }
+
+        // Handle dangling || / && after a heredoc.
+        // In bash, `cat >file <<EOF ||` (with nothing after || on the same line)
+        // is valid M-bM-^@M-^T the operator is silently ignored.  Detect this by checking
+        // whether the rest of the line (after the operator) contains only whitespace.
+        if had_heredoc {
+            if let Some(Token::And) | Some(Token::Or) = self.lexer.peek() {
+                if let Some((start, _)) = self.lexer.get_span() {
+                    let input_bytes = self.lexer.input.as_bytes();
+                    let mut pos = start;
+                    // Scan from the operator position to the end of the line.
+                    while pos < input_bytes.len() && input_bytes[pos] != b'\n' {
+                        match input_bytes[pos] {
+                            b'|' | b'&' | b' ' | b'\t' => {
+                                pos += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    // If we reached the newline (or end of input) without finding
+                    // a non-whitespace, non-operator character, this is a dangling
+                    // operator.  Consume it.
+                    if (pos < input_bytes.len() && input_bytes[pos] == b'\n')
+                        || pos >= input_bytes.len()
+                    {
+                        // Dangling operator M-bM-^@M-^T consume it and the following newline.
+                        self.lexer.next(); // consume the operator
+                        // Consume trailing whitespace/newlines
+                        while let Some(tok) = self.lexer.peek() {
+                            match tok {
+                                Token::Space | Token::Tab | Token::Newline
+                                | Token::CarriageReturn | Token::Comment => {
+                                    self.lexer.next();
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -682,7 +728,7 @@ impl Parser {
                     // - If pipe_commands is empty we had a previous `&&`/`||`, so
                     //   the accumulated result IS the left side.
                     let left = if pipe_commands.is_empty() {
-                        // result must be Some — the previous `&&`/`||` stored it
+                        // result must be Some M-bM-^@M-^T the previous `&&`/`||` stored it
                         result
                             .take()
                             .expect("unexpected empty state in pipeline parsing")
@@ -701,7 +747,7 @@ impl Parser {
                     };
 
                     // Parse the right side as a single pipe-sequence (NOT consuming
-                    // further `&&`/`||` — those are handled by the outer loop to
+                    // further `&&`/`||` M-bM-^@M-^T those are handled by the outer loop to
                     // ensure left-associativity).
                     let right_start_span = self.lexer.get_span();
                     let right_start_pos = right_start_span.map(|(s, _)| s).unwrap_or(0);
