@@ -55,25 +55,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     output.push_str("use File::Copy qw(copy);\n");
 
     for src in &sources {
-        if recursive && dest.contains("'") && !dest.starts_with('$') {
-            // For recursive copy with a directory destination, use File::Path::make_path
-            // but since cp -r is complex, use a simple system call approach that
-            // doesn't trigger QX violations: use IPC::Open3 to call the real cp
-            output.push_str(&generator.indent());
-            output.push_str("do {\n");
-            output.push_str(&generator.indent());
-            output.push_str("    my ($in, $out, $err);\n");
-            output.push_str(&generator.indent());
-            output.push_str(&format!("    my $pid = open3($in, $out, $err, '/bin/cp', '-r', {}, {});\n", src, dest));
-            output.push_str(&generator.indent());
-            output.push_str("    close $in or croak 'Close failed: $OS_ERROR';\n");
-            output.push_str(&generator.indent());
-            output.push_str("    waitpid $pid, 0;\n");
-            output.push_str(&generator.indent());
-            output.push_str(&format!("    $CHILD_ERROR = $? >> 8;\n"));
-            output.push_str(&generator.indent());
-            output.push_str("};\n");
-        } else if recursive {
+        if recursive {
             // For recursive copy with a variable destination, use File::Path methods
             output.push_str(&generator.indent());
             output.push_str(&format!(
