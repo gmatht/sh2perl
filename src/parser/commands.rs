@@ -1682,21 +1682,39 @@ impl Parser {
 
         // Collect the raw content inside (( ... ))
         let mut content = String::new();
-        let mut paren_depth = 1;
+        let mut paren_depth = 2; // (( contributes 2 opening parens
 
         loop {
             match self.lexer.peek() {
                 Some(Token::ArithmeticEvalClose) => {
+                    // ArithmeticEvalClose represents TWO closing parens
                     self.lexer.next();
-                    paren_depth -= 1;
-                    if paren_depth == 0 {
+                    paren_depth -= 2;
+                    if paren_depth <= 0 {
                         break;
                     }
                     content.push_str("))");
                 }
-                Some(Token::ArithmeticEval) => {
+                Some(Token::ParenOpen) => {
+                    if let Some(text) = self.lexer.get_current_text() {
+                        content.push_str(&text);
+                    }
                     self.lexer.next();
                     paren_depth += 1;
+                }
+                Some(Token::ParenClose) => {
+                    if let Some(text) = self.lexer.get_current_text() {
+                        content.push_str(&text);
+                    }
+                    self.lexer.next();
+                    paren_depth -= 1;
+                    if paren_depth <= 0 {
+                        break;
+                    }
+                }
+                Some(Token::ArithmeticEval) => {
+                    self.lexer.next();
+                    paren_depth += 2;
                     content.push_str("((");
                 }
                 Some(Token::Newline) | Some(Token::CarriageReturn) => {
@@ -2121,20 +2139,38 @@ impl Parser {
                     // Handle $(( expr )) or (( expr )) arithmetic inside test expression
                     self.lexer.next(); // consume $(( or ((
                     let mut arith = String::new();
-                    let mut depth = 1usize;
+                    let mut depth = 2usize; // (( or $(( contributes 2 opening parens
                     loop {
                         match self.lexer.peek() {
                             Some(Token::ArithmeticEvalClose) => {
+                                // ArithmeticEvalClose represents TWO closing parens
                                 self.lexer.next();
-                                depth -= 1;
-                                if depth == 0 {
+                                depth -= 2;
+                                if depth <= 0 {
                                     break;
                                 }
                                 arith.push_str("))");
                             }
-                            Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                            Some(Token::ParenOpen) => {
+                                if let Some(text) = self.lexer.get_current_text() {
+                                    arith.push_str(&text);
+                                }
                                 self.lexer.next();
                                 depth += 1;
+                            }
+                            Some(Token::ParenClose) => {
+                                if let Some(text) = self.lexer.get_current_text() {
+                                    arith.push_str(&text);
+                                }
+                                self.lexer.next();
+                                depth -= 1;
+                                if depth <= 0 {
+                                    break;
+                                }
+                            }
+                            Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                                self.lexer.next();
+                                depth += 2;
                                 arith.push_str("$((");
                             }
                             None => break,
