@@ -357,6 +357,7 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         span_end += 1;
     }
 
+
     // The next surviving token starts at body_end or later.
     let mut next_start = if span_end < lexer.tokens.len() {
         lexer.tokens[span_end].1
@@ -364,19 +365,17 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         input.len()
     };
 
-    // Check if the character just before next_start is a single-quote or
-    // double-quote that came from a spanning token's closing delimiter.
-    // If so, extend next_start to include the rest of the string, so that
-    // the re-tokenized gap produces a proper SingleQuotedString.
+    // Check for a quote character just before next_start that might be
+    // the opening of a spanning string whose closing quote is inside the
+    // gap.  Extend next_start past that closing quote so the gap includes
+    // the complete string for re-tokenization.
     if next_start > body_end && next_start > 0 && next_start <= input.len() {
         let last_gap_byte = input.as_bytes()[next_start - 1];
         if last_gap_byte == b'\'' {
-            // Find the matching closing single-quote starting from next_start.
             if let Some(closing_pos) = input[next_start..].find('\'') {
                 next_start = next_start + closing_pos + 1;
             }
         } else if last_gap_byte == b'"' {
-            // Find the matching closing double-quote (handling escapes).
             let mut i = next_start;
             while i < input.len() {
                 let b = input.as_bytes()[i];
@@ -385,11 +384,23 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
                     break;
                 }
                 if b == b'\\' && i + 1 < input.len() {
-                    i += 2; // skip escape sequence
+                    i += 2;
                 } else {
                     i += 1;
                 }
             }
+        }
+    }
+    // Also extend next_start past any tokens that start in [body_end, next_start)
+    // but end past next_start (spanning tokens from the body).
+    for i in span_end..lexer.tokens.len() {
+        let (tok_start, tok_end) = (lexer.tokens[i].1, lexer.tokens[i].2);
+        if tok_start >= next_start {
+            break;
+        }
+        if tok_start >= body_end && tok_end > next_start {
+            next_start = tok_end;
+            break;
         }
     }
 
@@ -409,8 +420,11 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
     let remove_len = remove_end - body_start_idx;
     if remove_len > 0 {
         lexer.tokens.drain(body_start_idx..remove_end);
-        if lexer.current >= remove_end {
-            lexer.current = lexer.current.saturating_sub(remove_len);
+        // Set current to point past the removed body tokens.
+        // If current was before body_start_idx (pointing to unconsumed redirect
+        // header tokens like `> file` after `<<-'EOF'`), keep it there.
+        if lexer.current >= body_start_idx {
+            lexer.current = body_start_idx;
         }
     }
 
@@ -442,10 +456,9 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
             for (j, gt) in gap_tokens.iter().enumerate() {
                 lexer.tokens.insert(insert_at + j, gt.clone());
             }
-            // Advance lexer.current past the newly inserted tokens if needed
-            if lexer.current >= insert_at {
-                lexer.current += gap_tokens.len();
-            }
+            // Point lexer.current to the first inserted gap token,
+            // replacing the original body tokens with the re-tokenized gap.
+            lexer.current = insert_at;
         }
     }
 
