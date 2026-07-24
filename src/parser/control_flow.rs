@@ -646,20 +646,37 @@ pub fn parse_for_loop(parser: &mut Parser) -> Result<Command, ParserError> {
         // Consume (( and collect everything until matching ))
         parser.lexer.next(); // consume ((
         let mut arith_content = String::new();
-        let mut depth = 1usize;
+        let mut depth = 2usize;
         loop {
             match parser.lexer.peek() {
                 Some(Token::ArithmeticEvalClose) => {
                     parser.lexer.next();
-                    depth -= 1;
-                    if depth == 0 {
+                    depth -= 2;
+                    if depth <= 0 {
                         break;
                     }
                     arith_content.push_str("))");
                 }
-                Some(Token::ArithmeticEval) => {
+                Some(Token::ParenOpen) => {
+                    if let Some(text) = parser.lexer.get_current_text() {
+                        arith_content.push_str(&text);
+                    }
                     parser.lexer.next();
                     depth += 1;
+                }
+                Some(Token::ParenClose) => {
+                    if let Some(text) = parser.lexer.get_current_text() {
+                        arith_content.push_str(&text);
+                    }
+                    parser.lexer.next();
+                    depth -= 1;
+                    if depth <= 0 {
+                        break;
+                    }
+                }
+                Some(Token::ArithmeticEval) => {
+                    parser.lexer.next();
+                    depth += 2;
                     arith_content.push_str("((");
                 }
                 None => return Err(ParserError::UnexpectedEOF),
@@ -1268,14 +1285,43 @@ fn parse_arithmetic_expression(parser: &mut Parser) -> Result<Word, ParserError>
     }
 
     let mut expression_parts = Vec::new();
+    let mut paren_depth = 2; // (( or $(( contributes 2 opening parens
 
-    // Simple case: just parse until we find the closing ))
     loop {
         match parser.lexer.peek() {
             Some(Token::ArithmeticEvalClose) => {
-                // Found the closing )), consume it and break
+                // ArithmeticEvalClose represents TWO closing parens
                 parser.lexer.next();
-                break;
+                paren_depth -= 2;
+                if paren_depth <= 0 {
+                    break;
+                }
+                expression_parts.push("))".to_string());
+            }
+            Some(Token::ParenOpen) => {
+                if let Some(text) = parser.lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                parser.lexer.next();
+                paren_depth += 1;
+            }
+            Some(Token::ParenClose) => {
+                if let Some(text) = parser.lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                parser.lexer.next();
+                paren_depth -= 1;
+                if paren_depth <= 0 {
+                    break;
+                }
+            }
+            Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                // Nested (( or $(( 
+                if let Some(text) = parser.lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                parser.lexer.next();
+                paren_depth += 2;
             }
             Some(Token::Identifier) => {
                 // Variable reference like 'i'
@@ -1723,20 +1769,37 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                 // Handle $(( expr )) or (( expr )) arithmetic inside test expression
                 lexer.next(); // consume $(( or ((
                 let mut arith = String::new();
-                let mut depth = 1usize;
+                let mut depth = 2usize;
                 loop {
                     match lexer.peek() {
                         Some(Token::ArithmeticEvalClose) => {
                             lexer.next();
-                            depth -= 1;
-                            if depth == 0 {
+                            depth -= 2;
+                            if depth <= 0 {
                                 break;
                             }
                             arith.push_str("))");
                         }
-                        Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                        Some(Token::ParenOpen) => {
+                            if let Some(text) = lexer.get_current_text() {
+                                arith.push_str(&text);
+                            }
                             lexer.next();
                             depth += 1;
+                        }
+                        Some(Token::ParenClose) => {
+                            if let Some(text) = lexer.get_current_text() {
+                                arith.push_str(&text);
+                            }
+                            lexer.next();
+                            depth -= 1;
+                            if depth <= 0 {
+                                break;
+                            }
+                        }
+                        Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                            lexer.next();
+                            depth += 2;
                             arith.push_str("$((");
                         }
                         None => break,

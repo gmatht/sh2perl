@@ -334,14 +334,43 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
     }
 
     let mut expression_parts = Vec::new();
+    let mut paren_depth = 2; // $(( or (( contributes 2 opening parens
 
-    // Simple case: just parse until we find the closing ))
     loop {
         match lexer.peek() {
             Some(Token::ArithmeticEvalClose) => {
-                // Found the closing )), consume it and break
+                // ArithmeticEvalClose represents TWO closing parens
                 lexer.next();
-                break;
+                paren_depth -= 2;
+                if paren_depth <= 0 {
+                    break;
+                }
+                expression_parts.push("))".to_string());
+            }
+            Some(Token::ParenOpen) => {
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                lexer.next();
+                paren_depth += 1;
+            }
+            Some(Token::ParenClose) => {
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                lexer.next();
+                paren_depth -= 1;
+                if paren_depth <= 0 {
+                    break;
+                }
+            }
+            Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                // Nested (( or $(( 
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                lexer.next();
+                paren_depth += 2;
             }
             Some(Token::Identifier) => {
                 let var_name = lexer.get_identifier_text()?;
