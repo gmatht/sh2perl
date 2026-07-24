@@ -2230,6 +2230,16 @@ impl Parser {
                 Some(Token::At) => { expression_parts.push("@".to_string()); self.lexer.next(); }
                 Some(Token::Colon) => { expression_parts.push(":".to_string()); self.lexer.next(); }
                 Some(Token::Pipe) => { expression_parts.push("|".to_string()); self.lexer.next(); }
+                Some(Token::BraceOpen) => { expression_parts.push("{".to_string()); self.lexer.next(); }
+                Some(Token::BraceClose) => { expression_parts.push("}".to_string()); self.lexer.next(); }
+                Some(Token::Comma) => { expression_parts.push(",".to_string()); self.lexer.next(); }
+                Some(Token::Percent) => { expression_parts.push("%".to_string()); self.lexer.next(); }
+                Some(Token::Question) => { expression_parts.push("?".to_string()); self.lexer.next(); }
+                Some(Token::Background) => { expression_parts.push("&".to_string()); self.lexer.next(); }
+                Some(Token::PlusAssign) | Some(Token::MinusAssign) | Some(Token::StarAssign) | Some(Token::SlashAssign) | Some(Token::PercentAssign) => {
+                    let text = self.lexer.get_raw_token_text().unwrap_or_default();
+                    expression_parts.push(text);
+                }
                 Some(Token::DollarParen) => {
                     // Handle $() command substitution inside test expressions
                     let mut sub = "$(".to_string();

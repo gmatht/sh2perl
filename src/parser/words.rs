@@ -164,9 +164,11 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         return Ok(word);
     }
 
-    // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
+    // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons,
+    // and compound assignment operators like +=) into a single literal.
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
     // and also handles find arguments like "+1M" by combining Plus + Number + Identifier
+    // and let arguments like "bits+=${#val}" by combining Identifier + PlusAssign + ...
     if matches!(
         lexer.peek(),
         Some(Token::Identifier)
@@ -184,6 +186,11 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::Star)
             | Some(Token::Percent)
             | Some(Token::Comma)
+            | Some(Token::PlusAssign)
+            | Some(Token::MinusAssign)
+            | Some(Token::StarAssign)
+            | Some(Token::SlashAssign)
+            | Some(Token::PercentAssign)
     ) {
         let mut combined = String::new();
         loop {
@@ -234,6 +241,24 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
         Some(Token::Float) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
+        Some(Token::DoubleQuote) => {
+            // Handle a bare DoubleQuote that logos could not match as a full
+            // DoubleQuotedString (e.g. because of backslash-newline continuation
+            // inside the string). Scan forward through the raw input bytes to
+            // find the matching closing quote, resolving backslash-newlines.
+            let whole = lexer.scan_double_quoted_string()?;
+            // Create a temporary lexer from the cleaned string and parse it
+            // as a normal double-quoted string.
+            let mut sub_lexer = Lexer::new(&whole);
+            if let Some(Token::DoubleQuotedString) = sub_lexer.peek() {
+                Ok(parse_string_interpolation(&mut sub_lexer)?)
+            } else {
+                // Fallback: return the content as a literal
+                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' { &whole[1..] } else { &whole };
+                let inner = if inner.ends_with('"') { &inner[..inner.len()-1] } else { inner };
+                Ok(Word::Literal(inner.to_string(), None))
+            }
+        }
         Some(Token::DoubleQuotedString) => {
             // Always parse as string interpolation for double-quoted strings
             // This handles both strings and strings with variables
@@ -487,8 +512,11 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         | Some(Token::Le)
         | Some(Token::Gt)
         | Some(Token::Ge)
-        | Some(Token::Zero) => {
-            // Handle test operator tokens like -e, -f, -d, etc.
+        | Some(Token::Zero)
+        | Some(Token::SameFile)
+        | Some(Token::NewerThan)
+        | Some(Token::OlderThan) => {
+            // Handle test operator tokens like -e, -f, -d, -ef, -nt, -ot, etc.
             // These are already complete flags, just get their text
             let text = lexer.get_raw_token_text()?;
             Ok(Word::Literal(text, None))
@@ -584,9 +612,11 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
     // by parse_word(), which is used in contexts that need that behavior.
     let start_pos = lexer.current_position();
 
-    // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons) into a single literal
+    // Combine contiguous bare-word tokens (identifiers, numbers, slashes, dots, plus, minus, colons,
+    // and compound assignment operators like +=) into a single literal.
     // This handles filenames like "file.txt" by combining Identifier + Dot + Identifier
     // and also handles find arguments like "+1M" by combining Plus + Number + Identifier
+    // and let arguments like "bits+=${#val}" by combining Identifier + PlusAssign + ...
     if matches!(
         lexer.peek(),
         Some(Token::Identifier)
@@ -604,6 +634,11 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::Star)
             | Some(Token::Percent)
             | Some(Token::Comma)
+            | Some(Token::PlusAssign)
+            | Some(Token::MinusAssign)
+            | Some(Token::StarAssign)
+            | Some(Token::SlashAssign)
+            | Some(Token::PercentAssign)
     ) {
         let mut combined = String::new();
         loop {
@@ -622,7 +657,12 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::Colon)
                 | Some(Token::Star)
                 | Some(Token::Percent)
-                | Some(Token::Comma) => {
+                | Some(Token::Comma)
+                | Some(Token::PlusAssign)
+                | Some(Token::MinusAssign)
+                | Some(Token::StarAssign)
+                | Some(Token::SlashAssign)
+                | Some(Token::PercentAssign) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -644,6 +684,24 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
         Some(Token::Float) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
+        Some(Token::DoubleQuote) => {
+            // Handle a bare DoubleQuote that logos could not match as a full
+            // DoubleQuotedString (e.g. because of backslash-newline continuation
+            // inside the string). Scan forward through the raw input bytes to
+            // find the matching closing quote, resolving backslash-newlines.
+            let whole = lexer.scan_double_quoted_string()?;
+            // Create a temporary lexer from the cleaned string and parse it
+            // as a normal double-quoted string.
+            let mut sub_lexer = Lexer::new(&whole);
+            if let Some(Token::DoubleQuotedString) = sub_lexer.peek() {
+                Ok(parse_string_interpolation(&mut sub_lexer)?)
+            } else {
+                // Fallback: return the content as a literal
+                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' { &whole[1..] } else { &whole };
+                let inner = if inner.ends_with('"') { &inner[..inner.len()-1] } else { inner };
+                Ok(Word::Literal(inner.to_string(), None))
+            }
+        }
         Some(Token::DoubleQuotedString) => {
             // Always parse as string interpolation for double-quoted strings
             // This handles both simple strings and strings with variables
@@ -897,8 +955,11 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         | Some(Token::Le)
         | Some(Token::Gt)
         | Some(Token::Ge)
-        | Some(Token::Zero) => {
-            // Handle test operator tokens like -e, -f, -d, etc.
+        | Some(Token::Zero)
+        | Some(Token::SameFile)
+        | Some(Token::NewerThan)
+        | Some(Token::OlderThan) => {
+            // Handle test operator tokens like -e, -f, -d, -ef, -nt, -ot, etc.
             // These are already complete flags, just get their text
             let text = lexer.get_raw_token_text()?;
             Ok(Word::Literal(text, None))
