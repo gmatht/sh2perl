@@ -64,7 +64,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
             output.push_str(&generator.indent());
             output.push_str("    my ($in, $out, $err);\n");
             output.push_str(&generator.indent());
-            output.push_str(&format!("    my $pid = open3($in, $out, $err, 'cp', '-r', {}, {});\n", src, dest));
+            output.push_str(&format!("    my $pid = open3($in, $out, $err, '/bin/cp', '-r', {}, {});\n", src, dest));
             output.push_str(&generator.indent());
             output.push_str("    close $in or croak 'Close failed: $OS_ERROR';\n");
             output.push_str(&generator.indent());

@@ -685,6 +685,26 @@ pub fn parse_for_loop(parser: &mut Parser) -> Result<Command, ParserError> {
                     depth += 2;
                     arith_content.push_str("((");
                 }
+                Some(Token::Arithmetic) => {
+                    // Nested $((...)) — adds 2 to depth
+                    parser.lexer.next();
+                    depth += 2;
+                    arith_content.push_str("$((");
+                }
+                Some(Token::DollarParen) => {
+                    // Nested $(...) inside arithmetic — adds 1 to depth
+                    if let Some(text) = parser.lexer.get_current_text() {
+                        arith_content.push_str(&text);
+                    }
+                    parser.lexer.next();
+                    depth += 1;
+                }
+                Some(Token::Comment) => {
+                    // A `#` inside an arithmetic expression is the base-notation
+                    // operator (e.g. 10#$x), not a comment start.
+                    let captured = parser.lexer.scan_arithmetic_comment();
+                    arith_content.push_str(&captured);
+                }
                 None => return Err(ParserError::UnexpectedEOF),
                 _ => {
                     if let Some(text) = parser.lexer.get_current_text() {

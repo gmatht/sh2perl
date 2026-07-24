@@ -358,26 +358,63 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
     }
 
     // The next surviving token starts at body_end or later.
-    let next_start = if span_end < lexer.tokens.len() {
+    let mut next_start = if span_end < lexer.tokens.len() {
         lexer.tokens[span_end].1
     } else {
         input.len()
     };
 
-    // Remove all tokens in [body_start_idx, span_end).
-    if lexer.current >= body_start_idx && lexer.current < span_end {
-        lexer.current = body_start_idx;
-    }
-    let remove_len = span_end - body_start_idx;
-    if remove_len > 0 {
-        lexer.tokens.drain(body_start_idx..span_end);
-        if lexer.current >= span_end {
-            lexer.current = lexer.current.saturating_sub(remove_len);
+    // Check if the character just before next_start is a single-quote or
+    // double-quote that came from a spanning token's closing delimiter.
+    // If so, extend next_start to include the rest of the string, so that
+    // the re-tokenized gap produces a proper SingleQuotedString.
+    if next_start > body_end && next_start > 0 && next_start <= input.len() {
+        let last_gap_byte = input.as_bytes()[next_start - 1];
+        if last_gap_byte == b'\'' {
+            // Find the matching closing single-quote starting from next_start.
+            if let Some(closing_pos) = input[next_start..].find('\'') {
+                next_start = next_start + closing_pos + 1;
+            }
+        } else if last_gap_byte == b'"' {
+            // Find the matching closing double-quote (handling escapes).
+            let mut i = next_start;
+            while i < input.len() {
+                let b = input.as_bytes()[i];
+                if b == b'"' {
+                    next_start = i + 1;
+                    break;
+                }
+                if b == b'\\' && i + 1 < input.len() {
+                    i += 2; // skip escape sequence
+                } else {
+                    i += 1;
+                }
+            }
         }
-        // After drain, the token at body_start_idx is the old span_end token
     }
 
-    // Step 4: re-tokenize gap between body_end and next surviving token.
+    // Remove all tokens in [body_start_idx, span_end) and also any old tokens
+    // that start in [body_end, next_start).  These were created by the original
+    // logos run and will be replaced by the re-tokenized gap below.
+    let mut remove_end = span_end;
+    while remove_end < lexer.tokens.len() {
+        if lexer.tokens[remove_end].1 >= next_start {
+            break;
+        }
+        remove_end += 1;
+    }
+    if lexer.current >= body_start_idx && lexer.current < remove_end {
+        lexer.current = body_start_idx;
+    }
+    let remove_len = remove_end - body_start_idx;
+    if remove_len > 0 {
+        lexer.tokens.drain(body_start_idx..remove_end);
+        if lexer.current >= remove_end {
+            lexer.current = lexer.current.saturating_sub(remove_len);
+        }
+    }
+
+    // Step 4: re-tokenize gap between body_end and next_start.
     // This content was consumed by spanning tokens (e.g. SingleQuotedStrings
     // that started inside the body).  Using logos to re-tokenize works here
     // because logos sees the standalone content without the preceding `'` that

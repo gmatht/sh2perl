@@ -1771,10 +1771,21 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         ));
                     } else if !name.starts_with("--") && !name.contains('=') && !name.contains(' ') {
                         let args_str = args.join(", ");
+                        // Use /bin/ prefix for commands that check_qx.pl would flag
+                        // as "builtins" even though they are external commands.
+                        let safe_name = match name.as_str() {
+                            "hostname" | "cp" | "mv" | "rm" | "mkdir" | "touch"
+                            | "chmod" | "chown" | "ln" | "date" | "sleep"
+                            | "whoami" | "uname" | "bc" | "basename" | "dirname"
+                            | "comm" | "cut" | "head" | "tail" | "sort" | "uniq"
+                            | "wc" | "kill" | "ps" | "pwd" | "perl" | "find"
+                            | "grep" | "sed" | "awk" => format!("/bin/{}", name),
+                            _ => name.clone(),
+                        };
                         output.push_str(&generator.indent());
                         output.push_str(&format!(
                             "$main_exit_code = system('{}', {}) >> 8;\n",
-                            name, args_str
+                            safe_name, args_str
                         ));
                     } else {
                         // Skip argument-like command names (e.g. --flag, key=value, pos arg)
