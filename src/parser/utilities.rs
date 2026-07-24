@@ -37,7 +37,7 @@ impl ParserUtilities for Lexer {
     fn skip_whitespace_and_comments(&mut self) {
         while let Some(token) = self.peek() {
             match token {
-                Token::Space | Token::Tab | Token::Comment | Token::Newline => {
+                Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn => {
                     self.next();
                 }
                 _ => break,

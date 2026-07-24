@@ -42,7 +42,7 @@ impl Parser {
                 Some(Token::Space) | Some(Token::Tab) | Some(Token::Comment) => {
                     self.lexer.next();
                 }
-                Some(Token::Newline) => {
+                Some(Token::Newline) | Some(Token::CarriageReturn) => {
                     newline_count += 1;
                     self.lexer.next();
                 }
@@ -59,8 +59,8 @@ impl Parser {
             }
 
             // Check if we're at a newline before parsing the command
-            if let Some(Token::Newline) = self.lexer.peek() {
-                // Consume the newline and continue to next iteration
+            if let Some(Token::Newline) | Some(Token::CarriageReturn) = self.lexer.peek() {
+                // Consume the token and continue to next iteration
                 self.lexer.next();
                 continue;
             }
@@ -100,7 +100,7 @@ impl Parser {
                     Some(Token::Space) | Some(Token::Tab) | Some(Token::Comment) => {
                         self.lexer.next();
                     }
-                    Some(Token::Newline) => {
+                    Some(Token::Newline) | Some(Token::CarriageReturn) => {
                         newline_count += 1;
                         self.lexer.next();
                     }
@@ -340,6 +340,7 @@ impl Parser {
                 Some(Token::Newline) | Some(Token::CarriageReturn) => {
                     // Newlines should be handled at the top level, not here
                     // Return an empty command to indicate we hit a newline
+                    self.lexer.next(); // consume the token
                     return Ok(Command::Simple(SimpleCommand {
                         name: Word::literal("".to_string()),
                         args: vec![],

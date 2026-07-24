@@ -774,7 +774,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             if let Some(pid) = generator.current_pipeline_output_id() {
                 output.push_str(&format!("$output_{} = ${};", pid, output_var));
             }
-        } else if name == "echo" {
+        } else if name == "echo" || name == "/bin/echo" || name == "/usr/bin/echo" {
             // Use the echo command generator for non-pipeline echo commands
             if generator.inline_mode {
                 // In inline mode, generate the output value directly instead of print statements
