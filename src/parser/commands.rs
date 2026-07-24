@@ -2332,12 +2332,20 @@ impl Parser {
                                 depth -= 1;
                                 if depth == 0 { break; }
                             }
+                            Some(Token::ArithmeticEvalClose) => {
+                                // )) closes two levels of paren depth
+                                depth = depth.saturating_sub(2);
+                                sub.push_str("))");
+                                self.lexer.next();
+                                if depth == 0 { break; }
+                            }
                             Some(_) => {
                                 sub.push_str(&self.lexer.get_raw_token_text()?);
                             }
-                            None => return Err(ParserError::InvalidSyntax(
-                                "Unexpected end of input in command substitution".to_string(),
-                            )),
+                            None => {
+                                // If we run out of tokens, use whatever we have
+                                break;
+                            },
                         }
                     }
                     expression_parts.push(sub);
@@ -2585,6 +2593,11 @@ impl Parser {
                             Some(Token::DollarParen) => {
                                 expression_parts.push(self.lexer.get_raw_token_text()?);
                                 depth += 1;
+                            }
+                            Some(Token::ArithmeticEvalClose) => {
+                                // )) closes two levels of paren depth
+                                depth = depth.saturating_sub(2);
+                                expression_parts.push(self.lexer.get_raw_token_text()?);
                             }
                             Some(_) => {
                                 expression_parts.push(self.lexer.get_raw_token_text()?);

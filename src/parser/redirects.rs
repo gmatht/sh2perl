@@ -365,31 +365,13 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         input.len()
     };
 
-    // Check for a quote character just before next_start that might be
-    // the opening of a spanning string whose closing quote is inside the
-    // gap.  Extend next_start past that closing quote so the gap includes
-    // the complete string for re-tokenization.
-    if next_start > body_end && next_start > 0 && next_start <= input.len() {
-        let last_gap_byte = input.as_bytes()[next_start - 1];
-        if last_gap_byte == b'\'' {
-            if let Some(closing_pos) = input[next_start..].find('\'') {
-                next_start = next_start + closing_pos + 1;
-            }
-        } else if last_gap_byte == b'"' {
-            let mut i = next_start;
-            while i < input.len() {
-                let b = input.as_bytes()[i];
-                if b == b'"' {
-                    next_start = i + 1;
-                    break;
-                }
-                if b == b'\\' && i + 1 < input.len() {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        }
+    // If the next surviving token is far beyond the heredoc body, we likely had
+    // spanning SingleQuotedStrings that consumed part of the file.
+    // Extend next_start to the end of the input so the entire remainder
+    // is re-tokenized correctly.
+    // Use a threshold of 16 bytes to avoid triggering on small gaps.
+    if next_start > body_end + 16 && next_start < input.len() {
+        next_start = input.len();
     }
     // Also extend next_start past any tokens that start in [body_end, next_start)
     // but end past next_start (spanning tokens from the body).
