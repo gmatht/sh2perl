@@ -2,6 +2,8 @@ use logos::Logos;
 use std::cmp::Ordering;
 use thiserror::Error;
 
+use crate::parser::errors::ParserError;
+
 #[derive(Logos, Debug, PartialEq, Clone)]
 pub enum Token {
     // Keywords
@@ -633,6 +635,91 @@ impl Lexer {
 }
 
 impl Lexer {
+    /// Scan forward from the current token (which must be a DoubleQuote at
+    /// a `"` byte) through the raw input bytes to find the matching closing
+    /// `"`, handling backslash-newline continuations and `$(...)`/`${...}`
+    /// nesting. Returns the captured substring (including both quotes) WITH
+    /// backslash-newline continuations removed so that the result is a clean
+    /// single-line string suitable for re-tokenization as a DoubleQuotedString.
+    /// Advances the lexer past all tokens that fall within the captured span.
+    pub fn scan_double_quoted_string(&mut self) -> Result<String, ParserError> {
+        use crate::parser::errors::ParserError;
+
+        let start = self.tokens[self.current].1;
+        let bytes = self.input.as_bytes();
+        if bytes[start] != b'"' {
+            return Err(ParserError::InvalidSyntax(
+                "scan_double_quoted_string called on non-quote token".to_string(),
+            ));
+        }
+
+        let mut result = String::new();
+        result.push('"'); // opening quote
+
+        let mut pos = start + 1;
+        let mut p_depth = 0i32;
+        let mut b_depth = 0i32;
+
+        while pos < bytes.len() {
+            match bytes[pos] {
+                b'"' if p_depth == 0 && b_depth == 0 => {
+                    result.push('"'); // closing quote
+                    pos += 1;
+                    break;
+                }
+                b'\\' if pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' => {
+                    // Backslash-newline continuation: skip both bytes (do not copy)
+                    pos += 2;
+                }
+                b'\\' if pos + 1 < bytes.len() => {
+                    // Other escaped char: copy backslash and the escaped char
+                    result.push('\\');
+                    pos += 1;
+                    result.push(bytes[pos] as char);
+                    pos += 1;
+                }
+                b'$' if pos + 1 < bytes.len() && bytes[pos + 1] == b'(' => {
+                    p_depth += 1;
+                    result.push('$');
+                    result.push('(');
+                    pos += 2;
+                }
+                b'$' if pos + 1 < bytes.len() && bytes[pos + 1] == b'{' => {
+                    b_depth += 1;
+                    result.push('$');
+                    result.push('{');
+                    pos += 2;
+                }
+                b')' => {
+                    if p_depth > 0 {
+                        p_depth -= 1;
+                    }
+                    result.push(')');
+                    pos += 1;
+                }
+                b'}' => {
+                    if b_depth > 0 {
+                        b_depth -= 1;
+                    }
+                    result.push('}');
+                    pos += 1;
+                }
+                _ => {
+                    result.push(bytes[pos] as char);
+                    pos += 1;
+                }
+            }
+        }
+
+        // Advance lexer past all tokens that are within the captured span
+        let end_pos = pos;
+        while self.current < self.tokens.len() && self.tokens[self.current].1 < end_pos {
+            self.current += 1;
+        }
+
+        Ok(result)
+    }
+
     pub fn offset_to_line_col(&self, offset: usize) -> (usize, usize) {
         if self.line_starts.is_empty() {
             return (1, offset + 1);
