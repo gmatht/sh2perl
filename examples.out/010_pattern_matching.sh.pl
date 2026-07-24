@@ -13,9 +13,6 @@ my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '010_pattern_matching.sh';
-my $s;
-my @s;
-my %s;
 my $f2;
 my @f2;
 my %f2;
@@ -25,6 +22,9 @@ my %f1;
 my $word;
 my @word;
 my %word;
+my $s;
+my @s;
+my %s;
 
 $__set_e = 1;
 # set uo not implemented

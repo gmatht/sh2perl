@@ -292,7 +292,7 @@ pub enum Token {
     // Long options (must come before Identifier to avoid conflicts)
     // Match both --option=value and --option (without =value)
     // Note: use raw string r##"..."## to allow double quotes inside
-    #[regex(r##"--[a-zA-Z][a-zA-Z0-9_*?.-]*(=[^ \t\n\r|&;(){}<>"'`$\[\]\?#!@*]*)?"##, priority = 3)]
+    #[regex(r##"--[a-zA-Z][a-zA-Z0-9_*?.-]*(=("[^"]*"|'[^']*'|[^ \t\n\r|&;(){}<>"'`$\[\]\?#!@*]*))?"##, priority = 3)]
     LongOption,
 
     // Identifiers and words
