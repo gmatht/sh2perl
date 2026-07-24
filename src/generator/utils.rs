@@ -926,8 +926,8 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
     match word {
         Word::Literal(s, _) => {
             // Strip shell quotes if present and return the raw string for regex
-            if (s.starts_with("'") && s.ends_with("'"))
-                || (s.starts_with("\"") && s.ends_with("\""))
+            if s.len() >= 2 && ((s.starts_with("'") && s.ends_with("'"))
+                || (s.starts_with("\"") && s.ends_with("\"")))
             {
                 // Remove the outer quotes
                 s[1..s.len() - 1].to_string()
