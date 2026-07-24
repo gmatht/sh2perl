@@ -282,7 +282,7 @@ pub enum Token {
     // Strings and literals
     #[regex(r#""([^"\\]|\\\n|\\.)*""#, priority = 4)]
     DoubleQuotedString,
-    #[regex(r"'([^'\\]|\\[^'])*'", priority = 3)]
+    #[regex(r"'[^']*'", priority = 3)]
     SingleQuotedString,
     #[regex(r"`([^`\\]|\\.)*`", priority = 3)]
     BacktickString,

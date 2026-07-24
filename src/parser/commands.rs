@@ -1759,6 +1759,11 @@ impl Parser {
                         break;
                     }
                 }
+                Some(Token::Arithmetic) => {
+                    self.lexer.next();
+                    paren_depth += 2;
+                    content.push_str("$((");
+                }
                 Some(Token::ArithmeticEval) => {
                     self.lexer.next();
                     paren_depth += 2;
@@ -2404,13 +2409,13 @@ impl Parser {
                             // Variable name like 'i'
                             let var_name = self.lexer.get_identifier_text()?;
                             expression_parts.push(var_name);
-                            self.lexer.next(); // consume the identifier token
+                            // Note: get_identifier_text already advances, no extra next() needed
                         }
                         Some(Token::Number) => {
                             // Number like '1'
                             let num_text = self.lexer.get_number_text()?;
                             expression_parts.push(num_text);
-                            self.lexer.next(); // consume the number token
+                            // Note: get_number_text already advances, no extra next() needed
                         }
                         Some(Token::Space) | Some(Token::Tab) => {
                             // Skip whitespace
@@ -2422,9 +2427,10 @@ impl Parser {
                             ));
                         }
                         _ => {
-                            return Err(ParserError::InvalidSyntax(
-                                "Unexpected token in parameter expansion".to_string(),
-                            ));
+                            // In parameter expansion, operators like %, #, :, -, +, ?, /, = are valid
+                            // Also handle Star for glob patterns like ${var%pattern}
+                            let raw_text = self.lexer.get_raw_token_text()?;
+                            expression_parts.push(raw_text);
                         }
                     }
                 }
@@ -2489,6 +2495,99 @@ impl Parser {
                     // Division operator
                     self.lexer.next();
                     expression_parts.push("/".to_string());
+                }
+                Some(Token::Percent) => {
+                    // Modulo operator
+                    self.lexer.next();
+                    expression_parts.push("%".to_string());
+                }
+                Some(Token::Equality) => {
+                    // Equality comparison
+                    self.lexer.next();
+                    expression_parts.push("==".to_string());
+                }
+                Some(Token::Dollar) => {
+                    // Variable reference inside arithmetic
+                    self.lexer.next();
+                    if let Some(Token::Identifier) = self.lexer.peek() {
+                        let var_name = self.lexer.get_identifier_text()?;
+                        expression_parts.push(format!("${}", var_name));
+                    } else if let Some(Token::Arithmetic) = self.lexer.peek() {
+                        // Nested $((...)) arithmetic
+                        let text = self.lexer.get_raw_token_text()?;
+                        let mut depth = 1usize;
+                        expression_parts.push(text);
+                        while depth > 0 {
+                            match self.lexer.peek() {
+                                Some(Token::ArithmeticEvalClose) => {
+                                    expression_parts.push(self.lexer.get_raw_token_text()?);
+                                    depth -= 1;
+                                }
+                                Some(Token::Arithmetic) => {
+                                    expression_parts.push(self.lexer.get_raw_token_text()?);
+                                    depth += 1;
+                                }
+                                Some(_) => {
+                                    expression_parts.push(self.lexer.get_raw_token_text()?);
+                                }
+                                None => break,
+                            }
+                        }
+                    } else {
+                        expression_parts.push("$".to_string());
+                    }
+                }
+                Some(Token::DollarParen) => {
+                    // $() command substitution inside arithmetic
+                    let text = self.lexer.get_raw_token_text()?;
+                    let mut depth = 1usize;
+                    expression_parts.push(text);
+                    while depth > 0 {
+                        match self.lexer.peek() {
+                            Some(Token::ParenClose) => {
+                                expression_parts.push(self.lexer.get_raw_token_text()?);
+                                depth -= 1;
+                            }
+                            Some(Token::DollarParen) => {
+                                expression_parts.push(self.lexer.get_raw_token_text()?);
+                                depth += 1;
+                            }
+                            Some(_) => {
+                                expression_parts.push(self.lexer.get_raw_token_text()?);
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                Some(Token::Arithmetic) => {
+                    // Nested $((...)) arithmetic
+                    let text = self.lexer.get_raw_token_text()?;
+                    let mut depth = 1usize;
+                    expression_parts.push(text);
+                    while depth > 0 {
+                        match self.lexer.peek() {
+                            Some(Token::ArithmeticEvalClose) => {
+                                expression_parts.push(self.lexer.get_raw_token_text()?);
+                                depth -= 1;
+                            }
+                            Some(Token::Arithmetic) => {
+                                expression_parts.push(self.lexer.get_raw_token_text()?);
+                                depth += 1;
+                            }
+                            Some(_) => {
+                                expression_parts.push(self.lexer.get_raw_token_text()?);
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                Some(Token::ParenOpen) => {
+                    self.lexer.next();
+                    expression_parts.push("(".to_string());
+                }
+                Some(Token::ParenClose) => {
+                    self.lexer.next();
+                    expression_parts.push(")".to_string());
                 }
                 Some(Token::Space) | Some(Token::Tab) => {
                     // Skip whitespace
