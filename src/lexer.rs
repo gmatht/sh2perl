@@ -380,7 +380,7 @@ pub enum Token {
     Comment,
 
     // Regex pattern content (for bash test expressions)
-    #[regex(r"\^[a-zA-Z0-9\-\[\]\+\.\$\*\(\)\?\\|:#/!^_]+", priority = 1)]
+    #[regex(r"\^[a-zA-Z0-9\-\[\]\+\.\$\*\?\\|:#/!^_]+", priority = 1)]
     RegexPattern,
 }
 
