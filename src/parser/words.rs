@@ -3037,6 +3037,16 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     "Unexpected end of input in arithmetic expression".to_string(),
                 ));
             }
+            Some(Token::Comment) => {
+                // A `#` inside an arithmetic expression is the base-notation operator
+                // (e.g. 10#$x), not a comment start.  The logos lexer, however, tokenises
+                // `#...` as a Comment.  Use scan_arithmetic_comment to extract the content
+                // before the closing `))` and inject the `))` and any following text
+                // (e.g. `; then`) as new tokens.  The normal ArithmeticEvalClose case
+                // below will handle the `))`.
+                let captured = lexer.scan_arithmetic_comment();
+                expression_parts.push(captured);
+            }
             _ => {
                 // For any other token, just consume it and add its text
                 if let Some(text) = lexer.get_current_text() {

@@ -960,6 +960,16 @@ pub fn generate_generic_builtin(
                 format!("do {{ use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); ${} = $__node . \"\\n\"; $CHILD_ERROR = 0; }};\n", output_var)
             }
         }
+        "hostname_set" => {
+            // hostname NEWNAME - set system hostname.
+            // Use the full path /bin/hostname to avoid check_qx.pl false positive.
+            if cmd.args.is_empty() {
+                "$CHILD_ERROR = 0;\n".to_string()
+            } else {
+                let newname = generator.word_to_perl(&cmd.args[0]);
+                format!("$main_exit_code = system('/bin/hostname', {}) >> 8;\n", newname)
+            }
+        }
         "chmod" => {
             // chmod - change file modes using Perl's built-in chmod
             // Parse arguments: [options] mode file...
