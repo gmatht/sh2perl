@@ -1,4 +1,0 @@
-017_grep_context.sh	Failed due to: stdout mismatch
-018_grep_params.sh	Failed due to: exit code mismatch, stdout mismatch
-063_hard_to_parse.sh	Failed due to: exit code mismatch, stdout mismatch
-064_14_nested_command_substitution_arithmetic.sh	Failed due to: stdout mismatch
