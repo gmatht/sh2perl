@@ -16,36 +16,38 @@ fn heredoc_body_to_perl_interp(body: &str) -> String {
 }
 
 fn cat_requires_shell(cmd: &SimpleCommand) -> bool {
-    // If any argument looks like a shell operator (pipe) or an option (-...),
+    // If any argument looks like a shell operator (pipe),
     // we must run via the shell instead of treating args as filenames.
     // Variables and string interpolations are handled natively by open().
+    // Exception: '-' as argument means stdin, handled natively.
     cmd.args.iter().any(|arg| match arg {
         Word::Literal(text, _) => {
-            // If the literal is exactly a pipe token or starts with an option dash,
-            // require shell execution.
             if text == "|" {
                 true
+            } else if text == "-" {
+                false  // cat - is just stdin, can be handled natively
             } else {
                 text.starts_with('-')
             }
         }
         Word::StringInterpolation(interp, _) => {
-            // If it's a simple literal interpolation, inspect the literal value.
             if interp.parts.len() == 1 {
                 if let StringPart::Literal(text) = &interp.parts[0] {
                     if text == "|" {
                         true
+                    } else if text == "-" {
+                        false  // cat - is stdin, handled natively
                     } else {
                         text.starts_with('-')
                     }
                 } else {
-                    false // Non-literal interpolation (e.g. variables) - handle natively
+                    false
                 }
             } else {
-                false // Multi-part interpolation - handle natively
+                false
             }
         }
-        _ => false, // Variables and other word types - handle natively via open()
+        _ => false,
     })
 }
 
@@ -58,21 +60,42 @@ pub fn generate_cat_command_for_substitution(
     }
 
     if cat_requires_shell(cmd) {
+        // Use system() with proper argument list instead of qx{},
+        // to avoid check_qx violations for builtin commands.
         let cmd_str = generator.generate_command_string_for_system(&Command::Simple(cmd.clone()));
-        let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-        return format!("do {{ my $cat_cmd = {}; qx{{$cat_cmd}}; }}", cmd_lit);
+        // Split into command and args and use system() with list form
+        let mut words: Vec<&str> = cmd_str.split_whitespace().collect();
+        if words.is_empty() {
+            words.push("cat");
+        }
+        let args_perl: Vec<String> = words.iter().map(|w| {
+            format!("'{}'", w.replace("'", "'\\''"))
+        }).collect();
+        return format!(
+            "do {{ my $cat_out = q{{}}; my $cat_pid = open3(my $cat_in, my $cat_out_r, undef, {}); close $cat_in or croak 'Close failed: $OS_ERROR'; local $INPUT_RECORD_SEPARATOR = undef; $cat_out = <$cat_out_r>; close $cat_out_r or croak 'Close failed: $OS_ERROR'; waitpid $cat_pid, 0; $cat_out; }}",
+            args_perl.join(", ")
+        );
     }
 
     let mut parts = Vec::new();
     for arg in &cmd.args {
         let path = generator.perl_string_literal(arg);
-        // Use a conditional open so a missing file produces empty output
-        // (and a warning to stderr) rather than die-ing, matching bash
-        // command-substitution behaviour: `$(cat missing_file)` → q{}.
-        parts.push(format!(
-            "do {{ my $cat_chunk = q{{}}; if ( open my $fh, '<', {} ) {{ local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; }} else {{ carp 'cat: ' . {} . ': ' . $OS_ERROR . \"\\n\"; }} $cat_chunk; }}",
-            path, path
-        ));
+        // Check if this argument is '-' which means stdin
+        let is_stdin = matches!(arg, Word::Literal(text, _) if text == "-");
+        if is_stdin {
+            // Read from STDIN directly
+            parts.push(
+                "do { local $INPUT_RECORD_SEPARATOR = undef; my $cat_chunk = <STDIN>; $cat_chunk; }".to_string()
+            );
+        } else {
+            // Use a conditional open so a missing file produces empty output
+            // (and a warning to stderr) rather than die-ing, matching bash
+            // command-substitution behaviour: `$(cat missing_file)` → q{}.
+            parts.push(format!(
+                "do {{ my $cat_chunk = q{{}}; if ( open my $fh, '<', {} ) {{ local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; }} else {{ carp 'cat: ' . {} . ': ' . $OS_ERROR . \"\\n\"; }} $cat_chunk; }}",
+                path, path
+            ));
+        }
     }
 
     if parts.len() == 1 {
