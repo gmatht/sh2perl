@@ -50,36 +50,69 @@ pub fn generate_grep_command(
                     continue;
                 }
 
-                // Handle --include flag
-                if s.starts_with("--include=") {
-                    let pattern = s[10..].to_string(); // Remove "--include=" prefix
-                                                       // Remove quotes if present
-                    let clean_pattern = if pattern.starts_with('"') && pattern.ends_with('"') {
-                        pattern[1..pattern.len() - 1].to_string()
-                    } else if pattern.starts_with("'") && pattern.ends_with("'") {
-                        pattern[1..pattern.len() - 1].to_string()
+                // Handle --include flag both as:
+                //   --include=PATTERN  (single word)
+                //   --include PATTERN  (two words)
+                // Also handle the case where the lexer tokenizes
+                // --include="*.txt" as --include= + "*.txt"
+                if s == "--include" || s.starts_with("--include=") {
+                    if s == "--include" {
+                        // --include as separate word, next arg is the pattern
+                        if let Some(next_arg) = args_iter.next() {
+                            let pat_str = extract_pattern_from_word(next_arg);
+                            include_pattern = Some(pat_str);
+                        }
                     } else {
-                        pattern
-                    };
-                    include_pattern = Some(clean_pattern);
-                    // Don't treat this as a pattern
-
+                        // --include=PATTERN
+                        let pattern = s[10..].to_string();
+                        let clean_pattern = if pattern.starts_with('"') && pattern.ends_with('"') {
+                            pattern[1..pattern.len() - 1].to_string()
+                        } else if pattern.starts_with("'") && pattern.ends_with("'") {
+                            pattern[1..pattern.len() - 1].to_string()
+                        } else {
+                            pattern
+                        };
+                        // If the pattern is empty (due to lexer splitting --include="*.txt"
+                        // into --include= + "*.txt"), check next arg
+                        if clean_pattern.is_empty() {
+                            if let Some(next_arg) = args_iter.next() {
+                                let pat_str = extract_pattern_from_word(next_arg);
+                                include_pattern = Some(pat_str);
+                            }
+                        } else {
+                            include_pattern = Some(clean_pattern);
+                        }
+                    }
                     continue;
                 }
 
-                // Handle --exclude flag
-                if s.starts_with("--exclude=") {
-                    let pattern = s[10..].to_string(); // Remove "--exclude=" prefix
-                                                       // Remove quotes if present
-                    let clean_pattern = if pattern.starts_with('"') && pattern.ends_with('"') {
-                        pattern[1..pattern.len() - 1].to_string()
-                    } else if pattern.starts_with("'") && pattern.ends_with("'") {
-                        pattern[1..pattern.len() - 1].to_string()
+                // Handle --exclude flag both as:
+                //   --exclude=PATTERN  (single word)
+                //   --exclude PATTERN  (two words)
+                if s == "--exclude" || s.starts_with("--exclude=") {
+                    if s == "--exclude" {
+                        if let Some(next_arg) = args_iter.next() {
+                            let pat_str = extract_pattern_from_word(next_arg);
+                            exclude_pattern = Some(pat_str);
+                        }
                     } else {
-                        pattern
-                    };
-                    exclude_pattern = Some(clean_pattern);
-                    // Don't treat this as a pattern
+                        let pattern = s[10..].to_string();
+                        let clean_pattern = if pattern.starts_with('"') && pattern.ends_with('"') {
+                            pattern[1..pattern.len() - 1].to_string()
+                        } else if pattern.starts_with("'") && pattern.ends_with("'") {
+                            pattern[1..pattern.len() - 1].to_string()
+                        } else {
+                            pattern
+                        };
+                        if clean_pattern.is_empty() {
+                            if let Some(next_arg) = args_iter.next() {
+                                let pat_str = extract_pattern_from_word(next_arg);
+                                exclude_pattern = Some(pat_str);
+                            }
+                        } else {
+                            exclude_pattern = Some(clean_pattern);
+                        }
+                    }
                     continue;
                 }
 
@@ -1120,4 +1153,33 @@ pub fn generate_grep_command(
     }
 
     output
+}
+
+/// Extract a pattern string from a Word, handling both Literal and StringInterpolation
+fn extract_pattern_from_word(word: &Word) -> String {
+    match word {
+        Word::Literal(s, _) => {
+            // Strip outer quotes if present
+            if s.starts_with('"') && s.ends_with('"') {
+                s[1..s.len() - 1].to_string()
+            } else if s.starts_with("'") && s.ends_with("'") {
+                s[1..s.len() - 1].to_string()
+            } else {
+                s.clone()
+            }
+        }
+        Word::StringInterpolation(interp, _) => {
+            // Extract literal content from string interpolation
+            // (this strips the outer quotes that are part of the token)
+            let mut result = String::new();
+            for part in &interp.parts {
+                match part {
+                    StringPart::Literal(s) => result.push_str(s),
+                    _ => {}
+                }
+            }
+            result
+        }
+        _ => word.to_string(),
+    }
 }
