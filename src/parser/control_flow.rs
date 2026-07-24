@@ -1260,7 +1260,11 @@ pub fn parse_return_statement(parser: &mut Parser) -> Result<Command, ParserErro
 
     // Optional return value
     let mut return_value = None;
-    parser.lexer.skip_whitespace_and_comments();
+    // Use INLINE whitespace only (not newlines) so that a newline right after
+    // `return` means no return value.  Using skip_whitespace_and_comments would
+    // eat the newline and cause the parser to consume the next token (e.g. `fi`
+    // from `if ...; then return; fi`) as the return value.
+    parser.lexer.skip_inline_whitespace_and_comments();
 
     if !parser.lexer.is_eof()
         && !matches!(
