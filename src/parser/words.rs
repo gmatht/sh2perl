@@ -392,7 +392,48 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         }
         Some(Token::LongOption) => {
             // Treat long options like --color=always as literals
-            let text = lexer.get_raw_token_text()?;
+            let mut text = lexer.get_raw_token_text()?;
+            // If long option ends with =, merge with following quoted string
+            // e.g. --long-option="value with spaces" should be one argument
+            if text.ends_with('=') {
+                if let Some(next) = lexer.peek() {
+                    match next {
+                        Token::DoubleQuotedString => {
+                            let quoted = lexer.get_string_text()?;
+                            let inner = if quoted.starts_with('"') && quoted.ends_with('"') {
+                                &quoted[1..quoted.len()-1]
+                            } else {
+                                &quoted
+                            };
+                            text.push_str(inner);
+                        }
+                        Token::SingleQuotedString => {
+                            let quoted = lexer.get_string_text()?;
+                            let inner = if quoted.starts_with('\'') && quoted.ends_with('\'') {
+                                &quoted[1..quoted.len()-1]
+                            } else {
+                                &quoted
+                            };
+                            text.push_str(inner);
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                // Strip quotes from value if the regex captured them as part of the token
+                // (e.g. --option="value" or --option='value')
+                if let Some(eq_pos) = text.find('=') {
+                    let value_part = &text[eq_pos+1..];
+                    if value_part.len() >= 2 {
+                        if (value_part.starts_with('"') && value_part.ends_with('"'))
+                            || (value_part.starts_with('\'') && value_part.ends_with('\''))
+                        {
+                            let inner = &value_part[1..value_part.len()-1];
+                            text = format!("{}={}", &text[..eq_pos], inner);
+                        }
+                    }
+                }
+            }
             Ok(Word::Literal(text, None))
         }
         Some(Token::RegexPattern) => {
@@ -761,7 +802,48 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         }
         Some(Token::LongOption) => {
             // Treat long options like --color=always as literals
-            let text = lexer.get_raw_token_text()?;
+            let mut text = lexer.get_raw_token_text()?;
+            // If long option ends with =, merge with following quoted string
+            // e.g. --long-option="value with spaces" should be one argument
+            if text.ends_with('=') {
+                if let Some(next) = lexer.peek() {
+                    match next {
+                        Token::DoubleQuotedString => {
+                            let quoted = lexer.get_string_text()?;
+                            let inner = if quoted.starts_with('"') && quoted.ends_with('"') {
+                                &quoted[1..quoted.len()-1]
+                            } else {
+                                &quoted
+                            };
+                            text.push_str(inner);
+                        }
+                        Token::SingleQuotedString => {
+                            let quoted = lexer.get_string_text()?;
+                            let inner = if quoted.starts_with('\'') && quoted.ends_with('\'') {
+                                &quoted[1..quoted.len()-1]
+                            } else {
+                                &quoted
+                            };
+                            text.push_str(inner);
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                // Strip quotes from value if the regex captured them as part of the token
+                // (e.g. --option="value" or --option='value')
+                if let Some(eq_pos) = text.find('=') {
+                    let value_part = &text[eq_pos+1..];
+                    if value_part.len() >= 2 {
+                        if (value_part.starts_with('"') && value_part.ends_with('"'))
+                            || (value_part.starts_with('\'') && value_part.ends_with('\''))
+                        {
+                            let inner = &value_part[1..value_part.len()-1];
+                            text = format!("{}={}", &text[..eq_pos], inner);
+                        }
+                    }
+                }
+            }
             Ok(Word::Literal(text, None))
         }
         Some(Token::RegexPattern) => {
@@ -2867,6 +2949,14 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
             }
             Some(Token::Space) | Some(Token::Tab) => {
                 expression_parts.push(" ".to_string());
+                lexer.next();
+            }
+            Some(Token::DollarParen) => {
+                // Nested $(...) command substitution inside arithmetic
+                paren_depth += 1;
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
                 lexer.next();
             }
             Some(Token::Dollar) => {
