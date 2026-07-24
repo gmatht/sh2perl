@@ -2796,23 +2796,48 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
     }
 
     // Capture the content until we find the closing ))
+    // Track actual parenthesis depth: $(( or (( contributes 2 opening parens,
+    // and each ArithmeticEvalClose ("))") contributes 2 closing parens.
+    // Regular ParenOpen/ParenClose tokens adjust depth by 1.
     let mut expression_parts = Vec::new();
-    let mut paren_depth = 1; // We're already inside one level of parentheses
+    let mut paren_depth = 2; // $(( or (( contributes 2 opening parens
 
     loop {
         match lexer.peek() {
             Some(Token::ArithmeticEvalClose) => {
-                // This is the closing )) for $((...))
+                // This is the closing )) for $((...)) or ((...))
+                // ArithmeticEvalClose represents TWO closing parens
+                lexer.next();
+                paren_depth -= 2;
+                if paren_depth <= 0 {
+                    break;
+                }
+                expression_parts.push("))".to_string());
+            }
+            Some(Token::ParenOpen) => {
+                // Regular opening parenthesis inside the expression
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                lexer.next();
+                paren_depth += 1;
+            }
+            Some(Token::ParenClose) => {
+                // Regular closing parenthesis inside the expression
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
                 lexer.next();
                 paren_depth -= 1;
-                if paren_depth == 0 {
+                if paren_depth <= 0 {
                     break;
                 }
             }
-            Some(Token::Arithmetic) => {
-                // This is another opening $((...))
+            Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                // This is another opening $((...)) or nested ((...))
                 lexer.next();
-                paren_depth += 1;
+                paren_depth += 2;
+                expression_parts.push("$((".to_string());
             }
             Some(Token::Identifier) => {
                 expression_parts.push(lexer.get_identifier_text()?);
