@@ -1776,6 +1776,13 @@ impl Parser {
                 None => {
                     return Err(ParserError::UnexpectedEOF);
                 }
+                Some(Token::Comment) => {
+                    // A `#` inside an arithmetic expression is the base-notation operator
+                    // (e.g. 10#$x), not a comment start.  Use scan_arithmetic_comment to
+                    // extract the content before `))` and inject `))` + remaining text.
+                    let captured = self.lexer.scan_arithmetic_comment();
+                    content.push_str(&captured);
+                }
                 _ => {
                     if let Some(text) = self.lexer.get_current_text() {
                         content.push_str(&text);
@@ -2226,6 +2233,12 @@ impl Parser {
                                 arith.push_str("$((");
                             }
                             None => break,
+                            Some(Token::Comment) => {
+                                // A `#` inside an arithmetic expression is the base-notation
+                                // operator (e.g. 10#$x), not a comment start.
+                                let captured = self.lexer.scan_arithmetic_comment();
+                                arith.push_str(&captured);
+                            }
                             _ => {
                                 if let Some(text) = self.lexer.get_current_text() {
                                     arith.push_str(&text);

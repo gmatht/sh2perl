@@ -720,6 +720,87 @@ impl Lexer {
         Ok(result)
     }
 
+    /// Scan from the current token (which must be a Comment token at a `#` byte)
+    /// through the raw input to find the closing `))` of an arithmetic expression,
+    /// handling `#` as the base-notation operator (e.g. `10#$x`).  Returns the
+    /// captured substring (including the `#` but NOT the closing `))`).
+    /// Re-injects any text after `))` (e.g. `; then`) as new tokens so the
+    /// caller can continue parsing normally.
+    pub fn scan_arithmetic_comment(&mut self) -> String {
+        let start = self.tokens[self.current].1;
+        let bytes = self.input.as_bytes();
+        let mut i = start;
+        // Skip the `#`
+        if i < bytes.len() && bytes[i] == b'#' {
+            i += 1;
+        }
+        // Scan forward until we find the closing `))` or end of line
+        let mut paren_depth = 0i32;
+        let mut closing_pos = None;
+        while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+            if bytes[i] == b')' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b')' {
+                    // Found closing `))`
+                    closing_pos = Some(i);
+                    break;
+                }
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    break;
+                }
+            } else if bytes[i] == b'(' {
+                paren_depth += 1;
+            }
+            i += 1;
+        }
+        
+        let captured = self.input[start..i].to_string();
+        
+        // Build list of tokens to inject after the Comment token.
+        // First inject the closing `))` as ArithmeticEvalClose, then inject
+        // any remaining text after `))` (e.g. `; then`).
+        let mut inject_tokens: Vec<(Token, usize, usize)> = Vec::new();
+        if let Some(cp) = closing_pos {
+            // Inject `))` as ArithmeticEvalClose
+            inject_tokens.push((
+                Token::ArithmeticEvalClose,
+                cp,
+                cp + 2,
+            ));
+            
+            // Re-inject text after `))` (e.g. `; then`)
+            let after_parens = cp + 2;
+            let remaining = &self.input[after_parens..];
+            if !remaining.is_empty() && !remaining.trim().is_empty() {
+                let mut sub_lexer = Token::lexer(remaining);
+                while let Some(token_result) = sub_lexer.next() {
+                    let span = sub_lexer.span();
+                    match token_result {
+                        Ok(tok) => {
+                            inject_tokens.push((
+                                tok,
+                                after_parens + span.start,
+                                after_parens + span.end,
+                            ));
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }
+        
+        // Insert injected tokens AFTER the Comment token (at self.current).
+        // We haven't advanced past the Comment yet, so insert at self.current + 1.
+        let insert_at = self.current + 1;
+        for (j, st) in inject_tokens.iter().enumerate() {
+            self.tokens.insert(insert_at + j, st.clone());
+        }
+        
+        // Advance lexer past the Comment token.
+        self.current += 1;
+        captured
+    }
+
     pub fn offset_to_line_col(&self, offset: usize) -> (usize, usize) {
         if self.line_starts.is_empty() {
             return (1, offset + 1);

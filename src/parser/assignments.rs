@@ -431,6 +431,14 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     "Unexpected end of input in arithmetic expression".to_string(),
                 ));
             }
+            Some(Token::Comment) => {
+                // A `#` inside an arithmetic expression is the base-notation operator
+                // (e.g. 10#$x), not a comment start.  Use scan_arithmetic_comment to
+                // extract the content before `))` and inject `))` + remaining text.
+                // The normal ArithmeticEvalClose case handles the `))`.
+                let captured = lexer.scan_arithmetic_comment();
+                expression_parts.push(captured);
+            }
             _ => {
                 // For any other token, just consume it and add its text
                 if let Some(text) = lexer.get_current_text() {
