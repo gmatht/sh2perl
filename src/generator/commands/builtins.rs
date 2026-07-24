@@ -245,6 +245,12 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
         BuiltinCommand::new("yes", "Output a string repeatedly", true),
     );
 
+    // Network
+    commands.insert(
+        "hostname",
+        BuiltinCommand::new("hostname", "Print/set system hostname", false),
+    );
+
     //TODO: pkill and killall
     commands
 }
@@ -706,6 +712,9 @@ pub fn generate_generic_builtin(
         "cp" => {
             // For now, use the existing signature but we should standardize this
             crate::generator::commands::cp::generate_cp_command(generator, cmd)
+        }
+        "hostname" => {
+            crate::generator::commands::hostname::generate_hostname_command(generator, cmd)
         }
         "mv" => {
             // For now, use the existing signature but we should standardize this

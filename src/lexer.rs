@@ -755,24 +755,22 @@ impl Lexer {
         }
         
         let captured = self.input[start..i].to_string();
-        
-        // Build list of tokens to inject after the Comment token.
-        // First inject the closing `))` as ArithmeticEvalClose, then inject
-        // any remaining text after `))` (e.g. `; then`).
+
+        // Build list of tokens to inject:
+        //   1. ArithmeticEvalClose at the "))" position
+        //   2. Re-lexed tokens for text after "))" up to the newline
+        //      (the original Comment swallowed this text; we must recreate it).
         let mut inject_tokens: Vec<(Token, usize, usize)> = Vec::new();
         if let Some(cp) = closing_pos {
-            // Inject `))` as ArithmeticEvalClose
-            inject_tokens.push((
-                Token::ArithmeticEvalClose,
-                cp,
-                cp + 2,
-            ));
-            
-            // Re-inject text after `))` (e.g. `; then`)
+            inject_tokens.push((Token::ArithmeticEvalClose, cp, cp + 2));
+
             let after_parens = cp + 2;
             let remaining = &self.input[after_parens..];
-            if !remaining.is_empty() && !remaining.trim().is_empty() {
-                let mut sub_lexer = Token::lexer(remaining);
+            // Only re-lex up to the newline (the Comment covered everything to EOL).
+            let line_end = remaining.find('\n').unwrap_or(remaining.len());
+            let before_nl = &remaining[..line_end];
+            if !before_nl.is_empty() && !before_nl.trim().is_empty() {
+                let mut sub_lexer = Token::lexer(before_nl);
                 while let Some(token_result) = sub_lexer.next() {
                     let span = sub_lexer.span();
                     match token_result {
@@ -788,17 +786,101 @@ impl Lexer {
                 }
             }
         }
-        
-        // Insert injected tokens AFTER the Comment token (at self.current).
-        // We haven't advanced past the Comment yet, so insert at self.current + 1.
-        let insert_at = self.current + 1;
+
+        // ---- Remove stale tokens ----
+        // The Comment token at self.current spans from `#` to the newline.
+        // Any tokens between the Comment and the first token after the newline
+        // are stale (they were subsumed by the Comment).  Remove them all.
+        let after_comment_end = self.tokens[self.current].2; // Comment's byte end
+        let remove_start_idx = self.current;     // Remove the Comment itself
+        let mut remove_end_idx = remove_start_idx + 1;
+        while remove_end_idx < self.tokens.len() {
+            if self.tokens[remove_end_idx].1 >= after_comment_end {
+                break; // First token that starts at or after Comment's end (usually Newline)
+            }
+            remove_end_idx += 1;
+        }
+        let removed_len = remove_end_idx - remove_start_idx;
+
+        if removed_len > 0 {
+            self.tokens.drain(remove_start_idx..remove_end_idx);
+            if self.current >= remove_end_idx {
+                self.current = self.current.saturating_sub(removed_len);
+            } else if self.current >= remove_start_idx {
+                self.current = remove_start_idx;
+            }
+        }
+
+        // Insert injected tokens at the position where the Comment was.
+        let insert_at = remove_start_idx;
         for (j, st) in inject_tokens.iter().enumerate() {
             self.tokens.insert(insert_at + j, st.clone());
         }
-        
-        // Advance lexer past the Comment token.
-        self.current += 1;
+
+        // Point current at the first injected token (ArithmeticEvalClose).
+        self.current = remove_start_idx;
         captured
+    }
+
+    /// Handle a Comment token that appears inside `${...}` where `#` is a
+    /// parameter-expansion operator, not a comment start.  The Comment may
+    /// have consumed the closing `}` and subsequent text (e.g. `#* } ]; then`).
+    /// This method:
+    ///   1. Finds the first `}` in the comment text.
+    ///   2. Returns everything from `#` up to (but not including) that `}`.
+    ///   3. Re-injects any text after `}` as newly-lexed tokens so the
+    ///      caller can continue parsing normally.
+    pub fn handle_comment_with_brace(&mut self, mut brace_depth: usize) -> Result<String, ParserError> {
+        let idx = self.current;
+        let start = self.tokens[idx].1;
+        let end = self.tokens[idx].2;
+        let text = self.input[start..end].to_string();
+
+        if let Some(pos) = text.find('}') {
+            let before = &text[..pos];       // content up to `}`
+            let after  = &text[pos + 1..];   // content after `}`
+
+            // Remove the Comment token itself; we are going to replace it.
+            self.tokens.remove(idx);
+            if self.current >= idx && self.current > 0 {
+                self.current -= 1;
+            }
+
+            // Build tokens to inject: none (the `}` is implicit because we
+            // break brace_depth to 0).  But re-lex the `after` text and
+            // inject those tokens.
+            let mut inject: Vec<(Token, usize, usize)> = Vec::new();
+            if !after.trim().is_empty() {
+                // Map positions relative to the original comment start
+                let comment_start = start;
+                let after_start = comment_start + pos + 1;
+                let mut sub = Token::lexer(after);
+                while let Some(tok) = sub.next() {
+                    let span = sub.span();
+                    if let Ok(t) = tok {
+                        inject.push((t, after_start + span.start, after_start + span.end));
+                    }
+                }
+            }
+
+            // Insert injected tokens at the Comment's old position.
+            let insert_at = idx;
+            for (j, t) in inject.iter().enumerate() {
+                self.tokens.insert(insert_at + j, t.clone());
+            }
+
+            // Point current at the first injected token (or stay at idx
+            // if nothing was injected, but the caller will advance).
+            if self.current >= idx {
+                self.current = idx;
+            }
+
+            Ok(before.to_string())
+        } else {
+            // No `}` found — consume the Comment as literal text.
+            self.current += 1;
+            Ok(text)
+        }
     }
 
     pub fn offset_to_line_col(&self, offset: usize) -> (usize, usize) {

@@ -2110,6 +2110,16 @@ impl Parser {
                                 expansion.push_str(&self.lexer.get_raw_token_text()?);
                                 brace_depth += 1;
                             }
+                            Some(Token::Comment) => {
+                                // A `#` inside ${...} is a parameter-expansion operator
+                                // (${var#pattern}, ${var##pattern}), not a comment start.
+                                // We need to split the Comment at `}` and inject any
+                                // text after `}` as re-lexed tokens (e.g. `]; then`).
+                                let text = self.lexer.handle_comment_with_brace(brace_depth)?;
+                                expansion.push_str(&text);
+                                brace_depth = 0;
+                                break;
+                            }
                             Some(_) => expansion.push_str(&self.lexer.get_raw_token_text()?),
                             None => {
                                 return Err(ParserError::InvalidSyntax(
@@ -2438,6 +2448,17 @@ impl Parser {
                             return Err(ParserError::InvalidSyntax(
                                 "Unexpected end of input in parameter expansion".to_string(),
                             ));
+                        }
+                        Some(Token::Comment) => {
+                            // A `#` inside ${...} is a parameter-expansion operator
+                            // (${var#pattern}), not a comment start.
+                            let text = self.lexer.get_raw_token_text()?;
+                            if let Some(pos) = text.find('}') {
+                                expression_parts.push(text[..pos].to_string());
+                                break;
+                            } else {
+                                expression_parts.push(text);
+                            }
                         }
                         _ => {
                             // In parameter expansion, operators like %, #, :, -, +, ?, /, = are valid
