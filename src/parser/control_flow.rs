@@ -393,6 +393,12 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
                                 parser.lexer.next();
                             }
                         }
+                        Some(Token::ParenOpen) if nested_parens == 0 && current_pattern.trim().is_empty() => {
+                            // In bash, case patterns can be surrounded by optional parentheses.
+                            // When '(' appears at the start of a pattern with no preceding content,
+                            // it is just a wrapper delimiter, not part of the pattern or nesting.
+                            parser.lexer.next();
+                        }
                         Some(Token::ParenOpen) => {
                             nested_parens += 1;
                             current_pattern.push('(');
