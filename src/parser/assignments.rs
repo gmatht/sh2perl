@@ -406,6 +406,14 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 // Skip whitespace
                 lexer.next();
             }
+            Some(Token::DollarParen) => {
+                // Nested $(...) command substitution inside arithmetic
+                paren_depth += 1;
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                lexer.next();
+            }
             Some(Token::Dollar) => {
                 // Handle variable references like $i
                 lexer.next();
