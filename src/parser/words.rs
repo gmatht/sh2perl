@@ -175,6 +175,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::Number)
             | Some(Token::Float)
             | Some(Token::PaddedNumber)
+            | Some(Token::HexNumber)
             | Some(Token::Slash)
             | Some(Token::Dot)
             | Some(Token::Range)
@@ -200,6 +201,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Number)
                 | Some(Token::Float)
                 | Some(Token::PaddedNumber)
+                | Some(Token::HexNumber)
                 | Some(Token::Slash)
                 | Some(Token::Dot)
                 | Some(Token::Range)
@@ -251,6 +253,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
         Some(Token::Float) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
+        Some(Token::HexNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::DoubleQuote) => {
             // Handle a bare DoubleQuote that logos could not match as a full
             // DoubleQuotedString (e.g. because of backslash-newline continuation
@@ -714,6 +717,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         Some(Token::Number) => Ok(Word::Literal(lexer.get_number_text()?, None)),
         Some(Token::Float) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::PaddedNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
+        Some(Token::HexNumber) => Ok(Word::Literal(lexer.get_raw_token_text()?, None)),
         Some(Token::DoubleQuote) => {
             // Handle a bare DoubleQuote that logos could not match as a full
             // DoubleQuotedString (e.g. because of backslash-newline continuation

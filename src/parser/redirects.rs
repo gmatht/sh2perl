@@ -256,9 +256,9 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
 /// the raw input.  Scans backwards from the first newline after the current
 /// position to find the delimiter and checks for surrounding quote characters.
 fn detect_heredoc_quoted(lexer: &Lexer, target: &Word) -> bool {
-    let delim = match target {
-        Word::Literal(s, _) => s.clone(),
-        _ => return false,
+    let delim = match heredoc_delim_from_word(target) {
+        Some(s) => s,
+        None => return false,
     };
     if delim.is_empty() {
         return false;
@@ -285,10 +285,27 @@ fn detect_heredoc_quoted(lexer: &Lexer, target: &Word) -> bool {
     line.contains(&single_quoted) || line.contains(&double_quoted) || line.contains(&backslash_quoted)
 }
 
+/// Helper: extract a literal string from a Word, accepting both
+/// `Literal` and `StringInterpolation` with a single literal part.
+fn heredoc_delim_from_word(word: &Word) -> Option<String> {
+    match word {
+        Word::Literal(s, _) => Some(s.clone()),
+        Word::StringInterpolation(interp, _) => {
+            if interp.parts.len() == 1 {
+                if let crate::ast_words::StringPart::Literal(s) = &interp.parts[0] {
+                    return Some(s.clone());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, ParserError> {
-    let delim = match target {
-        Word::Literal(s, _) => s.clone(),
-        _ => {
+    let delim = match heredoc_delim_from_word(target) {
+        Some(s) => s,
+        None => {
             return Err(ParserError::InvalidSyntax(
                 "Heredoc delimiter must be a literal string".to_string(),
             ))
