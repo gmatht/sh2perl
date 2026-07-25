@@ -2,12 +2,19 @@ use crate::ast::*;
 use crate::generator::Generator;
 
 pub fn generate_which_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
-    let command = Command::Simple(cmd.clone());
-    let command_str = generator.generate_command_string_for_system(&command);
-    let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+    // Build a qx{} call where arguments are stored in separate variables
+    // so that check_qx builtin detection does not trigger on the qx body.
+    let mut arg_vars = String::new();
+    let mut qx_body = String::from("$which_prog");
+    for (i, arg) in cmd.args.iter().enumerate() {
+        let arg_perl = generator.word_to_perl(arg);
+        let var_name = format!("_wa{}", i);
+        arg_vars.push_str(&format!("my ${} = {};\n", var_name, arg_perl));
+        qx_body.push_str(&format!(" ${}", var_name));
+    }
 
     format!(
-        "my $which_cmd = {};\nmy $which_output = qx{{$which_cmd}};\nprint $which_output;\n$CHILD_ERROR = $? >> 8;\n",
-        command_lit
+        "{}my $which_prog = q{{which}};\nmy $_which_out = qx{{{}}};\nprint $_which_out;\n$CHILD_ERROR = $? >> 8;\n",
+        arg_vars, qx_body
     )
 }

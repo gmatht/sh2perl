@@ -165,7 +165,7 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
         return format!(
-            "do {{ my $touch_cmd = {}; qx{{$touch_cmd}}; }};\n",
+            "do {{ my $touch_cmd_str = {}; system $touch_cmd_str; }};\n",
             command_lit
         );
     }
