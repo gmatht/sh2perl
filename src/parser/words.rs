@@ -186,6 +186,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::Star)
             | Some(Token::Percent)
             | Some(Token::Comma)
+            | Some(Token::Question)
             | Some(Token::PlusAssign)
             | Some(Token::MinusAssign)
             | Some(Token::StarAssign)
@@ -209,7 +210,8 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Colon)
                 | Some(Token::Star)
                 | Some(Token::Percent)
-                | Some(Token::Comma) => {
+                | Some(Token::Comma)
+                | Some(Token::Question) => {
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -652,6 +654,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::Star)
             | Some(Token::Percent)
             | Some(Token::Comma)
+            | Some(Token::Question)
             | Some(Token::PlusAssign)
             | Some(Token::MinusAssign)
             | Some(Token::StarAssign)
@@ -676,6 +679,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::Star)
                 | Some(Token::Percent)
                 | Some(Token::Comma)
+                | Some(Token::Question)
                 | Some(Token::PlusAssign)
                 | Some(Token::MinusAssign)
                 | Some(Token::StarAssign)
@@ -822,10 +826,12 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             lexer.next();
             Ok(Word::Literal("..".to_string(), None))
         }
-        Some(Token::Star) | Some(Token::Percent) => {
+        Some(Token::Star) | Some(Token::Percent) | Some(Token::Question) => {
             // Treat standalone '*' as a literal (e.g., `ls *`)
             lexer.next();
-            Ok(Word::Literal("*".to_string(), None))
+            let raw = lexer.get_current_text().unwrap_or_default();
+            let text = if raw.is_empty() { "*".to_string() } else { raw };
+            Ok(Word::Literal(text, None))
         }
         Some(Token::Dot) => {
             // Treat standalone '.' as a literal (e.g., `ls .`)
