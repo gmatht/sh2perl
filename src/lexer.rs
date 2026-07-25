@@ -366,6 +366,10 @@ pub enum Token {
     // attempting a greedy match that fails inside ${...} expansions.
     #[regex(r#"\\""#, priority = 6)]
     EscapedDoubleQuote,
+    // Escaped single-quote: backslash-quote - higher priority than Escape
+    // so that backslash-quote is matched as a single token.
+    #[regex(r"\\'", priority = 6)]
+    EscapedSingleQuote,
     #[regex(r"\n", priority = 5)]
     Newline,
     #[token("\r")]
@@ -483,6 +487,10 @@ impl Lexer {
         // " even inside $(...)/${...}, so we manually scan from each
         // opening " forward, tracking nesting, to find the real closing ".
         Self::merge_double_quoted_strings(input, &mut tokens);
+
+        // Split over-greedy SingleQuotedString tokens that span multiple
+        // lines and contain shell keywords.
+        Self::split_overgreedy_sq(input, &mut tokens);
 
         // Precompute starts of lines
 
@@ -970,6 +978,118 @@ impl Lexer {
             i += 1;
         }
         *tokens = merged;
+    }
+    /// Split over-greedy SingleQuotedString tokens that span multiple
+    /// lines and contain known shell keywords after newlines.
+    /// Logos's `'[^']*'` can match a closing `'` that is far away (e.g.
+    /// inside a case pattern), consuming intervening shell code.  We
+    /// detect such tokens and split them at the first newline that is
+    /// followed by a shell keyword, turning the opening `'` into a bare
+    /// `SingleQuote` token and re-tokenizing the tail with a fresh logos
+    /// instance.
+    pub fn split_overgreedy_sq(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
+        let bytes = input.as_bytes();
+        let mut result: Vec<(Token, usize, usize)> = Vec::new();
+
+        for token in tokens.drain(..) {
+            let (tok, start, end) = token;
+            if tok != Token::SingleQuotedString {
+                result.push((tok, start, end));
+                continue;
+            }
+
+            // Only consider tokens that span at least one newline
+            let span = &input[start..end];
+            if !span.contains('\n') {
+                result.push((tok, start, end));
+                continue;
+            }
+
+            // Check if this SQ is preceded by an Escape or EscapedSingleQuote token.
+            // If so, it's not over-greedy.
+            let mut preceded_by_escape = false;
+            if let Some(&(ref prev_tok, ref prev_end, _)) = result.last() {
+                if (*prev_tok == Token::Escape || *prev_tok == Token::EscapedSingleQuote)
+                    && *prev_end == start
+                {
+                    preceded_by_escape = true;
+                }
+            }
+            if preceded_by_escape {
+                result.push((tok, start, end));
+                continue;
+            }
+
+            // Scan the content for newline followed by a shell keyword
+            let content = &span[1..]; // skip opening '
+
+            let keywords = [
+                "while ", "for ", "case ", "if ", "do ",
+                "done", "then", "fi", "esac", "elif ",
+                "until ", "select ", "function ", "{",
+            ];
+            let mut split_pos = None;
+
+            for (i, ch) in content.char_indices() {
+                if ch == '\n' {
+                    let mut j = i + 1;
+                    while j < content.len()
+                        && (content.as_bytes()[j] == b' '
+                            || content.as_bytes()[j] == b'\t')
+                    {
+                        j += 1;
+                    }
+                    if j < content.len() {
+                        let rest = &content[j..];
+                        for kw in &keywords {
+                            if rest.starts_with(kw) {
+                                split_pos = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    if split_pos.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            if let Some(split_at) = split_pos {
+                let body_start = start + 1;
+                let split_byte = body_start + split_at;
+
+                // Emit the opening ' as a bare SingleQuote
+                result.push((Token::SingleQuote, start, start + 1));
+
+                // Content between opening ' and split point
+                if split_byte > start + 1 {
+                    result.push((Token::SingleQuotedString, start + 1, split_byte));
+                }
+
+                // Re-tokenize the tail using logos
+                if split_byte < end {
+                    let tail = &input[split_byte..end];
+                    let mut tail_lex = Token::lexer(tail);
+                    while let Some(token_result) = tail_lex.next() {
+                        let tail_span = tail_lex.span();
+                        match token_result {
+                            Ok(tok) => {
+                                result.push((
+                                    tok,
+                                    split_byte + tail_span.start,
+                                    split_byte + tail_span.end,
+                                ));
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                }
+            } else {
+                result.push((tok, start, end));
+            }
+        }
+
+        *tokens = result;
     }
 }
 

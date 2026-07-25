@@ -181,7 +181,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::Plus)
             | Some(Token::Minus)
             | Some(Token::Escape)
-            | Some(Token::EscapedDoubleQuote)
+            | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
             | Some(Token::Colon)
             | Some(Token::Star)
             | Some(Token::Percent)
@@ -205,7 +205,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
-                | Some(Token::EscapedDoubleQuote)
+                | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
                 | Some(Token::Colon)
                 | Some(Token::Star)
                 | Some(Token::Percent)
@@ -647,7 +647,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::Plus)
             | Some(Token::Minus)
             | Some(Token::Escape)
-            | Some(Token::EscapedDoubleQuote)
+            | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
             | Some(Token::Colon)
             | Some(Token::Star)
             | Some(Token::Percent)
@@ -671,7 +671,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
-                | Some(Token::EscapedDoubleQuote)
+                | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
                 | Some(Token::Colon)
                 | Some(Token::Star)
                 | Some(Token::Percent)
@@ -2951,6 +2951,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Token::Tilde
                 | Token::Escape
                 | Token::EscapedDoubleQuote
+                | Token::EscapedSingleQuote
                 | Token::HexNumber
                 | Token::Semicolon
                 | Token::NonZero
