@@ -280,9 +280,16 @@ pub enum Token {
     RegexMatch,
 
     // Strings and literals
-    #[regex(r#""([^"\\]|\\\n|\\.)*""#, priority = 4)]
+    #[regex(r#""([^"\\\n]|\\\n|\\.)*""#, priority = 4)]
     DoubleQuotedString,
-    #[regex(r"'[^']*'", priority = 3)]
+    // SingleQuotedString is handled by post-processing (pairing SingleQuote tokens).
+    // We do NOT define a regex for it because logos 0.15 has a bug where the regex
+    // `'[^']*'` corrupts internal state when no closing quote is found.
+    // The token is kept as a variant for parser compatibility; it is produced
+    // during post-processing by merging pairs of SingleQuote tokens.
+    // We give it a token attribute for logos compatibility but with lowest priority
+    // so it never matches (it's just a placeholder).
+    #[token("'", priority = 0)]
     SingleQuotedString,
     #[regex(r"`([^`\\]|\\.)*`", priority = 3)]
     BacktickString,
@@ -417,43 +424,44 @@ impl Lexer {
             }
         }
 
-        // Workaround for logos 0.15 bug: when a regex fails after consuming bytes,
-        // logos may stop producing tokens even though input remains.  Re-lex
-        // the untokenized tail with a fresh logos instance, skipping any bare
-        // ' characters that the SingleQuotedString regex cannot handle.
-        if let Some(&(_, _, last_end)) = tokens.last() {
-            if last_end < input.len() {
-                let remaining = &input[last_end..];
-                let mut skip = 0;
-                while skip < remaining.len() && remaining.as_bytes()[skip] == b'\'' {
-                    tokens.push((Token::SingleQuote, last_end + skip, last_end + skip + 1));
-                    skip += 1;
+        if crate::debug::is_debug_enabled() {
+            eprintln!("DEBUG RAW2: {} tokens total", tokens.len());
+            for (j, (tok, st, en)) in tokens.iter().enumerate() {
+                let text = &input[*st..*en];
+                if *st >= 450 && *st <= 600 {
+                    eprintln!("DEBUG RAW2[{:4}]: {:30?} bytes[{:4}-{:4}] = {:?}", j, tok, st, en, text);
                 }
-                if skip > 0 {
-                    let remaining = &remaining[skip..];
-                    if !remaining.is_empty() {
-                        let mut resume = Token::lexer(remaining);
-                        while let Some(token_result) = resume.next() {
-                            let span = resume.span();
-                            match token_result {
-                                Ok(tok) => {
-                                    tokens.push((tok, last_end + skip + span.start, last_end + skip + span.end));
-                                }
-                                Err(_) => continue,
-                            }
+            }
+        }
+
+        // Workaround for logos bug: when a regex (e.g. SingleQuotedString
+        // `'[^']*'`) fails because no closing delimiter is found, logos may
+        // stop producing tokens even though input remains.  Detect this by
+        // checking if the last token ends before the input length, and if so,
+        // resume tokenization for the remaining bytes.
+        if let Some(&(_, _, last_end)) = tokens.last() {
+            if crate::debug::is_debug_enabled() {
+                eprintln!("DEBUG LOGOS: last_end={}, input.len={}", last_end, input.len());
+            }
+            if last_end < input.len() {
+                if crate::debug::is_debug_enabled() {
+                    eprintln!("DEBUG LOGOS: Resuming tokenization from byte {} ({} bytes remaining)", last_end, input.len() - last_end);
+                    eprintln!("DEBUG LOGOS: Remaining text: {:?}", &input[last_end..std::cmp::min(last_end + 100, input.len())]);
+                }
+                // Re-lex the remaining bytes with a fresh logos lexer.
+                let remaining = &input[last_end..];
+                let mut resume_lexer = Token::lexer(remaining);
+                while let Some(token_result) = resume_lexer.next() {
+                    let span = resume_lexer.span();
+                    match token_result {
+                        Ok(token) => {
+                            tokens.push((token, last_end + span.start, last_end + span.end));
                         }
+                        Err(_) => continue,
                     }
-                } else {
-                    let mut resume = Token::lexer(remaining);
-                    while let Some(token_result) = resume.next() {
-                        let span = resume.span();
-                        match token_result {
-                            Ok(tok) => {
-                                tokens.push((tok, last_end + span.start, last_end + span.end));
-                            }
-                            Err(_) => continue,
-                        }
-                    }
+                }
+                if crate::debug::is_debug_enabled() {
+                    eprintln!("DEBUG LOGOS: After resuming, total tokens = {}", tokens.len());
                 }
             }
         }
@@ -541,6 +549,63 @@ impl Lexer {
                 i += 1;
             }
             tokens = merged;
+        }
+
+        
+
+// Post-process: merge single-quoted strings.
+        // After DQ processing, any remaining SingleQuote tokens should form
+        // balanced pairs that represent single-quoted strings.  Scan through
+        // the input bytes to match '...' pairs and merge them.
+        {
+            let mut merged: Vec<(Token, usize, usize)> = Vec::new();
+            let mut i = 0;
+            while i < tokens.len() {
+                if tokens[i].0 == Token::SingleQuote
+                    && tokens[i].2 > tokens[i].1
+                {
+                    let start = tokens[i].1;
+                    let bytes = input.as_bytes();
+                    // Scan forward for the closing '
+                    let mut end = start + 1;
+                    while end < bytes.len() && bytes[end] != b'\'' {
+                        end += 1;
+                    }
+                    if end < bytes.len() {
+                        end += 1; // include closing '
+                        // Verify a corresponding SingleQuote token exists at end-1
+                        let mut found = false;
+                        for j in i + 1..tokens.len() {
+                            if tokens[j].0 == Token::SingleQuote
+                                && tokens[j].2 > tokens[j].1
+                                && tokens[j].1 == end - 1
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if found {
+                            merged.push((Token::SingleQuotedString, start, end));
+                            while i + 1 < tokens.len() && tokens[i + 1].1 < end {
+                                i += 1;
+                            }
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                merged.push(tokens[i].clone());
+                i += 1;
+            }
+            tokens = merged;
+        if crate::debug::is_debug_enabled() {
+            eprintln!("DEBUG FINAL: tokens.len={}", tokens.len());
+            for (j, (tok, st, en)) in tokens.iter().enumerate() {
+                let text = &input[*st..*en];
+                eprintln!("DEBUG FINAL[{}]: {:30?} bytes[{:4}-{:4}] = {:?}", j, tok, st, en, text);
+            }
+        }
+
         }
 
         // Precompute starts of lines for quick offset->(line,col)
