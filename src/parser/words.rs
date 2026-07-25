@@ -583,6 +583,16 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     lexer.next();
                     Ok(Word::Literal(text, None))
                 }
+                Some(Token::Question) => {
+                    // A standalone ? in word position is a valid glob character
+                    lexer.next();
+                    Ok(Word::Literal("?".to_string(), None))
+                }
+                Some(Token::Question) => {
+                    // A standalone ? in word position is a valid glob character
+                    lexer.next();
+                    Ok(Word::Literal("?".to_string(), None))
+                }
                 _ => {
                     let token = token.unwrap_or(Token::Identifier);
                     // Use the actual byte offset of the current token for error position
@@ -2584,6 +2594,38 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
             Ok(ParameterExpansion {
                 variable: parts[0].to_string(),
                 operator: ParameterExpansionOperator::ErrorIfUnset(parts[1].to_string()),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if content.contains('-') && !content.contains('%') && !content.contains('#') && !content.contains('/') && !content.contains('!') && !content.contains(':') {
+        // ${var-default} - use default if var is unset (not if empty)
+        let parts: Vec<&str> = content.splitn(2, '-').collect();
+        if parts.len() == 2 && !parts[0].is_empty() {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if content.contains("=-") {
+        // ${var=-default} - assign default if var is unset
+        let parts: Vec<&str> = content.splitn(2, "=-").collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[0].contains('%') && !parts[0].contains('#') {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
                 is_mutable: true,
             })
         } else {
