@@ -817,8 +817,23 @@ pub fn generate_pipeline_for_substitution(
                             // expanded in the generated Perl code. Detect an
                             // unescaped sigil by looking for a $ or @ not preceded
                             // by a backslash in the raw (pre-decoded) text.
-                            let sigil_re = Regex::new(r"(?<!\\)[\$@]").unwrap();
-                            if was_double && sigil_re.is_match(&raw) {
+                            // Use a simple scan instead of regex with look-behind
+                            // (which Rust regex does not support).
+                            let has_unescaped_sigil = {
+                                let mut found = false;
+                                let mut chars = raw.chars().peekable();
+                                while let Some(ch) = chars.next() {
+                                    if ch == '\\' {
+                                        // Skip the escaped character
+                                        chars.next();
+                                    } else if ch == '$' || ch == '@' {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                found
+                            };
+                            if was_double && has_unescaped_sigil {
                                 generator.perl_string_literal_force_interp(&Word::literal(decoded))
                             } else {
                                 generator.perl_string_literal(&Word::literal(decoded))

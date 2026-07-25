@@ -494,14 +494,22 @@ impl Lexer {
                         let mut end = start + 1; // skip past opening "
                         let mut p_depth = 0i32;
                         let mut b_depth = 0i32;
+                        let mut bt_depth = 0i32; // backtick depth
                         while end < bytes.len() {
                             match bytes[end] {
-                                b'"' if p_depth == 0 && b_depth == 0 => {
+                                b'"' if p_depth == 0 && b_depth == 0 && bt_depth == 0 => {
                                     end += 1; // include closing "
                                     break;
                                 }
                                 b'\\' if end + 1 < bytes.len() => {
                                     end += 2; // skip escaped char
+                                }
+                                b'`' => {
+                                    // Toggle backtick depth — backticks inside double
+                                    // quotes are command substitutions and should not
+                                    // cause the inner " to close the outer string.
+                                    bt_depth = if bt_depth == 0 { 1 } else { 0 };
+                                    end += 1;
                                 }
                                 b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'(' => {
                                     p_depth += 1;
