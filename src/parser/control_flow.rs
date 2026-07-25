@@ -413,6 +413,50 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
                             current_pattern.push(' ');
                             parser.lexer.next();
                         }
+                        Some(Token::Escape) => {
+                            // `\'` in a case pattern: backslash escapes the
+                            // following single-quote, making it a literal char.
+                            // The lexer splits this into Escape + SingleQuotedString.
+                            // Handle it as a pair: take the backslash and only the
+                            // opening single-quote, then re-inject the rest of the
+                            // SingleQuotedString for re-tokenization.
+                            current_pattern.push('\\');
+                            parser.lexer.next();
+                            if matches!(parser.lexer.peek(), Some(Token::SingleQuotedString)) {
+                                // Get the byte span of the SingleQuotedString token
+                                let (sq_start, sq_end) = parser.lexer.get_span()
+                                    .ok_or_else(|| ParserError::InvalidSyntax(
+                                        "Missing span for SingleQuotedString after Escape".to_string()
+                                    ))?;
+                                let sq_text = parser.lexer.get_raw_token_text()?;
+                                // sq_text = '...' (with surrounding quotes)
+                                // First char is the escaped quote
+                                current_pattern.push('\'');
+                                // Everything from sq_start+1 (after the opening ')
+                                // to sq_end needs to be re-tokenized.
+                                let after_start = sq_start + 1;
+                                let after_text = &parser.lexer.input[after_start..sq_end];
+                                if !after_text.is_empty() {
+                                    use logos::Logos;
+                                    let mut inner_lex = Token::lexer(after_text);
+                                    let mut inject: Vec<(Token, usize, usize)> = Vec::new();
+                                    while let Some(tok_result) = inner_lex.next() {
+                                        if let Ok(t) = tok_result {
+                                            let span = inner_lex.span();
+                                            inject.push((
+                                                t,
+                                                after_start + span.start,
+                                                after_start + span.end,
+                                            ));
+                                        }
+                                    }
+                                    let insert_at = parser.lexer.current;
+                                    for (j, t) in inject.iter().enumerate() {
+                                        parser.lexer.tokens.insert(insert_at + j, t.clone());
+                                    }
+                                }
+                            }
+                        }
                         Some(_) => {
                             current_pattern.push_str(&parser.lexer.get_raw_token_text()?);
                         }
