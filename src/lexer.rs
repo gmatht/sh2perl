@@ -1023,10 +1023,14 @@ impl Lexer {
             // Scan the content for newline followed by a shell keyword
             let content = &span[1..]; // skip opening '
 
+            // Only split on closing/continuation keywords that indicate
+            // the single-quoted string has likely overrun its bounds.
+            // Opening keywords like '{', 'while', 'for', 'if', 'case',
+            // 'until', 'select', 'function' can legitimately appear inside
+            // multi-line quoted strings passed to awk, sed, perl, etc.
             let keywords = [
-                "while ", "for ", "case ", "if ", "do ",
                 "done", "then", "fi", "esac", "elif ",
-                "until ", "select ", "function ", "{",
+                "do ",
             ];
             let mut split_pos = None;
 
@@ -1043,8 +1047,18 @@ impl Lexer {
                         let rest = &content[j..];
                         for kw in &keywords {
                             if rest.starts_with(kw) {
-                                split_pos = Some(i);
-                                break;
+                                // Only split if the keyword is standalone on its line:
+                                // after the keyword, only whitespace until newline or end.
+                                let after_kw = &rest[kw.len()..];
+                                let is_standalone = after_kw.is_empty()
+                                    || after_kw.starts_with('\n')
+                                    || after_kw.starts_with('\r')
+                                    || after_kw.trim().is_empty()
+                                    || after_kw.trim_start().starts_with('#');
+                                if is_standalone {
+                                    split_pos = Some(i);
+                                    break;
+                                }
                             }
                         }
                     }
