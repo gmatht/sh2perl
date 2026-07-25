@@ -1835,7 +1835,7 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                 expression_parts.push("+".to_string());
                 lexer.next();
             }
-            Some(Token::Escape) | Some(Token::EscapedDoubleQuote) => {
+            Some(Token::Escape) | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) => {
                 expression_parts.push("\\".to_string());
                 lexer.next();
             }
