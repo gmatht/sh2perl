@@ -284,7 +284,7 @@ pub enum Token {
     DoubleQuotedString,
     #[regex(r"'[^']*'", priority = 3)]
     SingleQuotedString,
-    #[regex(r"`([^`\\]|\\.)*`", priority = 3)]
+    #[regex(r"`([^`\\]|\\\n|\\.)*`", priority = 3)]
     BacktickString,
     #[regex(r"\$'([^'\\]|\\.)*'", priority = 3)]
     DollarSingleQuotedString,

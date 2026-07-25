@@ -3177,32 +3177,25 @@ fn parse_braced_variable_name(lexer: &mut Lexer) -> Result<String, ParserError> 
                 Some(Token::Comment) => {
                     // A `#` inside ${...} is a parameter expansion operator (${var#pattern},
                     // ${var##pattern}), not a comment start.  The logos lexer, however,
-                    // tokenises `#...` as a Comment.  Check whether the comment text
-                    // contains the closing `}` we are looking for and, if so, split on it.
+                    // tokenises `#...` as a Comment.
+                    //
+                    // Use the lexer's handle_comment_with_brace which finds the first `}`
+                    // inside the comment text, returns everything before it, and re-lexes
+                    // any text after `}` so that subsequent tokens (e.g. `in`) are not lost.
                     let text = lexer.get_text(start, end);
-                    if let Some(pos) = text.find('}') {
-                        // Only push the part before the `}`
-                        content.push_str(&text[..pos]);
+                    if text.contains('}') {
+                        let before = lexer.handle_comment_with_brace(brace_depth)?;
+                        content.push_str(&before);
                         brace_depth -= 1;
-                        lexer.next(); // consume the Comment token
                         if brace_depth == 0 {
                             break;
                         }
-                        // The remainder of the comment after `}` may contain more `}` chars
-                        // (unusual but handle gracefully)
-                        let remaining = &text[pos + 1..];
-                        for ch in remaining.chars() {
-                            if ch == '}' {
-                                brace_depth -= 1;
-                                if brace_depth == 0 {
-                                    break;
-                                }
-                            }
-                        }
-                        if brace_depth == 0 {
-                            break;
-                        }
+                        // handle_comment_with_brace removed the Comment token and injected
+                        // re-lexed tokens.  Do NOT call lexer.next() — current already
+                        // points at the first injected token.
                     } else {
+                        // No `}` means this # is just part of a variable name or pattern
+                        // (e.g. ${#var} for length).  Consume the comment as literal text.
                         content.push_str(&text);
                         lexer.next();
                     }

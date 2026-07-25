@@ -149,11 +149,31 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
     }
 
     // For here-strings, parse the string content as the target
-    let target = if matches!(operator, RedirectOperator::HereString) {
+    let target_raw = if matches!(operator, RedirectOperator::HereString) {
         // For here-strings, parse the string content that follows
         parse_word(lexer)?
     } else {
         parse_word(lexer)?
+    };
+
+    // For heredocs, strip leading backslash from the delimiter.
+    // `<<\EOF` means the delimiter is `EOF` (backslash quotes it).
+    let mut heredoc_quoted = false;
+    let target = match operator {
+        RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => {
+            if let Word::Literal(s, meta) = &target_raw {
+                if s.starts_with('\\') {
+                    heredoc_quoted = true;
+                    eprintln!("DEBUG: stripped backslash from heredoc delimiter '{}' -> '{}'", s, &s[1..]);
+                    Word::Literal(s[1..].to_string(), *meta)
+                } else {
+                    target_raw
+                }
+            } else {
+                target_raw
+            }
+        }
+        _ => target_raw,
     };
 
     // If this is a heredoc, DO NOT parse the body here — the caller
@@ -182,7 +202,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
                                     operator,
                                     target,
                                     heredoc_body: None,
-                                    heredoc_quoted: false,
+                                    heredoc_quoted,
                                 });
                             }
                         }
@@ -200,7 +220,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
         operator,
         target,
         heredoc_body,
-        heredoc_quoted: false,
+        heredoc_quoted,
     })
 }
 
@@ -258,10 +278,11 @@ fn detect_heredoc_quoted(lexer: &Lexer, target: &Word) -> bool {
     // Find the beginning of the line containing the delimiter (search backwards from start_pos)
     let line_start = input[..start_pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
     let line = &input[line_start..start_pos];
-    // Look for 'delim' or "delim" (with quotes)
+    // Look for 'delim' or "delim" (with quotes) or \delim (backslash-quoted)
     let single_quoted = format!("'{}'", delim);
     let double_quoted = format!("\"{}\"", delim);
-    line.contains(&single_quoted) || line.contains(&double_quoted)
+    let backslash_quoted = format!("\\{}", delim);
+    line.contains(&single_quoted) || line.contains(&double_quoted) || line.contains(&backslash_quoted)
 }
 
 fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, ParserError> {
@@ -273,9 +294,11 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
             ))
         }
     };
+    eprintln!("DEBUG parse_heredoc: delim='{}'", delim);
 
     // Find the start of the heredoc body in the raw input.
     let start_pos = if let Some((cur_pos, _)) = lexer.get_span() {
+        eprintln!("DEBUG parse_heredoc: cur_pos={}, input[..]={:?}", cur_pos, &lexer.input[cur_pos..cur_pos+40.min(lexer.input.len()-cur_pos)]);
         match lexer.input[cur_pos..].find('\n') {
             Some(nl_offset) => cur_pos + nl_offset + 1,
             None => lexer.input.len(),
