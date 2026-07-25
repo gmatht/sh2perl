@@ -12,6 +12,19 @@ use crate::parser::utilities::ParserUtilities;
 use crate::parser::words::{parse_word, parse_word_no_newline_skip};
 use std::collections::{BTreeMap, HashMap};
 
+/// Convert a Word into a Vec of StringParts for use in StringInterpolation.
+fn word_to_parts(word: Word) -> Vec<StringPart> {
+    match word {
+        Word::Literal(s, _) => vec![StringPart::Literal(s)],
+        Word::StringInterpolation(interp, _) => interp.parts,
+        Word::Variable(v, _, _) => vec![StringPart::Variable(v)],
+        Word::CommandSubstitution(cmd, _) => vec![StringPart::CommandSubstitution(cmd)],
+        Word::ParameterExpansion(pe, _) => vec![StringPart::ParameterExpansion(pe)],
+        Word::Arithmetic(ae, _) => vec![StringPart::Arithmetic(ae)],
+        other => vec![StringPart::Literal(other.to_string())],
+    }
+}
+
 pub struct Parser {
     pub lexer: Lexer,
     shopt_state: TestModifiers,
@@ -1586,7 +1599,97 @@ impl Parser {
             // Empty value (e.g. IFS= read ...)
             Word::literal(String::new())
         } else {
-            parse_word(&mut self.lexer)?
+            let mut value_word = parse_word(&mut self.lexer)?;
+            // After parsing the initial value, check if there are adjacent
+            // tokens (no whitespace gap) that should be part of the same value.
+            // This handles patterns like `var='foo'\'bar'` where the lexer
+            // splits the shell idiom for embedding a single quote into multiple
+            // tokens (SingleQuotedString + Escape + SingleQuotedString + ...).
+            //
+            // Only activate the merge loop when the next adjacent token is a
+            // continuation (Escape, bare SingleQuote, or another quoted string)
+            // rather than a separator (Newline, Space).
+            let should_merge = match self.lexer.peek() {
+                Some(Token::Escape) => true,
+                Some(Token::SingleQuote) => true,
+                Some(Token::SingleQuotedString) => true,
+                Some(Token::Newline) => {
+                    // Only continue across newlines if the first value token
+                    // was a SingleQuotedString that did NOT reach the closing
+                    // quote on the same line (i.e. the next token after the
+                    // string is not Newline/Space).
+                    false
+                }
+                _ => false,
+            };
+            if should_merge {
+                loop {
+                    let next_token = match self.lexer.peek() {
+                        Some(t) => t,
+                        None => break,
+                    };
+                    // Stop on token types that can never be part of a value.
+                    if matches!(
+                        next_token,
+                        Token::Space
+                            | Token::Tab
+                            | Token::CarriageReturn
+                            | Token::Semicolon
+                            | Token::DoubleSemicolon
+                            | Token::Background
+                            | Token::Pipe
+                            | Token::And
+                            | Token::Or
+                            | Token::RedirectIn
+                            | Token::RedirectOut
+                            | Token::RedirectAppend
+                            | Token::Heredoc
+                            | Token::HeredocTabs
+                            | Token::HereString
+                            | Token::RedirectInOut
+                            | Token::RedirectOutErr
+                            | Token::RedirectInErr
+                            | Token::RedirectOutClobber
+                            | Token::RedirectAll
+                            | Token::RedirectAllAppend
+                    ) {
+                        break;
+                    }
+                    // Check if the next token is adjacent (no gap)
+                    let prev_end = match self.lexer.tokens.get(self.lexer.current.saturating_sub(1)) {
+                        Some((_, _, end)) => *end,
+                        None => break,
+                    };
+                    let next_start = match self.lexer.tokens.get(self.lexer.current) {
+                        Some((_, start, _)) => *start,
+                        None => break,
+                    };
+                    if next_start != prev_end {
+                        break;
+                    }
+                    // Bare SingleQuote = closing delimiter
+                    if matches!(next_token, Token::SingleQuote) {
+                        self.lexer.next();
+                        break;
+                    }
+                    // Newline is literal content inside a multi-line string
+                    if matches!(next_token, Token::Newline) {
+                        value_word = {
+                            let mut parts = word_to_parts(value_word);
+                            parts.push(StringPart::Literal("\n".to_string()));
+                            Word::StringInterpolation(StringInterpolation { parts }, None)
+                        };
+                        self.lexer.next();
+                        continue;
+                    }
+                    // Next token is adjacent — parse it and combine
+                    let next_word = parse_word(&mut self.lexer)?;
+                    let mut parts = word_to_parts(value_word);
+                    parts.extend(word_to_parts(next_word));
+                    value_word = Word::StringInterpolation(StringInterpolation { parts }, None);
+                }
+            }
+            value_word
         };
 
         // Check if there's a command following this assignment.
