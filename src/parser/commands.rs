@@ -637,6 +637,32 @@ impl Parser {
                 let cmd = self.parse_pipeline_segment()?;
                 Ok(Command::Not(Box::new(cmd)))
             }
+            // Handle redirects at the beginning of a command (e.g., < "$file")
+            Some(Token::RedirectIn)
+            | Some(Token::RedirectOut)
+            | Some(Token::RedirectAppend)
+            | Some(Token::RedirectInOut)
+            | Some(Token::Heredoc)
+            | Some(Token::HeredocTabs)
+            | Some(Token::HereString)
+            | Some(Token::RedirectOutErr)
+            | Some(Token::RedirectInErr)
+            | Some(Token::RedirectOutClobber)
+            | Some(Token::RedirectAll)
+            | Some(Token::RedirectAllAppend) => {
+                let redirects = vec![parse_redirect(&mut self.lexer)?];
+                Ok(Command::Redirect(RedirectCommand {
+                    command: Box::new(Command::Simple(SimpleCommand {
+                        name: Word::literal("".to_string()),
+                        args: vec![],
+                        redirects: vec![],
+                        env_vars: BTreeMap::new(),
+                        stdout_used: true,
+                        stderr_used: true,
+                    })),
+                    redirects,
+                }))
+            }
             Some(Token::Identifier) => {
                 // Check for implicit function definition: name() { ... }
                 // Allow whitespace between identifier and parentheses
@@ -1079,7 +1105,7 @@ impl Parser {
                     | Some(Token::Star)
                     | Some(Token::Percent)
                     | Some(Token::Escape)
-                    | Some(Token::EscapedDoubleQuote)
+                    | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
                     | Some(Token::Colon)
                     | Some(Token::Comma)
                     | Some(Token::If)
@@ -1489,7 +1515,7 @@ impl Parser {
                 | Token::Plus
                 | Token::Minus
                 | Token::Escape
-                | Token::EscapedDoubleQuote => {
+                | Token::EscapedDoubleQuote | Token::EscapedSingleQuote => {
                     // These are valid argument tokens
                     args.push(parse_word_no_newline_skip(&mut self.lexer)?);
 
@@ -1611,6 +1637,7 @@ impl Parser {
             // rather than a separator (Newline, Space).
             let should_merge = match self.lexer.peek() {
                 Some(Token::Escape) => true,
+                Some(Token::EscapedSingleQuote) => true,
                 Some(Token::SingleQuote) => true,
                 Some(Token::SingleQuotedString) => true,
                 Some(Token::Newline) => {
@@ -1672,8 +1699,60 @@ impl Parser {
                         self.lexer.next();
                         break;
                     }
-                    // Newline is literal content inside a multi-line string
+                    // EscapedSingleQuote token (\') -> literal single quote
+                    if matches!(next_token, Token::EscapedSingleQuote) {
+                        self.lexer.next(); // consume the EscapedSingleQuote token
+                        let mut parts = word_to_parts(value_word);
+                        parts.push(StringPart::Literal("'".to_string()));
+                        value_word = Word::StringInterpolation(StringInterpolation { parts }, None);
+                        continue;
+                    }
+                    // Escape + character: consume the escape and output only
+                    // the escaped character (e.g. \' produces just ').
+                    if matches!(next_token, Token::Escape) {
+                        self.lexer.next(); // consume the backslash
+                        // The next token is the escaped character.
+                        if let Some(escaped_text) = self.lexer.get_current_text() {
+                            let mut parts = word_to_parts(value_word);
+                            // For a SingleQuotedString token (like ''),
+                            // strip the outer quotes and use the content.
+                            let inner = if (escaped_text.starts_with('\'') && escaped_text.ends_with('\''))
+                                || (escaped_text.starts_with('"') && escaped_text.ends_with('"'))
+                            {
+                                &escaped_text[1..escaped_text.len()-1]
+                            } else {
+                                &escaped_text[..]
+                            };
+                            if inner.is_empty() {
+                                // Empty content (e.g. '' after escape) means
+                                // the escaped char is just '
+                                parts.push(StringPart::Literal("'".to_string()));
+                            } else {
+                                parts.push(StringPart::Literal(inner.to_string()));
+                            }
+                            value_word = Word::StringInterpolation(StringInterpolation { parts }, None);
+                            self.lexer.next();
+                            continue;
+                        }
+                        break;
+                    }
+                    // Newline is literal content inside a multi-line string,
+                    // but only if we are still inside a quoted region. A newline
+                    // that follows a SingleQuotedString (which ends with ') is a
+                    // command separator, not string content.
                     if matches!(next_token, Token::Newline) {
+                        // Check the previous token to see if we're inside a
+                        // quoted region.
+                        let prev_is_quote_end = self.lexer.current >= 2
+                            && matches!(
+                                self.lexer.tokens.get(self.lexer.current - 1),
+                                Some((Token::SingleQuotedString, _, _))
+                            );
+                        if prev_is_quote_end {
+                            // This newline follows a closing ' — it's a command
+                            // separator, not string content.
+                            break;
+                        }
                         value_word = {
                             let mut parts = word_to_parts(value_word);
                             parts.push(StringPart::Literal("\n".to_string()));
@@ -2179,7 +2258,7 @@ impl Parser {
                     expression_parts.push("+".to_string());
                     self.lexer.next();
                 }
-                Some(Token::Escape) | Some(Token::EscapedDoubleQuote) => {
+                Some(Token::Escape) | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) => {
                     expression_parts.push("\\".to_string());
                     self.lexer.next();
                 }
