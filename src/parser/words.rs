@@ -214,6 +214,14 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
                         lexer.next();
+                        // If this was an escape character, also consume and append
+                        // the escaped character that follows (e.g. \$ -> literal $)
+                        if matches!(text.as_str(), "\\") {
+                            if let Some(escaped_text) = lexer.get_current_text() {
+                                combined.push_str(&escaped_text);
+                                lexer.next();
+                            }
+                        }
                     } else {
                         break;
                     }
@@ -667,6 +675,14 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
                         lexer.next();
+                        // If this was an escape character, also consume and append
+                        // the escaped character that follows (e.g. \$ -> literal $)
+                        if matches!(text.as_str(), "\\") {
+                            if let Some(escaped_text) = lexer.get_current_text() {
+                                combined.push_str(&escaped_text);
+                                lexer.next();
+                            }
+                        }
                     } else {
                         break;
                     }

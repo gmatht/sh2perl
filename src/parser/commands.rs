@@ -1110,6 +1110,11 @@ impl Parser {
             }
         }
 
+        // If the first token is BraceOpen, this is a block command { ... }, not a word
+        if matches!(self.lexer.peek(), Some(Token::BraceOpen)) {
+            return parse_block(self);
+        }
+
         // Parse the command name first
         let name = parse_word(&mut self.lexer)?;
         let name = match name {
@@ -1188,8 +1193,23 @@ impl Parser {
                                                 }
                                             }
                                             _ => {
-                                                // For other types, use parse_word
-                                                parse_word(&mut self.lexer)?
+                                                // Check for empty value (e.g. export ENV=)
+                                                if matches!(
+                                                    self.lexer.peek(),
+                                                    Some(
+                                                        Token::Space
+                                                            | Token::Tab
+                                                            | Token::Newline
+                                                            | Token::CarriageReturn
+                                                            | Token::Semicolon
+                                                    )
+                                                    | None
+                                                ) {
+                                                    Word::literal(String::new())
+                                                } else {
+                                                    // For other types, use parse_word
+                                                    parse_word(&mut self.lexer)?
+                                                }
                                             }
                                         };
 
