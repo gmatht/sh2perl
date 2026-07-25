@@ -49,7 +49,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         let command_str = generator.generate_command_string_for_system(&command);
         let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
-        return format!("do {{ my $rm_cmd = {}; qx{{$rm_cmd}}; }};\n", command_lit);
+        return format!("do {{ my $rm_cmd_str = {}; system $rm_cmd_str; }};\n", command_lit);
     }
 
     if files.is_empty() {
