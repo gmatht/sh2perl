@@ -2521,7 +2521,9 @@ impl Parser {
                     expression_parts.push(text);
                 }
                 Some(Token::DollarParen) => {
-                    // Handle $() command substitution inside test expressions
+                    // Handle $() command substitution inside test expressions.
+                    // Track nested parens so we don't stop at the first )
+                    // that closes an inner subshell rather than the $().
                     let mut sub = "$(".to_string();
                     self.lexer.next(); // consume $(
                     let mut depth = 1usize;
@@ -2529,6 +2531,11 @@ impl Parser {
                         match self.lexer.peek() {
                             Some(Token::DollarParen) => {
                                 sub.push_str(&self.lexer.get_raw_token_text()?);
+                                depth += 1;
+                            }
+                            Some(Token::ParenOpen) => {
+                                sub.push('(');
+                                self.lexer.next();
                                 depth += 1;
                             }
                             Some(Token::ParenClose) => {
