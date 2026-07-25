@@ -1619,6 +1619,7 @@ impl Parser {
                     | Token::Newline
                     | Token::CarriageReturn
                     | Token::Semicolon
+                    | Token::DoubleSemicolon
             )
             | None
         ) {
