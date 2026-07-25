@@ -1289,7 +1289,7 @@ pub fn parse_return_statement(parser: &mut Parser) -> Result<Command, ParserErro
     if !parser.lexer.is_eof()
         && !matches!(
             parser.lexer.peek(),
-            Some(Token::Newline | Token::Semicolon | Token::CarriageReturn)
+            Some(Token::Newline | Token::Semicolon | Token::CarriageReturn | Token::DoubleSemicolon)
         )
     {
         // Parse the return value as a word
