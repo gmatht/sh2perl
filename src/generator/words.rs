@@ -268,7 +268,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
             // Handle literal strings
-            if s.starts_with('`') && s.ends_with('`') {
+            if s.len() >= 2 && s.starts_with('`') && s.ends_with('`') {
                 let command_str = s[1..s.len() - 1].to_string();
                 if let Ok(command) = crate::parser::commands::parse_pipeline_from_text(&command_str)
                 {

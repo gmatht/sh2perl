@@ -1776,39 +1776,85 @@ impl Parser {
         // Use skip_inline to NOT skip newlines — a newline separates
         // the assignment from any following command.
         self.lexer.skip_inline_whitespace_and_comments();
-        if let Some(Token::Identifier) = self.lexer.peek() {
-            // Check whether the identifier is actually another assignment
-            // (has `=`, `+=`, etc. after it) rather than a command name.
-            let mut pos = 1usize;
-            while matches!(
-                self.lexer.peek_n(pos),
-                Some(Token::Space | Token::Tab | Token::Comment)
-            ) {
-                pos += 1;
-            }
-            let is_next_assignment =
-                Self::is_assignment_operator(self.lexer.peek_n(pos).cloned())
-                || self.has_indexed_assignment_after_identifier(pos);
 
-            if is_next_assignment {
-                // The next identifier is another assignment, not a command.
-                // Return the current one as a standalone Assignment and let
-                // the outer parse loop handle the remaining assignments.
-                return Ok(Command::Assignment(Assignment {
-                    variable: var_name,
-                    value: value_word,
-                    operator: match assignment_op {
-                        Token::Assign => AssignmentOperator::Assign,
-                        Token::PlusAssign => AssignmentOperator::PlusAssign,
-                        Token::MinusAssign => AssignmentOperator::MinusAssign,
-                        Token::StarAssign => AssignmentOperator::StarAssign,
-                        Token::SlashAssign => AssignmentOperator::SlashAssign,
-                        Token::PercentAssign => AssignmentOperator::PercentAssign,
-                        _ => AssignmentOperator::Assign,
-                    },
-                }));
-            }
+        /// Returns true if the token can start a simple command name
+        /// (an identifier or a builtin/reserved-word keyword).
+        fn is_command_name_token(token: &Token) -> bool {
+            matches!(
+                token,
+                Token::Identifier
+                    | Token::If
+                    | Token::Then
+                    | Token::Else
+                    | Token::Elif
+                    | Token::Fi
+                    | Token::While
+                    | Token::Until
+                    | Token::For
+                    | Token::Do
+                    | Token::Done
+                    | Token::In
+                    | Token::Function
+                    | Token::Case
+                    | Token::Esac
+                    | Token::Select
+                    | Token::Break
+                    | Token::Continue
+                    | Token::Return
+                    | Token::Exit
+                    | Token::Export
+                    | Token::Readonly
+                    | Token::Local
+                    | Token::Declare
+                    | Token::Typeset
+                    | Token::Unset
+                    | Token::Shift
+                    | Token::Eval
+                    | Token::Exec
+                    | Token::Source
+                    | Token::Trap
+                    | Token::Wait
+                    | Token::Set
+                    | Token::Shopt
+                    | Token::True
+                    | Token::False
+                    | Token::TestBracket
+                    | Token::Bang
+                    | Token::ParenOpen
+                    | Token::BraceOpen
+                    | Token::ArithmeticEval
+            )
+        }
 
+        // Check if there's a command following this assignment.
+        // Use skip_inline to NOT skip newlines — a newline separates
+        // the assignment from any following command.
+        self.lexer.skip_inline_whitespace_and_comments();
+        let has_following_command = if let Some(next_token) = self.lexer.peek() {
+            if !is_command_name_token(next_token) {
+                false
+            } else if matches!(next_token, Token::Identifier) {
+                // Check whether the identifier is actually another assignment
+                // (has `=`, `+=`, etc. after it) rather than a command name.
+                let mut pos = 1usize;
+                while matches!(
+                    self.lexer.peek_n(pos),
+                    Some(Token::Space | Token::Tab | Token::Comment)
+                ) {
+                    pos += 1;
+                }
+                let is_next_assignment =
+                    Self::is_assignment_operator(self.lexer.peek_n(pos).cloned())
+                    || self.has_indexed_assignment_after_identifier(pos);
+                !is_next_assignment
+            } else {
+                true  // keyword or other command-starting token
+            }
+        } else {
+            false
+        };
+
+        if has_following_command {
             // There's a command following, parse it as a command with environment variables
             let mut env_vars = BTreeMap::new();
             env_vars.insert(var_name, value_word);
