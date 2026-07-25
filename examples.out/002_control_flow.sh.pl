@@ -17,8 +17,8 @@ my $i;
 my @i;
 my %i;
 
-my $MAGIC_10   = 10;
 my $MAX_LOOP_5 = 5;
+my $MAGIC_10   = 10;
 
 if ((-f "file.txt")) {
     print "File exists\n";
