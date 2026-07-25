@@ -853,9 +853,20 @@ impl Lexer {
                 self.tokens.insert(insert_at + j, t.clone());
             }
 
-            // Point current at the first injected token (or stay at idx
-            // if nothing was injected, but the caller will advance).
-            if self.current >= idx {
+            // Point current at the first injected token (which sits at idx),
+            // or at idx (the position where the Comment was removed) if
+            // nothing was injected.  The token at idx after removal (or the
+            // first injected token) is the next token after the `}` that the
+            // caller should process.  We must NOT leave current pointing at
+            // an already-consumed token.
+            if !inject.is_empty() {
+                // Tokens were injected — point at the first one (at idx).
+                self.current = idx;
+            } else if self.current >= idx && self.current > 0 {
+                // Nothing injected — skip past the Comment position.
+                self.current = idx;
+            } else {
+                // self.current < idx — advance past the Comment.
                 self.current = idx;
             }
 
