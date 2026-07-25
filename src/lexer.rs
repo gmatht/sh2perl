@@ -482,74 +482,9 @@ impl Lexer {
         // handle $(...) and ${...} nesting. Logos's regex splits on every
         // " even inside $(...)/${...}, so we manually scan from each
         // opening " forward, tracking nesting, to find the real closing ".
-        {
-            let mut merged: Vec<(Token, usize, usize)> = Vec::new();
-            let mut i = 0;
-            while i < tokens.len() {
-                if tokens[i].0 == Token::DoubleQuotedString {
-                    let start = tokens[i].1;
-                    let bytes = input.as_bytes();
-                    // Only re-parse if this " is at byte position with "
-                    if bytes[start] == b'"' {
-                        let mut end = start + 1; // skip past opening "
-                        let mut p_depth = 0i32;
-                        let mut b_depth = 0i32;
-                        let mut bt_depth = 0i32; // backtick depth
-                        while end < bytes.len() {
-                            match bytes[end] {
-                                b'"' if p_depth == 0 && b_depth == 0 && bt_depth == 0 => {
-                                    end += 1; // include closing "
-                                    break;
-                                }
-                                b'\\' if end + 1 < bytes.len() => {
-                                    end += 2; // skip escaped char
-                                }
-                                b'`' => {
-                                    // Toggle backtick depth — backticks inside double
-                                    // quotes are command substitutions and should not
-                                    // cause the inner " to close the outer string.
-                                    bt_depth = if bt_depth == 0 { 1 } else { 0 };
-                                    end += 1;
-                                }
-                                b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'(' => {
-                                    p_depth += 1;
-                                    end += 2;
-                                }
-                                b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'{' => {
-                                    b_depth += 1;
-                                    end += 2;
-                                }
-                                b')' => {
-                                    if p_depth > 0 {
-                                        p_depth -= 1;
-                                    }
-                                    end += 1;
-                                }
-                                b'}' => {
-                                    if b_depth > 0 {
-                                        b_depth -= 1;
-                                    }
-                                    end += 1;
-                                }
-                                _ => {
-                                    end += 1;
-                                }
-                            }
-                        }
-                        merged.push((Token::DoubleQuotedString, start, end));
-                        // Skip all logos tokens covered by this span
-                        while i + 1 < tokens.len() && tokens[i + 1].1 < end {
-                            i += 1;
-                        }
-                        i += 1;
-                        continue;
-                    }
-                }
-                merged.push(tokens[i].clone());
-                i += 1;
-            }
-            tokens = merged;
-        }
+        Self::merge_double_quoted_strings(input, &mut tokens);
+
+        // Precompute starts of lines
 
         // Precompute starts of lines for quick offset->(line,col)
         let mut line_starts = Vec::new();
@@ -951,6 +886,79 @@ impl Lexer {
         let line = idx + 1;
         let col = offset.saturating_sub(line_start) + 1;
         (line, col)
+    }
+    /// Re-parse DoubleQuotedString tokens to properly handle nesting
+    /// of $(...), ${...}, and backtick command substitutions.
+    /// Logos's regex splits on every " even inside nested constructs,
+    /// so we manually scan from each opening " forward, tracking
+    /// nesting depth, to find the real closing ".
+    pub fn merge_double_quoted_strings(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
+        let mut merged: Vec<(Token, usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            if tokens[i].0 == Token::DoubleQuotedString {
+                let start = tokens[i].1;
+                let bytes = input.as_bytes();
+                // Only re-parse if this " is at byte position with "
+                if bytes[start] == b'"' {
+                    let mut end = start + 1; // skip past opening "
+                    let mut p_depth = 0i32;
+                    let mut b_depth = 0i32;
+                    let mut bt_depth = 0i32; // backtick depth
+                    while end < bytes.len() {
+                        match bytes[end] {
+                            b'"' if p_depth == 0 && b_depth == 0 && bt_depth == 0 => {
+                                end += 1; // include closing "
+                                break;
+                            }
+                            b'\\' if end + 1 < bytes.len() => {
+                                end += 2; // skip escaped char
+                            }
+                            b'`' => {
+                                // Toggle backtick depth — backticks inside double
+                                // quotes are command substitutions and should not
+                                // cause the inner " to close the outer string.
+                                bt_depth = if bt_depth == 0 { 1 } else { 0 };
+                                end += 1;
+                            }
+                            b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'(' => {
+                                p_depth += 1;
+                                end += 2;
+                            }
+                            b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'{' => {
+                                b_depth += 1;
+                                end += 2;
+                            }
+                            b')' => {
+                                if p_depth > 0 {
+                                    p_depth -= 1;
+                                }
+                                end += 1;
+                            }
+                            b'}' => {
+                                if b_depth > 0 {
+                                    b_depth -= 1;
+                                }
+                                end += 1;
+                            }
+                            _ => {
+                                end += 1;
+                            }
+                        }
+                    }
+                    merged.push((Token::DoubleQuotedString, start, end));
+                    // Skip all logos tokens covered by this span
+                    while i + 1 < tokens.len() && tokens[i + 1].1 < end {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+            merged.push(tokens[i].clone());
+            i += 1;
+        }
+        *tokens = merged;
     }
 }
 

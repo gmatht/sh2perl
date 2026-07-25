@@ -441,6 +441,10 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
             // Point lexer.current to the first inserted gap token,
             // replacing the original body tokens with the re-tokenized gap.
             lexer.current = insert_at;
+            // Re-apply DoubleQuotedString merging to the re-tokenized content
+            // because logos re-tokenization does not handle nesting of
+            // $(...), ${...}, and backtick command substitutions inside DQS.
+            Lexer::merge_double_quoted_strings(&lexer.input, &mut lexer.tokens);
         }
     }
 
