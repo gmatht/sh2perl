@@ -1397,6 +1397,7 @@ impl Parser {
                 | Token::RedirectInOut
                 | Token::RedirectAll
                 | Token::RedirectAllAppend
+                | Token::RedirectOutClobber
                 | Token::Heredoc
                 | Token::HeredocTabs
                 | Token::HereString => {
@@ -1414,6 +1415,7 @@ impl Parser {
                             | Token::RedirectInOut
                             | Token::RedirectAll
                             | Token::RedirectAllAppend
+                            | Token::RedirectOutClobber
                             | Token::Heredoc
                             | Token::HeredocTabs
                             | Token::HereString => {
