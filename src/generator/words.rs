@@ -3126,6 +3126,24 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
         result = result.replace(placeholder, perl_code);
     }
 
+    // Convert octal literals (e.g. 0777) to decimal to avoid Perl::Critic warnings
+    // about integers with leading zeros. The regex matches numbers starting with '0'
+    // followed by one or more octal digits (0-7).
+    {
+        let re_octal = regex::Regex::new(r"\b0[0-7]+\b").unwrap();
+        result = re_octal
+            .replace_all(&result, |caps: &regex::Captures| {
+                let octal_str = &caps[0];
+                // Parse as octal and convert to decimal
+                if let Ok(val) = i64::from_str_radix(octal_str, 8) {
+                    val.to_string()
+                } else {
+                    octal_str.to_string() // fallback, shouldn't happen
+                }
+            })
+            .to_string();
+    }
+
     // Wrap with int() to match bash integer arithmetic semantics.
     // Use eval {} // "" to handle division/modulo by zero (bash leaves
     // the variable unset/empty on arithmetic error instead of dying).

@@ -3,6 +3,70 @@ use crate::ast::Word;
 use crate::generator::commands::system_commands::word_to_bash_string_for_system;
 use crate::generator::Generator;
 
+/// Simple transformation: replace bareword file handles in Perl code with lexical ones.
+/// This avoids Perl::Critic "Bareword file handle" violations.
+/// Strategy: find all open(NAME, or open NAME, patterns, collect names,
+/// then do simple string replacements on `NAME` -> `$NAME` in filehandle positions.
+fn bareword_fh_to_lexical(code: &str) -> String {
+    let mut result = code.to_string();
+
+    // 1. Collect bareword file handle names from open() calls
+    let mut names: Vec<String> = Vec::new();
+    // Simpler: just hardcode the known filehandle patterns that appear in practice
+    // Collect all uppercase identifiers followed by , in open/open(my context
+    let mut i = 0;
+    let bytes = result.as_bytes().to_vec();
+    while i < bytes.len() {
+        // look for "open" or "open("
+        if (i + 4 <= bytes.len() && &bytes[i..i+4] == b"open") {
+            // skip past "open" and any whitespace/parens
+            let mut j = i + 4;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'(' || bytes[j] == b'\n') {
+                j += 1;
+            }
+            // check for uppercase identifier (filehandle name)
+            let start = j;
+            while j < bytes.len() && bytes[j].is_ascii_uppercase() {
+                j += 1;
+            }
+            if j > start {
+                let name = String::from_utf8_lossy(&bytes[start..j]).to_string();
+                if !names.contains(&name) && name != "STDIN" && name != "STDOUT" && name != "STDERR" && name.len() >= 1 {
+                    names.push(name);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if names.is_empty() {
+        return result;
+    }
+
+    // 2. For each name, do targeted replacements
+    for name in &names {
+        // open(NAME, -> open(my $NAME,
+        result = result.replace(&format!("open({},", name), &format!("open(my ${},", name));
+        // open NAME, -> open my $NAME, (but not "open my $NAME," already)
+        result = result.replace(&format!("open {},", name), &format!("open my ${},", name));
+        // while (<NAME>) -> while (<$NAME>)
+        result = result.replace(&format!("while (<{}>)", name), &format!("while (<${}>)", name));
+        // (<NAME>) in other contexts -> (<$NAME>)
+        // but be careful: close(NAME) -> close($NAME)
+        result = result.replace(&format!("close({})", name), &format!("close(${})", name));
+        result = result.replace(&format!("close {}", name), &format!("close ${}", name));
+        // print NAME -> print {$NAME}
+        result = result.replace(&format!("print {} ", name), &format!("print {{${}}} ", name));
+        result = result.replace(&format!("print {}\n", name), &format!("print {{${}}}\n", name));
+        result = result.replace(&format!("print {};", name), &format!("print {{${}}};", name));
+        result = result.replace(&format!("print {} or", name), &format!("print {{${}}} or", name));
+        // <NAME> (angle-bracket read from filehandle)
+        result = result.replace(&format!("<{}>", name), &format!("<${}>", name));
+    }
+
+    result
+}
+
 /// Handle Perl commands by embedding the Perl code directly
 pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     eprintln!(
@@ -19,7 +83,6 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                 let perl_code = if let Word::Literal(perl_code, _) = &cmd.args[1] {
                     Some(perl_code.clone())
                 } else if let Word::StringInterpolation(interp, _) = &cmd.args[1] {
-                    // Convert string interpolation to Perl code
                     Some(generator.convert_string_interpolation_to_perl(&interp))
                 } else {
                     None
@@ -27,7 +90,6 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
 
                 if let Some(perl_code) = perl_code {
                     eprintln!("DEBUG: Found perl code: {}", perl_code);
-                    // Clean up the Perl code - remove outer quotes if present
                     let mut clean_code = perl_code.clone();
                     if (clean_code.starts_with('"') && clean_code.ends_with('"'))
                         || (clean_code.starts_with('\'') && clean_code.ends_with('\''))
@@ -36,10 +98,10 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                     }
                     eprintln!("DEBUG: Clean perl code: {}", clean_code);
 
-                    // Don't interpret backslash escapes for Perl code - keep them as-is
-                    // The Perl interpreter will handle them correctly
+                    // Transform bareword file handles to lexical file handles
+                    clean_code = bareword_fh_to_lexical(&clean_code);
+                    eprintln!("DEBUG: After bareword fix: {}", clean_code);
 
-                    // Set up @ARGV with the remaining arguments (skip first two: perl command and -e flag)
                     if cmd.args.len() > 2 {
                         output.push_str("@ARGV = (");
                         for (i, arg) in cmd.args.iter().skip(2).enumerate() {
@@ -51,26 +113,19 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                         output.push_str(");\n");
                     }
 
-                    // Initialize environment variables to empty strings to avoid Perl warnings
-                    // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
                     output.push_str("if (!defined $ENV{SHELL_VAR}) { $ENV{SHELL_VAR} = q{}; }\n");
 
                     eprintln!("DEBUG: About to execute perl code lines");
-                    // Execute the perl code - split by newlines and add proper indentation
                     for line in clean_code.lines() {
                         let trimmed_line = line.trim();
                         if !trimmed_line.is_empty() {
                             output.push_str(&generator.indent());
-
-                            // Special handling for foreach loops - add 'my' if missing
                             let mut final_line = trimmed_line.to_string();
                             if trimmed_line.starts_with("foreach $")
                                 && !trimmed_line.contains("my $")
                             {
                                 final_line = trimmed_line.replace("foreach $", "foreach my $");
                             }
-
-                            // Add semicolon if the line doesn't end with one and isn't a control structure
                             if !final_line.ends_with(';')
                                 && !final_line.ends_with('{')
                                 && !final_line.ends_with('}')
@@ -86,18 +141,15 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                     return output;
                 }
             } else if flag == "-ne" {
-                // Extract the Perl code from the second argument
                 let perl_code = if let Word::Literal(perl_code, _) = &cmd.args[1] {
                     Some(perl_code.clone())
                 } else if let Word::StringInterpolation(interp, _) = &cmd.args[1] {
-                    // Convert string interpolation to Perl code
                     Some(generator.convert_string_interpolation_to_perl(&interp))
                 } else {
                     None
                 };
 
                 if let Some(perl_code) = perl_code {
-                    // Clean up the Perl code
                     let mut clean_code = perl_code.clone();
                     if (clean_code.starts_with('"') && clean_code.ends_with('"'))
                         || (clean_code.starts_with('\'') && clean_code.ends_with('\''))
@@ -105,8 +157,8 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                         clean_code = clean_code[1..clean_code.len() - 1].to_string();
                     }
 
-                    // Don't interpret backslash escapes for Perl code - keep them as-is
-                    // The Perl interpreter will handle them correctly
+                    // Also apply bareword fix for -ne path
+                    clean_code = bareword_fh_to_lexical(&clean_code);
 
                     output.push_str(&generator.indent());
                     output.push_str(&format!("# Perl -ne: {}\n", clean_code));
@@ -135,9 +187,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
 
     let output_var = format!("perl_output_{}", generator.get_unique_id());
 
-    // Use native Perl execution instead of open3 for builtin perl commands
     if args_list.len() >= 2 && args_list[0] == "\"-e\"" {
-        // Handle perl -e commands by executing the code directly
         let code = &args_list[1];
         output.push_str(&format!(
             "my ${} = do {{ 
@@ -154,7 +204,6 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
             output_var, code
         ));
     } else {
-        // For other perl commands, use system call as fallback
         let formatted_args = args_list.join(" ");
         output.push_str(&format!(
             "my ${} = do {{ 
@@ -180,7 +229,6 @@ pub fn generate_perl_pipeline_command(
     let mut perl_code = String::new();
     let mut is_ne = false;
 
-    // Extract Perl code from arguments
     for (i, arg) in cmd.args.iter().enumerate() {
         if let Word::Literal(s, _) = arg {
             if s == "-e" {
@@ -189,7 +237,6 @@ pub fn generate_perl_pipeline_command(
                         perl_code = code.clone();
                         break;
                     } else if let Word::StringInterpolation(interp, _) = &cmd.args[i + 1] {
-                        // Convert string interpolation to Perl code
                         perl_code = generator.convert_string_interpolation_to_perl(&interp);
                         break;
                     }
@@ -201,7 +248,6 @@ pub fn generate_perl_pipeline_command(
                         is_ne = true;
                         break;
                     } else if let Word::StringInterpolation(interp, _) = &cmd.args[i + 1] {
-                        // Convert string interpolation to Perl code
                         perl_code = generator.convert_string_interpolation_to_perl(&interp);
                         is_ne = true;
                         break;
@@ -212,51 +258,41 @@ pub fn generate_perl_pipeline_command(
     }
 
     if !perl_code.is_empty() {
-        // Clean the Perl code by removing outer quotes
         let mut clean_code = perl_code.clone();
 
-        // Remove outer quotes if present
         if (clean_code.starts_with('\'') && clean_code.ends_with('\''))
             || (clean_code.starts_with('"') && clean_code.ends_with('"'))
         {
             clean_code = clean_code[1..clean_code.len() - 1].to_string();
         }
 
-        // For pipeline context, we need to capture output instead of printing directly
+        // Also apply bareword fix for pipeline path
+        clean_code = bareword_fh_to_lexical(&clean_code);
+
         let output_var = format!("perl_output_{}", generator.get_unique_id());
         output.push_str(&format!("my ${} = q{{}};\n", output_var));
 
-        // For pipeline context, we need to set $_ to the input
         if is_ne {
-            // For -ne mode, process each line of input
             output.push_str(&format!(
                 "for my $line (split /\\n/msx, ${}) {{\n",
                 input_var
             ));
             output.push_str(&format!("    $_ = \"$line\\n\";\n"));
         } else {
-            // For -e mode, set $_ to the entire input
             output.push_str(&format!("$_ = ${};\n", input_var));
         }
 
-        // Initialize environment variables to empty strings to avoid Perl warnings
-        // This prevents "Use of uninitialized value" warnings when accessing undefined env vars
         output.push_str("if (!defined $ENV{SHELL_VAR}) { $ENV{SHELL_VAR} = q{}; }\n");
 
-        // Execute the perl code - split by newlines and add proper indentation
         for line in clean_code.lines() {
             let trimmed_line = line.trim();
             if !trimmed_line.is_empty() {
-                // Special handling for foreach loops - add 'my' if missing
                 let mut final_line = trimmed_line.to_string();
                 if trimmed_line.starts_with("foreach $") && !trimmed_line.contains("my $") {
                     final_line = trimmed_line.replace("foreach $", "foreach my $");
                 }
 
-                // Replace print statements to capture output instead of printing directly
-                // Handle both standalone print statements and print statements within semicolon-separated code
                 if final_line.contains("print ") {
-                    // Split by semicolon and process each part
                     let parts: Vec<&str> = final_line.split(';').collect();
                     let mut processed_parts = Vec::new();
 
@@ -274,7 +310,6 @@ pub fn generate_perl_pipeline_command(
                     final_line = processed_parts.join("; ");
                 }
 
-                // Add semicolon if the line doesn't end with one and isn't a control structure
                 if !final_line.ends_with(';')
                     && !final_line.ends_with('{')
                     && !final_line.ends_with('}')
@@ -287,15 +322,12 @@ pub fn generate_perl_pipeline_command(
             }
         }
 
-        // Close the for loop for -ne mode and set the output variable
         if is_ne {
             output.push_str("}\n");
         }
 
-        // Set the output variable for the pipeline
         output.push_str(&format!("${} = ${};\n", input_var, output_var));
     } else {
-        // Fallback to system call
         let args_list = cmd
             .args
             .iter()
@@ -310,9 +342,7 @@ pub fn generate_perl_pipeline_command(
 
         let output_var = format!("perl_output_{}", generator.get_unique_id());
 
-        // Use native Perl execution instead of open3 for builtin perl commands
         if args_list.len() >= 2 && args_list[0] == "\"-e\"" {
-            // Handle perl -e commands by executing the code directly
             let code = &args_list[1];
             output.push_str(&format!(
                 "my ${} = do {{ 
@@ -329,7 +359,6 @@ pub fn generate_perl_pipeline_command(
                 output_var, code
             ));
         } else {
-            // For other perl commands, use system call as fallback
             let formatted_args = args_list.join(" ");
             output.push_str(&format!(
                 "my ${} = do {{ 
