@@ -18,6 +18,12 @@ impl SharedUtils {
 
     /// Generate indentation string    // Removed unused extract_var_name function
 
+    /// Read file content with lossy UTF-8 decoding (replaces invalid byte sequences)
+    pub fn read_file_lossy(path: &str) -> io::Result<String> {
+        let bytes = fs::read(path)?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+
     /// Write content to file with proper UTF-8 encoding
     pub fn write_utf8_file(path: &str, content: &str) -> io::Result<()> {
         // Write UTF-8 content without BOM for better shell compatibility

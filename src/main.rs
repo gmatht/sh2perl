@@ -223,7 +223,7 @@ fn main_with_args(args: Vec<String>) {
     if command == "-i" || command == "-o" {
         if let Some(input_filename) = &input_file {
             // Always treat as input file when -i is specified
-            match fs::read_to_string(input_filename) {
+            match SharedUtils::read_file_lossy(input_filename) {
                 Ok(content) => {
                     println!("Processing input file: {}", input_filename);
                     // Parse the shell script
@@ -658,7 +658,7 @@ fn main_with_args(args: Vec<String>) {
             // Handle input file option
             if let Some(input_filename) = &input_file {
                 // Always treat as input file when -i is specified
-                match fs::read_to_string(input_filename) {
+                match SharedUtils::read_file_lossy(input_filename) {
                     Ok(content) => {
                         println!("Processing input file: {}", input_filename);
                         // Parse the shell script
