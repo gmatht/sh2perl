@@ -587,6 +587,9 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
             Ok(parse_arithmetic_expression(lexer)?)
         }
+        Some(Token::ArithmeticBracket) => {
+            Ok(parse_arithmetic_bracket(lexer)?)
+        }
         Some(Token::True) => {
             // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
             lexer.next();
@@ -1082,6 +1085,9 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         | Some(Token::DollarBraceBangAt) => Ok(parse_variable_expansion(lexer)?),
         Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
             Ok(parse_arithmetic_expression(lexer)?)
+        }
+        Some(Token::ArithmeticBracket) => {
+            Ok(parse_arithmetic_bracket(lexer)?)
         }
         Some(Token::True) => {
             // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
@@ -3344,6 +3350,84 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
         ArithmeticExpression {
             expression,
             tokens: Vec::new(), // We don't need to store individual tokens for now
+        },
+        None,
+    ))
+}
+
+fn parse_arithmetic_bracket(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    // Parse $[...] arithmetic expressions (deprecated but supported in bash)
+    // Consume the opening $[
+    lexer.next(); // consume $[
+
+    let mut expression_parts = Vec::new();
+    let mut bracket_depth = 1; // we just consumed $[
+
+    loop {
+        match lexer.peek() {
+            Some(Token::TestBracket) => {
+                // Opening [ inside expression (nested array subscript?)
+                bracket_depth += 1;
+                expression_parts.push("[".to_string());
+                lexer.next();
+            }
+            Some(Token::TestBracketClose) => {
+                lexer.next();
+                bracket_depth -= 1;
+                if bracket_depth <= 0 {
+                    break;
+                }
+                expression_parts.push("]".to_string());
+            }
+            Some(Token::DollarBrace) => {
+                // ${...} variable expansion inside arithmetic
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                lexer.next();
+                // Parse until the matching }
+                loop {
+                    match lexer.peek() {
+                        Some(Token::BraceClose) => {
+                            expression_parts.push("}".to_string());
+                            lexer.next();
+                            break;
+                        }
+                        Some(_) => {
+                            if let Some(text) = lexer.get_current_text() {
+                                expression_parts.push(text);
+                            }
+                            lexer.next();
+                        }
+                        None => {
+                            return Err(ParserError::InvalidSyntax(
+                                "Unclosed ${} inside arithmetic bracket".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            None => {
+                return Err(ParserError::InvalidSyntax(
+                    "Unexpected end of input in arithmetic bracket expression".to_string(),
+                ));
+            }
+            _ => {
+                // Any other token: consume and add its text
+                if let Some(text) = lexer.get_current_text() {
+                    expression_parts.push(text);
+                }
+                lexer.next();
+            }
+        }
+    }
+
+    let expression = expression_parts.join("");
+
+    Ok(Word::Arithmetic(
+        ArithmeticExpression {
+            expression,
+            tokens: Vec::new(),
         },
         None,
     ))
