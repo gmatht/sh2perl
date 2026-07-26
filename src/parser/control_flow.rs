@@ -420,6 +420,9 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
                             // Handle it as a pair: take the backslash and only the
                             // opening single-quote, then re-inject the rest of the
                             // SingleQuotedString for re-tokenization.
+                            // Similarly, `\#` is an escaped hash (literal) in a
+                            // case pattern; the lexer produces Escape + Comment,
+                            // so we extract just '#' and re-inject the tail.
                             current_pattern.push('\\');
                             parser.lexer.next();
                             if matches!(parser.lexer.peek(), Some(Token::SingleQuotedString)) {
@@ -438,6 +441,36 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
                                 let after_text = &parser.lexer.input[after_start..sq_end];
                                 if !after_text.is_empty() {
                                     use logos::Logos;
+                                    let mut inner_lex = Token::lexer(after_text);
+                                    let mut inject: Vec<(Token, usize, usize)> = Vec::new();
+                                    while let Some(tok_result) = inner_lex.next() {
+                                        if let Ok(t) = tok_result {
+                                            let span = inner_lex.span();
+                                            inject.push((
+                                                t,
+                                                after_start + span.start,
+                                                after_start + span.end,
+                                            ));
+                                        }
+                                    }
+                                    let insert_at = parser.lexer.current;
+                                    for (j, t) in inject.iter().enumerate() {
+                                        parser.lexer.tokens.insert(insert_at + j, t.clone());
+                                    }
+                                }
+                            } else if matches!(parser.lexer.peek(), Some(Token::Comment)) {
+                                // `\#` in a case pattern — eat the '#' as a literal
+                                // and re-inject the rest of the comment line.
+                                current_pattern.push('#');
+                                let (cm_start, cm_end) = parser.lexer.get_span()
+                                    .ok_or_else(|| ParserError::InvalidSyntax(
+                                        "Missing span for Comment after Escape".to_string()
+                                    ))?;
+                                // Skip the '#' character
+                                let after_start = cm_start + 1;
+                                if after_start < cm_end {
+                                    use logos::Logos;
+                                    let after_text = &parser.lexer.input[after_start..cm_end];
                                     let mut inner_lex = Token::lexer(after_text);
                                     let mut inject: Vec<(Token, usize, usize)> = Vec::new();
                                     while let Some(tok_result) = inner_lex.next() {
