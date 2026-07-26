@@ -343,11 +343,10 @@ pub enum Token {
     Question,
     #[token(".")]
     Dot,
-    #[regex(
-        r"\*[a-zA-Z0-9_*?]*|\[[a-zA-Z0-9\-]+\]|\[[a-zA-Z0-9\-]+\]\[[a-zA-Z0-9\-]+\]",
-        priority = 1
-    )]
-    CasePattern,
+    // NOTE: CasePattern was removed because its regex over-matched array
+    // subscripts like `[ext4]` in `${mkopts[ext4]}`.  Instead, the parser
+    // handles case patterns and glob patterns using individual tokens
+    // (Star, TestBracket, Identifier, etc.).
     #[token(":", priority = 1)]
     Colon,
     #[token("@")]
@@ -370,6 +369,11 @@ pub enum Token {
     // so that backslash-quote is matched as a single token.
     #[regex(r"\\'", priority = 6)]
     EscapedSingleQuote,
+    // Escaped backtick: backslash-backtick - higher priority than Escape
+    // so that backslash-backtick is matched as a single token instead of
+    // Escape followed by the start of a BacktickString regex.
+    #[regex(r"\\`", priority = 6)]
+    EscapedBacktick,
     #[regex(r"\n", priority = 5)]
     Newline,
     #[token("\r")]
@@ -1137,6 +1141,68 @@ impl Lexer {
             if tok != Token::SingleQuotedString {
                 result.push((tok, start, end));
                 continue;
+            }
+
+            // Check if this SQS starts inside a previous SQS token's span.
+            // Logos can produce overlapping SingleQuotedString tokens when a
+            // closing `'` of one SQS is mistakenly treated as the opening `'`
+            // of a new SQS.  In that case, emit a bare SingleQuote for the
+            // overlapping character and re-lex the tail (the rest of this token).
+            if let Some(&(Token::SingleQuotedString, prev_start, prev_end)) = result.last() {
+                if start > prev_start && start < prev_end {
+                    // Opening ' is actually the closing quote of the previous SQS.
+                    result.push((Token::SingleQuote, start, start + 1));
+                    // Re-lex the content after this bare quote.
+                    if start + 1 < end {
+                        let tail_text = &input[start+1..end];
+                        let tail_start = start + 1;
+                        let mut tail_offset = 0;
+                        while tail_offset < tail_text.len() {
+                            let remaining = &tail_text[tail_offset..];
+                            let mut sub = Token::lexer(remaining);
+                            let mut had_ok = false;
+                            while let Some(token_result) = sub.next() {
+                                let span = sub.span();
+                                match token_result {
+                                    Ok(t) => {
+                                        result.push((
+                                            t,
+                                            tail_start + tail_offset + span.start,
+                                            tail_start + tail_offset + span.end,
+                                        ));
+                                        had_ok = true;
+                                    }
+                                    Err(_) => continue,
+                                }
+                            }
+                            if had_ok {
+                                if let Some(&(_, _, last_end)) = result.last() {
+                                    tail_offset = last_end - tail_start;
+                                } else {
+                                    tail_offset = tail_text.len();
+                                }
+                            } else {
+                                // Emit problematic byte as bare quote
+                                let ch = tail_text.as_bytes()[tail_offset];
+                                if ch == b'\'' {
+                                    result.push((
+                                        Token::SingleQuote,
+                                        tail_start + tail_offset,
+                                        tail_start + tail_offset + 1,
+                                    ));
+                                } else if ch == b'"' {
+                                    result.push((
+                                        Token::DoubleQuote,
+                                        tail_start + tail_offset,
+                                        tail_start + tail_offset + 1,
+                                    ));
+                                }
+                                tail_offset += 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
 
             // Only consider tokens that span at least one newline
