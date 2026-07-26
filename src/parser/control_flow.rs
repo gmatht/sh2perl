@@ -82,6 +82,9 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
     loop {
         match parser.lexer.peek() {
             Some(Token::Else) | Some(Token::Elif) | Some(Token::Fi) | None => break,
+            Some(Token::DoubleSemicolon) => {
+                parser.lexer.next();
+            }
             _ => {
                 let cmd = parser.parse_command()?;
                 then_cmds.push(cmd);
@@ -94,6 +97,7 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
                             | Token::Comment
                             | Token::Newline
                             | Token::Semicolon
+                            | Token::DoubleSemicolon
                             | Token::CarriageReturn
                     )
                 ) {
@@ -152,6 +156,7 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
                                 | Token::Comment
                                 | Token::Newline
                                 | Token::Semicolon
+                                | Token::DoubleSemicolon
                                 | Token::CarriageReturn
                         )
                     ) {
@@ -223,6 +228,7 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
                                     | Token::Comment
                                     | Token::Newline
                                     | Token::Semicolon
+                                    | Token::DoubleSemicolon
                                     | Token::CarriageReturn
                             )
                         ) {
@@ -263,6 +269,7 @@ pub fn parse_if_statement(parser: &mut Parser) -> Result<Command, ParserError> {
                                     | Token::Comment
                                     | Token::Newline
                                     | Token::Semicolon
+                                    | Token::DoubleSemicolon
                                     | Token::CarriageReturn
                             )
                         ) {
@@ -1249,7 +1256,7 @@ pub fn parse_posix_function(parser: &mut Parser) -> Result<Command, ParserError>
         // Skip separators
         while matches!(
             parser.lexer.peek(),
-            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::Semicolon)
+            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::Semicolon | Token::DoubleSemicolon)
         ) {
             parser.lexer.next();
         }
@@ -1301,7 +1308,7 @@ pub fn parse_block(parser: &mut Parser) -> Result<Command, ParserError> {
         // Skip separators
         while matches!(
             parser.lexer.peek(),
-            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::Semicolon)
+            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::Semicolon | Token::DoubleSemicolon)
         ) {
             parser.lexer.next();
         }
