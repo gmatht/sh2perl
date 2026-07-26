@@ -489,19 +489,6 @@ impl Parser {
     }
 
     fn has_indexed_assignment_after_identifier(&mut self, start_pos: usize) -> bool {
-        if matches!(self.lexer.peek_n(start_pos), Some(Token::CasePattern)) {
-            let mut pos = start_pos + 1;
-            while pos < start_pos + 16
-                && matches!(
-                    self.lexer.peek_n(pos),
-                    Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
-                )
-            {
-                pos += 1;
-            }
-            return Self::is_assignment_operator(self.lexer.peek_n(pos).cloned());
-        }
-
         if !matches!(self.lexer.peek_n(start_pos), Some(Token::TestBracket)) {
             return false;
         }
@@ -542,9 +529,6 @@ impl Parser {
         let mut var_name = self.lexer.get_identifier_text()?;
 
         match self.lexer.peek() {
-            Some(Token::CasePattern) => {
-                var_name.push_str(&self.lexer.get_raw_token_text()?);
-            }
             Some(Token::TestBracket) => {
                 var_name.push_str(&self.parse_index_suffix()?);
             }
@@ -956,8 +940,9 @@ impl Parser {
                             pos += 1;
                         }
                         self.lexer.peek_n(pos).cloned()
-                    } else if matches!(self.lexer.peek_n(1), Some(Token::CasePattern)) {
-                        self.lexer.peek_n(2).cloned()
+                    } else if matches!(self.lexer.peek_n(1), Some(Token::TestBracket)) {
+                        // identifier[subscript]op: position 1=TestBracket([), 2=content, 3=TestBracketClose(]), 4=op
+                        self.lexer.peek_n(4).cloned()
                     } else {
                         None
                     };
@@ -1097,7 +1082,7 @@ impl Parser {
                     | Some(Token::Star)
                     | Some(Token::Percent)
                     | Some(Token::Escape)
-                    | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
+                    | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
                     | Some(Token::Colon)
                     | Some(Token::Comma)
                     | Some(Token::If)
@@ -1507,7 +1492,7 @@ impl Parser {
                 | Token::Plus
                 | Token::Minus
                 | Token::Escape
-                | Token::EscapedDoubleQuote | Token::EscapedSingleQuote => {
+                | Token::EscapedDoubleQuote | Token::EscapedSingleQuote | Token::EscapedBacktick => {
                     // These are valid argument tokens
                     args.push(parse_word_no_newline_skip(&mut self.lexer)?);
 
@@ -2285,8 +2270,30 @@ impl Parser {
                     expression_parts.push(")".to_string());
                     self.lexer.next();
                 }
-                Some(Token::CasePattern) => {
-                    expression_parts.push(self.lexer.get_raw_token_text()?);
+                Some(Token::TestBracket) => {
+                    // Read the full [...] expression
+                    expression_parts.push("[".to_string());
+                    self.lexer.next();
+                    // Collect content until TestBracketClose
+                    loop {
+                        match self.lexer.peek() {
+                            Some(Token::TestBracketClose) => {
+                                expression_parts.push("]".to_string());
+                                self.lexer.next();
+                                break;
+                            }
+                            Some(Token::Space) | Some(Token::Tab) => {
+                                expression_parts.push(" ".to_string());
+                                self.lexer.next();
+                            }
+                            _ => {
+                                if let Some(text) = self.lexer.get_current_text() {
+                                    expression_parts.push(text);
+                                }
+                                self.lexer.next();
+                            }
+                        }
+                    }
                 }
                 Some(Token::Caret) => {
                     expression_parts.push("^".to_string());
@@ -2296,7 +2303,7 @@ impl Parser {
                     expression_parts.push("+".to_string());
                     self.lexer.next();
                 }
-                Some(Token::Escape) | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) => {
+                Some(Token::Escape) | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick) => {
                     expression_parts.push("\\".to_string());
                     self.lexer.next();
                 }
