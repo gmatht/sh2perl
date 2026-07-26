@@ -1256,6 +1256,47 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     return Ok(Word::MapAccess(var_name, index_content, None));
                 }
 
+                // Check for adjacent suffix tokens (no whitespace gap) that
+                // should be concatenated, like $DEST.new or $var-suffix.
+                if let Some(next_start) = lexer.tokens.get(lexer.current).map(|(_, s, _)| *s) {
+                    let prev_end = lexer.tokens.get(lexer.current.checked_sub(1).unwrap_or(0)).map(|(_, _, e)| *e).unwrap_or(0);
+                    if next_start == prev_end {
+                        if let Some(Token::Dot) = lexer.peek() {
+                            // $var.suffix — consume . and following identifier
+                            let mut parts = vec![
+                                StringPart::Variable(var_name.clone()),
+                            ];
+                            lexer.next(); // consume the Dot
+                            if let Some(Token::Identifier) = lexer.peek() {
+                                if let Some(id_text) = lexer.get_current_text() {
+                                    parts.push(StringPart::Literal(format!(".{}", id_text)));
+                                    lexer.next();
+                                    return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                                }
+                            }
+                            // Just the dot
+                            parts.push(StringPart::Literal(".".to_string()));
+                            return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                        }
+                        if let Some(Token::Minus) = lexer.peek() {
+                            // $var-suffix — consume - and following identifier
+                            let mut parts = vec![
+                                StringPart::Variable(var_name.clone()),
+                            ];
+                            lexer.next(); // consume the Minus
+                            if let Some(Token::Identifier) = lexer.peek() {
+                                if let Some(id_text) = lexer.get_current_text() {
+                                    parts.push(StringPart::Literal(format!("-{}", id_text)));
+                                    lexer.next();
+                                    return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                                }
+                            }
+                            parts.push(StringPart::Literal("-".to_string()));
+                            return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                        }
+                    }
+                }
+
                 Ok(Word::Variable(var_name, false, None))
             } else if let Some(Token::Number) = lexer.peek() {
                 // Handle special shell variables like $0, $1, $2, etc.
@@ -1361,6 +1402,22 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 // Generate as keys %prefix for Perl.
                 let var_name = &braced_content[1..braced_content.len()-1];
                 return Ok(Word::MapKeys(var_name.to_string(), None));
+            } else if braced_content.contains("::") {
+                // ${var::offset} or ${var::offset:length} - substring syntax
+                // with empty offset (defaults to 0). Must check before :-
+                // because ::-2 contains :- as a substring.
+                let colon_pos = braced_content.find("::").unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let rest = &braced_content[colon_pos + 2..];
+                // rest is the length (since offset is empty = 0)
+                return Ok(Word::ParameterExpansion(
+                    ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::ArraySlice("0".to_string(), Some(rest.to_string())),
+                        is_mutable: true,
+                    },
+                    None,
+                ));
             } else if braced_content.contains(":-") {
                 eprintln!(
                     "DEBUG parse_variable_expansion: found :- in braced_content='{}'",
@@ -2421,6 +2478,19 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         }
     }
 
+    // Check for substring syntax ${var::length} BEFORE :-
+    // because ::-2 would match :-2 incorrectly.
+    if content.contains("::") {
+        let colon_pos = content.find("::").unwrap();
+        let var_name = &content[..colon_pos];
+        let rest = &content[colon_pos + 2..];
+        return Ok(ParameterExpansion {
+            variable: var_name.to_string(),
+            operator: ParameterExpansionOperator::ArraySlice("0".to_string(), Some(rest.to_string())),
+            is_mutable: true,
+        });
+    }
+
     // Check for parameter expansion operators with colon prefix BEFORE array access
     if content.contains(":-") {
         let parts: Vec<&str> = content.splitn(2, ":-").collect();
@@ -3217,15 +3287,27 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 lexer.next();
             }
             Some(Token::Dollar) => {
-                // Handle variable references like $i
+                // Handle variable references like $i, $1, $2, etc.
                 lexer.next();
-                if let Some(Token::Identifier) = lexer.peek() {
-                    let var_name = lexer.get_identifier_text()?;
-                    expression_parts.push(format!("${}", var_name));
-                } else {
-                    return Err(ParserError::InvalidSyntax(
-                        "Expected identifier after $ in arithmetic expression".to_string(),
-                    ));
+                match lexer.peek() {
+                    Some(Token::Identifier) => {
+                        let var_name = lexer.get_identifier_text()?;
+                        expression_parts.push(format!("${}", var_name));
+                    }
+                    Some(Token::Number) => {
+                        let num = lexer.get_number_text()?;
+                        expression_parts.push(format!("${}", num));
+                    }
+                    _ => {
+                        // For special $ vars ($?, $$, $!, $-, $#, $@, $*)
+                        // these are already separate tokens (DollarQuestion,
+                        // DollarDollar, etc.) and fall through to the catch-all
+                        // below. But if we see a bare $ followed by something
+                        // unexpected, report an error.
+                        return Err(ParserError::InvalidSyntax(
+                            "Expected identifier after $ in arithmetic expression".to_string(),
+                        ));
+                    }
                 }
             }
             None => {
