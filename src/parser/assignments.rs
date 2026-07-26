@@ -296,9 +296,6 @@ pub fn parse_word_list(lexer: &mut Lexer) -> Result<Vec<Word>, ParserError> {
                         | Token::Newline
                         | Token::CarriageReturn
                         | Token::Done
-                        | Token::Fi
-                        | Token::Then
-                        | Token::Else
                         | Token::ParenClose
                         | Token::BraceClose
                 )

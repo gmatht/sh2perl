@@ -432,16 +432,18 @@ impl Lexer {
                 break;
             }
             let remaining = &input[last_end..];
-            // Skip bare ' and " that logos may choke on
+            // Skip bare ' and " and ` that logos may choke on
             let mut skip = 0;
             while skip < remaining.len()
-                && (remaining.as_bytes()[skip] == b'\'' || remaining.as_bytes()[skip] == b'"')
+                && (remaining.as_bytes()[skip] == b'\'' || remaining.as_bytes()[skip] == b'"' || remaining.as_bytes()[skip] == b'`')
             {
                 let ch = remaining.as_bytes()[skip];
                 if ch == b'\'' {
                     tokens.push((Token::SingleQuote, last_end + skip, last_end + skip + 1));
-                } else {
+                } else if ch == b'"' {
                     tokens.push((Token::DoubleQuote, last_end + skip, last_end + skip + 1));
+                } else {
+                    tokens.push((Token::BacktickChar, last_end + skip, last_end + skip + 1));
                 }
                 skip += 1;
             }

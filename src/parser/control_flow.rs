@@ -24,9 +24,6 @@ fn parse_word_list(parser: &mut Parser) -> Result<Vec<Word>, ParserError> {
                         | Token::CarriageReturn
                         | Token::Do
                         | Token::Done
-                        | Token::Fi
-                        | Token::Then
-                        | Token::Else
                         | Token::ParenClose
                         | Token::BraceClose
                 )
