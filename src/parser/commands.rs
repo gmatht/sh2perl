@@ -340,8 +340,8 @@ impl Parser {
                     let cmd = self.parse_pipeline()?;
                     Command::Not(Box::new(cmd))
                 }
-                Some(Token::Semicolon) => {
-                    // Skip semicolon and continue parsing
+                Some(Token::Semicolon) | Some(Token::DoubleSemicolon) => {
+                    // Skip semicolon/double-semicolon and continue parsing
                     self.lexer.next();
                     self.parse_command()?
                 }
