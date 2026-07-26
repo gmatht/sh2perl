@@ -528,6 +528,10 @@ impl Lexer {
         // Fix bare quotes that logos failed to pair (e.g. in fragments).
         Self::fix_bare_quotes(input, &mut tokens);
 
+        // Resolve (( ambiguity: if (( cannot be closed by )), it is two
+        // nested subshells rather than an arithmetic evaluation.
+        Self::resolve_double_paren_ambiguity(input, &mut tokens);
+
         // Precompute starts of lines
 
         // Precompute starts of lines for quick offset->(line,col)
@@ -1396,6 +1400,59 @@ impl Lexer {
                     result.push(tokens[i].clone());
                     i += 1;
                 }
+            }
+        }
+        *tokens = result;
+    }
+
+    /// Resolve the ambiguous `((` token.
+    ///
+    /// In bash, `((` can mean either arithmetic evaluation (`(( expr ))`) or
+    /// two nested subshells (`( (cmd) ... )`).  We disambiguate by scanning
+    /// forward from each `ArithmeticEval` token to find its matching close.
+    /// If the matching close is `ArithmeticEvalClose` (`))`), the `((` is a
+    /// true arithmetic expression.  If the matching close is via two separate
+    /// `ParenClose` tokens, the `((` is two nested subshells and we split it
+    /// into two `ParenOpen` tokens.
+    fn resolve_double_paren_ambiguity(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
+        let mut result: Vec<(Token, usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            if tokens[i].0 == Token::ArithmeticEval {
+                let (_, start, end) = tokens[i];
+                // Scan forward from i+1 to find how this (( closes.
+                let mut depth: i32 = 2;
+                let mut j = i + 1;
+                let mut closed_by_arithmetic = false;
+                while j < tokens.len() && depth > 0 {
+                    match tokens[j].0 {
+                        Token::ArithmeticEval => depth += 2,
+                        Token::Arithmetic => depth += 2, // $((
+                        Token::DollarParen => depth += 1, // $(
+                        Token::ParenOpen => depth += 1,
+                        Token::ArithmeticEvalClose => {
+                            depth -= 2;
+                            if depth <= 0 {
+                                closed_by_arithmetic = true;
+                            }
+                        }
+                        Token::ParenClose => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if closed_by_arithmetic {
+                    // True arithmetic (( ... )) — keep as ArithmeticEval.
+                    result.push(tokens[i].clone());
+                } else {
+                    // Nested subshells — split into two ParenOpen tokens.
+                    result.push((Token::ParenOpen, start, start + 1));
+                    result.push((Token::ParenOpen, start + 1, end));
+                }
+                i += 1;
+            } else {
+                result.push(tokens[i].clone());
+                i += 1;
             }
         }
         *tokens = result;

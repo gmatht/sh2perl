@@ -92,6 +92,13 @@ impl ParserUtilities for Lexer {
                     }
                     self.next();
                 }
+                Some(Token::ArithmeticEval) => {
+                    // ((...)) adds two opening parens.
+                    depth += 2;
+                    let text = self.get_current_text().unwrap_or_default();
+                    content.push_str(&text);
+                    self.next();
+                }
                 Some(Token::Arithmetic) => {
                     // $((...)) adds two opening parens
                     depth += 2;

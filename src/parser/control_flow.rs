@@ -413,6 +413,15 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
                             current_pattern.push(' ');
                             parser.lexer.next();
                         }
+                        Some(Token::DollarParen) => {
+                            // $(...) inside a case pattern — capture the full
+                            // $() text including the matched close paren, so
+                            // the inner ) does NOT confuse the nesting tracking.
+                            current_pattern.push_str("$(");
+                            let captured = parser.lexer.capture_parenthetical_text()?;
+                            current_pattern.push_str(&captured);
+                            current_pattern.push(')');
+                        }
                         Some(Token::Escape) => {
                             // `\'` in a case pattern: backslash escapes the
                             // following single-quote, making it a literal char.
