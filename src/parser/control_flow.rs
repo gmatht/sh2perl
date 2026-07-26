@@ -565,16 +565,58 @@ pub fn parse_while_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     parser.lexer.consume(Token::While)?;
     // Skip whitespace after 'while'
     parser.lexer.skip_whitespace_and_comments();
-    // Parse condition using parse_command which handles [[ ]], (( )), and regular commands
-    let condition = Box::new(parser.parse_command()?);
 
-    // Optional separator after condition (semicolon or newline) and skip whitespace
-    match parser.lexer.peek() {
-        Some(Token::Semicolon) | Some(Token::Newline) | Some(Token::CarriageReturn) => {
+    // Parse condition: a list of one or more commands terminated by `do`.
+    // (This matches bash semantics where `while list1; do list2; done`
+    //  and `list1` can be a sequence of pipelines separated by newlines.)
+    let mut condition_commands = Vec::new();
+    loop {
+        // Skip whitespace/newlines before each condition command
+        while matches!(
+            parser.lexer.peek(),
+            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
+        ) {
             parser.lexer.next();
         }
-        _ => {}
+        match parser.lexer.peek() {
+            Some(Token::Do) => break,
+            Some(Token::Done) => break,
+            None => return Err(ParserError::UnexpectedEOF),
+            _ => {
+                let cmd = parser.parse_command()?;
+                condition_commands.push(cmd);
+                // Consume separator (semicolon or newline) after the command
+                match parser.lexer.peek() {
+                    Some(Token::Semicolon) | Some(Token::Newline) | Some(Token::CarriageReturn) => {
+                        parser.lexer.next();
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
+
+    let condition = if condition_commands.is_empty() {
+        // Empty condition is equivalent to "true" (infinite loop)
+        Box::new(Command::Simple(SimpleCommand {
+            name: Word::Literal("true".to_string(), None),
+            args: vec![],
+            redirects: vec![],
+            env_vars: BTreeMap::new(),
+            stdout_used: true,
+            stderr_used: true,
+        }))
+    } else if condition_commands.len() == 1 {
+        Box::new(condition_commands.remove(0))
+    } else {
+        // Multiple commands in the condition — wrap in a Block so the
+        // generator can execute each and check the last one's exit status.
+        Box::new(Command::Block(Block {
+            commands: condition_commands,
+        }))
+    };
+
+    // Skip whitespace before 'do'
     while matches!(
         parser.lexer.peek(),
         Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
@@ -659,20 +701,59 @@ pub fn parse_while_loop(parser: &mut Parser) -> Result<Command, ParserError> {
 pub fn parse_until_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     parser.lexer.consume(Token::Until)?;
     parser.lexer.skip_whitespace_and_comments();
-    let condition = Box::new(parser.parse_command()?);
-    match parser.lexer.peek() {
-        Some(Token::Semicolon) | Some(Token::Newline) | Some(Token::CarriageReturn) => {
+
+    // Parse condition: a list of one or more commands terminated by `do`.
+    let mut condition_commands = Vec::new();
+    loop {
+        while matches!(
+            parser.lexer.peek(),
+            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
+        ) {
             parser.lexer.next();
         }
-        _ => {}
+        match parser.lexer.peek() {
+            Some(Token::Do) => break,
+            Some(Token::Done) => break,
+            None => return Err(ParserError::UnexpectedEOF),
+            _ => {
+                let cmd = parser.parse_command()?;
+                condition_commands.push(cmd);
+                match parser.lexer.peek() {
+                    Some(Token::Semicolon) | Some(Token::Newline) | Some(Token::CarriageReturn) => {
+                        parser.lexer.next();
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
+
+    let condition = if condition_commands.is_empty() {
+        Box::new(Command::Simple(SimpleCommand {
+            name: Word::Literal("false".to_string(), None),
+            args: vec![],
+            redirects: vec![],
+            env_vars: BTreeMap::new(),
+            stdout_used: true,
+            stderr_used: true,
+        }))
+    } else if condition_commands.len() == 1 {
+        Box::new(condition_commands.remove(0))
+    } else {
+        Box::new(Command::Block(Block {
+            commands: condition_commands,
+        }))
+    };
+
     while matches!(
         parser.lexer.peek(),
         Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
     ) {
         parser.lexer.next();
     }
+
     parser.lexer.consume(Token::Do)?;
+
     while matches!(
         parser.lexer.peek(),
         Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
