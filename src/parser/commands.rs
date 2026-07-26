@@ -1301,7 +1301,18 @@ impl Parser {
                             | Token::Or
                             | Token::Semicolon
                             | Token::DoubleSemicolon
-                            | Token::Background => break,
+                            | Token::Background
+                            | Token::RedirectIn
+                            | Token::RedirectOut
+                            | Token::RedirectAppend
+                            | Token::RedirectInErr
+                            | Token::RedirectOutErr
+                            | Token::RedirectInOut
+                            | Token::RedirectAll
+                            | Token::RedirectAllAppend
+                            | Token::Heredoc
+                            | Token::HeredocTabs
+                            | Token::HereString => break,
                             _ => {
                                 args.push(parse_word_no_newline_skip(&mut self.lexer)?);
                             }
@@ -2123,6 +2134,21 @@ impl Parser {
         // Skip whitespace
         self.lexer.skip_whitespace_and_comments();
 
+        // Skip any flags like -q (quiet) before -s/-u
+        loop {
+            match self.lexer.peek() {
+                Some(Token::Minus) => {
+                    // Might be -q or other flag; skip it and the following identifier
+                    self.lexer.next();
+                    if let Some(Token::Identifier) = self.lexer.peek() {
+                        self.lexer.next();
+                    }
+                    self.lexer.skip_whitespace_and_comments();
+                }
+                _ => break,
+            }
+        }
+
         // Parse the option (e.g., -s, -u)
         let enable = if let Some(token) = self.lexer.peek() {
             match token {
@@ -2130,7 +2156,7 @@ impl Parser {
                     self.lexer.next();
                     true // -s means set (enable)
                 }
-                Token::Unset => {
+                Token::SetUid => {
                     self.lexer.next();
                     false // -u means unset (disable)
                 }
