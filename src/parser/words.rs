@@ -1177,9 +1177,11 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         lexer.next();
                         Ok(Word::Variable(var_name, false, None))
                     } else {
-                        Err(ParserError::InvalidSyntax(
-                            "Expected identifier or number after $".to_string(),
-                        ))
+                        // $ followed by non-identifier (e.g., $/ in sed s/$$//)
+                        // is a literal $ character. Return it as a literal Word.
+                        // IMPORTANT: we have NOT consumed the next token yet,
+                        // so a subsequent parse_word call will handle it.
+                        return Ok(Word::Literal("$".to_string(), None));
                     }
                 } else {
                     Err(ParserError::InvalidSyntax(

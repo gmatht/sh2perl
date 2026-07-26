@@ -2207,7 +2207,6 @@ impl Parser {
 
         loop {
             let current_token = self.lexer.peek();
-            //             eprintln!("DEBUG: Processing token in loop: {:?}", current_token);
             match current_token {
                 Some(Token::TestBracketClose) => {
                     if is_double_bracket {
