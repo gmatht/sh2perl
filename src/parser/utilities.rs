@@ -114,6 +114,19 @@ impl ParserUtilities for Lexer {
                     content.push_str(&text);
                     self.next();
                 }
+                Some(Token::Escape) => {
+                    // Escaped character like \( or \). Consume the escape and
+                    // the next token without affecting parenthesis depth.
+                    if let Some(text) = self.get_current_text() {
+                        content.push_str(&text);
+                    }
+                    self.next();
+                    // Also consume the escaped character
+                    if let Some(text) = self.get_current_text() {
+                        content.push_str(&text);
+                    }
+                    self.next();
+                }
                 Some(_) => {
                     if let Some(text) = self.get_current_text() {
                         content.push_str(&text);
