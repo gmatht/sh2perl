@@ -64,6 +64,12 @@ fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
             }
             true
         }
+        Word::Variable(var_name, _, _) => {
+            let mut parts = vec![StringPart::Variable(var_name.clone())];
+            parts.push(StringPart::Literal(fragment.to_string()));
+            *word = Word::StringInterpolation(StringInterpolation { parts }, None);
+            true
+        }
         _ => false,
     }
 }
