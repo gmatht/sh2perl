@@ -2510,7 +2510,7 @@ impl Parser {
                     }
                     expression_parts.push(format!("$(({}))", arith));
                 }
-                Some(Token::Newline) | Some(Token::CarriageReturn) => {
+                Some(Token::Newline) | Some(Token::CarriageReturn) | Some(Token::Semicolon) => {
                     // Should not appear inside test expression, treat as end
                     break;
                 }
@@ -2646,11 +2646,19 @@ impl Parser {
                     ));
                 }
                 _ => {
-                    let token_str = format!("{:?}", self.lexer.peek());
-                    return Err(ParserError::InvalidSyntax(format!(
-                        "Unexpected token in test expression: {}",
-                        token_str
-                    )));
+                    // In a test expression, shell keywords and many other tokens
+                    // can appear as literal values (e.g. `set` in `[ x = set ]`).
+                    // Treat them as literal text rather than failing.
+                    if let Some(text) = self.lexer.get_current_text() {
+                        expression_parts.push(text);
+                        self.lexer.next();
+                    } else {
+                        let token_str = format!("{:?}", self.lexer.peek());
+                        return Err(ParserError::InvalidSyntax(format!(
+                            "Unexpected token in test expression: {}",
+                            token_str
+                        )));
+                    }
                 }
             }
         }

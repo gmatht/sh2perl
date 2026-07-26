@@ -599,6 +599,8 @@ impl Lexer {
                         col,
                     })
                 } else {
+                    // If we can't get the token, it means self.current was 0 (shouldn't happen
+                    // after next() advanced it), but handle gracefully.
                     Err(LexerError::UnexpectedChar {
                         ch: '?',
                         line: 1,
@@ -607,11 +609,22 @@ impl Lexer {
                 }
             }
         } else {
-            Err(LexerError::UnexpectedChar {
-                ch: '?',
-                line: 1,
-                col: 1,
-            })
+            // No more tokens — this is an "unexpected end of input" situation.
+            // Use the last known position for a better error.
+            if let Some((_, _, last_end)) = self.tokens.last() {
+                let (line, col) = self.offset_to_line_col(*last_end);
+                Err(LexerError::UnexpectedChar {
+                    ch: '?',
+                    line,
+                    col,
+                })
+            } else {
+                Err(LexerError::UnexpectedChar {
+                    ch: '?',
+                    line: 1,
+                    col: 1,
+                })
+            }
         }
     }
 
@@ -957,11 +970,15 @@ impl Lexer {
                 // Only re-parse if this " is at byte position with "
                 if bytes[start] == b'"' {
                     let mut end = start + 1; // skip past opening "
-                    let mut p_depth = 0i32;
-                    let mut b_depth = 0i32;
-                    let mut bt_depth = 0i32; // backtick depth
+                    let mut p_depth = 0i32;          // $(  ) depth
+                    let mut b_depth = 0i32;          // ${  } depth
+                    let mut bt_depth = 0i32;          // backtick depth
+                    // When inside $(), track standalone '(' that are not part of
+                    // '$(' so we correctly match ')' to its corresponding '$('.
+                    let mut paren_depth = 0i32;
                     while end < bytes.len() {
-                        match bytes[end] {
+                        let ch = bytes[end];
+                        match ch {
                             b'"' if p_depth == 0 && b_depth == 0 && bt_depth == 0 => {
                                 end += 1; // include closing "
                                 break;
@@ -984,9 +1001,20 @@ impl Lexer {
                                 b_depth += 1;
                                 end += 2;
                             }
+                            b'(' if p_depth > 0 => {
+                                // Standalone '(' inside $() — not part of '$('.
+                                paren_depth += 1;
+                                end += 1;
+                            }
                             b')' => {
                                 if p_depth > 0 {
-                                    p_depth -= 1;
+                                    if paren_depth > 0 {
+                                        // This ')' matches a previous '(' inside $().
+                                        paren_depth -= 1;
+                                    } else {
+                                        // This ')' matches a '$('.
+                                        p_depth -= 1;
+                                    }
                                 }
                                 end += 1;
                             }
