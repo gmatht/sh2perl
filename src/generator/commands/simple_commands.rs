@@ -818,13 +818,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                     // Interpret backslash escapes
                                                     let mut interpreted = literal.clone();
                                                     // Remove outer quotes if present
-                                                    if (interpreted.starts_with('"')
-                                                        && interpreted.ends_with('"'))
-                                                        || (interpreted.starts_with('\'')
-                                                            && interpreted.ends_with('\''))
+                                                    let qlen = interpreted.len();
+                                                    if qlen >= 2
+                                                        && ((interpreted.starts_with('"')
+                                                             && interpreted.ends_with('"'))
+                                                            || (interpreted.starts_with('\'')
+                                                                && interpreted.ends_with('\'')))
                                                     {
                                                         interpreted = interpreted
-                                                            [1..interpreted.len() - 1]
+                                                            [1..qlen - 1]
                                                             .to_string();
                                                     }
 
@@ -1012,13 +1014,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                     // Interpret backslash escapes
                                                     let mut interpreted = literal.clone();
                                                     // Remove outer quotes if present
-                                                    if (interpreted.starts_with('"')
-                                                        && interpreted.ends_with('"'))
-                                                        || (interpreted.starts_with('\'')
-                                                            && interpreted.ends_with('\''))
+                                                    let qlen = interpreted.len();
+                                                    if qlen >= 2
+                                                        && ((interpreted.starts_with('"')
+                                                             && interpreted.ends_with('"'))
+                                                            || (interpreted.starts_with('\'')
+                                                                && interpreted.ends_with('\'')))
                                                     {
                                                         interpreted = interpreted
-                                                            [1..interpreted.len() - 1]
+                                                            [1..qlen - 1]
                                                             .to_string();
                                                     }
 

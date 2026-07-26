@@ -114,6 +114,75 @@ impl ParserUtilities for Lexer {
                     content.push_str(&text);
                     self.next();
                 }
+                Some(Token::Comment) => {
+                    // A Comment token may contain `)` characters when `#` appears
+                    // inside ${...} parameter-expansion operators (e.g. ${var#pattern}
+                    // or ${var##pattern}) inside $(...).  The logos lexer treats `#...`
+                    // as a line comment, which swallows the closing `)` of the $(...).
+                    // Scan the comment text for `)` and adjust depth accordingly.
+                    let idx = self.current;
+                    let cm_start = self.tokens[idx].1;
+                    let cm_end = self.tokens[idx].2;
+                    let text = self.input[cm_start..cm_end].to_string();
+
+                    // Find the first `)` that brings paren_depth to 0.
+                    let mut found_close = false;
+                    let mut close_pos = 0;
+                    let mut temp_depth = depth;
+                    for (i, c) in text.char_indices() {
+                        if c == ')' {
+                            temp_depth -= 1;
+                            if temp_depth == 0 {
+                                close_pos = i;
+                                found_close = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if found_close {
+                        // Push everything before the closing `)`
+                        content.push_str(&text[..close_pos]);
+
+                        // Text after the `)` needs to be re-lexed and injected.
+                        let after = &text[close_pos + 1..];
+
+                        // Remove the Comment token itself.
+                        self.tokens.remove(idx);
+                        if self.current >= idx && self.current > 0 {
+                            self.current = idx;
+                        } else {
+                            self.current = idx;
+                        }
+
+                        // Re-lex the after-text and inject as new tokens.
+                        if !after.trim().is_empty() {
+                            use logos::Logos;
+                            let after_start = cm_start + close_pos + 1;
+                            let mut sub_lex = Token::lexer(after);
+                            let mut inject: Vec<(Token, usize, usize)> = Vec::new();
+                            while let Some(tok_result) = sub_lex.next() {
+                                let span = sub_lex.span();
+                                if let Ok(tok) = tok_result {
+                                    inject.push((
+                                        tok,
+                                        after_start + span.start,
+                                        after_start + span.end,
+                                    ));
+                                }
+                            }
+                            for (j, t) in inject.iter().enumerate() {
+                                self.tokens.insert(idx + j, t.clone());
+                            }
+                        }
+
+                        depth = 0; // The `)` closed our outer paren
+                    } else {
+                        // No `)` found — just consume the Comment as literal text.
+                        content.push_str(&text);
+                        self.next();
+                    }
+                }
                 Some(Token::Escape) => {
                     // Escaped character like \( or \). Consume the escape and
                     // the next token without affecting parenthesis depth.
