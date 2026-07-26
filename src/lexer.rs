@@ -422,42 +422,68 @@ impl Lexer {
         }
 
         // Workaround for logos 0.15 bug: when a regex fails after consuming bytes,
-        // logos may stop producing tokens even though input remains.  Re-lex
-        // the untokenized tail with a fresh logos instance, skipping any bare
-        // ' characters that the SingleQuotedString regex cannot handle.
-        if let Some(&(_, _, last_end)) = tokens.last() {
-            if last_end < input.len() {
-                let remaining = &input[last_end..];
-                let mut skip = 0;
-                while skip < remaining.len() && remaining.as_bytes()[skip] == b'\'' {
+        // logos may stop producing tokens even though input remains.  We loop,
+        // re-lexing any untokenized tail with a fresh logos instance, and skip
+        // bare ' and " characters that logos cannot handle (e.g. unterminated
+        // single- or double-quoted strings in the remaining input).
+        loop {
+            let last_end = tokens.last().map(|&(_, _, e)| e).unwrap_or(0);
+            if last_end >= input.len() {
+                break;
+            }
+            let remaining = &input[last_end..];
+            // Skip bare ' and " that logos may choke on
+            let mut skip = 0;
+            while skip < remaining.len()
+                && (remaining.as_bytes()[skip] == b'\'' || remaining.as_bytes()[skip] == b'"')
+            {
+                let ch = remaining.as_bytes()[skip];
+                if ch == b'\'' {
                     tokens.push((Token::SingleQuote, last_end + skip, last_end + skip + 1));
-                    skip += 1;
-                }
-                if skip > 0 {
-                    let remaining = &remaining[skip..];
-                    if !remaining.is_empty() {
-                        let mut resume = Token::lexer(remaining);
-                        while let Some(token_result) = resume.next() {
-                            let span = resume.span();
-                            match token_result {
-                                Ok(tok) => {
-                                    tokens.push((tok, last_end + skip + span.start, last_end + skip + span.end));
-                                }
-                                Err(_) => continue,
-                            }
-                        }
-                    }
                 } else {
+                    tokens.push((Token::DoubleQuote, last_end + skip, last_end + skip + 1));
+                }
+                skip += 1;
+            }
+            if skip > 0 {
+                let remaining = &remaining[skip..];
+                if !remaining.is_empty() {
                     let mut resume = Token::lexer(remaining);
                     while let Some(token_result) = resume.next() {
                         let span = resume.span();
                         match token_result {
                             Ok(tok) => {
-                                tokens.push((tok, last_end + span.start, last_end + span.end));
+                                tokens.push((
+                                    tok,
+                                    last_end + skip + span.start,
+                                    last_end + skip + span.end,
+                                ));
                             }
                             Err(_) => continue,
                         }
                     }
+                }
+            } else {
+                // No bare quotes to skip — try logos on the remaining text
+                let mut resume = Token::lexer(remaining);
+                while let Some(token_result) = resume.next() {
+                    let span = resume.span();
+                    match token_result {
+                        Ok(tok) => {
+                            tokens.push((
+                                tok,
+                                last_end + span.start,
+                                last_end + span.end,
+                            ));
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                // If logos still failed to make progress, break to avoid
+                // an infinite loop (the remaining characters will be ignored).
+                let new_last_end = tokens.last().map(|&(_, _, e)| e).unwrap_or(last_end);
+                if new_last_end == last_end {
+                    break;
                 }
             }
         }
@@ -486,11 +512,21 @@ impl Lexer {
         // handle $(...) and ${...} nesting. Logos's regex splits on every
         // " even inside $(...)/${...}, so we manually scan from each
         // opening " forward, tracking nesting, to find the real closing ".
+        // Re-parse DoubleQuotedString tokens to properly handle $(...)
+        // and ${...} nesting. Logos's regex splits on every
+        // " even inside $(...)/${...}, so we manually scan from each
+        // opening " forward, tracking nesting, to find the real closing ".
+        // Run multiple passes because a merged DQS may create new bare
+        // DoubleQuote tokens in the re-lexed tail that also need merging.
+        Self::merge_double_quoted_strings(input, &mut tokens);
         Self::merge_double_quoted_strings(input, &mut tokens);
 
         // Split over-greedy SingleQuotedString tokens that span multiple
         // lines and contain shell keywords.
         Self::split_overgreedy_sq(input, &mut tokens);
+
+        // Fix bare quotes that logos failed to pair (e.g. in fragments).
+        Self::fix_bare_quotes(input, &mut tokens);
 
         // Precompute starts of lines
 
@@ -915,7 +951,7 @@ impl Lexer {
         let mut merged: Vec<(Token, usize, usize)> = Vec::new();
         let mut i = 0;
         while i < tokens.len() {
-            if tokens[i].0 == Token::DoubleQuotedString {
+            if tokens[i].0 == Token::DoubleQuotedString || tokens[i].0 == Token::DoubleQuote {
                 let start = tokens[i].1;
                 let bytes = input.as_bytes();
                 // Only re-parse if this " is at byte position with "
@@ -966,8 +1002,65 @@ impl Lexer {
                         }
                     }
                     merged.push((Token::DoubleQuotedString, start, end));
-                    // Skip all logos tokens covered by this span
-                    while i + 1 < tokens.len() && tokens[i + 1].1 < end {
+                    // Skip all logos tokens covered by this span.
+                    // If a token extends beyond the end, the tail portion
+                    // contains real code that must be re-tokenized.
+                    while i + 1 < tokens.len() {
+                        let next_start = tokens[i + 1].1;
+                        let next_end = tokens[i + 1].2;
+                        if next_start >= end {
+                            break;
+                        }
+                        if next_end > end {
+                            // Token overlaps boundary — re-lex the tail
+                            // using the same workaround as split_overgreedy_sq.
+                            let tail_text = &input[end..next_end];
+                            let tail_start = end;
+                            let mut tail_offset = 0;
+                            while tail_offset < tail_text.len() {
+                                let remaining = &tail_text[tail_offset..];
+                                let mut sub = Token::lexer(remaining);
+                                let mut had_ok = false;
+                                while let Some(token_result) = sub.next() {
+                                    let span = sub.span();
+                                    match token_result {
+                                        Ok(tok) => {
+                                            merged.push((
+                                                tok,
+                                                tail_start + tail_offset + span.start,
+                                                tail_start + tail_offset + span.end,
+                                            ));
+                                            had_ok = true;
+                                        }
+                                        Err(_) => continue,
+                                    }
+                                }
+                                if had_ok {
+                                    if let Some(&(_, _, last_end)) = merged.last() {
+                                        tail_offset = last_end - tail_start;
+                                    } else {
+                                        tail_offset = tail_text.len();
+                                    }
+                                } else {
+                                    // Emit problematic byte
+                                    let ch = tail_text.as_bytes()[tail_offset];
+                                    if ch == b'\'' {
+                                        merged.push((
+                                            Token::SingleQuote,
+                                            tail_start + tail_offset,
+                                            tail_start + tail_offset + 1,
+                                        ));
+                                    } else if ch == b'"' {
+                                        merged.push((
+                                            Token::DoubleQuote,
+                                            tail_start + tail_offset,
+                                            tail_start + tail_offset + 1,
+                                        ));
+                                    }
+                                    tail_offset += 1;
+                                }
+                            }
+                        }
                         i += 1;
                     }
                     i += 1;
@@ -1075,26 +1168,112 @@ impl Lexer {
                 // Emit the opening ' as a bare SingleQuote
                 result.push((Token::SingleQuote, start, start + 1));
 
-                // Content between opening ' and split point
+                // The content between the opening ' and the split point is
+                // NOT actually single-quoted text — it is real shell code
+                // that was gobbled up by the over-greedy SQS.  Re-lex it
+                // so that the shell code is properly tokenized.
                 if split_byte > start + 1 {
-                    result.push((Token::SingleQuotedString, start + 1, split_byte));
+                    let middle = &input[start + 1..split_byte];
+                    let mid_start = start + 1;
+                    let mut mid_offset = 0;
+                    while mid_offset < middle.len() {
+                        let remaining = &middle[mid_offset..];
+                        let mut sub = Token::lexer(remaining);
+                        let mut had_ok = false;
+                        while let Some(token_result) = sub.next() {
+                            let span = sub.span();
+                            match token_result {
+                                Ok(tok) => {
+                                    result.push((
+                                        tok,
+                                        mid_start + mid_offset + span.start,
+                                        mid_start + mid_offset + span.end,
+                                    ));
+                                    had_ok = true;
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                        if had_ok {
+                            if let Some(&(_, _, last_end)) = result.last() {
+                                mid_offset = last_end - mid_start;
+                            } else {
+                                mid_offset = middle.len();
+                            }
+                        } else {
+                            // Emit problematic byte
+                            let ch = middle.as_bytes()[mid_offset];
+                            if ch == b'\'' {
+                                result.push((
+                                    Token::SingleQuote,
+                                    mid_start + mid_offset,
+                                    mid_start + mid_offset + 1,
+                                ));
+                            } else if ch == b'"' {
+                                result.push((
+                                    Token::DoubleQuote,
+                                    mid_start + mid_offset,
+                                    mid_start + mid_offset + 1,
+                                ));
+                            }
+                            mid_offset += 1;
+                        }
+                    }
                 }
 
                 // Re-tokenize the tail using logos
+                // Logos 0.15 may stop early on unterminated strings (e.g. a '"'
+                // without a matching closing '"').  We work around this by
+                // looping until the entire tail is consumed, skipping bytes
+                // that logos cannot tokenize.
                 if split_byte < end {
                     let tail = &input[split_byte..end];
-                    let mut tail_lex = Token::lexer(tail);
-                    while let Some(token_result) = tail_lex.next() {
-                        let tail_span = tail_lex.span();
-                        match token_result {
-                            Ok(tok) => {
+                    let tail_start = split_byte;
+                    let mut tail_offset = 0;
+                    while tail_offset < tail.len() {
+                        let remaining = &tail[tail_offset..];
+                        let mut sub = Token::lexer(remaining);
+                        let mut had_ok = false;
+                        while let Some(token_result) = sub.next() {
+                            let span = sub.span();
+                            match token_result {
+                                Ok(tok) => {
+                                    result.push((
+                                        tok,
+                                        tail_start + tail_offset + span.start,
+                                        tail_start + tail_offset + span.end,
+                                    ));
+                                    had_ok = true;
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                        if had_ok {
+                            // Advance past the last successfully tokenized byte
+                            if let Some(&(_, _, last_end)) = result.last() {
+                                tail_offset = last_end - tail_start;
+                            } else {
+                                tail_offset = tail.len();
+                            }
+                        } else {
+                            // No progress — skip the problematic byte.
+                            // Emit it as a bare SingleQuote or DoubleQuote
+                            // so the character is not lost.
+                            let ch = tail.as_bytes()[tail_offset];
+                            if ch == b'\'' {
                                 result.push((
-                                    tok,
-                                    split_byte + tail_span.start,
-                                    split_byte + tail_span.end,
+                                    Token::SingleQuote,
+                                    tail_start + tail_offset,
+                                    tail_start + tail_offset + 1,
+                                ));
+                            } else if ch == b'"' {
+                                result.push((
+                                    Token::DoubleQuote,
+                                    tail_start + tail_offset,
+                                    tail_start + tail_offset + 1,
                                 ));
                             }
-                            Err(_) => continue,
+                            tail_offset += 1;
                         }
                     }
                 }
@@ -1103,6 +1282,94 @@ impl Lexer {
             }
         }
 
+        *tokens = result;
+    }
+
+    /// Fix bare SingleQuote/DoubleQuote tokens that should have been
+    /// paired into a proper quoted string, but logos failed to match
+    /// them because the closing quote was in a different fragment.
+    /// Scans forward in the input to find the matching close quote
+    /// and replaces the bare token(s) with a proper string token.
+    fn fix_bare_quotes(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
+        let mut result: Vec<(Token, usize, usize)> = Vec::new();
+        let bytes = input.as_bytes();
+        let mut i = 0;
+        while i < tokens.len() {
+            let (ref tok, start, end) = tokens[i];
+            let single_span = end - start == 1
+                && (*tok == Token::SingleQuote || *tok == Token::DoubleQuote);
+            if !single_span {
+                result.push(tokens[i].clone());
+                i += 1;
+                continue;
+            }
+            let quote_byte = bytes[start];
+            // Only process if this is actually a quote character
+            if quote_byte != b'\'' && quote_byte != b'"' {
+                result.push(tokens[i].clone());
+                i += 1;
+                continue;
+            }
+            // Determine which token type to use for the pair
+            let open = start;
+            // Scan forward in input to find matching close quote
+            let mut pos = open + 1;
+            if quote_byte == b'\'' {
+                // Simple single-quoted string: find next unescaped '
+                while pos < input.len() {
+                    if bytes[pos] == b'\'' {
+                        // Found it -- replace the bare SingleQuote with
+                        // a proper SingleQuotedString
+                        result.push((Token::SingleQuotedString, open, pos + 1));
+                        // Skip any tokens that lie within this span
+                        i += 1;
+                        while i < tokens.len() && tokens[i].2 <= pos + 1 {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    if bytes[pos] == b'\\' && pos + 1 < input.len() {
+                        pos += 2; // skip escaped char
+                    } else {
+                        pos += 1;
+                    }
+                }
+                if pos >= input.len() {
+                    // No matching close quote found — keep bare
+                    result.push(tokens[i].clone());
+                    i += 1;
+                }
+            } else {
+                // Double-quoted string: track $(...)/${...} nesting
+                let mut p_depth = 0i32;
+                let mut b_depth = 0i32;
+                let mut bt_depth = 0i32;
+                while pos < input.len() {
+                    match bytes[pos] {
+                        b'"' if p_depth == 0 && b_depth == 0 && bt_depth == 0 => {
+                            result.push((Token::DoubleQuotedString, open, pos + 1));
+                            i += 1;
+                            while i < tokens.len() && tokens[i].2 <= pos + 1 {
+                                i += 1;
+                            }
+                            break;
+                        }
+                        b'\\' if pos + 1 < input.len() => { pos += 2; }
+                        b'`' => { bt_depth = if bt_depth == 0 { 1 } else { 0 }; pos += 1; }
+                        b'$' if pos + 1 < input.len() && bytes[pos + 1] == b'(' => { p_depth += 1; pos += 2; }
+                        b'$' if pos + 1 < input.len() && bytes[pos + 1] == b'{' => { b_depth += 1; pos += 2; }
+                        b')' => { if p_depth > 0 { p_depth -= 1; } pos += 1; }
+                        b'}' => { if b_depth > 0 { b_depth -= 1; } pos += 1; }
+                        _ => { pos += 1; }
+                    }
+                }
+                if pos >= input.len() {
+                    // No matching close quote — keep bare
+                    result.push(tokens[i].clone());
+                    i += 1;
+                }
+            }
+        }
         *tokens = result;
     }
 }
