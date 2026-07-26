@@ -1333,11 +1333,23 @@ pub fn parse_break_statement(parser: &mut Parser) -> Result<Command, ParserError
 
     // Optional argument (loop level)
     let mut level = None;
-    parser.lexer.skip_whitespace_and_comments();
+    // Use INLINE whitespace only (not newlines) so that a newline right after
+    // `break` means no level argument.
+    parser.lexer.skip_inline_whitespace_and_comments();
 
-    if let Some(Token::Number) = parser.lexer.peek() {
-        let level_text = parser.lexer.get_number_text()?;
-        level = Some(level_text);
+    if !parser.lexer.is_eof()
+        && !matches!(
+            parser.lexer.peek(),
+            Some(
+                Token::Newline | Token::Semicolon | Token::CarriageReturn
+                | Token::DoubleSemicolon | Token::And | Token::Or | Token::Pipe
+            )
+        )
+    {
+        if let Some(Token::Number) = parser.lexer.peek() {
+            let level_text = parser.lexer.get_number_text()?;
+            level = Some(level_text);
+        }
     }
 
     Ok(Command::Break(level))
@@ -1348,11 +1360,23 @@ pub fn parse_continue_statement(parser: &mut Parser) -> Result<Command, ParserEr
 
     // Optional argument (loop level)
     let mut level = None;
-    parser.lexer.skip_whitespace_and_comments();
+    // Use INLINE whitespace only (not newlines) so that a newline right after
+    // `continue` means no level argument.
+    parser.lexer.skip_inline_whitespace_and_comments();
 
-    if let Some(Token::Number) = parser.lexer.peek() {
-        let level_text = parser.lexer.get_number_text()?;
-        level = Some(level_text);
+    if !parser.lexer.is_eof()
+        && !matches!(
+            parser.lexer.peek(),
+            Some(
+                Token::Newline | Token::Semicolon | Token::CarriageReturn
+                | Token::DoubleSemicolon | Token::And | Token::Or | Token::Pipe
+            )
+        )
+    {
+        if let Some(Token::Number) = parser.lexer.peek() {
+            let level_text = parser.lexer.get_number_text()?;
+            level = Some(level_text);
+        }
     }
 
     Ok(Command::Continue(level))
@@ -1372,7 +1396,10 @@ pub fn parse_return_statement(parser: &mut Parser) -> Result<Command, ParserErro
     if !parser.lexer.is_eof()
         && !matches!(
             parser.lexer.peek(),
-            Some(Token::Newline | Token::Semicolon | Token::CarriageReturn | Token::DoubleSemicolon)
+            Some(
+                Token::Newline | Token::Semicolon | Token::CarriageReturn
+                | Token::DoubleSemicolon | Token::And | Token::Or | Token::Pipe
+            )
         )
     {
         // Parse the return value as a word

@@ -982,11 +982,19 @@ impl Lexer {
                     // When inside $(), track standalone '(' that are not part of
                     // '$(' so we correctly match ')' to its corresponding '$('.
                     let mut paren_depth = 0i32;
+                    let mut found_close = false;
                     while end < bytes.len() {
                         let ch = bytes[end];
+                        // Stop at unescaped newlines when not inside nested $()/${}/backtick.
+                        // This prevents bare DoubleQuote tokens (from the logos-fallback
+                        // workaround) from swallowing shell code across multiple lines.
+                        if ch == b'\n' && p_depth == 0 && b_depth == 0 && bt_depth == 0 {
+                            break;
+                        }
                         match ch {
                             b'"' if p_depth == 0 && b_depth == 0 && bt_depth == 0 => {
                                 end += 1; // include closing "
+                                found_close = true;
                                 break;
                             }
                             b'\\' if end + 1 < bytes.len() => {
@@ -1034,6 +1042,12 @@ impl Lexer {
                                 end += 1;
                             }
                         }
+                    }
+                    if !found_close {
+                        // No closing " found — do not merge; leave the original token(s) as-is.
+                        merged.push(tokens[i].clone());
+                        i += 1;
+                        continue;
                     }
                     merged.push((Token::DoubleQuotedString, start, end));
                     // Skip all logos tokens covered by this span.
