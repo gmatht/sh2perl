@@ -1236,8 +1236,8 @@ impl Lexer {
             // 'until', 'select', 'function' can legitimately appear inside
             // multi-line quoted strings passed to awk, sed, perl, etc.
             let keywords = [
-                "done", "then", "fi", "esac", "elif ",
-                "do ",
+                "done", "then", "fi", "esac", "elif",
+                "do",
             ];
             let mut split_pos = None;
 
