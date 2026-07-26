@@ -182,7 +182,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::Plus)
             | Some(Token::Minus)
             | Some(Token::Escape)
-            | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
+            | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
             | Some(Token::Colon)
             | Some(Token::Star)
             | Some(Token::Percent)
@@ -213,7 +213,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
-                | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
+                | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
                 | Some(Token::Colon)
                 | Some(Token::Star)
                 | Some(Token::Percent)
@@ -384,10 +384,34 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             lexer.next();
             Ok(Word::Literal(".".to_string(), None))
         }
-        Some(Token::CasePattern) => {
-            // Treat case statement patterns like *.txt as literals.
-            // get_raw_token_text() consumes the current token, so do not call next() here.
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+        Some(Token::TestBracket) => {
+            // Treat [...] expressions as literals (case patterns, array subscripts, etc.)
+            let mut text = String::from("[");
+            lexer.next(); // consume [
+            loop {
+                match lexer.peek() {
+                    Some(Token::TestBracketClose) => {
+                        text.push(']');
+                        lexer.next();
+                        break;
+                    }
+                    Some(Token::Escape) => {
+                        text.push('\\');
+                        lexer.next();
+                        if let Some(escaped) = lexer.get_current_text() {
+                            text.push_str(&escaped);
+                            lexer.next();
+                        }
+                    }
+                    _ => {
+                        if let Some(t) = lexer.get_current_text() {
+                            text.push_str(&t);
+                        }
+                        lexer.next();
+                    }
+                }
+            }
+            Ok(Word::Literal(text, None))
         }
         Some(Token::Slash) => {
             // Treat standalone '/' as a literal (e.g., `cd /`)
@@ -656,7 +680,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::Plus)
             | Some(Token::Minus)
             | Some(Token::Escape)
-            | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
+            | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
             | Some(Token::Colon)
             | Some(Token::Star)
             | Some(Token::Percent)
@@ -686,7 +710,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::Plus)
                 | Some(Token::Minus)
                 | Some(Token::Escape)
-                | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote)
+                | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
                 | Some(Token::Colon)
                 | Some(Token::Star)
                 | Some(Token::Percent)
@@ -856,10 +880,34 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             lexer.next();
             Ok(Word::Literal(".".to_string(), None))
         }
-        Some(Token::CasePattern) => {
-            // Treat case statement patterns like *.txt as literals.
-            // get_raw_token_text() consumes the current token, so do not call next() here.
-            Ok(Word::Literal(lexer.get_raw_token_text()?, None))
+        Some(Token::TestBracket) => {
+            // Treat [...] expressions as literals (case patterns, array subscripts, etc.)
+            let mut text = String::from("[");
+            lexer.next(); // consume [
+            loop {
+                match lexer.peek() {
+                    Some(Token::TestBracketClose) => {
+                        text.push(']');
+                        lexer.next();
+                        break;
+                    }
+                    Some(Token::Escape) => {
+                        text.push('\\');
+                        lexer.next();
+                        if let Some(escaped) = lexer.get_current_text() {
+                            text.push_str(&escaped);
+                            lexer.next();
+                        }
+                    }
+                    _ => {
+                        if let Some(t) = lexer.get_current_text() {
+                            text.push_str(&t);
+                        }
+                        lexer.next();
+                    }
+                }
+            }
+            Ok(Word::Literal(text, None))
         }
         Some(Token::Slash) => {
             // Treat standalone '/' as a literal (e.g., `cd /`)
@@ -1100,6 +1148,53 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
         Some(Token::Dollar) => {
             lexer.next();
             if let Some(Token::Identifier) = lexer.peek() {
+                // Variable names in shell can only contain alphanumeric characters
+                // and underscores.  The identifier token may include extra characters
+                // like `-`, `*`, `?` (e.g. `$CODESET-*`).  Extract only the valid
+                // variable name prefix BEFORE calling get_identifier_text (which
+                // advances past the token).  Modify the token span so the suffix
+                // characters become separate tokens for the merge block.
+                let var_name = if let Some(text) = lexer.get_current_text() {
+                    text
+                } else {
+                    return Err(ParserError::InvalidSyntax(
+                        "Failed to get identifier text".to_string(),
+                    ));
+                };
+                let valid_var_end = var_name
+                    .bytes()
+                    .position(|b| !b.is_ascii_alphanumeric() && b != b'_')
+                    .unwrap_or(var_name.len());
+                if valid_var_end < var_name.len() {
+                    let valid_name = &var_name[..valid_var_end];
+                    let suffix = &var_name[valid_var_end..];
+                    // Truncate the current identifier token to only the valid variable name
+                    if let Some((_, start, end)) = lexer.tokens.get_mut(lexer.current) {
+                        *end = *start + valid_var_end;
+                    }
+                    // Insert synthetic tokens for each remaining suffix byte
+                    if let Some((_, start, _)) = lexer.tokens.get(lexer.current) {
+                        let suffix_start = *start + valid_var_end;
+                        for (i, byte) in suffix.bytes().enumerate() {
+                            let tok = match byte {
+                                b'-' => Token::Minus,
+                                b'*' => Token::Star,
+                                b'?' => Token::Question,
+                                b'.' => Token::Dot,
+                                b'/' => Token::Slash,
+                                b':' => Token::Colon,
+                                _ => Token::Identifier,
+                            };
+                            lexer.tokens.insert(
+                                lexer.current + 1 + i,
+                                (tok, suffix_start + i, suffix_start + i + 1),
+                            );
+                        }
+                    }
+                    // Now consume the (now-truncated) identifier token
+                    lexer.next();
+                    return Ok(Word::Variable(valid_name.to_string(), false, None));
+                }
                 let var_name = lexer.get_identifier_text()?;
 
                 // Check if this is followed by a bracket for array/map access like $map[key]

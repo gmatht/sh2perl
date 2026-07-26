@@ -1896,9 +1896,25 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                 expression_parts.push(")".to_string());
                 lexer.next();
             }
-            Some(Token::CasePattern) => {
-                expression_parts.push(lexer.get_raw_token_text()?);
+            Some(Token::TestBracket) => {
+                expression_parts.push("[".to_string());
                 lexer.next();
+                // Read content until TestBracketClose
+                loop {
+                    match lexer.peek() {
+                        Some(Token::TestBracketClose) => {
+                            expression_parts.push("]".to_string());
+                            lexer.next();
+                            break;
+                        }
+                        _ => {
+                            if let Some(text) = lexer.get_current_text() {
+                                expression_parts.push(text);
+                            }
+                            lexer.next();
+                        }
+                    }
+                }
             }
             Some(Token::Caret) => {
                 expression_parts.push("^".to_string());
@@ -1908,7 +1924,7 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                 expression_parts.push("+".to_string());
                 lexer.next();
             }
-            Some(Token::Escape) | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) => {
+            Some(Token::Escape) | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick) => {
                 expression_parts.push("\\".to_string());
                 lexer.next();
             }
