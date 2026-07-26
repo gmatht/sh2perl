@@ -601,11 +601,6 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     lexer.next();
                     Ok(Word::Literal("?".to_string(), None))
                 }
-                Some(Token::Question) => {
-                    // A standalone ? in word position is a valid glob character
-                    lexer.next();
-                    Ok(Word::Literal("?".to_string(), None))
-                }
                 _ => {
                     let token = token.unwrap_or(Token::Identifier);
                     // Use the actual byte offset of the current token for error position
@@ -1172,9 +1167,25 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 let var_name = lexer.get_number_text()?;
                 Ok(Word::Variable(var_name, false, None))
             } else {
-                Err(ParserError::InvalidSyntax(
-                    "Expected identifier or number after $".to_string(),
-                ))
+                // After $, also accept keyword tokens that match shell keywords
+                // (e.g., $exec, $prog) since they are valid variable names.
+                // Fall back to treating any token text as a variable name.
+                if let Some(text) = lexer.get_current_text() {
+                    let first = text.chars().next().unwrap_or(' ');
+                    if text.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                        let var_name = text;
+                        lexer.next();
+                        Ok(Word::Variable(var_name, false, None))
+                    } else {
+                        Err(ParserError::InvalidSyntax(
+                            "Expected identifier or number after $".to_string(),
+                        ))
+                    }
+                } else {
+                    Err(ParserError::InvalidSyntax(
+                        "Expected identifier or number after $".to_string(),
+                    ))
+                }
             }
         }
         Some(Token::DollarHashSimple) => {

@@ -2502,9 +2502,18 @@ impl Parser {
                     }
                     expression_parts.push(format!("$(({}))", arith));
                 }
-                Some(Token::Newline) | Some(Token::CarriageReturn) | Some(Token::Semicolon) => {
+                Some(Token::Semicolon) => {
                     // Should not appear inside test expression, treat as end
                     break;
+                }
+                Some(Token::Newline) | Some(Token::CarriageReturn) => {
+                    // In double-bracket [[ ]], newlines are whitespace (expressions can span lines)
+                    // In single-bracket [ ], newlines end the expression
+                    if is_double_bracket {
+                        self.lexer.next(); // skip newline
+                    } else {
+                        break;
+                    }
                 }
                 Some(Token::Minus) => {
                     // POSIX test -a (AND) / -o (OR) operators are lexed as Minus + Identifier
