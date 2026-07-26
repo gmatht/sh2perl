@@ -292,11 +292,6 @@ impl Parser {
                 Some(Token::ArithmeticEval) => {
                     self.parse_double_paren_command()?
                 }
-                Some(Token::ParenOpen)
-                    if matches!(self.lexer.peek_n(1), Some(Token::ParenOpen)) =>
-                {
-                    self.parse_double_paren_command()?
-                }
                 Some(Token::ParenOpen) => self.parse_subshell()?,
                 Some(Token::BraceOpen) => parse_block(self)?,
                 Some(Token::TestBracket) => {
@@ -619,9 +614,6 @@ impl Parser {
             Some(Token::Continue) => parse_continue_statement(self),
             Some(Token::Return) => parse_return_statement(self),
             Some(Token::ArithmeticEval) => {
-                self.parse_double_paren_command()
-            }
-            Some(Token::ParenOpen) if matches!(self.lexer.peek_n(1), Some(Token::ParenOpen)) => {
                 self.parse_double_paren_command()
             }
             Some(Token::ParenOpen) => self.parse_subshell(),
