@@ -547,8 +547,17 @@ impl Lexer {
         // lines and contain shell keywords.
         Self::split_overgreedy_sq(input, &mut tokens);
 
+        // Fix split comments: logos 0.15's `#[^\r\n]*` can fail to match
+        // through `'` characters, breaking a Comment into Comment + bare tokens.
+        // Re-merge any Comment with adjacent non-newline tokens on the same line.
+        Self::fix_split_comments(input, &mut tokens);
+
         // Fix bare quotes that logos failed to pair (e.g. in fragments).
         Self::fix_bare_quotes(input, &mut tokens);
+
+        // After fix_bare_quotes may have created new SQS tokens that overlap
+        // with existing ones, run split_overgreedy_sq again to fix them.
+        Self::split_overgreedy_sq(input, &mut tokens);
 
         // Resolve (( ambiguity: if (( cannot be closed by )), it is two
         // nested subshells rather than an arithmetic evaluation.
@@ -1450,6 +1459,43 @@ impl Lexer {
             }
         }
 
+        *tokens = result;
+    }
+
+    /// Logos 0.15's `#[^\r\n]*` regex can fail to match through `'`
+    /// characters, breaking a Comment into a Comment token (ending at
+    /// the `'`) followed by adjacent non-newline tokens.  This function
+    /// re-merges such fragments back into the Comment.
+    fn fix_split_comments(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
+        let mut result: Vec<(Token, usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            let (tok, start, end) = &tokens[i];
+            if !matches!(tok, Token::Comment) {
+                result.push(tokens[i].clone());
+                i += 1;
+                continue;
+            }
+            let mut merge_end = *end;
+            // Look ahead: if the next token starts exactly at merge_end
+            // and is NOT a Newline/CarriageReturn, it was gobbled out of
+            // the comment by the logos bug.  Absorb it and keep going.
+            while i + 1 < tokens.len() {
+                let (ref ntok, nstart, nend) = tokens[i + 1];
+                if nstart != merge_end {
+                    break;
+                }
+                match ntok {
+                    Token::Newline | Token::CarriageReturn => break,
+                    _ => {
+                        merge_end = nend;
+                        i += 1;
+                    }
+                }
+            }
+            result.push((Token::Comment, *start, merge_end));
+            i += 1;
+        }
         *tokens = result;
     }
 
