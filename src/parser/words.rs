@@ -1982,6 +1982,8 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     let content = content.replace("\\\"", "\"");
     let content = content.replace("\\\\", "\\");
 
+    eprintln!("DEBUG parse_string_interpolation: content len={}, content={:?}", content.len(), &content[..content.len().min(80)]);
+
     // Parse the string content to extract literal parts and variable references
     let mut parts = Vec::new();
     let mut current_literal = String::new();
@@ -2260,11 +2262,27 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
                 if paren_count == 0 {
                     let cmd_content = &content[cmd_start..i - 1];
-                    if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content)
-                    {
-                        parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                    eprintln!("DEBUG parse_string_interpolation: found $(...), cmd_content len={}, first 80: {:?}", cmd_content.len(), &cmd_content[..cmd_content.len().min(80)]);
+                    if let Ok(cmds) = crate::parser::commands::parse_commands_from_text(cmd_content) {
+                        eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text OK, {} commands", cmds.len());
+                        if cmds.is_empty() {
+                            parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                        } else if cmds.len() == 1 {
+                            parts.push(StringPart::CommandSubstitution(Box::new(cmds.into_iter().next().unwrap())));
+                        } else {
+                            let block = crate::ast::Block { commands: cmds };
+                            parts.push(StringPart::CommandSubstitution(Box::new(crate::ast::Command::Block(block))));
+                        }
                     } else {
-                        parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                        eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text FAILED, trying pipeline");
+                        // Fallback: try the old pipeline-based parser
+                        if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
+                            eprintln!("DEBUG parse_string_interpolation: pipeline parser OK");
+                            parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                        } else {
+                            eprintln!("DEBUG parse_string_interpolation: both parsers failed, using literal");
+                            parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                        }
                     }
                 } else {
                     current_literal.push_str("$(");
