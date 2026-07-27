@@ -3280,6 +3280,10 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 lexer.next();
                 items.push(BraceItem::Literal(text));
             }
+            None => {
+                // End of input without a closing } - treat the { as a literal.
+                break;
+            }
             _ => {
                 // Instead of erroring, treat unexpected tokens as literal text.
                 // This handles cases like `{-v | --version}` where the `{` 
@@ -3288,9 +3292,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     items.push(BraceItem::Literal(text));
                     lexer.next();
                 } else {
-                    return Err(ParserError::InvalidSyntax(
-                        "Unexpected token in brace expansion".to_string(),
-                    ));
+                    break;
                 }
             }
         }
