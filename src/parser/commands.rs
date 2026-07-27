@@ -209,18 +209,11 @@ impl Parser {
                 parse_posix_function(self)?
             } else {
                 // Check if this is a standalone variable assignment: identifier=value or identifier[subscript]=value
-                let mut pos = 1;
-                while pos < 10
-                    && matches!(
-                        self.lexer.peek_n(pos),
-                        Some(Token::Space | Token::Tab | Token::Comment | Token::Newline)
-                    )
-                {
-                    pos += 1;
-                }
+                // In bash, a true standalone assignment requires the = to immediately follow
+                // the identifier (no whitespace).  "FOO = bar" is a command, not an assignment.
 
-                // Check for simple assignment: identifier=value
-                if Self::is_assignment_operator(self.lexer.peek_n(pos).cloned())
+                // Check for simple assignment: identifier=value (no whitespace before =)
+                if Self::is_assignment_operator(self.lexer.peek_n(1).cloned())
                     || self.has_indexed_assignment_after_identifier(1)
                 {
                     self.parse_standalone_assignment()?
@@ -1678,6 +1671,11 @@ impl Parser {
         let var_name = self.parse_assignment_target()?;
 
         // Consume the assignment token (=, +=, -=, etc.)
+        // Skip inline whitespace before the operator (defensive; the caller
+        // should have ensured no whitespace before `=`, but arrays like
+        // `arr=( ... )` may have whitespace between the var name and `=`
+        // when parsed via the env-var path in parse_simple_command).
+        self.lexer.skip_inline_whitespace_and_comments();
         let assignment_op = self.lexer.peek().cloned().unwrap();
         match assignment_op {
             Token::Assign
