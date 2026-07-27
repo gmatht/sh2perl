@@ -280,7 +280,7 @@ pub enum Token {
     RegexMatch,
 
     // Strings and literals
-    #[regex(r#""([^"\\]|\\[^\n])*""#, priority = 4)]
+    #[regex(r#""([^"\\]|\\[^\n]|\\\n)*""#, priority = 4)]
     DoubleQuotedString,
     #[regex(r"'[^']*'", priority = 3)]
     SingleQuotedString,
