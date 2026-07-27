@@ -906,7 +906,7 @@ impl Lexer {
         // Scan the comment text tracking nested ${...} depth so we find the
         // correct matching `}` rather than the first one (which may belong to
         // a nested expansion like ${PATH#"${GIT_EXEC_PATH}:"}).
-        let mut depth = brace_depth;
+        let mut depth = 0;
         let mut found_pos = None;
         let bytes = text.as_bytes();
         let mut i = 0;
