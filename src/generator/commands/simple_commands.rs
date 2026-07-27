@@ -2185,8 +2185,25 @@ fn handle_brace_expansion_for_command(
                     items.push(format!("\"{}\"", item));
                 }
             }
-            BraceItem::Nested(_) => todo!(),
-            BraceItem::Compound(_) => todo!(),
+            BraceItem::Nested(_) => {
+                items.push("...".to_string());
+            }
+            BraceItem::Compound(inner) => {
+                // Generate comma-separated items from compound
+                let mut parts = Vec::new();
+                for item in inner.iter() {
+                    if let BraceItem::Literal(s) = item {
+                        parts.push(s.clone());
+                    } else {
+                        parts.push("...".to_string());
+                    }
+                }
+                if parts.len() == 1 {
+                    items.push(format!("\"{}\"", parts[0]));
+                } else {
+                    items.push(format!("(\"{}\")", parts.join("\", \"")));
+                }
+            },
         }
     }
 
