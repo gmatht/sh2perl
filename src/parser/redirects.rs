@@ -437,16 +437,19 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         remove_end += 1;
     }
     if lexer.current >= body_start_idx && lexer.current < remove_end {
-        lexer.current = body_start_idx;
+        lexer.current = saved_lexer_current;
     }
     let remove_len = remove_end - body_start_idx;
     if remove_len > 0 {
         lexer.tokens.drain(body_start_idx..remove_end);
-        // Set current to point past the removed body tokens.
-        // If current was before body_start_idx (pointing to unconsumed redirect
-        // header tokens like `> file` after `<<-'EOF'`), keep it there.
+        // Set current back to saved_lexer_current so the caller
+        // (e.g. parse_command_redirects) can continue processing
+        // any additional redirects on the same line (e.g. `2>&1 >/dev/null`
+        // after `<<EOF`).  The body tokens have been removed, but any
+        // redirect tokens that appeared after the heredoc delimiter on
+        // the same line are still in the token list before body_start_idx.
         if lexer.current >= body_start_idx {
-            lexer.current = body_start_idx;
+            lexer.current = saved_lexer_current;
         }
     }
 
@@ -478,9 +481,12 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
             for (j, gt) in gap_tokens.iter().enumerate() {
                 lexer.tokens.insert(insert_at + j, gt.clone());
             }
-            // Point lexer.current to the first inserted gap token,
-            // replacing the original body tokens with the re-tokenized gap.
-            lexer.current = insert_at;
+            // Point lexer.current back to saved_lexer_current so the
+            // caller can continue processing any additional redirects
+            // on the same line.  The re-tokenized gap tokens are now
+            // in place after body_start_idx and will be encountered
+            // after the newline separator.
+            lexer.current = saved_lexer_current;
             // Re-apply DoubleQuotedString merging to the re-tokenized content
             // because logos re-tokenization does not handle nesting of
             // $(...), ${...}, and backtick command substitutions inside DQS.
