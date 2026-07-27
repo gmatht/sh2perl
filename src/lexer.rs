@@ -1045,12 +1045,9 @@ impl Lexer {
                     let mut found_close = false;
                     while end < bytes.len() {
                         let ch = bytes[end];
-                        // Stop at unescaped newlines when not inside nested $()/${}/backtick.
-                        // This prevents bare DoubleQuote tokens (from the logos-fallback
-                        // workaround) from swallowing shell code across multiple lines.
-                        if ch == b'\n' && p_depth == 0 && b_depth == 0 && bt_depth == 0 {
-                            break;
-                        }
+                        // Allow bare newlines inside double-quoted strings (valid in bash).
+                        // Continue scanning until we find the matching closing quote
+                        // (tracking $(...)/${...}/backtick nesting) or run out of input.
                         match ch {
                             b'"' if p_depth == 0 && b_depth == 0 && bt_depth == 0 => {
                                 end += 1; // include closing "
