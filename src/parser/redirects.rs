@@ -491,6 +491,19 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
             // because logos re-tokenization does not handle nesting of
             // $(...), ${...}, and backtick command substitutions inside DQS.
             Lexer::merge_double_quoted_strings(&lexer.input, &mut lexer.tokens);
+            // Apply the same post-processing steps as Lexer::new to the
+            // modified token list: split over-greedy single-quoted strings,
+            // fix bare quotes that logos failed to pair, and fix split comments.
+            // These steps are necessary because the re-tokenized gap may contain
+            // single quotes that were previously part of spanning SQS tokens,
+            // and the raw logos output for the gap may not have gone through
+            // the full post-processing pipeline.
+            Lexer::split_overgreedy_sq(&lexer.input, &mut lexer.tokens);
+            Lexer::fix_split_comments(&lexer.input, &mut lexer.tokens);
+            Lexer::fix_bare_quotes(&lexer.input, &mut lexer.tokens);
+            // After fix_bare_quotes may have created new SQS tokens that overlap
+            // with existing ones, run split_overgreedy_sq again to fix them.
+            Lexer::split_overgreedy_sq(&lexer.input, &mut lexer.tokens);
         }
     }
 
