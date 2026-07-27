@@ -280,7 +280,7 @@ pub enum Token {
     RegexMatch,
 
     // Strings and literals
-    #[regex(r#""([^"\\]|\\\n|\\.)*""#, priority = 4)]
+    #[regex(r#""([^"\\]|\\[^\n])*""#, priority = 4)]
     DoubleQuotedString,
     #[regex(r"'[^']*'", priority = 3)]
     SingleQuotedString,
@@ -1002,7 +1002,17 @@ impl Lexer {
                                 break;
                             }
                             b'\\' if end + 1 < bytes.len() => {
-                                end += 2; // skip escaped char
+                                // Backslash followed by newline is a line continuation.
+                                // Don't skip the newline — let the newline check above
+                                // break us out of the DQS scan.  This prevents bare
+                                // DoubleQuote tokens from consuming content on subsequent
+                                // lines (e.g. the `"` in `\\"''"/g` on one line followed
+                                // by `-e "s/..."` on the next).
+                                if bytes[end + 1] == b'\n' {
+                                    end += 1; // just skip the backslash, stop at newline
+                                } else {
+                                    end += 2; // skip escaped char
+                                }
                             }
                             b'`' => {
                                 // Toggle backtick depth — backticks inside double
