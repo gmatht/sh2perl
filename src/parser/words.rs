@@ -751,6 +751,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::Number)
                 | Some(Token::Float)
                 | Some(Token::PaddedNumber)
+                | Some(Token::HexNumber)
                 | Some(Token::Slash)
                 | Some(Token::Dot)
                 | Some(Token::Range)
