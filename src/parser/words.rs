@@ -3178,7 +3178,9 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Token::File
                 | Token::Directory
                 | Token::Readable
-                | Token::PipeFile,
+                | Token::PipeFile
+                | Token::TestBracket
+                | Token::TestBracketClose,
             ) => {
                 let text = lexer.get_current_text().unwrap_or_default();
                 lexer.next();

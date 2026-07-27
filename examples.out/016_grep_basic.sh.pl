@@ -157,6 +157,7 @@ $CHILD_ERROR = 0;
     }
     if ( !$pipeline_success_192 ) { $main_exit_code = 1; }
     }
+# Original bash: echo "text with pattern123 in it" | grep -o "pattern[0-9]\+"
 {
     my $output_193 = q{};
     my $output_printed_193;

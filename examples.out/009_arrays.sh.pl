@@ -39,6 +39,7 @@ print $map{'foo'};
 if ( !( ($map{'foo'}) =~ m{\n\z}msx ) ) { print "\n"; }
 print $map{'answer'};
 if ( !( ($map{'answer'}) =~ m{\n\z}msx ) ) { print "\n"; }
+# Original bash: #!/usr/bin/env bash
 {
     my $output_154 = q{};
     my $output_printed_154;

@@ -21,6 +21,7 @@ do {
     q{};
 };
 print "== Simple pipeline ==\n";
+# Original bash: echo "alpha beta" | grep beta
 {
     my $output_146 = q{};
     my $output_printed_146;
