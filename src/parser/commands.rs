@@ -364,7 +364,8 @@ impl Parser {
 
         let command = self.parse_command_redirects(command)?;
 
-        self.lexer.skip_whitespace_and_comments();
+        // Skip only inline whitespace — newlines separate commands.
+        self.lexer.skip_inline_whitespace_and_comments();
         if let Some(Token::Background) = self.lexer.peek() {
             self.lexer.next();
             Ok(Command::Background(Box::new(command)))
@@ -378,16 +379,16 @@ impl Parser {
         }
     }
 
-    fn parse_command_redirects(&mut self, command: Command) -> Result<Command, ParserError> {
+    fn parse_command_redirects(&mut self, mut command: Command) -> Result<Command, ParserError> {
         // Check if there are redirects following the command
         let mut redirects = Vec::new();
         let mut had_heredoc = false;
 
         // Parse redirects until we hit a command separator or other non-redirect token.
         // Skip inline whitespace between redirects so sequences like `cmd <(a) <(b)`
-        // keep both operands.
+        // keep both operands.  Do NOT skip newlines — they separate commands.
         loop {
-            self.lexer.skip_whitespace_and_comments();
+            self.lexer.skip_inline_whitespace_and_comments();
             let Some(token) = self.lexer.peek() else {
                 break;
             };
@@ -396,7 +397,7 @@ impl Parser {
                     // Skip whitespace between consecutive redirects (e.g. the space
                     // between `<(sort a.txt)` and `<(sort b.txt)` in
                     // `comm -23 <(sort a.txt) <(sort b.txt)`).
-                    self.lexer.skip_whitespace_and_comments();
+                    self.lexer.skip_inline_whitespace_and_comments();
                 }
                 Token::Number
                 | Token::RedirectIn
@@ -458,6 +459,86 @@ impl Parser {
                                 _ => break,
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // After parsing redirects, collect any additional arguments on the same line.
+        // bash allows redirects between arguments (e.g. `grep >/dev/null pattern file`).
+        // Only process SimpleCommand and break on keywords that start new statements.
+        if let Command::Simple(ref mut simple_cmd) = command {
+            loop {
+                self.lexer.skip_inline_whitespace_and_comments();
+                match self.lexer.peek() {
+                    Some(Token::Newline) | Some(Token::CarriageReturn)
+                    | Some(Token::Semicolon) | Some(Token::DoubleSemicolon)
+                    | Some(Token::Pipe) | Some(Token::And) | Some(Token::Or)
+                    | Some(Token::Background)
+                    | Some(Token::ParenClose) | Some(Token::BraceClose)
+                    | Some(Token::Fi) | Some(Token::Then) | Some(Token::Else)
+                    | Some(Token::Elif) | Some(Token::Do) | Some(Token::Done)
+                    | Some(Token::Esac)
+                    // Statement-starting keywords — stop so the caller can
+                    // parse them as a new command.
+                    | Some(Token::If) | Some(Token::Case) | Some(Token::While)
+                    | Some(Token::Until) | Some(Token::For) | Some(Token::Function)
+                    // Subshell or block start
+                    | Some(Token::ParenOpen) | Some(Token::BraceOpen)
+                    | None => break,
+                    // Do not consume an Identifier that looks like a function
+                    // definition (identifier followed by `()`)
+                    // OR the start of a standalone assignment (identifier=value).
+                    Some(Token::Identifier) => {
+                        let mut pos = 1usize;
+                        while matches!(
+                            self.lexer.peek_n(pos),
+                            Some(Token::Space | Token::Tab | Token::Comment)
+                        ) {
+                            pos += 1;
+                        }
+                        // Break if this identifier begins a standalone assignment
+                        if Self::is_assignment_operator(self.lexer.peek_n(pos).cloned()) {
+                            break;
+                        }
+                        if matches!(self.lexer.peek_n(pos), Some(Token::ParenOpen))
+                            && matches!(self.lexer.peek_n(pos + 1), Some(Token::ParenClose))
+                        {
+                            break;
+                        }
+                        simple_cmd.args.push(parse_word_no_newline_skip(&mut self.lexer)?);
+                    }
+                    // Additional redirects may appear among arguments
+                    Some(Token::Number) => {
+                        if let Some(next_token) = self.lexer.peek_n(1) {
+                            match next_token {
+                                Token::RedirectIn | Token::RedirectOut
+                                | Token::RedirectAppend | Token::RedirectInErr
+                                | Token::RedirectOutErr | Token::RedirectInOut
+                                | Token::RedirectAll | Token::RedirectAllAppend
+                                | Token::RedirectOutClobber
+                                | Token::Heredoc | Token::HeredocTabs
+                                | Token::HereString => {
+                                    redirects.push(parse_redirect(&mut self.lexer)?);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                        simple_cmd.args.push(parse_word_no_newline_skip(&mut self.lexer)?);
+                    }
+                    Some(Token::RedirectIn) | Some(Token::RedirectOut)
+                    | Some(Token::RedirectAppend) | Some(Token::RedirectInErr)
+                    | Some(Token::RedirectOutErr) | Some(Token::RedirectInOut)
+                    | Some(Token::RedirectAll) | Some(Token::RedirectAllAppend)
+                    | Some(Token::RedirectOutClobber)
+                    | Some(Token::Heredoc) | Some(Token::HeredocTabs)
+                    | Some(Token::HereString) => {
+                        redirects.push(parse_redirect(&mut self.lexer)?);
+                        continue;
+                    }
+                    _ => {
+                        simple_cmd.args.push(parse_word_no_newline_skip(&mut self.lexer)?);
                     }
                 }
             }
@@ -715,8 +796,9 @@ impl Parser {
         let mut result: Option<Command> = None;
 
         while let Some(_) = self.lexer.peek() {
-            // Skip any whitespace/comments before checking for an operator
-            self.lexer.skip_whitespace_and_comments();
+            // Skip any inline whitespace/comments before checking for an operator
+            // Do NOT skip newlines — they separate commands.
+            self.lexer.skip_inline_whitespace_and_comments();
             let Some(token) = self.lexer.peek() else {
                 break;
             };
@@ -928,7 +1010,7 @@ impl Parser {
                                         break;
                                     }
                                 }
-                                Some(_) => pos += 1,
+                                Some(_) => {},
                                 None => break,
                             }
                             pos += 1;
@@ -1814,6 +1896,90 @@ impl Parser {
             )
         }
 
+        // Convert the assignment operator token to an AssignmentOperator.
+        let op_to_assignop = |tok: &Token| -> AssignmentOperator {
+            match tok {
+                Token::PlusAssign => AssignmentOperator::PlusAssign,
+                Token::MinusAssign => AssignmentOperator::MinusAssign,
+                Token::StarAssign => AssignmentOperator::StarAssign,
+                Token::SlashAssign => AssignmentOperator::SlashAssign,
+                Token::PercentAssign => AssignmentOperator::PercentAssign,
+                _ => AssignmentOperator::Assign,
+            }
+        };
+        let first_op = op_to_assignop(&assignment_op);
+
+        // Check if there are more consecutive assignments before a command.
+        // Collect all identifier=value pairs before checking for a following command.
+        let mut env_vars: BTreeMap<String, Word> = BTreeMap::new();
+        let mut env_ops: BTreeMap<String, AssignmentOperator> = BTreeMap::new();
+        env_ops.insert(var_name.clone(), first_op);
+        env_vars.insert(var_name, value_word);
+
+        // Loop to parse additional consecutive env-var assignments
+        loop {
+            self.lexer.skip_inline_whitespace_and_comments();
+            match self.lexer.peek() {
+                Some(Token::Identifier) => {
+                    let mut pos = 1usize;
+                    while matches!(
+                        self.lexer.peek_n(pos),
+                        Some(Token::Space | Token::Tab | Token::Comment)
+                    ) {
+                        pos += 1;
+                    }
+                    let is_next_assignment =
+                        Self::is_assignment_operator(self.lexer.peek_n(pos).cloned())
+                        || self.has_indexed_assignment_after_identifier(pos);
+                    if is_next_assignment {
+                        // Parse the next assignment
+                        let next_var = self.parse_assignment_target()?;
+                        let next_op = self.lexer.peek().cloned().unwrap();
+                        let next_op_converted = op_to_assignop(&next_op);
+                        match next_op {
+                            Token::Assign
+                            | Token::PlusAssign
+                            | Token::MinusAssign
+                            | Token::StarAssign
+                            | Token::SlashAssign
+                            | Token::PercentAssign => {
+                                self.lexer.next();
+                            }
+                            _ => {
+                                return Err(ParserError::InvalidSyntax(
+                                    "Expected assignment operator".to_string(),
+                                ))
+                            }
+                        }
+                        let next_value = if matches!(self.lexer.peek(), Some(Token::ParenOpen)) {
+                            let elements = parse_array_elements(&mut self.lexer)?;
+                            Word::array(next_var.clone(), elements)
+                        } else if matches!(
+                            self.lexer.peek(),
+                            Some(
+                                Token::Space
+                                    | Token::Tab
+                                    | Token::Newline
+                                    | Token::CarriageReturn
+                                    | Token::Semicolon
+                                    | Token::DoubleSemicolon
+                            )
+                            | None
+                        ) {
+                            Word::literal(String::new())
+                        } else {
+                            parse_word(&mut self.lexer)?
+                        };
+                        env_vars.insert(next_var.clone(), next_value);
+                        env_ops.insert(next_var, next_op_converted);
+                        continue;
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+
         // Check if there's a command following this assignment.
         // Use skip_inline to NOT skip newlines — a newline separates
         // the assignment from any following command.
@@ -1844,9 +2010,6 @@ impl Parser {
 
         if has_following_command {
             // There's a command following, parse it as a command with environment variables
-            let mut env_vars = BTreeMap::new();
-            env_vars.insert(var_name, value_word);
-
             let command = self.parse_command()?;
 
             // Merge the environment variables with the command's environment variables
@@ -1860,16 +2023,16 @@ impl Parser {
                 }
                 _ => {
                     // For non-simple commands, wrap in a block with environment variables
-                    let mut env_vars_cmd = BTreeMap::new();
+                    let mut env_cmd_vars = BTreeMap::new();
                     for (key, value) in env_vars {
-                        env_vars_cmd.insert(key, value);
+                        env_cmd_vars.insert(key, value);
                     }
 
                     let env_cmd = Command::Simple(SimpleCommand {
                         name: Word::literal("true".to_string()),
                         args: Vec::new(),
                         redirects: Vec::new(),
-                        env_vars: env_vars_cmd,
+                        env_vars: env_cmd_vars,
                         stdout_used: true,
                         stderr_used: true,
                     });
@@ -1880,20 +2043,20 @@ impl Parser {
                 }
             }
         } else {
-            // No command following, this is a standalone assignment
-            Ok(Command::Assignment(Assignment {
-                variable: var_name,
-                value: value_word,
-                operator: match assignment_op {
-                    Token::Assign => AssignmentOperator::Assign,
-                    Token::PlusAssign => AssignmentOperator::PlusAssign,
-                    Token::MinusAssign => AssignmentOperator::MinusAssign,
-                    Token::StarAssign => AssignmentOperator::StarAssign,
-                    Token::SlashAssign => AssignmentOperator::SlashAssign,
-                    Token::PercentAssign => AssignmentOperator::PercentAssign,
-                    _ => AssignmentOperator::Assign, // Default fallback
-                },
-            }))
+            // No command following, return as standalone assignment(s)
+            let commands: Vec<Command> = env_vars.into_iter().map(|(variable, value)| {
+                let operator = env_ops.get(&variable).cloned().unwrap_or(AssignmentOperator::Assign);
+                Command::Assignment(Assignment {
+                    variable,
+                    value,
+                    operator,
+                })
+            }).collect();
+            if commands.len() == 1 {
+                Ok(commands.into_iter().next().unwrap())
+            } else {
+                Ok(Command::Block(Block { commands }))
+            }
         }
     }
 
