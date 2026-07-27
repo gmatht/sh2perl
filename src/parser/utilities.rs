@@ -59,6 +59,7 @@ impl ParserUtilities for Lexer {
     fn capture_parenthetical_text(&mut self) -> Result<String, ParserError> {
         let mut content = String::new();
         let mut depth = 1;
+        let start_pos = self.current;
 
         // Consume the opening parenthesis
         self.next();
@@ -302,6 +303,10 @@ impl ParserUtilities for Lexer {
         }
 
 
+        eprintln!("DEBUG capture_parenthetical_text: captured {} chars, returning at token idx {}", content.len(), self.current);
+        if content.len() > 50 {
+            eprintln!("DEBUG capture_parenthetical_text: first 50 chars: {:?}", &content[..50]);
+        }
         Ok(content)
     }
 
