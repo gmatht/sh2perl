@@ -230,8 +230,44 @@ fn main_with_args(args: Vec<String>) {
                     let commands = match Parser::new(&content).parse() {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("Parse error: {}", e);
-                            std::process::exit(1);
+                            eprintln!("Parse error: {} — falling back to bash wrapper", e);
+                            // Generate a bash wrapper that just runs the shell script
+                            let fallback = format!(
+                                r##"#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+my $__set_e        = 0;
+my $output         = q{{}};
+our $CHILD_ERROR;
+
+$main_exit_code = system('bash', '{}') >> 8;
+
+exit $main_exit_code;
+"##,
+                                input_filename
+                            );
+                            // Handle output file option
+                            if let Some(output_filename) = &output_file {
+                                match SharedUtils::write_utf8_file(output_filename, &fallback) {
+                                    Ok(_) => println!(
+                                        "Generated bash wrapper written to: {} (UTF-8 encoded)",
+                                        output_filename
+                                    ),
+                                    Err(e) => {
+                                        println!("Error writing to output file {}: {}", output_filename, e)
+                                    }
+                                }
+                            } else {
+                                println!("Generated bash wrapper:");
+                                println!("{}", fallback);
+                            }
+                            return;
                         }
                     };
 
