@@ -1,0 +1,632 @@
+warning: unused import: `HashMap`
+ --> src/ast.rs:1:34
+  |
+1 | use std::collections::{BTreeMap, HashMap};
+  |                                  ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `HashMap`
+  --> src/parser/commands.rs:13:34
+   |
+13 | use std::collections::{BTreeMap, HashMap};
+   |                                  ^^^^^^^
+
+warning: unused import: `Token`
+    --> src/parser/commands.rs:3253:31
+     |
+3253 |     use crate::lexer::{Lexer, Token};
+     |                               ^^^^^
+
+warning: unused import: `HashMap`
+ --> src/parser/control_flow.rs:7:34
+  |
+7 | use std::collections::{BTreeMap, HashMap};
+  |                                  ^^^^^^^
+
+warning: unused imports: `BTreeMap` and `HashMap`
+ --> src/parser/redirects.rs:7:24
+  |
+7 | use std::collections::{BTreeMap, HashMap};
+  |                        ^^^^^^^^  ^^^^^^^
+
+warning: unused import: `HashMap`
+ --> src/parser/words.rs:7:34
+  |
+7 | use std::collections::{BTreeMap, HashMap};
+  |                                  ^^^^^^^
+
+warning: unused import: `HashMap`
+    --> src/parser/words.rs:1894:38
+     |
+1894 |     use std::collections::{BTreeMap, HashMap};
+     |                                      ^^^^^^^
+
+warning: unused import: `regex::Regex`
+ --> src/generator/commands/pipeline_commands.rs:6:5
+  |
+6 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+
+warning: unused import: `extract_array_key_impl`
+ --> src/generator/commands/simple_commands.rs:2:31
+  |
+2 | use crate::generator::utils::{extract_array_key_impl, get_temp_dir};
+  |                               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `HashMap`
+ --> src/generator/commands/simple_commands.rs:5:34
+  |
+5 | use std::collections::{BTreeMap, HashMap};
+  |                                  ^^^^^^^
+
+warning: unnecessary parentheses around `if` condition
+  --> src/generator/commands/perl.rs:21:12
+   |
+21 |         if (i + 4 <= bytes.len() && &bytes[i..i+4] == b"open") {
+   |            ^                                                 ^
+   |
+   = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+   |
+21 -         if (i + 4 <= bytes.len() && &bytes[i..i+4] == b"open") {
+21 +         if i + 4 <= bytes.len() && &bytes[i..i+4] == b"open"  {
+   |
+
+warning: unused import: `std::collections::HashMap`
+ --> src/generator/redirects.rs:5:5
+  |
+5 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+   --> src/timeout_manager.rs:321:1
+    |
+321 | /// Global timeout manager instance
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `brace_depth`
+   --> src/lexer.rs:900:49
+    |
+900 |     pub fn handle_comment_with_brace(&mut self, brace_depth: usize) -> Result<String, ParserError> {
+    |                                                 ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_brace_depth`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `bytes`
+    --> src/lexer.rs:1190:13
+     |
+1190 |         let bytes = input.as_bytes();
+     |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_bytes`
+
+warning: unused variable: `input`
+    --> src/lexer.rs:1553:39
+     |
+1553 |     fn resolve_double_paren_ambiguity(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
+     |                                       ^^^^^ help: if this is intentional, prefix it with an underscore: `_input`
+
+warning: value assigned to `newline_count` is never read
+  --> src/parser/commands.rs:52:33
+   |
+52 |         let mut newline_count = 0;
+   |                                 ^ this value is reassigned later and never used
+...
+59 |                     newline_count += 1;
+   |                     ------------------ `newline_count` is overwritten here before the previous value is read
+   |
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `newline_count` is never read
+   --> src/parser/commands.rs:59:21
+    |
+ 59 |                     newline_count += 1;
+    |                     ^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+110 |             newline_count = 0;
+    |             ----------------- `newline_count` is overwritten here before the previous value is read
+
+warning: unused variable: `start_byte_pos`
+   --> src/parser/commands.rs:795:13
+    |
+795 |             start_byte_pos: usize,
+    |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_start_byte_pos`
+
+warning: unused variable: `parser`
+   --> src/parser/commands.rs:796:13
+    |
+796 |             parser: &Parser,
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_parser`
+
+warning: value assigned to `brace_depth` is never read
+    --> src/parser/commands.rs:2577:33
+     |
+2577 | ...                   brace_depth = 0;
+     |                       ^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+    --> src/parser/commands.rs:3256:9
+     |
+3256 |     let mut lexer = Lexer::new(text);
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `sq_text`
+   --> src/parser/control_flow.rs:447:37
+    |
+447 | ...                   let sq_text = parser.lexer.get_raw_token_text()?;
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_sq_text`
+
+warning: unused variable: `first`
+    --> src/parser/words.rs:1322:25
+     |
+1322 |                     let first = text.chars().next().unwrap_or(' ');
+     |                         ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unreachable pattern
+   --> src/generator/commands/builtins.rs:964:9
+    |
+716 |         "hostname" => {
+    |         ---------- matches all the relevant values
+...
+964 |         "hostname" => {
+    |         ^^^^^^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/generator/commands/command_dispatcher.rs:724:29
+    |
+724 |                         let mut lines: Vec<&str> = specific_output.rsplitn(2, '\n').collect();
+    |                             ----^^^^^
+    |                             |
+    |                             help: remove this `mut`
+
+warning: unused variable: `mode`
+   --> src/generator/commands/command_dispatcher.rs:892:42
+    |
+892 | ...                   if let Some((ref mode, ref target)) = output_redirect_target {
+    |                                    ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mode`
+
+warning: unused variable: `target`
+   --> src/generator/commands/command_dispatcher.rs:892:52
+    |
+892 | ...                   if let Some((ref mode, ref target)) = output_redirect_target {
+    |                                              ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: value assigned to `stderr_scope_opened` is never read
+   --> src/generator/commands/command_dispatcher.rs:905:33
+    |
+905 | ...                   stderr_scope_opened = false;
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `cmd2`
+   --> src/generator/commands/pipeline_commands.rs:710:66
+    |
+710 |         if let (Command::Redirect(redirect_cmd), Command::Simple(cmd2)) =
+    |                                                                  ^^^^ help: if this is intentional, prefix it with an underscore: `_cmd2`
+
+warning: variable `head_max` is assigned to, but never used
+    --> src/generator/commands/pipeline_commands.rs:1240:21
+     |
+1240 |                 let mut head_max = 10; // Default value
+     |                     ^^^^^^^^^^^^
+     |
+     = note: consider using `_head_max` instead
+
+warning: unused variable: `i`
+    --> src/generator/commands/pipeline_commands.rs:1303:22
+     |
+1303 |                 for (i, command) in pipeline.commands[start_index..].iter().enumerate() {
+     |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `j`
+    --> src/generator/commands/pipeline_commands.rs:1323:34
+     |
+1323 | ...                   for (j, nested_command) in nested_pipeline.commands.iter().enumerate() {
+     |                            ^ help: if this is intentional, prefix it with an underscore: `_j`
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1264:49
+     |
+1259 | ...                       head_max = num;
+     |                           -------------- `head_max` is overwritten here before the previous value is read
+...
+1264 | ...                   head_max = num;
+     |                       ^^^^^^^^^^^^^^ this value is reassigned later and never used
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1259:53
+     |
+1252 | ...                   head_max = num;
+     |                       -------------- `head_max` is overwritten here before the previous value is read
+...
+1259 | ...                   head_max = num;
+     |                       ^^^^^^^^^^^^^^ this value is reassigned later and never used
+
+warning: value assigned to `head_max` is never read
+    --> src/generator/commands/pipeline_commands.rs:1252:53
+     |
+1252 | ...                   head_max = num;
+     |                       ^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unused variable: `i`
+  --> src/generator/commands/system_commands.rs:11:21
+   |
+11 |     while let Some((i, ch)) = chars.next() {
+   |                     ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `input_var`
+ --> src/generator/commands/comm.rs:7:5
+  |
+7 |     input_var: &str,
+  |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_input_var`
+
+warning: variable `force` is assigned to, but never used
+  --> src/generator/commands/cp.rs:20:9
+   |
+20 |     let mut force = false;
+   |         ^^^^^^^^^
+   |
+   = note: consider using `_force` instead
+
+warning: variable `preserve` is assigned to, but never used
+  --> src/generator/commands/cp.rs:21:9
+   |
+21 |     let mut preserve = false;
+   |         ^^^^^^^^^^^^
+   |
+   = note: consider using `_preserve` instead
+
+warning: value assigned to `force` is never read
+  --> src/generator/commands/cp.rs:33:28
+   |
+33 |                     'f' => force = true,
+   |                            ^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+
+warning: value assigned to `preserve` is never read
+  --> src/generator/commands/cp.rs:34:28
+   |
+34 |                     'p' => preserve = true,
+   |                            ^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:501:13
+    |
+501 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:502:13
+    |
+502 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: unused variable: `all_found_var`
+   --> src/generator/commands/ls.rs:503:13
+    |
+503 |         let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_all_found_var`
+
+warning: variable `sort_by_time` is assigned to, but never used
+   --> src/generator/commands/ls.rs:782:9
+    |
+782 |     let mut sort_by_time = false; // -t flag: sort by modification time
+    |         ^^^^^^^^^^^^^^^^
+    |
+    = note: consider using `_sort_by_time` instead
+
+warning: value assigned to `sort_by_time` is never read
+   --> src/generator/commands/ls.rs:796:32
+    |
+796 |                         't' => sort_by_time = true,   // -t flag: sort by modification time
+    |                                ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `command_index`
+  --> src/generator/commands/wc.rs:23:5
+   |
+23 |     command_index: &str,
+   |     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_command_index`
+
+warning: variable does not need to be mutable
+  --> src/generator/control_flow.rs:41:17
+   |
+41 |             let mut cond = generator.generate_command(&if_stmt.condition);
+   |                 ----^^^^
+   |                 |
+   |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/generator/control_flow.rs:494:17
+    |
+494 |             let mut cond = generator.generate_command(&while_loop.condition);
+    |                 ----^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src/generator/control_flow.rs:1168:21
+     |
+1168 |                 let mut c = generator.generate_command(cmd);
+     |                     ----^
+     |                     |
+     |                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/generator/test_expressions.rs:545:17
+    |
+545 |             let mut qx_expr = inner.to_string();
+    |                 ----^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: unused variable: `literal`
+   --> src/generator/utils.rs:301:59
+    |
+301 | ...                   Word::Literal(literal, _) => {
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `err_var`
+   --> src/generator/utils.rs:436:51
+    |
+436 | ...                   let (in_var, out_var, err_var, pid_var, result_var) =
+    |                                             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_err_var`
+
+warning: unused variable: `err_var`
+   --> src/generator/utils.rs:453:47
+    |
+453 |                         let (in_var, out_var, err_var, pid_var, result_var) =
+    |                                               ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_err_var`
+
+warning: unused variable: `err_var`
+   --> src/generator/utils.rs:469:43
+    |
+469 |                     let (in_var, out_var, err_var, pid_var, result_var) =
+    |                                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_err_var`
+
+warning: unused variable: `err_var`
+   --> src/generator/words.rs:252:27
+    |
+252 |     let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+    |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_err_var`
+
+warning: unused variable: `pid_var`
+   --> src/generator/words.rs:252:36
+    |
+252 |     let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+    |                                    ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pid_var`
+
+warning: variable does not need to be mutable
+    --> src/generator/words.rs:1321:37
+     |
+1321 | ...                   let mut code = format!(
+     |                           ----^^^^
+     |                           |
+     |                           help: remove this `mut`
+
+warning: unused variable: `literal`
+    --> src/generator/words.rs:1103:59
+     |
+1103 | ...                   Word::Literal(literal, _) => {
+     |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_literal`
+
+warning: unused variable: `cmd_name`
+   --> src/generator/words.rs:588:25
+    |
+588 |                     let cmd_name = generator.word_to_perl(&simple_cmd.name);
+    |                         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cmd_name`
+
+warning: unused variable: `indent1`
+    --> src/generator/words.rs:1483:33
+     |
+1483 | ...                   let indent1 = "    ".to_string(); // 4 spaces for outer do block
+     |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+    --> src/generator/words.rs:1524:33
+     |
+1524 | ...                   let indent1 = "    ".to_string();
+     |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+    --> src/generator/words.rs:1565:33
+     |
+1565 | ...                   let indent1 = "    ".to_string();
+     |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+    --> src/generator/words.rs:1601:33
+     |
+1601 | ...                   let indent1 = "    ".to_string();
+     |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `indent1`
+    --> src/generator/words.rs:1640:33
+     |
+1640 | ...                   let indent1 = "    ".to_string();
+     |                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_indent1`
+
+warning: unused variable: `err_var`
+    --> src/generator/words.rs:1861:51
+     |
+1861 | ...                   let (in_var, out_var, err_var, pid_var, result_var) =
+     |                                             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_err_var`
+
+warning: unused variable: `err_var`
+    --> src/generator/words.rs:1879:47
+     |
+1879 |                         let (in_var, out_var, err_var, pid_var, result_var) =
+     |                                               ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_err_var`
+
+warning: unused variable: `s`
+    --> src/generator/words.rs:2348:23
+     |
+2348 |         Word::Literal(s, _) => generator.perl_string_literal(word),
+     |                       ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `full_match`
+    --> src/generator/words.rs:2992:21
+     |
+2992 |                 let full_match = result[i..end].to_string();
+     |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_full_match`
+
+warning: unused variable: `needs_exit_code`
+   --> src/generator/mod.rs:274:13
+    |
+274 |         let needs_exit_code = self.needs_exit_code_tracking(ast);
+    |             ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_needs_exit_code`
+
+warning: unused variable: `array_re`
+   --> src/generator/mod.rs:706:21
+    |
+706 |                 let array_re = regex::Regex::new(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\[").unwrap();
+    |                     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_array_re`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:161:13
+    |
+161 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: unused variable: `operation_handle`
+   --> src/timeout_manager.rs:221:13
+    |
+221 |         let operation_handle = thread::spawn(move || {
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_operation_handle`
+
+warning: associated items `rebalance_logical_chain`, `parse_variable_expansion`, and `parse_arithmetic_expression` are never used
+    --> src/parser/commands.rs:955:8
+     |
+  33 | impl Parser {
+     | ----------- associated items in this implementation
+...
+ 955 |     fn rebalance_logical_chain(command: Command) -> Command {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+...
+2889 |     fn parse_variable_expansion(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2976 |     fn parse_arithmetic_expression(&mut self) -> Result<Word, ParserError> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `parse_arithmetic_expression` is never used
+    --> src/parser/control_flow.rs:1501:4
+     |
+1501 | fn parse_arithmetic_expression(parser: &mut Parser) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_pipeline` is never used
+    --> src/parser/control_flow.rs:1625:4
+     |
+1625 | fn parse_pipeline(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^
+
+warning: function `parse_command` is never used
+    --> src/parser/control_flow.rs:1794:4
+     |
+1794 | fn parse_command(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `parse_assignment` is never used
+    --> src/parser/control_flow.rs:2121:4
+     |
+2121 | fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `parse_parameter_expansion` is never used
+    --> src/parser/words.rs:3537:4
+     |
+3537 | fn parse_parameter_expansion(_lexer: &mut Lexer) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_array_slicing` is never used
+    --> src/parser/words.rs:3544:4
+     |
+3544 | fn parse_array_slicing(_lexer: &mut Lexer, _array_name: String) -> Result<Word, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_simple_command_from_text` is never used
+    --> src/parser/words.rs:3616:4
+     |
+3616 | fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `contains_diff_command` is never used
+   --> src/generator/commands/logic_commands.rs:299:4
+    |
+299 | fn contains_diff_command(cmd: &Command) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_linebyline_impl` is never used
+  --> src/generator/commands/tr.rs:73:4
+   |
+73 | fn generate_tr_linebyline_impl(
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_tr_buffered_impl` is never used
+   --> src/generator/commands/tr.rs:143:4
+    |
+143 | fn generate_tr_buffered_impl(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_variable_used_after_for_loop` is never used
+   --> src/generator/control_flow.rs:518:4
+    |
+518 | fn is_variable_used_after_for_loop(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_shell_command_substitution` is never used
+   --> src/generator/words.rs:238:4
+    |
+238 | fn generate_shell_command_substitution(generator: &mut Generator, cmd: &Command) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `variable_usage` and `scope_depth` are never read
+  --> src/variable_analysis.rs:8:5
+   |
+ 6 | pub struct VariableUsageAnalyzer {
+   |            --------------------- fields in this struct
+ 7 |     /// Maps variable names to their usage information
+ 8 |     variable_usage: HashMap<String, VariableUsageInfo>,
+   |     ^^^^^^^^^^^^^^
+ 9 |     /// Current scope depth for tracking nested scopes
+10 |     scope_depth: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `VariableUsageAnalyzer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `debashl` (lib) generated 88 warnings (run `cargo fix --lib -p debashl` to apply 58 suggestions)
+warning: unused import: `Token`
+ --> src/bin/dump_tokens2.rs:3:29
+  |
+3 | use debashl::lexer::{Lexer, Token};
+  |                             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `debashl` (bin "dump_tokens2") generated 1 warning (run `cargo fix --bin "dump_tokens2" -p debashl` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running `target/debug/dump_tokens2 ../sh/xzgrep`
+
+thread 'main' (272753) panicked at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/io/stdio.rs:1166:9:
+failed printing to stdout: Broken pipe (os error 32)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
