@@ -196,6 +196,101 @@ impl ParserUtilities for Lexer {
                     }
                     self.next();
                 }
+                Some(Token::Heredoc) | Some(Token::HeredocTabs) => {
+                    // Heredoc inside $(...): skip the heredoc body tokens.
+                    // The parentheses inside the heredoc body should NOT affect
+                    // the depth tracking.
+                    let heredoc_text = self.get_current_text().unwrap_or_default();
+                    content.push_str(&heredoc_text);
+                    self.next(); // consume << or <<-
+
+                    // Skip whitespace before delimiter
+                    while matches!(
+                        self.peek(),
+                        Some(Token::Space | Token::Tab | Token::Comment)
+                    ) {
+                        if let Some(text) = self.get_current_text() {
+                            content.push_str(&text);
+                        }
+                        self.next();
+                    }
+
+                    // Consume delimiter (possibly backslash-quoted) and save the delimiter text.
+                    let mut delim_str = String::new();
+                    if matches!(self.peek(), Some(Token::Escape)) {
+                        if let Some(text) = self.get_current_text() {
+                            content.push_str(&text);
+                        }
+                        self.next(); // consume backslash
+                    }
+                    if let Some(text) = self.get_current_text() {
+                        delim_str = text.to_string();
+                        content.push_str(&text);
+                    }
+                    self.next(); // consume delimiter word
+
+                    // Add the newline after the delimiter word to content
+                    if let Some(text) = self.get_current_text() {
+                        content.push_str(&text);
+                    }
+                    self.next(); // consume the newline after delimiter
+
+                    // The current token is now at the start of the heredoc body.
+                    let cur_pos = match self.get_span() {
+                        Some((s, _)) => s,
+                        None => return Err(ParserError::UnexpectedEOF),
+                    };
+                    let start_pos = cur_pos;
+
+                    // Also extract delimiter from raw line for robustness.
+                    if delim_str.is_empty() {
+                        let heredoc_line_end = cur_pos; // position of newline after delimiter
+                        let heredoc_line_start = self.input[..heredoc_line_end].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                        let line = &self.input[heredoc_line_start..heredoc_line_end];
+                        let trimmed = line.trim();
+                        if let Some(pos) = trimmed.rfind(|c: char| c.is_whitespace()) {
+                            let word = trimmed[pos+1..].trim();
+                            delim_str = if word.starts_with('\\') { word[1..].to_string() } else { word.to_string() };
+                        }
+                    }
+
+                    if !delim_str.is_empty() {
+                        // Scan raw input line by line until we find the delimiter
+                        let input_bytes = self.input.as_bytes();
+                        let mut current_pos = start_pos;
+                        while current_pos < self.input.len() {
+                            let line_end = self.input[current_pos..]
+                                .find('\n')
+                                .map(|i| current_pos + i)
+                                .unwrap_or(self.input.len());
+                            let line = &self.input[current_pos..line_end];
+                            if line.trim() == delim_str {
+                                content.push_str(line);
+                                content.push('\n');
+                                current_pos = line_end.saturating_add(1);
+                                break;
+                            }
+                            content.push_str(line);
+                            if line_end < self.input.len() && input_bytes[line_end] == b'\n' {
+                                content.push('\n');
+                                current_pos = line_end + 1;
+                            } else {
+                                current_pos = line_end;
+                                break;
+                            }
+                        }
+
+                        // Advance past all tokens up to current_pos
+                        loop {
+                            match self.tokens.get(self.current) {
+                                Some((_, start, _)) if *start < current_pos => {
+                                    self.next();
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                }
                 Some(_) => {
                     if let Some(text) = self.get_current_text() {
                         content.push_str(&text);
