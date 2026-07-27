@@ -3262,6 +3262,13 @@ pub fn parse_pipeline_from_text(text: &str) -> Result<Command, ParserError> {
     parser.parse_pipeline()
 }
 
+/// Parse text as one or more commands, using the full parser that handles
+/// compound constructs (for, if, while, case, etc.) as well as pipelines.
+pub fn parse_commands_from_text(text: &str) -> Result<Vec<Command>, ParserError> {
+    let mut parser = Parser::new(text);
+    parser.parse()
+}
+
 // Re-export the main parsing function
 pub fn parse(input: &str) -> Result<Vec<Command>, ParserError> {
     let mut parser = Parser::new(input);
