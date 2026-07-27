@@ -1334,10 +1334,10 @@ pub fn parse_posix_function(parser: &mut Parser) -> Result<Command, ParserError>
 
     // Parse commands until we find the closing brace
     loop {
-        // Skip separators
+        // Skip separators (but NOT DoubleSemicolon -- that belongs to case statements)
         while matches!(
             parser.lexer.peek(),
-            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::Semicolon | Token::DoubleSemicolon)
+            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::Semicolon)
         ) {
             parser.lexer.next();
         }
@@ -1386,10 +1386,10 @@ pub fn parse_block(parser: &mut Parser) -> Result<Command, ParserError> {
 
     // Parse commands until we find the closing brace
     loop {
-        // Skip separators
+        // Skip separators (but NOT DoubleSemicolon -- that belongs to case statements)
         while matches!(
             parser.lexer.peek(),
-            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::Semicolon | Token::DoubleSemicolon)
+            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::Semicolon)
         ) {
             parser.lexer.next();
         }

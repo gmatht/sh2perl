@@ -345,6 +345,25 @@ impl Parser {
                     self.lexer.next();
                     self.parse_command()?
                 }
+                Some(Token::Pipe) => {
+                    // A pipe at the start of a command is a continuation from
+                    // a previous line (e.g. after backslash-newline or orphaned |).
+                    // Consume it and parse the remaining command as a pipeline segment.
+                    self.lexer.next();
+                    // Skip whitespace (including newlines) after the pipe
+                    self.lexer.skip_whitespace_and_comments();
+                    if self.lexer.is_eof() {
+                        return Ok(Command::Simple(SimpleCommand {
+                            name: Word::literal(String::new()),
+                            args: vec![],
+                            redirects: vec![],
+                            env_vars: BTreeMap::new(),
+                            stdout_used: true,
+                            stderr_used: true,
+                        }));
+                    }
+                    self.parse_pipeline_segment()?
+                }
                 Some(Token::Newline) | Some(Token::CarriageReturn) => {
                     // Newlines should be handled at the top level, not here
                     // Return an empty command to indicate we hit a newline
