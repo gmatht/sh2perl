@@ -33,3 +33,6 @@ __tmp_direct_exec.pl
 kip first SKIP bytes of both inputs
 examples/final_result.txt
 examples/users.txt
+
+# Development artifacts
+debug_perl_code.pl
