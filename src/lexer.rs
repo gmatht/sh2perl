@@ -1466,7 +1466,7 @@ impl Lexer {
     /// characters, breaking a Comment into a Comment token (ending at
     /// the `'`) followed by adjacent non-newline tokens.  This function
     /// re-merges such fragments back into the Comment.
-    fn fix_split_comments(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
+    pub fn fix_split_comments(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
         let mut result: Vec<(Token, usize, usize)> = Vec::new();
         let mut i = 0;
         while i < tokens.len() {
@@ -1504,7 +1504,7 @@ impl Lexer {
     /// them because the closing quote was in a different fragment.
     /// Scans forward in the input to find the matching close quote
     /// and replaces the bare token(s) with a proper string token.
-    fn fix_bare_quotes(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
+    pub fn fix_bare_quotes(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
         let mut result: Vec<(Token, usize, usize)> = Vec::new();
         let bytes = input.as_bytes();
         let mut i = 0;

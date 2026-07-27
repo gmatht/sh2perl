@@ -301,6 +301,44 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             };
             Ok(Word::Literal(content, None))
         }
+        Some(Token::SingleQuote) => {
+            // Handle a bare single-quote token that wasn't paired into
+            // a SingleQuotedString by the lexer (e.g. after heredoc
+            // re-tokenization or multi-line single-quoted strings).
+            // Scan forward through the raw input to find the matching
+            // closing quote.
+            let cur = lexer.current;
+            let start = if let Some((_, s, _)) = lexer.tokens.get(cur) {
+                *s
+            } else {
+                let pos = lexer.current_position();
+                let (line, col) = lexer.offset_to_line_col(pos);
+                return Err(ParserError::UnexpectedToken {
+                    token: Token::SingleQuote,
+                    line,
+                    col,
+                });
+            };
+            let bytes = lexer.input.as_bytes();
+            let mut pos = start + 1;
+            while pos < bytes.len() && bytes[pos] != b'\'' {
+                pos += 1;
+            }
+            let content = if pos < bytes.len() {
+                // Found matching close quote
+                let end = pos + 1;
+                // Advance lexer past all tokens covered by this span
+                while lexer.current < lexer.tokens.len() && lexer.tokens[lexer.current].2 <= end {
+                    lexer.current += 1;
+                }
+                lexer.input[start + 1..pos].to_string()
+            } else {
+                // No matching close quote found - treat the rest as literal
+                lexer.current = lexer.tokens.len();
+                lexer.input[start + 1..].to_string()
+            };
+            Ok(Word::Literal(content, None))
+        }
         Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
         Some(Token::DollarDoubleQuotedString) => Ok(parse_string_interpolation(lexer)?),
@@ -795,6 +833,44 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 quoted_text[1..quoted_text.len() - 1].to_string()
             } else {
                 quoted_text
+            };
+            Ok(Word::Literal(content, None))
+        }
+        Some(Token::SingleQuote) => {
+            // Handle a bare single-quote token that wasn't paired into
+            // a SingleQuotedString by the lexer (e.g. after heredoc
+            // re-tokenization or multi-line single-quoted strings).
+            // Scan forward through the raw input to find the matching
+            // closing quote.
+            let cur = lexer.current;
+            let start = if let Some((_, s, _)) = lexer.tokens.get(cur) {
+                *s
+            } else {
+                let pos = lexer.current_position();
+                let (line, col) = lexer.offset_to_line_col(pos);
+                return Err(ParserError::UnexpectedToken {
+                    token: Token::SingleQuote,
+                    line,
+                    col,
+                });
+            };
+            let bytes = lexer.input.as_bytes();
+            let mut pos = start + 1;
+            while pos < bytes.len() && bytes[pos] != b'\'' {
+                pos += 1;
+            }
+            let content = if pos < bytes.len() {
+                // Found matching close quote
+                let end = pos + 1;
+                // Advance lexer past all tokens covered by this span
+                while lexer.current < lexer.tokens.len() && lexer.tokens[lexer.current].2 <= end {
+                    lexer.current += 1;
+                }
+                lexer.input[start + 1..pos].to_string()
+            } else {
+                // No matching close quote found - treat the rest as literal
+                lexer.current = lexer.tokens.len();
+                lexer.input[start + 1..].to_string()
             };
             Ok(Word::Literal(content, None))
         }
