@@ -1049,14 +1049,11 @@ impl Lexer {
                                 break;
                             }
                             b'\\' if end + 1 < bytes.len() => {
-                                // Backslash followed by newline is a line continuation.
-                                // Don't skip the newline — let the newline check above
-                                // break us out of the DQS scan.  This prevents bare
-                                // DoubleQuote tokens from consuming content on subsequent
-                                // lines (e.g. the `"` in `\\"''"/g` on one line followed
-                                // by `-e "s/..."` on the next).
+                                // Backslash followed by newline is a line continuation
+                                // inside double-quoted strings.  Skip both the backslash
+                                // and the newline so the string spans multiple lines.
                                 if bytes[end + 1] == b'\n' {
-                                    end += 1; // just skip the backslash, stop at newline
+                                    end += 2; // skip backslash AND newline (line continuation)
                                 } else {
                                     end += 2; // skip escaped char
                                 }
