@@ -419,7 +419,23 @@ impl Lexer {
             match token_result {
                 Ok(token) => tokens.push((token, span.start, span.end)),
                 Err(_) => {
-                    // Skip invalid tokens (logos couldn't match anything)
+                    // Logos couldn't match anything at this position.
+                    // Check if it's a bare quote character that we should keep.
+                    let pos = span.start;
+                    if pos < input.len() {
+                        let ch = input.as_bytes()[pos];
+                        if ch == b'\'' {
+                            tokens.push((Token::SingleQuote, pos, pos + 1));
+                            continue;
+                        } else if ch == b'"' {
+                            tokens.push((Token::DoubleQuote, pos, pos + 1));
+                            continue;
+                        } else if ch == b'`' {
+                            tokens.push((Token::BacktickChar, pos, pos + 1));
+                            continue;
+                        }
+                    }
+                    // Skip other invalid tokens
                     continue;
                 }
             }
@@ -881,13 +897,44 @@ impl Lexer {
     ///   2. Returns everything from `#` up to (but not including) that `}`.
     ///   3. Re-injects any text after `}` as newly-lexed tokens so the
     ///      caller can continue parsing normally.
-    pub fn handle_comment_with_brace(&mut self, mut brace_depth: usize) -> Result<String, ParserError> {
+    pub fn handle_comment_with_brace(&mut self, brace_depth: usize) -> Result<String, ParserError> {
         let idx = self.current;
         let start = self.tokens[idx].1;
         let end = self.tokens[idx].2;
         let text = self.input[start..end].to_string();
 
-        if let Some(pos) = text.find('}') {
+        // Scan the comment text tracking nested ${...} depth so we find the
+        // correct matching `}` rather than the first one (which may belong to
+        // a nested expansion like ${PATH#"${GIT_EXEC_PATH}:"}).
+        let mut depth = brace_depth;
+        let mut found_pos = None;
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
+                    depth += 1;
+                    i += 2;
+                }
+                b'}' => {
+                    if depth == 0 {
+                        found_pos = Some(i);
+                        break;
+                    }
+                    depth -= 1;
+                    i += 1;
+                }
+                b'\\' if i + 1 < bytes.len() && bytes[i + 1] == b'\\' => {
+                    // Skip escaped backslash (could be part of pattern like [/\\])
+                    i += 2;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+
+        if let Some(pos) = found_pos {
             let before = &text[..pos];       // content up to `}`
             let after  = &text[pos + 1..];   // content after `}`
 
