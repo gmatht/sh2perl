@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
+use crate::ir::{AssignTarget, IrExpr, IrStmt, Sigil};
 
 /// Generate logical AND operation (left && right)
 pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &Command) -> String {
@@ -285,8 +286,17 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                     generator.indent_level -= 1;
                     output.push_str(&generator.indent());
                     output.push_str("}\n");
-                    output.push_str(&generator.indent());
-                    output.push_str("$main_exit_code = 0;\n");
+                    output.push_str(&crate::ir::stmt_to_perl(
+                        &IrStmt::Assign {
+                            targets: vec![AssignTarget {
+                                var: "main_exit_code".to_string(),
+                                sigil: Sigil::Scalar,
+                                indices: vec![],
+                            }],
+                            expr: IrExpr::Int(0),
+                        },
+                        generator.indent_level,
+                    ));
                     return output;
                 }
             }
@@ -311,8 +321,17 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                         generator.indent_level -= 1;
                         output.push_str(&generator.indent());
                         output.push_str("}\n");
-                        output.push_str(&generator.indent());
-                        output.push_str("$main_exit_code = 0;\n");
+                        output.push_str(&crate::ir::stmt_to_perl(
+                            &IrStmt::Assign {
+                                targets: vec![AssignTarget {
+                                    var: "main_exit_code".to_string(),
+                                    sigil: Sigil::Scalar,
+                                    indices: vec![],
+                                }],
+                                expr: IrExpr::Int(0),
+                            },
+                            generator.indent_level,
+                        ));
                         return output;
                     }
                 }
