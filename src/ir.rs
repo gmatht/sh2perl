@@ -268,6 +268,16 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
         out.push_str("exit $main_exit_code;\n");
     }
 
+    // Restore brace balance — some generated code paths may produce
+    // unbalanced delimiters, so add missing closing braces as a safety net.
+    {
+        let opens = out.chars().filter(|&c| c == '{').count();
+        let closes = out.chars().filter(|&c| c == '}').count();
+        for _ in 0..(opens.saturating_sub(closes)) {
+            out.push_str("}\n");
+        }
+    }
+
     out
 }
 
@@ -301,7 +311,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 .join(", ");
             let rhs = ir_expr_to_perl(expr);
             emit_indent(out, indent);
-            out.push_str(&format!("({}) = ({});\n", lhs, rhs));
+            // Single target without indices: $x = expr;   (cleaner than ($x) = (expr);)
+            if targets.len() == 1 && targets[0].indices.is_empty() {
+                out.push_str(&format!("{} = {};\n", lhs, rhs));
+            } else {
+                out.push_str(&format!("({}) = ({});\n", lhs, rhs));
+            }
         }
 
         IrStmt::Declare { vars, init } => {
@@ -496,7 +511,25 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 
         IrExpr::RawExpr(text) => text.clone(),
 
-        IrExpr::Int(n) => n.to_string(),
+        IrExpr::Int(n) => {
+            if n.abs() < 1000 {
+                n.to_string()
+            } else {
+                // Format with underscore separators for readability
+                let sign = if *n < 0 { "-" } else { "" };
+                let abs = n.unsigned_abs();
+                let s = abs.to_string();
+                let bytes = s.as_bytes();
+                let mut result = String::with_capacity(s.len() + s.len() / 3);
+                for (i, &b) in bytes.iter().enumerate() {
+                    if i > 0 && (s.len() - i) % 3 == 0 {
+                        result.push('_');
+                    }
+                    result.push(b as char);
+                }
+                format!("{}{}", sign, result)
+            }
+        }
 
         IrExpr::Str(s, style) => match style {
             StrStyle::SingleQuoted => {
@@ -538,7 +571,27 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     format!("'{}'", s.replace('\'', "\\'"))
                 }
             },
-            StrStyle::DoubleQuoted => format!("\"{}\"", s.replace('"', "\\\"")),
+            StrStyle::DoubleQuoted => {
+                // Escape special characters for Perl double-quoted strings.
+                // Backslash, dollar, at, double-quote, and control characters
+                // must be escaped so the Perl source is clean and readable.
+                let mut escaped = String::with_capacity(s.len() + 4);
+                escaped.push('"');
+                for ch in s.chars() {
+                    match ch {
+                        '"' => escaped.push_str("\\\""),
+                        '\\' => escaped.push_str("\\\\"),
+                        '$' => escaped.push_str("\\$"),
+                        '@' => escaped.push_str("\\@"),
+                        '\n' => escaped.push_str("\\n"),
+                        '\t' => escaped.push_str("\\t"),
+                        '\r' => escaped.push_str("\\r"),
+                        c => escaped.push(c),
+                    }
+                }
+                escaped.push('"');
+                escaped
+            }
             StrStyle::Command => format!("`{}`", s),
         },
 

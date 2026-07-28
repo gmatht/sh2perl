@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
+use crate::ir::{stmt_to_perl, AssignTarget, Decl, IrExpr, IrStmt, Sigil, StrStyle};
 use regex::escape;
 
 pub fn generate_sort_command(
@@ -172,33 +173,39 @@ pub fn generate_sort_command_with_output(
         format!("${}", output_name)
     };
 
-    // Reuse an existing declaration when the caller already introduced this variable.
+    // Build the join expression using IR nodes so the backend can produce
+    // clean output.  The trailing-newline check is unnecessary because
+    // join never produces a trailing newline.
+    let join_expr = IrExpr::Call {
+        func: "join".to_string(),
+        args: vec![
+            IrExpr::Str("\n".to_string(), StrStyle::DoubleQuoted),
+            IrExpr::Var(format!("sort_sorted_{}", command_index), Sigil::Array),
+        ],
+    };
+
+    let indent_level = generator.indent_level;
     if generator.declared_locals.contains(output_name) {
-        output.push_str(&format!(
-            "{} = join \"\\n\", @sort_sorted_{};\n",
-            output_ref, command_index
-        ));
+        let stmt = IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: output_name.to_string(),
+                sigil: Sigil::Scalar,
+                indices: vec![],
+            }],
+            expr: join_expr,
+        };
+        output.push_str(&stmt_to_perl(&stmt, indent_level));
     } else {
-        output.push_str(&format!(
-            "my {} = join \"\\n\", @sort_sorted_{};\n",
-            output_ref, command_index
-        ));
+        let stmt = IrStmt::Declare {
+            vars: vec![Decl {
+                name: output_name.to_string(),
+                sigil: Sigil::Scalar,
+            }],
+            init: Some(join_expr),
+        };
+        output.push_str(&stmt_to_perl(&stmt, indent_level));
         generator.declared_locals.insert(output_name.to_string());
     }
-    // Ensure output ends with newline to match shell behavior
-    output.push_str(&generator.indent());
-    output.push_str(&format!(
-        "if ({} ne q{{}} && !({} =~ {})) {{\n",
-        output_ref,
-        output_ref,
-        generator.newline_end_regex()
-    ));
-    generator.indent_level += 1;
-    output.push_str(&generator.indent());
-    output.push_str(&format!("{} .= \"\\n\";\n", output_ref));
-    generator.indent_level -= 1;
-    output.push_str(&generator.indent());
-    output.push_str("}\n");
 
     // If this is being used in a pipeline context, assign the result back to the input variable
     if input_var != output_var {

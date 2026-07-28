@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
+use crate::ir::{stmt_to_perl, Decl, IrExpr, IrStmt, Sigil, StrStyle};
 
 pub fn generate_wc_command(
     _generator: &mut Generator,
@@ -145,44 +146,60 @@ pub fn generate_wc_command_with_output(
         output.push_str("}\n");
     }
 
-    // Build output string: wc output is space-separated counts followed by filename (if given)
-    // Real wc omits padding when only one count column is requested.
-    output.push_str(&generator.indent());
-    output.push_str("my $_wc_result = q{};\n");
-    // Count how many number columns we have
+    // Build a single sprintf call through IR.  This produces clean
+    // output like:  my $_wc_result = sprintf "%7d %7d %7d\n",
+    //                $_wc_lines, $_wc_words, $_wc_bytes;
+    // instead of the piecewise .= concatenation.
     let num_cols = [count_lines, count_words, count_chars || count_bytes, longest_line]
         .iter().filter(|&&x| x).count();
     let use_padding = num_cols > 1;
+    let pad = if use_padding { "%7d" } else { "%d" };
+
+    let mut fmt_parts: Vec<String> = Vec::new();
+    let mut sprintf_args: Vec<IrExpr> = Vec::new();
+
     if count_lines {
-        let line_fmt = if use_padding { "%7d" } else { "%d" };
-        output.push_str(&generator.indent());
-        output.push_str(&format!("$_wc_result .= sprintf q{{{}}}, $_wc_lines;\n", line_fmt));
+        fmt_parts.push(pad.to_string());
+        sprintf_args.push(IrExpr::Var("_wc_lines".to_string(), Sigil::Scalar));
     }
     if count_words {
-        let word_fmt = if use_padding { "%7d" } else { "%d" };
-        output.push_str(&generator.indent());
-        output.push_str(&format!("$_wc_result .= sprintf q{{{}}}, $_wc_words;\n", word_fmt));
+        fmt_parts.push(pad.to_string());
+        sprintf_args.push(IrExpr::Var("_wc_words".to_string(), Sigil::Scalar));
     }
     if count_chars || count_bytes {
-        let val = if count_chars { "$_wc_chars" } else { "$_wc_bytes" };
-        let byte_fmt = if use_padding { "%7d" } else { "%d" };
-        output.push_str(&generator.indent());
-        output.push_str(&format!("$_wc_result .= sprintf q{{{}}}, {};\n", byte_fmt, val));
+        fmt_parts.push(pad.to_string());
+        let var_name = if count_chars { "_wc_chars" } else { "_wc_bytes" };
+        sprintf_args.push(IrExpr::Var(var_name.to_string(), Sigil::Scalar));
     }
     if longest_line {
-        let long_fmt = if use_padding { "%7d" } else { "%d" };
-        output.push_str(&generator.indent());
-        output.push_str(&format!("$_wc_result .= sprintf q{{{}}}, $_wc_longest;\n", long_fmt));
+        fmt_parts.push(pad.to_string());
+        sprintf_args.push(IrExpr::Var("_wc_longest".to_string(), Sigil::Scalar));
     }
 
-    // Add filename if provided
+    // Append filename if provided
     if let Some(ref filename) = file_arg {
-        output.push_str(&generator.indent());
-        output.push_str(&format!("$_wc_result .= ' ' . '{}';\n", filename));
+        fmt_parts.push(filename.clone());
     }
 
-    output.push_str(&generator.indent());
-    output.push_str("$_wc_result .= \"\\n\";\n");
+    // Use literal newline; DoubleQuoted handler will escape it to \\n
+    fmt_parts.push("\n".to_string());
+    let fmt_str = fmt_parts.join(" ");
+
+    let mut all_args = vec![IrExpr::Str(fmt_str, StrStyle::DoubleQuoted)];
+    all_args.extend(sprintf_args);
+
+    let sprintf_expr = IrExpr::Call {
+        func: "sprintf".to_string(),
+        args: all_args,
+    };
+    let decl = IrStmt::Declare {
+        vars: vec![Decl {
+            name: "_wc_result".to_string(),
+            sigil: Sigil::Scalar,
+        }],
+        init: Some(sprintf_expr),
+    };
+    output.push_str(&stmt_to_perl(&decl, generator.indent_level));
     output.push_str(&generator.indent());
     output.push_str("$_wc_result;\n");
 
