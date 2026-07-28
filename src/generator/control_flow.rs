@@ -109,6 +109,12 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
         _ => {
             output.push_str(&generator.indent());
             output.push_str(&generator.generate_command(&if_stmt.then_branch));
+            // Ensure a newline after the command so that the closing `}`
+            // does not end up on the same line (which confuses perlcritic
+            // and makes subsequent `my` declarations appear conditional).
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
         }
     }
 
@@ -129,6 +135,11 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             _ => {
                 output.push_str(&generator.indent());
                 output.push_str(&generator.generate_command(else_branch));
+                // Ensure a newline after the command so that the closing `}`
+                // does not end up on the same line.
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
             }
         }
 
