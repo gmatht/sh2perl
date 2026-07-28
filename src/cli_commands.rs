@@ -84,7 +84,15 @@ pub fn parse_file(filename: &str) {
 }
 
 pub fn parse_to_perl(input: &str) {
+    // Magic numbers are off by default (constructor sets no_magic_numbers=true).
+    parse_to_perl_with_opts(input, None);
+}
+
+pub fn parse_to_perl_with_opts(input: &str, no_magic_numbers: Option<bool>) {
     let mut generator = Generator::new();
+    if let Some(val) = no_magic_numbers {
+        generator.set_no_magic_numbers(val);
+    }
 
     // Check if debug is enabled before printing debug output
     if debashl::debug::is_debug_enabled() {

@@ -50,6 +50,7 @@ pub struct Generator {
     pub constants: HashMap<String, i64>,
     pub translation_mode: bool, // New field for pure translation mode
     pub inline_mode: bool,      // New field for inline mode (for backticks)
+    pub no_magic_numbers: bool, // When true, suppress MAGIC_N constant declarations
     pub original_script_name: Option<String>, // Original script name for $0 compatibility
     pub use_function_signatures: bool, // Control whether to use modern function signatures
     /// Stack of pipeline output ids currently being generated. Used so nested
@@ -139,6 +140,7 @@ impl Generator {
             constants: HashMap::new(),
             translation_mode: false,
             inline_mode: false,
+            no_magic_numbers: true,
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
             pipeline_output_stack: Vec::new(),
@@ -166,6 +168,7 @@ impl Generator {
             constants: HashMap::new(),
             translation_mode: true,
             inline_mode: false,
+            no_magic_numbers: true,
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
             pipeline_output_stack: Vec::new(),
@@ -193,6 +196,7 @@ impl Generator {
             constants: HashMap::new(),
             translation_mode: false,
             inline_mode: true,
+            no_magic_numbers: true,
             original_script_name: None,
             use_function_signatures: true, // Default to modern function signatures
             pipeline_output_stack: Vec::new(),
@@ -251,6 +255,10 @@ impl Generator {
         self.original_script_name = Some(name);
     }
 
+    pub fn set_no_magic_numbers(&mut self, val: bool) {
+        self.no_magic_numbers = val;
+    }
+
     pub fn generate(&mut self, ast: &[Command]) -> String {
         let mut output = String::new();
 
@@ -258,7 +266,9 @@ impl Generator {
         self.analyze_variable_usage(ast);
 
         // Pre-analysis pass: identify constants needed for magic numbers
-        self.analyze_constants_needed(ast);
+        if !self.no_magic_numbers {
+            self.analyze_constants_needed(ast);
+        }
 
         // Pre-analysis pass: scan test expressions for shell variable references
         // and add them to function_level_vars so they get proper `my` declarations.
@@ -433,8 +443,8 @@ impl Generator {
             output.push_str("\n");
         }
 
-        // Add constant declarations
-        if !self.constants.is_empty() {
+        // Add constant declarations (skipped with --no-magic-numbers)
+        if !self.no_magic_numbers && !self.constants.is_empty() {
             // Calculate the maximum length for alignment
             let max_name_len = self
                 .constants
@@ -454,7 +464,7 @@ impl Generator {
                 ));
             }
         }
-        if !self.constants.is_empty() {
+        if !self.no_magic_numbers && !self.constants.is_empty() {
             output.push_str("\n");
         }
 

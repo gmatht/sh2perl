@@ -1098,13 +1098,16 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     }
 
     // Generate function body
-    eprintln!("DEBUG: Generating function body for {}", func.name);
-    eprintln!("DEBUG: Function body commands: {:?}", func.body.commands);
+    // DEBUG: eprintln!("DEBUG: Generating function body for {}", func.name);
+    // DEBUG: eprintln!("DEBUG: Function body commands: {:?}", func.body.commands);
 
     // Use all commands from the function body. The `local` commands
     // (e.g. `local file=$1`) are handled by redirects.rs which generates
     // proper `my $var = $_[0];` declarations.
     let filtered_commands = func.body.commands.clone();
+
+    // Save the current output length so we can measure the body's brace balance.
+    let saved_output_len = output.len();
 
     // Save declared_locals, function_level_vars and associative_arrays so that
     // variables declared inside the function (via `local` etc.) do not leak into
@@ -1172,6 +1175,21 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     }
 
     output.push_str(&body_code);
+
+    // Balance braces inside the function body so that extra opens from
+    // pipeline/command-substitution code do not leak into the outer scope.
+    // The closing `}` we emit below only closes the function `sub { ... }`
+    // itself; any surplus `{` inside the body would make perlcritic report
+    // "Nested named subroutine" for subs defined later.
+    {
+        let body_text = &output[saved_output_len..];
+        let opens = body_text.chars().filter(|&c| c == '{').count();
+        let closes = body_text.chars().filter(|&c| c == '}').count();
+        for _ in 0..(opens.saturating_sub(closes)) {
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+        }
+    }
 
     // Restore nesting depth
     generator.fn_nesting_depth -= 1;
