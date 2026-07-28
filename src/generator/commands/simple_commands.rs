@@ -1200,32 +1200,20 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // -n flag: suppress trailing newline
                         output.push_str(&format!("print {};\n", args[0]));
                     } else {
-                        // Check if the argument contains variables that might end with newlines
-                        let has_variables = cmd.args.iter().any(|arg| match arg {
-                            Word::Variable(_, _, _) => true,
-                            Word::StringInterpolation(interp, _) => interp
-                                .parts
-                                .iter()
-                                .any(|part| matches!(part, crate::ast::StringPart::Variable(_))),
-                            _ => false,
-                        }) || args[0].contains('$');
-
                         let in_pipeline = generator.current_pipeline_output_id().is_some();
-                        if has_variables {
-                            if in_pipeline {
-                                output.push_str(&format!("do {{\n    my $__echo_line = {};\n    if ( !( $__echo_line =~ {} ) ) {{\n        $__echo_line .= \"\\n\";\n    }}\n    $output .= $__echo_line;\n}};\n", args[0], generator.newline_end_regex()));
-                            } else {
-                                output.push_str(&format!("do {{\n    my $__echo_line = {};\n    print $__echo_line;\n    if ( !( $__echo_line =~ {} ) ) {{\n        print \"\\n\";\n        $__echo_line .= \"\\n\";\n    }}\n    $output .= $__echo_line;\n}};\n", args[0], generator.newline_end_regex()));
-                            }
-                        } else if args[0] == "q{}" {
+                        if args[0] == "q{}" {
                             // Empty result from unresolved/invalid parameter expansion;
                             // skip printing to match bash behavior (error on stderr, nothing on stdout).
+                        } else if in_pipeline {
+                            // Pipeline: accumulate into output buffer
+                            output.push_str(&format!("$output .= {} . \"\\n\";\n", args[0]));
                         } else {
-                            if in_pipeline {
-                                output.push_str(&format!("$output .= {} . \"\\n\";\n", args[0]));
-                            } else {
-                                output.push_str(&format!("print {} . \"\\n\";\n", args[0]));
-                            }
+                            // Standalone: use clean IR-based output (say "...")
+                            let ir_stmt = crate::ir::IrStmt::Output {
+                                value: crate::ir::IrExpr::RawExpr(args[0].clone()),
+                                newline: true,
+                            };
+                            output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                         }
 
                         // echo as a builtin succeeded
@@ -1251,42 +1239,25 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // For multiple arguments, join them with spaces
                         let args_str = args.join(" . q{ } . ");
                         output.push_str(&generator.indent());
-                        // Check if any argument contains variables that might end with newlines
-                        let has_variables = cmd.args.iter().any(|arg| match arg {
-                            Word::Variable(_, _, _) => true,
-                            Word::StringInterpolation(interp, _) => interp
-                                .parts
-                                .iter()
-                                .any(|part| matches!(part, crate::ast::StringPart::Variable(_))),
-                            _ => false,
-                        });
                         let in_pipeline = generator.current_pipeline_output_id().is_some();
-                        if has_variables {
-                            if has_n_flag {
-                                if in_pipeline {
-                                    output.push_str(&format!("$output .= {};\n", args_str));
-                                } else {
-                                    output.push_str(&format!("print {};\n", args_str));
-                                }
-                            } else {
-                                if in_pipeline {
-                                    output.push_str(&format!("do {{\n    my $__echo_line = {};\n    if (!($__echo_line =~ /\\n$/msx)) {{\n        $__echo_line .= \"\\n\";\n    }}\n    $output .= $__echo_line;\n}};\n", args_str));
-                                } else {
-                                    output.push_str(&format!("do {{\n    my $__echo_line = {};\n    print $__echo_line;\n    if (!($__echo_line =~ /\\n$/msx)) {{\n        print \"\\n\";\n        $__echo_line .= \"\\n\";\n    }}\n    $output .= $__echo_line;\n}};\n", args_str));
-                                }
-                            }
-                        } else if has_n_flag {
+                        if has_n_flag {
                             if in_pipeline {
                                 output.push_str(&format!("$output .= {};\n", args_str));
                             } else {
-                                output.push_str(&format!("print {};\n", args_str));
+                                let ir_stmt = crate::ir::IrStmt::Output {
+                                    value: crate::ir::IrExpr::RawExpr(args_str.clone()),
+                                    newline: false,
+                                };
+                                output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                             }
+                        } else if in_pipeline {
+                            output.push_str(&format!("$output .= {} . \"\\n\";\n", args_str));
                         } else {
-                            if in_pipeline {
-                                output.push_str(&format!("$output .= {} . \"\\n\";\n", args_str));
-                            } else {
-                                output.push_str(&format!("print {} . \"\\n\";\n", args_str));
-                            }
+                            let ir_stmt = crate::ir::IrStmt::Output {
+                                value: crate::ir::IrExpr::RawExpr(args_str.clone()),
+                                newline: true,
+                            };
+                            output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                         }
 
                         // echo as a builtin succeeded

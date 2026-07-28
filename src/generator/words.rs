@@ -2093,118 +2093,22 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         );
                     }
 
-                    // Both sides are simple and without redirects: compose them.
-                    let unique_id = generator.get_unique_id();
-                    let left_result = word_to_perl_impl(
-                        generator,
-                        &Word::CommandSubstitution(left_cmd.clone(), Default::default()),
-                    );
-
-                    // Default: generate the right-hand result normally. For the
-                    // special case where the right-hand simple command is a
-                    // sha256sum/sha512sum -c verification that should read from
-                    // the left command's output, call the sha generator directly
-                    // and pass the $left_result_<id> variable as input_var so the
-                    // split/verification code has a valid variable to operate on.
-                    let mut right_result = word_to_perl_impl(
-                        generator,
-                        &Word::CommandSubstitution(right_cmd.clone(), Default::default()),
-                    );
-                    // Debug: persist the raw left/right generated Perl snippets to /tmp
-                    // so we can inspect exact shapes when diagnosing nested do-block issues.
-                    // These files are temporary and helpful during development; they can be
-                    // removed once the issue is resolved.
-                    let _ = std::fs::write(
-                        format!("/tmp/sh2perl_and_left_{}.txt", unique_id),
-                        &left_result,
-                    );
-                    let _ = std::fs::write(
-                        format!("/tmp/sh2perl_and_right_{}.txt", unique_id),
-                        &right_result,
-                    );
-                    if let Command::Simple(simple_right) = right_cmd.as_ref() {
-                        if let Word::Literal(rname, _) = &simple_right.name {
-                            if (rname == "sha256sum" || rname == "sha512sum")
-                                && simple_right
-                                    .args
-                                    .iter()
-                                    .any(|a| matches!(a, Word::Literal(s, _) if s == "-c"))
-                            {
-                                // Decide whether to pass the left-side captured
-                                // variable into the sha generator. Only do this
-                                // when the left command is a simple command
-                                // without redirections (i.e., its output was
-                                // captured into a Perl value). If the left
-                                // command performed a shell redirection (e.g.
-                                // '> file') then the checksum is written to
-                                // a file and the sha verifier should read that
-                                // file instead, so pass an empty input_var.
-                                let mut input_var = String::new();
-                                if let Command::Simple(simple_left) = left_cmd.as_ref() {
-                                    if simple_left.redirects.is_empty() {
-                                        input_var = format!("$left_result_{}", unique_id);
-                                    }
-                                }
-
-                                // Only inline the sha generator when we have a valid
-                                // Perl variable to pass as input_var (i.e. the left
-                                // side's output was captured into a variable). If the
-                                // left side performed shell redirections (wrote to a
-                                // file) we should NOT replace the already-generated
-                                // right_result; leave it as the normal command
-                                // substitution form which executes the checksum tool
-                                // via the shell. This avoids producing nested
-                                // do-blocks / duplicated declarations.
-                                if !input_var.is_empty() {
-                                    if rname == "sha256sum" {
-                                        right_result = crate::generator::commands::sha256sum::generate_sha256sum_command(
-                                            generator,
-                                            simple_right,
-                                            &input_var,
-                                        );
-                                    } else {
-                                        right_result = crate::generator::commands::sha512sum::generate_sha512sum_command(
-                                            generator,
-                                            simple_right,
-                                            &input_var,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Generate code that executes left command, checks exit code,
-                    // then executes right if successful. Keep both sides as
-                    // expression-valued do-blocks to avoid fragile string
-                    // splicing/manipulation.
-                    // Normalize a specific dupication pattern where a generator
-                    // may emit a top-level "my @results;" and also an inner
-                    // do { ... } block that itself begins with a declaration.
-                    // This produced nested "my @results; do { my @results;" in
-                    // the output; remove the redundant one here.
-                    let left_normalized = left_result
-                        .replace("my @results;\n    do {", "do {")
-                        .replace("my @results;\ndo {", "do {");
-                    let right_normalized = right_result
-                        .replace("my @results;\n    do {", "do {")
-                        .replace("my @results;\ndo {", "do {");
-
-                    let left_wrapped = if left_normalized.trim_start().starts_with("do {") {
-                        left_normalized
-                    } else {
-                        format!("do {{ {} }}", left_normalized)
+                    // Both sides are simple and without redirects: run the
+                    // combined command through the shell (qx{}) instead of
+                    // building complex do-blocks.  This produces much cleaner
+                    // Perl and avoids the left_result/right_result boilerplate.
+                    let command_str =
+                        crate::generator::redirects::generate_bash_command_string(cmd);
+                    let result_var = format!("and_result_{}", generator.get_unique_id());
+                    let ir_stmt = crate::ir::IrStmt::System {
+                        cmd: crate::ir::IrExpr::Str(command_str, crate::ir::StrStyle::Command),
+                        args: vec![],
+                        capture: Some(result_var.clone()),
                     };
-
-                    let right_wrapped = if right_normalized.trim_start().starts_with("do {") {
-                        right_normalized
-                    } else {
-                        format!("do {{ {} }}", right_normalized)
-                    };
-
+                    let qx_perl = crate::ir::stmt_to_perl(&ir_stmt, 0);
                     format!(
-                        "do {{\n    my $left_result_{} = {};\n    if ( $CHILD_ERROR == 0 ) {{\n        my $right_result_{} = {};\n        $left_result_{} . $right_result_{};\n    }} else {{\n        q{{}};\n    }}\n}}",
-                        unique_id, left_wrapped, unique_id, right_wrapped, unique_id, unique_id,
+                        "do {{\n{}    ${};\n}}",
+                        qx_perl, result_var
                     )
                 }
                 _ => {
