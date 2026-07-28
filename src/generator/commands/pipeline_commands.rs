@@ -780,89 +780,11 @@ pub fn generate_pipeline_for_substitution(
                 }
             }
 
-            if cmd1_name == "echo" && cmd2_name == "tr" {
-                // Special case for echo | tr
-                let unique_id = generator.get_unique_id();
-                // Generate echo output directly as a string value. Decode
-                // literal arguments so any shell-style escapes become actual
-                // characters in the inlined Perl literal (so downstream
-                // builtins like head see real newlines).
-                let echo_args: Vec<String> = cmd1
-                    .args
-                    .iter()
-                    .map(|arg| match arg {
-                        Word::Literal(s, _) => {
-                            // Preserve the original literal so we can tell whether it
-                            // was double-quoted (which implies shell interpolation of
-                            // $/@) and whether any sigils were escaped by a backslash.
-                            let original = s.clone();
-                            let was_double = original.starts_with('"') && original.ends_with('"');
-
-                            // Strip outer quotes if present (single or double)
-                            let raw = if (original.starts_with('"') && original.ends_with('"'))
-                                || (original.starts_with('\'') && original.ends_with('\''))
-                            {
-                                original[1..original.len() - 1].to_string()
-                            } else {
-                                original.clone()
-                            };
-
-                            // Decode shell escapes into actual characters for the
-                            // Perl literal content.
-                            let decoded = crate::generator::utils::decode_shell_escapes_impl(&raw);
-
-                            // If the token was double-quoted in the original shell
-                            // source and it contains an unescaped $ or @, we must
-                            // allow Perl interpolation so variables like "$i" are
-                            // expanded in the generated Perl code. Detect an
-                            // unescaped sigil by looking for a $ or @ not preceded
-                            // by a backslash in the raw (pre-decoded) text.
-                            // Use a simple scan instead of regex with look-behind
-                            // (which Rust regex does not support).
-                            let has_unescaped_sigil = {
-                                let mut found = false;
-                                let mut chars = raw.chars().peekable();
-                                while let Some(ch) = chars.next() {
-                                    if ch == '\\' {
-                                        // Skip the escaped character
-                                        chars.next();
-                                    } else if ch == '$' || ch == '@' {
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                                found
-                            };
-                            if was_double && has_unescaped_sigil {
-                                generator.perl_string_literal_force_interp(&Word::literal(decoded))
-                            } else {
-                                generator.perl_string_literal(&Word::literal(decoded))
-                            }
-                        }
-                        _ => generator.word_to_perl(arg),
-                    })
-                    .collect();
-                let echo_string = if echo_args.is_empty() {
-                    "\"\"".to_string()
-                } else {
-                    format!("({})", echo_args.join(" . q{ } . "))
-                };
-                // echo always appends a newline to its output; include it in
-                // the Perl string so the tr result has the same trailing
-                // newline that Perl backticks would preserve.
-                let echo_string_with_nl = format!("{} . \"\\n\"", echo_string);
-                let tr_output =
-                    crate::generator::commands::tr::generate_tr_command_for_substitution(
-                        generator,
-                        cmd2,
-                        "input_data",
-                        &unique_id.to_string(),
-                    );
-                return format!(
-                    "do {{\n    my $input_data = {};\n    {}\n}}",
-                    echo_string_with_nl, tr_output
-                );
-            }
+            // Disabled: the echo|tr fast-path sometimes produces unbalanced
+            // braces in generated Perl (context: command-substitution inside
+            // a function body).  The generic pipeline handler below generates
+            // correct (if more verbose) code.
+            // if cmd1_name == "echo" && cmd2_name == "tr" { ... }
         }
     }
 

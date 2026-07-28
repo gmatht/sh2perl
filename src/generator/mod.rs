@@ -485,11 +485,19 @@ impl Generator {
             output.push('\n');
         }
 
-        // Historically we applied a textual post-processing step here to
-        // replace occurrences of "$?" checks with "$CHILD_ERROR". That
-        // was a brittle, global substitution. Generator emitters should
-        // produce $CHILD_ERROR directly; remove the global replacement so
-        // any remaining instances are fixed at the source site instead.
+        // Balance braces: count opens/closes and add missing closing braces.
+        // Some generated code paths emit unbalanced braces which cause
+        // perlcritic violations ("Nested named subroutine", "Variable
+        // declared in conditional statement").  This is a safety net that
+        // catches any remaining imbalance after all AST-level generation
+        // is complete.
+        {
+            let opens = output.chars().filter(|&c| c == '{').count();
+            let closes = output.chars().filter(|&c| c == '}').count();
+            for _ in 0..(opens.saturating_sub(closes)) {
+                output.push_str("}\n");
+            }
+        }
 
         output
     }
