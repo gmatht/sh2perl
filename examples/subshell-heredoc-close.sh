@@ -1,10 +1,10 @@
 #!/bin/sh
 # Subshell with heredoc followed by closing paren
-# Failed: Unexpected token: ParenClose (git-filter-branch pattern)
+var=hello
 (
   cat <<EOF
 content
 EOF
 )
 eval "$var"
-echo done
+printf 'subshell+heredoc+eval parsed OK\n'

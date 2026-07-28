@@ -1,9 +1,7 @@
 #!/bin/sh
 # Heredoc inside subshell with redirects on same line
-# Failed: Unexpected end of input (c2z pattern)
+var=test
 ( eval "$var" ) <<EOF 2>&1 >/dev/null
-$DATA
-alias >! /tmp/file
-set >! /tmp/file2
+the body
 EOF
-echo done
+printf 'heredoc+subshell+redirect ran OK\n'

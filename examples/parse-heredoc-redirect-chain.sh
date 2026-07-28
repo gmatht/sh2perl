@@ -3,4 +3,4 @@
 cat <<EOF 2>&1 >/dev/null
 hello
 EOF
-echo done
+printf 'heredoc+redirect-chain parsed OK\n'
