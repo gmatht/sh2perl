@@ -622,7 +622,7 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
             // Return the code that executes the pipeline and captures output
             // Shell command substitution strips all trailing newlines
             format!(
-                "do {{ {} {} =~ s/\\n+\\z//; {} }}",
+                "do {{ {} chomp {}; {} }}",
                 captured_pipeline.trim(),
                 output_var,
                 output_var

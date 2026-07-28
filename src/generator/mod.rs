@@ -2573,7 +2573,9 @@ impl Generator {
         match command {
             Command::Simple(cmd) => {
                 if let Word::Literal(name, _) = &cmd.name {
-                    matches!(name.as_str(), "open3" | "exec" | "system")
+                    // tee generates croak/carp for file I/O errors;
+                    // open3, exec, system also use Carp for error handling.
+                    matches!(name.as_str(), "open3" | "exec" | "system" | "tee")
                 } else {
                     false
                 }
@@ -2589,6 +2591,26 @@ impl Generator {
             Command::Subshell(c) | Command::Background(c) => self.command_uses_croak(c),
             Command::Block(b) => b.commands.iter().any(|c| self.command_uses_croak(c)),
             Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_croak(c)),
+            Command::Redirect(rc) => self.command_uses_croak(&rc.command),
+            Command::Assignment(assign) => {
+                // Check inside the assignment value for command substitutions
+                // that may contain commands needing Carp (e.g. tee inside backticks).
+                self.word_uses_croak(&assign.value)
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if a Word contains a command substitution that needs Carp.
+    fn word_uses_croak(&self, word: &Word) -> bool {
+        match word {
+            Word::CommandSubstitution(cmd, _) => self.command_uses_croak(cmd),
+            Word::StringInterpolation(interp, _) => {
+                interp.parts.iter().any(|part| match part {
+                    StringPart::CommandSubstitution(cmd) => self.command_uses_croak(cmd),
+                    _ => false,
+                })
+            }
             _ => false,
         }
     }
