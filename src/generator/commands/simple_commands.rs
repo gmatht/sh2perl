@@ -1182,15 +1182,26 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     {
                         // The string is already a valid Perl literal, so reuse it directly.
                         let content = &args[0][1..args[0].len() - 1]; // Remove quotes
-                        output.push_str(&format!("print \"{}\\n\";\n", content));
+                        // Use clean IR-based output (say) instead of print with explicit \n
+                        let ir_stmt = crate::ir::IrStmt::Output {
+                            value: crate::ir::IrExpr::RawExpr(format!("\"{}\"", content)),
+                            newline: true,
+                        };
+                        output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                     } else if !has_n_flag && args[0].starts_with('$') && !args[0].contains("\\n") {
-                        // For variables, check if they already end with newline to avoid extra blank lines
-                        output.push_str(&format!("print {};\n", args[0]));
-                        output.push_str(&format!(
-                            "if ( !( ({}) =~ {} ) ) {{ print \"\\n\"; }}\n",
-                            args[0],
-                            generator.newline_end_regex()
-                        ));
+                        // For variables, use clean IR-based output (say) instead of newline guard
+                        let in_pipeline = generator.current_pipeline_output_id().is_some();
+                        if in_pipeline {
+                            // Pipeline: accumulate into output buffer
+                            output.push_str(&format!("$output .= {} . \"\\n\";\n", args[0]));
+                        } else {
+                            // Standalone: use clean IR-based output (say "...")
+                            let ir_stmt = crate::ir::IrStmt::Output {
+                                value: crate::ir::IrExpr::RawExpr(args[0].clone()),
+                                newline: true,
+                            };
+                            output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
+                        }
                     } else if has_n_flag {
                         // -n flag: suppress trailing newline
                         output.push_str(&format!("print {};\n", args[0]));

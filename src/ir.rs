@@ -234,6 +234,7 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
     out.push_str("#!/usr/bin/env perl\n");
     out.push_str("use strict;\n");
     out.push_str("use warnings;\n");
+    out.push_str("use feature 'say';\n");
 
     // Imports
     for import in &prog.imports {
@@ -316,7 +317,13 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             if let Some(init_expr) = init {
                 let rhs = ir_expr_to_perl(init_expr);
                 emit_indent(out, indent);
-                out.push_str(&format!("my ({}) = ({});\n", decls, rhs));
+                // Single scalar can omit parentheses: "my $x = expr;"
+                // Multiple vars need parentheses: "my ($x, $y) = (expr1, expr2);"
+                if vars.len() == 1 && vars[0].sigil == Sigil::Scalar {
+                    out.push_str(&format!("my {} = {};\n", decls, rhs));
+                } else {
+                    out.push_str(&format!("my ({}) = ({});\n", decls, rhs));
+                }
             } else {
                 emit_indent(out, indent);
                 out.push_str(&format!("my {};\n", decls));

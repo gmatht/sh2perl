@@ -117,7 +117,7 @@ pub fn generate_find_command(
     // Add name filter
     if let Some(ref pat) = name_pattern {
         let regex = escape_glob_to_regex(pat);
-        wanted_lines.push(format!("    next unless $_ =~ /{}/msx;", regex));
+        wanted_lines.push(format!("    next unless $_ =~ /{}/;", regex));
     }
 
     // Add maxdepth handling
@@ -242,7 +242,7 @@ pub fn generate_find_for_substitution(
     // Name filter (convert glob pattern to regex)
     if let Some(ref pat) = name_pattern {
         let regex = escape_glob_to_regex(pat);
-        conditions.push(format!("$_ =~ /{}/msx", regex));
+        conditions.push(format!("$_ =~ /{}/", regex));
     }
 
     let condition_code = if conditions.is_empty() {
