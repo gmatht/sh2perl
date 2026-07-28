@@ -498,7 +498,7 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                             } else {
                                 format!("'{}'", adjusted_file)
                             };
-                            return format!("do {{\n    my @grep_lines_{};\n    if (-e {}) {{\n        open my $fh_{}, '<', {}\n            or croak \"Cannot access file: $OS_ERROR\";\n        @grep_lines_{} = <$fh_{}>;\n        close $fh_{}\n            or croak \"Close failed: $OS_ERROR\";\n        chomp @grep_lines_{};\n        @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{};\n    }}\n    join \"\\n\", @grep_lines_{};\n}}", 
+                            return format!("do {{\n    my @grep_lines_{};\n    if (-e {}) {{\n        open my $fh_{}, '<', {}\n            or croak \"Cannot access file: $OS_ERROR\";\n        @grep_lines_{} = <$fh_{}>;\n        close $fh_{}\n            or croak \"Close failed: $OS_ERROR\";\n        chomp @grep_lines_{};\n        @grep_lines_{} = grep {{ /{}/ }} @grep_lines_{};\n    }}\n    join \"\\n\", @grep_lines_{};\n}}", 
                                 unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id);
                         }
                     }
@@ -622,7 +622,7 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
             // Return the code that executes the pipeline and captures output
             // Shell command substitution strips all trailing newlines
             format!(
-                "do {{ {} {} =~ s/\\n+\\z//msx; {} }}",
+                "do {{ {} {} =~ s/\\n+\\z//; {} }}",
                 captured_pipeline.trim(),
                 output_var,
                 output_var

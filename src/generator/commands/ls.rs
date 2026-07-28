@@ -36,7 +36,7 @@ fn generate_ls_helper(
                 // Match shell ls ordering without letting -p suffixes affect sort order.
                 // Schwartzian transform: strip trailing slash for comparison, keep original.
                 output.push_str(&format!(
-                    "@{0} = map {{ $_->[0] }} sort {{ $a->[1] cmp $b->[1] }} map {{ [ $_, do {{ (my $s = $_) =~ s{{/$}}{{}}msx; $s }} ] }} @{0};\n",
+                    "@{0} = map {{ $_->[0] }} sort {{ $a->[1] cmp $b->[1] }} map {{ [ $_, do {{ (my $s = $_) =~ s{{/$}}{{}}; $s }} ] }} @{0};\n",
                     array_name
                 ));
             }
@@ -68,7 +68,7 @@ fn generate_ls_helper(
         generator.indent_level += 1;
         if !show_hidden {
             output.push_str(&generator.indent());
-            output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
+            output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n");
         }
         if add_slash_to_dirs {
             output.push_str(&generator.indent());
@@ -106,7 +106,7 @@ fn generate_ls_helper(
                 // Match shell ls ordering without letting -p suffixes affect sort order.
                 // Schwartzian transform: strip trailing slash for comparison, keep original.
                 output.push_str(&format!(
-                    "@{0} = map {{ $_->[0] }} sort {{ $a->[1] cmp $b->[1] }} map {{ [ $_, do {{ (my $s = $_) =~ s{{/$}}{{}}msx; $s }} ] }} @{0};\n",
+                    "@{0} = map {{ $_->[0] }} sort {{ $a->[1] cmp $b->[1] }} map {{ [ $_, do {{ (my $s = $_) =~ s{{/$}}{{}}; $s }} ] }} @{0};\n",
                     array_name
                 ));
             }
@@ -286,7 +286,7 @@ fn generate_ls_sections_helper(
     generator.indent_level += 1;
     if !show_hidden {
         output.push_str(&generator.indent());
-        output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n");
+        output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n");
     }
     if add_slash_to_dirs {
         output.push_str(&generator.indent());
@@ -324,7 +324,7 @@ fn generate_ls_sections_helper(
     } else {
         output.push_str(&generator.indent());
         output.push_str(&format!(
-            "@{0} = map {{ $_->[0] }} sort {{ $a->[1] cmp $b->[1] }} map {{ [ $_, do {{ (my $s = $_) =~ s{{/$}}{{}}msx; $s }} ] }} @{0};\n",
+            "@{0} = map {{ $_->[0] }} sort {{ $a->[1] cmp $b->[1] }} map {{ [ $_, do {{ (my $s = $_) =~ s{{/$}}{{}}; $s }} ] }} @{0};\n",
             dir_entries_array
         ));
     }
@@ -533,7 +533,7 @@ pub fn generate_ls_command(
                 if !show_hidden {
                     output.push_str(&generator.indent());
                     output.push_str(
-                        "next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n",
+                        "next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n",
                     );
                 }
                 if add_slash_to_dirs {
@@ -647,7 +647,7 @@ pub fn generate_ls_command(
                     if !show_hidden {
                         output.push_str(&generator.indent());
                         output.push_str(
-                            "next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/msx;\n",
+                            "next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n",
                         );
                     }
                     if add_slash_to_dirs {

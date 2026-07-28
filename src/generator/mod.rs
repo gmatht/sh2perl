@@ -296,6 +296,7 @@ impl Generator {
         output.push_str("#!/usr/bin/env perl\n");
         output.push_str("use strict;\n");
         output.push_str("use warnings;\n");
+        output.push_str("use feature 'say';\n");
         // Only emit imports that are actually needed by the generated code.
         // Carp, English, locale are part of the original boilerplate but
         // many scripts don't use them — skip when not needed.
@@ -731,18 +732,12 @@ impl Generator {
         } else {
             // For compound operators (+=, -=, *=, /=, %=), the variable MUST already exist
             // (bash semantics), so we should NOT declare it here.  For plain `=` assignment,
-            // declare if not already declared.
-            if matches!(assignment.operator, AssignmentOperator::Assign) {
-                if !self.declared_locals.contains(&assignment.variable)
-                    && !self.function_level_vars.contains(&assignment.variable)
-                {
-                    output.push_str(&self.indent());
-                    output.push_str(&format!("my ${};\n", assignment.variable));
-                    // Omit @ and % forms — they are never used without explicit
-                    // array/hash syntax.
-                    self.declared_locals.insert(assignment.variable.clone());
-                }
-            }
+            // we defer declaration to the Assign handler below, which can combine it with
+            // the initial value into `my $var = value;` instead of two separate statements.
+            // Track whether we'll need a declaration for the Assign block below.
+            let needs_decl_for_assign = matches!(assignment.operator, AssignmentOperator::Assign)
+                && !self.declared_locals.contains(&assignment.variable)
+                && !self.function_level_vars.contains(&assignment.variable);
 
             // Auto-declare bare variables used in arithmetic expressions (like `a`, `b` in $((a + b)))
             if let Word::Arithmetic(arith_expr, _) = &assignment.value {
@@ -801,17 +796,43 @@ impl Generator {
             }
             match assignment.operator {
                 AssignmentOperator::Assign => {
-                    let value_perl = words::word_to_perl_impl(self, &assignment.value);
-                    // If the value is a block, wrap it in do {...}
-                    if value_perl.starts_with('{') && value_perl.ends_with('}') {
-                        output.push_str(&format!("${} = do {};\n", assignment.variable, value_perl));
-                    } else {
-                        output.push_str(&format!("${} = {};\n", assignment.variable, value_perl));
-                    }
-                    if !self.declared_locals.contains(&assignment.variable)
-                        && !self.function_level_vars.contains(&assignment.variable)
-                    {
+                    let value_perl_raw = words::word_to_perl_impl(self, &assignment.value);
+                    // Some word-to-perl functions (e.g. generate_ls_for_substitution) append
+                    // a trailing `;\n` to their result (making it a statement, not an expression).
+                    // Strip it here so we don't get double semicolons like `$x = do { ... };;`.
+                    // Only strip the last `;` if it's a statement terminator (after a `}` or `)`),
+                    // not semicolons that are part of the expression.
+                    let value_perl = {
+                        let trimmed = value_perl_raw.trim_end();
+                        if trimmed.ends_with(';') {
+                            // Check the character before the `;` — if it closes a block or paren,
+                            // it's a statement terminator that should be stripped.
+                            let before = &trimmed[..trimmed.len()-1];
+                            if before.ends_with('}') || before.ends_with(')') {
+                                before.to_string()
+                            } else {
+                                trimmed.to_string()
+                            }
+                        } else {
+                            trimmed.to_string()
+                        }
+                    };
+                    if needs_decl_for_assign {
+                        // Variable was not yet declared — combine declaration + assignment
+                        // into `my $var = value;` instead of separate lines.
+                        if value_perl.starts_with('{') && value_perl.ends_with('}') {
+                            output.push_str(&format!("my ${} = do {};\n", assignment.variable, value_perl));
+                        } else {
+                            output.push_str(&format!("my ${} = {};\n", assignment.variable, value_perl));
+                        }
                         self.declared_locals.insert(assignment.variable.clone());
+                    } else {
+                        // Variable already declared, just assign
+                        if value_perl.starts_with('{') && value_perl.ends_with('}') {
+                            output.push_str(&format!("${} = do {};\n", assignment.variable, value_perl));
+                        } else {
+                            output.push_str(&format!("${} = {};\n", assignment.variable, value_perl));
+                        }
                     }
                 }
                 AssignmentOperator::PlusAssign => {

@@ -51,9 +51,9 @@ pub fn generate_tail_command(
     }
 
     if input_var.starts_with('$') {
-        output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
+        output.push_str(&format!("my @lines = split /\\n/, {};\n", input_var));
     } else {
-        output.push_str(&format!("my @lines = split /\\n/msx, ${};\n", input_var));
+        output.push_str(&format!("my @lines = split /\\n/, ${};\n", input_var));
     }
     output.push_str(&format!("my $num_lines = {};\n", num_lines));
     output.push_str("if ($num_lines > scalar @lines) {\n");
@@ -65,13 +65,13 @@ pub fn generate_tail_command(
     if input_var.starts_with('$') {
         output.push_str(&format!("{} = join \"\\n\", @result;\n", input_var));
         output.push_str(&format!(
-            "if ({} ne q{{}} && !({} =~ m{{\\n\\z}}msx)) {{ {} .= \"\\n\"; }}\n",
+            "if ({} ne q{{}} && !({} =~ m{{\\n\\z}})) {{ {} .= \"\\n\"; }}\n",
             input_var, input_var, input_var
         ));
     } else {
         output.push_str(&format!("${} = join \"\\n\", @result;\n", input_var));
         output.push_str(&format!(
-            "if (${} ne q{{}} && !(${}  =~ m{{\\n\\z}}msx)) {{ ${} .= \"\\n\"; }}\n",
+            "if (${} ne q{{}} && !(${}  =~ m{{\\n\\z}})) {{ ${} .= \"\\n\"; }}\n",
             input_var, input_var, input_var
         ));
     }

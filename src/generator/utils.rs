@@ -1118,7 +1118,8 @@ pub fn decode_shell_escapes_impl(s: &str) -> String {
 pub fn newline_end_regex() -> String {
     // Use a regex pattern that matches actual newline characters
     // Use \z so we only match a true trailing newline, not any newline in a multiline string.
-    "m{\\n\\z}msx".to_string()
+    // No msx flags needed: \z is always absolute end, there's no ., and no whitespace.
+    "m{\\n\\z}".to_string()
 }
 
 /// Convert postfix unless statement to block form

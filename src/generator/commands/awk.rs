@@ -241,9 +241,9 @@ pub fn generate_awk_command(
     let uses_nr = full_program.contains("NR");
 
     if input_var.starts_with('$') {
-        output.push_str(&format!("my @lines = split /\\n/msx, {};\n", input_var));
+        output.push_str(&format!("my @lines = split /\\n/, {};\n", input_var));
     } else {
-        output.push_str(&format!("my @lines = split /\\n/msx, ${};\n", input_var));
+        output.push_str(&format!("my @lines = split /\\n/, ${};\n", input_var));
     }
     output.push_str("my @result;\n");
 

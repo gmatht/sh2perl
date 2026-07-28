@@ -162,7 +162,7 @@ pub fn generate_xargs_command_with_output(
     if command == "grep" && args.contains(&"function".to_string()) {
         // Handle grep -l "function" on the input files
         output.push_str(&format!(
-            "my @xargs_files_{} = split /\\n/msx, ${};\n",
+            "my @xargs_files_{} = split /\\n/, ${};\n",
             command_index, input_var
         ));
         output.push_str(&format!("my @xargs_matching_files_{};\n", command_index));
@@ -249,7 +249,7 @@ pub fn generate_xargs_command_with_output(
             "\\s+"
         };
         output.push_str(&format!(
-            "my @xargs_input_{} = grep {{ $_ ne q{{}} }} split /{}/msx, ${};\n",
+            "my @xargs_input_{} = grep {{ $_ ne q{{}} }} split /{}/, ${};\n",
             command_index, split_pattern, input_var
         ));
         output.push_str(&format!("my @xargs_output_{};\n", command_index));
@@ -452,7 +452,7 @@ pub fn generate_xargs_command_with_output(
         // join("\n", …) above produces inter-element separators but no
         // trailing newline, so we add one here when necessary.
         output.push_str(&format!(
-            "if (${} ne q{{}} && !( ${} =~ m{{\\n\\z}}msx )) {{ ${} .= \"\\n\"; }}\n",
+            "if (${} ne q{{}} && !( ${} =~ m{{\\n\\z}} )) {{ ${} .= \"\\n\"; }}\n",
             output_var, output_var, output_var
         ));
 

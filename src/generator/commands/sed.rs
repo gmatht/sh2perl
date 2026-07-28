@@ -12,7 +12,7 @@ pub fn generate_sed_command(
     // For now, implement basic sed-like functionality
     // This can be extended to handle more complex sed patterns
     output.push_str(&format!(
-        "my @sed_lines_{} = split /\\n/msx, ${};\n",
+        "my @sed_lines_{} = split /\\n/, ${};\n",
         command_index, input_var
     ));
     output.push_str(&format!("my @sed_result_{};\n", command_index));

@@ -135,7 +135,7 @@ pub fn generate_cut_command_with_output(
 
     let unique_id = generator.get_unique_id();
     output.push_str(&format!(
-        "my @lines_{} = split /\\n/msx, ${};\n",
+        "my @lines_{} = split /\\n/, ${};\n",
         unique_id, effective_input
     ));
     output.push_str(&format!("my @result_{};\n", unique_id));
@@ -199,7 +199,7 @@ pub fn generate_cut_command_with_output(
             result_var, unique_id
         ));
         output.push_str(&format!(
-            "if (${} ne q{{}} && !(${}  =~ m{{\\n\\z}}msx)) {{ ${} .= \"\\n\"; }}\n",
+            "if (${} ne q{{}} && !(${}  =~ m{{\\n\\z}})) {{ ${} .= \"\\n\"; }}\n",
             result_var, result_var, result_var
         ));
     }
