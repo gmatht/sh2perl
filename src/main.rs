@@ -8,15 +8,20 @@ mod utils;
 
 use std::env;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Use the debug module for controlling DEBUG output
 use debashl::debug::set_debug_enabled;
 use debashl::{shared_utils::SharedUtils, Generator, Parser};
 
+// Global flag for --no-magic-numbers
+static NO_MAGIC_NUMBERS: AtomicBool = AtomicBool::new(false);
+
 // Import from our new modules
 use crate::cli_commands::{
     export_mir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
-    parse_file_to_perl, parse_input, parse_system_to_perl, parse_to_perl, parse_to_perl_inline,
+    parse_file_to_perl, parse_input, parse_system_to_perl, parse_to_perl,
+    parse_to_perl_inline, parse_to_perl_with_opts,
     run_generated,
 };
 use crate::help::show_help;
@@ -68,6 +73,18 @@ fn main_with_args(args: Vec<String>) {
         return;
     } else if command == "--no-debug" {
         set_debug_enabled(false);
+        // Process remaining arguments as a command
+        if args.len() > 2 {
+            let remaining_args = &args[2..];
+            let new_args = vec![args[0].clone()]
+                .into_iter()
+                .chain(remaining_args.iter().cloned())
+                .collect::<Vec<String>>();
+            return main_with_args(new_args);
+        }
+        return;
+    } else if command == "--no-magic-numbers" {
+        NO_MAGIC_NUMBERS.store(true, Ordering::SeqCst);
         // Process remaining arguments as a command
         if args.len() > 2 {
             let remaining_args = &args[2..];
@@ -461,7 +478,11 @@ exit $main_exit_code;
                     return;
                 }
                 let input = &args[3];
-                parse_to_perl(input);
+                if NO_MAGIC_NUMBERS.load(Ordering::SeqCst) {
+                    parse_to_perl_with_opts(input, Some(true));
+                } else {
+                    parse_to_perl(input);
+                }
             } else if args.len() >= 3 && args[2] == "--inline" {
                 if args.len() < 4 {
                     println!("Error: parse --inline command requires input");
