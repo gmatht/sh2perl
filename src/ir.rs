@@ -199,6 +199,20 @@ pub struct IrProgram {
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
 
+/// Convert a single IR statement to a Perl source string.
+/// This is the public entry point for the generator to produce clean
+/// Perl from IR nodes without constructing a full IrProgram.
+pub fn stmt_to_perl(stmt: &IrStmt, indent: usize) -> String {
+    let mut out = String::new();
+    emit_stmt(&mut out, stmt, indent);
+    out
+}
+
+/// Convert a single IR expression to a Perl source string.
+pub fn expr_to_perl(expr: &IrExpr) -> String {
+    ir_expr_to_perl(expr)
+}
+
 /// Convert an `IrProgram` to a Perl source string.
 ///
 /// Style decisions (say vs print, parentheses style, indentation) are
@@ -242,7 +256,7 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
 
 // ── Statement emitter ────────────────────────────────────────────────
 
-fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
+pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
     match stmt {
         IrStmt::RawText(text) => {
             // Splice verbatim — no transformation
@@ -356,10 +370,40 @@ fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str("}\n");
         }
 
-        IrStmt::System { cmd, .. } => {
+        IrStmt::System { cmd, args, capture } => {
             let cmd_str = ir_expr_to_perl(cmd);
-            emit_indent(out, indent);
-            out.push_str(&format!("system {};\n", cmd_str));
+            if let Some(var) = capture {
+                // With capture: emit qx{...} assignment
+                // Build the full command string with args
+                let mut full_cmd = cmd_str.clone();
+                if !args.is_empty() {
+                    let arg_strs: Vec<String> = args.iter()
+                        .map(|a| ir_expr_to_perl(a))
+                        .collect();
+                    // For qx{}, we build a single string command
+                    full_cmd = format!("{} {}", cmd_str, arg_strs.join(" "));
+                }
+                // Remove surrounding backticks if already present from StrStyle::Command
+                let inner = if full_cmd.starts_with('`') && full_cmd.ends_with('`') {
+                    &full_cmd[1..full_cmd.len()-1]
+                } else {
+                    &full_cmd
+                };
+                emit_indent(out, indent);
+                out.push_str(&format!("my ${} = qx{{{}}};\n", var, inner));
+                out.push_str(&format!("$CHILD_ERROR = $? >> 8;\n"));
+            } else {
+                // Without capture: use system()
+                emit_indent(out, indent);
+                if args.is_empty() {
+                    out.push_str(&format!("system {};\n", cmd_str));
+                } else {
+                    let arg_strs: Vec<String> = args.iter()
+                        .map(|a| ir_expr_to_perl(a))
+                        .collect();
+                    out.push_str(&format!("system({}, {});\n", cmd_str, arg_strs.join(", ")));
+                }
+            }
         }
 
         IrStmt::Return(Some(expr)) => {
@@ -398,7 +442,7 @@ fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
 
 // ── Subroutine emitter ───────────────────────────────────────────────
 
-fn emit_sub(out: &mut String, sub: &IrSub) {
+pub(crate) fn emit_sub(out: &mut String, sub: &IrSub) {
     out.push_str(&format!("sub {} {{\n", sub.name));
     for s in &sub.body {
         emit_stmt(out, s, 1);
@@ -408,7 +452,7 @@ fn emit_sub(out: &mut String, sub: &IrSub) {
 
 // ── Expression emitter ───────────────────────────────────────────────
 
-fn ir_expr_to_perl(expr: &IrExpr) -> String {
+pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     match expr {
         IrExpr::RawExpr(text) => text.clone(),
 
@@ -488,10 +532,36 @@ fn ir_expr_to_perl(expr: &IrExpr) -> String {
             let mut s = String::from("\"");
             for part in parts {
                 match part {
-                    InterpPart::Lit(text) => s.push_str(text),
+                    InterpPart::Lit(text) => {
+                        // Escape special Perl characters in double-quoted strings
+                        for ch in text.chars() {
+                            match ch {
+                                '"' => s.push_str("\\\""),
+                                '\\' => s.push_str("\\\\"),
+                                '$' => s.push_str("\\$"),
+                                '@' => s.push_str("\\@"),
+                                '\n' => s.push_str("\\n"),
+                                '\t' => s.push_str("\\t"),
+                                '\r' => s.push_str("\\r"),
+                                c => s.push(c),
+                            }
+                        }
+                    },
                     InterpPart::Expr(e) => {
-                        let ev = ir_expr_to_perl(e);
-                        s.push_str(&format!("${{{}}}", ev));
+                        // If the expression is a simple variable, emit $varname
+                        // directly without the ${...} wrapper.
+                        match e.as_ref() {
+                            IrExpr::Var(name, Sigil::Scalar) => {
+                                s.push_str(&format!("${}", name));
+                            }
+                            IrExpr::Var(name, Sigil::Array) => {
+                                s.push_str(&format!("@{}[\"\"]", name));
+                            }
+                            _ => {
+                                let ev = ir_expr_to_perl(e);
+                                s.push_str(&format!("${{{}}}", ev));
+                            }
+                        }
                     }
                 }
             }
@@ -503,7 +573,7 @@ fn ir_expr_to_perl(expr: &IrExpr) -> String {
 
 // ── Helper ───────────────────────────────────────────────────────────
 
-fn emit_indent(out: &mut String, indent: usize) {
+pub(crate) fn emit_indent(out: &mut String, indent: usize) {
     for _ in 0..indent {
         out.push_str("    ");
     }
