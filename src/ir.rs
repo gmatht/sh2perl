@@ -499,7 +499,45 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         IrExpr::Int(n) => n.to_string(),
 
         IrExpr::Str(s, style) => match style {
-            StrStyle::SingleQuoted => format!("'{}'", s.replace('\'', "\\'")),
+            StrStyle::SingleQuoted => {
+                // Check for leading-zero patterns that PPI may parse as octal
+                let has_leading_zero = {
+                    let bytes = s.as_bytes();
+                    let mut i = 0;
+                    let len = bytes.len();
+                    let mut found = false;
+                    while i < len && !found {
+                        if !bytes[i].is_ascii_digit() {
+                            i += 1;
+                            continue;
+                        }
+                        if bytes[i] == b'0' && i + 1 < len && bytes[i + 1] >= b'0' && bytes[i + 1] <= b'7' {
+                            let preceded_by_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+                            if preceded_by_boundary {
+                                let mut j = i + 1;
+                                while j < len && bytes[j].is_ascii_digit() {
+                                    j += 1;
+                                }
+                                if j - i >= 2 {
+                                    found = true;
+                                }
+                            }
+                        }
+                        while i < len && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                    found
+                };
+                if has_leading_zero {
+                    format!("q{{{}}}", s
+                        .replace("\\", "\\\\")
+                        .replace("{", "\\{")
+                        .replace("}", "\\}"))
+                } else {
+                    format!("'{}'", s.replace('\'', "\\'"))
+                }
+            },
             StrStyle::DoubleQuoted => format!("\"{}\"", s.replace('"', "\\\"")),
             StrStyle::Command => format!("`{}`", s),
         },
