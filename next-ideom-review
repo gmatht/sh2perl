@@ -1,0 +1,145 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path);
+$| = 1;
+
+my $root = dirname(abs_path($0));
+my $debashc = "$root/target/debug/debashc";
+my $ideom_examples = "$root/ideom/examples";
+my $ideom_sh = "$root/ideom/sh";
+
+# Collect all scripts that have reviews
+my %reviewed;
+for my $g (glob "$ideom_examples/*.md $ideom_sh/*.md") {
+    my $name = basename($_, '.md');
+    # Strip .sh suffix if present in the md name
+    $name =~ s/\.sh$//;
+    $reviewed{$name} = 1;
+}
+
+# Find first unreviewed script
+my @candidates;
+# First check examples/
+for my $f (sort glob "$root/examples/*.sh") {
+    my $name = basename($f, '.sh');
+    next if $reviewed{$name};
+    push @candidates, { file => $f, type => 'examples', name => $name };
+    last;  # one at a time
+}
+
+# If no examples, check sh/ passing scripts (not in failing list)
+unless (@candidates) {
+    my %failing;
+    if (open my $fh, '<', "$root/../check_sh_files_failing.txt") {
+        while (<$fh>) {
+            my ($name) = split /\t/;
+            $failing{$name} = 1;
+        }
+        close $fh;
+    }
+    for my $f (sort glob "$root/../sh/*") {
+        next unless -f $f;
+        my $name = basename($f);
+        next if $name !~ /\.sh$/;
+        $name =~ s/\.sh$//;
+        next if $reviewed{$name};
+        next if $failing{$name};
+        push @candidates, { file => $f, type => 'sh', name => $name };
+        last;
+    }
+}
+
+unless (@candidates) {
+    print "All scripts have idiom reviews! Nothing to do.\n";
+    exit 0;
+}
+
+my $candidate = $candidates[0];
+my $source = $candidate->{file};
+my $type = $candidate->{type};
+my $name = $candidate->{name};
+my $outfile = $type eq 'examples' ? "$ideom_examples/${name}.sh.md" : "$ideom_sh/${name}.sh.md";
+
+print "Generating idiom review for $type/$name.sh\n";
+print "Output: $outfile\n\n";
+
+# Generate Perl code
+my $perl_code = `$debashc -i '$source' -o /dev/stdout 2>/dev/null`;
+if ($? != 0) {
+    print "WARNING: debashc returned non-zero exit. Using partial output.\n";
+}
+
+# Read source
+my $source_code = do { local $/; open my $fh, '<', $source or die $!; <$fh> };
+
+# Build prompt for pi
+my $prompt = <<"PROMPT";
+Write an idiom review for the shell-to-Perl translation of $type/$name.sh.
+
+The review should:
+
+1. Show the original shell script and the generated Perl code.
+2. List each non-idiomatic pattern in the generated Perl.
+3. For each pattern, state whether an IR-based optimizing backend (like the one described in docs/ir-design.md) could fix it automatically by changing how the IR node is pretty-printed.
+4. If IR-fixable, say which IR node would be involved and what the cleaned-up output would look like.
+5. If NOT IR-fixable (requires changing the generator logic itself), say why.
+6. Identify **unnecessarily verbose translations** — places where the generated code wraps simple operations in complex control structures (e.g. a `for` loop with pipeline infrastructure for a single command, or multiple nested `do` blocks for a simple echo). These are prime candidates for IR-based simplification.
+
+Focus on patterns that make the Perl code read like a line-by-line transliteration rather than native Perl. Be specific — show the actual generated code and the preferred idiomatic Perl.
+
+Source shell script ($type/$name.sh):
+\`\`\`bash
+$source_code
+\`\`\`
+
+Generated Perl:
+\`\`\`perl
+$perl_code
+\`\`\`
+PROMPT
+
+print "Invoking pi for review...\n";
+
+use JSON::PP;
+my $pi_pid = open(my $pi_fh, '-|', 'pi', '--mode', 'json', '--provider', 'opencode-go', '--model', 'deepseek-v4-flash', '--thinking', 'high', $prompt);
+my $review = '';
+if (defined $pi_pid) {
+    my $buffer = '';
+    while (<$pi_fh>) {
+        $buffer .= $_;
+        while ($buffer =~ s/^(.*)\n//) {
+            my $line = $1;
+            next if $line eq '';
+            my $event = eval { JSON::PP::decode_json($line) };
+            if ($@) { print STDERR "."; next; }
+            next unless ref $event eq 'HASH';
+            my $type = $event->{type} // '';
+            if ($type eq 'message_update') {
+                my $msg = $event->{assistantMessageEvent};
+                next unless ref $msg eq 'HASH';
+                my $dt = $msg->{delta} // '';
+                my $et = $msg->{type} // '';
+                if ($et eq 'text_delta' && length $dt) {
+                    print $dt;
+                    $review .= $dt;
+                }
+            }
+        }
+    }
+    close $pi_fh;
+    print "\n";
+} else {
+    print STDERR "WARNING: Could not run pi: $!\n";
+    exit 1;
+}
+
+if (length $review > 100) {
+    open my $fh, '>', $outfile or die $!;
+    print $fh $review;
+    close $fh;
+    print "\nReview saved to $outfile\n";
+} else {
+    print "WARNING: Review too short, not saving.\n";
+}
