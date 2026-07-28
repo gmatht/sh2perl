@@ -1178,9 +1178,16 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     })
                                     .collect();
                                 if generator.inline_mode {
-                                    format!("({}) . \"\\n\"", args.join(" . q{ } . "))
+                                    let joined = args.join(" . q{ } . ");
+                                    format!("({}) . \"\\n\"", joined)
                                 } else {
-                                    format!("({})", args.join(" . q{ } . "))
+                                    let joined = args.join(" . q{ } . ");
+                                    // Avoid unnecessary parens for single expressions
+                                    if joined.starts_with('"') || joined.starts_with("q{") || joined.starts_with('$') || joined.starts_with('(') {
+                                        joined
+                                    } else {
+                                        format!("({})", joined)
+                                    }
                                 }
                             }
                         } else if name == "sha256sum" {
