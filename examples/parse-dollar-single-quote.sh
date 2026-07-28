@@ -1,4 +1,4 @@
 #!/bin/bash
 # Dollar-single-quoted string $'...' pattern.
 IFS=$'\n\t'
-echo "test"
+printf 'IFS value (hex)='; printf '%q' "$IFS"; printf '\n'

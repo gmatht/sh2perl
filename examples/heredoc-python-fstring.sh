@@ -3,9 +3,10 @@
 # cause logos to tokenize the first inner quote as closing the
 # SingleQuotedString, leaving a trailing orphan quote that spans
 # past the EOF delimiter and corrupts post-heredoc tokens.
-cat << 'EOF'
+result=$(cat << 'EOF'
 import re
 name = "world"
 print(f'Hello, {name}!')
 EOF
-echo "after heredoc"
+)
+printf 'heredoc content=[%s]\n' "$result"

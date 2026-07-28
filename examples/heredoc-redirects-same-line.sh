@@ -1,6 +1,8 @@
 #!/bin/sh
 # Heredoc with additional redirects on the same line
-(cmd) <<EOF 2>&1 >/dev/null
+tmpf=$(mktemp /tmp/heredoc_redirect_test.XXXXXX)
+(cmd) <<EOF 2>&1 >"$tmpf"
 body
 EOF
-printf 'heredoc+redirects parsed OK\n'
+printf 'heredoc+redirects output=[%s]\n' "$(cat "$tmpf" 2>/dev/null || echo '(empty)')"
+rm -f "$tmpf"
