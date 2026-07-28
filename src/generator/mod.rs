@@ -804,17 +804,34 @@ impl Generator {
                     // not semicolons that are part of the expression.
                     let value_perl = {
                         let trimmed = value_perl_raw.trim_end();
-                        if trimmed.ends_with(';') {
-                            // Check the character before the `;` — if it closes a block or paren,
-                            // it's a statement terminator that should be stripped.
-                            let before = &trimmed[..trimmed.len()-1];
-                            if before.ends_with('}') || before.ends_with(')') {
-                                before.to_string()
+                        // Strip any trailing `#` comment from the value expression.
+                        // `#` outside a string literal starts a Perl comment and should
+                        // not be part of a value expression (it confuses PPI/perlcritic
+                        // when the comment contains `{`/`}` characters).
+                        let no_comment = if let Some(pos) = trimmed.find('#') {
+                            // Only strip `#` that is NOT inside a string literal.
+                            // Simple heuristic: if there's an even number of " before `#`,
+                            // we're not inside a string.
+                            let quotes_before = trimmed[..pos].chars().filter(|&c| c == '"').count();
+                            if quotes_before % 2 == 0 {
+                                trimmed[..pos].trim_end().to_string()
                             } else {
                                 trimmed.to_string()
                             }
                         } else {
                             trimmed.to_string()
+                        };
+                        if no_comment.ends_with(';') {
+                            // Check the character before the `;` — if it closes a block or paren,
+                            // it's a statement terminator that should be stripped.
+                            let before = &no_comment[..no_comment.len()-1];
+                            if before.ends_with('}') || before.ends_with(')') {
+                                before.to_string()
+                            } else {
+                                no_comment.to_string()
+                            }
+                        } else {
+                            no_comment.to_string()
                         }
                     };
                     if needs_decl_for_assign {

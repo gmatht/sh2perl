@@ -5,6 +5,18 @@ use regex::Regex;
 pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStatement) -> String {
     let mut output = String::new();
 
+    // Pre-declare variables that are assigned in any branch, so that
+    // `my $var = ...` does not end up inside the conditional body (which
+    // Perl::Critic's ProhibitConditionalDeclarations would flag).
+    {
+        let mut branch_vars = std::collections::HashSet::new();
+        collect_assigned_vars(&if_stmt.then_branch, &mut branch_vars);
+        if let Some(else_branch) = &if_stmt.else_branch {
+            collect_assigned_vars(else_branch, &mut branch_vars);
+        }
+        hoist_my_declarations(generator, &branch_vars, &mut output);
+    }
+
     // Generate condition
     output.push_str("if (");
     match &*if_stmt.condition {
@@ -58,13 +70,20 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             generator.suppress_set_e_depth -= 1;
             // Strip trailing semicolons and whitespace - the condition
             // is used inside if(...) not as a standalone statement
-            let cond = cond
+            let mut cond = cond
                 .trim_start()
                 .strip_prefix("$main_exit_code = ")
                 .unwrap_or(&cond)
                 .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                 .trim_end_matches(';')
                 .to_string();
+            // If the stripped condition ends with `}` (e.g. from a pipeline's
+            // do { ... } block) and is used inside another do { } block (as in
+            // a combined condition), preserve the trailing semicolon so the
+            // inner do block is properly terminated.
+            if cond.ends_with('}') {
+                cond.push(';');
+            }
             // Negate the condition for shell functions:
             // shell returns 0 for success, non-zero for failure.
             // In Perl 0 is falsy, so we write
@@ -126,6 +145,18 @@ pub fn generate_case_statement_impl(
     case_stmt: &CaseStatement,
 ) -> String {
     let mut output = String::new();
+
+    // Pre-declare variables assigned in any case body, so that
+    // `my $var = ...` does not end up inside the if/elsif block.
+    {
+        let mut case_vars = std::collections::HashSet::new();
+        for case in &case_stmt.cases {
+            for cmd in &case.body {
+                collect_assigned_vars(cmd, &mut case_vars);
+            }
+        }
+        hoist_my_declarations(generator, &case_vars, &mut output);
+    }
 
     // Convert bash case statement to Perl if/elsif/else
     let mut first_case = true;
@@ -211,6 +242,16 @@ pub fn generate_case_statement_impl(
 
 pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoop) -> String {
     let mut output = String::new();
+
+    // Pre-declare variables assigned inside the loop body so they are
+    // not declared with `my` inside the while/until block.
+    {
+        let mut body_vars = std::collections::HashSet::new();
+        for cmd in &while_loop.body.commands {
+            collect_assigned_vars(cmd, &mut body_vars);
+        }
+        hoist_my_declarations(generator, &body_vars, &mut output);
+    }
 
     let loop_keyword = if while_loop.is_until { "until" } else { "while" };
 
@@ -610,6 +651,15 @@ pub fn generate_cstyle_for_loop_impl(
 ) -> String {
     let mut output = String::new();
 
+    // Pre-declare variables assigned inside the loop body.
+    {
+        let mut body_vars = std::collections::HashSet::new();
+        for cmd in &for_loop.body.commands {
+            collect_assigned_vars(cmd, &mut body_vars);
+        }
+        hoist_my_declarations(generator, &body_vars, &mut output);
+    }
+
     // Parse "init; cond; incr" from arith_content
     let parts: Vec<&str> = for_loop.arith_content.splitn(3, ';').collect();
     let init_raw = parts.first().map(|s| s.trim()).unwrap_or("");
@@ -674,6 +724,16 @@ pub fn generate_cstyle_for_loop_impl(
 
 pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> String {
     let mut output = String::new();
+
+    // Pre-declare variables assigned inside the loop body so they are
+    // not declared with `my` inside the for block.
+    {
+        let mut body_vars = std::collections::HashSet::new();
+        for cmd in &for_loop.body.commands {
+            collect_assigned_vars(cmd, &mut body_vars);
+        }
+        hoist_my_declarations(generator, &body_vars, &mut output);
+    }
 
     // Declare the loop variable outside the loop so it persists after the loop ends
     // But only if it hasn't already been declared and it's not a function-level variable
@@ -1241,7 +1301,18 @@ pub fn indent_impl(generator: &Generator) -> String {
 pub fn generate_block_commands_impl(generator: &mut Generator, block: &Block) -> String {
     let mut output = String::new();
     for command in &block.commands {
-        output.push_str(&generator.generate_command(command));
+        let cmd_out = generator.generate_command(command);
+        output.push_str(&cmd_out);
+        // If the generated command ends with `}` without `;`, add a semicolon
+        // so it can be used as a statement inside a `do { }` block.
+        let trimmed = cmd_out.trim();
+        if trimmed.ends_with('}') && !trimmed.ends_with(';') && !trimmed.ends_with(";}")
+            && !trimmed.ends_with("};") && !trimmed.starts_with("if")
+            && !trimmed.starts_with("while") && !trimmed.starts_with("for")
+            && !trimmed.starts_with("foreach") && !trimmed.starts_with("sub")
+        {
+            output.push(';');
+        }
         if !output.ends_with('\n') {
             output.push('\n');
         }
@@ -1277,6 +1348,21 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
                         let line = generator.generate_command(cmd);
                         generator.suppress_set_e_depth -= 1;
                         body.push_str(&line);
+                        // Ensure the generated command is properly terminated with `;`
+                        // if it ends with `}` and is used as a statement inside `do { }`.
+                        let trimmed = line.trim();
+                        if trimmed.ends_with('}')
+                            && !trimmed.ends_with(';')
+                            && !trimmed.starts_with("if")
+                            && !trimmed.starts_with("while")
+                            && !trimmed.starts_with("for")
+                            && !trimmed.starts_with("foreach")
+                        {
+                            body.push(';');
+                        }
+                        if !body.ends_with('\n') {
+                            body.push('\n');
+                        }
                     }
                     body.push_str(&combine(generator, &block.commands[block.commands.len() - 1]));
                     format!("do {{ {} }}", body)
@@ -1309,6 +1395,87 @@ fn flatten_conditions(cmd: &Command, conds: &mut Vec<Command>) {
         }
         other => {
             conds.push(other.clone());
+        }
+    }
+}
+
+/// Recursively collect all variable names that are assigned via `Assignment` commands
+/// in a command tree. This is used to hoist `my` declarations before conditional
+/// statements (if/elsif/while/for) to satisfy Perl::Critic's
+/// `ProhibitConditionalDeclarations` policy.
+fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet<String>) {
+    match cmd {
+        Command::Assignment(assignment) => {
+            vars.insert(assignment.variable.clone());
+        }
+        Command::Block(block) => {
+            for c in &block.commands {
+                collect_assigned_vars(c, vars);
+            }
+        }
+        Command::If(if_stmt) => {
+            collect_assigned_vars(&if_stmt.then_branch, vars);
+            if let Some(else_branch) = &if_stmt.else_branch {
+                collect_assigned_vars(else_branch, vars);
+            }
+        }
+        Command::Pipeline(pipeline) => {
+            for c in &pipeline.commands {
+                collect_assigned_vars(c, vars);
+            }
+        }
+        Command::And(left, right) | Command::Or(left, right) => {
+            collect_assigned_vars(left, vars);
+            collect_assigned_vars(right, vars);
+        }
+        Command::While(while_loop) => {
+            collect_assigned_vars(&Command::Block(while_loop.body.clone()), vars);
+        }
+        Command::For(for_loop) => {
+            collect_assigned_vars(&Command::Block(for_loop.body.clone()), vars);
+        }
+        Command::CStyleFor(for_loop) => {
+            collect_assigned_vars(&Command::Block(for_loop.body.clone()), vars);
+        }
+        Command::Function(func) => {
+            collect_assigned_vars(&Command::Block(func.body.clone()), vars);
+        }
+        Command::Case(case_stmt) => {
+            for case in &case_stmt.cases {
+                for c in &case.body {
+                    collect_assigned_vars(c, vars);
+                }
+            }
+        }
+        Command::Redirect(redirect_cmd) => {
+            collect_assigned_vars(&redirect_cmd.command, vars);
+        }
+        Command::Subshell(cmd) | Command::Background(cmd) | Command::Not(cmd) => {
+            collect_assigned_vars(cmd, vars);
+        }
+        Command::BuiltinCommand(_)
+        | Command::Simple(_)
+        | Command::ShoptCommand(_)
+        | Command::TestExpression(_)
+        | Command::Break(_)
+        | Command::Continue(_)
+        | Command::Return(_)
+        | Command::BlankLine => {}
+    }
+}
+
+/// Emit `my $var;` declarations for any variables in `vars` that have not yet
+/// been declared in the generator.  This is used before conditional statements
+/// so that the `my` declaration sits outside the conditional body, satisfying
+/// Perl::Critic's `ProhibitConditionalDeclarations` policy.
+fn hoist_my_declarations(generator: &mut Generator, vars: &std::collections::HashSet<String>, output: &mut String) {
+    for var in vars {
+        if !generator.declared_locals.contains(var)
+            && !generator.function_level_vars.contains(var)
+        {
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my ${};\n", var));
+            generator.declared_locals.insert(var.clone());
         }
     }
 }
