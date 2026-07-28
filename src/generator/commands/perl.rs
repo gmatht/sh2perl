@@ -318,7 +318,7 @@ pub fn generate_perl_pipeline_command(
 
         if is_ne {
             output.push_str(&format!(
-                "for my $line (split /\\n/msx, ${}) {{\n",
+                "for my $line (split /\\n/, ${}) {{\n",
                 input_var
             ));
             output.push_str(&format!("    $_ = \"$line\\n\";\n"));

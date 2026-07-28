@@ -86,7 +86,7 @@ pub fn generate_sort_command_with_output(
         format!("${}", input_var)
     };
     output.push_str(&format!(
-        "my @sort_lines_{} = split /\\n/msx, {};\n",
+        "my @sort_lines_{} = split /\\n/, {};\n",
         command_index, input_ref
     ));
     if numeric {

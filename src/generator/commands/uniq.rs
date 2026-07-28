@@ -31,7 +31,7 @@ pub fn generate_uniq_command_with_output(
     }
 
     output.push_str(&format!(
-        "my @uniq_lines_{} = split /\\n/msx, ${};\n",
+        "my @uniq_lines_{} = split /\\n/, ${};\n",
         command_index, input_var
     ));
     output.push_str(&format!(

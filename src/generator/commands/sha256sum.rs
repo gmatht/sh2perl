@@ -79,7 +79,7 @@ pub fn generate_sha256sum_command(
                 ));
                 output.push_str("    my $file_content = do { local $/ = undef; <$fh> };\n");
                 output.push_str("    close $fh or croak \"Close failed: $ERRNO\";\n");
-                output.push_str("    my @lines = split /\\n/msx, $file_content;\n");
+                output.push_str("    my @lines = split /\\n/, $file_content;\n");
                 output.push_str("    foreach my $line (@lines) {\n");
                 output.push_str("        chomp $line;\n");
                 output.push_str(&format!(
@@ -123,11 +123,11 @@ pub fn generate_sha256sum_command(
             if input_var.is_empty() {
                 // No input var: operate on implicit input (e.g., STDIN) when used
                 // as a standalone command substitution.
-                output.push_str("do {\n    my @lines = split /\\n/msx, do { local $/ = undef; <STDIN> };\n    my @results;\n");
+                output.push_str("do {\n    my @lines = split /\\n/, do { local $/ = undef; <STDIN> };\n    my @results;\n");
             } else {
                 // Read lines from the provided input variable and run verifier
                 output.push_str(&format!(
-                    "do {{\n    my @lines = split /\\n/msx, {};\n    my @results;\n",
+                    "do {{\n    my @lines = split /\\n/, {};\n    my @results;\n",
                     input_expr
                 ));
             }
