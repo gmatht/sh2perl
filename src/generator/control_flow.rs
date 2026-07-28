@@ -36,6 +36,22 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             let cond = generate_combined_test_condition(generator, &if_stmt.condition);
             output.push_str(&cond);
         }
+        Command::Not(inner) => {
+            // `! cmd` in shell: enter then-branch when cmd fails (exit != 0).
+            // Generate the inner command as a raw exit-code expression (no !() wrapper)
+            // so that non-zero (failure) is truthy in Perl.
+            generator.suppress_set_e_depth += 1;
+            let mut cond = generator.generate_command(inner);
+            generator.suppress_set_e_depth -= 1;
+            let cond = cond
+                .trim_start()
+                .strip_prefix("$main_exit_code = ")
+                .unwrap_or(&cond)
+                .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
+                .trim_end_matches(';')
+                .to_string();
+            output.push_str(&cond);
+        }
         _ => {
             generator.suppress_set_e_depth += 1;
             let mut cond = generator.generate_command(&if_stmt.condition);
@@ -43,7 +59,11 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             // Strip trailing semicolons and whitespace - the condition
             // is used inside if(...) not as a standalone statement
             let cond = cond
+                .trim_start()
+                .strip_prefix("$main_exit_code = ")
+                .unwrap_or(&cond)
                 .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
+                .trim_end_matches(';')
                 .to_string();
             // Negate the condition for shell functions:
             // shell returns 0 for success, non-zero for failure.
@@ -1241,12 +1261,37 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
             Command::Or(l, r) => {
                 format!("({} || {})", combine(generator, l), combine(generator, r))
             }
+            Command::Block(block) => {
+                // A compound list { ... } in a condition: exit status =
+                // exit status of the last command in the block.
+                if block.commands.is_empty() {
+                    "1".to_string()
+                } else if block.commands.len() == 1 {
+                    combine(generator, &block.commands[0])
+                } else {
+                    // Multiple commands: use do { } to execute all for side effects
+                    // and return the last command's exit status as the condition.
+                    let mut body = String::new();
+                    for cmd in &block.commands[..block.commands.len() - 1] {
+                        generator.suppress_set_e_depth += 1;
+                        let line = generator.generate_command(cmd);
+                        generator.suppress_set_e_depth -= 1;
+                        body.push_str(&line);
+                    }
+                    body.push_str(&combine(generator, &block.commands[block.commands.len() - 1]));
+                    format!("do {{ {} }}", body)
+                }
+            }
             _ => {
                 generator.suppress_set_e_depth += 1;
                 let mut c = generator.generate_command(cmd);
                 generator.suppress_set_e_depth -= 1;
                 let c = c
+                    .trim_start()
+                    .strip_prefix("$main_exit_code = ")
+                    .unwrap_or(&c)
                     .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
+                    .trim_end_matches(';')
                     .to_string();
                 format!("!({})", c)
             }
