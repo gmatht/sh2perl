@@ -8,6 +8,7 @@ for iface in $(cmd | awk '{print $1}')
 do
   if [ -n "${iface}" ]; then
     ip="$(cmd | awk '{print$3}' | sed 's|\(.*\)/.*|\1|')"
+printf 'pretty_name=[%s]\n' "$pretty_name"
     echo "${ip}"
   fi
 done
