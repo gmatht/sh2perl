@@ -296,9 +296,21 @@ impl Generator {
         output.push_str("#!/usr/bin/env perl\n");
         output.push_str("use strict;\n");
         output.push_str("use warnings;\n");
-        output.push_str("use Carp;\n");
-        output.push_str("use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);\n");
-        output.push_str("use locale;\n");
+        // Only emit imports that are actually needed by the generated code.
+        // Carp, English, locale are part of the original boilerplate but
+        // many scripts don't use them — skip when not needed.
+        let needs_carp = self.needs_carp_import(ast);
+        let needs_english = self.needs_english_import(ast);
+        let needs_locale = self.needs_locale_import(ast);
+        if needs_carp {
+            output.push_str("use Carp;\n");
+        }
+        if needs_english {
+            output.push_str("use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);\n");
+        }
+        if needs_locale {
+            output.push_str("use locale;\n");
+        }
 
         if needs_basename {
             output.push_str("use File::Basename;\n");
@@ -354,15 +366,34 @@ impl Generator {
         }
         output.push_str("\n");
 
-        // Add main exit code variable for pipeline tracking
-        // Always declare it since it's used in pipeline generation
-        output.push_str("my $main_exit_code = 0;\n");
-        output.push_str("my $ls_success     = 0;\n");
-        output.push_str("my $__set_e        = 0;\n");
-        output.push_str("my $output         = q{};\n");
+        // Add infrastructure variables only when actually needed.
+        // Many scripts don't use $main_exit_code, $ls_success, etc.
+        let needs_exit_code = self.needs_exit_code_tracking(ast);
+        if needs_exit_code {
+            output.push_str("my $main_exit_code = 0;\n");
+        }
+        // $ls_success is only needed for ls command output parsing
+        if self.needs_ls_success(ast) {
+            output.push_str("my $ls_success     = 0;\n");
+        }
+        // $__set_e is only needed when `set -e` (errexit) is active
+        if self.set_e_active {
+            output.push_str("my $__set_e        = 0;\n");
+        }
+        // $output is only needed when there are top-level output statements
+        if needs_exit_code || self.needs_output_var(ast) {
+            output.push_str("my $output         = q{};\n");
+        }
 
-        // Add global CHILD_ERROR variable for command substitution
-        output.push_str("our $CHILD_ERROR;\n\n");
+        // Add global CHILD_ERROR variable for command substitution.
+        // Only emit when there are actual command substitutions or system calls.
+        let needs_child_error = self.needs_ipc_open3(ast) || self.needs_exit_code_tracking(ast);
+        if needs_child_error {
+            output.push_str("our $CHILD_ERROR;\n");
+        }
+        if needs_child_error || !self.function_level_vars.is_empty() {
+            output.push_str("\n");
+        }
 
         // Set $PROGRAM_NAME to original script name if available for $0 compatibility
         if let Some(ref script_name) = self.original_script_name {
@@ -370,17 +401,24 @@ impl Generator {
             output.push_str(&format!("$PROGRAM_NAME = '{}';\n", escaped));
         }
 
-        // Add declarations for variables that are used in arithmetic expressions
+        // Add declarations for variables that are used in arithmetic expressions.
         // Note: we do NOT initialize them to 0, because in bash an unset variable
         // used in $((...)) with $ prefix causes a syntax error.  By leaving the
         // Perl variable undef, subsequent arithmetic can detect the uninitialized
         // state and match bash's error behaviour (no stdout assignment).
-        // Also declare array (@) and hash (%) forms for variables that may be
-        // accessed with different sigils in different contexts (e.g., $array vs @array).
+        //
+        // Only declare the scalar form by default.  The array (@) and hash (%)
+        // forms are only emitted when the variable is specifically indexed
+        // as an array or hash.  This avoids the "triple declaration" bloat.
         for var in &self.function_level_vars {
             output.push_str(&format!("my ${};\n", var));
-            output.push_str(&format!("my @{};\n", var));
-            output.push_str(&format!("my %{};\n", var));
+            // Only emit @ and % forms if the variable is known to be used
+            // as an array or hash in some context.
+            if self.associative_arrays.contains(var) {
+                output.push_str(&format!("my %{};\n", var));
+            } else if self.indexed_arrays.contains(var) {
+                output.push_str(&format!("my @{};\n", var));
+            }
         }
         if !self.function_level_vars.is_empty() {
             output.push_str("\n");
@@ -423,9 +461,10 @@ impl Generator {
             }
         }
 
-        // Add final exit statement
-        // Always exit with $main_exit_code since it's always declared
-        output.push_str("\nexit $main_exit_code;\n");
+        // Add final exit statement — only if $main_exit_code is tracked.
+        if needs_exit_code {
+            output.push_str("\nexit $main_exit_code;\n");
+        }
 
         // Ensure the output ends with a newline
         if !output.ends_with('\n') {
@@ -699,12 +738,8 @@ impl Generator {
                 {
                     output.push_str(&self.indent());
                     output.push_str(&format!("my ${};\n", assignment.variable));
-                    // Also declare @ and % forms to handle potential array/hash access
-                    // to the same variable (e.g., $result[$i] and $result{"i"})
-                    output.push_str(&self.indent());
-                    output.push_str(&format!("my @{};\n", assignment.variable));
-                    output.push_str(&self.indent());
-                    output.push_str(&format!("my %{};\n", assignment.variable));
+                    // Omit @ and % forms — they are never used without explicit
+                    // array/hash syntax.
                     self.declared_locals.insert(assignment.variable.clone());
                 }
             }
@@ -2237,6 +2272,61 @@ impl Generator {
         }
     }
 
+    /// Check if the AST uses `ls` with output parsing that needs `$ls_success`.
+    fn needs_ls_success(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_uses_ls(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if any command in the AST uses `ls`.
+    fn command_uses_ls(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                if let Word::Literal(name, _) = &cmd.name {
+                    name == "ls"
+                } else {
+                    false
+                }
+            }
+            Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_ls(c)),
+            Command::And(l, r) | Command::Or(l, r) => self.command_uses_ls(l) || self.command_uses_ls(r),
+            Command::If(stmt) => {
+                self.command_uses_ls(&stmt.then_branch)
+                    || stmt.else_branch.as_ref().map_or(false, |e| self.command_uses_ls(e))
+            }
+            Command::While(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_ls(c)),
+            Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_ls(c)),
+            Command::Subshell(c) | Command::Background(c) => self.command_uses_ls(c),
+            Command::Block(b) => b.commands.iter().any(|c| self.command_uses_ls(c)),
+            Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_ls(c)),
+            _ => false,
+        }
+    }
+
+    /// Check if the AST needs the `$output` variable.
+    fn needs_output_var(&self, ast: &[Command]) -> bool {
+        // $output is used when commands append to it and then print it.
+        // If there's any top-level command that produces output, we need it.
+        for command in ast {
+            match command {
+                Command::Simple(cmd) => {
+                    if let Word::Literal(name, _) = &cmd.name {
+                        if matches!(name.as_str(), "echo" | "printf" | "print") {
+                            return true;
+                        }
+                    }
+                }
+                Command::Pipeline(_) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Check if the AST needs POSIX import
     fn needs_posix_import(&self, ast: &[Command]) -> bool {
         for command in ast {
@@ -2381,6 +2471,94 @@ impl Generator {
     fn word_needs_date_snapshot(&self, word: &Word) -> bool {
         match word {
             Word::CommandSubstitution(cmd, _) => self.command_needs_date_snapshot(cmd),
+            _ => false,
+        }
+    }
+
+    /// Check if the AST uses `Carp` (croak/carp) for error handling.
+    fn needs_carp_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_uses_croak(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if the AST uses `English` variables ($ERRNO, $OS_ERROR, etc.).
+    fn needs_english_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_uses_english(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if the AST needs `use locale` (e.g., for locale-sensitive comparisons).
+    fn needs_locale_import(&self, ast: &[Command]) -> bool {
+        for command in ast {
+            if self.command_uses_locale(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn command_uses_croak(&self, command: &Command) -> bool {
+        match command {
+            Command::Simple(cmd) => {
+                if let Word::Literal(name, _) = &cmd.name {
+                    matches!(name.as_str(), "open3" | "exec" | "system")
+                } else {
+                    false
+                }
+            }
+            Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_croak(c)),
+            Command::And(l, r) | Command::Or(l, r) => self.command_uses_croak(l) || self.command_uses_croak(r),
+            Command::If(stmt) => {
+                self.command_uses_croak(&stmt.then_branch)
+                    || stmt.else_branch.as_ref().map_or(false, |e| self.command_uses_croak(e))
+            }
+            Command::While(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_croak(c)),
+            Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_croak(c)),
+            Command::Subshell(c) | Command::Background(c) => self.command_uses_croak(c),
+            Command::Block(b) => b.commands.iter().any(|c| self.command_uses_croak(c)),
+            Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_croak(c)),
+            _ => false,
+        }
+    }
+
+    fn command_uses_english(&self, command: &Command) -> bool {
+        // English module provides long names for Perl special variables.
+        // Check if generated code will use $OS_ERROR, $ERRNO, etc.
+        match command {
+            Command::Simple(cmd) => {
+                // Commands that typically reference OS errors
+                if let Word::Literal(name, _) = &cmd.name {
+                    matches!(name.as_str(), "open3" | "exec" | "system" | "eval")
+                } else {
+                    false
+                }
+            }
+            Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_english(c)),
+            Command::And(l, r) | Command::Or(l, r) => self.command_uses_english(l) || self.command_uses_english(r),
+            _ => false,
+        }
+    }
+
+    fn command_uses_locale(&self, command: &Command) -> bool {
+        // `use locale` is needed for locale-sensitive string operations.
+        // Most scripts don't need it.
+        match command {
+            Command::Simple(cmd) => {
+                if let Word::Literal(name, _) = &cmd.name {
+                    matches!(name.as_str(), "sort" | "comm" | "join" | "tr" | "sed")
+                } else {
+                    false
+                }
+            }
+            Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_locale(c)),
             _ => false,
         }
     }
