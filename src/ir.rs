@@ -247,6 +247,15 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
     // Top-level variable declarations from usage analysis
     // (emitted by generator as Declare stmts, handled below)
 
+    // FUTURE: Run optimization passes here once more generator functions
+    // emit structural IR nodes instead of RawText.  Candidate passes:
+    //   - Dead assignment elimination: `$main_exit_code = $CHILD_ERROR`
+    //     inside ls.rs is dead because it is always overwritten by the
+    //     `$main_exit_code = 0;` from logic_commands.rs before any read.
+    //   - Redundant-assignment removal: `$main_exit_code = 0;` could be
+    //     elided once ls.rs no longer emits the dead `= $CHILD_ERROR`,
+    //     since the variable was already initialized to 0.
+
     // Top-level statements
     for stmt in &prog.stmts {
         emit_stmt(&mut out, stmt, 0);
