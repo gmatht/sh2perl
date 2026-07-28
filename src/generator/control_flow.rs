@@ -619,8 +619,27 @@ pub fn generate_cstyle_for_loop_impl(
         .replace("!=", "!=")
         .replace("==", "==");
 
+    // Strip the outer eval { int(EXPR) } // "" wrapper from each component
+    // because PPI cannot correctly parse eval { } blocks inside a for-loop
+    // condition (it confuses the eval-block with the for-loop body).
+    // The for-loop init/cond/incr are typically simple assignments and
+    // comparisons that do not need the eval-wrapping (which was only added
+    // to catch division-by-zero errors in general arithmetic expressions).
+    let strip_eval_wrapper = |s: &str| -> String {
+        let trimmed = s.trim();
+        if trimmed.starts_with("eval { int(") && trimmed.ends_with("} // \"\"") {
+            let inner = &trimmed["eval { int(".len()..trimmed.len() - "} // \"\"".len()];
+            inner.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let init_clean = strip_eval_wrapper(&init_perl);
+    let cond_clean = strip_eval_wrapper(&cond_perl);
+    let incr_clean = strip_eval_wrapper(&incr_perl);
+
     output.push_str(&generator.indent());
-    output.push_str(&format!("for ({init_perl}; {cond_perl}; {incr_perl}) {{\n"));
+    output.push_str(&format!("for ({init_clean}; {cond_clean}; {incr_clean}) {{\n"));
 
     generator.indent_level += 1;
     let body_output = generator.generate_block(&for_loop.body);
