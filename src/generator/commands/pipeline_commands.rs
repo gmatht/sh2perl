@@ -2826,7 +2826,7 @@ fn generate_buffered_pipeline(
                 // Bash command substitution strips all trailing newlines from
                 // the captured output before assigning to the variable.
                 output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
+                output.push_str(&format!("chomp $output_{};\n", unique_id));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
             } else {
@@ -2967,7 +2967,7 @@ fn generate_buffered_pipeline(
                 // Return the output variable as the last statement.
                 // Bash command substitution strips all trailing newlines.
                 output.push_str(&generator.indent());
-                output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
+                output.push_str(&format!("chomp $output_{};\n", unique_id));
                 output.push_str(&generator.indent());
                 output.push_str(&format!("$output_{};\n", unique_id));
             }
@@ -3081,7 +3081,7 @@ fn generate_buffered_pipeline(
             }
             // Bash command substitution strips all trailing newlines.
             output.push_str(&generator.indent());
-            output.push_str(&format!("$output_{} =~ s/\\n+\\z//msx;\n", unique_id));
+            output.push_str(&format!("chomp $output_{};\n", unique_id));
             output.push_str(&generator.indent());
             output.push_str(&format!("$output_{};\n", unique_id));
         }

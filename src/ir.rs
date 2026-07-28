@@ -247,17 +247,13 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
     // Top-level variable declarations from usage analysis
     // (emitted by generator as Declare stmts, handled below)
 
-    // FUTURE: Run optimization passes here once more generator functions
-    // emit structural IR nodes instead of RawText.  Candidate passes:
-    //   - Dead assignment elimination: `$main_exit_code = $CHILD_ERROR`
-    //     inside ls.rs is dead because it is always overwritten by the
-    //     `$main_exit_code = 0;` from logic_commands.rs before any read.
-    //   - Redundant-assignment removal: `$main_exit_code = 0;` could be
-    //     elided once ls.rs no longer emits the dead `= $CHILD_ERROR`,
-    //     since the variable was already initialized to 0.
+    // Run optimization passes before emitting.
+    // These operate on semantic IR nodes (Assign, Declare, etc.) and are
+    // no-ops for RawText (which passes through unchanged).
+    let stmts = optimize_stmts(&prog.stmts);
 
     // Top-level statements
-    for stmt in &prog.stmts {
+    for stmt in &stmts {
         emit_stmt(&mut out, stmt, 0);
     }
     out.push('\n');
@@ -271,7 +267,7 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
     // Exit — only if $main_exit_code might be non-zero (i.e. if any
     // statement references it).  For scripts that never touch it,
     // omit the exit so Perl's default exit(0) applies.
-    let has_main_exit = prog.stmts.iter().any(|s| stmt_refers_to_main_exit(s))
+    let has_main_exit = stmts.iter().any(|s| stmt_refers_to_main_exit(s))
         || prog.subs.iter().any(|sub| sub.body.iter().any(|s| stmt_refers_to_main_exit(s)));
     if has_main_exit {
         out.push_str("exit $main_exit_code;\n");
@@ -646,7 +642,13 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 
         IrExpr::Call { func, args } => {
             let a = args.iter().map(|a| ir_expr_to_perl(a)).collect::<Vec<_>>().join(", ");
-            format!("{}({})", func, a)
+            // Special-case `chomp` with a single scalar argument to produce
+            // the idiomatic `chomp $var;` (without parentheses).
+            if func == "chomp" && args.len() == 1 {
+                format!("chomp {}", a)
+            } else {
+                format!("{}({})", func, a)
+            }
         }
 
         IrExpr::MethodCall { obj, method, args } => {
@@ -779,6 +781,48 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         IrExpr::DefinedOr { expr, default } => expr_refers_to_main_exit(expr) || expr_refers_to_main_exit(default),
         IrExpr::Int(_) | IrExpr::Str(_, _) => false,
     }
+}
+
+// ── Optimization passes ────────────────────────────────────────────
+
+/// Check whether an `IrStmt::Assign` is a no-op self-assignment
+/// (e.g. `$x = $x;` or `($x) = ($x);`).
+fn is_self_assignment(stmt: &IrStmt) -> bool {
+    if let IrStmt::Assign { targets, expr } = stmt {
+        if targets.len() == 1 && targets[0].indices.is_empty() {
+            // Single target: `$x = expr`. Check if expr is just `$x`.
+            if let IrExpr::Var(name, _) = expr {
+                return *name == targets[0].var;
+            }
+        }
+    }
+    false
+}
+
+/// Run optimization passes on a list of IR statements.
+///
+/// Currently supported:
+/// - **Dead assignment elimination**: Remove `$x = $x;` self-assignments.
+///   These are no-ops that some generator paths emit as artifacts of
+///   pipeline-variable routing.
+///
+/// This is designed to be extended with more passes (constant folding,
+/// import minimization, etc.) as the generator emits more semantic IR
+/// nodes instead of RawText.
+pub(crate) fn optimize_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
+    // Pass 1: Dead assignment elimination (self-assignment removal)
+    let pass1: Vec<IrStmt> = stmts
+        .iter()
+        .filter(|s| !is_self_assignment(s))
+        .cloned()
+        .collect();
+
+    // Future passes (when more semantic IR nodes are available):
+    //   - Redundant-assignment removal
+    //   - Constant folding
+    //   - Import minimization
+
+    pass1
 }
 
 // ── Bridge: wrap current generator output in RawText ────────────────
