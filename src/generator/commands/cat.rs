@@ -169,7 +169,7 @@ pub fn generate_cat_command(
             // Write heredoc content to the output file
             let filename_pl = generator.perl_string_literal(&Word::literal(filename));
             output.push_str(&format!(
-                "open my $fh_cat, '>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
+                "open my $fh_cat, '>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
                 filename_pl
             ));
             output.push_str(&format!(

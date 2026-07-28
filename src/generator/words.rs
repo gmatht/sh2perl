@@ -11,7 +11,10 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
     let rendered = if current_string.contains("system") || current_string.contains('`') {
         crate::generator::commands::utilities::source_safe_perl_string_expr(current_string)
     } else {
-        format!("\"{}\"", current_string.replace('"', "\\\""))
+        let escaped = current_string
+            .replace('"', "\\\"")
+            .replace("@", "\\@");
+        format!("\"{}\"", escaped)
     };
 
     parts.push(rendered);
@@ -1130,7 +1133,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 .map(|redirect| {
                                     let file_name = generator.word_to_perl(&redirect.target);
                                     format!(
-                                        "my ${} = do {{\n    local $INPUT_RECORD_SEPARATOR = undef;\n    if (open my $fh, '<', {}) {{\n        my $content = <$fh>;\n        close $fh or warn \"Close failed: $OS_ERROR\";\n        $content;\n    }} else {{\n        warn \"Cannot open file: $OS_ERROR\";\n        q{{}};\n    }}\n}};\n",
+                                        "my ${} = do {{\n    local $INPUT_RECORD_SEPARATOR = undef;\n    if (open my $fh, '<', {}) {{\n        my $content = <$fh>;\n        close $fh or warn \"Close failed: $OS_ERROR\";\n        $content;\n    }} else {{\n        warn \"Cannot access file: $OS_ERROR\";\n        q{{}};\n    }}\n}};\n",
                                         input_var, file_name
                                     )
                                 })

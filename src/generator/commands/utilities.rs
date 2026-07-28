@@ -5,6 +5,7 @@ pub fn escape_perl_string(s: &str) -> String {
         .replace("\n", "\\n")
         .replace("\t", "\\t")
         .replace("\r", "\\r")
+        .replace("@", "\\@")
 }
 
 /// Render a Perl string expression without emitting banned source substrings.

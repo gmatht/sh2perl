@@ -743,7 +743,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     Word::Literal(filename, _) => {
                         // Read from file - generate a proper variable assignment
                         let file_var = format!("file_content_{}", command_index);
-                        let reading_code = format!("my ${} = do {{\n    local $INPUT_RECORD_SEPARATOR = undef;\n    if (open my $fh, '<', '{}') {{\n        my $content = <$fh>;\n        close $fh or warn \"Close failed: $OS_ERROR\";\n        $content;\n    }} else {{\n        warn \"Cannot open file: $OS_ERROR\";\n        q{{}};\n    }}\n}};", file_var, filename);
+                        let reading_code = format!("my ${} = do {{\n    local $INPUT_RECORD_SEPARATOR = undef;\n    if (open my $fh, '<', '{}') {{\n        my $content = <$fh>;\n        close $fh or warn \"Close failed: $OS_ERROR\";\n        $content;\n    }} else {{\n        warn \"Cannot access file: $OS_ERROR\";\n        q{{}};\n    }}\n}};", file_var, filename);
                         (format!("${}", file_var), reading_code)
                     }
                     _ => {
@@ -1434,7 +1434,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 if let crate::ast::RedirectOperator::Input = redirect.operator {
                                     let file_name = generator.word_to_perl(&redirect.target);
                                     output.push_str(&generator.indent());
-                                    output.push_str(&format!("open STDIN, '<', {} or croak \"Cannot open file: $ERRNO\";\n", file_name));
+                                    output.push_str(&format!("open STDIN, '<', {} or croak \"Cannot access file: $ERRNO\";\n", file_name));
                                     break;
                                 }
                             }
@@ -1523,11 +1523,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         );
                     }
                 }
-            } else if generator.declared_functions.contains(name) || *name == "greet" {
+            } else if generator.declared_functions.contains(name) || *name == "greet" || generator.lexical_functions.contains(name) {
+                // Determine whether this is a lexical (nested) function call -> $name->(...)
+                let is_lexical = generator.lexical_functions.contains(name);
+                let call_prefix = if is_lexical { format!("${}->", name) } else { name.clone() };
+
                 // Function call
                 if cmd.args.is_empty() {
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("{}();\n", name));
+                    output.push_str(&format!("{}();\n", call_prefix));
                 } else {
                     // Check if any argument contains glob patterns
                     let has_glob_patterns = cmd.args.iter().any(|arg| match arg {
@@ -1574,7 +1578,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             output.push_str(&generator.indent());
                             output.push_str(&format!(
                                 "{}({});\n",
-                                name,
+                                call_prefix,
                                 if non_glob_args.is_empty() {
                                     "$file".to_string()
                                 } else {
@@ -1588,7 +1592,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             // No glob patterns, use the original logic
                             let args_str = non_glob_args.join(", ");
                             output.push_str(&generator.indent());
-                            output.push_str(&format!("{}({});\n", name, args_str));
+                            output.push_str(&format!("{}({});\n", call_prefix, args_str));
                         }
                     } else {
                         let args: Vec<String> = cmd
@@ -1606,7 +1610,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             .collect();
                         let args_str = args.join(", ");
                         output.push_str(&generator.indent());
-                        output.push_str(&format!("{}({});\n", name, args_str));
+                        output.push_str(&format!("{}({});\n", call_prefix, args_str));
                     }
                 }
             } else {
