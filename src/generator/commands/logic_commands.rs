@@ -31,6 +31,18 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         return output;
     }
 
+    // For continue/break, the left command transfers control (jumps),
+    // so the right side is unreachable inside a loop.  Emit both
+    // sequentially and let `next`/`last` skip the right code.
+    if matches!(left, Command::Continue(_) | Command::Break(_)) {
+        generator.suppress_set_e_depth += 1;
+        output.push_str(&generator.generate_command(left));
+        generator.suppress_set_e_depth -= 1;
+        output.push_str(&generator.indent());
+        output.push_str(&generator.generate_command(right));
+        return output;
+    }
+
     // For other commands, use the original pattern with exit code checking
     output.push_str("if (");
 
@@ -190,6 +202,19 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         output.push_str(&generator.indent());
         output.push_str("}\n");
         return output;
+    } else if matches!(left, Command::Continue(_) | Command::Break(_)) {
+        // `continue || X` and `break || X` in bash: the left command transfers
+        // control (jumps to next iteration / exits the loop), so the right-hand
+        // side is unreachable inside a loop.  In Perl `next`/`last` also transfer
+        // control, so we emit both statements sequentially — the right side is
+        // dead code inside a loop (which matches bash behaviour where the right
+        // side of `||` only runs if the left side fails, and `continue`/`break`
+        // never fail inside a loop).
+        generator.suppress_set_e_depth += 1;
+        output.push_str(&generator.generate_command(left));
+        generator.suppress_set_e_depth -= 1;
+        output.push_str(&generator.indent());
+        output.push_str(&generator.generate_command(right));
     } else {
         // For commands that generate Perl code (like grep, ls), we need to handle them specially
         // to avoid embedding Perl code inside shell backticks

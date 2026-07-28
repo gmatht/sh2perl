@@ -351,10 +351,13 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
         Command::Block(block) => {
             // Block conditions arise when env vars are assigned before a command
             // (e.g. `IFS= read -r line && ...`). Generate each command in the block
-            // as a step in a while (1)/until(1) loop, checking exit code after each.
-            output.push_str(&format!("{} (1) {{\n", loop_keyword));
+            // as a step in a while (1) loop, checking exit code after each.
+            // NOTE: Always use `while (1)` — using `until (1)` would never execute
+            // the body because `until` runs while the condition is false.
+            output.push_str("while (1) {\n");
             generator.indent_level += 1;
             // Generate all commands except the last one as plain statements
+            let is_until = while_loop.is_until;
             let len = block.commands.len();
             for (i, cmd) in block.commands.iter().enumerate() {
                 if i < len - 1 {
@@ -371,7 +374,12 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                         }
                     }
                     output.push_str(&generator.indent());
-                    output.push_str("last unless $CHILD_ERROR == 0;\n");
+                    if is_until {
+                        // For `until`, exit the loop when a command succeeds
+                        output.push_str("last if $CHILD_ERROR == 0;\n");
+                    } else {
+                        output.push_str("last unless $CHILD_ERROR == 0;\n");
+                    }
                 } else {
                     // Last command: treat as the main condition
                     match cmd {
@@ -387,11 +395,23 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                                     generator.suppress_set_e_depth -= 1;
                                     let cond_code = cond_code.trim().to_string();
                                     if is_and {
-                                        output.push_str(&generator.indent());
-                                        output.push_str(&format!("last unless ({});\n", cond_code));
+                                        // For AND: exit unless all succeed
+                                        if is_until {
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!("last if ({});\n", cond_code));
+                                        } else {
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!("last unless ({});\n", cond_code));
+                                        }
                                     } else {
-                                        output.push_str(&generator.indent());
-                                        output.push_str(&format!("last if ({});\n", cond_code));
+                                        // For OR: exit if any succeeds
+                                        if is_until {
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!("last unless ({});\n", cond_code));
+                                        } else {
+                                            output.push_str(&generator.indent());
+                                            output.push_str(&format!("last if ({});\n", cond_code));
+                                        }
                                     }
                                 } else {
                                     generator.suppress_set_e_depth += 1;
@@ -399,9 +419,17 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                                     generator.suppress_set_e_depth -= 1;
                                     output.push_str(&generator.indent());
                                     if is_and {
-                                        output.push_str("last unless do {\n");
+                                        if is_until {
+                                            output.push_str("last if do {\n");
+                                        } else {
+                                            output.push_str("last unless do {\n");
+                                        }
                                     } else {
-                                        output.push_str("last if do {\n");
+                                        if is_until {
+                                            output.push_str("last unless do {\n");
+                                        } else {
+                                            output.push_str("last if do {\n");
+                                        }
                                     }
                                     generator.indent_level += 1;
                                     for line in cond_code.lines() {
@@ -426,7 +454,11 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                             let cond_code = generator.generate_command(cmd);
                             generator.suppress_set_e_depth -= 1;
                             output.push_str(&generator.indent());
-                            output.push_str("last unless do {\n");
+                            if is_until {
+                                output.push_str("last if do {\n");
+                            } else {
+                                output.push_str("last unless do {\n");
+                            }
                             generator.indent_level += 1;
                             for line in cond_code.lines() {
                                 let trimmed = line.trim();

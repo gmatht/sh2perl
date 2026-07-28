@@ -1,0 +1,5 @@
+#!/bin/sh
+# Variable concatenated with single-quoted string
+x=hello
+y=$x'world'
+echo $y

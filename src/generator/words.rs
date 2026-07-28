@@ -446,6 +446,72 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                             command_lit
                         )
+                    } else if redirect_cmd.redirects.iter().any(|r| {
+                            matches!(r.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs)
+                        }) {
+                        // Heredoc inside command substitution — generate native Perl code
+                        // that uses the heredoc body rather than falling through to a qx{}
+                        // call (which would lose the heredoc content).
+                        let heredoc_body = redirect_cmd.redirects.iter().find_map(|r| match &r.operator {
+                            RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => r.heredoc_body.as_ref(),
+                            _ => None,
+                        });
+                        if let Some(body) = heredoc_body {
+                            if let Command::Simple(simple_cmd) = &*redirect_cmd.command {
+                                if let Word::Literal(name, _) = &simple_cmd.name {
+                                    // For `cat` with no args, just return the heredoc body
+                                    // (bash strips trailing newlines from command substitution)
+                                    if name == "cat" && simple_cmd.args.is_empty() {
+                                        let trimmed = body.trim_end_matches('\n');
+                                        generator.perl_string_literal(&Word::literal(trimmed.to_string()))
+                                    } else {
+                                        // For other commands, build a shell command that
+                                        // pipes the heredoc body via stdin.  We generate a
+                                        // safe heredoc-with-body fragment to embed in qx{}.
+                                        let inner_cmd_str =
+                                            crate::generator::redirects::generate_bash_command_string(
+                                                &redirect_cmd.command,
+                                            );
+                                        // Use a fresh delimiter that won't appear in the body.
+                                        let delim = "SH2PERL_HEREDOC_END";
+                                        let heredoc_snippet = format!(
+                                            "{} <<'{}'\n{}{}",
+                                            inner_cmd_str, delim, body, delim
+                                        );
+                                        let command_lit = generator.perl_string_literal_force_interp(
+                                            &Word::literal(heredoc_snippet),
+                                        );
+                                        format!(
+                                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                            command_lit
+                                        )
+                                    }
+                                } else {
+                                    // Non-literal command name — fall through
+                                    let command_str =
+                                        crate::generator::redirects::generate_bash_command_string(cmd);
+                                    let command_lit =
+                                        generator.perl_string_literal_force_interp(&Word::literal(command_str));
+                                    format!(
+                                        "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                        command_lit
+                                    )
+                                }
+                            } else {
+                                // Non-simple inner command — fall through
+                                let command_str =
+                                    crate::generator::redirects::generate_bash_command_string(cmd);
+                                let command_lit =
+                                    generator.perl_string_literal_force_interp(&Word::literal(command_str));
+                                format!(
+                                    "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                    command_lit
+                                )
+                            }
+                        } else {
+                            // No heredoc body — treat as empty
+                            "q{}".to_string()
+                        }
                     } else {
                         // Check if the inner command is a known builtin with a simple
                         // input redirect. If so, use native Perl code instead of qx{}.
