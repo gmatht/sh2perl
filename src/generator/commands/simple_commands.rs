@@ -1186,6 +1186,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         let ir_stmt = crate::ir::IrStmt::Output {
                             value: crate::ir::IrExpr::RawExpr(format!("\"{}\"", content)),
                             newline: true,
+                            target: None,
                         };
                         output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                     } else if !has_n_flag && args[0].starts_with('$') && !args[0].contains("\\n") {
@@ -1199,6 +1200,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             let ir_stmt = crate::ir::IrStmt::Output {
                                 value: crate::ir::IrExpr::RawExpr(args[0].clone()),
                                 newline: true,
+                                target: None,
                             };
                             output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                         }
@@ -1218,6 +1220,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             let ir_stmt = crate::ir::IrStmt::Output {
                                 value: crate::ir::IrExpr::RawExpr(args[0].clone()),
                                 newline: true,
+                                target: None,
                             };
                             output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                         }
@@ -1246,6 +1249,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 let ir_stmt = crate::ir::IrStmt::Output {
                                     value: crate::ir::IrExpr::RawExpr(args_str.clone()),
                                     newline: false,
+                                    target: None,
                                 };
                                 output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                             }
@@ -1255,6 +1259,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             let ir_stmt = crate::ir::IrStmt::Output {
                                 value: crate::ir::IrExpr::RawExpr(args_str.clone()),
                                 newline: true,
+                                target: None,
                             };
                             output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                         }

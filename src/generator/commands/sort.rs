@@ -202,6 +202,7 @@ pub fn generate_sort_command_with_output(
                 sigil: Sigil::Scalar,
             }],
             init: Some(join_expr),
+            local: false,
         };
         output.push_str(&stmt_to_perl(&stmt, indent_level));
         generator.declared_locals.insert(output_name.to_string());

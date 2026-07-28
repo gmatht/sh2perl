@@ -198,6 +198,7 @@ pub fn generate_wc_command_with_output(
             sigil: Sigil::Scalar,
         }],
         init: Some(sprintf_expr),
+        local: false,
     };
     output.push_str(&stmt_to_perl(&decl, generator.indent_level));
     output.push_str(&generator.indent());

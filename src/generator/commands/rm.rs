@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
+use crate::ir::{expr_to_perl, IrExpr, StrStyle};
 
 pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
@@ -50,6 +51,36 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
         return format!("do {{ my $rm_cmd_str = {}; system $rm_cmd_str; }};\n", command_lit);
+    }
+
+    // Fast path for `rm -f file` (force, non-recursive, no glob): emit
+    // simple `unlink` calls using IR expressions for file names instead of
+    // the full existence-check block.
+    if force && !recursive && !use_shell_fallback && !files.is_empty() {
+        let has_glob = files.iter().any(|f| f.contains('*') || f.contains('?'));
+        if !has_glob {
+            for file in &files {
+                let file_expr = if file.starts_with('$') {
+                    IrExpr::RawExpr(file[1..].to_string())
+                } else {
+                    // Strip surrounding quotes if present
+                    let bare = if (file.starts_with('"') && file.ends_with('"'))
+                        || (file.starts_with("'") && file.ends_with("'"))
+                    {
+                        &file[1..file.len() - 1]
+                    } else {
+                        file
+                    };
+                    IrExpr::Str(bare.to_string(), StrStyle::SingleQuoted)
+                };
+                output.push_str(&generator.indent());
+                output.push_str(&format!(
+                    "unlink({});\n",
+                    expr_to_perl(&file_expr)
+                ));
+            }
+            return output;
+        }
     }
 
     if files.is_empty() {
