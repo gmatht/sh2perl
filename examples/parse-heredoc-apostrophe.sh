@@ -3,7 +3,8 @@
 # SingleQuotedString that spans past the heredoc delimiter. The lexer
 # must correctly handle this by removing the spanning token and
 # re-tokenizing the content after the heredoc.
-cat <<EOF
+result=$(cat <<EOF
 It isn't broken
 EOF
-echo "done"
+)
+printf 'heredoc content=[%s]\n' "$result"

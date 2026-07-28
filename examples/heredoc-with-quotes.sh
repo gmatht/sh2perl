@@ -1,7 +1,8 @@
 #!/bin/sh
 # Regression test: heredoc containing single quotes, which must not
 # confuse the lexer into opening a false string.
-cat <<'EOF'
+result=$(cat <<'EOF'
 I can't stop this feeling
 EOF
-echo "done"
+)
+printf 'heredoc content=[%s]\n' "$result"

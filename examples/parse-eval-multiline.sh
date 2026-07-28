@@ -12,4 +12,6 @@ eval '
         done
     }
 '
-echo done
+# Verify function was defined
+type doselect 2>/dev/null | head -1
+printf 'doselect definition parsed OK\n'

@@ -7,4 +7,4 @@ content
 EOF
 )
 eval "$var"
-printf 'subshell+heredoc+eval parsed OK\n'
+printf 'var after eval=[%s]\n' "$var"

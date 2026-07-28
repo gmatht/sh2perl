@@ -1,6 +1,7 @@
 #!/bin/bash
 # Heredoc with apostrophe that creates a spanning string
-cat << EOF
+result=$(cat << EOF
 It's a test with an apostrophe here.
 EOF
-echo "done"
+)
+printf 'heredoc content=[%s]\n' "$result"

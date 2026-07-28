@@ -1,6 +1,7 @@
 #!/bin/sh
 # Heredoc with apostrophes in body
-cat << 'EOF'
+result=$(cat << 'EOF'
 This is a test with an apostrophe: it's fine
 EOF
-echo done
+)
+printf 'heredoc content=[%s]\n' "$result"
