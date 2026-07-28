@@ -679,17 +679,23 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // For backtick commands, we need to return the value, not print it
                             perl_code
                         } else if name == "head" {
-                            // Use array element to avoid check_qx Pattern 2 (qx{$scalar})
+                            // Use IrExpr::Backtick for a clean qx{} expression.
+                            // This avoids the `do { my @_qx_cmd = (...); ... }` boilerplate
+                            // (Pattern A fix).
                             let head_cmd = generator.generate_command_string_for_system(cmd);
-                            let head_lit = generator
-                                .perl_string_literal_no_interp(&Word::literal(head_cmd));
-                            format!("do {{ my @_qx_cmd = ({}); qx{{$_qx_cmd[0]}}; }}", head_lit)
+                            let backtick = crate::ir::IrExpr::Backtick {
+                                expr: Box::new(crate::ir::IrExpr::RawExpr(head_cmd)),
+                                native: false,
+                            };
+                            crate::ir::expr_to_perl(&backtick)
                         } else if name == "tail" {
-                            // Use array element to avoid check_qx Pattern 2 (qx{$scalar})
+                            // Use IrExpr::Backtick for a clean qx{} expression.
                             let tail_cmd = generator.generate_command_string_for_system(cmd);
-                            let tail_lit = generator
-                                .perl_string_literal_no_interp(&Word::literal(tail_cmd));
-                            format!("do {{ my @_qx_cmd = ({}); qx{{$_qx_cmd[0]}}; }}", tail_lit)
+                            let backtick = crate::ir::IrExpr::Backtick {
+                                expr: Box::new(crate::ir::IrExpr::RawExpr(tail_cmd)),
+                                native: false,
+                            };
+                            crate::ir::expr_to_perl(&backtick)
                         } else if name == "cat" {
                             crate::generator::commands::cat::generate_cat_command_for_substitution(
                                 generator, simple_cmd,
