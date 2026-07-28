@@ -918,9 +918,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             if cmd.args.is_empty() {
                 output.push_str(&generator.indent());
                 output.push_str("print \"\\n\";\n");
-                // Emulate successful builtin exit status for echo
-                output.push_str(&generator.indent());
-                output.push_str("$CHILD_ERROR = 0;\n");
             } else {
                 // Check for -e / -n flags
                 let has_e_flag = cmd.args.iter().any(|arg| {
@@ -1166,8 +1163,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         output.push_str(&generator.indent());
                         output.push_str("print \"\\n\";\n");
                     }
-                    output.push_str(&generator.indent());
-                    output.push_str("$CHILD_ERROR = 0;\n");
                 } else if args.len() == 1 {
                     output.push_str(&generator.indent());
                     // Check if the argument is a command substitution
@@ -1216,9 +1211,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                         }
 
-                        // echo as a builtin succeeded
-                        output.push_str(&generator.indent());
-                        output.push_str("$CHILD_ERROR = 0;\n");
                     }
                 } else {
                     // Check if we have multiple brace expansions that need cartesian product
@@ -1231,10 +1223,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     if brace_expansions.len() > 1 {
                         // Generate cartesian product for multiple brace expansions
                         output.push_str(&generate_cartesian_product_for_echo(generator, &cmd.args));
-
-                        // echo as a builtin succeeded
-                        output.push_str(&generator.indent());
-                        output.push_str("$CHILD_ERROR = 0;\n");
                     } else {
                         // For multiple arguments, join them with spaces
                         let args_str = args.join(" . q{ } . ");
@@ -1260,9 +1248,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                         }
 
-                        // echo as a builtin succeeded
-                        output.push_str(&generator.indent());
-                        output.push_str("$CHILD_ERROR = 0;\n");
                     }
                 }
             }
