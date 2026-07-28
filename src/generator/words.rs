@@ -254,7 +254,7 @@ fn generate_shell_command_substitution(generator: &mut Generator, cmd: &Command)
 
     let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
     format!(
-        "do {{\n{}    my ({}, {});\n    my $pid = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    $result =~ s/\\n+\\z//msx;\n    $result;\n}}",
+        "do {{\n{}    my ({}, {});\n    my $pid = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    chomp $result;\n    $result;\n}}",
         env_setup,
         in_var,
         out_var,

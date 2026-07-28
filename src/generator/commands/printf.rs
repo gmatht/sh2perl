@@ -95,7 +95,18 @@ pub fn generate_printf_command(
             }
         } else {
             // Subsequent arguments are the values to format
-            args.push(generator.word_to_perl(arg));
+            // Detect integer literals and emit bare integers (IrExpr::Int)
+            // instead of quoted strings like '42'. This produces cleaner
+            // Perl and avoids implicit string-to-number conversions.
+            if let Word::Literal(s, _) = arg {
+                if let Ok(n) = s.parse::<i64>() {
+                    args.push(crate::ir::expr_to_perl(&crate::ir::IrExpr::Int(n)));
+                } else {
+                    args.push(generator.word_to_perl(arg));
+                }
+            } else {
+                args.push(generator.word_to_perl(arg));
+            }
         }
     }
 

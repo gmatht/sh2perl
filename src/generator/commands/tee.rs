@@ -48,8 +48,6 @@ pub fn generate_tee_command(
     if files.is_empty() {
         // No files specified, just pass through the input value.
     } else {
-        output.push_str("use Carp qw(carp croak);\n");
-
         // Write to specified files
         for (file, special_stderr) in &files {
             if *special_stderr {
@@ -91,7 +89,12 @@ pub fn generate_tee_command(
             .take(stdout_copies)
             .collect::<Vec<_>>()
             .join(" . ");
-        output.push_str(&format!("${} = {};\n", output_var, stdout_expr));
+        // Avoid self-assignment like `$output_0 = $output_0;` when the
+        // output variable already contains the same value (Pattern E).
+        let lhs = format!("${}", output_var);
+        if stdout_expr != lhs {
+            output.push_str(&format!("{} = {};\n", lhs, stdout_expr));
+        }
     }
 
     output
