@@ -4,3 +4,4 @@ case $1 in
   a) set -- hello ;;
   b) dryrun=t ;;
 esac
+printf "parsed OK\\n"

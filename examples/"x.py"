@@ -1,3 +1,2 @@
-import re
-func_match = re.search(r'`([^`]+)`', line)
+x = re.search(r'`([^`]+)`', line)
 if x == '\'': pass

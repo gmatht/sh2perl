@@ -4,3 +4,4 @@
     -d "$FILE" \) -o \
     \( -h "$FILE" -a \
     "$(readlink "$FILE")" = "target" \) ]
+printf "parsed OK\\n"
