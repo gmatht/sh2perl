@@ -6,3 +6,5 @@ $1
 EOF
 IFS='
 '
+printf "%s=[%s]\n" IFS "${IFS:-}"
+

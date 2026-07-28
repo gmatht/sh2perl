@@ -5,3 +5,5 @@ if [ "source" = "$var" ]; then
     echo "source matched"
 fi
 . /etc/profile
+printf "%s=[%s]\n" var "${var:-}"
+

@@ -10,3 +10,6 @@ case "$opt" in
         echo "default"
         ;;
 esac
+printf "%s=[%s]\n" tmp "${tmp:-}"
+printf "%s=[%s]\n" configfile "${configfile:-}"
+

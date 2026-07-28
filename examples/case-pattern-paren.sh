@@ -8,3 +8,5 @@ case "$arch" in
         cpu=unknown
         ;;
 esac
+printf "%s=[%s]\n" cpu "${cpu:-}"
+

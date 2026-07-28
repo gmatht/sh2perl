@@ -11,3 +11,5 @@ import zipfile
 print('Hello from embedded Python')
 END_OF_PYTHON
 PK
+printf "%s=[%s]\n" EXECUTABLE "${EXECUTABLE:-}"
+
