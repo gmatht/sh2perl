@@ -1,6 +1,6 @@
 #!/bin/sh
 # Heredoc with additional redirects on the same line
-tmpf=$(mktemp /tmp/heredoc_redirect_test.XXXXXX)
+tmpf=$(mktemp /tmp/heredoc_redirect_same_line.XXXXXX)
 (cmd) <<EOF 2>&1 >"$tmpf"
 body
 EOF

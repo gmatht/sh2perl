@@ -157,7 +157,7 @@ get_system_info() {
 
 # 23. Complex error handling with traps
 trap 'echo "Error on line $LINENO"; exit 1' ERR
-trap 'echo "Cleaning up..."; rm -f /tmp/temp_*' EXIT
+trap 'echo "Cleaning up..."; rm -f /tmp/064_hard_temp_*' EXIT
 
 # 24. Advanced parameter expansion with default values and transformations
 input="${1:-default_value}"

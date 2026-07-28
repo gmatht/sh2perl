@@ -1,6 +1,6 @@
 #!/bin/sh
 # Test heredoc followed by more redirects on same line
-tmpf=$(mktemp /tmp/heredoc_redirect_test.XXXXXX)
+tmpf=$(mktemp /tmp/parse_heredoc_redirect_chain.XXXXXX)
 cat <<EOF 2>&1 >"$tmpf"
 hello
 EOF

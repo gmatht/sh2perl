@@ -12,7 +12,7 @@ echo "${name,,}"        # world
 echo "${name^}"         # World
 
 echo "== Advanced parameter expansion =="
-path="/tmp/file.txt"
+path="/tmp/013_param_expansion_file.txt"
 echo "${path##*/}"       # file.txt
 echo "${path%/*}"        # /tmp
 s2="abba"; echo "${s2//b/X}"  # aXXa
