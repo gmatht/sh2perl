@@ -133,18 +133,24 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                 };
 
                 if let Some(perl_code) = perl_code {
-                    eprintln!("DEBUG: Found perl code: {}", perl_code);
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!("DEBUG: Found perl code: {}", perl_code);
+                    }
                     let mut clean_code = perl_code.clone();
                     if (clean_code.starts_with('"') && clean_code.ends_with('"'))
                         || (clean_code.starts_with('\'') && clean_code.ends_with('\''))
                     {
                         clean_code = clean_code[1..clean_code.len() - 1].to_string();
                     }
-                    eprintln!("DEBUG: Clean perl code: {}", clean_code);
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!("DEBUG: Clean perl code: {}", clean_code);
+                    }
 
                     // Transform bareword file handles to lexical file handles
                     clean_code = bareword_fh_to_lexical(&clean_code);
-                    eprintln!("DEBUG: After bareword fix: {}", clean_code);
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!("DEBUG: After bareword fix: {}", clean_code);
+                    }
 
                     if cmd.args.len() > 2 {
                         output.push_str("@ARGV = (");
@@ -159,7 +165,9 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
 
                     output.push_str("if (!defined $ENV{SHELL_VAR}) { $ENV{SHELL_VAR} = q{}; }\n");
 
-                    eprintln!("DEBUG: About to execute perl code lines");
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!("DEBUG: About to execute perl code lines");
+                    }
                     for line in clean_code.lines() {
                         let trimmed_line = line.trim();
                         if !trimmed_line.is_empty() {
@@ -181,7 +189,9 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                             }
                         }
                     }
-                    eprintln!("DEBUG: Returning perl output: {}", output);
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!("DEBUG: Returning perl output: {}", output);
+                    }
                     return output;
                 }
             } else if flag == "-ne" {
