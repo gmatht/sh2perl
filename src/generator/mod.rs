@@ -1848,8 +1848,10 @@ impl Generator {
                 let needs_open3 = if let Word::Literal(name, _) = &cmd.name {
                     // Commands that typically use open3 for IPC
                     match name.as_str() {
-                        "pwd" | "whoami" | "date" | "id" | "uname" | "hostname" | "uptime"
-                        | "w" | "who" | "perl" => true,
+                        // Commands that generate native Perl code and don't need IPC::Open3.
+                        // `date` is always converted to POSIX::strftime natively.
+                        // `pwd`, `whoami`, `id`, `uname`, `hostname` are converted to native Perl.
+                        "perl" => true,
                         _ => {
                             // Check if it's a pipeline command or has complex arguments
                             cmd.args.len() > 0 || self.is_pipeline_command(name)

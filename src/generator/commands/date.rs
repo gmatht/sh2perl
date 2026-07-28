@@ -53,6 +53,13 @@ fn strftime_var_ir(format_expr: IrExpr, gmtime: bool) -> IrExpr {
     }
 }
 
+/// Return just the strftime call expression (without `require POSIX;`).
+/// Used by generators that want to emit `require POSIX;` separately.
+pub fn date_strftime_expr(format: &str, gmtime: bool) -> String {
+    let ir = strftime_ir(format, gmtime);
+    expr_to_perl(&ir)
+}
+
 fn default_date_expr() -> String {
     // Use the IR backend for clean formatting
     let ir = strftime_ir("%a %b %e %H:%M:%S %Z %Y", false);
@@ -151,10 +158,31 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
     format!("{}{}", prefix, body)
 }
 
+/// Helper: if `body` starts with `require POSIX; ` or `require POSIX;\n` return
+/// the part after that prefix.  This lets callers split the require from the
+/// expression for cleaner output.
+pub fn split_posix_require(body: &str) -> Option<&str> {
+    if let Some(rest) = body.strip_prefix("require POSIX; ") {
+        Some(rest)
+    } else if let Some(rest) = body.strip_prefix("require POSIX;\n") {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
 pub fn generate_date_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let body = generate_date_expression(generator, cmd);
-    // Add \"\\n\" because a standalone `date` command should output with newline.
-    // The expression body no longer appends it (it was removed for command-substitution
-    // use where newlines are handled by the chomp wrapper).
-    format!("my $date = do {{\n{}\n}} . \"\\n\";\nprint $date;\n", body)
+    // If the body is just `require POSIX; expr`, split into separate statements
+    // to avoid the `do { require POSIX; expr }` wrapper (Pattern B).
+    if let Some(expr) = split_posix_require(&body) {
+        format!(
+            "require POSIX;\nmy $date = {} . \"\\n\";\nprint $date;\n",
+            expr
+        )
+    } else {
+        // Complex body (e.g., -d with multiple requires) — keep the do-block.
+        format!("my $date = do {{\n{}\n}} . \"\\n\";\nprint $date;\n", body)
+    }
 }
+
