@@ -164,7 +164,9 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
             if let Word::Literal(s, meta) = &target_raw {
                 if s.starts_with('\\') {
                     heredoc_quoted = true;
-                    eprintln!("DEBUG: stripped backslash from heredoc delimiter '{}' -> '{}'", s, &s[1..]);
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!("DEBUG: stripped backslash from heredoc delimiter '{}' -> '{}'", s, &s[1..]);
+                    }
                     Word::Literal(s[1..].to_string(), *meta)
                 } else {
                     target_raw
@@ -311,11 +313,15 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
             ))
         }
     };
-    eprintln!("DEBUG parse_heredoc: delim='{}'", delim);
+    if crate::debug::is_debug_enabled() {
+        eprintln!("DEBUG parse_heredoc: delim='{}'", delim);
+    }
 
     // Find the start of the heredoc body in the raw input.
     let start_pos = if let Some((cur_pos, _)) = lexer.get_span() {
-        eprintln!("DEBUG parse_heredoc: cur_pos={}, input[..]={:?}", cur_pos, &lexer.input[cur_pos..cur_pos+40.min(lexer.input.len()-cur_pos)]);
+        if crate::debug::is_debug_enabled() {
+            eprintln!("DEBUG parse_heredoc: cur_pos={}, input[..]={:?}", cur_pos, &lexer.input[cur_pos..cur_pos+40.min(lexer.input.len()-cur_pos)]);
+        }
         match lexer.input[cur_pos..].find('\n') {
             Some(nl_offset) => cur_pos + nl_offset + 1,
             None => lexer.input.len(),
