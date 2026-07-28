@@ -71,6 +71,11 @@ pub struct Generator {
     /// (via `declare -a` or `local -a` or simple array assignment like `arr=(...)`).
     /// Used to emit Perl array syntax `@arr` instead of `$arr`.
     pub indexed_arrays: HashSet<String>,
+    /// Parameter names for each declared function, e.g. `mul_xy → {1: "x", 2: "y"}`.
+    /// Built by scanning the function body for `name=\$1` assignments during
+    /// `generate_function_impl`, then used by call sites for named-argument passing.
+    pub fn_param_names: HashMap<String, HashMap<usize, String>>,
+
     /// Nesting depth of function definitions.  0 = top level, 1 = inside a function, etc.
     pub fn_nesting_depth: usize,
     /// Names of functions that were defined lexically (nested inside another function).
@@ -142,6 +147,7 @@ impl Generator {
             associative_arrays: HashSet::new(),
             indexed_arrays: HashSet::new(),
             fn_nesting_depth: 0,
+            fn_param_names: HashMap::new(),
             lexical_functions: HashSet::new(),
         }
     }
@@ -168,6 +174,7 @@ impl Generator {
             associative_arrays: HashSet::new(),
             indexed_arrays: HashSet::new(),
             fn_nesting_depth: 0,
+            fn_param_names: HashMap::new(),
             lexical_functions: HashSet::new(),
         }
     }
@@ -194,6 +201,7 @@ impl Generator {
             associative_arrays: HashSet::new(),
             indexed_arrays: HashSet::new(),
             fn_nesting_depth: 0,
+            fn_param_names: HashMap::new(),
             lexical_functions: HashSet::new(),
         }
     }
