@@ -64,6 +64,50 @@ fn bareword_fh_to_lexical(code: &str) -> String {
         result = result.replace(&format!("<{}>", name), &format!("<${}>", name));
     }
 
+    // 3. Convert two-argument opens to three-argument opens for
+    //    bareword-filehandle patterns like: open FH, ">file"
+    //    We handle the common case: open $name, "MODE..."
+    for name in &names {
+        let pat = format!(" ${}, \"", name);
+        let mut new_result = String::new();
+        let mut scan = 0usize;
+        let rb = result.as_bytes();
+        while scan < rb.len() {
+            if let Some(idx) = result[scan..].find(&pat) {
+                let abs = scan + idx;
+                new_result.push_str(&result[scan..abs + pat.len() - 1]); // includes " ${}, "
+                let mode_start = abs + pat.len() - 1; // position of the opening quote
+                if mode_start < rb.len() && rb[mode_start] == b'"' {
+                    // The quote was already consumed by pat, which ends at '\"'
+                    // Actually pat ends with '\"' which is the backslash-escaped quote in pattern.
+                    // Let's re-check: pat = format!(" ${}, \"", name) -> " $name, \"" where \" is
+                    // the escaped double-quote. So the pattern ends BEFORE the quote.
+                    // The opening " is at offset abs + pat.len()
+                    // Let's fix the logic:
+                    // pat is " $name, " (the , " at the end)
+                    // After all the replacements, we need to find the actual quote.
+                }
+                // Simplified approach: scan for mode characters after the match
+                let mut mode_pos = abs + pat.len();
+                while mode_pos < rb.len() && (rb[mode_pos] == b'>' || rb[mode_pos] == b'<' || rb[mode_pos] == b'&' || rb[mode_pos] == b'|' || rb[mode_pos] == b'-') {
+                    mode_pos += 1;
+                }
+                if mode_pos > abs + pat.len() {
+                    let mode = &result[abs + pat.len()..mode_pos];
+                    new_result.push_str(&format!("q{{{}}}, \"", mode));
+                    scan = mode_pos;
+                } else {
+                    new_result.push('"');
+                    scan = abs + pat.len();
+                }
+            } else {
+                new_result.push_str(&result[scan..]);
+                break;
+            }
+        }
+        result = new_result;
+    }
+
     result
 }
 
