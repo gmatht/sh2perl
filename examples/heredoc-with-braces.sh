@@ -1,8 +1,9 @@
 #!/bin/bash
 # Regression test: heredoc with Python/JS code containing braces, and other delimiters
-cat > /tmp/test.py << 'PYEOF'
+f=test.py
+cat > "$f" << 'PYEOF'
 def foo():
     if True:
         return {"key": "value"}
 PYEOF
-echo "heredoc done"
+printf 'wrote %d bytes to %s\n' $(wc -c < "$f") "$f"

@@ -1,8 +1,9 @@
 #!/bin/bash
 # Heredoc with single quotes and backticks that create spanning strings
-cat > /tmp/x.py << 'EOF'
+f=x.py
+cat > "$f" << 'EOF'
 import re
 func_match = re.search(r'`([^`]+)`', line)
 if x == '\'': pass
 EOF
-echo "done"
+printf 'wrote %d bytes to %s\n' $(wc -c < "$f") "$f"
