@@ -78,10 +78,12 @@ pub fn generate_command_impl_with_input(
         Command::Continue(level) => generator.generate_continue_statement(level),
         Command::Return(value) => generator.generate_return_statement(value),
         Command::Assignment(assignment) => {
-            eprintln!(
-                "DEBUG: Processing Assignment command: {} = {:?}",
-                assignment.variable, assignment.value
-            );
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "DEBUG: Processing Assignment command: {} = {:?}",
+                    assignment.variable, assignment.value
+                );
+            }
             generator.generate_assignment(assignment)
         }
         Command::Not(cmd) => {

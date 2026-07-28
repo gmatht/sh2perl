@@ -303,8 +303,10 @@ impl ParserUtilities for Lexer {
         }
 
 
-        eprintln!("DEBUG capture_parenthetical_text: captured {} chars, returning at token idx {}", content.len(), self.current);
-        if content.len() > 50 {
+        if crate::debug::is_debug_enabled() {
+            eprintln!("DEBUG capture_parenthetical_text: captured {} chars, returning at token idx {}", content.len(), self.current);
+        }
+        if crate::debug::is_debug_enabled() && content.len() > 50 {
             eprintln!("DEBUG capture_parenthetical_text: first 50 chars: {:?}", &content[..50]);
         }
         Ok(content)

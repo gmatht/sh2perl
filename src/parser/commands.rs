@@ -829,7 +829,9 @@ impl Parser {
                     self.lexer.skip_whitespace_and_comments();
                     if let Some((start, _end)) = self.lexer.get_span() {
                         let (line, col) = self.lexer.offset_to_line_col(start);
-                        eprintln!("DEBUG After operator, token at {}:{} = {:?}", line, col, self.lexer.peek());
+                        if crate::debug::is_debug_enabled() {
+                            eprintln!("DEBUG After operator, token at {}:{} = {:?}", line, col, self.lexer.peek());
+                        }
                     }
 
                     // Build the left side for this operator:
