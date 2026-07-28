@@ -16,7 +16,11 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         output.push_str(") {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str(&generator.generate_command(right));
+        let right_perl = generator.generate_command(right);
+        output.push_str(&right_perl);
+        if !right_perl.ends_with('\n') {
+            output.push('\n');
+        }
         output.push_str(&generator.indent());
         output.push_str("$CHILD_ERROR = 0;\n");
         generator.indent_level -= 1;
@@ -156,7 +160,11 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
     output.push_str(") {\n");
     generator.indent_level += 1;
     output.push_str(&generator.indent());
-    output.push_str(&generator.generate_command(right));
+    let right_perl = generator.generate_command(right);
+    output.push_str(&right_perl);
+    if !right_perl.ends_with('\n') {
+        output.push('\n');
+    }
     generator.indent_level -= 1;
     output.push_str(&generator.indent());
     output.push_str("}\n");
@@ -182,7 +190,11 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         output.push_str(")) {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str(&generator.generate_command(right));
+        let right_perl = generator.generate_command(right);
+        output.push_str(&right_perl);
+        if !right_perl.ends_with('\n') {
+            output.push('\n');
+        }
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
@@ -197,7 +209,11 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         output.push_str("if ($CHILD_ERROR != 0) {\n");
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str(&generator.generate_command(right));
+        let right_perl = generator.generate_command(right);
+        output.push_str(&right_perl);
+        if !right_perl.ends_with('\n') {
+            output.push('\n');
+        }
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
@@ -287,7 +303,11 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                         output.push_str("if ( !defined $ls_success || $ls_success == 0 ) {\n");
                         generator.indent_level += 1;
                         output.push_str(&generator.indent());
-                        output.push_str(&generator.generate_command(right));
+                        let right_perl = generator.generate_command(right);
+                        output.push_str(&right_perl);
+                        if !right_perl.ends_with('\n') {
+                            output.push('\n');
+                        }
                         generator.indent_level -= 1;
                         output.push_str(&generator.indent());
                         output.push_str("}\n");
@@ -311,7 +331,11 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         output.push_str(&format!("if ({} != 0) {{\n", exit_code_var));
         generator.indent_level += 1;
         output.push_str(&generator.indent());
-        output.push_str(&generator.generate_command(right));
+        let right_perl = generator.generate_command(right);
+        output.push_str(&right_perl);
+        if !right_perl.ends_with('\n') {
+            output.push('\n');
+        }
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}\n");
