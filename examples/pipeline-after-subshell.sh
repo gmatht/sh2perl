@@ -1,3 +1,3 @@
 #!/bin/sh
 cd "$(dirname "$0")"/.. || exit 1
-echo "done"
+printf 'resolved dir=[%s]\n' "$PWD"

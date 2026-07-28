@@ -1,7 +1,8 @@
 #!/bin/sh
 # Test: heredoc with tabs <<-
-cat <<-EOF
+result=$(cat <<-EOF
 	indented content
 	with tabs
 EOF
-echo "done"
+)
+printf 'heredoc content=[%s]\n' "$result"
