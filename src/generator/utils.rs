@@ -223,8 +223,60 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     // Always use q{} for single characters to avoid Perl::Critic violations
                     format!("q{{{}}}", s)
                 } else {
-                    let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
-                    format!("'{}'", escaped)
+                    // Check for leading-zero patterns that Perl::Critic's
+                    // ProhibitLeadingZeros would flag (PPI may parse "07403"
+                    // inside a single-quoted string as an octal Number token).
+                    // Use q{...} syntax which PPI does not parse as numeric.
+                    let has_leading_zero = {
+                        let bytes = s.as_bytes();
+                        let mut i = 0;
+                        let len = bytes.len();
+                        let mut found = false;
+                        while i < len && !found {
+                            // Skip non-digit characters
+                            if !bytes[i].is_ascii_digit() {
+                                i += 1;
+                                continue;
+                            }
+                            // Found a digit — check if it's '0' followed by [0-7]
+                            if bytes[i] == b'0' && i + 1 < len && bytes[i + 1] >= b'0' && bytes[i + 1] <= b'7' {
+                                // Check that this isn't part of a longer number
+                                // (i.e. preceded by non-word char or start of string)
+                                let preceded_by_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+                                if preceded_by_boundary {
+                                    // Verify the sequence is at least 2 digits
+                                    // and contains at least one digit 0-7 after the first 0
+                                    let mut j = i + 1;
+                                    while j < len && bytes[j].is_ascii_digit() {
+                                        j += 1;
+                                    }
+                                    if j - i >= 2 {
+                                        let has_octal_digit = bytes[i+1..j].iter().any(|&b| b >= b'0' && b <= b'7');
+                                        if has_octal_digit {
+                                            found = true;
+                                        }
+                                    }
+                                }
+                            }
+                            // Skip remaining digits of this number
+                            while i < len && bytes[i].is_ascii_digit() {
+                                i += 1;
+                            }
+                        }
+                        found
+                    };
+                    if has_leading_zero {
+                        // Use q{...} to avoid PPI parsing "07403" as octal.
+                        // Escape braces inside the content.
+                        let escaped_q = s
+                            .replace("\\", "\\\\")
+                            .replace("{", "\\{")
+                            .replace("}", "\\}");
+                        format!("q{{{}}}", escaped_q)
+                    } else {
+                        let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
+                        format!("'{}'", escaped)
+                    }
                 }
             }
         }
