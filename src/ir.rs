@@ -130,6 +130,17 @@ pub enum IrStmt {
         newline: bool,
         target: Option<String>,
     },
+    /// Write content to a file (shell output redirect `> file` / `>> file`).
+    /// This replaces the STDOUT-save/restore pattern with a clean
+    /// open-write-close idiom.
+    WriteFile {
+        /// Path to the target file (as an IR expression)
+        path: IrExpr,
+        /// Content to write (as an IR expression)
+        content: IrExpr,
+        /// If true, append (`>>`) instead of overwrite (`>`)
+        append: bool,
+    },
     /// Assignment
     Assign {
         targets: Vec<AssignTarget>,
@@ -190,10 +201,19 @@ pub enum IrStmt {
         args: Vec<IrExpr>,
         capture: Option<String>,
     },
-    /// Pipeline
+    /// Pipeline — a sequence of commands connected by pipes.
+    /// When `capture` is `Some(var)`, the entire pipeline's stdout is captured
+    /// into `$var` using a single `qx{...}` call instead of simulating the
+    /// pipeline in Perl.  This produces cleaner, more idiomatic output for
+    /// pipelines used in command substitution (e.g. `` count=`ls -1 | wc -l` ``).
+    /// `cmd_str` holds the reconstructed shell command for qx{} when capture is set.
     Pipeline {
         stages: Vec<Vec<IrStmt>>,
         last_output: Option<String>,
+        /// If set, capture the pipeline's stdout into this variable using qx{}.
+        capture: Option<String>,
+        /// Original shell command string (for qx{} capture).
+        cmd_str: Option<String>,
     },
     /// Return
     Return(Option<IrExpr>),
@@ -292,7 +312,10 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
 
     // Restore brace balance — some generated code paths may produce
     // unbalanced delimiters, so add missing closing braces as a safety net.
-    {
+    // NOTE: As generators migrate to emit proper IR nodes instead of RawText,
+    // the backend naturally produces balanced braces and this hack becomes
+    // unnecessary. It is kept for now to catch any remaining RawText paths.
+    if !cfg!(feature = "no-brace-fix") {
         let opens = out.chars().filter(|&c| c == '{').count();
         let closes = out.chars().filter(|&c| c == '}').count();
         for _ in 0..(opens.saturating_sub(closes)) {
@@ -332,6 +355,24 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 emit_indent(out, indent);
                 out.push_str(&format!("print {};\n", expr));
             }
+        }
+
+        IrStmt::WriteFile { path, content, append } => {
+            let path_str = ir_expr_to_perl(path);
+            let content_str = ir_expr_to_perl(content);
+            let mode = if *append { "'>>'" } else { "'>'" };
+            emit_indent(out, indent);
+            out.push_str(&format!(
+                "open my $__fh, {}, {} or die \"Cannot write to {}: $!\\n\";\n",
+                mode, path_str, path_str
+            ));
+            emit_indent(out, indent);
+            // `$` is not special in Rust format strings; it passes through literally.
+            out.push_str("print {$__fh} ");
+            out.push_str(&content_str);
+            out.push_str(";\n");
+            emit_indent(out, indent);
+            out.push_str("close $__fh;\n");
         }
 
         IrStmt::Assign { targets, expr } => {
@@ -506,12 +547,32 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str(&format!("$CHILD_ERROR = {};\n", e));
         }
 
-        IrStmt::Pipeline { stages, .. } => {
-            // Simple pipeline: for now fall back to RawText-style output
-            // until proper pipeline IR is fully designed.
-            for stage in stages {
-                for s in stage {
-                    emit_stmt(out, s, indent);
+        IrStmt::Pipeline { stages, capture, cmd_str, .. } => {
+            if let Some(var) = capture {
+                // Capture pipeline: emit a single `qx{...}` call.
+                // Use the stored command string if available, otherwise
+                // fall back to emitting the stage statements.
+                if let Some(cmd) = cmd_str {
+                    emit_indent(out, indent);
+                    out.push_str(&format!("my ${} = qx{{{}}};\n", var, cmd));
+                    emit_indent(out, indent);
+                    out.push_str(&format!("chomp ${};\n", var));
+                    emit_indent(out, indent);
+                    out.push_str("$CHILD_ERROR = $? >> 8;\n");
+                } else {
+                    // No command string — fall back to stage emission.
+                    for stage in stages {
+                        for s in stage {
+                            emit_stmt(out, s, indent);
+                        }
+                    }
+                }
+            } else {
+                // Side-effect pipeline: emit stage statements directly.
+                for stage in stages {
+                    for s in stage {
+                        emit_stmt(out, s, indent);
+                    }
                 }
             }
         }
@@ -773,6 +834,9 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
         }
         IrStmt::Output { value, .. } | IrStmt::SetChildError(value) | IrStmt::Return(Some(value)) => {
             expr_refers_to_main_exit(value)
+        }
+        IrStmt::WriteFile { path, content, .. } => {
+            expr_refers_to_main_exit(path) || expr_refers_to_main_exit(content)
         }
         IrStmt::Declare { vars, .. } => vars.iter().any(|d| d.name == "main_exit_code"),
         IrStmt::If { cond, then, elsifs, else_ } => {
