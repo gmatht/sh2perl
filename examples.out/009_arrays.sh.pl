@@ -1,14 +1,10 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use feature 'say';
 use locale;
 use IPC::Open3;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
@@ -16,56 +12,44 @@ $PROGRAM_NAME = '009_arrays.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
-print "== Indexed arrays ==\n";
-my $arr;
+say "== Indexed arrays ==";
 my @arr = ('one', 'two', 'three');
-my %arr;
-print $arr[1];
-if ( !( ($arr[1]) =~ m{\n\z}msx ) ) { print "\n"; }
-print scalar(@arr) . "\n";
-$CHILD_ERROR = 0;
+say $arr[1];
+say scalar(@arr);
 my $x;
 for my $x (@arr) {
 printf('%s ', "$x");
 }
 print "\n";
-$CHILD_ERROR = 0;
-print "== Associative arrays ==\n";
+say "== Associative arrays ==";
 my %map = ();
 $map{"foo"} = 'bar';
 $map{"answer"} = '42';
 $map{"two"} = "1 + 1";
-print $map{'foo'};
-if ( !( ($map{'foo'}) =~ m{\n\z}msx ) ) { print "\n"; }
-print $map{'answer'};
-if ( !( ($map{'answer'}) =~ m{\n\z}msx ) ) { print "\n"; }
+say $map{'foo'};
+say $map{'answer'};
 # Original bash: #!/usr/bin/env bash
-{
-    my $output_154 = q{};
-    my $output_printed_154;
-    my $pipeline_success_154 = 1;
-        $output_154 = q{};
-    my @output_154_items = (keys %map);
-    for my $k (@output_154_items) {
-    $output_154 .= "$k => " . $map{$k}. "\n";
+do {
+    my $output_142 = q{};
+    my $output_printed_142;
+    my $pipeline_success_142 = 1;
+        $output_142 = q{};
+    my @output_142_items = (keys %map);
+    for my $k (@output_142_items) {
+    $output_142 .= "$k => " . $map{$k}. "\n";
     }
 
-        my @sort_lines_154_1 = split /\n/msx, $output_154;
-    my @sort_sorted_154_1 = sort @sort_lines_154_1;
-    my $output_154_1 = join "\n", @sort_sorted_154_1;
-    if ($output_154_1 ne q{} && !($output_154_1 =~ m{\n\z}msx)) {
-    $output_154_1 .= "\n";
-    }
-    $output_154 = $output_154_1;
-    $output_154 = $output_154_1;
-    if ($output_154 ne q{} && !defined $output_printed_154) {
-        print $output_154;
-        if (!($output_154 =~ m{\n\z}msx)) {
+        my @sort_lines_142_1 = split /\n/, $output_142;
+    my @sort_sorted_142_1 = sort @sort_lines_142_1;
+    my $output_142_1 = join("\n", @sort_sorted_142_1);
+    $output_142 = $output_142_1;
+    $output_142 = $output_142_1;
+    if ($output_142 ne q{} && !defined $output_printed_142) {
+        print $output_142;
+        if (!($output_142 =~ m{\n\z})) {
             print "\n";
         }
     }
-    if ( !$pipeline_success_154 ) { $main_exit_code = 1; }
+    if ( !$pipeline_success_142 ) { $main_exit_code = 1; }
     exit $main_exit_code if $__set_e && $main_exit_code != 0;
     }
-
-exit $main_exit_code;

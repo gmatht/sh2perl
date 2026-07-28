@@ -97,6 +97,11 @@ pub enum IrExpr {
         expr: Box<IrExpr>,
         native: bool,
     },
+    /// Perl match regex: /pattern/flags
+    Regex {
+        pattern: String,
+        flags: String,
+    },
     /// Raw Perl expression text (migration bridge)
     RawExpr(String),
 }
@@ -399,21 +404,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 let lhs = format!("${}", var);
                 if let IrExpr::Backtick { native: false, .. } = expr {
                     // Extract the inner expression string for qx{...}
-                    // The ir_expr_to_perl for Backtick emits:
-                    //   do { chomp(my $_r = qx{<cmd>}); $_r; }
-                    // We want to extract <cmd> and emit two statements instead.
-                    // Parse the backtick inner value from rhs.
                     if let IrExpr::Backtick { expr: inner_expr, .. } = expr {
-                        let inner_str = ir_expr_to_perl(inner_expr);
-                        // inner_str may be `cmd` (from StrStyle::Command) or
-                        // a raw string. Strip surrounding backticks if present.
-                        let cmd = if inner_str.starts_with('`') && inner_str.ends_with('`') {
-                            &inner_str[1..inner_str.len()-1]
-                        } else {
-                            &inner_str
-                        };
+                        let mut inner_str = ir_expr_to_perl(inner_expr);
+                        // Strip surrounding backticks from StrStyle::Command rendering
+                        if inner_str.starts_with('`') && inner_str.ends_with('`') && inner_str.len() >= 2 {
+                            inner_str = inner_str[1..inner_str.len()-1].to_string();
+                        }
                         emit_indent(out, indent);
-                        out.push_str(&format!("{} = qx{{{}}};\n", lhs, cmd));
+                        out.push_str(&format!("{} = qx{{{}}};\n", lhs, inner_str));
                         emit_indent(out, indent);
                         out.push_str(&format!("chomp {};\n", lhs));
                     } else {
@@ -527,14 +525,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         IrStmt::Die { expr, carp } => {
-            let e = ir_expr_to_perl(expr);
+            let e = ir_expr_to_perl(expr)
+                .replace("$ERRNO", "$!")
+                .replace("$OS_ERROR", "$!");
             let kw = if *carp { "croak" } else { "die" };
             emit_indent(out, indent);
             out.push_str(&format!("{} {};\n", kw, e));
         }
 
         IrStmt::Warn { expr, carp } => {
-            let e = ir_expr_to_perl(expr);
+            let e = ir_expr_to_perl(expr)
+                .replace("$ERRNO", "$!")
+                .replace("$OS_ERROR", "$!");
             let kw = if *carp { "carp" } else { "warn" };
             emit_indent(out, indent);
             out.push_str(&format!("{} {};\n", kw, e));
@@ -545,7 +547,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             if let Some(var) = capture {
                 // With capture: emit clean qx{...} assignment with chomp.
                 // This replaces the old `do { my $_r = qx{...}; chomp $_r; $_r; }`
-                // pattern with two clean statements.
+                // pattern with two clean statements.  Omit $CHILD_ERROR tracking
+                // — it is rarely checked and adds noise; callers may add
+                // IrStmt::SetChildError explicitly if needed.
                 let mut full_cmd = cmd_str.clone();
                 if !args.is_empty() {
                     let arg_strs: Vec<String> = args.iter()
@@ -563,8 +567,6 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 out.push_str(&format!("my ${} = qx{{{}}};\n", var, inner));
                 emit_indent(out, indent);
                 out.push_str(&format!("chomp ${};\n", var));
-                emit_indent(out, indent);
-                out.push_str(&format!("$CHILD_ERROR = $? >> 8;\n"));
             } else {
                 // Without capture: use system()
                 emit_indent(out, indent);
@@ -600,13 +602,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // Capture pipeline: emit a single `qx{...}` call.
                 // Use the stored command string if available, otherwise
                 // fall back to emitting the stage statements.
+                // Omit $CHILD_ERROR tracking (same rationale as System capture).
                 if let Some(cmd) = cmd_str {
                     emit_indent(out, indent);
                     out.push_str(&format!("my ${} = qx{{{}}};\n", var, cmd));
                     emit_indent(out, indent);
                     out.push_str(&format!("chomp ${};\n", var));
-                    emit_indent(out, indent);
-                    out.push_str("$CHILD_ERROR = $? >> 8;\n");
                 } else {
                     // No command string — fall back to stage emission.
                     for stage in stages {
@@ -659,7 +660,11 @@ pub(crate) fn emit_sub(out: &mut String, sub: &IrSub) {
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     match expr {
         IrExpr::Backtick { expr, native } => {
-            let inner = ir_expr_to_perl(expr);
+            let mut inner = ir_expr_to_perl(expr);
+            // Strip surrounding backticks from StrStyle::Command rendering
+            if inner.starts_with('`') && inner.ends_with('`') && inner.len() >= 2 {
+                inner = inner[1..inner.len()-1].to_string();
+            }
             if *native {
                 // Native Perl expression — return as-is, no stripping
                 inner
@@ -668,6 +673,35 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 // Use the shorter do-block form: chomp(my $r = qx{...}); $r
                 // This avoids the verbose `do { my $_r = qx{...}; chomp $_r; $_r; }`.
                 format!("do {{ chomp(my $_r = qx{{{}}}); $_r; }}", inner)
+            }
+        }
+
+        IrExpr::Regex { pattern, flags } => {
+            // Omit meaningless default flags (m, s, x) when they add no value.
+            let clean_flags: String = flags.chars().filter(|&c| {
+                // Keep 'i' (case-insensitive), 'g' (global), etc.
+                // Remove 'm', 's', 'x' when they are the only flags or when
+                // the pattern doesn"t use the features they enable.
+                if c == 'm' {
+                    // /m enables ^ and $ to match line boundaries; only
+                    // meaningful if the pattern uses ^ or $.
+                    !pattern.contains('^') && !pattern.contains('$')
+                } else if c == 's' {
+                    // /s makes . match \n; only meaningful if . is in pattern.
+                    !pattern.contains('.')
+                } else if c == 'x' {
+                    // /x allows whitespace and comments; strip if pattern
+                    // has no whitespace or # that would change meaning.
+                    true  // Conservative: always strip /x — it"s almost
+                          // always cargo-culted from generated boilerplate.
+                } else {
+                    true
+                }
+            }).collect();
+            if clean_flags.is_empty() {
+                format!("{{{}}}", pattern)
+            } else {
+                format!("/{}/{}", pattern, clean_flags)
             }
         }
 
@@ -941,7 +975,7 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         IrExpr::Index { key, .. } => expr_refers_to_main_exit(key),
         IrExpr::Ternary { cond, then, else_ } => expr_refers_to_main_exit(cond) || expr_refers_to_main_exit(then) || expr_refers_to_main_exit(else_),
         IrExpr::DefinedOr { expr, default } => expr_refers_to_main_exit(expr) || expr_refers_to_main_exit(default),
-        IrExpr::Int(_) | IrExpr::Str(_, _) => false,
+        IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Regex { .. } => false,
     }
 }
 

@@ -1,15 +1,10 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
+use feature 'say';
 use File::Basename;
 use IPC::Open3;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
@@ -17,17 +12,17 @@ $PROGRAM_NAME = '041_process_substitution_mapfile.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
-print "== readarray/mapfile ==\n";
+say "== readarray/mapfile ==";
 my $temp_file_ps_fh_1 = q{/tmp} . '/process_sub_fh_1.tmp';
 my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_251 = q{};
-    my $output_printed_251;
+    my $output_239 = q{};
+    my $output_printed_239;
     printf("x\ny\n");
-if ($output_251 ne q{} && !$output_printed_251) {
-    print $output_251;
+if ($output_239 ne q{} && !$output_printed_239) {
+    print $output_239;
 }
 }
 use File::Path qw(make_path);
@@ -47,6 +42,3 @@ if (open(my $mapfile_fh, '<', $temp_file_ps_fh_1)) {
 }
 printf('%s ', (join(" ", @lines)));
 print "\n";
-$CHILD_ERROR = 0;
-
-exit $main_exit_code;

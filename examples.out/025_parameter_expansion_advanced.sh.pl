@@ -1,15 +1,10 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
+use feature 'say';
 use File::Basename;
 use IPC::Open3;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
@@ -17,36 +12,9 @@ $PROGRAM_NAME = '025_parameter_expansion_advanced.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
-print "== Advanced parameter expansion ==\n";
-my $path;
-my @path;
-my %path;
-$path = "/tmp/file.txt";
-do {
-    my $__echo_line = basename(${path});
-    print $__echo_line;
-    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
-        print "\n";
-        $__echo_line .= "\n";
-    }
-    $output .= $__echo_line;
-};
-$CHILD_ERROR = 0;
-do {
-    my $__echo_line = dirname(${path});
-    print $__echo_line;
-    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
-        print "\n";
-        $__echo_line .= "\n";
-    }
-    $output .= $__echo_line;
-};
-$CHILD_ERROR = 0;
-my $s2;
-my @s2;
-my %s2;
-$s2 = "abba";
-print $s2 =~ s/b/X/grs;
-if ( !( ($s2 =~ s/b/X/grs) =~ m{\n\z}msx ) ) { print "\n"; }
-
-exit $main_exit_code;
+say "== Advanced parameter expansion ==";
+my $path = "/tmp/025_param_expansion_file.txt";
+say basename(${path});
+say dirname(${path});
+my $s2 = "abba";
+say $s2 =~ s/b/X/grs;

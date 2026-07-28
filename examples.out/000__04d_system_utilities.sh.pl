@@ -1,72 +1,22 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
+use feature 'say';
 use IPC::Open3;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04d_system_utilities.sh';
-print "=== System Utilities ===\n";
-my $formatted_date;
-my @formatted_date;
-my %formatted_date;
-$formatted_date = do {
-require POSIX; POSIX::strftime('%Y-%m-%d', localtime(time())) . "\n"
+say "=== System Utilities ===";
+my $formatted_date = do {
+require POSIX; POSIX::strftime('%Y-%m-%d', localtime())
 };
-do {
-    my $__echo_line = "Formatted date: $formatted_date";
-    print $__echo_line;
-    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
-        print "\n";
-        $__echo_line .= "\n";
-    }
-    $output .= $__echo_line;
-};
-$CHILD_ERROR = 0;
-my $sleep_duration;
-my @sleep_duration;
-my %sleep_duration;
-$sleep_duration = ("1");
-do {
-    my $__echo_line = "Sleeping for $sleep_duration seconds...";
-    print $__echo_line;
-    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
-        print "\n";
-        $__echo_line .= "\n";
-    }
-    $output .= $__echo_line;
-};
-$CHILD_ERROR = 0;
+say "Formatted date: $formatted_date";
+my $sleep_duration = "1";
+say "Sleeping for $sleep_duration seconds...";
 require Time::HiRes; Time::HiRes::sleep($sleep_duration);
-my $yes_result;
-my @yes_result;
-my %yes_result;
-$yes_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
-    do { my $output_66 = q{};
-my $output_printed_66;
-my $head_line_count = 0;
-while (1) {
-    my $line = 'Hello';
-    if ($head_line_count < 3) {
-    $output_66 .= $line . "\n";
-    ++$head_line_count;
-    } else {
-    $line = q{}; # Clear line to prevent printing
-    last; # Break out of the yes loop when head limit is reached
-    }
-}
-$output_66 };
-}; $_pipeline_result; };
-print "Yes command result:\n";
-print $yes_result;
-if ( !( ($yes_result) =~ m{\n\z}msx ) ) { print "\n"; }
-print "=== System Utilities Complete ===\n";
-
-exit $main_exit_code;
+my $yes_result = do { chomp(my $result_62 = qx{yes Hello | head -3}); $result_62; };
+say "Yes command result:";
+say $yes_result;
+say "=== System Utilities Complete ===";

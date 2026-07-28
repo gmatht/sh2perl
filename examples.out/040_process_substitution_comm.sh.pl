@@ -1,15 +1,10 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
+use feature 'say';
 use File::Basename;
 use IPC::Open3;
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
@@ -17,17 +12,17 @@ $PROGRAM_NAME = '040_process_substitution_comm.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
-print "== Process substitution with comm ==\n";
+say "== Process substitution with comm ==";
 my $temp_file_ps_fh_1 = q{/tmp} . '/process_sub_fh_1.tmp';
 my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_247 = q{};
-    my $output_printed_247;
+    my $output_235 = q{};
+    my $output_printed_235;
     printf("a\nb\n");
-if ($output_247 ne q{} && !$output_printed_247) {
-    print $output_247;
+if ($output_235 ne q{} && !$output_printed_235) {
+    print $output_235;
 }
 }
 use File::Path qw(make_path);
@@ -42,11 +37,11 @@ my $output_ps_fh_2;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_249 = q{};
-    my $output_printed_249;
+    my $output_237 = q{};
+    my $output_printed_237;
     printf("b\nc\n");
-if ($output_249 ne q{} && !$output_printed_249) {
-    print $output_249;
+if ($output_237 ne q{} && !$output_printed_237) {
+    print $output_237;
 }
 }
 use File::Path qw(make_path);
@@ -85,5 +80,3 @@ $result .= join("\n", @common_lines) . "\n";
 chomp $result;
 print $result;
 print "\n";
-
-exit $main_exit_code;
