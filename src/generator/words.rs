@@ -1352,11 +1352,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 }
                             }
                         } else if name == "date" {
+                            // Generate the date expression. It may contain `require POSIX;`
+                            // which must stay inside a do-block in expression context.
+                            let date_body = crate::generator::commands::date::generate_date_expression(
+                                generator, simple_cmd,
+                            );
                             format!(
                                 "do {{\n{}\n}}",
-                                crate::generator::commands::date::generate_date_expression(
-                                    generator, simple_cmd,
-                                )
+                                date_body
                             )
                         } else if name == "pwd" {
                             // Special handling for pwd in command substitution

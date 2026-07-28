@@ -219,6 +219,10 @@ pub enum IrStmt {
     Return(Option<IrExpr>),
     /// Set $CHILD_ERROR (from $? >> 8 after an external command)
     SetChildError(IrExpr),
+    /// Require a module at file scope (e.g. `require POSIX;`).
+    /// Unlike `use`, `require` is evaluated at runtime and does not
+    /// import symbols.  It is emitted inline as a bare statement.
+    Require(String),
     /// Raw Perl text (migration bridge)
     RawText(String),
 }
@@ -237,7 +241,11 @@ pub struct IrSub {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IrProgram {
     /// use statements — auto-derived from constructs used
+    /// `use` statements — auto-derived from constructs used
     pub imports: Vec<String>,
+    /// `require` statements (e.g. `require POSIX;`) — emitted at file scope
+    /// before top-level statements but after `use` statements.
+    pub requires: Vec<String>,
     /// Top-level statements
     pub stmts: Vec<IrStmt>,
     /// Subroutine definitions
@@ -273,11 +281,18 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
     out.push_str("use warnings;\n");
     out.push_str("use feature 'say';\n");
 
-    // Imports
+    // Imports (`use` statements)
     for import in &prog.imports {
         out.push_str(&format!("use {};\n", import));
     }
     if !prog.imports.is_empty() {
+        out.push('\n');
+    }
+    // Runtime imports (`require` statements)
+    for req in &prog.requires {
+        out.push_str(&format!("require {};\n", req));
+    }
+    if !prog.requires.is_empty() {
         out.push('\n');
     }
 
@@ -376,17 +391,47 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         IrStmt::Assign { targets, expr } => {
-            let lhs = targets
-                .iter()
-                .map(|t| format!("${}", t.var))
-                .collect::<Vec<_>>()
-                .join(", ");
             let rhs = ir_expr_to_perl(expr);
-            emit_indent(out, indent);
-            // Single target without indices: $x = expr;   (cleaner than ($x) = (expr);)
+            // Detect Backtick { native: false } on the RHS — emit the
+            // two-statement clean form instead of embedding a do-block.
             if targets.len() == 1 && targets[0].indices.is_empty() {
-                out.push_str(&format!("{} = {};\n", lhs, rhs));
+                let var = &targets[0].var;
+                let lhs = format!("${}", var);
+                if let IrExpr::Backtick { native: false, .. } = expr {
+                    // Extract the inner expression string for qx{...}
+                    // The ir_expr_to_perl for Backtick emits:
+                    //   do { chomp(my $_r = qx{<cmd>}); $_r; }
+                    // We want to extract <cmd> and emit two statements instead.
+                    // Parse the backtick inner value from rhs.
+                    if let IrExpr::Backtick { expr: inner_expr, .. } = expr {
+                        let inner_str = ir_expr_to_perl(inner_expr);
+                        // inner_str may be `cmd` (from StrStyle::Command) or
+                        // a raw string. Strip surrounding backticks if present.
+                        let cmd = if inner_str.starts_with('`') && inner_str.ends_with('`') {
+                            &inner_str[1..inner_str.len()-1]
+                        } else {
+                            &inner_str
+                        };
+                        emit_indent(out, indent);
+                        out.push_str(&format!("{} = qx{{{}}};\n", lhs, cmd));
+                        emit_indent(out, indent);
+                        out.push_str(&format!("chomp {};\n", lhs));
+                    } else {
+                        // Fallback: use the regular expression form
+                        emit_indent(out, indent);
+                        out.push_str(&format!("{} = {};\n", lhs, rhs));
+                    }
+                } else {
+                    emit_indent(out, indent);
+                    out.push_str(&format!("{} = {};\n", lhs, rhs));
+                }
             } else {
+                let lhs = targets
+                    .iter()
+                    .map(|t| format!("${}", t.var))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                emit_indent(out, indent);
                 out.push_str(&format!("({}) = ({});\n", lhs, rhs));
             }
         }
@@ -498,14 +543,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::System { cmd, args, capture } => {
             let cmd_str = ir_expr_to_perl(cmd);
             if let Some(var) = capture {
-                // With capture: emit qx{...} assignment
-                // Build the full command string with args
+                // With capture: emit clean qx{...} assignment with chomp.
+                // This replaces the old `do { my $_r = qx{...}; chomp $_r; $_r; }`
+                // pattern with two clean statements.
                 let mut full_cmd = cmd_str.clone();
                 if !args.is_empty() {
                     let arg_strs: Vec<String> = args.iter()
                         .map(|a| ir_expr_to_perl(a))
                         .collect();
-                    // For qx{}, we build a single string command
                     full_cmd = format!("{} {}", cmd_str, arg_strs.join(" "));
                 }
                 // Remove surrounding backticks if already present from StrStyle::Command
@@ -516,6 +561,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 };
                 emit_indent(out, indent);
                 out.push_str(&format!("my ${} = qx{{{}}};\n", var, inner));
+                emit_indent(out, indent);
+                out.push_str(&format!("chomp ${};\n", var));
+                emit_indent(out, indent);
                 out.push_str(&format!("$CHILD_ERROR = $? >> 8;\n"));
             } else {
                 // Without capture: use system()
@@ -577,6 +625,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             }
         }
 
+        IrStmt::Require(module) => {
+            emit_indent(out, indent);
+            out.push_str(&format!("require {};\n", module));
+        }
+
         IrStmt::DoWhile { body, cond, until } => {
             let kw = if *until { "until" } else { "while" };
             let cond_str = ir_expr_to_perl(cond);
@@ -611,8 +664,10 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 // Native Perl expression — return as-is, no stripping
                 inner
             } else {
-                // Shell backtick result — strip trailing newlines
-                format!("do {{ my $_r = qx{{{}}}; chomp $_r; $_r; }}", inner)
+                // Shell backtick result — strip trailing newlines.
+                // Use the shorter do-block form: chomp(my $r = qx{...}); $r
+                // This avoids the verbose `do { my $_r = qx{...}; chomp $_r; $_r; }`.
+                format!("do {{ chomp(my $_r = qx{{{}}}); $_r; }}", inner)
             }
         }
 
@@ -864,6 +919,7 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
             stages.iter().any(|s| s.iter().any(|s| stmt_refers_to_main_exit(s)))
         }
         IrStmt::DeclareArray { var, .. } => var == "main_exit_code",
+        IrStmt::Require(_) => false,
         IrStmt::Return(None) => false,
         IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => expr_refers_to_main_exit(expr),
     }
@@ -945,6 +1001,7 @@ impl IrProgram {
                 "locale".to_string(),
                 "IPC::Open3".to_string(),
             ],
+            requires: vec![],
             stmts: vec![IrStmt::RawText(code.to_string())],
             subs: vec![],
         }
