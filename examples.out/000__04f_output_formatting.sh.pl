@@ -1,100 +1,21 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use feature 'say';
 use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 
-my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
 $PROGRAM_NAME = '000__04f_output_formatting.sh';
-print "=== Output and Formatting Commands ===\n";
-my $echo_result;
-my @echo_result;
-my %echo_result;
-$echo_result = ("Hello from backticks");
-do {
-    my $__echo_line = "Echo result: $echo_result";
-    print $__echo_line;
-    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
-        print "\n";
-        $__echo_line .= "\n";
-    }
-    $output .= $__echo_line;
-};
-$CHILD_ERROR = 0;
-my $printf_result;
-my @printf_result;
-my %printf_result;
-$printf_result = sprintf("Number: %d, String: %s\n", '42', "test");
-;
-do {
-    my $__echo_line = "Printf result: $printf_result";
-    print $__echo_line;
-    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
-        print "\n";
-        $__echo_line .= "\n";
-    }
-    $output .= $__echo_line;
-};
-$CHILD_ERROR = 0;
-my $tee_result;
-my @tee_result;
-my %tee_result;
-$tee_result = do { local $CHILD_ERROR = 0; my $_pipeline_result = do {
-    my $output_110 = q{};
-    my $output_printed_110;
-    my $pipeline_success_110 = 1;
-    $output_110 .= 'test output' . "\n";
-    if ( !($output_110 =~ m{\n\z}msx) ) { $output_110 .= "\n"; }
-    $CHILD_ERROR = 0;
-    if ($CHILD_ERROR != 0) { $pipeline_success_110 = 0; }
-    use Carp qw(carp croak);
-    if ( open my $fh, '>', 'test_tee.txt' ) {
-        print {$fh} $output_110;
-        close $fh or croak "Close failed: $ERRNO";
-    }
-    else {
-        carp "tee: Cannot open 'test_tee.txt': $ERRNO";
-    }
-    $output_110 = $output_110;
-    if ( !$pipeline_success_110 ) { $main_exit_code = 1; }
-    $output_110 =~ s/\n+\z//msx;
-    $output_110;
-}; $_pipeline_result; };
-do {
-    my $__echo_line = "Tee result: $tee_result";
-    print $__echo_line;
-    if ( !( $__echo_line =~ m{\n\z}msx ) ) {
-        print "\n";
-        $__echo_line .= "\n";
-    }
-    $output .= $__echo_line;
-};
-$CHILD_ERROR = 0;
-if ( -e "test_tee.txt" ) {
-    if ( -d "test_tee.txt" ) {
-        carp "rm: carping: ", "test_tee.txt",
-          " is a directory (use -r to remove recursively)\n";
-    }
-    else {
-        if ( unlink "test_tee.txt" ) {
-                    }
-        else {
-            carp "rm: carping: could not remove ", "test_tee.txt",
-              ": $OS_ERROR\n";
-        }
-    }
-}
-else {
-    local $CHILD_ERROR = 0;
-}
-print "=== Output and Formatting Commands Complete ===\n";
-
-exit $main_exit_code;
+say "=== Output and Formatting Commands ===";
+my $echo_result = "Hello from backticks";
+say "Echo result: $echo_result";
+my $printf_result = sprintf("Number: %d, String: %s\n", 42, "test");
+say "Printf result: $printf_result";
+my $tee_result = do { chomp(my $result_106 = qx{echo 'test output' | tee test_tee.txt}); $result_106; };
+say "Tee result: $tee_result";
+unlink('test_tee.txt');
+say "=== Output and Formatting Commands Complete ===";

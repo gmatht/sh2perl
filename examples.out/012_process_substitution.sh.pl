@@ -1,15 +1,11 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Carp;
-use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use locale;
+use feature 'say';
 use File::Basename;
 use IPC::Open3;
 
 my $main_exit_code = 0;
-my $ls_success     = 0;
-my $__set_e        = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
@@ -17,7 +13,7 @@ $PROGRAM_NAME = '012_process_substitution.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
-print "== Here-string with grep -o ==\n";
+say "== Here-string with grep -o ==";
 my $here_string_content_fh_1 = "some pattern here";
 my $grep_result_0;
 my @grep_lines_0 = split /\n/msx, $here_string_content_fh_1;
@@ -32,17 +28,17 @@ $grep_result_0 = join "\n", @grep_matches_0;
 print $grep_result_0;
 print "\n";
 $CHILD_ERROR = scalar @grep_filtered_0 > 0 ? 0 : 1;
-print "== Process substitution with comm ==\n";
+say "== Process substitution with comm ==";
 my $temp_file_ps_fh_2 = q{/tmp} . '/process_sub_fh_2.tmp';
 my $output_ps_fh_2;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_165 = q{};
-    my $output_printed_165;
+    my $output_153 = q{};
+    my $output_printed_153;
     printf("a\nb\n");
-if ($output_165 ne q{} && !$output_printed_165) {
-    print $output_165;
+if ($output_153 ne q{} && !$output_printed_153) {
+    print $output_153;
 }
 }
 use File::Path qw(make_path);
@@ -57,11 +53,11 @@ my $output_ps_fh_3;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_3 or croak "Cannot redirect STDOUT";
-    my $output_167 = q{};
-    my $output_printed_167;
+    my $output_155 = q{};
+    my $output_printed_155;
     printf("b\nc\n");
-if ($output_167 ne q{} && !$output_printed_167) {
-    print $output_167;
+if ($output_155 ne q{} && !$output_printed_155) {
+    print $output_155;
 }
 }
 use File::Path qw(make_path);
@@ -100,17 +96,17 @@ $result .= join("\n", @common_lines) . "\n";
 chomp $result;
 print $result;
 print "\n";
-print "== readarray/mapfile ==\n";
+say "== readarray/mapfile ==";
 my $temp_file_ps_fh_4 = q{/tmp} . '/process_sub_fh_4.tmp';
 my $output_ps_fh_4;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_4 or croak "Cannot redirect STDOUT";
-    my $output_169 = q{};
-    my $output_printed_169;
+    my $output_157 = q{};
+    my $output_printed_157;
     printf("x\ny\n");
-if ($output_169 ne q{} && !$output_printed_169) {
-    print $output_169;
+if ($output_157 ne q{} && !$output_printed_157) {
+    print $output_157;
 }
 }
 use File::Path qw(make_path);
@@ -130,35 +126,30 @@ if (open(my $mapfile_fh, '<', $temp_file_ps_fh_4)) {
 }
 printf('%s ', (join(" ", @lines)));
 print "\n";
-$CHILD_ERROR = 0;
-print "== More process substitution examples ==\n";
+say "== More process substitution examples ==";
 my $temp_file_ps_fh_5 = q{/tmp} . '/process_sub_fh_5.tmp';
 my $output_ps_fh_5;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_5 or croak "Cannot redirect STDOUT";
-    my $output_172 = q{};
-    my $output_printed_172;
-    {
-        my $pipeline_success_172 = 1;
-        $output_172 .= "a\nc\nb";
-    if ( !($output_172 =~ m{\n\z}msx) ) { $output_172 .= "\n"; }
-    $CHILD_ERROR = 0;
-            my @sort_lines_172_1 = split /\n/msx, $output_172;
-        my @sort_sorted_172_1 = sort @sort_lines_172_1;
-        my $output_172_1 = join "\n", @sort_sorted_172_1;
-        if ($output_172_1 ne q{} && !($output_172_1 =~ m{\n\z}msx)) {
-        $output_172_1 .= "\n";
-        }
-        $output_172 = $output_172_1;
-        $output_172 = $output_172_1;
-        if ($output_172 ne q{} && !defined $output_printed_172) {
-            print $output_172;
-            if (!($output_172 =~ m{\n\z}msx)) {
+    my $output_160 = q{};
+    my $output_printed_160;
+    do {
+        my $pipeline_success_160 = 1;
+        $output_160 .= "a\nc\nb";
+    if ( !($output_160 =~ m{\n\z}) ) { $output_160 .= "\n"; }
+            my @sort_lines_160_1 = split /\n/, $output_160;
+        my @sort_sorted_160_1 = sort @sort_lines_160_1;
+        my $output_160_1 = join("\n", @sort_sorted_160_1);
+        $output_160 = $output_160_1;
+        $output_160 = $output_160_1;
+        if ($output_160 ne q{} && !defined $output_printed_160) {
+            print $output_160;
+            if (!($output_160 =~ m{\n\z})) {
                 print "\n";
             }
         }
-        if ( !$pipeline_success_172 ) { $main_exit_code = 1; }
+        if ( !$pipeline_success_160 ) { $main_exit_code = 1; }
         }
 }
 use File::Path qw(make_path);
@@ -173,28 +164,24 @@ my $output_ps_fh_6;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_6 or croak "Cannot redirect STDOUT";
-    my $output_173 = q{};
-    my $output_printed_173;
-    {
-        my $pipeline_success_173 = 1;
-        $output_173 .= "a\nb\nd";
-    if ( !($output_173 =~ m{\n\z}msx) ) { $output_173 .= "\n"; }
-    $CHILD_ERROR = 0;
-            my @sort_lines_173_1 = split /\n/msx, $output_173;
-        my @sort_sorted_173_1 = sort @sort_lines_173_1;
-        my $output_173_1 = join "\n", @sort_sorted_173_1;
-        if ($output_173_1 ne q{} && !($output_173_1 =~ m{\n\z}msx)) {
-        $output_173_1 .= "\n";
-        }
-        $output_173 = $output_173_1;
-        $output_173 = $output_173_1;
-        if ($output_173 ne q{} && !defined $output_printed_173) {
-            print $output_173;
-            if (!($output_173 =~ m{\n\z}msx)) {
+    my $output_161 = q{};
+    my $output_printed_161;
+    do {
+        my $pipeline_success_161 = 1;
+        $output_161 .= "a\nb\nd";
+    if ( !($output_161 =~ m{\n\z}) ) { $output_161 .= "\n"; }
+            my @sort_lines_161_1 = split /\n/, $output_161;
+        my @sort_sorted_161_1 = sort @sort_lines_161_1;
+        my $output_161_1 = join("\n", @sort_sorted_161_1);
+        $output_161 = $output_161_1;
+        $output_161 = $output_161_1;
+        if ($output_161 ne q{} && !defined $output_printed_161) {
+            print $output_161;
+            if (!($output_161 =~ m{\n\z})) {
                 print "\n";
             }
         }
-        if ( !$pipeline_success_173 ) { $main_exit_code = 1; }
+        if ( !$pipeline_success_161 ) { $main_exit_code = 1; }
         }
 }
 use File::Path qw(make_path);
@@ -206,37 +193,22 @@ close $fh_ps_fh_6 or croak "Close failed: $ERRNO\n";
 open STDIN, '<', $temp_file_ps_fh_6 or croak "Cannot open process substitution: $ERRNO\n";
 $ENV{DIFF_TEMP_FILE1} = q{/tmp} . '/process_sub_fh_5.tmp';
 $ENV{DIFF_TEMP_FILE2} = q{/tmp} . '/process_sub_fh_6.tmp';
-my $diff_output = q{};
-{
-    my $diff_cmd = 'diff';
-    my @diff_args = ($temp_file_ps_fh_5, $temp_file_ps_fh_6);
-    my $diff_pid = open my $diff_fh, q{-|}, $diff_cmd, @diff_args;
-    if ($diff_pid) {
-        local $INPUT_RECORD_SEPARATOR = undef;
-        $diff_output = <$diff_fh>;
-        close $diff_fh;
-        $CHILD_ERROR = $? >> 8;
-    } else {
-        carp "Cannot execute diff command: $OS_ERROR";
-        $diff_output = q{};
-        $CHILD_ERROR = 1;
-    }
-}
-print $diff_output;
+my $diff_output = qx{'diff' $temp_file_ps_fh_5 $temp_file_ps_fh_6};
+chomp $diff_output;
+say $diff_output;
 if ($CHILD_ERROR != 0) {
-        print "Files differ\n";
+        say "Files differ";
 }
 my $temp_file_ps_fh_7 = q{/tmp} . '/process_sub_fh_7.tmp';
 my $output_ps_fh_7;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_7 or croak "Cannot redirect STDOUT";
-    my $output_174 = q{};
-    my $output_printed_174;
+    my $output_162 = q{};
+    my $output_printed_162;
     print "name1\nname2" . "\n";
-    $CHILD_ERROR = 0;
-if ($output_174 ne q{} && !$output_printed_174) {
-    print $output_174;
+if ($output_162 ne q{} && !$output_printed_162) {
+    print $output_162;
 }
 }
 use File::Path qw(make_path);
@@ -251,12 +223,11 @@ my $output_ps_fh_8;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_8 or croak "Cannot redirect STDOUT";
-    my $output_175 = q{};
-    my $output_printed_175;
+    my $output_163 = q{};
+    my $output_printed_163;
     print "value1\nvalue2" . "\n";
-    $CHILD_ERROR = 0;
-if ($output_175 ne q{} && !$output_printed_175) {
-    print $output_175;
+if ($output_163 ne q{} && !$output_printed_163) {
+    print $output_163;
 }
 }
 use File::Path qw(make_path);
@@ -266,7 +237,7 @@ open my $fh_ps_fh_8, '>', $temp_file_ps_fh_8 or croak "Cannot create temp file: 
 print {$fh_ps_fh_8} $output_ps_fh_8;
 close $fh_ps_fh_8 or croak "Close failed: $ERRNO\n";
 open STDIN, '<', $temp_file_ps_fh_8 or croak "Cannot open process substitution: $ERRNO\n";
-my $paste_result_176 = do {
+my $paste_result_164 = do {
 my @paste_file1_lines_fh_9;
 my @paste_file2_lines_fh_9;
 if (open my $fh1, '<', $temp_file_ps_fh_7) {
@@ -293,6 +264,6 @@ for my $i (0..$max_lines-1) {
 $paste_output
 }
 ;
-print $paste_result_176;
+print $paste_result_164;
 
 exit $main_exit_code;
