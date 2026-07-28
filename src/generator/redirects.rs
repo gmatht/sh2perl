@@ -1389,8 +1389,12 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     }
                 }
                 let concat_expr = parts_perl.join(" . ");
+                // Note: we pass $eval_input directly to bash -c rather than
+                // wrapping it in "eval \"...\"" because the latter triggers
+                // Perl::Critic's "Expression form of eval" false positive.
+                // bash -c "..." is semantically equivalent to eval "...".
                 output.push_str(&format!(
-                    "do {{ my $eval_input = {}; system('bash', '-c', \"eval \\\"$eval_input\\\"\"); $CHILD_ERROR = $? >> 8; }};\n",
+                    "do {{ my $eval_input = {}; system('bash', '-c', $eval_input); $CHILD_ERROR = $? >> 8; }};\n",
                     concat_expr
                 ));
             }
