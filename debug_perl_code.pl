@@ -12,28 +12,46 @@ my $__set_e        = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = 'test_system_builtin.sh';
-print "Testing " . "sys" . "tem" . " calls with builtin commands\n";
-my $result1;
-my @result1;
-my %result1;
-$result1 = do { my @_qx_cmd = ('ls -la'); my $result = qx{$_qx_cmd[0]}; $CHILD_ERROR = $? >> 8; $result; };
-my $result2;
-my @result2;
-my %result2;
-$result2 = do {
+$PROGRAM_NAME = '000__04b_file_directory_operations.sh';
+print "=== File and Directory Operations ===\n";
+my $file_list;
+my @file_list;
+my %file_list;
+$file_list = do {
+    my @ls_files_46 = ();
+    if ( -f q{.} ) {
+        push @ls_files_46, q{.};
+    }
+    elsif ( -d q{.} ) {
+        if ( opendir my $dh, q{.} ) {
+            while ( my $file = readdir $dh ) {
+                push @ls_files_46, $file;
+            }
+            closedir $dh;
+            @ls_files_46 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}msx; $s } ] } @ls_files_46;
+        }
+    }
+    (@ls_files_46 ? join("\n", @ls_files_46) . "\n" : q{});
+};
+;
+print "File listing:\n";
+print $file_list;
+if ( !( ($file_list) =~ m{\n\z}msx ) ) { print "\n"; }
+my $found_files;
+my @found_files;
+my %found_files;
+$found_files = do {
     require File::Find;
     my @find_results;
-    File::Find::find(sub { if ($_ =~ /^.*\.txt$/msx) { push @find_results, $File::Find::name; } }, q{.});
+    File::Find::find(sub { if (-f $_ && $_ =~ /^.*\.sh$/msx) { push @find_results, $File::Find::name; } }, q{.});
     my $result = join "\n", @find_results;
     if ($result ne q{}) { $result .= "\n"; }
     $CHILD_ERROR = 0;
     $result;
 };
-print "Results:\n";
-print $result1;
-if ( !( ($result1) =~ m{\n\z}msx ) ) { print "\n"; }
-print $result2;
-if ( !( ($result2) =~ m{\n\z}msx ) ) { print "\n"; }
+print "Found shell scripts:\n";
+print $found_files;
+if ( !( ($found_files) =~ m{\n\z}msx ) ) { print "\n"; }
+print "=== File and Directory Operations Complete ===\n";
 
 exit $main_exit_code;
