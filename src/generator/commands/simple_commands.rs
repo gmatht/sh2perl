@@ -1593,14 +1593,50 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             .map(|arg| {
                                 match arg {
                                     Word::BraceExpansion(expansion, _) => {
-                                        // Handle brace expansion for command arguments
                                         handle_brace_expansion_for_command(generator, expansion)
+                                    }
+                                    Word::Literal(s, _) => {
+                                        // Purely numeric literals: emit bare number, not quoted string
+                                        if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) && !(s.len() > 1 && s.starts_with('0')) {
+                                            s.clone()
+                                        } else {
+                                            generator.perl_string_literal(arg)
+                                        }
                                     }
                                     _ => generator.perl_string_literal(arg),
                                 }
                             })
                             .collect();
-                        let args_str = args.join(", ");
+
+                        // Check if this function has named parameters; if so,
+                        // pass arguments by name instead of positionally.
+                        let args_str = if let Some(param_map) = generator.fn_param_names.get(name) {
+                            // Build a sorted list of (param_name, arg) pairs
+                            let mut sorted: Vec<_> = param_map.iter().collect();
+                            sorted.sort_by_key(|(idx, _)| **idx);
+                            let named: Vec<String> = sorted
+                                .iter()
+                                .enumerate()
+                                .map(|(pos, (_, pname))| {
+                                    let arg = args.get(pos)
+                                        .cloned()
+                                        .unwrap_or_else(|| "undef".to_string());
+                                    format!("{} => {}", pname, arg)
+                                })
+                                .collect();
+                            // If there are more args than params, append the extras positionally
+                            let mut result = named.join(", ");
+                            if args.len() > param_map.len() {
+                                let extra: Vec<&str> = args[param_map.len()..].iter().map(|s| s.as_str()).collect();
+                                if !result.is_empty() {
+                                    result.push_str(", ");
+                                }
+                                result.push_str(&extra.join(", "));
+                            }
+                            result
+                        } else {
+                            args.join(", ")
+                        };
                         output.push_str(&generator.indent());
                         output.push_str(&format!("{}({});\n", call_prefix, args_str));
                     }

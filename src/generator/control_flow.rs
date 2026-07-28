@@ -1,6 +1,7 @@
 use super::Generator;
 use crate::ast::*;
 use regex::Regex;
+use std::collections::HashMap;
 
 pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStatement) -> String {
     let mut output = String::new();
@@ -1004,6 +1005,13 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
 pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> String {
     let mut output = String::new();
 
+    // Build parameter-name map by scanning for `name=$N` assignments.
+    // e.g. `x=$1; y=$2` → {1: "x", 2: "y"}
+    let param_map = build_param_name_map(&func.body);
+    if !param_map.is_empty() || !func.parameters.is_empty() {
+        generator.fn_param_names.insert(func.name.clone(), param_map.clone());
+    }
+
     // Determine if this function is nested inside another function
     let is_nested = generator.fn_nesting_depth > 0;
 
@@ -1035,24 +1043,18 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
                     .map(|param| format!("${}", param))
                     .collect();
                 output.push_str(&format!("sub {}({}) {{\n", func.name, params.join(", ")));
-            } else if uses_positional_params {
-                // Function uses $1, $2, etc. but has no declared parameters
+            } else if uses_positional_params && param_map.is_empty() {
+                // Function uses $1, $2, etc. but has no declared parameters AND
+                // no named-param assignment pattern (name=$1).  Emit the old-style
+                // positional unpacking as a fallback.
                 output.push_str(&format!("sub {} {{\n", func.name));
                 generator.indent_level += 1;
-
-                // Only emit @_ unpacking if the body does not already handle parameters
-                // via `local` commands (e.g. `local n=$1`).
-                let has_local_commands = func
-                    .body
-                    .commands
-                    .iter()
-                    .any(|cmd| matches!(cmd, Command::BuiltinCommand(cmd) if cmd.name == "local"));
-
-                if !has_local_commands {
-                    // Unpack @_ to get positional parameters
-                    output.push_str(&generator.indent());
-                    output.push_str("my ($file) = @_;\n");
-                }
+                output.push_str(&generator.indent());
+                output.push_str("my ($file) = @_;\n");
+            } else if uses_positional_params && !param_map.is_empty() {
+                // Named parameters will be unpacked later via the param-map.
+                output.push_str(&format!("sub {} {{\n", func.name));
+                generator.indent_level += 1;
             } else {
                 // No parameters
                 output.push_str(&format!("sub {} {{\n", func.name));
@@ -1115,11 +1117,61 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     // are also treated as lexical.
     generator.fn_nesting_depth += 1;
 
+    // If we have named parameters, mark them as already-declared so the
+    // body generator skips `my` (we'll emit the declaration ourselves).
+    for (_idx, pname) in &param_map {
+        generator.declared_locals.insert(pname.clone());
+    }
+
     // Create a temporary block with filtered commands
     let filtered_block = Block {
         commands: filtered_commands,
     };
-    output.push_str(&generator.generate_block_commands(&filtered_block));
+    let mut body_code = generator.generate_block_commands(&filtered_block);
+
+    // Post-process the body: replace $N → $_[N-1] for positional params.
+    // This must be done AFTER generating, because the generator emits $1 from
+    // Word::Variable("1", ...) which currently produces perl `$1` (regex capture).
+    // We fix it here so function args resolve to @_ instead.
+    // Apply the fix whenever the function uses ANY positional params, regardless
+    // of whether a param-name map (from name=$1 assignments) was built.
+    let uses_pos = check_function_uses_positional_params(&func.body);
+    if uses_pos {
+        // Replace $1 through $9 with $_[0] through $_[8]
+        for i in 1..=9 {
+            let old_ref = format!("${}", i);
+            let new_ref = format!("$_[{}]", i - 1);
+            body_code = body_code.replace(&old_ref, &new_ref);
+        }
+    }
+
+    // If we have named parameters, prepend a clean unpacking line and
+    // remove the now-redundant `my $name = $_[N-1];` declarations.
+    if !param_map.is_empty() {
+        // Sort by index so params appear in order: ($x, $y)
+        let mut sorted: Vec<_> = param_map.iter().collect();
+        sorted.sort_by_key(|(idx, _)| **idx);
+        let params_str = sorted
+            .iter()
+            .map(|(_, pname)| format!("${}", pname))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Build the unpacking line
+        let unpack_line = format!("    my ({}) = @_;
+", params_str);
+        output.push_str(&unpack_line);
+
+        // Remove the individual `$x = $_[0];` lines since they're now
+        // handled by the unpacking `my ($x, $y) = @_;` above.
+        for (idx, pname) in &param_map {
+            // The param was marked as declared, so the body emits assignment
+            // without `my`: `    $x = $_[0];\n`
+            let redundant = format!("    ${} = $_[{}];\n", pname, idx - 1);
+            body_code = body_code.replace(&redundant, "");
+        }
+    }
+
+    output.push_str(&body_code);
 
     // Restore nesting depth
     generator.fn_nesting_depth -= 1;
@@ -1214,6 +1266,19 @@ fn check_command_uses_positional_params(command: &Command) -> bool {
         }
         Command::For(for_loop) => check_function_uses_positional_params(&for_loop.body),
         Command::While(while_loop) => check_function_uses_positional_params(&while_loop.body),
+        Command::Assignment(assign) => {
+            check_word_uses_positional_params(&assign.value)
+        }
+        Command::Redirect(redir) => check_command_uses_positional_params(&redir.command),
+        Command::And(left, right) | Command::Or(left, right) => {
+            check_command_uses_positional_params(left)
+                || check_command_uses_positional_params(right)
+        }
+        Command::Subshell(c) | Command::Background(c) | Command::Not(c) => {
+            check_command_uses_positional_params(c)
+        }
+        Command::Return(w) => w.as_ref().map_or(false, |w| check_word_uses_positional_params(w)),
+        Command::CStyleFor(c) => check_function_uses_positional_params(&c.body),
         _ => false,
     }
 }
@@ -1251,6 +1316,10 @@ fn check_word_uses_positional_params(word: &Word) -> bool {
             false
         }
         Word::CommandSubstitution(cmd, _) => check_command_uses_positional_params(cmd),
+        Word::Variable(var, _, _) => {
+            // $1, $2, etc. are positional parameter references
+            var.parse::<usize>().map_or(false, |n| n >= 1 && n <= 9)
+        }
         _ => false,
     }
 }
@@ -1515,4 +1584,37 @@ fn extract_read_vars_from_condition(cmd: &Command) -> Vec<String> {
         _ => {}
     }
     vars
+}
+
+/// Scan a function body for assignments from positional parameters, e.g.
+/// `x=\$1; y=\$2`.  Returns `{1 → "x", 2 → "y"}`.
+/// These are used to generate clean `my ($x, $y) = @_;` unpacking and to
+/// pass named arguments at call sites.
+pub fn build_param_name_map(block: &Block) -> HashMap<usize, String> {
+    let mut map = HashMap::new();
+    for cmd in &block.commands {
+        if let Command::Assignment(assign) = cmd {
+            // Check if the value is a positional parameter reference like $1, $2
+            if let Word::Variable(var, _, _) = &assign.value {
+                if let Ok(idx) = var.parse::<usize>() {
+                    if idx >= 1 {
+                        map.insert(idx, assign.variable.clone());
+                    }
+                }
+            }
+            // Also check StringInterpolation containing just a Variable
+            if let Word::StringInterpolation(interp, _) = &assign.value {
+                if interp.parts.len() == 1 {
+                    if let StringPart::Variable(var) = &interp.parts[0] {
+                        if let Ok(idx) = var.parse::<usize>() {
+                            if idx >= 1 {
+                                map.insert(idx, assign.variable.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
 }

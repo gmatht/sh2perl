@@ -1965,7 +1965,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     let pipeline_code = crate::generator::commands::pipeline_commands::
                         generate_pipeline_for_substitution(generator, pipeline);
                     format!(
-                        "do {{ local $CHILD_ERROR = 0; my $_pipeline_result = {}; $_pipeline_result; }}",
+                        "do {{ local $CHILD_ERROR = 0; {}; }}",
                         pipeline_code
                     )
                 }
