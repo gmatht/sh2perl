@@ -4,3 +4,4 @@
 set -e
 export LANG=C
 test "a" = "b"
+printf "parsed OK\\n"

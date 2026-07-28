@@ -16,3 +16,4 @@ if [ a -ot b ]; then true; fi
 if [ a -ef b ]; then true; fi
 if [ -z "" ]; then true; fi
 if [ -n "x" ]; then true; fi
+printf "parsed OK\\n"

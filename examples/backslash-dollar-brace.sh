@@ -5,3 +5,4 @@ for var in BASH_ENV ENV MAIL
 do
     eval test \${$var+y} && unset $var || :
 done
+printf "parsed OK\\n"

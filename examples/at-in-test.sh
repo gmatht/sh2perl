@@ -3,3 +3,4 @@
 if [[ "$0" = @(pattern) ]]; then
     true
 fi
+printf "parsed OK\\n"
