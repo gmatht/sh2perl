@@ -2715,13 +2715,13 @@ pub fn convert_string_interpolation_to_perl_impl(
                 if !current_string.is_empty() {
                     push_string_expr(&mut parts, &mut current_string);
                 }
-                // Add the command substitution as a separate part
+                // Add the command substitution as a separate part.
+                // All command-substitution handlers already return a do { } block
+                // that handles newline stripping internally, so no outer chomp
+                // wrapper is needed.
                 let cmd_result =
                     generator.word_to_perl(&Word::CommandSubstitution(cmd.clone(), None));
-                parts.push(format!(
-                    "(do {{ my $_chomp_temp = {}; chomp $_chomp_temp; $_chomp_temp; }})",
-                    cmd_result
-                ));
+                parts.push(format!("({})", cmd_result));
             }
             StringPart::ParameterExpansion(pe) => {
                 // Handle parameter expansions like ${arr[1]}, ${#arr[@]}, etc.

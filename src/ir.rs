@@ -89,6 +89,14 @@ pub enum IrExpr {
     },
     /// String interpolation: "hello $name"
     Interpolate(Vec<InterpPart>),
+    /// Backtick command-substitution result.
+    /// If `native` is true, the expression already produces the exact
+    /// value (no trailing newline). If false, trailing newlines are
+    /// stripped (shell command-substitution semantics).
+    Backtick {
+        expr: Box<IrExpr>,
+        native: bool,
+    },
     /// Raw Perl expression text (migration bridge)
     RawExpr(String),
 }
@@ -172,6 +180,8 @@ pub enum IrStmt {
     },
     /// Return
     Return(Option<IrExpr>),
+    /// Set $CHILD_ERROR (from $? >> 8 after an external command)
+    SetChildError(IrExpr),
     /// Raw Perl text (migration bridge)
     RawText(String),
 }
@@ -248,8 +258,14 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
         out.push('\n');
     }
 
-    // Exit
-    out.push_str("exit $main_exit_code;\n");
+    // Exit — only if $main_exit_code might be non-zero (i.e. if any
+    // statement references it).  For scripts that never touch it,
+    // omit the exit so Perl's default exit(0) applies.
+    let has_main_exit = prog.stmts.iter().any(|s| stmt_refers_to_main_exit(s))
+        || prog.subs.iter().any(|sub| sub.body.iter().any(|s| stmt_refers_to_main_exit(s)));
+    if has_main_exit {
+        out.push_str("exit $main_exit_code;\n");
+    }
 
     out
 }
@@ -416,6 +432,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str("return;\n");
         }
 
+        IrStmt::SetChildError(expr) => {
+            let e = ir_expr_to_perl(expr);
+            emit_indent(out, indent);
+            out.push_str(&format!("$CHILD_ERROR = {};\n", e));
+        }
+
         IrStmt::Pipeline { stages, .. } => {
             // Simple pipeline: for now fall back to RawText-style output
             // until proper pipeline IR is fully designed.
@@ -454,6 +476,17 @@ pub(crate) fn emit_sub(out: &mut String, sub: &IrSub) {
 
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     match expr {
+        IrExpr::Backtick { expr, native } => {
+            let inner = ir_expr_to_perl(expr);
+            if *native {
+                // Native Perl expression — return as-is, no stripping
+                inner
+            } else {
+                // Shell backtick result — strip trailing newlines
+                format!("do {{ my $_r = qx{{{}}}; chomp $_r; $_r; }}", inner)
+            }
+        }
+
         IrExpr::RawExpr(text) => text.clone(),
 
         IrExpr::Int(n) => n.to_string(),
@@ -576,6 +609,68 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 pub(crate) fn emit_indent(out: &mut String, indent: usize) {
     for _ in 0..indent {
         out.push_str("    ");
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────
+
+/// Check whether an IR statement references `$main_exit_code`.
+fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
+    match stmt {
+        IrStmt::RawText(t) => t.contains("$main_exit_code") || t.contains("main_exit_code"),
+        IrStmt::Assign { targets, expr: _ } => {
+            targets.iter().any(|t| t.var == "main_exit_code")
+        }
+        IrStmt::Output { value, .. } | IrStmt::SetChildError(value) | IrStmt::Return(Some(value)) => {
+            expr_refers_to_main_exit(value)
+        }
+        IrStmt::Declare { vars, .. } => vars.iter().any(|d| d.name == "main_exit_code"),
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            expr_refers_to_main_exit(cond)
+                || then.iter().any(|s| stmt_refers_to_main_exit(s))
+                || elsifs.iter().any(|(c, b)| expr_refers_to_main_exit(c) || b.iter().any(|s| stmt_refers_to_main_exit(s)))
+                || else_.iter().any(|s| stmt_refers_to_main_exit(s))
+        }
+        IrStmt::For { iter, body, .. } => {
+            expr_refers_to_main_exit(iter)
+                || body.iter().any(|s| stmt_refers_to_main_exit(s))
+        }
+        IrStmt::While { cond, body } => {
+            expr_refers_to_main_exit(cond)
+                || body.iter().any(|s| stmt_refers_to_main_exit(s))
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            expr_refers_to_main_exit(cond)
+                || body.iter().any(|s| stmt_refers_to_main_exit(s))
+        }
+        IrStmt::System { capture, .. } => {
+            matches!(capture, Some(v) if v == "main_exit_code")
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            stages.iter().any(|s| s.iter().any(|s| stmt_refers_to_main_exit(s)))
+        }
+        IrStmt::DeclareArray { var, .. } => var == "main_exit_code",
+        IrStmt::Return(None) => false,
+    }
+}
+
+/// Check whether an IR expression references `$main_exit_code`.
+fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
+    match expr {
+        IrExpr::Var(name, _) => name == "main_exit_code",
+        IrExpr::RawExpr(t) => t.contains("main_exit_code"),
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Lit(_) => false,
+            InterpPart::Expr(e) => expr_refers_to_main_exit(e),
+        }),
+        IrExpr::BinOp { lhs, rhs, .. } => expr_refers_to_main_exit(lhs) || expr_refers_to_main_exit(rhs),
+        IrExpr::Backtick { expr, .. } => expr_refers_to_main_exit(expr),
+        IrExpr::Call { args, .. } => args.iter().any(|a| expr_refers_to_main_exit(a)),
+        IrExpr::MethodCall { obj, args, .. } => expr_refers_to_main_exit(obj) || args.iter().any(|a| expr_refers_to_main_exit(a)),
+        IrExpr::Index { key, .. } => expr_refers_to_main_exit(key),
+        IrExpr::Ternary { cond, then, else_ } => expr_refers_to_main_exit(cond) || expr_refers_to_main_exit(then) || expr_refers_to_main_exit(else_),
+        IrExpr::DefinedOr { expr, default } => expr_refers_to_main_exit(expr) || expr_refers_to_main_exit(default),
+        IrExpr::Int(_) | IrExpr::Str(_, _) => false,
     }
 }
 

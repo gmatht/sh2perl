@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
+use crate::ir::{expr_to_perl, IrExpr, StrStyle};
 
 fn perl_single_quoted(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
@@ -22,19 +23,46 @@ fn simple_word_text(word: &Word) -> Option<String> {
     }
 }
 
+/// Build an IR expression for POSIX::strftime with the given format.
+fn strftime_ir(format: &str, gmtime: bool) -> IrExpr {
+    let time_func = if gmtime { "gmtime" } else { "localtime" };
+    IrExpr::Call {
+        func: "POSIX::strftime".to_string(),
+        args: vec![
+            IrExpr::Str(format.to_string(), StrStyle::SingleQuoted),
+            IrExpr::Call {
+                func: time_func.to_string(),
+                args: vec![],
+            },
+        ],
+    }
+}
+
+/// Build an IR expression for POSIX::strftime with a dynamic format variable.
+fn strftime_var_ir(format_expr: IrExpr, gmtime: bool) -> IrExpr {
+    let time_func = if gmtime { "gmtime" } else { "localtime" };
+    IrExpr::Call {
+        func: "POSIX::strftime".to_string(),
+        args: vec![
+            format_expr,
+            IrExpr::Call {
+                func: time_func.to_string(),
+                args: vec![],
+            },
+        ],
+    }
+}
+
 fn default_date_expr() -> String {
-    "require POSIX; POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime(time())) . \"\\n\""
-        .to_string()
+    // Use the IR backend for clean formatting
+    let ir = strftime_ir("%a %b %e %H:%M:%S %Z %Y", false);
+    format!("require POSIX; {}", expr_to_perl(&ir))
 }
 
 fn format_date_expr(format: &str) -> String {
     let cleaned = format.strip_prefix('+').unwrap_or(format);
-    let format_expr = perl_single_quoted(cleaned);
-
-    format!(
-        "require POSIX; POSIX::strftime({}, localtime(time())) . \"\\n\"",
-        format_expr
-    )
+    let ir = strftime_ir(cleaned, false);
+    format!("require POSIX; {}", expr_to_perl(&ir))
 }
 
 pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) -> String {
@@ -51,8 +79,8 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
         [] => default_date_expr(),
         // -u: print date in UTC
         [flag_word] if simple_word_text(flag_word).as_deref() == Some("-u") => {
-            "require POSIX; POSIX::strftime('%a %b %e %H:%M:%S UTC %Y', gmtime(time())) . \"\\n\""
-                .to_string()
+            let ir = strftime_ir("%a %b %e %H:%M:%S UTC %Y", true);
+            format!("require POSIX; {}", expr_to_perl(&ir))
         }
         // -u -d 'date string': parse and print in UTC
         [uflag, dflag, arg, ..]
@@ -61,7 +89,7 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
         {
             let source_expr = generator.word_to_perl(arg);
             format!(
-                "my $date_source = {};\nrequire POSIX;\nrequire Time::Local;\nif ($date_source =~ /^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})\\s+(\\d{{2}}):(\\d{{2}}):(\\d{{2}})(?:\\s+UTC)?$/) {{\n    my $date_epoch = Time::Local::timegm($6,$5,$4,$3,$2-1,$1-1900);\n    POSIX::strftime('%a %b %e %H:%M:%S UTC %Y', gmtime($date_epoch)) . \"\\n\"\n}}\nelsif ($date_source =~ /^@([0-9]+)$/) {{\n    my $date_epoch = $1;\n    POSIX::strftime('%a %b %e %H:%M:%S UTC %Y', gmtime($date_epoch)) . \"\\n\"\n}}\nelse {{\n    select((select(STDOUT), $| = 1)[0]);\n    print {{*STDERR}} \"date: option requires an argument -- 'd'\\nTry 'date --help' for more information.\\n\";\n    q{{}};\n}}",
+                "my $date_source = {};\nrequire POSIX;\nrequire Time::Local;\nif ($date_source =~ /^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})\\s+(\\d{{2}}):(\\d{{2}}):(\\d{{2}})(?:\\s+UTC)?$/) {{\n    my $date_epoch = Time::Local::timegm($6,$5,$4,$3,$2-1,$1-1900);\n    POSIX::strftime('%a %b %e %H:%M:%S UTC %Y', gmtime($date_epoch))\n}}\nelsif ($date_source =~ /^@([0-9]+)$/) {{\n    my $date_epoch = $1;\n    POSIX::strftime('%a %b %e %H:%M:%S UTC %Y', gmtime($date_epoch))\n}}\nelse {{\n    select((select(STDOUT), $| = 1)[0]);\n    print {{*STDERR}} \"date: option requires an argument -- 'd'\\nTry 'date --help' for more information.\\n\";\n    q{{}};\n}}",
                 source_expr
             )
         }
@@ -69,31 +97,38 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
         [uflag, format_word, ..] if simple_word_text(uflag).as_deref() == Some("-u") => {
             if let Some(format) = simple_word_text(format_word) {
                 let cleaned = format.strip_prefix('+').unwrap_or(&format);
-                let format_expr = perl_single_quoted(cleaned);
-                format!(
-                    "require POSIX; POSIX::strftime({}, gmtime(time())) . \"\\n\"",
-                    format_expr
-                )
+                let ir = strftime_ir(cleaned, true);
+                format!("require POSIX; {}", expr_to_perl(&ir))
             } else {
                 let format_expr = generator.word_to_perl(format_word);
                 format!(
-                    "my $date_now = time(); my $date_format = {}; $date_format =~ s/^\\+//; require POSIX; POSIX::strftime($date_format, gmtime($date_now)) . \"\\n\"",
-                    format_expr
+                    "my $date_now = time(); my $date_format = {}; $date_format =~ s/^\\+//; require POSIX; {}",
+                    format_expr,
+                    expr_to_perl(&strftime_var_ir(
+                        IrExpr::Var("date_format".to_string(), crate::ir::Sigil::Scalar),
+                        true
+                    ))
                 )
             }
         }
         [flag_word, arg, ..] if simple_word_text(flag_word).as_deref() == Some("-r") => {
             let path_expr = generator.word_to_perl(arg);
-            format!(
-                "my $date_path = {};\nrequire POSIX; POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime((stat($date_path))[9])) . \"\\n\"",
-                path_expr
-            )
+            let ir = strftime_ir("%a %b %e %H:%M:%S %Z %Y", false);
+            // Replace localtime() with localtime((stat(path))[9])
+            let strftime_call = expr_to_perl(&ir);
+            // The strftime IR uses localtime() — for -r we need localtime((stat(path))[9])
+            // Since expr_to_perl gives us the clean call, we swap the time argument.
+            let time_arg = format!("localtime((stat({}))[9])", path_expr);
+            let modified_call = strftime_call.replace("localtime()", &time_arg);
+            format!("my $date_path = {};\nrequire POSIX; {}", path_expr, modified_call)
         }
         [flag_word, arg, ..] if simple_word_text(flag_word).as_deref() == Some("-d") => {
             let source_expr = generator.word_to_perl(arg);
+            let ir_str = expr_to_perl(&strftime_ir("%a %b %e %H:%M:%S %Z %Y", false));
             format!(
-                "my $date_source = {};\nrequire POSIX;\nif ($date_source =~ /^@([0-9]+)$/) {{\n    my $date_epoch = $1;\n    POSIX::strftime('%a %b %e %H:%M:%S %Z %Y', localtime($date_epoch)) . \"\\n\"\n}}\nelse {{\n    select((select(STDOUT), $| = 1)[0]);\n    print {{*STDERR}} \"date: option requires an argument -- 'd'\\nTry 'date --help' for more information.\\n\";\n    q{{}};\n}}",
-                source_expr
+                "my $date_source = {};\nrequire POSIX;\nif ($date_source =~ /^@([0-9]+)$/) {{\n    my $date_epoch = $1;\n    {}\n}}\nelse {{\n    select((select(STDOUT), $| = 1)[0]);\n    print {{*STDERR}} \"date: option requires an argument -- 'd'\\nTry 'date --help' for more information.\\n\";\n    q{{}};\n}}",
+                source_expr,
+                ir_str.replace("localtime()", "localtime($date_epoch)")
             )
         }
         [format_word, ..] => {
@@ -102,8 +137,12 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
             } else {
                 let format_expr = generator.word_to_perl(format_word);
                 format!(
-                    "my $date_now = time(); my $date_format = {}; $date_format =~ s/^\\+//; require POSIX; POSIX::strftime($date_format, localtime($date_now)) . \"\\n\"",
-                    format_expr
+                    "my $date_now = time(); my $date_format = {}; $date_format =~ s/^\\+//; require POSIX; {}",
+                    format_expr,
+                    expr_to_perl(&strftime_var_ir(
+                        IrExpr::Var("date_format".to_string(), crate::ir::Sigil::Scalar),
+                        false
+                    ))
                 )
             }
         }
@@ -114,5 +153,8 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
 
 pub fn generate_date_command(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let body = generate_date_expression(generator, cmd);
-    format!("my $date = do {{\n{}\n}};\nprint $date;\n", body)
+    // Add \"\\n\" because a standalone `date` command should output with newline.
+    // The expression body no longer appends it (it was removed for command-substitution
+    // use where newlines are handled by the chomp wrapper).
+    format!("my $date = do {{\n{}\n}} . \"\\n\";\nprint $date;\n", body)
 }
