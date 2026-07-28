@@ -905,79 +905,94 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
 pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> String {
     let mut output = String::new();
 
-    // Add blank line before function definition for better formatting
-    output.push_str("\n");
+    // Determine if this function is nested inside another function
+    let is_nested = generator.fn_nesting_depth > 0;
 
-    // Check if function uses positional parameters ($1, $2, etc.) in its body
-    let uses_positional_params = check_function_uses_positional_params(&func.body);
-
-    // Generate function definition with or without parameters based on setting
-    if generator.use_function_signatures {
-        // Use modern function signatures
-        if !func.parameters.is_empty() {
-            // Function has declared parameters
-            let params: Vec<String> = func
-                .parameters
-                .iter()
-                .map(|param| format!("${}", param))
-                .collect();
-            output.push_str(&format!("sub {}({}) {{\n", func.name, params.join(", ")));
-        } else if uses_positional_params {
-            // Function uses $1, $2, etc. but has no declared parameters
-            output.push_str(&format!("sub {} {{\n", func.name));
-            generator.indent_level += 1;
-
-            // Only emit @_ unpacking if the body does not already handle parameters
-            // via `local` commands (e.g. `local n=$1`).
-            let has_local_commands = func
-                .body
-                .commands
-                .iter()
-                .any(|cmd| matches!(cmd, Command::BuiltinCommand(cmd) if cmd.name == "local"));
-
-            if !has_local_commands {
-                // Unpack @_ to get positional parameters
-                output.push_str(&generator.indent());
-                output.push_str("my ($file) = @_;\n");
-            }
-        } else {
-            // No parameters
-            output.push_str(&format!("sub {} {{\n", func.name));
-            generator.indent_level += 1;
-        }
-    } else {
-        // Use traditional @_ unpacking approach
-        output.push_str(&format!("sub {} {{\n", func.name));
+    if is_nested {
+        // For nested functions, emit a lexical anonymous sub assigned to a
+        // variable instead of a named sub, to avoid Perl::Critic's
+        // "Nested named subroutine" violation.
+        output.push_str("\n");
+        output.push_str(&generator.indent());
+        output.push_str(&format!("my ${} = sub {{\n", func.name));
         generator.indent_level += 1;
 
-        // Handle function parameters - always unpack @_ first
-        if !func.parameters.is_empty() {
-            output.push_str(&generator.indent());
-            output.push_str("my (");
-            let params: Vec<String> = func
-                .parameters
-                .iter()
-                .map(|param| format!("${}", param))
-                .collect();
-            output.push_str(&params.join(", "));
-            output.push_str(") = @_;\n");
-        } else if uses_positional_params {
-            // Function uses $1, $2, etc. but has no declared parameters
-            // Check if the function body already has local commands that handle parameters
-            let has_local_commands = func
-                .body
-                .commands
-                .iter()
-                .any(|cmd| matches!(cmd, Command::BuiltinCommand(cmd) if cmd.name == "local"));
+        // Mark this function as lexical so call sites use $name->(...)
+        generator.lexical_functions.insert(func.name.clone());
+    } else {
+        // Add blank line before function definition for better formatting
+        output.push_str("\n");
 
-            if !has_local_commands {
-                // Generate parameter unpacking for the first parameter using proper @_ unpacking
-                output.push_str(&generator.indent());
-                output.push_str("my ($file) = @_;\n");
+        // Check if function uses positional parameters ($1, $2, etc.) in its body
+        let uses_positional_params = check_function_uses_positional_params(&func.body);
+
+        if generator.use_function_signatures {
+            // Use modern function signatures
+            if !func.parameters.is_empty() {
+                // Function has declared parameters
+                let params: Vec<String> = func
+                    .parameters
+                    .iter()
+                    .map(|param| format!("${}", param))
+                    .collect();
+                output.push_str(&format!("sub {}({}) {{\n", func.name, params.join(", ")));
+            } else if uses_positional_params {
+                // Function uses $1, $2, etc. but has no declared parameters
+                output.push_str(&format!("sub {} {{\n", func.name));
+                generator.indent_level += 1;
+
+                // Only emit @_ unpacking if the body does not already handle parameters
+                // via `local` commands (e.g. `local n=$1`).
+                let has_local_commands = func
+                    .body
+                    .commands
+                    .iter()
+                    .any(|cmd| matches!(cmd, Command::BuiltinCommand(cmd) if cmd.name == "local"));
+
+                if !has_local_commands {
+                    // Unpack @_ to get positional parameters
+                    output.push_str(&generator.indent());
+                    output.push_str("my ($file) = @_;\n");
+                }
+            } else {
+                // No parameters
+                output.push_str(&format!("sub {} {{\n", func.name));
+                generator.indent_level += 1;
             }
         } else {
-            // Even if no parameters, unpack @_ to satisfy Perl::Critic
-            // Note: @_ is a special variable and cannot be redeclared, so we don't need to do anything
+            // Use traditional @_ unpacking approach
+            output.push_str(&format!("sub {} {{\n", func.name));
+            generator.indent_level += 1;
+
+            // Handle function parameters - always unpack @_ first
+            if !func.parameters.is_empty() {
+                output.push_str(&generator.indent());
+                output.push_str("my (");
+                let params: Vec<String> = func
+                    .parameters
+                    .iter()
+                    .map(|param| format!("${}", param))
+                    .collect();
+                output.push_str(&params.join(", "));
+                output.push_str(") = @_;\n");
+            } else if uses_positional_params {
+                // Function uses $1, $2, etc. but has no declared parameters
+                // Check if the function body already has local commands that handle parameters
+                let has_local_commands = func
+                    .body
+                    .commands
+                    .iter()
+                    .any(|cmd| matches!(cmd, Command::BuiltinCommand(cmd) if cmd.name == "local"));
+
+                if !has_local_commands {
+                    // Generate parameter unpacking for the first parameter using proper @_ unpacking
+                    output.push_str(&generator.indent());
+                    output.push_str("my ($file) = @_;\n");
+                }
+            } else {
+                // Even if no parameters, unpack @_ to satisfy Perl::Critic
+                // Note: @_ is a special variable and cannot be redeclared, so we don't need to do anything
+            }
         }
     }
 
@@ -997,11 +1012,18 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     let saved_function_level_vars = generator.function_level_vars.clone();
     let saved_associative_arrays = generator.associative_arrays.clone();
 
+    // Increment nesting depth so any further nested function definitions
+    // are also treated as lexical.
+    generator.fn_nesting_depth += 1;
+
     // Create a temporary block with filtered commands
     let filtered_block = Block {
         commands: filtered_commands,
     };
     output.push_str(&generator.generate_block_commands(&filtered_block));
+
+    // Restore nesting depth
+    generator.fn_nesting_depth -= 1;
 
     // Restore scope state — function-level declarations are scoped.
     generator.declared_locals = saved_declared_locals;
@@ -1014,10 +1036,15 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
 
     generator.indent_level -= 1;
 
-    output.push_str("}\n");
-
-    // Mark function as declared
-    generator.declared_functions.insert(func.name.clone());
+    if is_nested {
+        // Close the anonymous sub with a semicolon
+        output.push_str(&generator.indent());
+        output.push_str("};\n");
+    } else {
+        output.push_str("}\n");
+        // Mark function as declared (global)
+        generator.declared_functions.insert(func.name.clone());
+    }
 
     output
 }

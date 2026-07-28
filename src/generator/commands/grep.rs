@@ -453,7 +453,7 @@ pub fn generate_grep_command(
                     let quoted_file = format!("\"{}\"", adjusted_file);
                     output.push_str(&format!("if (-e {}) {{\n", quoted_file));
                     output.push_str(&format!(
-                        "    open my $fh, '<', {} or croak \"Cannot open file: $ERRNO\";\n",
+                        "    open my $fh, '<', {} or croak \"Cannot access file: $ERRNO\";\n",
                         quoted_file
                     ));
                     output.push_str("    while (my $line = <$fh>) {\n");

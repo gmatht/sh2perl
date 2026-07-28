@@ -97,6 +97,7 @@ pub fn generate_echo_command(
                                             .replace("\n", "\\n")
                                             .replace("\t", "\\t")
                                             .replace("\r", "\\r")
+                                        .replace("@", "\\@")
                                     )
                                 } else {
                                     // If this echo is being captured into an output variable
@@ -197,6 +198,7 @@ pub fn generate_echo_command(
                                         .replace("\n", "\\n")
                                         .replace("\t", "\\t")
                                         .replace("\r", "\\r")
+                                        .replace("@", "\\@")
                                 )
                             } else {
                                 // For multi-part string interpolation without -e flag, use the general string interpolation handler
@@ -237,6 +239,7 @@ pub fn generate_echo_command(
                                     .replace("\n", "\\n")
                                     .replace("\t", "\\t")
                                     .replace("\r", "\\r")
+                                        .replace("@", "\\@")
                             )
                         } else {
                             // Check if the literal contains backticks that should be processed as command substitutions
@@ -307,7 +310,9 @@ pub fn generate_echo_command(
             if args[0].starts_with('"') && args[0].ends_with('"') && !args[0].contains("\\n") {
                 // Extract the string content and add newline directly using double quotes for escape sequences
                 let content = &args[0][1..args[0].len() - 1]; // Remove quotes
-                output.push_str(&format!("${} .= \"{}\\n\";\n", output_var, content));
+                // Escape @ to prevent accidental array interpolation in double-quoted context
+                let escaped_content = content.replace("@", "\\@");
+                output.push_str(&format!("${} .= \"{}\\n\";\n", output_var, escaped_content));
             } else if args[0].contains("\\n") {
                 output.push_str(&format!("${} .= {};\n", output_var, args[0]));
             } else {
@@ -499,7 +504,7 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
                             } else {
                                 format!("'{}'", adjusted_file)
                             };
-                            return format!("do {{\n    my @grep_lines_{};\n    if (-e {}) {{\n        open my $fh_{}, '<', {}\n            or croak \"Cannot open file: $OS_ERROR\";\n        @grep_lines_{} = <$fh_{}>;\n        close $fh_{}\n            or croak \"Close failed: $OS_ERROR\";\n        chomp @grep_lines_{};\n        @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{};\n    }}\n    join \"\\n\", @grep_lines_{};\n}}", 
+                            return format!("do {{\n    my @grep_lines_{};\n    if (-e {}) {{\n        open my $fh_{}, '<', {}\n            or croak \"Cannot access file: $OS_ERROR\";\n        @grep_lines_{} = <$fh_{}>;\n        close $fh_{}\n            or croak \"Close failed: $OS_ERROR\";\n        chomp @grep_lines_{};\n        @grep_lines_{} = grep {{ /{}/msx }} @grep_lines_{};\n    }}\n    join \"\\n\", @grep_lines_{};\n}}", 
                                 unique_id, quoted_file, unique_id, quoted_file, unique_id, unique_id, unique_id, unique_id, unique_id, pattern.trim_matches('\'').trim_matches('"'), unique_id, unique_id);
                         }
                     }

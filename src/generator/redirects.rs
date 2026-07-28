@@ -123,7 +123,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
             // Input redirection: command < file
             let target = generator.perl_string_literal(&redirect.target);
             output.push_str(&format!(
-                "open STDIN, '<', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
+                "open STDIN, '<', {} or croak \"Cannot read file: $OS_ERROR\\n\";\n",
                 target
             ));
         }
@@ -133,7 +133,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
             // The special handling is done in generate_simple_command
             let target = generator.perl_string_literal(&redirect.target);
             output.push_str(&format!(
-                "open STDOUT, '>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
+                "open STDOUT, '>', {} or croak \"Cannot write file: $OS_ERROR\\n\";\n",
                 target
             ));
         }
@@ -141,7 +141,7 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
             // Append redirection: command >> file
             let target = generator.perl_string_literal(&redirect.target);
             output.push_str(&format!(
-                "open STDOUT, '>>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
+                "open STDOUT, '>>', {} or croak \"Cannot append to file: $OS_ERROR\\n\";\n",
                 target
             ));
         }
@@ -263,7 +263,7 @@ waitpid $pid, 0;\n",
                 let target = generator.perl_string_literal(&redirect.target);
                 output.push_str("local *STDERR;\n");
                 output.push_str(&format!(
-                    "open STDERR, '>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
+                    "open STDERR, '>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
                     target
                 ));
             }
@@ -272,7 +272,7 @@ waitpid $pid, 0;\n",
             // Stderr append: command 2>> file
             let target = generator.perl_string_literal(&redirect.target);
             output.push_str(&format!(
-                "open STDERR, '>>', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
+                "open STDERR, '>>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
                 target
             ));
         }
@@ -280,7 +280,7 @@ waitpid $pid, 0;\n",
             // Stderr input: command 2< file
             let target = generator.perl_string_literal(&redirect.target);
             output.push_str(&format!(
-                "open STDERR, '<', {} or croak \"Cannot open file: $OS_ERROR\\n\";\n",
+                "open STDERR, '<', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
                 target
             ));
         }
@@ -1511,4 +1511,5 @@ pub fn escape_perl_string(s: &str) -> String {
         .replace("\n", "\\n")
         .replace("\t", "\\t")
         .replace("\r", "\\r")
+        .replace("@", "\\@")
 }

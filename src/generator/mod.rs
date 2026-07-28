@@ -71,6 +71,11 @@ pub struct Generator {
     /// (via `declare -a` or `local -a` or simple array assignment like `arr=(...)`).
     /// Used to emit Perl array syntax `@arr` instead of `$arr`.
     pub indexed_arrays: HashSet<String>,
+    /// Nesting depth of function definitions.  0 = top level, 1 = inside a function, etc.
+    pub fn_nesting_depth: usize,
+    /// Names of functions that were defined lexically (nested inside another function).
+    /// These must be called as `$func_name->(...)` instead of `func_name(...)`.
+    pub lexical_functions: HashSet<String>,
 }
 
 /// RAII guard that pops the pipeline_output_stack when dropped.
@@ -136,6 +141,8 @@ impl Generator {
             suppress_set_e_depth: 0,
             associative_arrays: HashSet::new(),
             indexed_arrays: HashSet::new(),
+            fn_nesting_depth: 0,
+            lexical_functions: HashSet::new(),
         }
     }
 
@@ -160,6 +167,8 @@ impl Generator {
             suppress_set_e_depth: 0,
             associative_arrays: HashSet::new(),
             indexed_arrays: HashSet::new(),
+            fn_nesting_depth: 0,
+            lexical_functions: HashSet::new(),
         }
     }
 
@@ -184,6 +193,8 @@ impl Generator {
             suppress_set_e_depth: 0,
             associative_arrays: HashSet::new(),
             indexed_arrays: HashSet::new(),
+            fn_nesting_depth: 0,
+            lexical_functions: HashSet::new(),
         }
     }
 

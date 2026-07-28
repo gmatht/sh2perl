@@ -22,7 +22,7 @@ pub fn generate_zcat_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
         output.push_str("} else {\n");
         output.push_str(&format!(
-            "die \"zcat: {}: Cannot open file\\n\";\n",
+            "die \"zcat: {}: Cannot access file\\n\";\n",
             filename_str
         ));
         output.push_str("}\n");

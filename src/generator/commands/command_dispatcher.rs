@@ -825,7 +825,7 @@ pub fn generate_command_impl_with_input(
                                 result.push_str("      or die \"Cannot save STDOUT: $OS_ERROR\\n\";\n");
                                 result.push_str(&generator.indent());
                                 result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                                result.push_str("      or die \"Cannot open file: $OS_ERROR\\n\";\n");
+                                result.push_str("      or die \"Cannot access file: $OS_ERROR\\n\";\n");
                             }
 
                             // If there's a stderr redirect, add it inside the do block
@@ -997,11 +997,11 @@ pub fn generate_command_impl_with_input(
                     };
                     result.push_str(&generator.indent());
                     result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                    result.push_str("      or die \"Cannot open file: $OS_ERROR\\n\";\n");
+                    result.push_str("      or die \"Cannot access file: $OS_ERROR\\n\";\n");
                 } else {
                     result.push_str(&generator.indent());
                     result.push_str("open STDOUT, '>', 'temp_file.txt'\n");
-                    result.push_str("      or die \"Cannot open file: $OS_ERROR\\n\";\n");
+                    result.push_str("      or die \"Cannot access file: $OS_ERROR\\n\";\n");
                 }
                 // Add stderr redirect inside the output redirect do block
                 if has_stderr_redirect {

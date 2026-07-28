@@ -213,7 +213,8 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     .replace("\"", "\\\"")
                     .replace("\n", "\\n")
                     .replace("\t", "\\t")
-                    .replace("\r", "\\r");
+                    .replace("\r", "\\r")
+                    .replace("@", "\\@");
                 format!("\"{}\"", escaped)
             } else {
                 // Use q{} for single characters to avoid "noisy quotes" violations
