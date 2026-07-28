@@ -1964,10 +1964,19 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     // interpolation/quoting is preserved correctly.
                     let pipeline_code = crate::generator::commands::pipeline_commands::
                         generate_pipeline_for_substitution(generator, pipeline);
-                    format!(
-                        "do {{ local $CHILD_ERROR = 0; {}; }}",
-                        pipeline_code
-                    )
+                    // If the generator already returned a self-contained do block
+                    // (e.g., a Backtick expression), avoid double-wrapping it.
+                    // The CHILD_ERROR localisation is handled inside those blocks
+                    // or is unnecessary for simple qx{} results.
+                    let trimmed = pipeline_code.trim();
+                    if trimmed.starts_with("do {") && trimmed.ends_with("}") {
+                        trimmed.to_string()
+                    } else {
+                        format!(
+                            "do {{ local $CHILD_ERROR = 0; {}; }}",
+                            pipeline_code
+                        )
+                    }
                 }
                 Command::And(left_cmd, right_cmd) => {
                     // Debug: print the AST shapes for left and right when handling && in

@@ -3,6 +3,7 @@ use crate::generator::commands::builtins::{
     generate_generic_builtin, is_builtin, pipeline_supports_linebyline,
 };
 use crate::generator::Generator;
+use crate::ir::{expr_to_perl, IrExpr};
 use regex::Regex;
 
 /// Helper function to generate Perl code for a command using the builtins registry
@@ -699,7 +700,26 @@ pub fn generate_pipeline_for_substitution(
                         let unique_id = generator.get_unique_id();
                         return crate::generator::commands::tr::generate_tr_command_for_substitution(generator, simple_cmd, "input_data", &unique_id.to_string());
                     }
-                    _ => {}
+                    _ => {
+                        // Generic fallback for non-special-cased single commands:
+                        // Use IrExpr::Backtick to emit a clean qx{bash -c '...'}
+                        // expression instead of the full pipeline scaffold.
+                        // This addresses Pattern A (pipeline boilerplate) and
+                        // Pattern B (contradictory newline handling).
+                        let cmd_str = generator.generate_command_string_for_system(cmd);
+                        let lit = generator.perl_string_literal_no_interp(
+                            &Word::literal(cmd_str),
+                        );
+                        // Wrap in bash -c for safety: RawExpr("bash -c 'cmd'")
+                        // becomes qx{bash -c 'cmd'} inside the Backtick handler.
+                        let backtick = IrExpr::Backtick {
+                            expr: Box::new(IrExpr::RawExpr(
+                                format!("bash -c {}", lit),
+                            )),
+                            native: false,
+                        };
+                        return expr_to_perl(&backtick);
+                    }
                 }
             }
         }
