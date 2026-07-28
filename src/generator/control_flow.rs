@@ -196,15 +196,11 @@ pub fn generate_case_statement_impl(
                 // Default case (*)
                 pattern_conditions.push("1".to_string()); // Always true
             } else {
-                // Convert bash glob patterns to Perl regex
-                let mut perl_pattern = pattern_str;
+                // Check whether this is a simple literal pattern (no glob characters).
+                // If so, use `eq` instead of a regex match — it's cleaner and avoids
+                // the `msx` flags that are unnecessary for plain string equality.
+                let has_glob = pattern_str.contains('*') || pattern_str.contains('?') || pattern_str.contains('[') || pattern_str.contains(']');
 
-                perl_pattern = perl_pattern.replace("*", ".*");
-                perl_pattern = perl_pattern.replace("?", ".");
-                perl_pattern = perl_pattern.replace("[", "\\[");
-                perl_pattern = perl_pattern.replace("]", "\\]");
-
-                // Create condition: $operation =~ /^pattern$/
                 let word_str = generator.word_to_perl(&case_stmt.word);
 
                 // Handle positional parameters in case statements
@@ -212,23 +208,32 @@ pub fn generate_case_statement_impl(
                     || word_str.contains("$2")
                     || word_str.contains("$3")
                 {
-                    // Replace positional parameters with generic names that will be replaced later
                     word_str
                         .replace("$1", "$arg1")
                         .replace("$2", "$arg2")
                         .replace("$3", "$arg3")
                 } else if word_str.contains("$name") {
-                    // The word_to_perl converted $1 to $name, but we need $arg1 for parameter replacement
                     word_str.replace("$name", "$arg1")
                 } else {
                     word_str
                 };
 
-                // Fix the regex pattern - use proper Perl regex syntax
-                // Remove any remaining quotes from the pattern
-                let clean_pattern = perl_pattern.trim_matches('"').trim_matches('\'');
-                let regex_pattern = format!("^{}$", clean_pattern);
-                pattern_conditions.push(format!("{} =~ /{}/msx", processed_word, regex_pattern));
+                if has_glob {
+                    // Convert bash glob patterns to Perl regex
+                    let mut perl_pattern = pattern_str.to_string();
+                    perl_pattern = perl_pattern.replace("*", ".*");
+                    perl_pattern = perl_pattern.replace("?", ".");
+                    perl_pattern = perl_pattern.replace("[", "\\[");
+                    perl_pattern = perl_pattern.replace("]", "\\]");
+                    let clean_pattern = perl_pattern.trim_matches('"').trim_matches('\'');
+                    let regex_pattern = format!("^{}$", clean_pattern);
+                    pattern_conditions.push(format!("{} =~ /{}/msx", processed_word, regex_pattern));
+                } else {
+                    // Simple literal — use eq for clarity and performance.
+                    // Quote the pattern for Perl: wrap in single quotes (escape embedded quotes).
+                    let quoted_pattern = format!("'{}'", pattern_str.replace("\\", "\\\\").replace("'", "\\'"));
+                    pattern_conditions.push(format!("{} eq {}", processed_word, quoted_pattern));
+                }
             }
         }
 

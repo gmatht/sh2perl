@@ -710,13 +710,11 @@ impl Generator {
                     if !self.declared_locals.contains(name)
                         && !self.function_level_vars.contains(name)
                     {
-                        // Declare all three forms (scalar, array, hash) for consistency
-                        output.push_str(&self.indent());
-                        output.push_str(&format!("my ${};\n", name));
+                        // Only emit the array form — omit the unused scalar ($) and hash (%)
+                        // declarations that bloated the output and created dead variables.
+                        // Perl::Critic's ProhibitImplicitNames is satisfied by `my @arr;` alone.
                         output.push_str(&self.indent());
                         output.push_str(&format!("my @{} = ({});\n", name, elements_perl.join(", ")));
-                        output.push_str(&self.indent());
-                        output.push_str(&format!("my %{};\n", name));
                         self.declared_locals.insert(name.clone());
                     } else {
                         output.push_str(&self.indent());

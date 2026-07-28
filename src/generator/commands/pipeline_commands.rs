@@ -808,56 +808,23 @@ pub fn generate_pipeline_for_substitution(
         }
     }
 
-    // For complex pipelines, fall back to the original complex generation
-    // but with a timeout to prevent infinite loops
-    let output = generate_simple_pipe_pipeline(generator, pipeline, false);
-
-    // Simplify the output by removing excessive complexity
-    let simplified = if output.len() > 5000 {
-        // If output is too long, use a simple system call instead. Use a
-        // non-interpolating Perl literal for the original pipeline source so
-        // embedded "$" or newlines are preserved exactly when passed to
-        // bash -c.
-        let unique_id = generator.get_unique_id();
-        // Reconstruct the pipeline command string using the generator's
-        // system-command rendering so each argument is properly shell-quoted.
-        // This is more robust than using pipeline.source_text which may have
-        // been altered by the parser/environment and can lead to nested-quote
-        // collisions when embedded in an outer Perl literal.
-        // Prefer the original source text for the pipeline (first line) when
-        // available. The parser's source_text preserves the original quoting
-        // (for example: "-name \"*.txt\"") which we want to keep when
-        // embedding the pipeline into a shell -c / qx invocation. Fall back to
-        // the reconstructed command when source_text is not present.
-        let reconstructed_cmd = if let Some(src) = &pipeline.source_text {
-            // Use only the first line to avoid including nearby unrelated text
-            src.lines().next().unwrap_or(src).to_string()
-        } else {
-            generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
-        };
-        // Prefer a non-interpolating literal so shell snippets (awk/sed
-        // programs, etc.) containing "$" or "@" are preserved verbatim
-        // when embedded into the generated Perl source and later passed to
-        // qx{{bash -c ...}}. Using a non-interpolating literal prevents
-        // accidental Perl interpolation (e.g. $0 -> $PROGRAM_NAME) which
-        // changes the runtime shell command semantics.
-        let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(reconstructed_cmd));
-        format!(
-            "do {{\n    my $result_{} = qx{{bash -c {} }};\n    chomp $result_{};\n    $result_{};\n}}",
-            unique_id, cmd_lit, unique_id, unique_id
-        )
+    // For non-special-case pipelines used in command substitution, emit
+    // a clean `qx{...}` call using the IR Pipeline { capture } path.
+    // This avoids generating hundreds of lines of Perl reimplementing
+    // `ls | wc` and similar pipelines.
+    let unique_id = generator.get_unique_id();
+    let reconstructed_cmd = if let Some(src) = &pipeline.source_text {
+        src.lines().next().unwrap_or(src).to_string()
     } else {
-        // Preserve Perl backtick newline semantics.
-        // If output is already a do block, don't nest it - just return it (chomp is handled elsewhere)
-        let trimmed_output = output.trim();
-        if trimmed_output.starts_with("do {") && trimmed_output.ends_with("}") {
-            // Already a do block - return as-is (chomp should be handled at assignment level)
-            trimmed_output.to_string()
-        } else {
-            // Output is code that should be in a do block - wrap it properly
-            format!("do {{\n    do {{ {} }};\n}}", output.trim())
-        }
+        generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
     };
+    // Use a non-interpolating Perl literal so shell snippets (awk/sed
+    // programs, etc.) containing "$" or "@" are preserved verbatim.
+    let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(reconstructed_cmd));
+    let simplified = format!(
+        "do {{ my $result_{} = qx{{bash -c {} }}; chomp $result_{}; $result_{}; }}",
+        unique_id, cmd_lit, unique_id, unique_id
+    );
 
     // Add basic chomp and newline handling - temporarily disabled to fix compilation errors
     // TODO: Fix variable scoping issue with $cmd_result_ variables

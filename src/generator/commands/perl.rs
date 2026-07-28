@@ -2,6 +2,9 @@ use crate::ast::SimpleCommand;
 use crate::ast::Word;
 use crate::generator::commands::system_commands::word_to_bash_string_for_system;
 use crate::generator::Generator;
+use crate::ir::IrStmt;
+use crate::ir::IrExpr;
+use crate::ir::{stmt_to_perl, StrStyle};
 
 /// Simple transformation: replace bareword file handles in Perl code with lexical ones.
 /// This avoids Perl::Critic "Bareword file handle" violations.
@@ -146,52 +149,23 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                         eprintln!("DEBUG: Clean perl code: {}", clean_code);
                     }
 
-                    // Transform bareword file handles to lexical file handles
-                    clean_code = bareword_fh_to_lexical(&clean_code);
-                    if crate::debug::is_debug_enabled() {
-                        eprintln!("DEBUG: After bareword fix: {}", clean_code);
-                    }
+                    // Build a shell-safe command string: perl -e '<code>'
+                    // Use single-quote shell escaping so embedded $ and @ are preserved.
+                    let escaped_code = clean_code.replace("'", "'\\''");
+                    let cmd_str = format!("perl -e '{}'", escaped_code);
 
-                    if cmd.args.len() > 2 {
-                        output.push_str("@ARGV = (");
-                        for (i, arg) in cmd.args.iter().skip(2).enumerate() {
-                            if i > 0 {
-                                output.push_str(", ");
-                            }
-                            output.push_str(&generator.word_to_perl(arg));
-                        }
-                        output.push_str(");\n");
-                    }
-
-                    output.push_str("if (!defined $ENV{SHELL_VAR}) { $ENV{SHELL_VAR} = q{}; }\n");
-
-                    if crate::debug::is_debug_enabled() {
-                        eprintln!("DEBUG: About to execute perl code lines");
-                    }
-                    for line in clean_code.lines() {
-                        let trimmed_line = line.trim();
-                        if !trimmed_line.is_empty() {
-                            output.push_str(&generator.indent());
-                            let mut final_line = trimmed_line.to_string();
-                            if trimmed_line.starts_with("foreach $")
-                                && !trimmed_line.contains("my $")
-                            {
-                                final_line = trimmed_line.replace("foreach $", "foreach my $");
-                            }
-                            if !final_line.ends_with(';')
-                                && !final_line.ends_with('{')
-                                && !final_line.ends_with('}')
-                                && !final_line.starts_with('#')
-                            {
-                                output.push_str(&format!("{};\n", final_line));
-                            } else {
-                                output.push_str(&format!("{}\n", final_line));
-                            }
-                        }
-                    }
-                    if crate::debug::is_debug_enabled() {
-                        eprintln!("DEBUG: Returning perl output: {}", output);
-                    }
+                    let output_var = format!("perl_output_{}", generator.get_unique_id());
+                    let sys_stmt = IrStmt::System {
+                        cmd: IrExpr::Str("bash".to_string(), StrStyle::SingleQuoted),
+                        args: vec![
+                            IrExpr::Str("-c".to_string(), StrStyle::SingleQuoted),
+                            IrExpr::Str(cmd_str, StrStyle::SingleQuoted),
+                        ],
+                        capture: Some(output_var.clone()),
+                    };
+                    output.push_str(&stmt_to_perl(&sys_stmt, 0));
+                    output.push_str(&format!("chomp ${};\n", output_var));
+                    output.push_str(&format!("print ${};\n", output_var));
                     return output;
                 }
             } else if flag == "-ne" {
@@ -241,33 +215,14 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
 
     let output_var = format!("perl_output_{}", generator.get_unique_id());
 
-    if args_list.len() >= 2 && args_list[0] == "\"-e\"" {
-        let code = &args_list[1];
-        output.push_str(&format!(
-            "my ${} = do {{ 
-            my $result;
-            my $eval_success = eval {{
-                $result = capture_stdout( sub {{ {} }} );
-                1;
-            }};
-            if ( !$eval_success ) {{
-                $result = \"Error executing Perl code: $EVAL_ERROR\";
-            }}
-            $result;
-        }};\n",
-            output_var, code
-        ));
-    } else {
-        let formatted_args = args_list.join(" ");
-        output.push_str(&format!(
-            "my ${} = do {{ 
-            my $result = qx{{perl {}}};
-            chomp $result;
-            $result;
-        }};\n",
-            output_var, formatted_args
-        ));
-    }
+    // Fallback: use qx{...} for all paths (no capture_stdout needed).
+    // Running perl in a subprocess matches shell semantics and avoids
+    // the need for the capture_stdout helper in the preamble.
+    let formatted_args = args_list.join(" ");
+    output.push_str(&format!(
+        "my ${} = qx{{perl {}}};\nchomp ${};\n",
+        output_var, formatted_args, output_var
+    ));
     output.push_str(&format!("print ${};\n", output_var));
 
     output
@@ -396,33 +351,12 @@ pub fn generate_perl_pipeline_command(
 
         let output_var = format!("perl_output_{}", generator.get_unique_id());
 
-        if args_list.len() >= 2 && args_list[0] == "\"-e\"" {
-            let code = &args_list[1];
-            output.push_str(&format!(
-                "my ${} = do {{ 
-                my $result;
-                my $eval_success = eval {{
-                    $result = capture_stdout(sub {{ {} }});
-                    1;
-                }};
-                if (!$eval_success) {{
-                    $result = \"Error executing Perl code: $EVAL_ERROR\";
-                }}
-                $result;
-            }};\n",
-                output_var, code
-            ));
-        } else {
-            let formatted_args = args_list.join(" ");
-            output.push_str(&format!(
-                "my ${} = do {{ 
-                my $result = qx{{perl {}}};
-                chomp $result;
-                $result;
-            }};\n",
-                output_var, formatted_args
-            ));
-        }
+        // Use qx{...} for all fallback paths (no capture_stdout needed).
+        let formatted_args = args_list.join(" ");
+        output.push_str(&format!(
+            "my ${} = qx{{perl {}}};\nchomp ${};\n",
+            output_var, formatted_args, output_var
+        ));
         output.push_str(&format!("print ${};\n", output_var));
     }
 
