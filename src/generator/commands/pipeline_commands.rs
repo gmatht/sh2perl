@@ -2333,7 +2333,8 @@ fn generate_buffered_pipeline(
 
     if should_print {
         // Wrap the entire pipeline in a block scope to prevent variable contamination
-        output.push_str("{\n");
+        // Use do{ } instead of bare { } to ensure PPI correctly parses the block structure.
+        output.push_str("do {\n");
         generator.indent_level += 1;
 
         // For printing pipelines, use proper command chaining
@@ -3144,7 +3145,7 @@ fn generate_buffered_pipeline(
         }
 
         generator.indent_level -= 1;
-        output.push_str("}\n");
+        output.push_str("};\n");
         // Done generating this pipeline. Any pipeline id pushed above used a
         // guard and will be popped when the guard goes out of scope.
     }

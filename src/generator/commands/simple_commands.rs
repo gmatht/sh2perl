@@ -853,11 +853,17 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             }
                                         }
                                         // Return as a quoted string literal with proper escaping for Perl
-                                        // For -e flag, we want to preserve the interpreted newlines, so don't escape them
-                                        format!(
-                                            "\"{}\"",
-                                            result.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
-                                        )
+                                        // For -e flag, we want to preserve the interpreted newlines, so don't escape them.
+                                        // Escape $ and @ to prevent Perl interpolation of literal characters.
+                                        let escaped = result
+                                            .replace("\\", "\\\\")
+                                            .replace("\"", "\\\"")
+                                            .replace("\n", "\\n")
+                                            .replace("\t", "\\t")
+                                            .replace("\r", "\\r")
+                                            .replace("$", "\\$")
+                                            .replace("@", "\\@");
+                                        format!("\"{}\"", escaped)
                                     } else {
                                         generator.convert_string_interpolation_to_perl(interp)
                                     }
@@ -884,11 +890,17 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             .replace("\\\\", "\\");
 
                                         // Return as a quoted string literal with proper escaping for Perl
-                                        // For -e flag, we want to preserve the interpreted newlines, so don't escape them
-                                        format!(
-                                            "\"{}\"",
-                                            interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
-                                        )
+                                        // For -e flag, we want to preserve the interpreted newlines, so don't escape them.
+                                        // Escape $ and @ to prevent Perl interpolation of literal characters.
+                                        let escaped = interpreted
+                                            .replace("\\", "\\\\")
+                                            .replace("\"", "\\\"")
+                                            .replace("\n", "\\n")
+                                            .replace("\t", "\\t")
+                                            .replace("\r", "\\r")
+                                            .replace("$", "\\$")
+                                            .replace("@", "\\@");
+                                        format!("\"{}\"", escaped)
                                     } else {
                                         // Escaped backticks should be treated as literal backticks, not command substitution
                                         generator.perl_string_literal(arg)
@@ -987,16 +999,17 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                 .replace("\\\\", "\\");
 
                                             // Return as a quoted string literal with proper escaping for Perl
-                                            // For -e flag, escape newlines to prevent multiline string literals with indentation issues
-                                            format!(
-                                                "\"{}\"",
-                                                interpreted
-                                                    .replace("\\", "\\\\")
-                                                    .replace("\"", "\\\"")
-                                                    .replace("\n", "\\n")
-                                                    .replace("\t", "\\t")
-                                                    .replace("\r", "\\r")
-                                            )
+                                            // For -e flag, escape newlines to prevent multiline string literals with indentation issues.
+                                            // Escape $ and @ to prevent Perl interpolation of literal characters.
+                                            let escaped = interpreted
+                                                .replace("\\", "\\\\")
+                                                .replace("\"", "\\\"")
+                                                .replace("\n", "\\n")
+                                                .replace("\t", "\\t")
+                                                .replace("\r", "\\r")
+                                                .replace("$", "\\$")
+                                                .replace("@", "\\@");
+                                            format!("\"{}\"", escaped)
                                         } else {
                                             generator.perl_string_literal(arg)
                                         }
@@ -1075,11 +1088,17 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             }
                                         }
                                         // Return as a quoted string literal with proper escaping for Perl
-                                        // For -e flag, we want to preserve the interpreted newlines, so don't escape them
-                                        format!(
-                                            "\"{}\"",
-                                            result.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
-                                        )
+                                        // For -e flag, we want to preserve the interpreted newlines, so don't escape them.
+                                        // Escape $ and @ to prevent Perl interpolation of literal characters.
+                                        let escaped = result
+                                            .replace("\\", "\\\\")
+                                            .replace("\"", "\\\"")
+                                            .replace("\n", "\\n")
+                                            .replace("\t", "\\t")
+                                            .replace("\r", "\\r")
+                                            .replace("$", "\\$")
+                                            .replace("@", "\\@");
+                                        format!("\"{}\"", escaped)
                                     } else {
                                         generator.perl_string_literal(arg)
                                     }
@@ -1120,11 +1139,17 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                         .replace("\\\\", "\\");
 
                                     // Return as a quoted string literal with proper escaping for Perl
-                                    // For -e flag, we want to preserve the interpreted newlines, so don't escape them
-                                    format!(
-                                        "\"{}\"",
-                                        interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
-                                    )
+                                    // For -e flag, we want to preserve the interpreted newlines, so don't escape them.
+                                    // Escape $ and @ to prevent Perl interpolation of literal characters.
+                                    let escaped = interpreted
+                                        .replace("\\", "\\\\")
+                                        .replace("\"", "\\\"")
+                                        .replace("\n", "\\n")
+                                        .replace("\t", "\\t")
+                                        .replace("\r", "\\r")
+                                        .replace("$", "\\$")
+                                        .replace("@", "\\@");
+                                    format!("\"{}\"", escaped)
                                 } else {
                                     // Escaped backticks should be treated as literal backticks, not command substitution
                                     generator.perl_string_literal(arg)
@@ -1946,16 +1971,17 @@ pub fn generate_echo_command(
                                     }
                                 }
                                 // Return as a quoted string literal with proper escaping for Perl
-                                // Only escape quotes and backslashes, preserve newlines and tabs as-is
-                                format!(
-                                    "\"{}\"",
-                                    result
-                                        .replace("\\", "\\\\")
-                                        .replace("\"", "\\\"")
-                                        .replace("\n", "\\n")
-                                        .replace("\t", "\\t")
-                                        .replace("\r", "\\r")
-                                )
+                                // Only escape quotes and backslashes, preserve newlines and tabs as-is.
+                                // Escape $ and @ to prevent Perl interpolation of literal characters.
+                                let escaped = result
+                                    .replace("\\", "\\\\")
+                                    .replace("\"", "\\\"")
+                                    .replace("\n", "\\n")
+                                    .replace("\t", "\\t")
+                                    .replace("\r", "\\r")
+                                    .replace("$", "\\$")
+                                    .replace("@", "\\@");
+                                format!("\"{}\"", escaped)
                             } else {
                                 generator.perl_string_literal(arg)
                             }
@@ -1996,11 +2022,17 @@ pub fn generate_echo_command(
                                 .replace("\\\\", "\\");
 
                             // Return as a quoted string literal with proper escaping for Perl
-                            // Only escape quotes and backslashes, preserve newlines and tabs as-is
-                            format!(
-                                "\"{}\"",
-                                interpreted.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
-                            )
+                            // Only escape quotes and backslashes, preserve newlines and tabs as-is.
+                            // Escape $ and @ to prevent Perl interpolation of literal characters.
+                            let escaped = interpreted
+                                .replace("\\", "\\\\")
+                                .replace("\"", "\\\"")
+                                .replace("\n", "\\n")
+                                .replace("\t", "\\t")
+                                .replace("\r", "\\r")
+                                .replace("$", "\\$")
+                                .replace("@", "\\@");
+                            format!("\"{}\"", escaped)
                         } else {
                             generator.perl_string_literal(arg)
                         }
