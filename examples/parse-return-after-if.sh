@@ -5,3 +5,4 @@ f() {
     return
   fi
 }
+printf "parsed OK\\n"

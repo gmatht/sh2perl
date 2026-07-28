@@ -4,3 +4,4 @@ case "$x" in
   a) y=;;
   *) z=;;
 esac
+printf "parsed OK\\n"
