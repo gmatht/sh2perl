@@ -479,29 +479,29 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             let l = ir_expr_to_perl(lhs);
             let r = ir_expr_to_perl(rhs);
             let op_str = match op {
-                BinOpKind::Add => "+",
-                BinOpKind::Sub => "-",
-                BinOpKind::Mul => "*",
-                BinOpKind::Div => "/",
-                BinOpKind::Mod => "%",
-                BinOpKind::Pow => "**",
-                BinOpKind::Concat => ".",
-                BinOpKind::Eq => "==",
-                BinOpKind::Ne => "!=",
-                BinOpKind::Lt => "<",
-                BinOpKind::Gt => ">",
-                BinOpKind::Le => "<=",
-                BinOpKind::Ge => ">=",
-                BinOpKind::And => "&&",
-                BinOpKind::Or => "||",
-                BinOpKind::Not => "!",
-                BinOpKind::BitAnd => "&",
-                BinOpKind::BitOr => "|",
-                BinOpKind::BitXor => "^",
-                BinOpKind::ShiftL => "<<",
-                BinOpKind::ShiftR => ">>",
+                BinOpKind::Add => " + ",
+                BinOpKind::Sub => " - ",
+                BinOpKind::Mul => " * ",
+                BinOpKind::Div => " / ",
+                BinOpKind::Mod => " % ",
+                BinOpKind::Pow => " ** ",
+                BinOpKind::Concat => " . ",
+                BinOpKind::Eq => " == ",
+                BinOpKind::Ne => " !=",
+                BinOpKind::Lt => " < ",
+                BinOpKind::Gt => " > ",
+                BinOpKind::Le => " <=",
+                BinOpKind::Ge => " >=",
+                BinOpKind::And => " && ",
+                BinOpKind::Or => " || ",
+                BinOpKind::Not => " !",
+                BinOpKind::BitAnd => " & ",
+                BinOpKind::BitOr => " | ",
+                BinOpKind::BitXor => " ^ ",
+                BinOpKind::ShiftL => " << ",
+                BinOpKind::ShiftR => " >> ",
             };
-            format!("({} {} {})", l, op_str, r)
+            format!("{}{}{}", l, op_str, r)
         }
 
         IrExpr::Call { func, args } => {

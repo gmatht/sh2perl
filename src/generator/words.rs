@@ -1353,7 +1353,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             )
                         } else if name == "pwd" {
                             // Special handling for pwd in command substitution
-                            "do { use Cwd; getcwd(); }".to_string()
+                            "do { use Cwd; $CHILD_ERROR = 0; getcwd(); }".to_string()
                         } else if name == "basename" {
                             // When any argument is a CommandSubstitution,
                             // generate_command_string_for_system emits a placeholder
@@ -1785,12 +1785,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             "do { use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); $__node . \"\\n\"; }"
                                 .to_string()
                         } else if name == "cd" {
-                            // cd in command substitution: chdir and return empty string
+                            // cd in command substitution: chdir and return empty string.
+                            // Set $CHILD_ERROR so that && composition (used by Command::And
+                            // in word_to_perl) can correctly branch on exit status.
                             if simple_cmd.args.is_empty() {
-                                "do { chdir($ENV{HOME} || $ENV{USERPROFILE} || '.'); q{} };\n".to_string()
+                                "do { if (chdir($ENV{HOME} || $ENV{USERPROFILE} || \'.\')) { $CHILD_ERROR = 0 } else { $CHILD_ERROR = 1 }; q{} }\n".to_string()
                             } else {
                                 let dir = generator.word_to_perl(&simple_cmd.args[0]);
-                                format!("do {{ chdir({}); q{{}} }};\n", dir)
+                                format!("do {{ if (chdir({})) {{ $CHILD_ERROR = 0 }} else {{ $CHILD_ERROR = 1 }}; q{{}} }}\n", dir)
                             }
                         } else if name == "sed" {
                             // For sed in command substitution, use the array trick to avoid check_qx violations,
@@ -2093,23 +2095,109 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         );
                     }
 
-                    // Both sides are simple and without redirects: run the
-                    // combined command through the shell (qx{}) instead of
-                    // building complex do-blocks.  This produces much cleaner
-                    // Perl and avoids the left_result/right_result boilerplate.
-                    let command_str =
-                        crate::generator::redirects::generate_bash_command_string(cmd);
-                    let result_var = format!("and_result_{}", generator.get_unique_id());
-                    let ir_stmt = crate::ir::IrStmt::System {
-                        cmd: crate::ir::IrExpr::Str(command_str, crate::ir::StrStyle::Command),
-                        args: vec![],
-                        capture: Some(result_var.clone()),
+                    // Both sides are simple and without redirects: compose them
+                    // in native Perl via IR nodes instead of raw format strings.
+                    // The left_result/right_result pattern preserves native Perl
+                    // emulation (e.g. File::Copy for cp, unlink for rm) rather
+                    // than falling back to qx{...} / shell.
+                    let unique_id = generator.get_unique_id();
+                    let left_var = format!("left_result_{}", unique_id);
+                    let right_var = format!("right_result_{}", unique_id);
+                    let left_result = word_to_perl_impl(
+                        generator,
+                        &Word::CommandSubstitution(left_cmd.clone(), Default::default()),
+                    );
+
+                    let mut right_result = word_to_perl_impl(
+                        generator,
+                        &Word::CommandSubstitution(right_cmd.clone(), Default::default()),
+                    );
+
+                    // sha256sum/sha512sum -c special case: pass left output directly
+                    if let Command::Simple(simple_right) = right_cmd.as_ref() {
+                        if let Word::Literal(rname, _) = &simple_right.name {
+                            if (rname == "sha256sum" || rname == "sha512sum")
+                                && simple_right
+                                    .args
+                                    .iter()
+                                    .any(|a| matches!(a, Word::Literal(s, _) if s == "-c"))
+                            {
+                                let mut input_var = String::new();
+                                if let Command::Simple(simple_left) = left_cmd.as_ref() {
+                                    if simple_left.redirects.is_empty() {
+                                        input_var = format!("${}", left_var);
+                                    }
+                                }
+                                if !input_var.is_empty() {
+                                    if rname == "sha256sum" {
+                                        right_result = crate::generator::commands::sha256sum::generate_sha256sum_command(
+                                            generator, simple_right, &input_var,
+                                        );
+                                    } else {
+                                        right_result = crate::generator::commands::sha512sum::generate_sha512sum_command(
+                                            generator, simple_right, &input_var,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let left_normalized = left_result
+                        .replace("my @results;\n    do {", "do {")
+                        .replace("my @results;\ndo {", "do {");
+                    let right_normalized = right_result
+                        .replace("my @results;\n    do {", "do {")
+                        .replace("my @results;\ndo {", "do {");
+
+                    let left_wrapped = if left_normalized.trim_start().starts_with("do {") {
+                        left_normalized.trim_end().to_string()
+                    } else {
+                        format!("do {{ {} }}", left_normalized.trim_end())
                     };
-                    let qx_perl = crate::ir::stmt_to_perl(&ir_stmt, 0);
-                    format!(
-                        "do {{\n{}    ${};\n}}",
-                        qx_perl, result_var
-                    )
+
+                    let right_wrapped = if right_normalized.trim_start().starts_with("do {") {
+                        right_normalized.trim_end().to_string()
+                    } else {
+                        format!("do {{ {} }}", right_normalized.trim_end())
+                    };
+
+                    // Build IR: declare left_result, then if/else with concat.
+                    // Use a proper multi-line do block with indentation.
+                    // We indent body statements directly so RawText splices
+                    // correctly regardless of nesting depth.
+                    let mut do_body = String::from("do {\n");
+                    crate::ir::emit_indent(&mut do_body, 1);
+                    do_body.push_str(&format!("my ${} = {};\n", left_var, left_wrapped));
+                    // if ($CHILD_ERROR == 0) { ... } else { ... }
+                    let then_raw = format!(
+                        "{}my ${} = {};\n{}${} . ${};\n",
+                        "        ", right_var, right_wrapped,
+                        "        ", left_var, right_var,
+                    );
+                    crate::ir::emit_stmt(
+                        &mut do_body,
+                        &crate::ir::IrStmt::If {
+                            cond: crate::ir::IrExpr::BinOp {
+                                lhs: Box::new(crate::ir::IrExpr::Var(
+                                    "CHILD_ERROR".to_string(),
+                                    crate::ir::Sigil::Scalar,
+                                )),
+                                op: crate::ir::BinOpKind::Eq,
+                                rhs: Box::new(crate::ir::IrExpr::Int(0)),
+                            },
+                            then: vec![
+                                crate::ir::IrStmt::RawText(then_raw),
+                            ],
+                            elsifs: vec![],
+                            else_: vec![
+                                crate::ir::IrStmt::RawText("        q{};\n".to_string()),
+                            ],
+                        },
+                        1,
+                    );
+                    do_body.push_str("}");
+                    do_body
                 }
                 _ => {
                     // For other command types, execute the real shell command so
