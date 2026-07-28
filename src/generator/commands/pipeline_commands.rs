@@ -721,15 +721,11 @@ pub fn generate_pipeline_for_substitution(
                         } else {
                             cmd_str
                         };
-                        let lit = generator.perl_string_literal_no_interp(
-                            &Word::literal(final_cmd_str),
-                        );
-                        // Wrap in bash -c for safety: RawExpr("bash -c 'cmd'")
-                        // becomes qx{bash -c 'cmd'} inside the Backtick handler.
+                        // Use the command string directly inside qx{...} instead
+                        // of wrapping in bash -c.  Perl's qx{} executes through
+                        // /bin/sh by default.
                         let backtick = IrExpr::Backtick {
-                            expr: Box::new(IrExpr::RawExpr(
-                                format!("bash -c {}", lit),
-                            )),
+                            expr: Box::new(IrExpr::RawExpr(final_cmd_str)),
                             native: false,
                         };
                         return expr_to_perl(&backtick);
@@ -853,12 +849,18 @@ pub fn generate_pipeline_for_substitution(
     } else {
         reconstructed_cmd
     };
-    // Use a non-interpolating Perl literal so shell snippets (awk/sed
-    // programs, etc.) containing "$" or "@" are preserved verbatim.
-    let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(final_cmd));
+    // Use the command string directly inside qx{...} instead of passing
+    // it through bash -c.  Perl's qx{} already runs through /bin/sh by
+    // default, so the bash -c wrapper is unnecessary for simple pipelines.
+    // Choose a qx delimiter that won't conflict with the command string.
+    let (qx_open, qx_close) = if final_cmd.contains('}') {
+        ("qx(", ")")
+    } else {
+        ("qx{", "}")
+    };
     let simplified = format!(
-        "do {{ my $result_{} = qx{{bash -c {} }}; chomp $result_{}; $result_{}; }}",
-        unique_id, cmd_lit, unique_id, unique_id
+        "do {{ chomp(my $result_{} = {}{}{}); $result_{}; }}",
+        unique_id, qx_open, final_cmd, qx_close, unique_id
     );
 
     // Add basic chomp and newline handling - temporarily disabled to fix compilation errors
