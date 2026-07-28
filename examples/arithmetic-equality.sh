@@ -5,3 +5,5 @@ n=5
 if (( $n == 5 )); then
   echo "equal"
 fi
+printf "%s=[%s]\n" n "${n:-}"
+

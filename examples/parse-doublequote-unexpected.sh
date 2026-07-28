@@ -3,3 +3,5 @@
 OPTIONS_SPEC="\
 --branch=<newname> \
 "
+printf "%s=[%s]\n" OPTIONS_SPEC "${OPTIONS_SPEC:-}"
+

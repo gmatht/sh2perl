@@ -6,3 +6,5 @@ function test() {
     echo 'hello world'
     RESULT=$(echo test)
 }
+printf "%s=[%s]\n" RESULT "${RESULT:-}"
+

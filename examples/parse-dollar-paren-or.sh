@@ -8,3 +8,5 @@ r=$(
     x=$?
 }
 echo "$r"
+printf "%s=[%s]\n" x "${x:-}"
+

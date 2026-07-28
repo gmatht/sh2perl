@@ -6,3 +6,5 @@ eval '
     fi
   }
 '
+printf "%s=[%s]\n" SHELLPROXY_URL "${SHELLPROXY_URL:-}"
+

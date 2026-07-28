@@ -5,3 +5,5 @@ case "$arch" in
         cpu="$basic_machine"
         ;;
 esac
+printf "%s=[%s]\n" cpu "${cpu:-}"
+

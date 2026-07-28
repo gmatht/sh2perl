@@ -5,3 +5,5 @@ var=test
 the body
 EOF
 printf 'heredoc+subshell+redirect ran OK\n'
+printf "%s=[%s]\n" var "${var:-}"
+

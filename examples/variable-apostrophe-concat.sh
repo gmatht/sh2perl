@@ -3,3 +3,5 @@
 x=hello
 y=$x'world'
 echo $y
+printf "%s=[%s]\n" x "${x:-}"
+
