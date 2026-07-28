@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
+use crate::ir::{stmt_to_perl, Decl, IrExpr, IrStmt, Sigil};
 
 pub fn generate_sha512sum_command(
     generator: &mut Generator,
@@ -187,7 +188,19 @@ pub fn generate_sha512sum_command(
                         file
                     };
                 output.push_str(&format!("    if ( -f {} ) {{\n", file));
-                output.push_str(&format!("        my $hash = sha512_hex(\n            do {{\n                local $INPUT_RECORD_SEPARATOR = undef;\n                open my $fh, '<', {}\n                  or croak \"Cannot open {}: $ERRNO\";\n                my $content = <$fh>;\n                close $fh\n                  or croak \"Close failed: $ERRNO\";\n                $content;\n            }}\n        );\n", file, file));
+                output.push_str(&format!("        my $hash = sha512_hex(\n            do {{\n                "));
+                output.push_str(&stmt_to_perl(
+                    &IrStmt::Declare {
+                        vars: vec![Decl {
+                            name: "/".to_string(),
+                            sigil: Sigil::Scalar,
+                        }],
+                        init: Some(IrExpr::RawExpr("undef".to_string())),
+                        local: true,
+                    },
+                    0,
+                ));
+                output.push_str(&format!("                open my $fh, '<', {}\n                  or croak \"Cannot open {}: $!\";\n                my $content = <$fh>;\n                close $fh\n                  or croak \"Close failed: $!\";\n                $content;\n            }}\n        );\n", file, file));
                 output.push_str(&format!(
                     "        push @results, \"$hash  {}\";\n",
                     unquoted_file
@@ -216,7 +229,19 @@ pub fn generate_sha512sum_command(
                         file
                     };
                 output.push_str(&format!("    if ( -f {} ) {{\n", file));
-                output.push_str(&format!("        my $hash = sha512_hex(\n            do {{\n                local $INPUT_RECORD_SEPARATOR = undef;\n                open my $fh, '<', {}\n                  or croak \"Cannot open {}: $ERRNO\";\n                my $content = <$fh>;\n                close $fh\n                  or croak \"Close failed: $ERRNO\";\n                $content;\n            }}\n        );\n", file, file));
+                output.push_str(&format!("        my $hash = sha512_hex(\n            do {{\n                "));
+                output.push_str(&stmt_to_perl(
+                    &IrStmt::Declare {
+                        vars: vec![Decl {
+                            name: "/".to_string(),
+                            sigil: Sigil::Scalar,
+                        }],
+                        init: Some(IrExpr::RawExpr("undef".to_string())),
+                        local: true,
+                    },
+                    0,
+                ));
+                output.push_str(&format!("                open my $fh, '<', {}\n                  or croak \"Cannot open {}: $!\";\n                my $content = <$fh>;\n                close $fh\n                  or croak \"Close failed: $!\";\n                $content;\n            }}\n        );\n", file, file));
                 output.push_str(&format!(
                     "        push @results, \"$hash  {}\";\n",
                     unquoted_file

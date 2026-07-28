@@ -4,6 +4,7 @@ use super::paste::generate_paste_command;
 use crate::ast::*;
 use crate::generator::utils::get_temp_dir;
 use crate::generator::Generator;
+use crate::ir::{stmt_to_perl, IrExpr, IrStmt, StrStyle};
 
 // Helper function to recursively collect all redirects from nested RedirectCommands
 fn collect_all_redirects(command: &Command) -> (Vec<Redirect>, Command) {
@@ -965,6 +966,78 @@ pub fn generate_command_impl_with_input(
                             }
 
                             return result;
+                        }
+                    }
+                }
+            }
+
+            // Fast path for echo with output redirect: emit direct file write
+            // using IrStmt::Output { target } instead of the STDOUT dup/restore pattern.
+            if has_output_redirect && !has_stderr_redirect && process_sub_files.is_empty() {
+                if let Command::Simple(echo_cmd) = &base_command {
+                    if let Word::Literal(name, _) = &echo_cmd.name {
+                        if name == "echo" && !echo_cmd.args.is_empty() {
+                            fn is_simple_literal_arg(word: &Word) -> Option<String> {
+                                match word {
+                                    Word::Literal(s, _) => Some(s.clone()),
+                                    Word::StringInterpolation(interp, _) => {
+                                        if interp.parts.len() == 1 {
+                                            if let crate::ast::StringPart::Literal(s) = &interp.parts[0] {
+                                                // Strip surrounding quotes if present
+                                                let bare = if (s.starts_with('"') && s.ends_with('"'))
+                                                    || (s.starts_with('\'') && s.ends_with('\''))
+                                                {
+                                                    &s[1..s.len()-1]
+                                                } else {
+                                                    s
+                                                };
+                                                return Some(bare.to_string());
+                                            }
+                                        }
+                                        None
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            let has_echo_flags = echo_cmd.args.iter().any(|a| {
+                                matches!(a, Word::Literal(s, _) if s == "-e" || s == "-n")
+                            });
+                            let all_simple = echo_cmd.args.iter().all(|a| is_simple_literal_arg(a).is_some());
+                            // Only apply fast path for simple literal echo (no -e/-n flags).
+                            if !has_echo_flags && all_simple {
+                                if let Some(redirect) = all_redirects.iter().find(|r| {
+                                    matches!(r.operator, RedirectOperator::Output)
+                                }) {
+                                    let target_str = match &redirect.target {
+                                        Word::Literal(s, _) => s.clone(),
+                                        _ => generator.word_to_perl(&redirect.target),
+                                    };
+                                    let content = echo_cmd.args.iter()
+                                        .filter_map(|a| is_simple_literal_arg(a))
+                                        .collect::<Vec<_>>()
+                                        .join(" ");
+                                    let target_lit = generator.perl_string_literal(
+                                        &Word::literal(target_str.clone()),
+                                    );
+                                    let expr = IrExpr::Str(content, StrStyle::DoubleQuoted);
+                                    let output_stmt = IrStmt::Output {
+                                        value: expr,
+                                        newline: true,
+                                        target: Some("fh".to_string()),
+                                    };
+                                    result.push_str(&generator.indent());
+                                    result.push_str(&format!(
+                                        "open my $fh, '>', {} or die \"{}: $!\\n\";\n",
+                                        target_lit,
+                                        target_str
+                                    ));
+                                    result.push_str(&stmt_to_perl(&output_stmt, generator.indent_level));
+                                    result.push_str(&generator.indent());
+                                    result.push_str("close $fh;\n");
+                                    // Skip the rest of the redirect handler
+                                    return result;
+                                }
+                            }
                         }
                     }
                 }

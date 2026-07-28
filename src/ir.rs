@@ -123,19 +123,24 @@ pub struct Decl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrStmt {
     /// Output: print/say with optional trailing newline
+    /// If `target` is Some(filehandle_name), output goes to that filehandle
+    /// (e.g. `$fh`) instead of STDOUT.  The name is emitted without a leading `$`.
     Output {
         value: IrExpr,
         newline: bool,
+        target: Option<String>,
     },
     /// Assignment
     Assign {
         targets: Vec<AssignTarget>,
         expr: IrExpr,
     },
-    /// Local variable declaration
+    /// Variable declaration
     Declare {
         vars: Vec<Decl>,
         init: Option<IrExpr>,
+        /// If true, emit `local` instead of `my`.
+        local: bool,
     },
     /// Array/hash assignment
     DeclareArray {
@@ -166,6 +171,18 @@ pub enum IrStmt {
         body: Vec<IrStmt>,
         cond: IrExpr,
         until: bool,
+    },
+    /// Fatal error: die/croak with a message expression
+    Die {
+        expr: IrExpr,
+        /// If true, emit `croak` instead of `die` (requires `use Carp`).
+        carp: bool,
+    },
+    /// Warning: warn/carp with a message expression
+    Warn {
+        expr: IrExpr,
+        /// If true, emit `carp` instead of `warn` (requires `use Carp`).
+        carp: bool,
     },
     /// System call
     System {
@@ -295,9 +312,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str(text);
         }
 
-        IrStmt::Output { value, newline } => {
+        IrStmt::Output { value, newline, target } => {
             let expr = ir_expr_to_perl(value);
-            if *newline {
+            if let Some(fh) = target {
+                // Output to a specific filehandle: print $fh ... or say $fh ...
+                emit_indent(out, indent);
+                if *newline {
+                    // Use `say {*$fh} ...` or `say $fh ...` for filehandles.
+                    out.push_str(&format!("say {{*{}}} {};\n", fh, expr));
+                } else {
+                    out.push_str(&format!("print {{*{}}} {};\n", fh, expr));
+                }
+            } else if *newline {
                 // Use `say` for newline-terminated output (cleaner than
                 // print + manual newline check).
                 emit_indent(out, indent);
@@ -324,7 +350,8 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             }
         }
 
-        IrStmt::Declare { vars, init } => {
+        IrStmt::Declare { vars, init, local } => {
+            let kw = if *local { "local" } else { "my" };
             let decls = vars
                 .iter()
                 .map(|d| match d.sigil {
@@ -337,16 +364,16 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             if let Some(init_expr) = init {
                 let rhs = ir_expr_to_perl(init_expr);
                 emit_indent(out, indent);
-                // Single scalar can omit parentheses: "my $x = expr;"
-                // Multiple vars need parentheses: "my ($x, $y) = (expr1, expr2);"
-                if vars.len() == 1 && vars[0].sigil == Sigil::Scalar {
-                    out.push_str(&format!("my {} = {};\n", decls, rhs));
+                // `local` always uses the `local $var = expr;` form.
+                // `my`: single scalar can omit parentheses: "my $x = expr;"
+                if *local || (vars.len() == 1 && vars[0].sigil == Sigil::Scalar) {
+                    out.push_str(&format!("{} {} = {};\n", kw, decls, rhs));
                 } else {
-                    out.push_str(&format!("my ({}) = ({});\n", decls, rhs));
+                    out.push_str(&format!("{} ({}) = ({});\n", kw, decls, rhs));
                 }
             } else {
                 emit_indent(out, indent);
-                out.push_str(&format!("my {};\n", decls));
+                out.push_str(&format!("{} {};\n", kw, decls));
             }
         }
 
@@ -411,6 +438,20 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             }
             emit_indent(out, indent);
             out.push_str("}\n");
+        }
+
+        IrStmt::Die { expr, carp } => {
+            let e = ir_expr_to_perl(expr);
+            let kw = if *carp { "croak" } else { "die" };
+            emit_indent(out, indent);
+            out.push_str(&format!("{} {};\n", kw, e));
+        }
+
+        IrStmt::Warn { expr, carp } => {
+            let e = ir_expr_to_perl(expr);
+            let kw = if *carp { "carp" } else { "warn" };
+            emit_indent(out, indent);
+            out.push_str(&format!("{} {};\n", kw, e));
         }
 
         IrStmt::System { cmd, args, capture } => {
@@ -760,6 +801,7 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
         }
         IrStmt::DeclareArray { var, .. } => var == "main_exit_code",
         IrStmt::Return(None) => false,
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => expr_refers_to_main_exit(expr),
     }
 }
 
