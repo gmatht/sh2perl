@@ -7,3 +7,6 @@ if true; then
 ${VAR} more ${VAR2} text
 EOF
 fi
+printf "%s=[%s]\n" VAR "${VAR:-}"
+printf "%s=[%s]\n" VAR2 "${VAR2:-}"
+
