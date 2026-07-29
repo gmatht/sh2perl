@@ -1,62 +1,73 @@
 # Failing Test Notes
 
-## All tests passing (512/512) 🎉
+## Current status: 173/517 passed, 344 failing
 
-All tests pass with no failures or timeouts.
+After the `--test-file` error-propagation fix, previously silent failures are now
+reported. The following systematic issues were fixed:
 
-## No remaining check_qx.pl violations
+## Fixed issues (this session)
 
-All qx{}/system() violations have been resolved.
+1. **`say` used without `use feature 'say'`**: The IR statement emitter used `say`
+   for `Output { newline: true }` but the generator preamble did not include
+   `use feature 'say'`. Fixed by emitting `print` with embedded `\n` instead of
+   `say` in `emit_stmt()` (ir.rs).
 
-## Fixed issues
+2. **`cmd_str_to_open_perl` returned empty string**: The function was supposed to
+   convert a shell command string into Perl code using `open()` instead of `qx{...}`,
+   but returned `"q{}"` (empty string constant). Fixed to produce a proper
+   `do { open(my $fh, '-|', 'bash', '-c', q{...}) or die ... }` block (ir.rs).
 
-1. **parse_command_redirects double call + newline consumption**: The `parse_command_redirects`
-   function was called twice (once from `parse_pipeline` and once from `parse_command`).
-   The first call to `skip_whitespace_and_comments()` (and similar calls in 
-   `parse_pipeline_from_command` and `parse_command`) consumed newlines that separated
-   commands, causing the second call's arg-collection loop to steal tokens from the
-   next command as additional arguments. Fixed by using `skip_inline_whitespace_and_comments`
-   instead (preserving newlines) and adding a standalone-assignment check in the
-   arg-collection loop.
+3. **Missing `$__set_e` declaration**: The `set -e` handler (for `set -e`/`set -euo`)
+   emitted `$__set_e = 1;` but the variable declaration `my $__set_e = 0;` was only
+   emitted before processing commands, when `set_e_active` was still false. Fixed by
+   adding a pre-scan for `set -e` that sets `set_e_active` before the declaration
+   block (mod.rs).
 
-2. **Standalone assignment operator lost**: `parse_standalone_assignment` read the
-   assignment operator (`+=`, `-=`, etc.) but always constructed `Command::Assignment`
-   with `AssignmentOperator::Assign`, losing the operator information. Fixed by
-   tracking the operator in a separate `BTreeMap` and using it when constructing
-   the Assignment command.
+4. **Missing `$CHILD_ERROR` declaration**: The `our $CHILD_ERROR;` declaration was
+   only emitted when `needs_ipc_open3` or `needs_exit_code_tracking` returned true.
+   Scripts with backtick command substitutions (which reference `$CHILD_ERROR`)
+   but without pipelines/operators missed the declaration. Fixed by adding
+   `has_command_substitution` check (mod.rs).
 
-3. **Heredoc pipeline timeout (063_05_heredoc_with_complex_content.sh)**: Two issues:
-   - The IR-based clean path in `generate_buffered_pipeline` used qx{...} for pipeline
-     capture, but `generate_bash_command_string` did not serialize heredoc redirects,
-     causing the heredoc content to be lost and `command cat` to hang waiting for stdin.
-     Fixed by detecting heredocs in the pipeline and skipping the clean path.
-   - The `do { ... }` block emitted by the scaffolding path lacked a trailing semicolon,
-     causing a Perl syntax error (`do BLOCK` without semicolon is ambiguous).
-     Fixed by changing `"}\n"` to `"};\n"`.
+5. **`croak` used without `use Carp`**: Many command generators (cp, mv, rm, mkdir,
+   touch, cat, grep, etc.) emit `croak()` calls but `use Carp` was only imported
+   for a few commands. Fixed by always importing `use Carp` (mod.rs).
 
-4. **Temp file race condition in parallel tests**: The hard-coded temp file name
-   `/tmp/__tmp_test_output.pl` caused race conditions when multiple test workers
-   ran in parallel, overwriting each other's temporary Perl files. Fixed by using
-   unique temp file names based on the test filename.
+6. **`$OS_ERROR`/`$ERRNO` used without `use English`**: The same generators use
+   English variable names but `use English` was only conditionally imported.
+   Fixed by always importing `use English` (mod.rs).
 
-5. **$PROGRAM_NAME assignment without use English**: The generator emitted
-   `$PROGRAM_NAME = '...'` when `set_original_script_name` was called, but didn't
-   ensure `use English` was imported, causing "Global symbol requires explicit
-   package name" errors. Fixed by using `$0` directly instead of `$PROGRAM_NAME`.
+7. **`$0` -> `$PROGRAM_NAME` conversion required `use English`**: The generator
+   converted shell `$0` to Perl `$PROGRAM_NAME` which requires the English module.
+   Changed to use `$0` directly (words.rs, utils.rs).
 
-6. **Missing $main_exit_code declaration for pipeline scaffolding**: The pipeline
-   scaffolding path references `$main_exit_code` but `needs_exit_code_tracking`
-   only returned true for pipelines with >2 commands, causing compilation errors.
-   Fixed by making `needs_exit_code_tracking` return true for any pipeline.
+8. **Pre-analysis detection functions missed `Redirect`/`Not` wrappers**:  
+   `command_uses_ls`, `command_uses_locale`, and `command_uses_english` did not
+   recurse into `Command::Redirect` or `Command::Not`, causing variables like
+   `$ls_success` to go undeclared when commands were wrapped in redirects.
+   Fixed by adding the missing match arms.
 
-7. **wc format string trailing space**: The wc command generator used
-   `fmt_parts.join(" ")` to join format parts, which added a space between `%d`
-   and `\n` even for single-column output, producing output like `"1 "` instead
-   of `"1"`. Fixed by joining without spaces for single-column output.
+## Remaining failures (~344)
 
-8. **Subshell in pipeline line-splitting corrupts multi-line literals**: When a
-   subshell command (containing heredocs) was the first command in a pipeline,
-   the scaffolding path split the generated Perl code into lines and re-indented
-   each line, corrupting multi-line string literals like `q{...}`. Fixed by
-   treating Subshell commands like Redirect commands (using the full generator
-   output without line-splitting).
+The remaining failures fall into several categories:
+
+1. **Runtime stderr warnings** (e.g., uninitialized values, filehandle issues):
+   Generated Perl code compiles but produces warnings on stderr that bash does not.
+   Many of these are due to incomplete variable initialization or filehandle
+   management in the command generators.
+
+2. **stdout formatting mismatches**: The translated output differs from bash
+   output (e.g., extra blank lines, missing content, wrong quoting). These are
+   specific to individual command generators and string interpolation code.
+
+3. **Test expression issues** (`[[ ... ]]`): Command substitution inside test
+   expressions (like `[[ $(uname -r) == 5.4.* ]]`) is not properly translated,
+   producing literal `$(uname` in the Perl output which is a syntax error.
+
+4. **Edge cases in parameter expansion, heredocs, arrays**: Various edge cases
+   in complex shell constructs that the generator does not handle correctly.
+
+5. **Pipeline output discrepancies**: Some pipelines produce extra blank lines
+   or missing output compared to bash.
+
+Each of these requires targeted fixes in specific generator modules.
