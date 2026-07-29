@@ -371,15 +371,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     out.push_str(&format!("print {{*{}}} {};\n", fh, expr));
                 }
             } else if *newline {
-                // Use `print` with newline for newline-terminated output.
-                // This avoids the dependency on `use feature 'say'`.
-                // For double-quoted string literals, embed \\n directly
-                // instead of concatenating a separate "\\n".
-                let is_dq = expr.starts_with('"') && expr.ends_with('"') && expr.len() >= 2;
-                if is_dq {
-                    let inner = &expr[1..expr.len()-1];
+                // For string literals (double-quoted, single-quoted, or q{...}),
+                // embed \\n directly instead of concatenating a separate "\\n".
+                if let Some(embedded) = try_embed_newline_in_string_literal(&expr) {
                     emit_indent(out, indent);
-                    out.push_str(&format!("print \"{}\\n\";\n", inner));
+                    out.push_str(&embedded);
                 } else {
                     emit_indent(out, indent);
                     out.push_str(&format!("print {}, \"\\n\";\n", expr));
@@ -1019,6 +1015,49 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 pub(crate) fn emit_indent(out: &mut String, indent: usize) {
     for _ in 0..indent {
         out.push_str("    ");
+    }
+}
+
+/// Try to embed a newline directly into a string literal for `Output { newline: true }`.
+///
+/// When the expression is a simple string literal (double-quoted, single-quoted,
+/// or `q{...}`), this function returns `Some(statement)` with `\n` embedded
+/// directly inside the string, producing cleaner Perl like `print "Hello\n";`
+/// instead of `print 'Hello', "\n";`.
+///
+/// Returns `None` for variables, function calls, interpolated strings, or any
+/// expression that is not a plain string literal.
+fn try_embed_newline_in_string_literal(expr: &str) -> Option<String> {
+    let s = expr.trim();
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        // Double-quoted string: just insert \n before the closing quote.
+        let inner = &s[1..s.len()-1];
+        Some(format!("print \"{}\\n\";\n", inner))
+    } else if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
+        // Single-quoted string: convert to double-quoted with \n.
+        // Escape characters that have special meaning in double-quoted strings.
+        let inner = &s[1..s.len()-1];
+        let escaped = inner
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("$", "\\$")
+            .replace("@", "\\@");
+        Some(format!("print \"{}\\
+\";\n", escaped))
+    } else if s.len() >= 4 && s.starts_with("q{") && s.ends_with('}') {
+        // q{...} string: convert to double-quoted with \n.
+        let inner = &s[2..s.len()-1];
+        let escaped = inner
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("$", "\\$")
+            .replace("@", "\\@")
+            .replace("{", "\\{")
+            .replace("}", "\\}");
+        Some(format!("print \"{}\\
+\";\n", escaped))
+    } else {
+        None
     }
 }
 
