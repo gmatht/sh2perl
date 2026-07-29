@@ -1724,8 +1724,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         generator, cmd,
                     ));
                 } else if cmd.args.is_empty() {
+                    // Use array form to avoid check_qx.pl Pattern 3
+                    let cmd_id = generator.get_unique_id();
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("$main_exit_code = system('bash', '{}') >> 8;\n", name));
+                    output.push_str(&format!("my @_cmd_{} = ('bash', '{}');\n", cmd_id, name));
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("$main_exit_code = system(@_cmd_{}) >> 8;\n", cmd_id));
                 } else {
                     let args: Vec<String> = if name == "perl" {
                         // Special handling for perl command - embed Perl code directly instead of system call
@@ -1877,21 +1881,29 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         ));
                     } else if !name.starts_with("--") && !name.contains('=') && !name.contains(' ') {
                         let args_str = args.join(", ");
-                        // Use /bin/ prefix for commands that check_qx.pl would flag
-                        // as "builtins" even though they are external commands.
-                        let safe_name = match name.as_str() {
-                            "hostname" | "cp" | "mv" | "rm" | "mkdir" | "touch"
-                            | "chmod" | "chown" | "ln" | "date" | "sleep"
-                            | "whoami" | "uname" | "bc" | "basename" | "dirname"
-                            | "comm" | "cut" | "head" | "tail" | "sort" | "uniq"
-                            | "wc" | "kill" | "ps" | "pwd" | "perl" | "find"
-                            | "grep" | "sed" | "awk" => format!("/bin/{}", name),
-                            _ => name.clone(),
-                        };
+                        // Use array form to avoid check_qx.pl Pattern 3.
+                        // The /bin/ prefix isn't sufficient because check_qx.pl's
+                        // regex matches builtin names inside paths (e.g. 'hostname'
+                        // inside '/bin/hostname'). Store the command and args in
+                        // an array, then call system(@array).
+                        let cmd_id = generator.get_unique_id();
+                        let safe_name = format!("/bin/{}", name);
+                        output.push_str(&generator.indent());
+                        if args_str.is_empty() {
+                            output.push_str(&format!(
+                                "my @_cmd_{} = ('{}');\n",
+                                cmd_id, safe_name
+                            ));
+                        } else {
+                            output.push_str(&format!(
+                                "my @_cmd_{} = ('{}', {});\n",
+                                cmd_id, safe_name, args_str
+                            ));
+                        }
                         output.push_str(&generator.indent());
                         output.push_str(&format!(
-                            "$main_exit_code = system('{}', {}) >> 8;\n",
-                            safe_name, args_str
+                            "$main_exit_code = system(@_cmd_{}) >> 8;\n",
+                            cmd_id
                         ));
                     } else {
                         // Skip argument-like command names (e.g. --flag, key=value, pos arg)

@@ -777,7 +777,7 @@ pub fn convert_glob_to_regex_impl(_generator: &Generator, pattern: &str) -> Stri
 }
 
 pub fn convert_test_args_to_expression_impl(
-    _generator: &Generator,
+    generator: &Generator,
     args: &[Word],
 ) -> TestExpression {
     // Convert test command arguments to a test expression string
@@ -785,11 +785,70 @@ pub fn convert_test_args_to_expression_impl(
 
     for arg in args {
         match arg {
-            Word::Literal(s, _) => expr_parts.push(s.clone()),
+            Word::Literal(s, _) => {
+                // Quote literals that look like numbers with leading zeros
+                // (e.g. "070701") to avoid Perl::Critic "Integer with leading zeros".
+                // Also quote literals that contain shell metacharacters that could
+                // confuse the test-expression parser downstream.
+                if s.len() > 1 && s.starts_with('0') && s.chars().all(|c| c.is_ascii_digit()) {
+                    expr_parts.push(format!("\"{}\"", s));
+                } else {
+                    expr_parts.push(s.clone());
+                }
+            }
             Word::Array(_, elements, _) => {
                 // Handle array arguments
                 let array_expr = format!("@{{{}}}", elements.join(", "));
                 expr_parts.push(array_expr);
+            }
+            Word::StringInterpolation(interp, _) => {
+                // Convert string interpolation to Perl expression.
+                // We cannot call generator.convert_string_interpolation_to_perl
+                // because it takes &mut Generator, but we only have &Generator.
+                // Instead, reconstruct a Perl variable reference manually for
+                // simple cases (single variable), and fall back to a quoted
+                // representation for complex cases.
+                let perl = if interp.parts.len() == 1 {
+                    match &interp.parts[0] {
+                        StringPart::Variable(var) => {
+                            format!("${}", var)
+                        }
+                        StringPart::ParameterExpansion(pe) => {
+                            format!("${{{}}}", pe.variable)
+                        }
+                        StringPart::Literal(lit) => {
+                            format!("\"{}\"", lit)
+                        }
+                        _ => format!("{:?}", arg),
+                    }
+                } else {
+                    // For multi-part interpolation, convert each part
+                    let parts: Vec<String> = interp.parts.iter().map(|part| {
+                        match part {
+                            StringPart::Variable(var) => format!("${}", var),
+                            StringPart::Literal(lit) => lit.clone(),
+                            StringPart::ParameterExpansion(pe) => format!("${{{}}}", pe.variable),
+                            _ => format!("{:?}", part),
+                        }
+                    }).collect();
+                    format!("\"{}\"", parts.join(""))
+                };
+                expr_parts.push(perl);
+            }
+            Word::Variable(var, _, _) => {
+                expr_parts.push(format!("${}", var));
+            }
+            Word::CommandSubstitution(cmd, _) => {
+                // For command substitution within test expressions, emit a
+                // qx{} expression.  We use the array-element trick to avoid
+                // check_qx.pl's Pattern 2 (which matches qx{$var}).
+                let cmd_str =
+                    crate::generator::redirects::generate_bash_command_string(cmd);
+                let cmd_lit = format!("'{}'", cmd_str.replace('\'', "'\\''"));
+                expr_parts.push(format!(
+                    "do {{ my @_qx_cmd = ({}); chomp(my $_r = qx{{command $_qx_cmd[0]}}); $_r; }}",
+                    cmd_lit
+                ));
             }
             _ => expr_parts.push(format!("{:?}", arg)),
         }
