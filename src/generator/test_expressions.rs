@@ -842,7 +842,7 @@ pub fn convert_test_args_to_expression_impl(
                 // command generation.
                 // Native Perl: read ARGV files
                 expr_parts.push(
-                    "do {{ my $_r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $_r .= <$__fh>; close $__fh }} }} }} chomp $_r; $_r; }}".to_string()
+                    "do {{ my $_r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ if (open my $__fh, q{{<}}, $__f) {{ $_r .= <$__fh>; close $__fh }} }} }} chomp $_r; $_r; }}".to_string()
                 );
             }
             _ => expr_parts.push(format!("{:?}", arg)),

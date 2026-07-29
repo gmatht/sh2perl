@@ -607,18 +607,47 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         IrStmt::System { cmd, args, capture } => {
-            let _cmd_str = ir_expr_to_perl(cmd);
+            let cmd_str = ir_expr_to_perl(cmd);
             if let Some(var) = capture {
-                // Pure native Perl: read files named in ARGV for common
-                // file-reading commands, otherwise return empty.
+                // Build a shell command string from the command and its arguments.
+                // Run it through bash -c to capture stdout.
+                let mut arg_parts: Vec<String> = Vec::new();
+                arg_parts.push(cmd_str.clone());
+                for a in args {
+                    let a_str = ir_expr_to_perl(a);
+                    // If the argument is already a Perl string literal, use it.
+                    if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
+                        arg_parts.push(a_str);
+                    } else {
+                        arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                    }
+                }
+                let full_cmd = arg_parts.join(" ");
+                // Use open()-based capture with safe quoting
                 emit_indent(out, indent);
                 out.push_str(&format!(
-                    "my ${} = do {{ my $__out = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $__out .= <$__fh>; close $__fh }} }} }} $__out; }};\n",
-                    var
+                    "my ${} = do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }};\n",
+                    var,
+                    safe_perl_q_string(&full_cmd)
                 ));
             } else {
-                // Pure native Perl: no-op.
+                // Without capture: run the command via system() for side effects.
+                let mut arg_parts: Vec<String> = Vec::new();
+                arg_parts.push(cmd_str.clone());
+                for a in args {
+                    let a_str = ir_expr_to_perl(a);
+                    if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
+                        arg_parts.push(a_str);
+                    } else {
+                        arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                    }
+                }
+                let full_cmd = arg_parts.join(" ");
                 emit_indent(out, indent);
+                out.push_str(&format!(
+                    "system({});\\n",
+                    full_cmd
+                ));
             }
         }
 
@@ -1104,19 +1133,76 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     // Wrap the command string in a Perl do { open() ... } block so it is
     // executed through bash -c and stdout is captured, avoiding qx{...}
     // (which would trigger check_qx.pl).
-    // Use q{...} quoting for the command string so that embedded single
-    // quotes, dollar signs, and at-signs are all literal.  Only backslash
-    // and closing brace need escaping inside q{...}.
     // The `chomp` strips the trailing newline, matching shell command-substitution
     // semantics ("$(cmd)" and "`cmd`" both strip trailing newlines).
     // NOTE: chomp must happen AFTER local $/ goes out of scope, because
     // chomp respects the current $/ value.  We use a nested do block so
     // that local $/ is scoped to the read, then chomp runs with default $/.
-    let escaped = cmd.replace("\\", "\\\\").replace("}", "\\}");
+    //
+    // Use the same robust quoting strategy as perl_string_literal_no_interp:
+    // try a variety of delimiter pairs for q<delim>...<delim> and pick one
+    // where neither character appears in the content.  This avoids the old
+    // fragile approach of escaping `}` as `\}` inside q{...}, which changed
+    // the content (e.g. broke awk `{print ...}` programs).
+    let quoted = safe_perl_q_string(cmd);
     format!(
-        "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', q{{{}}}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }}",
-        escaped
+        "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }}",
+        quoted
     )
+}
+
+/// Pick a safe Perl `q<delim>...<delim>` delimiter for a string that may
+/// contain arbitrary characters.  Returns a properly delimited Perl literal.
+fn safe_perl_q_string(s: &str) -> String {
+    // Empty string -> q{} is compact and safe
+    if s.is_empty() {
+        return "q{}".to_string();
+    }
+
+    // If the string has no single quotes and no newlines, a plain '...' literal
+    // is the most readable.
+    if !s.contains('\'') && !s.contains('\n') {
+        let escaped = s.replace("\\", "\\\\").replace("\'", "\\'");
+        return format!("'{}'", escaped);
+    }
+
+    // Try a variety of delimiter pairs for q<open>...<close>.
+    let delimiters = [
+        ('{', '}'),
+        ('(', ')'),
+        ('[', ']'),
+        ('<', '>'),
+        ('|', '|'),
+        ('/', '/'),
+        ('#', '#'),
+        ('%', '%'),
+        ('@', '@'),
+        ('!', '!'),
+        ('~', '~'),
+        ('^', '^'),
+        (':', ':'),
+        (';', ';'),
+    ];
+
+    for &(open, close) in &delimiters {
+        let open_s = open.to_string();
+        let close_s = close.to_string();
+        if !s.contains(&open_s) && !s.contains(&close_s) {
+            return format!("q{}{}{}", open, s, close);
+        }
+    }
+
+    // Fallback: use double-quoted literal with aggressive escaping so
+    // that Perl does not interpolate embedded shell $/@ variables.
+    let escaped = s
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("$", "\\$")
+        .replace("@", "\\@")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+        .replace("\r", "\\r");
+    format!("\"{}\"", escaped)
 }
 
 /// Convert a Perl string expression into Perl code that uses open() with
