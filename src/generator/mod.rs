@@ -279,6 +279,12 @@ impl Generator {
         // function calls as native (they do NOT need IPC::Open3).
         self.scan_function_definitions(ast);
 
+        // Pre-scan for `set -e` (errexit) so that `set_e_active` is true before
+        // the declaration block.  Otherwise the `my $__set_e = 0;` declaration is
+        // skipped and the later `$__set_e = 1;` from the builtin handler references
+        // an undeclared global variable.
+        self.scan_set_e(ast);
+
         // In inline mode, skip the script header and just generate the command code
         if self.inline_mode {
             for command in ast {
@@ -1630,6 +1636,65 @@ impl Generator {
         }
     }
 
+    /// Pre-scan for `set -e` (errexit) so we can declare `$__set_e` before
+    /// any command that references it.  Recognises combined options like
+    /// `-ex` or `-euo` through simple prefix matching on each arg.
+    fn scan_set_e(&mut self, ast: &[Command]) {
+        for cmd in ast {
+            self.scan_set_e_in_command(cmd);
+        }
+    }
+
+    fn scan_set_e_in_command(&mut self, cmd: &Command) {
+        match cmd {
+            Command::BuiltinCommand(bc) if bc.name == "set" => {
+                for arg in &bc.args {
+                    if let Word::Literal(opt, _) = arg {
+                        if opt == "-e" || opt.starts_with("-e") {
+                            self.set_e_active = true;
+                            return;
+                        }
+                    }
+                }
+            }
+            Command::If(if_stmt) => {
+                self.scan_set_e_in_command(&if_stmt.then_branch);
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    self.scan_set_e_in_command(else_branch);
+                }
+            }
+            Command::For(for_loop) => {
+                for c in &for_loop.body.commands {
+                    self.scan_set_e_in_command(c);
+                }
+            }
+            Command::While(while_loop) => {
+                for c in &while_loop.body.commands {
+                    self.scan_set_e_in_command(c);
+                }
+            }
+            Command::Block(block) => {
+                for c in &block.commands {
+                    self.scan_set_e_in_command(c);
+                }
+            }
+            Command::Pipeline(pipeline) => {
+                for c in &pipeline.commands {
+                    self.scan_set_e_in_command(c);
+                }
+            }
+            Command::Subshell(c) | Command::Background(c) => {
+                self.scan_set_e_in_command(c);
+            }
+            Command::Function(func) => {
+                for c in &func.body.commands {
+                    self.scan_set_e_in_command(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn scan_function_defs_in_command(&mut self, cmd: &Command) {
         match cmd {
             Command::Function(func) => {
@@ -2640,11 +2705,29 @@ impl Generator {
             Command::Simple(cmd) => {
                 // Commands that typically reference OS errors
                 if let Word::Literal(name, _) = &cmd.name {
-                    matches!(name.as_str(), "open3" | "exec" | "system" | "eval"
-                        | "cat" | "grep" | "head" | "tail" | "cut" | "tee"
-                        | "wc" | "sort" | "uniq" | "diff" | "sed"
-                        | "awk" | "strings" | "xargs" | "comm"
-                        | "paste" | "tr" | "find" | "ls" | "perl")
+                    match name.as_str() {
+                        "open3" | "exec" | "system" | "eval" => true,
+                        "cat" => {
+                            // cat only needs English when reading files (has args).
+                            // Heredoc-only cats don't reference $OS_ERROR.
+                            if cmd.args.is_empty() {
+                                // Check redirects - if only heredoc redirects,
+                                // no English needed.
+                                let has_file_redirect = cmd.redirects.iter().any(|r| {
+                                    !matches!(r.operator,
+                                        RedirectOperator::Heredoc | RedirectOperator::HeredocTabs)
+                                });
+                                has_file_redirect || !cmd.redirects.is_empty()
+                            } else {
+                                true // Has file arguments - may need $OS_ERROR
+                            }
+                        }
+                        "grep" | "head" | "tail" | "cut" | "tee"
+                            | "wc" | "sort" | "uniq" | "diff" | "sed"
+                            | "awk" | "strings" | "xargs" | "comm"
+                            | "paste" | "tr" | "find" | "ls" | "perl" => true,
+                        _ => false,
+                    }
                 } else {
                     false
                 }

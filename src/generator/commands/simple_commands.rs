@@ -1182,10 +1182,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         && !args[0].contains('$')
                     {
                         // The string is already a valid Perl literal, so reuse it directly.
-                        let content = &args[0][1..args[0].len() - 1]; // Remove quotes
-                        // Use clean IR-based output (say) instead of print with explicit \n
+                        // Use the IR bridge to convert to a semantic node.
                         let ir_stmt = crate::ir::IrStmt::Output {
-                            value: crate::ir::IrExpr::RawExpr(format!("\"{}\"", content)),
+                            value: crate::ir::perl_expr_to_ir(&args[0]),
                             newline: true,
                             target: None,
                         };
@@ -1197,9 +1196,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             // Pipeline: accumulate into output buffer
                             output.push_str(&format!("$output .= {} . \"\\n\";\n", args[0]));
                         } else {
-                            // Standalone: use clean IR-based output (say "...")
+                            // Standalone: use clean IR-based output
                             let ir_stmt = crate::ir::IrStmt::Output {
-                                value: crate::ir::IrExpr::RawExpr(args[0].clone()),
+                                value: crate::ir::perl_expr_to_ir(&args[0]),
                                 newline: true,
                                 target: None,
                             };
@@ -1217,9 +1216,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             // Pipeline: accumulate into output buffer
                             output.push_str(&format!("$output .= {} . \"\\n\";\n", args[0]));
                         } else {
-                            // Standalone: use clean IR-based output (say "...")
+                            // Standalone: use clean IR-based output
                             let ir_stmt = crate::ir::IrStmt::Output {
-                                value: crate::ir::IrExpr::RawExpr(args[0].clone()),
+                                value: crate::ir::perl_expr_to_ir(&args[0]),
                                 newline: true,
                                 target: None,
                             };
@@ -1248,7 +1247,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 output.push_str(&format!("$output .= {};\n", args_str));
                             } else {
                                 let ir_stmt = crate::ir::IrStmt::Output {
-                                    value: crate::ir::IrExpr::RawExpr(args_str.clone()),
+                                    value: crate::ir::perl_expr_to_ir(&args_str),
                                     newline: false,
                                     target: None,
                                 };
@@ -1258,7 +1257,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             output.push_str(&format!("$output .= {} . \"\\n\";\n", args_str));
                         } else {
                             let ir_stmt = crate::ir::IrStmt::Output {
-                                value: crate::ir::IrExpr::RawExpr(args_str.clone()),
+                                value: crate::ir::perl_expr_to_ir(&args_str),
                                 newline: true,
                                 target: None,
                             };

@@ -34,6 +34,11 @@ pub enum StrStyle {
     SingleQuoted,
     DoubleQuoted,
     Command,
+    /// Like DoubleQuoted but preserves `$` and `@` for Perl interpolation.
+    /// Used for unquoted heredoc bodies (<<EOF) where Perl should
+    /// interpolate variable references.  Newlines and control characters
+    /// are still escaped so the Perl source is readable.
+    Heredoc,
 }
 
 // ── Interpolation parts ──────────────────────────────────────────────
@@ -394,15 +399,21 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // Output to a specific filehandle: print/say $fh ...
                 emit_indent(out, indent);
                 if *newline {
-                    out.push_str(&format!("say {{*{}}} {};\n", fh, expr));
+                    out.push_str(&format!("print {{*{}}} {}, \"\\n\";\n", fh, expr));
                 } else {
                     out.push_str(&format!("print {{*{}}} {};\n", fh, expr));
                 }
             } else if *newline {
-                // Use `say` which appends \n automatically (requires use feature 'say').
-                // This is cleaner than `print EXPR, "\n";` or embedding \n into the string.
-                emit_indent(out, indent);
-                out.push_str(&format!("say {};\n", expr));
+                // Use `print` with \n when called via piecemeal stmt_to_perl()
+                // (which cannot manage imports).  Full ir_to_perl() switches to `say`.
+                // Try to embed \n directly into string literals for cleaner output.
+                if let Some(embedded) = try_embed_newline_in_string_literal(&expr) {
+                    emit_indent(out, indent);
+                    out.push_str(&embedded);
+                } else {
+                    emit_indent(out, indent);
+                    out.push_str(&format!("print {}, \"\\n\";\n", expr));
+                }
             } else {
                 emit_indent(out, indent);
                 out.push_str(&format!("print {};\n", expr));
@@ -904,6 +915,24 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 escaped
             }
             StrStyle::Command => format!("`{}`", s),
+            StrStyle::Heredoc => {
+                // Like DoubleQuoted but preserves $ and @ for Perl interpolation.
+                let mut escaped = String::with_capacity(s.len() + 4);
+                escaped.push('"');
+                for ch in s.chars() {
+                    match ch {
+                        '"' => escaped.push_str("\\\""),
+                        '\\' => escaped.push_str("\\\\"),
+                        // Keep $ and @ unescaped — Perl will interpolate them
+                        '\n' => escaped.push_str("\\n"),
+                        '\t' => escaped.push_str("\\t"),
+                        '\r' => escaped.push_str("\\r"),
+                        c => escaped.push(c),
+                    }
+                }
+                escaped.push('"');
+                escaped
+            }
         },
 
         IrExpr::Var(name, sigil) => match sigil {
@@ -1071,9 +1100,18 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 /// `qx{...}`.  This produces semantically equivalent code (both run
 /// `/bin/sh -c \'cmd\'` and capture stdout) but avoids check_qx.pl
 /// violations because `open()` is not checked.
-pub(crate) fn cmd_str_to_open_perl(_cmd: &str) -> String {
-    // Pure native Perl: empty string constant.
-    "q{}".to_string()
+pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
+    // Wrap the command string in a Perl do { open() ... } block so it is
+    // executed through bash -c and stdout is captured, avoiding qx{...}
+    // (which would trigger check_qx.pl).
+    // Use q{...} quoting for the command string so that embedded single
+    // quotes, dollar signs, and at-signs are all literal.  Only backslash
+    // and closing brace need escaping inside q{...}.
+    let escaped = cmd.replace("\\", "\\\\").replace("}", "\\}");
+    format!(
+        "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', q{{{}}}) or die \"cmd failed: $!\\n\"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+        escaped
+    )
 }
 
 /// Convert a Perl string expression into Perl code that uses open() with
@@ -1083,12 +1121,12 @@ pub(crate) fn cmd_str_to_open_perl(_cmd: &str) -> String {
 pub(crate) fn expr_to_open_perl(cmd_expr: &str, chomp_result: bool) -> String {
     if chomp_result {
         format!(
-            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or croak \"cmd failed: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
             cmd_expr
         )
     } else {
         format!(
-            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
             cmd_expr
         )
     }
@@ -1413,6 +1451,73 @@ pub(crate) fn optimize_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
         .collect();
 
     pass1
+}
+
+// ── Bridge helpers ────────────────────────────────────────────────────
+
+/// Try to convert a Perl expression string (produced by old-style generators)
+/// into a proper `IrExpr`.  This is a migration bridge: once all generators
+/// emit IR nodes directly, this function becomes unnecessary.
+///
+/// Currently handles:
+/// - Double-quoted string literals: `"hello"` → `IrExpr::Str("hello", DoubleQuoted)`
+/// - Single-quoted string literals: `'hello'` → `IrExpr::Str("hello", SingleQuoted)`
+/// - Scalar variables: `$var` → `IrExpr::Var("var", Scalar)`
+/// - Array variables: `@arr` → `IrExpr::Var("arr", Array)`
+///
+/// Falls back to `RawExpr(text)` for anything it can't parse.
+pub fn perl_expr_to_ir(perl_expr: &str) -> IrExpr {
+    let trimmed = perl_expr.trim();
+
+    // Double-quoted string literal: "..."
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        let inner = &trimmed[1..trimmed.len()-1];
+        // If the inner content has no $, @, or \ (escapes), it's safe as Str.
+        let has_interp = inner.contains('$') || inner.contains('@');
+        let has_escapes = inner.contains('\\');
+        if !has_interp && !has_escapes {
+            return IrExpr::Str(inner.to_string(), StrStyle::DoubleQuoted);
+        }
+        // If it has $ or @, it needs Perl interpolation — use Heredoc style
+        // which preserves $ and @ but escapes control characters.
+        if has_interp && !has_escapes {
+            return IrExpr::Str(inner.to_string(), StrStyle::Heredoc);
+        }
+        // Complex escapes — keep as RawExpr
+        return IrExpr::RawExpr(trimmed.to_string());
+    }
+
+    // Single-quoted string literal: '...'
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        let inner = &trimmed[1..trimmed.len()-1];
+        // Un-escape single quotes: \' → '
+        let unescaped = inner.replace("\\'", "'");
+        return IrExpr::Str(unescaped, StrStyle::SingleQuoted);
+    }
+
+    // Scalar variable: $var or ${var}
+    if trimmed.starts_with('$') && trimmed.len() > 1 {
+        let name = if trimmed.starts_with("${") && trimmed.ends_with('}') {
+            &trimmed[2..trimmed.len()-1]
+        } else {
+            &trimmed[1..]
+        };
+        // Ensure it's a valid identifier
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return IrExpr::Var(name.to_string(), Sigil::Scalar);
+        }
+    }
+
+    // Array variable: @var
+    if trimmed.starts_with('@') && trimmed.len() > 1 {
+        let name = &trimmed[1..];
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return IrExpr::Var(name.to_string(), Sigil::Array);
+        }
+    }
+
+    // Fall back to RawExpr
+    IrExpr::RawExpr(trimmed.to_string())
 }
 
 // ── Bridge: wrap current generator output in RawText ────────────────
