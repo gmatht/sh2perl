@@ -396,12 +396,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::Output { value, newline, target } => {
             let expr = ir_expr_to_perl(value);
             if let Some(fh) = target {
-                // Output to a specific filehandle: print/say $fh ...
+                // Output to a specific filehandle: print {$fh} ...
                 emit_indent(out, indent);
                 if *newline {
-                    out.push_str(&format!("print {{*{}}} {}, \"\\n\";\n", fh, expr));
+                    out.push_str(&format!("print {{${}}} {}, \"\\n\";\n", fh, expr));
                 } else {
-                    out.push_str(&format!("print {{*{}}} {};\n", fh, expr));
+                    out.push_str(&format!("print {{${}}} {};\n", fh, expr));
                 }
             } else if *newline {
                 // Use `print` with \n when called via piecemeal stmt_to_perl()
@@ -1107,9 +1107,14 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     // Use q{...} quoting for the command string so that embedded single
     // quotes, dollar signs, and at-signs are all literal.  Only backslash
     // and closing brace need escaping inside q{...}.
+    // The `chomp` strips the trailing newline, matching shell command-substitution
+    // semantics ("$(cmd)" and "`cmd`" both strip trailing newlines).
+    // NOTE: chomp must happen AFTER local $/ goes out of scope, because
+    // chomp respects the current $/ value.  We use a nested do block so
+    // that local $/ is scoped to the read, then chomp runs with default $/.
     let escaped = cmd.replace("\\", "\\\\").replace("}", "\\}");
     format!(
-        "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', q{{{}}}) or die \"cmd failed: $!\\n\"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+        "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', q{{{}}}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }}",
         escaped
     )
 }
@@ -1120,13 +1125,14 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
 /// or `"head -n $count /etc/passwd"`.
 pub(crate) fn expr_to_open_perl(cmd_expr: &str, chomp_result: bool) -> String {
     if chomp_result {
+        // chomp must happen without local $/ in scope (see cmd_str_to_open_perl).
         format!(
-            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }}",
             cmd_expr
         )
     } else {
         format!(
-            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
             cmd_expr
         )
     }

@@ -2305,6 +2305,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     "#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
                     "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
                     "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
+                    "$" => "$$".to_string(),         // $$ -> $$ (process ID)
                     "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                     _ => format!("${}", var),           // Regular variable
                 }
@@ -2689,7 +2690,7 @@ pub fn convert_string_interpolation_to_perl_impl(
                             parts.push("($? >> 8)".to_string());
                         } else if generator.declared_locals.contains(var)
                             || generator.function_level_vars.contains(var)
-                            || matches!(var.as_str(), "#" | "@" | "*" | "-" | "!" | "0")
+                            || matches!(var.as_str(), "#" | "@" | "*" | "-" | "!" | "0" | "$")
                         {
                             // Regular declared variable - add directly for interpolation
                             current_string.push_str(&format!("${}", var));
