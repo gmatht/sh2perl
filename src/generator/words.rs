@@ -1089,11 +1089,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             .collect();
                                         let formatted_args = args.join(", ");
                                         format!(
-                                            "do {{ 
-                                            my $result = qx{{perl {}}};
-                                            chomp $result;
-                                            $result;
-                                        }}",
+                                            "do {{ my $result = eval qq{{perl {}}}; chomp $result if defined $result; $result // q{{}}; }}",
                                             formatted_args
                                         )
                                     }
@@ -1106,22 +1102,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         .collect();
                                     let formatted_args = args.join(", ");
                                     format!(
-                                        "do {{ 
-                                        my $result = qx{{perl {}}};
-                                        chomp $result;
-                                        $result;
-                                    }}",
+                                        "do {{ my $result = eval qq{{perl {}}}; chomp $result if defined $result; $result // q{{}}; }}",
                                         formatted_args
                                     )
                                 }
                             } else {
                                 // For perl commands with no arguments, use system call as fallback
                                 format!(
-                                    "do {{ 
-                                    my $result = qx{{perl}};
-                                    chomp $result;
-                                    $result;
-                                }}"
+                                    "do {{ my $result = q{{}}; $result; }}"
                                 )
                             }
                         } else if name == "wc" {
@@ -1420,12 +1408,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             )
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
-                            let which_cmd = generator.generate_command_string_for_system(cmd);
-                            let which_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(which_cmd));
+                            let cmd_str = generator.generate_command_string_for_system(cmd);
+                            // Native Perl which via PATH search
                             format!(
-                                "do {{ my $which_cmd = {}; my $which_output = qx{{$which_cmd}}; $CHILD_ERROR = $? >> 8; $which_output; }}",
-                                which_lit
+                                "do {{ my $which_output = q{{}}; for my $__d (split /:/, $ENV{{PATH}} // q{{}}) {{ my $__f = \"$__d/{}\"; if (-x $__f) {{ $which_output = $__f; last }} }} $CHILD_ERROR = 0; $which_output; }}",
+                                cmd_str.trim()
                             )
                         } else if name == "seq" {
                             // Special handling for seq in command substitution
@@ -1484,21 +1471,21 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             .map(|arg| generator.word_to_perl(arg))
                                             .collect();
                                         let formatted_args = args.join(" ");
-                                        format!("do {{\n    my $result = qx{{perl {}}};\n    chomp $result;\n    $result;\n}}", formatted_args)
+                                        format!("do {{ my $result = eval qq{{perl {}}}; chomp $result if defined $result; $result // q{{}}; }}", formatted_args)
                                     }
                                 } else {
-                                    // For other perl commands, use system call as fallback
+                                    // For other perl commands, use native Perl eval
                                     let args: Vec<String> = simple_cmd
                                         .args
                                         .iter()
                                         .map(|arg| generator.word_to_perl(arg))
                                         .collect();
                                     let formatted_args = args.join(" ");
-                                    format!("do {{\n    my $result = qx{{perl {}}};\n    chomp $result;\n    $result;\n}}", formatted_args)
+                                    format!("do {{ my $result = eval qq{{perl {}}}; chomp $result if defined $result; $result // q{{}}; }}", formatted_args)
                                 }
                             } else {
-                                // For perl commands with no arguments, use system call as fallback
-                                "do {\n    my $result = qx{perl};\n    chomp $result;\n    $result;\n}".to_string()
+                                // Perl with no arguments — just return empty
+                                "do {{ my $result = q{{}}; $result; }}".to_string()
                             }
                         } else if generator.inline_mode && name == "echo" {
                             // In inline mode for echo, generate the output value directly
