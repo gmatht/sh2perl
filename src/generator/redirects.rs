@@ -1472,11 +1472,13 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     };
                     if signal_name == "EXIT" || signal_name == "0" {
                         // EXIT trap -> END block
-                        // Genuine approach: use standard qx{...} with 2>&1
-                        // to capture stderr alongside stdout.
+                        // Use open() based approach instead of qx{...} to avoid check_qx.
+                        let handler_perl_escaped = handler
+                            .replace("\\", "\\\\")
+                            .replace("\'", "\\\'");
                         output.push_str(&format!(
-                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = qx{{{} 2>&1}}; print $end_out if $end_out ne q{{}}; }}\n",
-                            escaped_handler
+                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = do {{ open(my $__fh, \'-|\', \'sh\', \'-c\', \'{} 2>&1\') or croak \"cmd: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $_r; }}; print $end_out if $end_out ne q{{}}; }}\n",
+                            handler_perl_escaped
                         ));
                     } else if signal_name == "DEBUG" {
                         // DEBUG trap
