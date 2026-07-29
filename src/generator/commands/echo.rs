@@ -52,6 +52,8 @@ pub fn generate_echo_command(
                     Word::Variable(var, _, _) => match var.as_str() {
                         "#" => "scalar(@ARGV)".to_string(),
                         "@" => "@ARGV".to_string(),
+                        "*" => "@ARGV".to_string(),
+                        "?" => "($? >> 8)".to_string(),
                         _ => format!("${}", var),
                     },
                     Word::StringInterpolation(interp, _) => {
@@ -61,6 +63,8 @@ pub fn generate_echo_command(
                                 match var.as_str() {
                                     "#" => "scalar(@ARGV)".to_string(),
                                     "@" => "@ARGV".to_string(),
+                                    "*" => "@ARGV".to_string(),
+                                    "?" => "($? >> 8)".to_string(),
                                     _ => format!("${}", var),
                                 }
                             } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
@@ -160,6 +164,8 @@ pub fn generate_echo_command(
                                             match var.as_str() {
                                                 "#" => result.push_str("scalar(@ARGV)"),
                                                 "@" => result.push_str("@ARGV"),
+                                                "*" => result.push_str("@ARGV"),
+                                                "?" => result.push_str("($? >> 8)"),
                                                 _ => result.push_str(&format!("${}", var)),
                                             }
                                         }
