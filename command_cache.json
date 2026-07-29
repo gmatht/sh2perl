@@ -1,5 +1,11 @@
 {
   "bash_cache": {
+    "examples/cat-heredoc-pipeline.sh": {
+      "stdout": "1\nexit: 0\n",
+      "stderr": "",
+      "exit_code": 0,
+      "code_hash": null
+    },
     "examples/063_05_heredoc_with_complex_content.sh": {
       "stdout": "  $(echo \"Command substitution\")\n  ${var:-default}\n  $(( 1 + 2 * 3 ))\n",
       "stderr": "",
@@ -18,31 +24,37 @@
       "exit_code": 0,
       "code_hash": null
     },
-    "examples/cat-heredoc-pipeline.sh": {
-      "stdout": "1\nexit: 0\n",
+    "examples/064_06_nested_arithmetic_expressions.sh": {
+      "stdout": "i=4, j=6\n",
       "stderr": "",
       "exit_code": 0,
       "code_hash": null
     }
   },
   "perl_cache": {
+    "examples/064_06_nested_arithmetic_expressions.sh": {
+      "stdout": "i=4, j=6\n",
+      "stderr": "",
+      "exit_code": 0,
+      "code_hash": "78e48e8c8d65493cab05f6691552b3d7"
+    },
     "examples/063_05_heredoc_with_complex_content.sh": {
       "stdout": "  $(echo \"Command substitution\")\n  ${var:-default}\n  $(( 1 + 2 * 3 ))\n",
       "stderr": "",
       "exit_code": 0,
       "code_hash": "f6f112d81b01288e5b41650604a0ec3a"
     },
-    "examples/000__02_output_formatting_commands.sh": {
-      "stdout": "=== Output and Formatting Commands ===\nEcho result: Hello from backticks\nPrintf result: Number: 42, String: test\n\n=== Compression Commands ===\n=== Network Commands ===\n=== Process Management Commands ===\n=== Checksum Commands ===\nSHA256 result: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  test_checksum.txt\n\nSHA512 result: cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e  test_checksum.txt\n\nStrings result:\n\n=== I/O Redirection Commands ===\nTee result: test output\n\n=== Perl Command ===\nPerl result: Hello from Perl\n\n",
-      "stderr": "Name \"main::fh\" used only once: possible typo at /tmp/__tmp_examples_000__02_output_formatting_commands.sh line 34.\nprint() on unopened filehandle fh at /tmp/__tmp_examples_000__02_output_formatting_commands.sh line 34.\nstrings: 'test_binary.txt': No such file\n",
-      "exit_code": 0,
-      "code_hash": "7d70a25f863561a15b5cd04959810adf"
-    },
     "examples/063_03_nested_command_substitutions.sh": {
       "stdout": "Result: Nested: Deep: Level 4\n",
       "stderr": "",
       "exit_code": 0,
       "code_hash": "f62cc676b2f7d5ccb19beace5bc963ae"
+    },
+    "examples/000__02_output_formatting_commands.sh": {
+      "stdout": "=== Output and Formatting Commands ===\nEcho result: Hello from backticks\nPrintf result: Number: 42, String: test\n\n=== Compression Commands ===\n=== Network Commands ===\n=== Process Management Commands ===\n=== Checksum Commands ===\nSHA256 result: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  test_checksum.txt\n\nSHA512 result: cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e  test_checksum.txt\n\nStrings result:\n\n=== I/O Redirection Commands ===\nTee result: test output\n\n=== Perl Command ===\nPerl result: Hello from Perl\n\n",
+      "stderr": "Name \"main::fh\" used only once: possible typo at /tmp/__tmp_examples_000__02_output_formatting_commands.sh line 34.\nprint() on unopened filehandle fh at /tmp/__tmp_examples_000__02_output_formatting_commands.sh line 34.\nstrings: 'test_binary.txt': No such file\n",
+      "exit_code": 0,
+      "code_hash": "7d70a25f863561a15b5cd04959810adf"
     },
     "examples/cat-heredoc-pipeline.sh": {
       "stdout": "1\nexit: 0\n",
