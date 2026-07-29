@@ -361,7 +361,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             } else {
                 r"\s+".to_string()
             };
-            output.push_str(&format!("{} ( my $L = <> ) {{\n", loop_keyword));
+            output.push_str(&format!("{} (my $L = <>) {{\n", loop_keyword));
             output.push_str(&format!("    chomp $L;\n"));
             output.push_str(&format!("    my @_fields = split /{}/msx, $L;\n", ifs_sep));
             for (i, var) in read_vars.iter().enumerate() {
@@ -570,9 +570,9 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             output.push_str("}\n");
         }
         Command::Simple(cmd) if cmd.name == "[" || cmd.name == "test" => {
-            output.push_str(&format!("{} ( ", loop_keyword));
+            output.push_str(&format!("{} (", loop_keyword));
             generator.generate_test_command(cmd, &mut output);
-            output.push_str(" ) {\n");
+            output.push_str(") {\n");
             // Generate body
             generator.indent_level += 1;
             output.push_str(&generator.generate_block_commands(&while_loop.body));
@@ -581,7 +581,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             output.push_str("}\n");
         }
         Command::TestExpression(test_expr) => {
-            output.push_str(&format!("{} ( ", loop_keyword));
+            output.push_str(&format!("{} (", loop_keyword));
             let test_result = generator.generate_test_expression(test_expr);
             // Remove outer parentheses if present to avoid double parentheses
             if test_result.starts_with('(') && test_result.ends_with(')') {
@@ -589,7 +589,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             } else {
                 output.push_str(&test_result);
             }
-            output.push_str(" ) {\n");
+            output.push_str(") {\n");
             // Generate body
             generator.indent_level += 1;
             output.push_str(&generator.generate_block_commands(&while_loop.body));
@@ -607,7 +607,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 &*while_loop.condition,
                 Command::Simple(cmd) if cmd.name == "let"
             );
-            output.push_str(&format!("{} ( ", loop_keyword));
+            output.push_str(&format!("{} (", loop_keyword));
             generator.suppress_set_e_depth += 1;
             let mut cond = generator.generate_command(&while_loop.condition);
             generator.suppress_set_e_depth -= 1;
@@ -619,7 +619,7 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             } else {
                 output.push_str(&cond);
             }
-            output.push_str(" ) {\n");
+            output.push_str(") {\n");
             // Generate body
             generator.indent_level += 1;
             output.push_str(&generator.generate_block_commands(&while_loop.body));
@@ -1284,9 +1284,12 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     generator.function_level_vars = saved_function_level_vars;
     generator.associative_arrays = saved_associative_arrays;
 
-    // Add final return statement to satisfy Perl::Critic
-    output.push_str(&generator.indent());
-    output.push_str("return;\n");
+    // Add final return statement to satisfy Perl::Critic.
+    // Use IR node so the backend can suppress it when unnecessary.
+    output.push_str(&crate::ir::stmt_to_perl(
+        &crate::ir::IrStmt::Return(None),
+        generator.indent_level,
+    ));
 
     generator.indent_level -= 1;
 
