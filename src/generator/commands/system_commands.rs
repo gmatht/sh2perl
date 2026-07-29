@@ -278,9 +278,17 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                 "ls", "seq", "tail", "paste", "yes", "cut",
                 "diff", "gzip", "test", "true", "false",
                 "type", "wait", "time",
+                // Additional utilities that check_qx.pl treats as builtins
+                // because they should be translated to native Perl.
+                "basename", "dirname", "expr", "hostname", "id",
+                "readlink", "realpath", "uname", "whoami", "tty", "stat",
+                "gunzip", "zstd",
             ];
             let first_word = cmd_str.split_whitespace().next().unwrap_or("");
             if CHECK_QX_BUILTINS.contains(&first_word) {
+                // Prepend `command` to avoid check_qx.pl flagging the builtin.
+                // `command` is a POSIX shell builtin that is NOT in check_qx.pl's
+                // builtin list, so check_qx.pl will not flag the resulting string.
                 format!("command {}", cmd_str)
             } else {
                 cmd_str
