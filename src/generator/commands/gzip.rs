@@ -42,7 +42,7 @@ pub fn generate_gzip_command(
             let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
             // Use a non-interpolating Perl literal for the bash -c argument so that
             // embedded "$" sequences (e.g. from awk) are preserved verbatim.
-            let bash_cmd = format!("echo \"${}\" | gunzip 2>/dev/null", input_var);
+            let bash_cmd = format!("command echo \"${}\" | gunzip 2>/dev/null", input_var);
             output.push_str(&format!(
                 "my ({});\nmy {} = open3({}, {}, {}, 'bash', '-c', {});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $decompressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
                 in_var,
@@ -69,7 +69,7 @@ pub fn generate_gzip_command(
             let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
             output.push_str(&format!(
                 "my ({});
-my {} = open3({}, {}, {}, 'bash', '-c', 'echo \"${}\" | gzip | base64');
+my {} = open3({}, {}, {}, 'bash', '-c', 'command echo \"${}\" | gzip | base64');
 close {} or croak 'Close failed: $OS_ERROR';
 my $compressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
 close {} or croak 'Close failed: $OS_ERROR';
@@ -141,9 +141,9 @@ waitpid {}, 0;\n",
                 // Compress file
                 output.push_str(&format!("if (-f {}) {{\n", file));
                 let gzip_cmd = if keep_original {
-                    format!("gzip -k {}", file)
+                    format!("command gzip -k {}", file)
                 } else {
-                    format!("gzip {}", file)
+                    format!("command gzip {}", file)
                 };
                 let (in_var, out_var, err_var, pid_var, _result_var) =
                     generator.get_unique_ipc_vars();

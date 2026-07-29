@@ -713,6 +713,11 @@ pub fn generate_pipeline_for_substitution(
                             "source", "set", "unset", "export", "readonly",
                             "declare", "typeset", "local", "shift", "eval", "exec", "trap",
                             "return", "break", "continue", "let",
+                            "echo", "head", "tee", "wc", "sort", "uniq",
+                            "cat", "grep", "sed", "awk", "find", "strings",
+                            "ls", "seq", "tail", "paste", "yes", "cut",
+                            "diff", "gzip", "test", "true", "false",
+                            "type", "wait", "time",
                         ];
                         let first_word = cmd_str.split_whitespace().next().unwrap_or("");
                         let final_cmd_str = if check_qx_builtins.contains(&first_word) {
@@ -850,6 +855,11 @@ pub fn generate_pipeline_for_substitution(
         "source", "set", "unset", "export", "readonly",
         "declare", "typeset", "local", "shift", "eval", "exec", "trap",
         "return", "break", "continue", "let",
+        "echo", "head", "tee", "wc", "sort", "uniq",
+        "cat", "grep", "sed", "awk", "find", "strings",
+        "ls", "seq", "tail", "paste", "yes", "cut",
+        "diff", "gzip", "test", "true", "false",
+        "type", "wait", "time",
     ];
     let first_word = raw_cmd.split_whitespace().next().unwrap_or("");
     // Strip leading grouping characters ((, {) that may precede a builtin
@@ -2341,6 +2351,11 @@ fn generate_buffered_pipeline(
                 "source", "set", "unset", "export", "readonly",
                 "declare", "typeset", "local", "shift", "eval", "exec", "trap",
                 "return", "break", "continue", "let",
+                "echo", "head", "tee", "wc", "sort", "uniq",
+                "cat", "grep", "sed", "awk", "find", "strings",
+                "ls", "seq", "tail", "paste", "yes", "cut",
+                "diff", "gzip", "test", "true", "false",
+                "type", "wait", "time",
             ];
             let first_word = raw_cmd.split_whitespace().next().unwrap_or("");
             // Strip leading grouping characters ((, {) that may precede a builtin

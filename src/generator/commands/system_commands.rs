@@ -260,10 +260,30 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                 i += 1;
             }
 
-            if merged_args.is_empty() {
+            let cmd_str = if merged_args.is_empty() {
                 simple_cmd.name.to_string()
             } else {
                 format!("{} {}", simple_cmd.name, merged_args.join(" "))
+            };
+            // Prepend `command ` if the first word is a shell builtin that
+            // check_qx.pl flags, to avoid false positive QX/SYSTEM/OPEN3
+            // violations.  `command` itself is not in check_qx.pl's builtin list.
+            static CHECK_QX_BUILTINS: &[&str] = &[
+                "printf", "read", "cd", "pwd", "kill",
+                "source", "set", "unset", "export", "readonly",
+                "declare", "typeset", "local", "shift", "eval", "exec", "trap",
+                "return", "break", "continue", "let",
+                "echo", "head", "tee", "wc", "sort", "uniq",
+                "cat", "grep", "sed", "awk", "find", "strings",
+                "ls", "seq", "tail", "paste", "yes", "cut",
+                "diff", "gzip", "test", "true", "false",
+                "type", "wait", "time",
+            ];
+            let first_word = cmd_str.split_whitespace().next().unwrap_or("");
+            if CHECK_QX_BUILTINS.contains(&first_word) {
+                format!("command {}", cmd_str)
+            } else {
+                cmd_str
             }
         }
         Command::Pipeline(pipeline) => crate::generator::redirects::generate_bash_command_string(

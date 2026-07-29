@@ -1508,6 +1508,67 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             ),
                         );
                     }
+                    "test" => {
+                        // Use the test expression generator to produce native Perl code
+                        // instead of shelling out to /usr/bin/test.
+                        let mut test_output = String::new();
+                        generator.generate_test_command(cmd, &mut test_output);
+                        let expr = test_output.trim().to_string();
+                        if expr == "0" || expr.is_empty() {
+                            output.push_str(&generator.indent());
+                            output.push_str("$CHILD_ERROR = 1;\n");
+                        } else {
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", expr));
+                        }
+                    }
+                    "type" => {
+                        // Implement `type` natively in Perl: search PATH for the command.
+                        if cmd.args.is_empty() {
+                            output.push_str(&generator.indent());
+                            output.push_str("$CHILD_ERROR = 0;\n");
+                        } else {
+                            for arg in &cmd.args {
+                                let arg_perl = generator.word_to_perl(arg);
+                                output.push_str(&generator.indent());
+                                // Search PATH for the command, similar to `type -P` / `command -v`.
+                                // Use q{} for the colon delimiter because it is not a regex.
+                                output.push_str(&format!(
+                                    "my $__type_cmd = {};\n",
+                                    arg_perl
+                                ));
+                                output.push_str(&generator.indent());
+                                output.push_str(
+                                    "my $__type_result = (grep { -x \"$_/$__type_cmd\" } split(q{:}, $ENV{PATH} // q{}))[0];\n"
+                                );
+                                output.push_str(&generator.indent());
+                                output.push_str(
+                                    "if (defined $__type_result) { print qq{$__type_cmd is $__type_result\\n}; } else { print qq{$__type_cmd not found\\n}; }\n"
+                                );
+                            }
+                            output.push_str(&generator.indent());
+                            output.push_str("$CHILD_ERROR = 0;\n");
+                        }
+                    }
+                    "wait" => {
+                        // `wait` without arguments waits for all background children.
+                        // Perl equivalent: waitpid(-1, 0) in a loop until no children remain.
+                        if cmd.args.is_empty() {
+                            output.push_str(&generator.indent());
+                            output.push_str("1 while waitpid(-1, 0) > 0;\n");
+                            output.push_str(&generator.indent());
+                            output.push_str("$CHILD_ERROR = 0;\n");
+                        } else {
+                            // `wait pid` — wait for a specific child.
+                            for arg in &cmd.args {
+                                let pid_expr = generator.word_to_perl(arg);
+                                output.push_str(&generator.indent());
+                                output.push_str(&format!("waitpid({}, 0);\n", pid_expr));
+                            }
+                            output.push_str(&generator.indent());
+                            output.push_str("$CHILD_ERROR = 0;\n");
+                        }
+                    }
                     _ => {
                         // Route other builtins to the builtins system
                         // Use unique index for standalone commands to prevent variable masking
