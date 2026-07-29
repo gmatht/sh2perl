@@ -54,13 +54,13 @@ pub fn generate_nohup_command(generator: &mut Generator, cmd: &SimpleCommand) ->
 
         // Execute the command
         if is_builtin {
-            // Use bash -c with `command` prefix to properly invoke the builtin.
+            // Use bash -c to invoke the command.
             let cmd_name = match &cmd.args[0] {
                 Word::Literal(s, _) => s.clone(),
                 _ => String::new(),
             };
-            // Generate: exec 'bash', '-c', 'command cmd_name "$@"', 'cmd_name', @args
-            let bash_cmd = format!("command {} \"$@\"", cmd_name);
+            // Generate: exec 'bash', '-c', 'cmd_name "$@"', 'cmd_name', @args
+            let bash_cmd = format!("{} \"$@\"", cmd_name);
             let bash_lit = generator.perl_string_literal_no_interp(
                 &Word::literal(bash_cmd),
             );

@@ -479,18 +479,27 @@ pub fn generate_ls_command(
 
     // Handle context-based logic
     if pipeline_context {
-        // If -l (long format) is requested, fall back to shell qx{ls ...} call
-        // to produce exact ls -l output.
+        // Native Perl ls -l using opendir/readdir/stat.
         if _long_format {
-            let command = Command::Simple(cmd.clone());
-            let command_str = generator.generate_command_string_for_system(&command);
-            let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+            let files_list: Vec<String> = cmd.args.iter()
+                .filter_map(|a| a.as_literal())
+                .map(|s| generator.perl_string_literal(&Word::literal(s.to_string())))
+                .collect();
+            let dirs = if files_list.is_empty() {
+                "'.'".to_string()
+            } else {
+                files_list.join(", ")
+            };
+            let perl_code = format!(
+                "do {{ my $__out = q{{}}; for my $__d ({dirs}) {{ opendir(my $__dh, $__d) or croak \"ls: $__d: $ERRNO\"; while (my $__f = readdir($__dh)) {{ next if $__f eq q{{.}} || $__f eq q{{..}}; my @__st = stat(\"$__d/$__f\"); my $__mode = sprintf \"%04o\", $__st[2] & 07777; $__out .= sprintf(\"%s %3d %-8s %-8s %8d %s %s\\n\", $__mode, $__st[3], (getpwuid($__st[4]))[0] // $__st[4], (getgrgid($__st[5]))[0] // $__st[5], $__st[7], scalar localtime($__st[9]), $__f); }} closedir($__dh); }} $CHILD_ERROR = 0; q{{}}; }}",
+                dirs = dirs
+            );
             if let Some(var) = output_var {
                 output.push_str(&generator.indent());
-                output.push_str(&format!(
-                    "${} = do {{ my @_qx_cmd = ({}); my $result = qx{{$_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }};\n",
-                    var, command_lit
-                ));
+                output.push_str(&format!("{} = {};\n", var, perl_code));
+            } else {
+                output.push_str(&perl_code);
+                output.push_str("\n");
             }
             return output;
         }
@@ -809,15 +818,21 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let saved_indent = generator.indent_level;
 
     // If -l (long format) is requested, fall back to shell qx{ls ...} call
-    // to produce exact ls -l output (permissions, owner, group, size, date).
+    // Native Perl ls -l using opendir/readdir/stat.
     if _long_format {
-        let command = Command::Simple(cmd.clone());
-        let command_str = generator.generate_command_string_for_system(&command);
-        let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
+        let files_list: Vec<String> = cmd.args.iter()
+            .filter_map(|a| a.as_literal())
+            .map(|s| generator.perl_string_literal(&Word::literal(s.to_string())))
+            .collect();
+        let dirs = if files_list.is_empty() {
+            "'.'".to_string()
+        } else {
+            files_list.join(", ")
+        };
         generator.indent_level = saved_indent;
         return format!(
-            "do {{ my @_qx_cmd = ({}); my $result = qx{{$_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }}",
-            command_lit
+            "do {{ my $__out = q{{}}; for my $__d ({dirs}) {{ opendir(my $__dh, $__d) or croak \"ls: $__d: $ERRNO\"; while (my $__f = readdir($__dh)) {{ next if $__f eq q{{.}} || $__f eq q{{..}}; my @__st = stat(\"$__d/$__f\"); my $__mode = sprintf \"%04o\", $__st[2] & 07777; $__out .= sprintf(\"%s %3d %-8s %-8s %8d %s %s\\n\", $__mode, $__st[3], (getpwuid($__st[4]))[0] // $__st[4], (getgrgid($__st[5]))[0] // $__st[5], $__st[7], scalar localtime($__st[9]), $__f); }} closedir($__dh); }} $CHILD_ERROR = 0; q{{}}; }}",
+            dirs = dirs
         );
     }
 
