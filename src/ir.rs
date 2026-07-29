@@ -289,12 +289,12 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
     out.push_str("#!/usr/bin/env perl\n");
     out.push_str("use strict;\n");
     out.push_str("use warnings;\n");
-    out.push_str("use feature 'say';\n");
 
     // Imports (`use` statements)
     for import in &prog.imports {
         out.push_str(&format!("use {};\n", import));
     }
+    // Blank line after imports block (only if there are imports)
     if !prog.imports.is_empty() {
         out.push('\n');
     }
@@ -363,19 +363,27 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::Output { value, newline, target } => {
             let expr = ir_expr_to_perl(value);
             if let Some(fh) = target {
-                // Output to a specific filehandle: print $fh ... or say $fh ...
+                // Output to a specific filehandle: print $fh ...
                 emit_indent(out, indent);
                 if *newline {
-                    // Use `say {*$fh} ...` or `say $fh ...` for filehandles.
-                    out.push_str(&format!("say {{*{}}} {};\n", fh, expr));
+                    out.push_str(&format!("print {{*{}}} {}.\"\\n\";\n", fh, expr));
                 } else {
                     out.push_str(&format!("print {{*{}}} {};\n", fh, expr));
                 }
             } else if *newline {
-                // Use `say` for newline-terminated output (cleaner than
-                // print + manual newline check).
-                emit_indent(out, indent);
-                out.push_str(&format!("say {};\n", expr));
+                // Use `print` with newline for newline-terminated output.
+                // This avoids the dependency on `use feature 'say'`.
+                // For double-quoted string literals, embed \\n directly
+                // instead of concatenating a separate "\\n".
+                let is_dq = expr.starts_with('"') && expr.ends_with('"') && expr.len() >= 2;
+                if is_dq {
+                    let inner = &expr[1..expr.len()-1];
+                    emit_indent(out, indent);
+                    out.push_str(&format!("print \"{}\\n\";\n", inner));
+                } else {
+                    emit_indent(out, indent);
+                    out.push_str(&format!("print {}.\"\\n\";\n", expr));
+                }
             } else {
                 emit_indent(out, indent);
                 out.push_str(&format!("print {};\n", expr));
@@ -675,7 +683,16 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
 
 pub(crate) fn emit_sub(out: &mut String, sub: &IrSub) {
     out.push_str(&format!("sub {} {{\n", sub.name));
-    for s in &sub.body {
+
+    // Filter out trailing `return;` (IrStmt::Return(None)) which is
+    // unnecessary ceremony — Perl subs return the last expression value.
+    let body: Vec<&IrStmt> = if sub.body.last() == Some(&IrStmt::Return(None)) {
+        sub.body[..sub.body.len() - 1].iter().collect()
+    } else {
+        sub.body.iter().collect()
+    };
+
+    for s in &body {
         emit_stmt(out, s, 1);
     }
     out.push_str("}\n");

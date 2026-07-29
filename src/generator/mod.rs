@@ -316,7 +316,6 @@ impl Generator {
         output.push_str("#!/usr/bin/env perl\n");
         output.push_str("use strict;\n");
         output.push_str("use warnings;\n");
-        output.push_str("use feature 'say';\n");
         // Only emit imports that are actually needed by the generated code.
         // Carp, English, locale are part of the original boilerplate but
         // many scripts don't use them — skip when not needed.
@@ -385,8 +384,6 @@ impl Generator {
 "#,
             );
         }
-        output.push_str("\n");
-
         // Add infrastructure variables only when actually needed.
         // Many scripts don't use $main_exit_code, $ls_success, etc.
         let needs_exit_code = self.needs_exit_code_tracking(ast);

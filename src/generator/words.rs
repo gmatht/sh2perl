@@ -3231,9 +3231,16 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
     }
 
     // Wrap with int() to match bash integer arithmetic semantics.
-    // Use eval {} // "" to handle division/modulo by zero (bash leaves
-    // the variable unset/empty on arithmetic error instead of dying).
-    format!("eval {{ int({}) }} // \"\"", result)
+    // Use eval {} // "" only when the expression contains division or
+    // modulo, because those are the only operations that can trigger a
+    // runtime error (division/modulo by zero).  For simple arithmetic
+    // like addition, subtraction, multiplication, and bitwise ops,
+    // int() is sufficient — Perl integer addition cannot die.
+    if result.contains('/') || result.contains('%') {
+        format!("eval {{ int({}) }} // \"\"", result)
+    } else {
+        format!("int({})", result)
+    }
 }
 
 /// Convert a simple parameter expansion content to Perl for use in arithmetic expressions.
