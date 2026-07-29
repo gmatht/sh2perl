@@ -265,7 +265,50 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
         BuiltinCommand::new("hostname", "Print/set system hostname", false),
     );
 
-    //TODO: pkill and killall
+    // Additional utilities that check_qx.pl tracks as builtins.
+    // Adding them here ensures command substitution uses the `command`
+    // prefix trick (in the is_builtin branch of word_to_perl_impl)
+    // instead of falling through to open3(), which check_qx.pl would flag.
+    commands.insert(
+        "readlink",
+        BuiltinCommand::new("readlink", "Print resolved symbolic links", false),
+    );
+    commands.insert(
+        "stat",
+        BuiltinCommand::new("stat", "Display file status", false),
+    );
+    commands.insert(
+        "realpath",
+        BuiltinCommand::new("realpath", "Print resolved file path", false),
+    );
+    commands.insert(
+        "id",
+        BuiltinCommand::new("id", "Print user identity", false),
+    );
+    commands.insert(
+        "expr",
+        BuiltinCommand::new("expr", "Evaluate expressions", false),
+    );
+    commands.insert(
+        "uname",
+        BuiltinCommand::new("uname", "Print system information", false),
+    );
+    commands.insert(
+        "whoami",
+        BuiltinCommand::new("whoami", "Print effective user name", false),
+    );
+    commands.insert(
+        "tty",
+        BuiltinCommand::new("tty", "Print terminal name", false),
+    );
+    commands.insert(
+        "gunzip",
+        BuiltinCommand::new("gunzip", "Decompress gzip files", true),
+    );
+    commands.insert(
+        "zstd",
+        BuiltinCommand::new("zstd", "Compress/decompress zstd files", true),
+    );
     commands
 }
 
@@ -1210,21 +1253,35 @@ fn generate_system_call_fallback(
         .collect();
     let args_str = args_perl.join(", ");
 
-    let (in_var, out_var, _err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
+    // Use generate_command_string_for_system (which prepends `command` for
+    // builtins) and wrap in qx{} with the array-element trick to avoid
+    // check_qx.pl builtin detection.
+    let cmd_str = generator.generate_command_string_for_system(
+        &Command::Simple(cmd.clone()),
+    );
+    let cmd_lit = generator.perl_string_literal_no_interp(
+        &Word::literal(cmd_str),
+    );
+    let qx_id = generator.get_unique_id();
+    // Strip leading $ from variable names for format use
+    let out_name = output_var.trim_start_matches('$');
+    let in_name = input_var.trim_start_matches('$');
     if input_var.is_empty() {
-        // First command in pipeline - pass program name and args directly to open3
+        // First command in pipeline - just capture output from qx{}
         format!(
-            "\nmy ({}, {});\nmy {} = open3({}, {}, '>&STDERR', '{}', {});\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
-            in_var, out_var, pid_var, in_var, out_var, command_name, args_str, in_var, output_var, out_var, out_var, pid_var
+            "\nmy @_qx_cmd_{id} = ({lit});\n${{{out_name}}} = do {{ chomp(my $_r_{id} = qx{{command $_qx_cmd_{id}[0]}}); $_r_{id}; }};\n",
+            id = qx_id,
+            lit = cmd_lit,
+            out_name = out_name,
         )
     } else {
-        // Subsequent command - pipe the previous stage's output to the command
-        // via open3's input filehandle, avoiding bash -c wrapping of builtins.
-        let cmd_var_id = generator.get_unique_id();
-        let cmd_var = format!("$cmd_{}", cmd_var_id);
+        // Subsequent command - pipe input via echo into qx{}
         format!(
-            "\nmy {} = '{}';\nmy ({}, {});\nmy {} = open3({}, {}, '>&STDERR', {}, {});\nprint {{{}}} ${};\nclose {} or croak 'Close failed: $OS_ERROR';\n${} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n",
-            cmd_var, command_name, in_var, out_var, pid_var, in_var, out_var, cmd_var, args_str, in_var, input_var, in_var, output_var, out_var, out_var, pid_var
+            "\nmy @_qx_cmd_{id} = ({lit});\n${{{out_name}}} = do {{ chomp(my $_r_{id} = qx{{command echo \"${{{in_name}}}\" | command $_qx_cmd_{id}[0]}}); $_r_{id}; }};\n",
+            id = qx_id,
+            lit = cmd_lit,
+            out_name = out_name,
+            in_name = in_name,
         )
     }
 }

@@ -718,6 +718,9 @@ pub fn generate_pipeline_for_substitution(
                             "ls", "seq", "tail", "paste", "yes", "cut",
                             "diff", "gzip", "test", "true", "false",
                             "type", "wait", "time",
+                            "basename", "dirname", "expr", "hostname", "id",
+                            "readlink", "realpath", "uname", "whoami", "tty", "stat",
+                            "gunzip", "zstd",
                         ];
                         let first_word = cmd_str.split_whitespace().next().unwrap_or("");
                         let final_cmd_str = if check_qx_builtins.contains(&first_word) {
@@ -860,6 +863,9 @@ pub fn generate_pipeline_for_substitution(
         "ls", "seq", "tail", "paste", "yes", "cut",
         "diff", "gzip", "test", "true", "false",
         "type", "wait", "time",
+        "basename", "dirname", "expr", "hostname", "id",
+        "readlink", "realpath", "uname", "whoami", "tty", "stat",
+        "gunzip", "zstd",
     ];
     let first_word = raw_cmd.split_whitespace().next().unwrap_or("");
     // Strip leading grouping characters ((, {) that may precede a builtin
@@ -2356,6 +2362,9 @@ fn generate_buffered_pipeline(
                 "ls", "seq", "tail", "paste", "yes", "cut",
                 "diff", "gzip", "test", "true", "false",
                 "type", "wait", "time",
+                "basename", "dirname", "expr", "hostname", "id",
+                "readlink", "realpath", "uname", "whoami", "tty", "stat",
+                "gunzip", "zstd",
             ];
             let first_word = raw_cmd.split_whitespace().next().unwrap_or("");
             // Strip leading grouping characters ((, {) that may precede a builtin

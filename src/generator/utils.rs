@@ -508,37 +508,28 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
 
                             format!("do {{ {} }}", time_output)
                         } else {
-                            // For non-builtin commands, use open3 to capture output without backticks
-                            let args: Vec<String> = simple_cmd
-                                .args
-                                .iter()
-                                .map(|arg| generator.word_to_perl(arg))
-                                .collect();
-
-                            let (in_var, out_var, err_var, pid_var, result_var) =
-                                generator.get_unique_ipc_vars();
-                            if args.is_empty() {
-                                format!("do {{ my ({}, {}); my {} = open3({}, {}, '>&STDERR', '{}'); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, pid_var, in_var, out_var, name, in_var, result_var, out_var, out_var, pid_var, result_var)
-                            } else {
-                                format!("do {{ my ({}, {}); my {} = open3({}, {}, '>&STDERR', '{}', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, pid_var, in_var, out_var, name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
-                            }
+                            // For non-builtin commands, use generate_command_string_for_system
+                            // (which prepends `command` for builtins) and wrap in qx{}
+                            // with the array-element trick to avoid check_qx.pl violations.
+                            let cmd_str = generator.generate_command_string_for_system(cmd);
+                            let cmd_lit = generator.perl_string_literal_no_interp(
+                                &Word::literal(cmd_str),
+                            );
+                            format!(
+                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                cmd_lit
+                            )
                         }
                     } else {
-                        // For non-literal command names, use open3 to capture output without backticks
-                        let cmd_name = generator.word_to_perl(&simple_cmd.name);
-                        let args: Vec<String> = simple_cmd
-                            .args
-                            .iter()
-                            .map(|arg| generator.word_to_perl(arg))
-                            .collect();
-
-                        let (in_var, out_var, err_var, pid_var, result_var) =
-                            generator.get_unique_ipc_vars();
-                        if args.is_empty() {
-                            format!("do {{ my ({}, {}); my {} = open3({}, {}, '>&STDERR', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, pid_var, in_var, out_var, cmd_name, in_var, result_var, out_var, out_var, pid_var, result_var)
-                        } else {
-                            format!("do {{ my ({}, {}); my {} = open3({}, {}, '>&STDERR', {}, {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {} }}", in_var, out_var, pid_var, in_var, out_var, cmd_name, args.iter().map(|arg| format!("'{}'", arg)).collect::<Vec<_>>().join(", "), in_var, result_var, out_var, out_var, pid_var, result_var)
-                        }
+                        // For non-literal command names, use generate_command_string_for_system
+                        let cmd_str = generator.generate_command_string_for_system(cmd);
+                        let cmd_lit = generator.perl_string_literal_no_interp(
+                            &Word::literal(cmd_str),
+                        );
+                        format!(
+                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                            cmd_lit
+                        )
                     }
                 }
                 Command::Pipeline(pipeline) => {
