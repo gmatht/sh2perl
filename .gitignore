@@ -40,3 +40,10 @@ sh2perl-*.pl
 
 # Accidentally committed build binary
 rust_out
+# Artifact files from running examples
+examples/out.txt
+examples/test.py
+examples/x.py
+examples/comparison.txt
+examples/config.txt
+examples/-
