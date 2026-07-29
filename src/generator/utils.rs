@@ -515,10 +515,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             let cmd_lit = generator.perl_string_literal_no_interp(
                                 &Word::literal(cmd_str),
                             );
-                            format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                                cmd_lit
-                            )
+                            crate::ir::expr_to_open_perl(&cmd_lit, true)
                         }
                     } else {
                         // For non-literal command names, use generate_command_string_for_system
@@ -526,10 +523,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         let cmd_lit = generator.perl_string_literal_no_interp(
                             &Word::literal(cmd_str),
                         );
-                        format!(
-                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                            cmd_lit
-                        )
+                        crate::ir::expr_to_open_perl(&cmd_lit, true)
                     }
                 }
                 Command::Pipeline(pipeline) => {

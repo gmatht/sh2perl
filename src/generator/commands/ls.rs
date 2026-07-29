@@ -491,7 +491,7 @@ pub fn generate_ls_command(
                 files_list.join(", ")
             };
             let perl_code = format!(
-                "do {{ my $__out = q{{}}; for my $__d ({dirs}) {{ opendir(my $__dh, $__d) or croak \"ls: $__d: $ERRNO\"; while (my $__f = readdir($__dh)) {{ next if $__f eq q{{.}} || $__f eq q{{..}}; my @__st = stat(\"$__d/$__f\"); my $__mode = sprintf \"%04o\", $__st[2] & 07777; $__out .= sprintf(\"%s %3d %-8s %-8s %8d %s %s\\n\", $__mode, $__st[3], (getpwuid($__st[4]))[0] // $__st[4], (getgrgid($__st[5]))[0] // $__st[5], $__st[7], scalar localtime($__st[9]), $__f); }} closedir($__dh); }} $CHILD_ERROR = 0; q{{}}; }}",
+                "do {{ my $__out = q{{}}; for my $__d ({dirs}) {{ opendir(my $__dh, $__d) or croak \"ls: $__d: $ERRNO\"; while (my $__f = readdir($__dh)) {{ next if $__f eq q{{.}} || $__f eq q{{..}}; my @__st = stat(\"$__d/$__f\"); my $__mode = sprintf \"%04o\", $__st[2] & 4095; $__out .= sprintf(\"%s %3d %-8s %-8s %8d %s %s\\n\", $__mode, $__st[3], (getpwuid($__st[4]))[0] // $__st[4], (getgrgid($__st[5]))[0] // $__st[5], $__st[7], scalar localtime($__st[9]), $__f); }} closedir($__dh); }} $CHILD_ERROR = 0; q{{}}; }}",
                 dirs = dirs
             );
             if let Some(var) = output_var {
@@ -831,7 +831,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
         };
         generator.indent_level = saved_indent;
         return format!(
-            "do {{ my $__out = q{{}}; for my $__d ({dirs}) {{ opendir(my $__dh, $__d) or croak \"ls: $__d: $ERRNO\"; while (my $__f = readdir($__dh)) {{ next if $__f eq q{{.}} || $__f eq q{{..}}; my @__st = stat(\"$__d/$__f\"); my $__mode = sprintf \"%04o\", $__st[2] & 07777; $__out .= sprintf(\"%s %3d %-8s %-8s %8d %s %s\\n\", $__mode, $__st[3], (getpwuid($__st[4]))[0] // $__st[4], (getgrgid($__st[5]))[0] // $__st[5], $__st[7], scalar localtime($__st[9]), $__f); }} closedir($__dh); }} $CHILD_ERROR = 0; q{{}}; }}",
+            "do {{ my $__out = q{{}}; for my $__d ({dirs}) {{ opendir(my $__dh, $__d) or croak \"ls: $__d: $ERRNO\"; while (my $__f = readdir($__dh)) {{ next if $__f eq q{{.}} || $__f eq q{{..}}; my @__st = stat(\"$__d/$__f\"); my $__mode = sprintf \"%04o\", $__st[2] & 4095; $__out .= sprintf(\"%s %3d %-8s %-8s %8d %s %s\\n\", $__mode, $__st[3], (getpwuid($__st[4]))[0] // $__st[4], (getgrgid($__st[5]))[0] // $__st[5], $__st[7], scalar localtime($__st[9]), $__f); }} closedir($__dh); }} $CHILD_ERROR = 0; q{{}}; }}",
             dirs = dirs
         );
     }

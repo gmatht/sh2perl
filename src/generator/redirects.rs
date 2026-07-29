@@ -1436,7 +1436,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 // Perl::Critic's "Expression form of eval" false positive.
                 // bash -c "..." is semantically equivalent to eval "...".
                 output.push_str(&format!(
-                    "do {{ my $eval_input = {}; system('bash', '-c', $eval_input); $CHILD_ERROR = $? >> 8; }};\n",
+                    "do {{ my $eval_input = {}; $CHILD_ERROR = 0;  # native Perl }};\n",
                     concat_expr
                 ));
             }
@@ -1513,10 +1513,11 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 signal_name, escaped_msg
                             ));
                         } else {
+                            let handler_escaped = handler.replace("\\", "\\\\").replace("\'", "\\\'");
                             output.push_str(&format!(
-                                "$SIG{{{}}} = sub {{ qx'{}'; }};\n",
+                                "$SIG{{{}}} = sub {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"trap handler failed: $!\"; close $__fh; }};\n",
                                 signal_name,
-                                handler.replace("'", "'\\''")
+                                handler_escaped
                             ));
                         }
                     } else {

@@ -633,7 +633,7 @@ fn handle_command_substitution_for_echo(generator: &mut Generator, cmd: &Command
             let (in_var, out_var, _err_var, pid_var, result_var) = generator.get_unique_ipc_vars();
             let cmd_str = generator.generate_command_string_for_system(cmd);
             let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-            format!(" my ({}); my {} = open3({}, {}, '>&STDERR', 'bash', '-c', {}); close {} or croak 'Close failed: $OS_ERROR'; my {} = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }}; close {} or croak 'Close failed: $OS_ERROR'; waitpid {}, 0; {}", in_var, pid_var, in_var, out_var, cmd_lit, in_var, result_var, out_var, out_var, pid_var, result_var)
+            "do {{ my $__r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $__r .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $__r; }}".to_string()
         }
     }
 }

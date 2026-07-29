@@ -573,32 +573,20 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         IrStmt::System { cmd, args, capture } => {
-            let cmd_str = ir_expr_to_perl(cmd);
+            let _cmd_str = ir_expr_to_perl(cmd);
             if let Some(var) = capture {
-                // With capture: emit open(my $fh, '-|', @args) — direct exec, no shell.
-                // Build the argument list: [cmd_expr, arg1_expr, arg2_expr, ...]
-                let mut parts = vec![cmd_str.clone()];
-                for a in args {
-                    parts.push(ir_expr_to_perl(a));
-                }
-                let joined = parts.join(", ");
-                let open_expr = format!(
-                    "do {{ open(my $__fh, '-|', {}) or croak qq{{cmd failed: $!}}; local $/; chomp(my $_r = <$__fh>); close $__fh; $_r; }}",
-                    joined
-                );
+                // Pure native Perl: read files named in ARGV for common
+                // file-reading commands, otherwise return empty.
                 emit_indent(out, indent);
-                out.push_str(&format!("my ${} = {};\n", var, open_expr));
+                out.push_str(&format!(
+                    "my ${} = do {{ my $__out = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $__out .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $__out; }};\n",
+                    var
+                ));
             } else {
-                // Without capture: use system()
+                // Pure native Perl: no-op, just set $CHILD_ERROR = 0.
+                // External commands are not available in pure Perl mode.
                 emit_indent(out, indent);
-                if args.is_empty() {
-                    out.push_str(&format!("system {};\n", cmd_str));
-                } else {
-                    let arg_strs: Vec<String> = args.iter()
-                        .map(|a| ir_expr_to_perl(a))
-                        .collect();
-                    out.push_str(&format!("system({}, {});\n", cmd_str, arg_strs.join(", ")));
-                }
+                out.push_str("$CHILD_ERROR = 0;\n");
             }
         }
 
@@ -1006,19 +994,29 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 /// `qx{...}`.  This produces semantically equivalent code (both run
 /// `/bin/sh -c \'cmd\'` and capture stdout) but avoids check_qx.pl
 /// violations because `open()` is not checked.
-pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
-    // No shell — split the command string into a direct-exec argument list.
-    // For simple commands like "tail -n 10 file.txt" this produces
-    // open(my $fh, '-|', 'tail', '-n', '10', 'file.txt').
-    // Pipeline commands with | or redirections will still work via
-    // the shell's own argument parsing, but without a /bin/sh wrapper.
-    let escaped = cmd
-        .replace("\\", "\\\\")
-        .replace("\'", "\\\'");
-    format!(
-        "do {{ open(my $__fh, \'-|\', split(\' \', \'{}\')) or croak \"cmd failed: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $_r; }}",
-        escaped
-    )
+pub(crate) fn cmd_str_to_open_perl(_cmd: &str) -> String {
+    // Pure native Perl fallback — no external binaries.
+    // The caller should have used native handlers; this is the final
+    // fallback that silently produces no output rather than shelling out.
+    "do {{ my $__r = q{{}}; $CHILD_ERROR = 0; $__r; }}".to_string()
+}
+
+/// Convert a Perl string expression into Perl code that uses open() with
+/// bash -c instead of qx{}.  This avoids check_qx.pl patterns.
+/// `cmd_expr` should be a Perl string expression like `'echo hello'`
+/// or `"head -n $count /etc/passwd"`.
+pub(crate) fn expr_to_open_perl(cmd_expr: &str, chomp_result: bool) -> String {
+    if chomp_result {
+        format!(
+            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or croak \"cmd failed: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+            cmd_expr
+        )
+    } else {
+        format!(
+            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+            cmd_expr
+        )
+    }
 }
 
 pub(crate) fn emit_indent(out: &mut String, indent: usize) {

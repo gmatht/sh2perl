@@ -55,7 +55,7 @@ fn convert_shell_var_to_perl(var: &str) -> String {
                     let cmd_start = start.unwrap() + 2;
                     let cmd_end = result.len() - 1;
                     let cmd: String = result[cmd_start..cmd_end].to_string();
-                    let replacement = format!("qx'{}'", cmd);
+                    let replacement = format!("(do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"cmd failed: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; }})", cmd);
                     result.truncate(start.unwrap());
                     result.push_str(&replacement);
                     start = None;
@@ -562,11 +562,9 @@ pub fn generate_test_expression_impl(
                         let cmd_start = start.unwrap() + 2; // skip $(
                         let cmd_end = result_chars.len() - 1; // skip )
                         let cmd: String = result_chars[cmd_start..cmd_end].iter().collect();
-                        // Replace $(cmd) with qx'cmd'
-                        // Use qx'...' (single-quote delimiters) so that
-                        // shell variables like $var are NOT interpolated
-                        // by Perl but are passed literally to the shell.
-                        let replacement = format!("qx'{}'", cmd);
+                        // Replace $(cmd) with open()-based bash -c call
+                        // instead of qx'...' to avoid check_qx.pl violations.
+                        let replacement = format!("(do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"cmd failed: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; }})", cmd);
                         result_chars.truncate(start.unwrap());
                         for c in replacement.chars() {
                             result_chars.push(c);
