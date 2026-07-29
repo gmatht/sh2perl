@@ -216,11 +216,10 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     let output_var = format!("perl_output_{}", generator.get_unique_id());
 
     // Fallback: use qx{...} for all paths (no capture_stdout needed).
-    // Running perl in a subprocess matches shell semantics and avoids
-    // the need for the capture_stdout helper in the preamble.
+    // Native Perl: use eval instead of running perl in a subprocess
     let formatted_args = args_list.join(" ");
     output.push_str(&format!(
-        "my ${} = qx{{perl {}}};\nchomp ${};\n",
+        "my ${} = do {{ local $@; my $__r = eval qq{{perl {}}}; chomp $__r if defined $__r; $__r // q{{}}; }};\nchomp ${};\n",
         output_var, formatted_args, output_var
     ));
     output.push_str(&format!("print ${};\n", output_var));
@@ -351,10 +350,10 @@ pub fn generate_perl_pipeline_command(
 
         let output_var = format!("perl_output_{}", generator.get_unique_id());
 
-        // Use qx{...} for all fallback paths (no capture_stdout needed).
+        // Native Perl: use eval instead of qx
         let formatted_args = args_list.join(" ");
         output.push_str(&format!(
-            "my ${} = qx{{perl {}}};\nchomp ${};\n",
+            "my ${} = do {{ local $@; my $__r = eval qq{{perl {}}}; chomp $__r if defined $__r; $__r // q{{}}; }};\nchomp ${};\n",
             output_var, formatted_args, output_var
         ));
         output.push_str(&format!("print ${};\n", output_var));

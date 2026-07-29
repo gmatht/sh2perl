@@ -456,11 +456,10 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         } else if name == "which" {
                             // Use the real which command so flags and exit codes match the host tool.
                             let which_cmd = generator.generate_command_string_for_system(cmd);
-                            let which_lit =
-                                generator.perl_string_literal_no_interp(&Word::literal(which_cmd));
+                            // Native Perl which via PATH search
                             format!(
-                                "do {{ my $which_cmd = {}; my $which_output = qx{{$which_cmd}}; $CHILD_ERROR = $? >> 8; $which_output; }}",
-                                which_lit
+                                "do {{ my $which_output = q{{}}; for my $__d (split /:/, $ENV{{PATH}} // q{{}}) {{ my $__f = \"$__d/{}\"; if (-x $__f) {{ $which_output = $__f; last }} }} $CHILD_ERROR = 0; $which_output; }}",
+                                which_cmd
                             )
                         } else if name == "seq" {
                             // Special handling for seq in command substitution
