@@ -54,6 +54,7 @@ pub fn generate_echo_command(
                         "@" => "@ARGV".to_string(),
                         "*" => "@ARGV".to_string(),
                         "?" => "($? >> 8)".to_string(),
+                        "!" => "''".to_string(),
                         _ => format!("${}", var),
                     },
                     Word::StringInterpolation(interp, _) => {
@@ -65,6 +66,7 @@ pub fn generate_echo_command(
                                     "@" => "@ARGV".to_string(),
                                     "*" => "@ARGV".to_string(),
                                     "?" => "($? >> 8)".to_string(),
+                                    "!" => "''".to_string(),
                                     _ => format!("${}", var),
                                 }
                             } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
@@ -166,6 +168,7 @@ pub fn generate_echo_command(
                                                 "@" => result.push_str("@ARGV"),
                                                 "*" => result.push_str("@ARGV"),
                                                 "?" => result.push_str("($? >> 8)"),
+                                                "!" => result.push_str(""),
                                                 _ => result.push_str(&format!("${}", var)),
                                             }
                                         }

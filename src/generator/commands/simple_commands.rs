@@ -960,6 +960,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 "@" => "@ARGV".to_string(),
                                 "*" => "@ARGV".to_string(),
                                 "?" => "($? >> 8)".to_string(),
+                                "!" => "''".to_string(),
                                 _ => format!("${}", var),
                             },
                             Word::StringInterpolation(interp, _) => {
@@ -971,6 +972,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             "@" => "@ARGV".to_string(),
                                             "*" => "@ARGV".to_string(),
                                             "?" => "($? >> 8)".to_string(),
+                                            "!" => "''".to_string(),
                                             _ => format!("${}", var),
                                         }
                                     } else if let StringPart::ParameterExpansion(pe) =
@@ -1057,6 +1059,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                         "@" => result.push_str("@ARGV"),
                                                         "*" => result.push_str("@ARGV"),
                                                         "?" => result.push_str("($? >> 8)"),
+                                                        "!" => result.push_str(""),
                                                         _ => result.push_str(&format!("${}", var)),
                                                     }
                                                 }
@@ -1179,8 +1182,18 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             .find(|a| !matches!(a, Word::Literal(s, _) if s == "-n" || s == "-e")),
                         Some(Word::CommandSubstitution(_, _))
                     ) {
-                        // For command substitution, don't add extra newline as it already contains proper formatting
-                        output.push_str(&format!("print {};\n", args[0]));
+                        // Command substitution needs trailing newline (bash `echo` adds one)
+                        if has_n_flag {
+                            output.push_str(&format!("print {};\n", args[0]));
+                        } else {
+                            // Use IR-based output for cleaner code
+                            let ir_stmt = crate::ir::IrStmt::Output {
+                                value: crate::ir::perl_expr_to_ir(&args[0]),
+                                newline: true,
+                                target: None,
+                            };
+                            output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
+                        }
                     } else if !has_n_flag
                         && args[0].starts_with('"')
                         && args[0].ends_with('"')
@@ -1956,6 +1969,7 @@ pub fn generate_echo_command(
                         "@" => "@ARGV".to_string(),
                         "*" => "@ARGV".to_string(),
                         "?" => "($? >> 8)".to_string(),
+                        "!" => "''".to_string(),
                         _ => format!("${}", var),
                     },
                     Word::StringInterpolation(interp, _) => {
@@ -1967,6 +1981,7 @@ pub fn generate_echo_command(
                                     "@" => "@ARGV".to_string(),
                                     "*" => "@ARGV".to_string(),
                                     "?" => "($? >> 8)".to_string(),
+                                    "!" => "''".to_string(),
                                     _ => format!("${}", var),
                                 }
                             } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
