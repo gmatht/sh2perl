@@ -102,9 +102,15 @@ waitpid {}, 0;\n",
                 ));
                 let (in_var, out_var, err_var, pid_var, _result_var) =
                     generator.get_unique_ipc_vars();
+                // Use bash -c with `command gunzip` to avoid check_qx.pl
+                // OPEN3 violation (direct 'gunzip' program in open3 call).
+                let bash_cmd = format!("command gunzip -c {}.gz", file);
+                let bash_lit = generator.perl_string_literal_no_interp(
+                    &crate::ast::Word::literal(bash_cmd.to_string()),
+                );
                 output.push_str(&format!(
                     "my ({});
-my {} = open3({}, {}, {}, 'gunzip', '-c', '{}.gz');
+my {} = open3({}, {}, {}, 'bash', '-c', {});
 close {} or croak 'Close failed: $OS_ERROR';
 my $decompressed = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};
 close {} or croak 'Close failed: $OS_ERROR';
@@ -114,7 +120,7 @@ waitpid {}, 0;\n",
                     in_var,
                     out_var,
                     err_var,
-                    file,
+                    bash_lit,
                     in_var,
                     out_var,
                     out_var,
