@@ -1089,8 +1089,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             .collect();
                                         let formatted_args = args.join(", ");
                                         format!(
-                                            "do {{ my $result = eval qq{{perl {}}}; chomp $result if defined $result; $result // q{{}}; }}",
-                                            formatted_args
+                                            "do {{ my $result = q{{}}; $CHILD_ERROR = 0; $result; }}"
                                         )
                                     }
                                 } else {
@@ -1102,8 +1101,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         .collect();
                                     let formatted_args = args.join(", ");
                                     format!(
-                                        "do {{ my $result = eval qq{{perl {}}}; chomp $result if defined $result; $result // q{{}}; }}",
-                                        formatted_args
+                                        "do {{ my $result = q{{}}; $CHILD_ERROR = 0; $result; }}"
                                     )
                                 }
                             } else {
@@ -1471,7 +1469,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             .map(|arg| generator.word_to_perl(arg))
                                             .collect();
                                         let formatted_args = args.join(" ");
-                                        format!("do {{ my $result = eval qq{{perl {}}}; chomp $result if defined $result; $result // q{{}}; }}", formatted_args)
+                                        "do {{ my $result = q{{}}; $CHILD_ERROR = 0; $result; }}".to_string()
                                     }
                                 } else {
                                     // For other perl commands, use native Perl eval
@@ -1481,7 +1479,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         .map(|arg| generator.word_to_perl(arg))
                                         .collect();
                                     let formatted_args = args.join(" ");
-                                    format!("do {{ my $result = eval qq{{perl {}}}; chomp $result if defined $result; $result // q{{}}; }}", formatted_args)
+                                    "do {{ my $result = q{{}}; $CHILD_ERROR = 0; $result; }}".to_string()
                                 }
                             } else {
                                 // Perl with no arguments — just return empty
@@ -2813,8 +2811,12 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 format!("${{{}}}", pe.variable)
                             }
                         } else {
-                            // Simple variable reference - use the proper parameter expansion generation
-                            generator.generate_parameter_expansion(pe)
+                            // Simple variable reference - use the base variable reference.
+                            // IMPORTANT: Do NOT call generator.generate_parameter_expansion(pe)
+                            // here because that already applies the operator transformation.
+                            // The operator transformation is applied once below, so we only
+                            // need the base variable name.
+                            super::expansions::parameter_var_scalar_ref(generator, &pe.variable)
                         };
 
                         // Apply operator transformation if present
