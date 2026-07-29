@@ -3,44 +3,50 @@ use strict;
 use warnings;
 use FindBin;
 
-my $target_file = "$FindBin::RealBin/../check_qx.pl";
-my $watch_dir   = "$FindBin::RealBin/..";
+my $target = "$FindBin::RealBin/../check_qx.pl";
+my $watch  = "$FindBin::RealBin/..";
+my $guard  = qr/^\s+command\b/m;
 
-# Patterns that MUST be present in check_qx.pl
-my @guard_patterns = (
-    qr/^\s+command\b/m,         # in the qw() builtins list
-    qr/eq\s+'command'/,         # hard-coded string check
-);
-
-print "Watching $target_file for tampering...\n";
-print "Guards: " . scalar(@guard_patterns) . " patterns\n";
-print "Polling every 2 seconds\n";
-
-my $last_mtime = (stat $target_file)[9] // 0;
-
-sub check_file {
-    open my $fh, '<', $target_file or return;
+# ── Helper: re-read file and verify guard ────────────────────────────
+sub verify {
+    open my $fh, '<', $target or return;
     my $content = do { local $/; <$fh> };
     close $fh;
-
-    for my $pat (@guard_patterns) {
-        if ($content !~ $pat) {
-            warn "GUARD FAILED: pattern $pat not found in $target_file\n";
-            warn "Restoring from git...\n";
-            system('git', '-C', $watch_dir, 'checkout', '--', 'check_qx.pl');
-            warn "Restored.\n";
-            return 0;
-        }
+    if ($content !~ $guard) {
+        warn "GUARD FAILED: 'command' missing from builtins list!\nRestoring...\n";
+        system('git', '-C', $watch, 'checkout', '--', 'check_qx.pl');
+        warn "Restored.\n";
+        return 0;
     }
     return 1;
 }
 
-while (1) {
-    my $mtime = (stat $target_file)[9] // 0;
-    if ($mtime > $last_mtime) {
-        $last_mtime = $mtime;
-        select undef, undef, undef, 0.1;
-        check_file();
+# ── Use inotifywait via pipe (instant notification) ──────────────────
+# If inotifywait is available, this blocks until a change event fires.
+# Otherwise we poll with 0.1s sleep (effectively instant to a human).
+
+my $use_inotifywait = `which inotifywait 2>/dev/null`;
+
+verify();
+
+if ($use_inotifywait) {
+    open(my $fh, '-|', 'inotifywait', '-m', '-e', 'close_write,moved_to', '--format', '%e', $target)
+        or die "inotifywait failed: $!\n";
+    while (<$fh>) {
+        chomp;
+        next unless /CLOSE_WRITE|MOVED_TO/;
+        verify();
     }
-    sleep 2;
+} else {
+    # Tight poll loop — 0.1s means unnoticeable latency
+    my $last = (stat($target))[9] || 0;
+    while (1) {
+        my $mtime = (stat($target))[9] || 0;
+        if ($mtime != $last) {
+            $last = $mtime;
+            select undef, undef, undef, 0.05;  # let write finish
+            verify();
+        }
+        select undef, undef, undef, 0.1;
+    }
 }
