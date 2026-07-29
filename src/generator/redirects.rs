@@ -699,10 +699,6 @@ fn needs_shell_quoting_literal(s: &str) -> bool {
         || s.contains('\n')
         || s.contains('\t')
         || s.contains('\r')
-        || s.contains('\n')
-        || s.contains('\t')
-        || s.contains('\r')
-        || s.contains('\n')
         || s.contains(';')
         || s.contains('|')
         || s.contains('&')
@@ -711,6 +707,9 @@ fn needs_shell_quoting_literal(s: &str) -> bool {
         || s.contains('*')
         || s.contains('?')
         || s.contains('[')
+        || s.contains('{')
+        || s.contains('}')
+        || s.contains('$')
 }
 
 fn word_to_bash_string(word: &Word) -> String {

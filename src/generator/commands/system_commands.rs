@@ -110,6 +110,13 @@ pub fn word_to_bash_string_for_system(generator: &mut Generator, word: &Word) ->
                 || s.contains('*')
                 || s.contains('?')
                 || s.contains('[')
+                // Shell brace expansion and positional parameters inside
+                // literal strings (e.g. awk/sed programs like '{print$3}')
+                // must be quoted to prevent bash from expanding $N as
+                // positional parameters or misinterpreting braces.
+                || s.contains('{')
+                || s.contains('}')
+                || s.contains('$')
             {
                 // If the literal contains backslash escape sequences (\n, \t, etc.),
                 // use double quotes so that bash's echo -e will interpret them.
