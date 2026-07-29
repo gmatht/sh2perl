@@ -258,6 +258,14 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
         "wait",
         BuiltinCommand::new("wait", "Wait for background processes", false),
     );
+    commands.insert(
+        "command",
+        BuiltinCommand::new("command", "Run a command bypassing shell functions", false),
+    );
+    commands.insert(
+        "env",
+        BuiltinCommand::new("env", "Run a command in a modified environment", false),
+    );
 
     // Network
     commands.insert(
@@ -311,7 +319,20 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
 }
 
 pub fn is_builtin(command_name: &str) -> bool {
-    get_builtin_commands().contains_key(command_name)
+    // Also check by basename for path-qualified commands like /bin/hostname
+    let name = std::path::Path::new(command_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(command_name);
+    get_builtin_commands().contains_key(name)
+}
+
+/// Get the basename of a command (strip path prefix if any)
+pub fn command_basename(command_name: &str) -> &str {
+    std::path::Path::new(command_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(command_name)
 }
 
 /// Check if all commands in a pipeline support line-by-line processing
@@ -461,8 +482,14 @@ pub fn generate_generic_builtin(
         Word::Literal(s, _) => s,
         _ => "unknown_command",
     };
+    // Use basename for matching so path-qualified commands like /bin/hostname still match
+    let command_basename = std::path::Path::new(&command_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&command_name);
 
-    match command_name {
+    // Match on basename for builtin dispatch, but keep command_name for other uses
+    match command_basename {
         "grep" => {
             // Print only for standalone grep (no pipeline input/output)
             let should_print = input_var.is_empty() && output_var.is_empty();
@@ -796,6 +823,80 @@ pub fn generate_generic_builtin(
         }
         "hostname" => {
             crate::generator::commands::hostname::generate_hostname_command(generator, cmd)
+        }
+        "command" => {
+            // command -v name: search PATH for the command
+            // command name args...: run the command (in Perl there are no shell functions to bypass)
+            if cmd.args.is_empty() {
+                "$CHILD_ERROR = 0;\n".to_string()
+            } else {
+                let first_arg = match &cmd.args[0] {
+                    Word::Literal(s, _) => s.clone(),
+                    _ => String::new(),
+                };
+                if (first_arg == "-v" || first_arg == "-V") && cmd.args.len() >= 2 {
+                    // command -v name: search PATH like `type -P`
+                    let name_arg = generator.word_to_perl(&cmd.args[1]);
+                    if output_var.is_empty() {
+                        format!(
+                            "do {{ my $__cmd = {}; my $__path = (grep {{ -x qq{{$_/$__cmd}} }} split(q{{:}}, $ENV{{PATH}} // q{{}}))[0]; if (defined $__path) {{ print qq{{$__path\n}}; $CHILD_ERROR = 0; }} else {{ $CHILD_ERROR = 1; }} }};\n",
+                            name_arg
+                        )
+                    } else {
+                        format!(
+                            "do {{ my $__cmd = {}; ${} = (grep {{ -x qq{{$_/$__cmd}} }} split(q{{:}}, $ENV{{PATH}} // q{{}}))[0]; $CHILD_ERROR = 0; }};\n",
+                            name_arg, output_var
+                        )
+                    }
+                } else {
+                    // command name args...: just run the command directly through the shell
+                    // to preserve builtin semantics for other builtins like echo, printf, etc.
+                    let cmd_str = generator.generate_command_string_for_system(
+                        &Command::Simple(cmd.clone()),
+                    );
+                    if output_var.is_empty() {
+                        format!(
+                            "$main_exit_code = system('bash', '-c', {}) >> 8;\n",
+                            cmd_str
+                        )
+                    } else {
+                        format!(
+                            "${{{}}} = do {{ open(my $__fh, q{{-|}}, 'bash', '-c', {}) or croak q{{cmd failed: $!}}; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }};\n",
+                            output_var, cmd_str
+                        )
+                    }
+                }
+            }
+        }
+        "env" => {
+            // env: print environment variables or run a command with modified environment
+            // Build a full bash command string from args, preserving env var patterns
+            // like VAR=value that the parser may have left as separate tokens.
+            let cmd_str = generator.generate_command_string_for_system(
+                &Command::Simple(cmd.clone()),
+            );
+            let cmd_lit = generator.perl_string_literal_no_interp(
+                &Word::literal(cmd_str),
+            );
+            if cmd.args.is_empty() && cmd.env_vars.is_empty() {
+                // env with no args: print all environment variables
+                "do { print qq{{$_\n}} for sort keys %ENV; $CHILD_ERROR = 0; };\n".to_string()
+            } else {
+                // env VAR=value cmd... : run cmd with modified environment via bash -c
+                // The reconstructed command string already includes any VAR=value prefixes
+                // that were in the original args (parser may split them into separate tokens).
+                if output_var.is_empty() {
+                    format!(
+                        "do {{ my $__r = system('bash', '-c', {}); $CHILD_ERROR = $__r >> 8; }};\n",
+                        cmd_lit
+                    )
+                } else {
+                    format!(
+                        "do {{ open(my $__fh, q{{-|}}, 'bash', '-c', {}) or croak q{{cmd failed: $!}}; local $/; ${} = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; }};\n",
+                        cmd_lit, output_var
+                    )
+                }
+            }
         }
         "mv" => {
             // For now, use the existing signature but we should standardize this
@@ -1226,6 +1327,12 @@ fn generate_system_call_fallback(
     input_var: &str,
     output_var: &str,
 ) -> String {
+    // Use basename for matching and system calls (strip path prefix)
+    let cmd_basename = std::path::Path::new(command_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(command_name);
+
     // Guard: if command_name looks like an argument (starts with --, or is
     // a value assignment like --flag="value", or contains spaces which
     // indicate it was a positional argument incorrectly parsed as a command),
@@ -1236,8 +1343,8 @@ fn generate_system_call_fallback(
         return format!("$CHILD_ERROR = 0;\n");
     }
 
-    // Check if this is a function call with glob patterns
-    if generator.declared_functions.contains(command_name) {
+    // Check if this is a function call with glob patterns (use cmd_basename)
+    if generator.declared_functions.contains(cmd_basename) {
         let has_glob_patterns = cmd.args.iter().any(|arg| match arg {
             Word::Literal(s, _) => s.contains('*') || s.contains('?'),
             _ => false,
