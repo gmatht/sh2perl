@@ -168,7 +168,7 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
                                 );
                                 output.push_str(&generator.indent());
                                 output
-                                    .push_str(&format!("exec '{}', '-c', {};\n", name, inner_lit));
+                                    .push_str(&format!("my $_exec_cmd = {}; exec '{}', '-c', $_exec_cmd;\n", inner_lit, name));
                                 output.push_str(&generator.indent());
                                 output.push_str("croak \"exec failed: $OS_ERROR\\n\";\n");
                                 handled = true;
@@ -184,7 +184,7 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
             let cmd_str = crate::generator::redirects::generate_bash_command_string(command);
             let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
             output.push_str(&generator.indent());
-            output.push_str(&format!("exec 'bash', '-c', {};\n", cmd_lit));
+            output.push_str(&format!("my $_exec_cmd = {}; exec 'bash', '-c', $_exec_cmd;\n", cmd_lit));
             output.push_str(&generator.indent());
             output.push_str("croak \"exec failed: $OS_ERROR\\n\";\n");
         }

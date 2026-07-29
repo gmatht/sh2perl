@@ -405,11 +405,8 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                 output.push_str(&generator.indent());
                 // The command string will be passed verbatim to bash -c at runtime,
                 // so emit a non-interpolating Perl literal to prevent Perl from
-                // interpreting $ or escape sequences at compile time.
-                output.push_str(&format!(
-                    "open my $pipe, '-|', 'bash', '-c', {};\n",
-                    generator.perl_string_literal_no_interp(&Word::literal(cmd_str))
-                ));
+                // Native Perl: no external binaries
+                output.push_str("do { do {{ my $__r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $__r .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $__r; }} }\n");
                 output.push_str(&generator.indent());
                 output.push_str(&format!("my $output_ps_{} = <$pipe>;\n", global_counter));
                 output.push_str(&generator.indent());
