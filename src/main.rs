@@ -313,16 +313,16 @@ exit $main_exit_code;
                         println!("Generated Perl code:");
                         println!("{}", code);
                         println!("\n--- Running generated Perl code ---");
-                        let tmp = "__tmp_run.pl";
-                        if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
+                        let tmp = format!("__tmp_run_{}.pl", std::process::id());
+                        if SharedUtils::write_utf8_file(&tmp, &code).is_ok() {
                             let mut cmd = std::process::Command::new("perl");
-                            cmd.arg(tmp);
+                            cmd.arg(&tmp);
                             // Run Perl from the examples directory to match the file path adjustments
                             let examples_dir =
                                 std::env::current_dir().unwrap_or_default().join("examples");
                             cmd.current_dir(&examples_dir);
                             let _ = cmd.status();
-                            let _ = fs::remove_file(tmp);
+                            let _ = fs::remove_file(&tmp);
                         }
                     }
                 }
@@ -753,16 +753,16 @@ exit $main_exit_code;
                             println!("Generated Perl code:");
                             println!("{}", code);
                             println!("\n--- Running generated Perl code ---");
-                            let tmp = "__tmp_run.pl";
-                            if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
+                            let tmp = format!("__tmp_run_{}.pl", std::process::id());
+                            if SharedUtils::write_utf8_file(&tmp, &code).is_ok() {
                                 let mut cmd = std::process::Command::new("perl");
-                                cmd.arg(tmp);
+                                cmd.arg(&tmp);
                                 // Run Perl from the examples directory to match the file path adjustments
                                 let examples_dir =
                                     std::env::current_dir().unwrap_or_default().join("examples");
                                 cmd.current_dir(&examples_dir);
                                 let _ = cmd.status();
-                                let _ = fs::remove_file(tmp);
+                                let _ = fs::remove_file(&tmp);
                             }
                         }
                     }
@@ -807,12 +807,12 @@ exit $main_exit_code;
                             println!("Generated Perl code:");
                             println!("{}", code);
                             println!("\n--- Running generated Perl code ---");
-                            let tmp = "__tmp_run.pl";
-                            if SharedUtils::write_utf8_file(tmp, &code).is_ok() {
+                            let tmp = format!("__tmp_run_{}.pl", std::process::id());
+                            if SharedUtils::write_utf8_file(&tmp, &code).is_ok() {
                                 // Time the Perl execution
                                 let perl_start = std::time::Instant::now();
                                 let mut cmd = std::process::Command::new("perl");
-                                cmd.arg(tmp);
+                                cmd.arg(&tmp);
                                 // Run Perl from the examples directory to match the file path adjustments
                                 let examples_dir =
                                     std::env::current_dir().unwrap_or_default().join("examples");
@@ -1026,8 +1026,8 @@ exit $main_exit_code;
                             let perl_code = gen.generate(&commands);
 
                             // Write to temporary file and execute
-                            let tmp_file = "__tmp_run.pl";
-                            if SharedUtils::write_utf8_file(tmp_file, &perl_code).is_ok() {
+                            let tmp_file = format!("__tmp_run_{}.pl", std::process::id());
+                            if SharedUtils::write_utf8_file(&tmp_file, &perl_code).is_ok() {
                                 println!("Generated Perl code:");
                                 println!("{}", perl_code);
                                 println!("\n--- Running generated Perl code ---");
@@ -1035,7 +1035,7 @@ exit $main_exit_code;
                                 // Time the Perl execution
                                 let perl_start = std::time::Instant::now();
                                 let mut cmd = std::process::Command::new("perl");
-                                cmd.arg(tmp_file);
+                                cmd.arg(&tmp_file);
                                 // Run Perl from the examples directory to match the file path adjustments
                                 let examples_dir =
                                     std::env::current_dir().unwrap_or_default().join("examples");

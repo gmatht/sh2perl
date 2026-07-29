@@ -4,14 +4,24 @@
 
 ### Newly Fixed (this session):
 
-1. **`))` consumed but `get_current_text()` called after `next()` in commands.rs ParenClose handler** —
+1. **Race condition on `__tmp_run.pl` temp file in parallel test execution** —
+   The `debashc` binary used a hard-coded temp file name `__tmp_run.pl` when
+   running generated Perl code.  When the `./fail` script runs tests in parallel
+   (4 workers), multiple `debashc` processes race on this file — one writes it,
+   another overwrites it, a third deletes it before perl can execute.  This
+   corrupts output and causes cascading stdout mismatches.  Fixed by using
+   `format!("__tmp_run_{}.pl", std::process::id())` (PID-unique) in all four
+   code paths that write `__tmp_run.pl`.  Fixed: `008_simple_backup.sh`,
+   `062_10_simple_pipeline.sh`.
+
+2. **`))` consumed but `get_current_text()` called after `next()` in commands.rs ParenClose handler** —
    `parse_arithmetic_expression` in `commands.rs` called `self.lexer.next()` BEFORE
    `self.lexer.get_current_text()` for `ParenClose` tokens, losing the `)` character
    and pushing the next token's text instead.  Fixed by moving `next()` after
    `get_current_text()`.  Fixed: `078_arithmetic_double_paren.sh`,
    `064_06_nested_arithmetic_expressions.sh`.
 
-2. **`print($expr, "\n")` with parenthesized expression broken by space before `(`** —
+3. **`print($expr, "\n")` with parenthesized expression broken by space before `(`** —
    `emit_stmt` in `ir.rs` used `"print {}, \"\\n\";\n"` format which produced
    `print (EXPR), "\n"` — Perl parsed the space before `(` as `print` with one
    parenthesized argument, then the `, "\n"` was in void context causing warnings
@@ -19,7 +29,7 @@
    no-newline and filehandle cases).  This fixes `unicode-in-string.sh` and
    any other test where print arguments start with `(`.
 
-2. **Extra `))` in arithmetic expressions with nested parens** —
+4. **Extra `))` in arithmetic expressions with nested parens** —
    `parse_arithmetic_expression` (in `words.rs`, `assignments.rs`, and `commands.rs`)
    pushed closing parens to the expression even when they closed the outer `$((` / `((`
    marker.  Fixed three copies of this function so that `ParenClose` and
@@ -28,7 +38,7 @@
    Fixed: `parse-arithmetic-extra-paren.sh`, and likely any other test using
    arithmetic with extra grouping parens.
 
-3. **`$` not escaped in Perl double-quoted string literals in eval handler** —
+5. **`$` not escaped in Perl double-quoted string literals in eval handler** —
    The dynamic eval command handler in `redirects.rs` escaped `\`, `"`, `\n`, `\r`
    but not `$` or `@` when building Perl double-quoted string literals from literal
    text parts.  A literal `${` in the generated string (e.g. `"\\${”`) was
@@ -36,12 +46,12 @@
    syntax error.  Added `.replace(”$”, “\\$”).replace(”@”, “\\@”)` to both
    escape blocks.  Fixed: `backslash-dollar-brace.sh`.
 
-4. **`# native Perl` comment swallowing closing `}` in eval handler** —
+6. **`# native Perl` comment swallowing closing `}` in eval handler** —
    The `do` block generated for dynamic eval had `# native Perl` before the closing
    `};`, making the `};` part of the comment.  Moved the `};` before the comment.
    This was found while fixing Item 3; together they fixed `backslash-dollar-brace.sh`.
 
-5. **Missing `use IPC::Open3;` in generated Perl** —
+7. **Missing `use IPC::Open3;` in generated Perl** —
    `command_needs_ipc_open3` always returned `false`, saying "No commands need
    IPC::Open3 anymore — all generate native Perl."  But the generator still uses
    `open3` in many code paths (cat, pipeline, command substitution fallbacks).
