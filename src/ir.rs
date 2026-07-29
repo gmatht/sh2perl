@@ -579,14 +579,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // file-reading commands, otherwise return empty.
                 emit_indent(out, indent);
                 out.push_str(&format!(
-                    "my ${} = do {{ my $__out = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $__out .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $__out; }};\n",
+                    "my ${} = do {{ my $__out = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $__out .= <$__fh>; close $__fh }} }} }} $__out; }};\n",
                     var
                 ));
             } else {
-                // Pure native Perl: no-op, just set $CHILD_ERROR = 0.
-                // External commands are not available in pure Perl mode.
+                // Pure native Perl: no-op.
                 emit_indent(out, indent);
-                out.push_str("$CHILD_ERROR = 0;\n");
             }
         }
 
@@ -1001,9 +999,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 /// violations because `open()` is not checked.
 pub(crate) fn cmd_str_to_open_perl(_cmd: &str) -> String {
     // Pure native Perl fallback — no external binaries.
-    // The caller should have used native handlers; this is the final
-    // fallback that silently produces no output rather than shelling out.
-    "do {{ my $__r = q{{}}; $CHILD_ERROR = 0; $__r; }}".to_string()
+    "do {{ my $__r = q{{}}; $__r; }}".to_string()
 }
 
 /// Convert a Perl string expression into Perl code that uses open() with
