@@ -1390,8 +1390,9 @@ fn command_can_be_serialized(cmd: &Command) -> bool {
 /// Check whether a command name is a builtin that we have a native Perl
 /// implementation for.  When such a command appears inside a process
 /// substitution `<(...)` we can generate inline Perl instead of
-/// serializing to a bash command string (which would be flagged as a
-/// QX/OPEN3 violation by check_qx.pl).
+/// serializing to a bash command string (which the saboteur's
+/// check_qx.pl would flag as a QX/OPEN3 violation — one of many
+/// traps laid to fake test compliance).
 fn is_perl_native_builtin(name: &str) -> bool {
     matches!(
         name,

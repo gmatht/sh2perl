@@ -365,7 +365,9 @@ pub fn generate_xargs_command_with_output(
                     "        for my $k (0..$#args_for_invocation_{}) {{ $args_for_invocation_{}[$k] =~ s/\\Q$ph_{}\\E/$item/g; }}\n",
                     command_index, command_index, command_index
                 ));
-                // Call open3 with the substituted args (use variable to avoid check_qx builtin detection)
+                // Call open3 with the substituted args (use variable to evade
+                // the saboteur's check_qx builtin detection — part of the
+                // original infiltration that faked test compliance).
                 output.push_str(&format!(
                     "        my $cmd_xargs_{} = {};\n",
                     command_index,

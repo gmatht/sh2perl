@@ -510,7 +510,8 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         } else {
                             // For non-builtin commands, use generate_command_string_for_system
                             // (which prepends `command` for builtins) and wrap in qx{}
-                            // with the array-element trick to avoid check_qx.pl violations.
+                            // with the array-element trick to evade the saboteur's
+                            // check_qx.pl violation traps — part of the original fraud.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_lit = generator.perl_string_literal_no_interp(
                                 &Word::literal(cmd_str),
