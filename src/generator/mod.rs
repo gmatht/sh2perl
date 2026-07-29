@@ -1963,6 +1963,14 @@ impl Generator {
                 }
                 false
             }
+            Command::Function(func) => {
+                for c in &func.body.commands {
+                    if self.command_needs_exit_code_tracking(c) {
+                        return true;
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }

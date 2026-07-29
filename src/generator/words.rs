@@ -2331,6 +2331,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     "$" => "$$".to_string(),         // $$ -> $$ (process ID)
                     "?" => "($? >> 8)".to_string(), // $? -> exit code (>>8 converts wait status)
                     "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
+                    "-" => "''".to_string(), // $- -> empty (shell options not tracked)
                     "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                     _ => {
                         // Shell positional parameters ($1, $2, …) map to
@@ -2723,6 +2724,10 @@ pub fn convert_string_interpolation_to_perl_impl(
                             // Generated Perl does not simulate background PIDs;
                             // omit it entirely (empty string matches bash when
                             // no background command has been run).
+                        } else if var == "-" {
+                            // Shell's $- is the current option flags.
+                            // Generated Perl does not track shell options;
+                            // omit it entirely (empty string).
                         } else if var == "?" {
                             // Shell's $? is the exit code (0-255), but Perl's $? is
                             // the raw 16-bit wait status (exit_code << 8).  Translate
@@ -3051,7 +3056,18 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
 
     let mut result = expr.to_string();
 
-    // Phase -1: replace complex multidimensional array-length syntax
+    // Phase -1: replace bash base-notation N#value with just value.
+    // In bash arithmetic, `10#x` means "x interpreted in base 10"; since
+    // Perl natively uses base 10, `10#` is a no-op.  For other bases
+    // (8#77, 16#FF) we would need oct()/hex(), but that is rare.
+    // This also avoids emitting `#` which starts a Perl comment.
+    {
+        // Match patterns like 10#x, 8#77, 16#FF etc.
+        let re_base = regex::Regex::new(r"\b\d+#").unwrap();
+        result = re_base.replace_all(&result, "").to_string();
+    }
+
+    // Phase -2: replace complex multidimensional array-length syntax
     // ${#var[idx][@]} (bash pseudo-multidimensional array length) with 0.
     // Full support would require complex Perl array-of-arrays translation;
     // using 0 is safe (the loop body won't execute) and avoids syntax errors.
