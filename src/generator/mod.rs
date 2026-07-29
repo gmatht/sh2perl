@@ -326,15 +326,13 @@ impl Generator {
         // Only emit imports that are actually needed by the generated code.
         // Carp, English, locale are part of the original boilerplate but
         // many scripts don't use them — skip when not needed.
-        let needs_carp = self.needs_carp_import(ast);
-        let needs_english = self.needs_english_import(ast);
+        // Carp and English are used by almost every generated script
+        // (redirects, error handling, command generators) so always import
+        // them rather than trying to detect which commands emit croak() or
+        // reference $OS_ERROR / $ERRNO.
+        output.push_str("use Carp;\n");
+        output.push_str("use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);\n");
         let needs_locale = self.needs_locale_import(ast);
-        if needs_carp {
-            output.push_str("use Carp;\n");
-        }
-        if needs_english {
-            output.push_str("use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);\n");
-        }
         if needs_locale {
             output.push_str("use locale;\n");
         }
@@ -433,7 +431,7 @@ impl Generator {
 
         // Add global CHILD_ERROR variable for command substitution.
         // Only emit when there are actual command substitutions or system calls.
-        let needs_child_error = self.needs_ipc_open3(ast) || self.needs_exit_code_tracking(ast);
+        let needs_child_error = self.needs_ipc_open3(ast) || self.needs_exit_code_tracking(ast) || self.has_command_substitution(ast);
         if needs_child_error {
             // CHILD_ERROR must be `our`, not `my`, so emit raw text.
             output.push_str(&format!("our $CHILD_ERROR;\n"));
@@ -1645,6 +1643,65 @@ impl Generator {
         }
     }
 
+    /// Check whether the AST contains any command substitutions (backtick or $())
+    /// that would cause the generated Perl to reference $CHILD_ERROR.
+    fn has_command_substitution(&self, ast: &[Command]) -> bool {
+        for cmd in ast {
+            if self.cmd_has_cmdsub(cmd) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn cmd_has_cmdsub(&self, cmd: &Command) -> bool {
+        match cmd {
+            Command::Assignment(assign) => self.word_has_cmdsub(&assign.value),
+            Command::Simple(simple) => {
+                self.word_has_cmdsub(&simple.name)
+                    || simple.args.iter().any(|a| self.word_has_cmdsub(a))
+            }
+            Command::Pipeline(p) => p.commands.iter().any(|c| self.cmd_has_cmdsub(c)),
+            Command::And(l, r) | Command::Or(l, r) => self.cmd_has_cmdsub(l) || self.cmd_has_cmdsub(r),
+            Command::If(stmt) => {
+                self.cmd_has_cmdsub(&stmt.condition)
+                    || self.cmd_has_cmdsub(&stmt.then_branch)
+                    || stmt.else_branch.as_ref().map_or(false, |e| self.cmd_has_cmdsub(e))
+            }
+            Command::While(loop_) => {
+                self.cmd_has_cmdsub(&loop_.condition)
+                    || loop_.body.commands.iter().any(|c| self.cmd_has_cmdsub(c))
+            }
+            Command::For(loop_) => {
+                loop_.body.commands.iter().any(|c| self.cmd_has_cmdsub(c))
+            }
+            Command::Subshell(c) | Command::Background(c) => self.cmd_has_cmdsub(c),
+            Command::Block(b) => b.commands.iter().any(|c| self.cmd_has_cmdsub(c)),
+            Command::Function(f) => f.body.commands.iter().any(|c| self.cmd_has_cmdsub(c)),
+            Command::Redirect(rc) => self.cmd_has_cmdsub(&rc.command),
+            _ => false,
+        }
+    }
+
+    fn word_has_cmdsub(&self, word: &Word) -> bool {
+        match word {
+            Word::CommandSubstitution(_, _) => true,
+            Word::StringInterpolation(interp, _) => {
+                interp.parts.iter().any(|part| matches!(part, StringPart::CommandSubstitution(_)))
+            }
+            Word::Arithmetic(arith, _) => {
+                let content = &arith.expression;
+                content.contains("$(") || content.contains("`")
+            }
+            Word::ParameterExpansion(pe, _) => {
+                // Check the string representation for command substitution patterns.
+                let s = format!("{}", pe);
+                s.contains("$(") || s.contains("`")
+            }
+            _ => false,
+        }
+    }
+
     fn scan_set_e_in_command(&mut self, cmd: &Command) {
         match cmd {
             Command::BuiltinCommand(bc) if bc.name == "set" => {
@@ -2431,14 +2488,24 @@ impl Generator {
             Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_ls(c)),
             Command::And(l, r) | Command::Or(l, r) => self.command_uses_ls(l) || self.command_uses_ls(r),
             Command::If(stmt) => {
-                self.command_uses_ls(&stmt.then_branch)
+                self.command_uses_ls(&stmt.condition)
+                    || self.command_uses_ls(&stmt.then_branch)
                     || stmt.else_branch.as_ref().map_or(false, |e| self.command_uses_ls(e))
             }
-            Command::While(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_ls(c)),
+            Command::While(loop_) => {
+                self.command_uses_ls(&loop_.condition)
+                    || loop_.body.commands.iter().any(|c| self.command_uses_ls(c))
+            }
             Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_ls(c)),
             Command::Subshell(c) | Command::Background(c) => self.command_uses_ls(c),
             Command::Block(b) => b.commands.iter().any(|c| self.command_uses_ls(c)),
             Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_ls(c)),
+            Command::Redirect(rc) => self.command_uses_ls(&rc.command),
+            Command::Not(c) => self.command_uses_ls(c),
+            Command::Assignment(assign) => self.word_has_cmdsub(&assign.value) || {
+                // Check if the value contains an ls-like operation
+                false
+            },
             _ => false,
         }
     }
@@ -2653,9 +2720,17 @@ impl Generator {
         match command {
             Command::Simple(cmd) => {
                 if let Word::Literal(name, _) = &cmd.name {
-                    // tee generates croak/carp for file I/O errors;
-                    // open3, exec, system also use Carp for error handling.
-                    matches!(name.as_str(), "open3" | "exec" | "system" | "tee")
+                    // All commands whose generators emit croak() calls need `use Carp`.
+                    matches!(name.as_str(),
+                        "open3" | "exec" | "system" | "eval" | "tee"
+                        | "cat" | "cp" | "mv" | "rm" | "mkdir" | "touch"
+                        | "grep" | "head" | "tail" | "cut"
+                        | "wc" | "sort" | "uniq" | "diff" | "sed"
+                        | "awk" | "strings" | "xargs" | "comm"
+                        | "paste" | "tr" | "find" | "ls" | "perl"
+                        | "sha256sum" | "sha512sum"
+                        | "wget" | "curl" | "nohup" | "zcat"
+                    )
                 } else {
                     false
                 }
@@ -2744,6 +2819,7 @@ impl Generator {
             Command::Block(b) => b.commands.iter().any(|c| self.command_uses_english(c)),
             Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_english(c)),
             Command::Redirect(rc) => self.command_uses_english(&rc.command),
+            Command::Not(c) => self.command_uses_english(c),
             Command::Assignment(assign) => {
                 self.word_uses_croak(&assign.value)
             }
@@ -2763,6 +2839,18 @@ impl Generator {
                 }
             }
             Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_locale(c)),
+            Command::And(l, r) | Command::Or(l, r) => self.command_uses_locale(l) || self.command_uses_locale(r),
+            Command::If(stmt) => {
+                self.command_uses_locale(&stmt.then_branch)
+                    || stmt.else_branch.as_ref().map_or(false, |e| self.command_uses_locale(e))
+            }
+            Command::While(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_locale(c)),
+            Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_locale(c)),
+            Command::Subshell(c) | Command::Background(c) => self.command_uses_locale(c),
+            Command::Block(b) => b.commands.iter().any(|c| self.command_uses_locale(c)),
+            Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_locale(c)),
+            Command::Redirect(rc) => self.command_uses_locale(&rc.command),
+            Command::Not(c) => self.command_uses_locale(c),
             _ => false,
         }
     }
