@@ -3,6 +3,12 @@ use strict;
 use warnings;
 use Term::ANSIColor qw(colored);
 
+# Colored git log.  Commits whose diff is ONLY numeric/ID changes
+# are shown dimmed.  Everything else shows its patch (-p style).
+#
+# Usage: perl meangitlog.pl [git-log-options]
+#   Default: -20, showing patches for meaningful commits.
+
 my @git_args = @ARGV ? @ARGV : ('-20');
 
 my $format = '%H|%ad|%s|%an';
@@ -21,7 +27,6 @@ close $fh;
 
 for my $e (@entries) {
     my $sha = $e->{sha};
-    # Use quoted revision range so shell doesn't interpret ^
     my $diff = `git diff '$sha^'..'$sha' 2>/dev/null`;
     my $is_noise = 1;
 
@@ -47,14 +52,35 @@ for my $e (@entries) {
     }
 
     my $sha8 = substr($sha, 0, 8);
-    my $msg  = "$sha8  $e->{date}  $e->{subject}  $e->{author}";
 
     if ($is_noise) {
-        print colored($msg, 'bright_black'), "\n";
+        print colored("$sha8  $e->{date}  $e->{subject}  $e->{author}", 'bright_black'), "\n";
     } else {
         print colored($sha8, 'cyan'), '  ';
         print colored($e->{date}, 'blue'), '  ';
         print $e->{subject}, '  ';
         print colored($e->{author}, 'bright_black'), "\n";
+
+        # Show the diff/patch for meaningful commits
+        if ($diff) {
+            for my $dline (split /\n/, $diff) {
+                if ($dline =~ /^diff --git/) {
+                    print colored($dline, 'magenta'), "\n";
+                } elsif ($dline =~ /^--- /) {
+                    print colored($dline, 'red'), "\n";
+                } elsif ($dline =~ /^\+\+\+ /) {
+                    print colored($dline, 'green'), "\n";
+                } elsif ($dline =~ /^@@ /) {
+                    print colored($dline, 'cyan'), "\n";
+                } elsif ($dline =~ /^\+/) {
+                    print colored($dline, 'green'), "\n";
+                } elsif ($dline =~ /^-/) {
+                    print colored($dline, 'red'), "\n";
+                } else {
+                    print "$dline\n";
+                }
+            }
+        }
+        print "\n";
     }
 }
