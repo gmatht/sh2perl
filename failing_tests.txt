@@ -2,14 +2,13 @@
 000__04h_complex_examples.sh	stdout mismatch
 000__07_find_path_commands.sh	stdout mismatch
 003_pipeline.sh	stdout mismatch
-008_simple_backup.sh	stdout mismatch
 009_arrays.sh	stdout mismatch
 011_brace_expansion.sh	stdout mismatch
 012_process_substitution.sh	stdout mismatch
-016_grep_basic.sh	stdout mismatch
 015_grep_advanced.sh	stdout mismatch
-017_grep_context.sh	stdout mismatch
+016_grep_basic.sh	stdout mismatch
 019_grep_regex.sh	stdout mismatch
+017_grep_context.sh	stdout mismatch
 018_grep_params.sh	stdout mismatch
 029_arrays_associative.sh	stdout mismatch
 035_brace_expansion_practical.sh	stdout mismatch
@@ -42,8 +41,8 @@
 arithmetic-vs-command-subshell.sh	stdout mismatch
 at-in-test.sh	stdout mismatch
 at-var-default.sh	stdout mismatch
-085_for_glob_pipe.sh	stdout mismatch
 background-chain.sh	stdout mismatch
+085_for_glob_pipe.sh	stdout mismatch
 backslash-continuation-dollar-paren.sh	stdout mismatch
 backslash-continuation-in-dollar-paren.sh	stdout mismatch
 backslash-gt-test.sh	stdout mismatch
@@ -66,23 +65,25 @@ escaped-paren-command-subst.sh	stdout mismatch
 096_head_procsub.sh	stdout mismatch
 exitScript-after-test.sh	stdout mismatch
 for-loop-dollar-at.sh	stdout mismatch
+func-after-or-assign.sh	stdout mismatch
+func-after-test-or.sh	stdout mismatch
 generator-system-echo-checkqx.sh	stdout mismatch
 heredoc-apostrophe-in-unquoted.sh	debashc failed to generate code
-heredoc-apostrophe-span.sh	debashc failed to generate code
 gunzip_example.sh	stdout mismatch
+heredoc-apostrophe-span.sh	debashc failed to generate code
 heredoc-apostrophe.sh	debashc failed to generate code
-heredoc-binary-data.sh	stdout mismatch
 heredoc-backtick-quote-span.sh	stdout mismatch
+heredoc-binary-data.sh	stdout mismatch
 heredoc-python-fstring.sh	debashc failed to generate code
 heredoc-parse-error.sh	stdout mismatch
-heredoc-singlequote-span.sh	stdout mismatch
 heredoc-redirects-same-line.sh	stdout mismatch
+heredoc-singlequote-span.sh	stdout mismatch
 heredoc-with-quotes.sh	debashc failed to generate code
 heredoc-with-redirect-same-line.sh	stdout mismatch
 keyword-in-arg.sh	stdout mismatch
 let-builtin.sh	stdout mismatch
-lex-dot-in-var.sh	stdout mismatch
 let-plusassign.sh	stdout mismatch
+lex-dot-in-var.sh	stdout mismatch
 lexer-char-minus.sh	stdout mismatch
 multiline-dq-string.sh	stdout mismatch
 param-expand-default-operator.sh	stdout mismatch
@@ -130,10 +131,10 @@ parse-source-in-test.sh	stdout mismatch
 parse-sq-awk-while.sh	stdout mismatch
 parse-standalone-redirect.sh	stdout mismatch
 parse-substring-double-colon.sh	stdout mismatch
-parse-test-with-source.sh	stdout mismatch
 parse-unexpected-end-of-input.sh	debashc failed to generate code
-parse-unexpected-braceclose.sh	stdout mismatch
 parse-unexpected-parenclose.sh	debashc failed to generate code
+parse-unexpected-braceclose.sh	stdout mismatch
+parse-test-with-source.sh	stdout mismatch
 parse-variable-default-with-quotes.sh	stdout mismatch
 pid_tempfile.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
@@ -151,8 +152,8 @@ test-expression-backslash-continuation.sh	stdout mismatch
 test-operator-S.sh	stdout mismatch
 test-operator-missing.sh	stdout mismatch
 test_grep.sh	stdout mismatch
-test_system_builtin.sh	stdout mismatch
 typeset-cmdsub.sh	stdout mismatch
+test_system_builtin.sh	stdout mismatch
 utf8-non-utf8-content.sh	stdout mismatch
 variable-apostrophe-concat.sh	stdout mismatch
 variable-default-with-hash.sh	stdout mismatch
