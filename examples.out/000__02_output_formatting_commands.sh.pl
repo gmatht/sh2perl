@@ -1,8 +1,8 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
 use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use IPC::Open3;
 use Digest::SHA   qw(sha256_hex sha512_hex);
 use File::Path    qw(make_path remove_tree);
@@ -18,22 +18,19 @@ sub capture_stdout {
     return $captured;
 }
 
-
-my $output         = q{};
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '000__02_output_formatting_commands.sh';
-say "=== Output and Formatting Commands ===";
+print "=== Output and Formatting Commands ===\n";
 my $echo_result = "Hello from backticks";
-say "Echo result: $echo_result";
+print "Echo result: $echo_result\n";
 my $printf_result = sprintf("Number: %d, String: %s\n", 42, "test");
-say "Printf result: $printf_result";
-say "=== Compression Commands ===";
-say "=== Network Commands ===";
-say "=== Process Management Commands ===";
-say "=== Checksum Commands ===";
+print "Printf result: $printf_result\n";
+print "=== Compression Commands ===\n";
+print "=== Network Commands ===\n";
+print "=== Process Management Commands ===\n";
+print "=== Checksum Commands ===\n";
 open my $fh, '>', 'test_checksum.txt' or die "test_checksum.txt: $!\n";
-say {*fh} "test content";
+print {*fh} "test content", "\n";
 close $fh;
 my $sha256_result = do {
     my @results;
@@ -57,7 +54,7 @@ my $sha256_result = do {
     }
     join("\n", @results) . "\n";
 };
-say "SHA256 result: $sha256_result";
+print "SHA256 result: $sha256_result\n";
 my $sha512_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
@@ -80,14 +77,14 @@ my $sha512_result = do {
     }
     join("\n", @results) . "\n";
 };
-say "SHA512 result: $sha512_result";
-my $strings_result = do { chomp(my $result_0 = qx{strings test_binary.txt | head -3}); $result_0; };
-say "Strings result:";
-say $strings_result;
-say "=== I/O Redirection Commands ===";
-my $tee_result = do { chomp(my $result_1 = qx{echo 'test output' | tee test_tee.txt}); $result_1; };
-say "Tee result: $tee_result";
-say "=== Perl Command ===";
+print "SHA512 result: $sha512_result\n";
+my $strings_result = do { chomp(my $_r = qx{command strings test_binary.txt | head -3}); $_r; };
+print "Strings result:\n";
+print $strings_result, "\n";
+print "=== I/O Redirection Commands ===\n";
+my $tee_result = do { chomp(my $_r = qx{command echo 'test output' | tee test_tee.txt}); $_r; };
+print "Tee result: $tee_result\n";
+print "=== Perl Command ===\n";
 my $perl_result = do {
     my $result;
     my $eval_success = eval {
@@ -99,6 +96,7 @@ my $perl_result = do {
     }
     $result;
 };
-say "Perl result: $perl_result";
+print "Perl result: $perl_result\n";
 unlink('test_checksum.txt');
 unlink('test_tee.txt');
+

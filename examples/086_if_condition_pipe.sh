@@ -6,3 +6,5 @@ if [ -f /etc/passwd ]; then
 else
     echo "not found"
 fi
+
+echo "exit: $?"

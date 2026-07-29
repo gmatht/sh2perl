@@ -1,13 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
-use IPC::Open3;
-
-my $output         = q{};
-our $CHILD_ERROR;
-
-$PROGRAM_NAME = '007_cat_EOF.sh';
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 print "alpha
 beta
 gamma ...
@@ -16,4 +10,6 @@ print "oyster
 snapper
 salmon
 ";
-say "Fin. That is all folks.";
+print "Fin. That is all folks.\n";
+print "exit: ${\($? >> 8)}\n";
+

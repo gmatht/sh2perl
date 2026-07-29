@@ -6,3 +6,5 @@ f() {
   fi
 }
 printf "parsed OK\\n"
+
+echo "exit: $?"

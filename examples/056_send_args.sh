@@ -8,3 +8,6 @@ bash examples/005_args.sh "A 'quoted' Sting"
 bash examples/005_args.sh "A 'quoted' Sting" 2 3 4 5 6
 
 
+
+result="ok"
+echo "status: ${result}"

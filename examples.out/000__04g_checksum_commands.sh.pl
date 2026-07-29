@@ -1,18 +1,14 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
 use IPC::Open3;
 use Digest::SHA   qw(sha256_hex sha512_hex);
 use File::Path    qw(make_path remove_tree);
-
-my $output         = q{};
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '000__04g_checksum_commands.sh';
-say "=== Checksum Commands ===";
+print "=== Checksum Commands ===\n";
 open my $fh, '>', 'test_checksum.txt' or die "test_checksum.txt: $!\n";
-say {*fh} "test content";
+print {*fh} "test content", "\n";
 close $fh;
 my $sha256_result = do {
     my @results;
@@ -36,7 +32,7 @@ my $sha256_result = do {
     }
     join("\n", @results) . "\n";
 };
-say "SHA256 result: $sha256_result";
+print "SHA256 result: $sha256_result\n";
 my $sha512_result = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
@@ -59,9 +55,10 @@ my $sha512_result = do {
     }
     join("\n", @results) . "\n";
 };
-say "SHA512 result: $sha512_result";
-my $strings_result = do { chomp(my $result_107 = qx{strings target/debug/debashc.exe | head -3}); $result_107; };
-say "Strings result:";
-say $strings_result;
+print "SHA512 result: $sha512_result\n";
+my $strings_result = do { chomp(my $_r = qx{command strings target/debug/debashc.exe | head -3}); $_r; };
+print "Strings result:\n";
+print $strings_result, "\n";
 unlink('test_checksum.txt');
-say "=== Checksum Commands Complete ===";
+print "=== Checksum Commands Complete ===\n";
+

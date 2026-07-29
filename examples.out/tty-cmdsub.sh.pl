@@ -4,8 +4,8 @@ use warnings;
 use IPC::Open3;
 our $CHILD_ERROR;
 
-my $dev;
 my $TTY_DEV;
+my $dev;
 
 use strict;
 

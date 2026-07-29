@@ -7,3 +7,5 @@ do
 	echo "file exists"
 	break
 done
+
+echo "exit: $?"

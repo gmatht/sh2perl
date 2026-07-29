@@ -1,2 +1,4 @@
 cd ..
 ls
+
+echo "exit: $?"

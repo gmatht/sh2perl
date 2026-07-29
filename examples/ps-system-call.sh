@@ -4,3 +4,5 @@
 if ps -C apt-get,apt,dpkg > /dev/null 2>&1; then
     echo "Package manager running"
 fi
+
+echo "done: $?"

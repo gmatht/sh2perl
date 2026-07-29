@@ -5,3 +5,5 @@ shopt -s extglob
 shopt -s nocasematch
 
 echo "Extended glob patterns enabled"
+
+echo "exit: $?"

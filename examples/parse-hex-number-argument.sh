@@ -5,3 +5,6 @@
 # to avoid an infinite loop where the token is never consumed.
 echo 0x1234
 apt-key adv --recv-keys 0xA236C58F409091A18ACA53CBEBFF6B99D9B78493
+
+hex_val=$((0xFF))
+echo "hex_val: $hex_val"

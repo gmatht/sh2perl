@@ -5,3 +5,5 @@
 hello world
 EOF
 ) | wc -l
+
+echo "exit: $?"

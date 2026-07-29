@@ -7,3 +7,5 @@ cat << 'EOF'
 }
 EOF
 EOF
+
+echo "exit: $?"

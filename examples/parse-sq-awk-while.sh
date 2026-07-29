@@ -8,3 +8,6 @@ echo "test data" | awk '
   }
 }
 ' > /dev/null
+
+result="ok"
+echo "status: ${result}"

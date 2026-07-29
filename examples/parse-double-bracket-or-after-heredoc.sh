@@ -8,3 +8,5 @@ EOF
 if [[ -d /path1 ]] || [[ -d /path2 ]]; then
     echo "found"
 fi
+
+echo "done: $?"

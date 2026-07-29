@@ -5,3 +5,5 @@ set -euo pipefail
 
 echo "== Process substitution with comm =="
 comm -12 <(printf 'a\nb\n') <(printf 'b\nc\n')
+
+echo "exit: $?"

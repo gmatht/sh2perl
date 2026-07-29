@@ -5,3 +5,5 @@ function myfunc ()
   echo "hello"
 }
 myfunc
+
+echo "exit: $?"

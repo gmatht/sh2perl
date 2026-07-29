@@ -1,28 +1,25 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
 use File::Basename;
 use IPC::Open3;
-
 my $output         = q{};
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '041_process_substitution_mapfile.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
-say "== readarray/mapfile ==";
+print "== readarray/mapfile ==\n";
 my $temp_file_ps_fh_1 = q{/tmp} . '/process_sub_fh_1.tmp';
 my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_239 = q{};
-    my $output_printed_239;
+    my $output_0 = q{};
+    my $output_printed_0;
     printf("x\ny\n");
-if ($output_239 ne q{} && !$output_printed_239) {
-    print $output_239;
+if ($output_0 ne q{} && !$output_printed_0) {
+    print $output_0;
 }
 }
 use File::Path qw(make_path);
@@ -42,3 +39,4 @@ if (open(my $mapfile_fh, '<', $temp_file_ps_fh_1)) {
 }
 printf('%s ', (join(" ", @lines)));
 print "\n";
+

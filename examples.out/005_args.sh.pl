@@ -1,17 +1,10 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
-use IPC::Open3;
-
-my $output         = q{};
-our $CHILD_ERROR;
-
-$PROGRAM_NAME = '005_args.sh';
-say "== Argument count ==";
-say scalar(@ARGV);
-say "== Arguments ==";
-my $a;
+print "== Argument count ==\n";
+print scalar(@ARGV), "\n";
+print "== Arguments ==\n";
 for my $a (@ARGV) {
-    say "Arg: $a";
+    print "Arg: $a\n";
 }
+

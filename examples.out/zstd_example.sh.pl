@@ -7,7 +7,9 @@ do {
     open STDOUT, '>', '/tmp/rp2.fw'
       or die "Cannot access file: $OS_ERROR\n";
     my $tmp = do {
-    $main_exit_code = system('zstd', '-d', q{c}, '/usr/lib/firmware/rp2.fw.zst') >> 8;
+
+my @_qx_cmd_1 = ('command zstd -dc /usr/lib/firmware/rp2.fw.zst');
+${} = do { chomp(my $_r_1 = qx{command $_qx_cmd_1[0]}); $_r_1; };
     };
     print $tmp;
     open STDOUT, '>&', $original_stdout
@@ -16,4 +18,5 @@ do {
       or die "Close failed: $OS_ERROR\n";
 };
 print "Decompressed rp2 firmware\n";
+print "exit: ${\($? >> 8)}\n";
 

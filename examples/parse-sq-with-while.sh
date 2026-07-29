@@ -9,3 +9,6 @@ BEGIN {
   }
 }
 '
+
+result="ok"
+echo "status: ${result}"
