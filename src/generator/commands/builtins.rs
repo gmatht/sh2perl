@@ -245,6 +245,20 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
         BuiltinCommand::new("yes", "Output a string repeatedly", true),
     );
 
+    // Test and type commands
+    commands.insert(
+        "test",
+        BuiltinCommand::new("test", "Evaluate conditional expression", false),
+    );
+    commands.insert(
+        "type",
+        BuiltinCommand::new("type", "Display command type/location", false),
+    );
+    commands.insert(
+        "wait",
+        BuiltinCommand::new("wait", "Wait for background processes", false),
+    );
+
     // Network
     commands.insert(
         "hostname",
