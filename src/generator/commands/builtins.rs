@@ -1368,6 +1368,43 @@ fn generate_system_call_fallback(
         }
     }
 
+    // Native Perl equivalents for commands that shouldn't need external binaries.
+    // Check before falling back to system call.
+    match cmd_basename {
+        "readlink" | "realpath" => {
+            let mut args: Vec<String> = Vec::new();
+            let mut flags: Vec<String> = Vec::new();
+            for arg in &cmd.args {
+                if let Word::Literal(s, _) = arg {
+                    if s.starts_with('-') {
+                        flags.push(s.clone());
+                    } else {
+                        args.push(generator.word_to_perl(arg));
+                    }
+                }
+            }
+            if args.is_empty() {
+                return format!("$CHILD_ERROR = 0;\n");
+            }
+            let arg_expr = args.join(", ");
+            // readlink -f / -e / -m → Cwd::abs_path()
+            if flags.iter().any(|f| f == "-f" || f == "-e" || f == "-m") {
+                return format!(
+                    "do {{ use Cwd qw(abs_path); my $_r = abs_path({}); defined $_r ? $_r : q{{}}; }}",
+                    arg_expr
+                );
+            }
+            // readlink with no flags → Perl readlink() which returns target of one link
+            if flags.is_empty() && args.len() == 1 {
+                return format!(
+                    "do {{ my $_r = readlink({}); defined $_r ? $_r : q{{}}; }}",
+                    arg_expr
+                );
+            }
+        }
+        _ => {}
+    }
+
     // Build argument list from the AST for direct exec (no shell).
     let cmd_name_lit = format!("'{}'", cmd.name.as_literal().unwrap_or(""));
     let args_perl: Vec<String> = cmd
