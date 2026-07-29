@@ -1415,6 +1415,8 @@ fn is_perl_native_builtin(name: &str) -> bool {
             | "whoami"
             | "uname"
             | "hostname"
+            | "command"
+            | "env"
             | "pwd"
             | "date"
             | "basename"
