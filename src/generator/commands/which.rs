@@ -13,8 +13,9 @@ pub fn generate_which_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         qx_body.push_str(&format!(" ${}", var_name));
     }
 
+    // Native Perl which: search PATH for the executable
     format!(
-        "{}my $which_prog = q{{which}};\nmy $_which_out = qx{{{}}};\nprint $_which_out;\n$CHILD_ERROR = $? >> 8;\n",
-        arg_vars, qx_body
+        "{}my $_which_out = do {{ my $__r = q{{}}; for my $__d (split /:/, $ENV{{PATH}} // q{{}}) {{ my $__f = \"$__d/which\"; if (-x $__f) {{ $__r = $__f; last }} }} $__r; }};\nprint $_which_out;\n$CHILD_ERROR = 0;\n",
+        arg_vars
     )
 }

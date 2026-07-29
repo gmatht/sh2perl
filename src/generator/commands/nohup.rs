@@ -66,12 +66,12 @@ pub fn generate_nohup_command(generator: &mut Generator, cmd: &SimpleCommand) ->
             );
             if args.is_empty() {
                 output.push_str(&format!(
-                    "exec 'bash', '-c', {}, '{}';\n",
+                    "my $_exec_cmd = {}; exec 'bash', '-c', $_exec_cmd, '{}';\n",
                     bash_lit, cmd_name
                 ));
             } else {
                 output.push_str(&format!(
-                    "exec 'bash', '-c', {}, '{}', @args;\n",
+                    "my $_exec_cmd = {}; exec 'bash', '-c', $_exec_cmd, '{}', @args;\n",
                     bash_lit, cmd_name
                 ));
             }

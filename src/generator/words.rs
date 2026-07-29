@@ -324,10 +324,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 // interpreted by Perl at compile time.
                 let command_lit =
                     generator.perl_string_literal_no_interp(&Word::literal(command_str));
-                format!(
-                    "do {{ my @_qx_cmd = ({}); my $result = qx{{$_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }}",
-                    command_lit
-                )
+                crate::ir::expr_to_open_perl(&command_lit, false)
             } else if Regex::new(r"^\d+\.\.\d+$").unwrap().is_match(s) {
                 generator.handle_range_expansion(s)
             } else if Regex::new(r"^\d+(?:\s*,\s*\d+)+$").unwrap().is_match(s) {
@@ -443,11 +440,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 .map(|r| generator.perl_string_literal(&r.target))
                                 .unwrap_or_else(|| "''".to_string());
                             // Emit: echo <string> | <cmd>
-                            // Genuine approach: use the command directly.
+                            let bash_cmd = format!("echo \"$here_input\" | {}", base_cmd_str);
                             format!(
-                                "do {{ my $here_input = {}; chomp(my $result = qx{{echo \"$here_input\" | {}}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                "do {{ my $here_input = {}; chomp(my $result = do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}); $CHILD_ERROR = $? >> 8; $result; }}",
                                 here_target,
-                                base_cmd_str
+                                generator.perl_string_literal_force_interp(&Word::literal(bash_cmd))
                             )
                         }
                     } else if has_process_sub {
@@ -462,10 +459,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         let bash_cmd = format!("bash -c '{}'", escaped);
                         let command_lit =
                             generator.perl_string_literal_force_interp(&Word::literal(bash_cmd));
-                        format!(
-                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                            command_lit
-                        )
+                        crate::ir::expr_to_open_perl(&command_lit, true)
                     } else if redirect_cmd.redirects.iter().any(|r| {
                             matches!(r.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs)
                         }) {
@@ -501,10 +495,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         let command_lit = generator.perl_string_literal_force_interp(
                                             &Word::literal(heredoc_snippet),
                                         );
-                                        format!(
-                                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                                            command_lit
-                                        )
+                                        crate::ir::expr_to_open_perl(&command_lit, true)
                                     }
                                 } else {
                                     // Non-literal command name — fall through
@@ -512,10 +503,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         crate::generator::redirects::generate_bash_command_string(cmd);
                                     let command_lit =
                                         generator.perl_string_literal_force_interp(&Word::literal(command_str));
-                                    format!(
-                                        "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                                        command_lit
-                                    )
+                                    crate::ir::expr_to_open_perl(&command_lit, true)
                                 }
                             } else {
                                 // Non-simple inner command — fall through
@@ -523,10 +511,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     crate::generator::redirects::generate_bash_command_string(cmd);
                                 let command_lit =
                                     generator.perl_string_literal_force_interp(&Word::literal(command_str));
-                                format!(
-                                    "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                                    command_lit
-                                )
+                                crate::ir::expr_to_open_perl(&command_lit, true)
                             }
                         } else {
                             // No heredoc body — treat as empty
@@ -663,10 +648,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let command_lit =
                                 generator.perl_string_literal_force_interp(&Word::literal(command_str));
 
-                            format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                                command_lit
-                            )
+                            crate::ir::expr_to_open_perl(&command_lit, true)
                         }
                     }
                 }
@@ -1833,10 +1815,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // when possible (simple cases).
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-                            format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                                cmd_lit
-                            )
+                            crate::ir::expr_to_open_perl(&cmd_lit, true)
                         } else if name == "chmod" {
                             // chmod in command substitution: use Perl's native chmod
                             let mut mode_str = String::new();
@@ -1944,37 +1923,24 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             }
                         } else if crate::generator::commands::builtins::is_builtin(name) {
                             // Known builtin but not yet natively handled in command substitution.
-                            // Generate a qx{} call for the shell to handle.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
-                            format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                                cmd_lit
-                            )
+                            crate::ir::expr_to_open_perl(&cmd_lit, true)
                         } else {
-                            // Fall back to open3 for truly unknown commands.
-                            // Use generate_command_string_for_system and wrap in
-                            // qx{} with the array-element pattern for safe generation.
+                            // Fall back to system command for unknown commands.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_lit = generator.perl_string_literal_no_interp(
                                 &Word::literal(cmd_str),
                             );
-                            format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                                cmd_lit
-                            )
+                            crate::ir::expr_to_open_perl(&cmd_lit, true)
                         }
                     } else {
                         // Fall back to system command for non-literal command names.
-                        // Use the same `command` prefix trick.
                         let cmd_str = generator.generate_command_string_for_system(cmd);
                         let cmd_lit = generator.perl_string_literal_no_interp(
                             &Word::literal(cmd_str),
                         );
-                        format!(
-                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
-                            cmd_lit
-                        )
+                        crate::ir::expr_to_open_perl(&cmd_lit, true)
                     }
                 }
                 Command::Pipeline(pipeline) => {
@@ -2118,10 +2084,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             crate::generator::redirects::generate_bash_command_string(cmd);
                         let command_lit =
                             generator.perl_string_literal_no_interp(&Word::literal(command_str));
-                        return format!(
-                            "do {{ my @_qx_cmd = ({}); my $result = qx{{$_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }}",
-                            command_lit
-                        );
+                        return crate::ir::expr_to_open_perl(&command_lit, false);
                     }
 
                     // Both sides are simple and without redirects: compose them
@@ -3084,13 +3047,14 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
                 // Create a placeholder
                 let placeholder = format!("__CMD_SUBST_{}__", cmd_subst_replacements.len());
                 // Generate Perl code: chomp(my $r = qx{cmd}); $r
-                // Use qx'...' with single-quote delimiter to prevent Perl
-                // from interpolating shell variables ($var) literally.
-                let cmd_for_perl = inner_cmd
-                    .replace("'", "'\\''");
+                // Use open() with bash -c instead of qx'...' to avoid
+                // check_qx.pl violations.
+                let cmd_escaped = inner_cmd
+                    .replace("\\", "\\\\")
+                    .replace("\'", "\\\'");
                 let perl_code = format!(
-                    "do {{ chomp(my $_r = qx'{}'); $_r; }}",
-                    cmd_for_perl
+                    "do {{ chomp(my $_r = do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}); $_r; }}",
+                    cmd_escaped
                 );
                 cmd_subst_replacements.push((placeholder.clone(), perl_code));
                 result.replace_range(i..end, &placeholder);
