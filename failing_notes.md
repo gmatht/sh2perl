@@ -1,6 +1,8 @@
 # Failing Test Notes
 
-## All tests passing (169/169) 🎉
+## All tests passing (512/512) 🎉
+
+All tests pass with no failures or timeouts.
 
 ## No remaining check_qx.pl violations
 
@@ -22,3 +24,12 @@ All qx{}/system() violations have been resolved.
    with `AssignmentOperator::Assign`, losing the operator information. Fixed by
    tracking the operator in a separate `BTreeMap` and using it when constructing
    the Assignment command.
+
+3. **Heredoc pipeline timeout (063_05_heredoc_with_complex_content.sh)**: Two issues:
+   - The IR-based clean path in `generate_buffered_pipeline` used qx{...} for pipeline
+     capture, but `generate_bash_command_string` did not serialize heredoc redirects,
+     causing the heredoc content to be lost and `command cat` to hang waiting for stdin.
+     Fixed by detecting heredocs in the pipeline and skipping the clean path.
+   - The `do { ... }` block emitted by the scaffolding path lacked a trailing semicolon,
+     causing a Perl syntax error (`do BLOCK` without semicolon is ambiguous).
+     Fixed by changing `"}\n"` to `"};\n"`.
