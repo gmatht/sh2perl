@@ -43,7 +43,15 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
         }
         Command::TestExpression(test_expr) => {
             let test_result = generator.generate_test_expression(test_expr);
-            output.push_str(&test_result);
+            // Avoid double parentheses: the test expression generator already
+            // wraps its result in (...), and the outer `if (...)` adds another
+            // layer.  Strip the outer parens here.
+            let trimmed = test_result.trim();
+            if trimmed.starts_with('(') && trimmed.ends_with(')') {
+                output.push_str(&trimmed[1..trimmed.len()-1]);
+            } else {
+                output.push_str(&test_result);
+            }
         }
         Command::And(_, _) | Command::Or(_, _) => {
             let cond = generate_combined_test_condition(generator, &if_stmt.condition);
@@ -752,19 +760,80 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
         hoist_my_declarations(generator, &body_vars, &mut output);
     }
 
-    // Declare the loop variable outside the loop so it persists after the loop ends
-    // But only if it hasn't already been declared and it's not a function-level variable
+    // The loop variable is declared by `for my $i (...)` — an outer `my $i;`
+    // before the loop is redundant because `for my $i` creates a new lexical
+    // variable scoped to the loop body.  If the variable is needed after the
+    // loop (shell-compatibility persistence), the pre-analysis pass has
+    // already added it to `function_level_vars` which declares it in the
+    // program preamble.  In either case, the outer declaration here is dead
+    // code.
+    //
+    // Pre-existing declaration is tracked so that post-loop assignments
+    // (see below) don't violate strict.
     let loop_var = &for_loop.variable;
     if !generator.declared_locals.contains(loop_var)
         && !generator.function_level_vars.contains(loop_var)
     {
-        output.push_str(&generator.indent());
-        output.push_str(&format!("my ${};\n", loop_var));
+        // Variable is not declared anywhere — no need to insert a dead
+        // `my $i;` because `for my $i` declares it lexically.
+        // Just mark it as declared so post-loop code knows it exists.
         generator.declared_locals.insert(loop_var.clone());
     }
 
-    // Generate for loop using the actual variable name from the AST (with 'my' for lexical scoping)
-    // We need to store the last value to mimic shell behavior
+    // Generate for loop using IR nodes for simple cases, falling back to
+    // string formatting for complex cases.
+    //
+    // Check if this is a simple numeric range for loop (e.g. `for i in {1..5}`).
+    // If so, emit an `IrStmt::For` with `IrExpr::Range` so the IR backend
+    // controls formatting (clean spacing, no magic-number constants, etc.).
+    //
+    // For complex cases (string lists, brace expansions with prefixes/suffixes,
+    // array variables, etc.) we fall back to the existing string-based approach.
+    let is_simple_range = for_loop.items.len() == 1
+        && matches!(&for_loop.items[0], Word::BraceExpansion(e, _) if e.items.len() == 1 && matches!(&e.items[0], BraceItem::Range(_)) && e.prefix.is_none() && e.suffix.is_none());
+
+    if is_simple_range {
+        // Build IrStmt::For with IrExpr::Range, then format via stmt_to_perl.
+        if let Word::BraceExpansion(expansion, _) = &for_loop.items[0] {
+            if let BraceItem::Range(range) = &expansion.items[0] {
+                if let (Ok(start_num), Ok(end_num)) =
+                    (range.start.parse::<i64>(), range.end.parse::<i64>())
+                {
+                    let step = range
+                        .step
+                        .as_ref()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(1);
+                    if step == 1 {
+                        // Build the body as RawText.  The body generator still
+                        // produces string output; it uses generator.indent_level
+                        // for indentation, so bump it first.
+                        generator.indent_level += 1;
+                        let body_str = generator.generate_block_commands(&for_loop.body);
+                        generator.indent_level -= 1;
+
+                        let ir_for = crate::ir::IrStmt::For {
+                            var: for_loop.variable.clone(),
+                            iter: crate::ir::IrExpr::Range { start: start_num, end: end_num },
+                            body: vec![crate::ir::IrStmt::RawText(body_str)],
+                        };
+                        output.push_str(&crate::ir::stmt_to_perl(&ir_for, generator.indent_level));
+
+                        // Post-loop persistence: if the variable is used after the loop,
+                        // assign it the final value (shell-compatibility).
+                        if generator.function_level_vars.contains(&for_loop.variable) {
+                            output.push_str(&generator.indent());
+                            output.push_str(&format!("${} = {};\n", for_loop.variable, end_num));
+                        }
+
+                        return output;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: string-based approach for complex cases
     output.push_str(&generator.indent());
     output.push_str(&format!("for my ${} (", for_loop.variable));
 
@@ -820,14 +889,14 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                                     .and_then(|s| s.parse::<i64>().ok())
                                     .unwrap_or(1);
                                 if step == 1 {
-                                    // Simple range: 1..5 - use constants for magic numbers
-                                    if end_num > 2 {
+                                    // Simple range: 1..5
+                                    if end_num > 2 && !generator.no_magic_numbers {
                                         // Use constant for magic numbers > 2
                                         let const_name = format!("$MAX_LOOP_{}", end_num);
                                         all_items
                                             .push(format!(" {} .. {} ", start_num, const_name));
                                     } else {
-                                        all_items.push(format!(" {} .. {} ", start_num, end_num));
+                                        all_items.push(format!("{}..{}", start_num, end_num));
                                     }
                                 } else {
                                     // Step range: use list with step
