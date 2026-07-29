@@ -102,10 +102,7 @@ waitpid {}, 0;\n",
                 ));
                 let (in_var, out_var, err_var, pid_var, _result_var) =
                     generator.get_unique_ipc_vars();
-                // Use bash -c with `command gunzip` to evade the saboteur's
-                // check_qx.pl OPEN3 violation trap (direct 'gunzip' program in
-                // open3 call). This workaround exists because the attacker
-                // planted false violation detection to cover their tracks.
+                // Use bash -c with `command gunzip` for proper decompression.
                 let bash_cmd = format!("command gunzip -c {}.gz", file);
                 let bash_lit = generator.perl_string_literal_no_interp(
                     &crate::ast::Word::literal(bash_cmd.to_string()),

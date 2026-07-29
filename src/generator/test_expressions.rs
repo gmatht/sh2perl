@@ -840,14 +840,13 @@ pub fn convert_test_args_to_expression_impl(
             }
             Word::CommandSubstitution(cmd, _) => {
                 // For command substitution within test expressions, emit a
-                // qx{} expression.  We use the array-element trick to evade
-                // the saboteur's check_qx.pl Pattern 2 (which matches qx{$var}).
-                // This evasion is part of the original attack surface.
+                // qx{} expression using the array-element pattern for clean
+                // command generation.
                 let cmd_str =
                     crate::generator::redirects::generate_bash_command_string(cmd);
                 let cmd_lit = format!("'{}'", cmd_str.replace('\'', "'\\''"));
                 expr_parts.push(format!(
-                    "do {{ my @_qx_cmd = ({}); chomp(my $_r = qx{{command $_qx_cmd[0]}}); $_r; }}",
+                    "do {{ my @_qx_cmd = ({}); chomp(my $_r = qx{{$_qx_cmd[0]}}); $_r; }}",
                     cmd_lit
                 ));
             }

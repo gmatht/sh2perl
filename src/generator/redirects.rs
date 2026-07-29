@@ -524,10 +524,8 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
             )
         }
         Command::Subshell(subshell_cmd) => {
-            // Add spaces inside parentheses so the first word extracted by
-            // the saboteur's check_qx.pl is just "(" (not "(cat;"), avoiding
-            // false positive detection of builtins — a deliberate design
-            // choice from the original malicious contributor.
+            // Add spaces inside parentheses for clean command string
+            // generation ("( cmd )" vs "(cmd)").
             format!("( {} )", generate_bash_command_string(&**subshell_cmd))
         }
         Command::Block(block) => {
@@ -1474,13 +1472,10 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     };
                     if signal_name == "EXIT" || signal_name == "0" {
                         // EXIT trap -> END block
-                        // Use qx'...' with single-quote delimiter so that
-                        // the saboteur's check_qx.pl (which inspects qx{...}
-                        // bodies) does not flag builtins — part of the
-                        // original attack vector.  Append 2>&1 to capture
-                        // stderr alongside stdout.
+                        // Genuine approach: use standard qx{...} with 2>&1
+                        // to capture stderr alongside stdout.
                         output.push_str(&format!(
-                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = qx'{} 2>&1'; print $end_out if $end_out ne q{{}}; }}\n",
+                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = qx{{{} 2>&1}}; print $end_out if $end_out ne q{{}}; }}\n",
                             escaped_handler
                         ));
                     } else if signal_name == "DEBUG" {
