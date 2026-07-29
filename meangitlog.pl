@@ -1,10 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use Term::ANSIColor qw(color colored);
-
-# Colored git log.  Commits whose diff is ONLY numeric/ID changes
-# are shown dimmed.  Everything else is normal.
+use Term::ANSIColor qw(colored);
 
 my @git_args = @ARGV ? @ARGV : ('-20');
 
@@ -23,27 +20,25 @@ while (<$fh>) {
 close $fh;
 
 for my $e (@entries) {
-    my $diff = `git diff ${$e}{sha}^..${$e}{sha} 2>/dev/null`;
+    my $sha = $e->{sha};
+    # Use quoted revision range so shell doesn't interpret ^
+    my $diff = `git diff '$sha^'..'$sha' 2>/dev/null`;
     my $is_noise = 1;
 
     if ($diff) {
         for my $dline (split /\n/, $diff) {
             next if $dline =~ /^diff --git|^index |^--- |^\+\+\+ |^@@ /;
             next if $dline =~ /^[ -]$/;
-            next if $dline =~ /^[ ]/;  # context
+            next if $dline =~ /^[ ]/;
             next if $dline =~ /^[+-]\s*$/;
 
             my $c = $dline;
             $c =~ s/^[+-]\s*//;
 
-            # Pure number changes (counter increments)
             next if $c =~ /^\d+$/;
-            # Variable-like IDs: _14 → _200
             next if $c =~ /^[a-zA-Z_]\w*_\d+$/;
-            # File mode changes
             next if $c =~ /^(new|deleted) file mode/;
             next if $c =~ /^Binary files/;
-            # Empty content
             next if $c eq '';
 
             $is_noise = 0;
@@ -51,16 +46,15 @@ for my $e (@entries) {
         }
     }
 
-    my $sha_str = substr(${$e}{sha}, 0, 8);
-    my $line = sprintf "%-8s %s  %s  %s",
-        $sha_str, ${$e}{date}, ${$e}{subject}, ${$e}{author};
+    my $sha8 = substr($sha, 0, 8);
+    my $msg  = "$sha8  $e->{date}  $e->{subject}  $e->{author}";
 
     if ($is_noise) {
-        print colored($line, 'bright_black'), "\n";
+        print colored($msg, 'bright_black'), "\n";
     } else {
-        print colored($sha_str, 'cyan'), '  ';
-        print colored(${$e}{date}, 'blue'), '  ';
-        print ${$e}{subject}, '  ';
-        print colored(${$e}{author}, 'bright_black'), "\n";
+        print colored($sha8, 'cyan'), '  ';
+        print colored($e->{date}, 'blue'), '  ';
+        print $e->{subject}, '  ';
+        print colored($e->{author}, 'bright_black'), "\n";
     }
 }
