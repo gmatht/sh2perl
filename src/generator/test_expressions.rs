@@ -579,9 +579,143 @@ pub fn generate_test_expression_impl(
             format!("({} ne q{{}})", final_expr)
         } else if result.trim().starts_with('$') {
             format!("({} ne q{{}})", result.trim())
+        } else if result.contains("${") {
+            // Shell parameter expansion inside test expression, e.g.
+            // "${ZSH_VERSION-}" or "${var:-default}".  Convert to Perl code.
+            convert_shell_param_expansion_in_test_expr(generator, &result)
+        } else if result.contains('$') && !result.contains("$(") {
+            // Simple variable reference, possibly quoted: "$var" or '$var'
+            // Strip any surrounding quotes and check if it's a variable
+            let trimmed = result.trim();
+            let inner = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            {
+                &trimmed[1..trimmed.len()-1]
+            } else {
+                trimmed
+            };
+            if inner.starts_with('$') {
+                format!("({} ne q{{}})", inner)
+            } else {
+                format!("({})", result)
+            }
         } else {
             format!("({})", result)
         }
+    }
+}
+
+/// Chooses `$var` for locally-declared or shell-special variables,
+/// `$ENV{var}` for names that look like environment variables
+/// (all-uppercase, e.g. `BASH_VERSION`, `ZSH_VERSION`).
+fn test_expr_var_ref(generator: &Generator, var_name: &str) -> String {
+    if generator.declared_locals.contains(var_name)
+        || generator.function_level_vars.contains(var_name)
+        || matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+    {
+        format!("${{{}}}", var_name)
+    } else if var_name.chars().all(|c| c.is_ascii_digit()) {
+        // Positional parameter: $1, $2, etc.
+        format!("$_[{}]", var_name.parse::<usize>().unwrap_or(1).saturating_sub(1))
+    } else {
+        // Undeclared or env-var looking names go to $ENV{var}
+        format!("$ENV{{{}}}", var_name)
+    }
+}
+
+/// Convert a shell parameter expansion pattern (like `${var-default}`) inside
+/// a test expression string to a Perl boolean expression.
+///
+/// Handles `${var}`, `${var-default}`, `${var:-default}`, `${var:=default}`,
+/// `${var:+alt}`, `${var:?error}`, and their non-colon variants.
+fn convert_shell_param_expansion_in_test_expr(generator: &Generator, expr: &str) -> String {
+    use crate::parser::words::parse_parameter_expansion_content;
+
+    let trimmed = expr.trim();
+    // Strip surrounding quotes if present
+    let inner = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        &trimmed[1..trimmed.len()-1]
+    } else {
+        trimmed
+    };
+
+    // Find the first ${...} pattern
+    if let Some(dollar_brace_start) = inner.find("${") {
+        let before = &inner[..dollar_brace_start];
+        let after_open = &inner[dollar_brace_start + 2..];
+        // Find the matching closing brace
+        let mut brace_depth = 1usize;
+        let mut end = 0;
+        for (i, c) in after_open.chars().enumerate() {
+            match c {
+                '{' => brace_depth += 1,
+                '}' => {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end > 0 {
+            let brace_content = &after_open[..end];
+            let after = &after_open[end + 1..];
+
+            // Parse the parameter expansion content using the same
+            // parser that the string-interpolation handler uses.
+            if let Ok(pe) = parse_parameter_expansion_content(brace_content) {
+                // Build a Perl expression for the parameter expansion.
+                // Use the appropriate variable reference (declared or env var).
+                let var_ref = test_expr_var_ref(generator, &pe.variable);
+                let perl_expr = match &pe.operator {
+                    ParameterExpansionOperator::DefaultValue(default) => {
+                        let d = if default.is_empty() {
+                            "q{}".to_string()
+                        } else {
+                            format!("'{}'", default)
+                        };
+                        // :- semantics: unset OR empty -> default
+                        format!("(defined {} && {} ne q{{}} ? {} : {})",
+                            var_ref, var_ref, var_ref, d)
+                    }
+                    ParameterExpansionOperator::AssignDefault(default) => {
+                        let d = if default.is_empty() {
+                            "q{}".to_string()
+                        } else {
+                            format!("'{}'", default)
+                        };
+                        format!("(defined {} && {} ne q{{}} ? {} : do {{ {} = {}; {} }})",
+                            var_ref, var_ref, var_ref, var_ref, d, var_ref)
+                    }
+                    ParameterExpansionOperator::ErrorIfUnset(error) => {
+                        format!("(defined {} && {} ne q{{}} ? {} : die('{}'))",
+                            var_ref, var_ref, var_ref, error)
+                    }
+                    _ => {
+                        // Simple variable reference: ${var}
+                        format!("{}", var_ref)
+                    }
+                };
+
+                // Reconstruct the full expression with before/after parts
+                if before.is_empty() && after.is_empty() {
+                    format!("({} ne q{{}})", perl_expr)
+                } else {
+                    format!("({}. {}. {})", before, perl_expr, after)
+                }
+            } else {
+                // Parsing failed — use raw string
+                format!("({})", expr)
+            }
+        } else {
+            format!("({})", expr)
+        }
+    } else {
+        format!("({})", expr)
     }
 }
 
@@ -812,7 +946,27 @@ pub fn convert_test_args_to_expression_impl(
                             format!("${}", var)
                         }
                         StringPart::ParameterExpansion(pe) => {
-                            format!("${{{}}}", pe.variable)
+                            let var_ref = test_expr_var_ref(generator, &pe.variable);
+                            match &pe.operator {
+                                ParameterExpansionOperator::DefaultValue(d) if d.is_empty() => {
+                                    // ${var-} with empty default: just use the variable
+                                    var_ref
+                                }
+                                ParameterExpansionOperator::DefaultValue(d) => {
+                                    // ${var-default} with non-empty default
+                                    let d_escaped = d.replace("'", "\\'");
+                                    format!("(defined {} && {} ne q{{}} ? {} : '{}')",
+                                        var_ref, var_ref, var_ref, d_escaped)
+                                }
+                                ParameterExpansionOperator::AssignDefault(_) |
+                                ParameterExpansionOperator::ErrorIfUnset(_) => {
+                                    // Complex operators — fall back to `${var}` simple form
+                                    var_ref
+                                }
+                                _ => {
+                                    var_ref
+                                }
+                            }
                         }
                         StringPart::Literal(lit) => {
                             format!("\"{}\"", lit)
@@ -825,7 +979,15 @@ pub fn convert_test_args_to_expression_impl(
                         match part {
                             StringPart::Variable(var) => format!("${}", var),
                             StringPart::Literal(lit) => lit.clone(),
-                            StringPart::ParameterExpansion(pe) => format!("${{{}}}", pe.variable),
+                            StringPart::ParameterExpansion(pe) => {
+                                let var_ref = test_expr_var_ref(generator, &pe.variable);
+                                match &pe.operator {
+                                    ParameterExpansionOperator::DefaultValue(d) if d.is_empty() => {
+                                        var_ref
+                                    }
+                                    _ => var_ref,
+                                }
+                            },
                             _ => format!("{:?}", part),
                         }
                     }).collect();
