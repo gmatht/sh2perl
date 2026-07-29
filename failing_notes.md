@@ -1,15 +1,32 @@
 # Failing Test Notes
 
-## Current status: 354/517 passed, 163 failing
-
-(My changes improve ${var-} parsing and test expression generation
-but do not alter the pass/fail count because the main affected test
-`param-expand-default-operator.sh` still fails due to `BASH_VERSION`
-not being in the Perl environment — an inherent limitation.)
+## Current status: fixed func-after-test-or.sh, func-after-or-assign.sh
 
 ### Newly Fixed (this session):
 
-1. **`${var-}` (default-value operator without colon) not recognized by parser** —
+1. **`${VAR}` in test expressions not converted to Perl variable references** —
+   The operator-specific handlers in `generate_test_expression_impl` (like `-n`,
+   `-z`, `-f`, etc.) extracted raw text from the expression and used it directly
+   as Perl code.  A fragment like `"${VAR}"` was emitted verbatim, causing Perl
+   to interpret `${VAR}` as the variable `$VAR` — which was undeclared because
+   the pre-analysis skips all-uppercase names (they are assumed to be env vars).
+   Added `preprocess_brace_vars_in_test_expr` that runs before operator-specific
+   handlers and converts simple `${identifier}` patterns to the appropriate Perl
+   reference (`$ENV{var}` for uppercase names, `$var` for lowercase/declared).
+   Fixed: `func-after-test-or.sh`, `func-after-or-assign.sh`.
+
+2. **Assignment to uppercase vars uses `my $VAR` while test expr uses `$ENV{VAR}`** —
+   The pre-analysis skips uppercase variable names, so they are not in
+   `function_level_vars`.  When an assignment like `VAR="default"` was generated,
+   `needs_decl_for_assign` was true, producing `my $VAR = "default"` (a local
+   lexical).  But the test expression condition used `$ENV{VAR}` — two different
+   variables.  Added a check in `generate_assignment`: when the variable name is
+   all-uppercase and not declared, emit `$ENV{VAR} = value` instead of
+   `my $VAR = value;`.  Fixed: `func-after-or-assign.sh` (the value now persists
+   to the function body, which also uses `$ENV{VAR}` via string-interpolation
+   fallback for undeclared vars).
+
+3. **`${var-}` (default-value operator without colon) not recognized by parser** —
    The main `DollarBrace` handler in `parser/words.rs` and the `DollarBraceAt`
    handler only recognised colon-prefixed operators (`:-`, `:=`, `:+`, `:?`)
    but missed the no-colon forms (`-`, `+`, `?`, `=`).  Content like
