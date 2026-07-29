@@ -225,8 +225,10 @@ pub enum IrStmt {
         /// Original shell command string (for qx{} capture).
         cmd_str: Option<String>,
     },
-    /// Return
+    /// Return from subroutine
     Return(Option<IrExpr>),
+    /// Exit the program with a code (or without, for default exit 0)
+    Exit(Option<IrExpr>),
     /// Set $CHILD_ERROR (from $? >> 8 after an external command)
     SetChildError(IrExpr),
     /// Require a module at file scope (e.g. `require POSIX;`).
@@ -278,6 +280,26 @@ pub fn expr_to_perl(expr: &IrExpr) -> String {
     ir_expr_to_perl(expr)
 }
 
+/// Check if any statement in a list uses `Output { newline: true }`.
+fn prog_uses_say(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|s| stmt_uses_say(s))
+}
+
+fn stmt_uses_say(stmt: &IrStmt) -> bool {
+    match stmt {
+        IrStmt::Output { newline: true, .. } => true,
+        IrStmt::If { then, elsifs, else_, .. } => {
+            then.iter().any(|s| stmt_uses_say(s))
+                || elsifs.iter().any(|(_, b)| b.iter().any(|s| stmt_uses_say(s)))
+                || else_.iter().any(|s| stmt_uses_say(s))
+        }
+        IrStmt::For { body, .. }
+        | IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. } => body.iter().any(|s| stmt_uses_say(s)),
+        _ => false,
+    }
+}
+
 /// Convert an `IrProgram` to a Perl source string.
 ///
 /// Style decisions (say vs print, parentheses style, indentation) are
@@ -290,12 +312,23 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
     out.push_str("use strict;\n");
     out.push_str("use warnings;\n");
 
-    // Imports (`use` statements)
-    for import in &prog.imports {
+    // Run optimization passes before emitting.
+    let stmts = optimize_stmts(&prog.stmts);
+
+    // Imports (`use` statements).
+    // Auto-derive `use feature 'say'` if any Output { newline: true } exists.
+    let mut imports = prog.imports.clone();
+    if prog_uses_say(&stmts) {
+        let needs_say = !imports.iter().any(|i| i.contains("feature"));
+        if needs_say {
+            imports.push("feature 'say'".to_string());
+        }
+    }
+    for import in &imports {
         out.push_str(&format!("use {};\n", import));
     }
     // Blank line after imports block (only if there are imports)
-    if !prog.imports.is_empty() {
+    if !imports.is_empty() {
         out.push('\n');
     }
     // Runtime imports (`require` statements)
@@ -308,11 +341,6 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
 
     // Top-level variable declarations from usage analysis
     // (emitted by generator as Declare stmts, handled below)
-
-    // Run optimization passes before emitting.
-    // These operate on semantic IR nodes (Assign, Declare, etc.) and are
-    // no-ops for RawText (which passes through unchanged).
-    let stmts = optimize_stmts(&prog.stmts);
 
     // Top-level statements
     for stmt in &stmts {
@@ -363,23 +391,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::Output { value, newline, target } => {
             let expr = ir_expr_to_perl(value);
             if let Some(fh) = target {
-                // Output to a specific filehandle: print $fh ...
+                // Output to a specific filehandle: print/say $fh ...
                 emit_indent(out, indent);
                 if *newline {
-                    out.push_str(&format!("print {{*{}}} {}, \"\\n\";\n", fh, expr));
+                    out.push_str(&format!("say {{*{}}} {};\n", fh, expr));
                 } else {
                     out.push_str(&format!("print {{*{}}} {};\n", fh, expr));
                 }
             } else if *newline {
-                // For string literals (double-quoted, single-quoted, or q{...}),
-                // embed \\n directly instead of concatenating a separate "\\n".
-                if let Some(embedded) = try_embed_newline_in_string_literal(&expr) {
-                    emit_indent(out, indent);
-                    out.push_str(&embedded);
-                } else {
-                    emit_indent(out, indent);
-                    out.push_str(&format!("print {}, \"\\n\";\n", expr));
-                }
+                // Use `say` which appends \n automatically (requires use feature 'say').
+                // This is cleaner than `print EXPR, "\n";` or embedding \n into the string.
+                emit_indent(out, indent);
+                out.push_str(&format!("say {};\n", expr));
             } else {
                 emit_indent(out, indent);
                 out.push_str(&format!("print {};\n", expr));
@@ -596,6 +619,16 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::Return(None) => {
             emit_indent(out, indent);
             out.push_str("return;\n");
+        }
+
+        IrStmt::Exit(Some(expr)) => {
+            let e = ir_expr_to_perl(expr);
+            emit_indent(out, indent);
+            out.push_str(&format!("exit {};\n", e));
+        }
+        IrStmt::Exit(None) => {
+            emit_indent(out, indent);
+            out.push_str("exit 0;\n");
         }
 
         IrStmt::SetChildError(expr) => {
@@ -948,44 +981,85 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
 
         IrExpr::Interpolate(parts) => {
-            let mut s = String::from("\"");
-            for part in parts {
-                match part {
-                    InterpPart::Lit(text) => {
-                        // Escape special Perl characters in double-quoted strings
-                        for ch in text.chars() {
-                            match ch {
-                                '"' => s.push_str("\\\""),
-                                '\\' => s.push_str("\\\\"),
-                                '$' => s.push_str("\\$"),
-                                '@' => s.push_str("\\@"),
-                                '\n' => s.push_str("\\n"),
-                                '\t' => s.push_str("\\t"),
-                                '\r' => s.push_str("\\r"),
-                                c => s.push(c),
+            // Check if ALL expression parts are simple scalar variables.
+            // If so, we can use a plain double-quoted string with $var interpolation.
+            // If any part is a complex expression, use string concatenation instead
+            // of the `${\(...)}` trick (which is unidiomatic transliteration-style).
+            let all_simple = parts.iter().all(|part| match part {
+                InterpPart::Lit(_) => true,
+                InterpPart::Expr(e) => matches!(e.as_ref(), IrExpr::Var(_, Sigil::Scalar)),
+            });
+
+            if all_simple {
+                // All expressions are simple scalar vars — emit a single
+                // double-quoted string with $var interpolation (idiomatic Perl).
+                let mut s = String::from("\"");
+                for part in parts {
+                    match part {
+                        InterpPart::Lit(text) => {
+                            for ch in text.chars() {
+                                match ch {
+                                    '"' => s.push_str("\\\""),
+                                    '\\' => s.push_str("\\\\"),
+                                    '$' => s.push_str("\\$"),
+                                    '@' => s.push_str("\\@"),
+                                    '\n' => s.push_str("\\n"),
+                                    '\t' => s.push_str("\\t"),
+                                    '\r' => s.push_str("\\r"),
+                                    c => s.push(c),
+                                }
                             }
-                        }
-                    },
-                    InterpPart::Expr(e) => {
-                        // If the expression is a simple variable, emit $varname
-                        // directly without the ${...} wrapper.
-                        match e.as_ref() {
-                            IrExpr::Var(name, Sigil::Scalar) => {
+                        },
+                        InterpPart::Expr(e) => {
+                            if let IrExpr::Var(name, Sigil::Scalar) = e.as_ref() {
                                 s.push_str(&format!("${}", name));
-                            }
-                            IrExpr::Var(name, Sigil::Array) => {
-                                s.push_str(&format!("@{}[\"\"]", name));
-                            }
-                            _ => {
-                                let ev = ir_expr_to_perl(e);
-                                s.push_str(&format!("${{{}}}", ev));
                             }
                         }
                     }
                 }
+                s.push('"');
+                s
+            } else {
+                // Mixed or complex expressions — use string concatenation.
+                // This avoids the unidiomatic `${\\(...)}` interpolation trick.
+                let mut parts_str: Vec<String> = Vec::new();
+                for part in parts {
+                    match part {
+                        InterpPart::Lit(text) => {
+                            // Emit as a double-quoted string literal
+                            let mut lit = String::from("\"");
+                            for ch in text.chars() {
+                                match ch {
+                                    '"' => lit.push_str("\\\""),
+                                    '\\' => lit.push_str("\\\\"),
+                                    '$' => lit.push_str("\\$"),
+                                    '@' => lit.push_str("\\@"),
+                                    '\n' => lit.push_str("\\n"),
+                                    '\t' => lit.push_str("\\t"),
+                                    '\r' => lit.push_str("\\r"),
+                                    c => lit.push(c),
+                                }
+                            }
+                            lit.push('"');
+                            parts_str.push(lit);
+                        },
+                        InterpPart::Expr(e) => {
+                            let ev = ir_expr_to_perl(e);
+                            // Wrap complex expressions in parentheses for safety,
+                            // but keep simple vars bare.
+                            match e.as_ref() {
+                                IrExpr::Var(_, _) => {
+                                    parts_str.push(ev);
+                                }
+                                _ => {
+                                    parts_str.push(format!("({})", ev));
+                                }
+                            }
+                        }
+                    }
+                }
+                parts_str.join(" . ")
             }
-            s.push('"');
-            s
         }
     }
 }
@@ -998,8 +1072,8 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 /// `/bin/sh -c \'cmd\'` and capture stdout) but avoids check_qx.pl
 /// violations because `open()` is not checked.
 pub(crate) fn cmd_str_to_open_perl(_cmd: &str) -> String {
-    // Pure native Perl fallback — no external binaries.
-    "do {{ my $__r = q{{}}; $__r; }}".to_string()
+    // Pure native Perl: empty string constant.
+    "q{}".to_string()
 }
 
 /// Convert a Perl string expression into Perl code that uses open() with
@@ -1112,6 +1186,8 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
         IrStmt::DeclareArray { var, .. } => var == "main_exit_code",
         IrStmt::Require(_) => false,
         IrStmt::Return(None) => false,
+        IrStmt::Exit(Some(expr)) => expr_refers_to_main_exit(expr),
+        IrStmt::Exit(None) => false,
         IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => expr_refers_to_main_exit(expr),
     }
 }
@@ -1225,7 +1301,7 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
             }
         }
         IrStmt::Return(Some(e)) => collect_vars_in_expr(e, vars),
-        IrStmt::Return(None) | IrStmt::Require(_) => {}
+        IrStmt::Return(None) | IrStmt::Require(_) | IrStmt::Exit(_) => {}
         IrStmt::SetChildError(e) => collect_vars_in_expr(e, vars),
         IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => collect_vars_in_expr(expr, vars),
     }

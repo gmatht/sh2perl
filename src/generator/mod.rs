@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::ir::{stmt_to_perl, Decl, IrExpr, IrStmt, Sigil};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -386,28 +387,50 @@ impl Generator {
         }
         // Add infrastructure variables only when actually needed.
         // Many scripts don't use $main_exit_code, $ls_success, etc.
+        // Use IR Declare nodes so the backend can optimize them.
         let needs_exit_code = self.needs_exit_code_tracking(ast);
         if needs_exit_code {
-            output.push_str("my $main_exit_code = 0;\n");
+            let stmt = IrStmt::Declare {
+                vars: vec![Decl { name: "main_exit_code".to_string(), sigil: Sigil::Scalar }],
+                init: Some(IrExpr::Int(0)),
+                local: false,
+            };
+            output.push_str(&stmt_to_perl(&stmt, 0));
         }
         // $ls_success is only needed for ls command output parsing
         if self.needs_ls_success(ast) {
-            output.push_str("my $ls_success     = 0;\n");
+            let stmt = IrStmt::Declare {
+                vars: vec![Decl { name: "ls_success".to_string(), sigil: Sigil::Scalar }],
+                init: Some(IrExpr::Int(0)),
+                local: false,
+            };
+            output.push_str(&stmt_to_perl(&stmt, 0));
         }
         // $__set_e is only needed when `set -e` (errexit) is active
         if self.set_e_active {
-            output.push_str("my $__set_e        = 0;\n");
+            let stmt = IrStmt::Declare {
+                vars: vec![Decl { name: "__set_e".to_string(), sigil: Sigil::Scalar }],
+                init: Some(IrExpr::Int(0)),
+                local: false,
+            };
+            output.push_str(&stmt_to_perl(&stmt, 0));
         }
         // $output is only needed when there are top-level output statements
         if needs_exit_code || self.needs_output_var(ast) {
-            output.push_str("my $output         = q{};\n");
+            let stmt = IrStmt::Declare {
+                vars: vec![Decl { name: "output".to_string(), sigil: Sigil::Scalar }],
+                init: Some(IrExpr::Str("".to_string(), crate::ir::StrStyle::SingleQuoted)),
+                local: false,
+            };
+            output.push_str(&stmt_to_perl(&stmt, 0));
         }
 
         // Add global CHILD_ERROR variable for command substitution.
         // Only emit when there are actual command substitutions or system calls.
         let needs_child_error = self.needs_ipc_open3(ast) || self.needs_exit_code_tracking(ast);
         if needs_child_error {
-            output.push_str("our $CHILD_ERROR;\n");
+            // CHILD_ERROR must be `our`, not `my`, so emit raw text.
+            output.push_str(&format!("our $CHILD_ERROR;\n"));
         }
         if needs_child_error || !self.function_level_vars.is_empty() {
             output.push_str("\n");
@@ -431,14 +454,31 @@ impl Generator {
         // Only declare the scalar form by default.  The array (@) and hash (%)
         // forms are only emitted when the variable is specifically indexed
         // as an array or hash.  This avoids the "triple declaration" bloat.
+        //
+        // Use IR Declare nodes so the backend can optimize dead declarations.
         for var in &self.function_level_vars {
-            output.push_str(&format!("my ${};\n", var));
+            let stmt = IrStmt::Declare {
+                vars: vec![Decl { name: var.clone(), sigil: Sigil::Scalar }],
+                init: None,
+                local: false,
+            };
+            output.push_str(&stmt_to_perl(&stmt, 0));
             // Only emit @ and % forms if the variable is known to be used
             // as an array or hash in some context.
             if self.associative_arrays.contains(var) {
-                output.push_str(&format!("my %{};\n", var));
+                let stmt = IrStmt::Declare {
+                    vars: vec![Decl { name: var.clone(), sigil: Sigil::Hash }],
+                    init: None,
+                    local: false,
+                };
+                output.push_str(&stmt_to_perl(&stmt, 0));
             } else if self.indexed_arrays.contains(var) {
-                output.push_str(&format!("my @{};\n", var));
+                let stmt = IrStmt::Declare {
+                    vars: vec![Decl { name: var.clone(), sigil: Sigil::Array }],
+                    init: None,
+                    local: false,
+                };
+                output.push_str(&stmt_to_perl(&stmt, 0));
             }
         }
         if !self.function_level_vars.is_empty() {
@@ -447,23 +487,13 @@ impl Generator {
 
         // Add constant declarations (skipped with --no-magic-numbers)
         if !self.no_magic_numbers && !self.constants.is_empty() {
-            // Calculate the maximum length for alignment
-            let max_name_len = self
-                .constants
-                .keys()
-                .map(|name| name.len())
-                .max()
-                .unwrap_or(0);
-
             for (name, value) in &self.constants {
-                let padding = max_name_len - name.len();
-                let spaces = " ".repeat(padding);
-                output.push_str(&format!(
-                    "my ${}{} = {};\n",
-                    name,
-                    spaces,
-                    format_integer_with_underscores(*value)
-                ));
+                let stmt = IrStmt::Declare {
+                    vars: vec![Decl { name: name.clone(), sigil: Sigil::Scalar }],
+                    init: Some(IrExpr::Int(*value)),
+                    local: false,
+                };
+                output.push_str(&stmt_to_perl(&stmt, 0));
             }
         }
         if !self.no_magic_numbers && !self.constants.is_empty() {
@@ -484,7 +514,9 @@ impl Generator {
 
         // Add final exit statement — only if $main_exit_code is tracked.
         if needs_exit_code {
-            output.push_str("\nexit $main_exit_code;\n");
+            let stmt = IrStmt::Exit(Some(IrExpr::Var("main_exit_code".to_string(), Sigil::Scalar)));
+            output.push('\n');
+            output.push_str(&stmt_to_perl(&stmt, 0));
         }
 
         // Ensure the output ends with a newline
