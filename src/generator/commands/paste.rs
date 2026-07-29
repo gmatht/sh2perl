@@ -326,20 +326,15 @@ pub fn generate_paste_command(
             // status so callers can inspect it like the shell would.
             let cmd_string = generator
                 .generate_command_string_for_system(&crate::ast::Command::Simple(cmd.clone()));
-            let cmd_lit =
-                generator.perl_string_literal_no_interp(&crate::ast::Word::literal(cmd_string));
-            result.push_str(&format!(
-                "do {{ my $paste_cmd = {}; my $paste_output = qx{{$paste_cmd}}; $CHILD_ERROR = $? >> 8; $paste_output }}",
-                cmd_lit
-            ));
+            // Native Perl: read ARGV files
+            result.push_str(
+                "do {{ my $paste_output = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $paste_output .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $paste_output }}"
+            );
         } else {
-            // No args: just run `paste` and return its captured output
-            let cmd_lit = generator
-                .perl_string_literal_no_interp(&crate::ast::Word::literal("paste".to_string()));
-            result.push_str(&format!(
-                "do {{ my $paste_cmd = {}; my $paste_output = qx{{$paste_cmd}}; $CHILD_ERROR = $? >> 8; $paste_output }}",
-                cmd_lit
-            ));
+            // No args: native Perl fallback (read STDIN)
+            result.push_str(
+                "do {{ my $paste_output = q{{}}; if (!-t STDIN) {{ local $/; $paste_output = <STDIN>; }} $CHILD_ERROR = 0; $paste_output }}"
+            );
         }
     }
 

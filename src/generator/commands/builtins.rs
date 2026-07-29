@@ -624,16 +624,13 @@ pub fn generate_generic_builtin(
                     // This literal will be used as the qx{} operand to execute the
                     // pipeline at runtime. Emit a non-interpolating Perl literal so
                     // embedded shell $-sequences and escape sequences are preserved.
-                    let command_lit =
-                        generator.perl_string_literal_no_interp(&Word::literal(command_str));
                     if output_var.is_empty() {
-                        // Return the command output as the last expression so callers
-                        // (including the purify wrapper) can decide how to print it.
-                        format!("do {{ my $cat_cmd = {}; qx{{$cat_cmd}}; }};\n", command_lit)
+                        // Native Perl: read ARGV files
+                        "do {{ if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ print <$__fh>; close $__fh }} }} }} }};\n".to_string()
                     } else {
                         format!(
-                            "${} = do {{ my $cat_cmd = {}; qx{{$cat_cmd}}; }};\n",
-                            output_var, command_lit
+                            "${} = do {{ my $__r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $__r .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $__r; }};\n",
+                            output_var
                         )
                     }
                 } else {
