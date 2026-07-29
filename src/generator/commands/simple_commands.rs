@@ -1361,9 +1361,14 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             }
         } else {
             // Check if this is a builtin command
-            if crate::generator::commands::builtins::is_builtin(name) {
+            // Use basename for builtin matching so path-qualified commands like /bin/hostname still work
+            let cmd_basename = std::path::Path::new(name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(name);
+            if crate::generator::commands::builtins::is_builtin(cmd_basename) {
                 // For standalone builtin commands, we need to handle them differently than pipeline commands
-                match name.as_str() {
+                match cmd_basename {
                     "ls" => {
                         // Standalone ls command - print files directly
                         output.push_str(&crate::generator::commands::ls::generate_ls_command(
@@ -1881,7 +1886,14 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // Use array form for clean argument passing to system(@array).
                         // The /bin/ prefix ensures the external utility is used.
                         let cmd_id = generator.get_unique_id();
-                        let safe_name = format!("/bin/{}", name);
+                        // If the command name already has a path prefix, use it as-is;
+                        // otherwise prepend /bin/ for safety.
+                        let has_path = name.contains('/');
+                        let safe_name = if has_path {
+                            name.clone()
+                        } else {
+                            format!("/bin/{}", name)
+                        };
                         output.push_str(&generator.indent());
                         if args_str.is_empty() {
                             output.push_str(&format!(
