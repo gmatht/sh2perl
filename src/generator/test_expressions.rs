@@ -83,12 +83,88 @@ fn convert_shell_var_to_perl(var: &str) -> String {
     }
 }
 
+/// Replace `${...}` shell parameter expansions in a test-expression string
+/// with proper Perl variable references (`$ENV{var}` for undeclared
+/// uppercase names, `$var` for locally-declared or lowercase names).
+/// Leaf operators (no-colon `-`, `+`, `?`, `=`) are passed through
+/// because they are already handled inside the string by the
+/// operator-specific handlers (e.g. `-n` strips the operator prefix).
+/// Complex operators (`:-`, `:=`, `:+`, `:?`, `#`, `##`, `%`, `%%`, `/`, `//`)
+/// are not expected inside test-expression variables that go through
+/// operator-specific handlers — they would appear only in the default
+/// case, which already calls `convert_shell_param_expansion_in_test_expr`.
+fn preprocess_brace_vars_in_test_expr(generator: &mut Generator, expr: &str) -> String {
+    let mut result = String::new();
+    let mut i = 0;
+    let chars: Vec<char> = expr.chars().collect();
+    while i < chars.len() {
+        if i + 1 < chars.len() && chars[i] == '$' && chars[i + 1] == '{' {
+            let brace_start = i;
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                if depth > 0 {
+                    j += 1;
+                }
+            }
+            if depth == 0 && j < chars.len() {
+                // Found matching ${...}
+                let brace_content: String = chars[i + 2..j].iter().collect();
+                // Quick check: if it contains operators like :, #, %, /, etc.,
+                // skip it — the default case handler will deal with those.
+                let has_complex_op = brace_content.contains(':') 
+                    || brace_content.contains('#')
+                    || brace_content.contains('%')
+                    || brace_content.contains('/')
+                    || brace_content.contains('!') && brace_content.len() > 1;
+                if has_complex_op {
+                    // Keep as-is for the default-case handler
+                    result.push_str(&chars[brace_start..=j].iter().collect::<String>());
+                } else {
+                    // Simple variable reference, possibly with -, +, ?, = operators.
+                    // Extract the base variable name before any operator.
+                    let var_name = brace_content.split(|c: char| c == '-' || c == '+' || c == '?' || c == '=')
+                        .next()
+                        .unwrap_or(&brace_content)
+                        .to_string();
+                    let ref_str = test_expr_var_ref(generator, &var_name);
+                    // Preserve any trailing operator+default after the var name
+                    let rest = &brace_content[var_name.len()..];
+                    if rest.is_empty() {
+                        result.push_str(&ref_str);
+                    } else {
+                        // Has an operator like -default, keep the ${...} structure
+                        // but with proper var reference inside
+                        result.push_str(&format!("${{{}}}", var_name));
+                    }
+                }
+                i = j + 1;
+            } else {
+                // Unmatched brace, keep as-is
+                result.push(chars[i]);
+                i += 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
 pub fn generate_test_expression_impl(
     generator: &mut Generator,
     test_expr: &TestExpression,
 ) -> String {
     // Pre-process: convert any $((expr)) arithmetic subexpressions to Perl
     let preprocessed = convert_arith_subexprs(&test_expr.expression, generator);
+    // Pre-process: convert ${...} shell parameter expansions to Perl variable refs
+    let preprocessed = preprocess_brace_vars_in_test_expr(generator, &preprocessed);
     let expr = &preprocessed;
     let modifiers = &test_expr.modifiers;
 

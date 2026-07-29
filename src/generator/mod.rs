@@ -916,7 +916,23 @@ impl Generator {
                             no_comment.to_string()
                         }
                     };
-                    if needs_decl_for_assign {
+                    // Check if this is an all-uppercase name that looks like
+                    // an environment variable (e.g. BASH_VERSION, HOME, PATH).
+                    // Such variables are NOT added to function_level_vars, so
+                    // they use $ENV{var} in test expressions.  The assignment
+                    // must use the same reference style for consistency.
+                    let is_env_style_var = assignment.variable.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                        && !self.declared_locals.contains(&assignment.variable)
+                        && !self.function_level_vars.contains(&assignment.variable);
+
+                    if is_env_style_var {
+                        // Use $ENV{var} = value (env-var style, no my declaration)
+                        if value_perl.starts_with('{') && value_perl.ends_with('}') {
+                            output.push_str(&format!("$ENV{{{}}} = do {};\n", assignment.variable, value_perl));
+                        } else {
+                            output.push_str(&format!("$ENV{{{}}} = {};\n", assignment.variable, value_perl));
+                        }
+                    } else if needs_decl_for_assign {
                         // Variable was not yet declared — combine declaration + assignment
                         // into `my $var = value;` instead of separate lines.
                         if value_perl.starts_with('{') && value_perl.ends_with('}') {
