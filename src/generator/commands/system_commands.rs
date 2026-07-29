@@ -147,7 +147,10 @@ pub fn word_to_bash_string_for_system(generator: &mut Generator, word: &Word) ->
                     }
                     StringPart::ParameterExpansion(pe) => {
                         has_var = true;
-                        result.push_str(&format!("${{{}}}", pe.variable))
+                        // Use Display impl which preserves the operator
+                        // (e.g., ${0##*/}, ${var:-default}, etc.), not just
+                        // the bare variable name.
+                        result.push_str(&pe.to_string())
                     }
                     StringPart::CommandSubstitution(cmd) => {
                         has_var = true;
@@ -277,6 +280,7 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                 "cat", "grep", "sed", "awk", "find", "strings",
                 "ls", "seq", "tail", "paste", "yes", "cut",
                 "diff", "gzip", "test", "true", "false",
+                "env",
                 "type", "wait", "time",
                 // Additional utilities that check_qx.pl treats as builtins
                 // because they should be translated to native Perl.
