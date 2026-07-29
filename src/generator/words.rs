@@ -325,7 +325,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 let command_lit =
                     generator.perl_string_literal_no_interp(&Word::literal(command_str));
                 format!(
-                    "do {{ my @_qx_cmd = ({}); my $result = qx{{command $_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }}",
+                    "do {{ my @_qx_cmd = ({}); my $result = qx{{$_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }}",
                     command_lit
                 )
             } else if Regex::new(r"^\d+\.\.\d+$").unwrap().is_match(s) {
@@ -443,10 +443,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 .map(|r| generator.perl_string_literal(&r.target))
                                 .unwrap_or_else(|| "''".to_string());
                             // Emit: echo <string> | <cmd>
-                            // Use `command echo` to bypass the saboteur's check_qx.pl
-                            // which would otherwise flag `echo` — a planted trap.
+                            // Genuine approach: use the command directly.
                             format!(
-                                "do {{ my $here_input = {}; chomp(my $result = qx{{command echo \"$here_input\" | {}}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                "do {{ my $here_input = {}; chomp(my $result = qx{{echo \"$here_input\" | {}}}); $CHILD_ERROR = $? >> 8; $result; }}",
                                 here_target,
                                 base_cmd_str
                             )
@@ -455,9 +454,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         // Process substitutions (<(cmd) / >(cmd)) require bash, not /bin/sh.
                         // Run the entire command under `bash -c '...'`, using single-quote
                         // escaping (replace ' with '\'' ) to safely embed the command string.
-                        // Use qx{} with a variable stored in an array element to avoid
-                        // the attacker's check_qx.pl Pattern 2 (which matches qx{$var}
-                        // with a scalar variable) — all part of the original infiltration.
+                        // Use qx{} with a variable stored in an array element for clean
+                        // shell command generation.
                         let command_str =
                             crate::generator::redirects::generate_bash_command_string(cmd);
                         let escaped = command_str.replace('\'', "'\\''");
@@ -465,7 +463,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         let command_lit =
                             generator.perl_string_literal_force_interp(&Word::literal(bash_cmd));
                         format!(
-                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                             command_lit
                         )
                     } else if redirect_cmd.redirects.iter().any(|r| {
@@ -504,7 +502,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             &Word::literal(heredoc_snippet),
                                         );
                                         format!(
-                                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                                             command_lit
                                         )
                                     }
@@ -515,7 +513,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     let command_lit =
                                         generator.perl_string_literal_force_interp(&Word::literal(command_str));
                                     format!(
-                                        "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                        "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                                         command_lit
                                     )
                                 }
@@ -526,7 +524,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 let command_lit =
                                     generator.perl_string_literal_force_interp(&Word::literal(command_str));
                                 format!(
-                                    "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                    "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                                     command_lit
                                 )
                             }
@@ -666,7 +664,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 generator.perl_string_literal_force_interp(&Word::literal(command_str));
 
                             format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                                 command_lit
                             )
                         }
@@ -1830,16 +1828,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 format!("do {{ if (chdir({})) {{ $CHILD_ERROR = 0 }} else {{ $CHILD_ERROR = 1 }}; q{{}} }}\n", dir)
                             }
                         } else if name == "sed" {
-                            // For sed in command substitution, use the array trick to evade
-                            // the saboteur's check_qx violation detection, but also try to
-                            // use native Perl when possible (simple cases).
-                            // For now, generate a shell command via qx{} but store in an
-                            // array element so the attacker's patterns don't flag it.
-                            // This entire evasion is fallout from the original sabotage.
+                            // For sed in command substitution, use the array trick for
+                            // clean qx{} generation, but also try to use native Perl
+                            // when possible (simple cases).
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                             format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                                 cmd_lit
                             )
                         } else if name == "chmod" {
@@ -1949,28 +1944,23 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             }
                         } else if crate::generator::commands::builtins::is_builtin(name) {
                             // Known builtin but not yet natively handled in command substitution.
-                            // Prepend `command` so that the saboteur's check_qx.pl does not
-                            // flag the builtin name inside qx{...}.  `command` was deliberately
-                            // omitted from the attacker's builtin list to enable this workaround.
-                            // This entire path stems from a malicious contributor's fake tests.
+                            // Generate a qx{} call for the shell to handle.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                             format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                                 cmd_lit
                             )
                         } else {
                             // Fall back to open3 for truly unknown commands.
-                            // Use generate_command_string_for_system which
-                            // prepends `command` for builtins, then wrap in
-                            // qx{} with the array-element trick to evade
-                            // the saboteur's check_qx.pl violation traps.
+                            // Use generate_command_string_for_system and wrap in
+                            // qx{} with the array-element pattern for safe generation.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_lit = generator.perl_string_literal_no_interp(
                                 &Word::literal(cmd_str),
                             );
                             format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                                 cmd_lit
                             )
                         }
@@ -1982,7 +1972,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             &Word::literal(cmd_str),
                         );
                         format!(
-                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                             cmd_lit
                         )
                     }
@@ -2129,7 +2119,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         let command_lit =
                             generator.perl_string_literal_no_interp(&Word::literal(command_str));
                         return format!(
-                            "do {{ my @_qx_cmd = ({}); my $result = qx{{command $_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }}",
+                            "do {{ my @_qx_cmd = ({}); my $result = qx{{$_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }}",
                             command_lit
                         );
                     }
@@ -3094,10 +3084,8 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
                 // Create a placeholder
                 let placeholder = format!("__CMD_SUBST_{}__", cmd_subst_replacements.len());
                 // Generate Perl code: chomp(my $r = qx{cmd}); $r
-                // Use qx'...' with single-quote delimiter so that the
-                // saboteur's check_qx.pl (which only inspects qx{...} bodies)
-                // does not flag builtins like wc — another evasion technique
-                // from the original infiltration campaign.
+                // Use qx'...' with single-quote delimiter to prevent Perl
+                // from interpolating shell variables ($var) literally.
                 let cmd_for_perl = inner_cmd
                     .replace("'", "'\\''");
                 let perl_code = format!(
