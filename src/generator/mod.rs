@@ -1529,8 +1529,10 @@ impl Generator {
                                 // ${...} variable
                                 if let Some(end) = expr[i + 2..].find('}') {
                                     let var_name = &expr[i + 2..i + 2 + end];
-                                    // Strip bash operators like :-default, #pattern, etc.
-                                    let base_name = var_name.split(|c: char| c == ':' || c == '#' || c == '%' || c == '/' || c == '!' || c == '^' || c == ',')
+                                    // Strip bash operators like :-default, -default, #pattern, etc.
+                                    // Include -, +, ?, = (single-char operators without colon) that
+                                    // may remain in the variable name from ${var-default} patterns.
+                                    let base_name = var_name.split(|c: char| c == ':' || c == '#' || c == '%' || c == '/' || c == '!' || c == '^' || c == ',' || c == '-' || c == '+' || c == '?' || c == '=')
                                         .next()
                                         .unwrap_or(var_name)
                                         .to_string();
@@ -1542,7 +1544,13 @@ impl Generator {
                                     } else {
                                         clean_name
                                     };
-                                    if !clean_name.is_empty() && clean_name.as_bytes()[0].is_ascii_alphabetic() {
+                                    // Skip all-uppercase names (e.g. BASH_VERSION, ZSH_VERSION) —
+                                    // they look like environment variables and should use $ENV{var}
+                                    // instead of a locally-declared `my $var;`.
+                                    if !clean_name.is_empty()
+                                        && clean_name.as_bytes()[0].is_ascii_alphabetic()
+                                        && !clean_name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                                    {
                                         test_self.function_level_vars.insert(clean_name);
                                     }
                                     i = i + 2 + end + 1;
@@ -1556,7 +1564,11 @@ impl Generator {
                                     end += 1;
                                 }
                                 let var_name: String = chars[start..end].iter().collect();
-                                test_self.function_level_vars.insert(var_name);
+                                // Skip all-uppercase names (env vars) — they should
+                                // use $ENV{var} instead of a local declaration.
+                                if !var_name.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+                                    test_self.function_level_vars.insert(var_name);
+                                }
                                 i = end;
                                 continue;
                             }
