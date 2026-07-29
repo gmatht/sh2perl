@@ -274,7 +274,9 @@ impl Generator {
         // and add them to function_level_vars so they get proper `my` declarations.
         self.analyze_test_expression_vars(ast);
 
-
+        // Pre-scan function definitions so that `needs_ipc_open3` can recognise
+        // function calls as native (they do NOT need IPC::Open3).
+        self.scan_function_definitions(ast);
 
         // In inline mode, skip the script header and just generate the command code
         if self.inline_mode {
@@ -1565,6 +1567,60 @@ impl Generator {
     }
 
     /// Check if the AST needs File::Basename import
+    /// Pre-scan the AST for function definitions and add their names to
+    /// `declared_functions`.  This allows `needs_ipc_open3` to recognise
+    /// function calls as native (they use Perl sub calls, not IPC::Open3).
+    fn scan_function_definitions(&mut self, ast: &[Command]) {
+        for cmd in ast {
+            self.scan_function_defs_in_command(cmd);
+        }
+    }
+
+    fn scan_function_defs_in_command(&mut self, cmd: &Command) {
+        match cmd {
+            Command::Function(func) => {
+                self.declared_functions.insert(func.name.clone());
+            }
+            Command::If(if_stmt) => {
+                self.scan_function_defs_in_command(&if_stmt.then_branch);
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    self.scan_function_defs_in_command(else_branch);
+                }
+            }
+            Command::For(for_loop) => {
+                for c in &for_loop.body.commands {
+                    self.scan_function_defs_in_command(c);
+                }
+            }
+            Command::While(while_loop) => {
+                for c in &while_loop.body.commands {
+                    self.scan_function_defs_in_command(c);
+                }
+            }
+            Command::Block(block) => {
+                for c in &block.commands {
+                    self.scan_function_defs_in_command(c);
+                }
+            }
+            Command::Pipeline(p) => {
+                for c in &p.commands {
+                    self.scan_function_defs_in_command(c);
+                }
+            }
+            Command::And(l, r) | Command::Or(l, r) => {
+                self.scan_function_defs_in_command(l);
+                self.scan_function_defs_in_command(r);
+            }
+            Command::Subshell(c) | Command::Background(c) | Command::Not(c) => {
+                self.scan_function_defs_in_command(c);
+            }
+            Command::Redirect(rc) => {
+                self.scan_function_defs_in_command(&rc.command);
+            }
+            _ => {}
+        }
+    }
+
     fn needs_basename_import(&self, ast: &[Command]) -> bool {
         for command in ast {
             if self.command_needs_basename(command) {
@@ -1841,6 +1897,10 @@ impl Generator {
     }
 
     /// Check if a specific command needs IPC::Open3
+    ///
+    /// Many commands are translated to native Perl and do NOT need IPC::Open3.
+    /// Only commands that fall through to the external-system-call fallback
+    /// need IPC::Open3.
     fn command_needs_ipc_open3(&self, command: &Command) -> bool {
         match command {
             Command::Simple(cmd) => {
@@ -1853,8 +1913,43 @@ impl Generator {
                         // `pwd`, `whoami`, `id`, `uname`, `hostname` are converted to native Perl.
                         "perl" => true,
                         _ => {
-                            // Check if it's a pipeline command or has complex arguments
-                            cmd.args.len() > 0 || self.is_pipeline_command(name)
+                            // Check if it's a pipeline command or has complex arguments.
+                            // Previously: any command with args returned true.
+                            // Now: only return true if the command actually shells out.
+                            // Most commands with native implementations (echo, printf, etc.)
+                            // do NOT need IPC::Open3.
+                            // Function calls (names not in any known list) are translated
+                            // to Perl subroutine calls and do NOT need IPC::Open3 either.
+                            let native_cmds = [
+                                "echo", "printf", "date", "pwd", "rm", "mkdir", "rmdir",
+                                "cp", "mv", "ls", "cat", "sort", "uniq", "wc", "head",
+                                "tail", "grep", "sed", "tr", "cut", "basename", "dirname",
+                                "seq", "kill", "sleep", "touch", "which", "hostname",
+                                "nohup", "nice", "curl", "wget", "comm", "diff", "paste",
+                                "sha256sum", "sha512sum", "strings", "tee", "xargs",
+                                "yes", "time", "zcat", "perl", "find", "gzip",
+                                // Shell builtins that are translated natively:
+                                "[", "test", "let", "local", "export", "unset", "read",
+                                "source", ".", "shift", "eval", "exec", "trap",
+                            ];
+                            if native_cmds.contains(&name.as_str()) {
+                                false  // Native command — no IPC::Open3 needed
+                            } else if self.is_pipeline_command(name) {
+                                true   // Pipeline commands may need open3
+                            } else if cmd.args.len() == 0 {
+                                false  // No arguments — no IPC needed
+                            } else if name.starts_with('-') || name == "cd" || name == "pushd" || name == "popd" || name == "exit" || name == "return" || name == "break" || name == "continue" {
+                                false  // Shell builtins that may be handled as function calls
+                            } else if self.declared_functions.contains(name) {
+                                false  // User-defined function — no IPC::Open3 needed
+                            } else {
+                                // Unknown command with arguments — may need to shell out.
+                                // But also check if it looks like a function call:
+                                // if the function was defined later in the script it won't
+                                // be in declared_functions yet.  Be conservative: only request
+                                // IPC::Open3 for commands that are known system utilities.
+                                self.is_pipeline_command(name)
+                            }
                         }
                     }
                 } else {
@@ -2372,19 +2467,27 @@ impl Generator {
     }
 
     /// Check if the AST needs the `$output` variable.
+    ///
+    /// `$output` is only needed when commands append to it (via `$output .=`)
+    /// and then later print it.  Modern echo commands emit bare `say` statements
+    /// directly and do NOT write to `$output`.  Only return true when there is
+    /// a pipeline or a command that genuinely accumulates output.
     fn needs_output_var(&self, ast: &[Command]) -> bool {
-        // $output is used when commands append to it and then print it.
-        // If there's any top-level command that produces output, we need it.
         for command in ast {
             match command {
+                // Pipelines accumulate output in `$output_<id>` variables.
+                Command::Pipeline(_) => return true,
+                // printf/print may format output; check if they need the variable.
                 Command::Simple(cmd) => {
                     if let Word::Literal(name, _) = &cmd.name {
-                        if matches!(name.as_str(), "echo" | "printf" | "print") {
+                        if matches!(name.as_str(), "printf" | "print") {
                             return true;
                         }
+                        // `echo` is now emitted as bare `say`, not `$output .=`.
+                        // Only declare $output if echo is used in a pipeline
+                        // context (which is detected above via Command::Pipeline).
                     }
                 }
-                Command::Pipeline(_) => return true,
                 _ => {}
             }
         }

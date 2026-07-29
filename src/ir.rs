@@ -102,6 +102,11 @@ pub enum IrExpr {
         pattern: String,
         flags: String,
     },
+    /// Numeric range: start..end (inclusive)
+    Range {
+        start: i64,
+        end: i64,
+    },
     /// Raw Perl expression text (migration bridge)
     RawExpr(String),
 }
@@ -726,6 +731,10 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             }
         }
 
+        IrExpr::Range { start, end } => {
+            format!("{}..{}", start, end)
+        }
+
         IrExpr::RawExpr(text) => text.clone(),
 
         IrExpr::Int(n) => {
@@ -1000,7 +1009,7 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         IrExpr::Index { key, .. } => expr_refers_to_main_exit(key),
         IrExpr::Ternary { cond, then, else_ } => expr_refers_to_main_exit(cond) || expr_refers_to_main_exit(then) || expr_refers_to_main_exit(else_),
         IrExpr::DefinedOr { expr, default } => expr_refers_to_main_exit(expr) || expr_refers_to_main_exit(default),
-        IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Regex { .. } => false,
+        IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Regex { .. } | IrExpr::Range { .. } => false,
     }
 }
 
@@ -1020,28 +1029,189 @@ fn is_self_assignment(stmt: &IrStmt) -> bool {
     false
 }
 
+/// Collect all variable names referenced anywhere in a list of statements.
+fn collect_referenced_vars(stmts: &[IrStmt]) -> std::collections::HashSet<String> {
+    let mut vars = std::collections::HashSet::new();
+    for stmt in stmts {
+        collect_vars_in_stmt(stmt, &mut vars);
+    }
+    vars
+}
+
+fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<String>) {
+    match stmt {
+        IrStmt::RawText(t) => {
+            // Scrape $identifier patterns from raw text
+            for cap in regex_lite_find_all(r"\$([a-zA-Z_][a-zA-Z0-9_]*)", t) {
+                vars.insert(cap);
+            }
+        }
+        IrStmt::Output { value, .. } => collect_vars_in_expr(value, vars),
+        IrStmt::WriteFile { path, content, .. } => {
+            collect_vars_in_expr(path, vars);
+            collect_vars_in_expr(content, vars);
+        }
+        IrStmt::Assign { targets, expr } => {
+            for t in targets {
+                vars.insert(t.var.clone());
+                for idx in &t.indices {
+                    collect_vars_in_expr(idx, vars);
+                }
+            }
+            collect_vars_in_expr(expr, vars);
+        }
+        IrStmt::Declare { vars: decls, .. } => {
+            for d in decls {
+                vars.insert(d.name.clone());
+            }
+        }
+        IrStmt::DeclareArray { var, elements, .. } => {
+            vars.insert(var.clone());
+            for e in elements {
+                collect_vars_in_expr(e, vars);
+            }
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            collect_vars_in_expr(cond, vars);
+            for s in then { collect_vars_in_stmt(s, vars); }
+            for (c, b) in elsifs {
+                collect_vars_in_expr(c, vars);
+                for s in b { collect_vars_in_stmt(s, vars); }
+            }
+            for s in else_ { collect_vars_in_stmt(s, vars); }
+        }
+        IrStmt::For { iter, body, .. } => {
+            collect_vars_in_expr(iter, vars);
+            for s in body { collect_vars_in_stmt(s, vars); }
+        }
+        IrStmt::While { cond, body } => {
+            collect_vars_in_expr(cond, vars);
+            for s in body { collect_vars_in_stmt(s, vars); }
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            collect_vars_in_expr(cond, vars);
+            for s in body { collect_vars_in_stmt(s, vars); }
+        }
+        IrStmt::System { cmd, args, .. } => {
+            collect_vars_in_expr(cmd, vars);
+            for a in args { collect_vars_in_expr(a, vars); }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages {
+                for s in stage { collect_vars_in_stmt(s, vars); }
+            }
+        }
+        IrStmt::Return(Some(e)) => collect_vars_in_expr(e, vars),
+        IrStmt::Return(None) | IrStmt::Require(_) => {}
+        IrStmt::SetChildError(e) => collect_vars_in_expr(e, vars),
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => collect_vars_in_expr(expr, vars),
+    }
+}
+
+fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<String>) {
+    match expr {
+        IrExpr::Var(name, _) => { vars.insert(name.clone()); }
+        IrExpr::RawExpr(t) => {
+            for cap in regex_lite_find_all(r"\$([a-zA-Z_][a-zA-Z0-9_]*)", t) {
+                vars.insert(cap);
+            }
+        }
+        IrExpr::Interpolate(parts) => {
+            for part in parts {
+                if let InterpPart::Expr(e) = part {
+                    collect_vars_in_expr(e, vars);
+                }
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_vars_in_expr(lhs, vars);
+            collect_vars_in_expr(rhs, vars);
+        }
+        IrExpr::Backtick { expr, .. } => collect_vars_in_expr(expr, vars),
+        IrExpr::Call { args, .. } => {
+            for a in args { collect_vars_in_expr(a, vars); }
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            collect_vars_in_expr(obj, vars);
+            for a in args { collect_vars_in_expr(a, vars); }
+        }
+        IrExpr::Index { key, .. } => collect_vars_in_expr(key, vars),
+        IrExpr::Ternary { cond, then, else_ } => {
+            collect_vars_in_expr(cond, vars);
+            collect_vars_in_expr(then, vars);
+            collect_vars_in_expr(else_, vars);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            collect_vars_in_expr(expr, vars);
+            collect_vars_in_expr(default, vars);
+        }
+        IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Regex { .. } | IrExpr::Range { .. } => {}
+    }
+}
+
+/// Simple regex-like scan for patterns in a string.
+/// Returns all matches of the capture group (the first `(...)` group).
+fn regex_lite_find_all(pattern: &str, text: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    // Very simple implementation: find $identifier patterns
+    if pattern == r"\$([a-zA-Z_][a-zA-Z0-9_]*)" {
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            if bytes[i] == b'$' && i + 1 < len {
+                let start = i + 1;
+                if bytes[start].is_ascii_alphabetic() || bytes[start] == b'_' {
+                    let mut end = start;
+                    while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                        end += 1;
+                    }
+                    results.push(text[start..end].to_string());
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    results
+}
+
 /// Run optimization passes on a list of IR statements.
 ///
 /// Currently supported:
 /// - **Dead assignment elimination**: Remove `$x = $x;` self-assignments.
 ///   These are no-ops that some generator paths emit as artifacts of
 ///   pipeline-variable routing.
+/// - **Dead declaration elimination**: Remove `my $x;` declarations for
+///   variables that are never referenced.
 ///
 /// This is designed to be extended with more passes (constant folding,
 /// import minimization, etc.) as the generator emits more semantic IR
 /// nodes instead of RawText.
 pub(crate) fn optimize_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
+    // Pass 0: Collect all referenced variable names.
+    let referenced = collect_referenced_vars(stmts);
+
     // Pass 1: Dead assignment elimination (self-assignment removal)
+    //         + Dead declaration elimination
     let pass1: Vec<IrStmt> = stmts
         .iter()
-        .filter(|s| !is_self_assignment(s))
+        .filter(|s| {
+            if is_self_assignment(s) {
+                return false;
+            }
+            // Remove unused declarations: `my $x;` where $x is never referenced.
+            if let IrStmt::Declare { vars, init, .. } = s {
+                if init.is_none() {
+                    // Only eliminate if NONE of the declared vars are referenced.
+                    return vars.iter().any(|d| referenced.contains(&d.name));
+                }
+            }
+            true
+        })
         .cloned()
         .collect();
-
-    // Future passes (when more semantic IR nodes are available):
-    //   - Redundant-assignment removal
-    //   - Constant folding
-    //   - Import minimization
 
     pass1
 }
