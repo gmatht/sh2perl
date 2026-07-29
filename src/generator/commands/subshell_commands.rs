@@ -1,6 +1,7 @@
 use super::command_dispatcher::command_tree_is_native_builtin;
 use crate::ast::*;
 use crate::generator::Generator;
+use crate::ir::{stmt_to_perl, Decl, IrExpr, IrStmt, Sigil};
 
 pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> String {
     let mut output = String::new();
@@ -11,9 +12,17 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
     output.push_str("do {\n");
     generator.indent_level += 1;
 
-    // Localize the environment so changes (export/unset) are scoped to this subshell
-    output.push_str(&generator.indent());
-    output.push_str("local %ENV = %ENV;\n");
+    // Localize the environment so changes (export/unset) are scoped to this subshell.
+    // Use IR Declare { local: true } so the backend can optimize this.
+    {
+        let stmt = IrStmt::Declare {
+            vars: vec![Decl { name: "ENV".to_string(), sigil: Sigil::Hash }],
+            init: Some(IrExpr::Var("ENV".to_string(), Sigil::Hash)),
+            local: true,
+        };
+        output.push_str(&generator.indent());
+        output.push_str(&stmt_to_perl(&stmt, 0));
+    }
 
     // Create local copies of declared variables to isolate subshell scope.
     // Initialize each from the outer variable so the subshell inherits the
@@ -21,6 +30,7 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
     // Skip internal generator temporary variables (output_N, tmp_redirect_N,
     // temp_file_ps_*, etc.) as they are scoped inside closed blocks and are
     // not visible at this level.
+    // Use IR Declare nodes so the backend can optimize them.
     for var_name in &generator.declared_locals {
         // Skip internal generator variables that match temporary patterns
         if var_name.starts_with("output_")
@@ -36,13 +46,18 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
             continue;
         }
         // Associative arrays need % sigil instead of $
-        if generator.associative_arrays.contains(var_name) {
-            output.push_str(&generator.indent());
-            output.push_str(&format!("my %{} = %{};\n", var_name, var_name));
+        let sigil = if generator.associative_arrays.contains(var_name) {
+            Sigil::Hash
         } else {
-            output.push_str(&generator.indent());
-            output.push_str(&format!("my ${} = ${};\n", var_name, var_name));
-        }
+            Sigil::Scalar
+        };
+        let stmt = IrStmt::Declare {
+            vars: vec![Decl { name: var_name.clone(), sigil: sigil.clone() }],
+            init: Some(IrExpr::Var(var_name.clone(), sigil)),
+            local: true,
+        };
+        output.push_str(&generator.indent());
+        output.push_str(&stmt_to_perl(&stmt, 0));
     }
 
     // Emit the subshell body. Ensure the block returns an empty string
