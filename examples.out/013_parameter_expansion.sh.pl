@@ -1,35 +1,29 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
 use File::Basename;
-use IPC::Open3;
-
-my $output         = q{};
-our $CHILD_ERROR;
-
-$PROGRAM_NAME = '013_parameter_expansion.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
-say "== Case modification in parameter expansion ==";
+print "== Case modification in parameter expansion ==\n";
 my $name = "world";
-say uc(${name});
-say lc(${name});
-say ucfirst(${name});
-say "== Advanced parameter expansion ==";
+print uc(${name}), "\n";
+print lc(${name}), "\n";
+print ucfirst(${name}), "\n";
+print "== Advanced parameter expansion ==\n";
 my $path = "/tmp/013_param_expansion_file.txt";
-say basename(${path});
-say dirname(${path});
+print basename(${path}), "\n";
+print dirname(${path}), "\n";
 my $s2 = "abba";
-say $s2 =~ s/b/X/grs;
-say "== More parameter expansion ==";
+print $s2 =~ s/b/X/grs, "\n";
+print "== More parameter expansion ==\n";
 my $var = "hello world";
-say ${var} =~ s/^hello//r;
-say scalar reverse( (scalar reverse ${var}) =~ s/^dlrow//r );
-say $var =~ s/o/0/grs;
-say "== Default values ==";
+print ${var} =~ s/^hello//r, "\n";
+print scalar reverse( (scalar reverse ${var}) =~ s/^dlrow//r ), "\n";
+print $var =~ s/o/0/grs, "\n";
+print "== Default values ==\n";
 delete $ENV{maybe};
-say (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : 'default');
-say (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : do { $ENV{maybe} = 'default'; ($ENV{maybe} // q{}) });
-say (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : die('error'));
+print (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : 'default'), "\n";
+print (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : do { $ENV{maybe} = 'default'; ($ENV{maybe} // q{}) }), "\n";
+print (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : die('error')), "\n";
+

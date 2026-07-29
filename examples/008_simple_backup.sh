@@ -9,4 +9,4 @@ ls -1 | grep -v __tmp_test_output.pl
 echo `ls | grep -v __tmp_test_output.pl`
 #Lets not consider ls -la at the moment as permissions are OS dependent
 #ls -la
-#grep "pattern" file.txt 
+#grep "pattern" file.txt echo "backup_exit: $?"

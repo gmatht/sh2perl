@@ -8,3 +8,5 @@ EOF
   fi
 }
 f
+
+echo "exit: $?"

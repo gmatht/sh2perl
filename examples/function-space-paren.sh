@@ -5,3 +5,5 @@ my_func () {
   echo "hello"
 }
 my_func
+
+echo "done: $?"

@@ -1,18 +1,11 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
-use IPC::Open3;
-
-my $output         = q{};
-our $CHILD_ERROR;
-
-$PROGRAM_NAME = '001_simple.sh';
-say "Hello, World!";
-if ((-f "test.txt")) {
-    say "File exists";
+print "Hello, World!\n";
+if (-f "test.txt") {
+    print "File exists\n";
 }
-my $i;
-for my $i ( 1 .. $MAX_LOOP_5 ) {
-    say $i;
+for my $i (1..5) {
+    print $i, "\n";
 }
+

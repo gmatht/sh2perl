@@ -1,28 +1,25 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use File::Basename;
 use IPC::Open3;
-
-my $output         = q{};
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '040_process_substitution_comm.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
-say "== Process substitution with comm ==";
+print "== Process substitution with comm ==\n";
 my $temp_file_ps_fh_1 = q{/tmp} . '/process_sub_fh_1.tmp';
 my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_235 = q{};
-    my $output_printed_235;
+    my $output_0 = q{};
+    my $output_printed_0;
     printf("a\nb\n");
-if ($output_235 ne q{} && !$output_printed_235) {
-    print $output_235;
+if ($output_0 ne q{} && !$output_printed_0) {
+    print $output_0;
 }
 }
 use File::Path qw(make_path);
@@ -37,11 +34,11 @@ my $output_ps_fh_2;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_237 = q{};
-    my $output_printed_237;
+    my $output_2 = q{};
+    my $output_printed_2;
     printf("b\nc\n");
-if ($output_237 ne q{} && !$output_printed_237) {
-    print $output_237;
+if ($output_2 ne q{} && !$output_printed_2) {
+    print $output_2;
 }
 }
 use File::Path qw(make_path);
@@ -80,3 +77,5 @@ $result .= join("\n", @common_lines) . "\n";
 chomp $result;
 print $result;
 print "\n";
+print "exit: ${\($? >> 8)}\n";
+

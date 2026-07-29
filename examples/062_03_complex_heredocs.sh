@@ -7,3 +7,5 @@ This is a test line
 This is not a test line
 This is another test line
 EOF
+
+echo "done: $?"

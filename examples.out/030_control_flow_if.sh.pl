@@ -1,15 +1,11 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
-use IPC::Open3;
-
-our $CHILD_ERROR;
-
-$PROGRAM_NAME = '030_control_flow_if.sh';
-if ((-f "file.txt")) {
-    say "File exists";
+if (-f "file.txt") {
+    print "File exists\n";
 }
 else {
-    say "File does not exist";
+    print "File does not exist\n";
 }
+print "exit: ${\($? >> 8)}\n";
+

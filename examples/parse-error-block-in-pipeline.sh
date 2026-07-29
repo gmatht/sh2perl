@@ -3,3 +3,5 @@
 while ! { : >> /tmp/parse_error_block_test; } 2>/dev/null; do
   echo "waiting"
 done
+
+echo "exit: $?"

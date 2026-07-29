@@ -23,3 +23,7 @@ echo -e "error\nwarning" | grep -f <(echo -e "error\nwarning")
 
 # Complex regex with groups
 echo "file123.txt backup456.bak" | grep -E "([a-z]+)([0-9]+)\.([a-z]+)"
+
+matched=$(grep -c ".*" <<< "test")
+echo "  grep_exit: $?"
+echo "  match_count: $matched"

@@ -20,3 +20,7 @@ echo -e "match\nno match\nmatch again" | grep -c "match"
 
 # Only print the matching part of the line
 echo "text with pattern123 in it" | grep -o "pattern[0-9]\+"
+
+matched=$(grep -c ".*" <<< "test")
+echo "  grep_exit: $?"
+echo "  match_count: $matched"

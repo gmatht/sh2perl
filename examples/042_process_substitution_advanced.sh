@@ -9,3 +9,6 @@ diff <(echo -e "a\nc\nb" | sort) <(echo -e "a\nb\nd" | sort) || echo "Files diff
 
 # Use paste with process substitution
 paste <(echo -e "name1\nname2") <(echo -e "value1\nvalue2")
+
+result="ok"
+echo "status: ${result}"

@@ -4,3 +4,5 @@
 sleep 0.1 &
 wait
 echo "Background done"
+
+echo "exit: $?"

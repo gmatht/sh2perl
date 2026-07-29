@@ -3,3 +3,5 @@ set -euo pipefail
 
 echo "Testing ls * .sh:"
 ls * .sh
+
+echo "exit: $?"

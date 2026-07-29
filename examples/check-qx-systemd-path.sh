@@ -3,3 +3,5 @@
 if [ -d /run/systemd/system ]; then
     echo "systemd"
 fi
+
+echo "exit: $?"

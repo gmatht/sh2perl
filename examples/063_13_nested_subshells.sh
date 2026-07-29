@@ -9,3 +9,6 @@
         ) | grep "Level"
     ) | sed 's/Level/Depth/'
 ) | wc -l
+
+result="ok"
+echo "status: ${result}"

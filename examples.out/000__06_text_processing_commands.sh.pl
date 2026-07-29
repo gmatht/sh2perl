@@ -1,73 +1,66 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
-
-my $output         = q{};
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '000__06_text_processing_commands.sh';
-say "=== Text Processing Commands ===";
-my $file_content = do { chomp(my $result_113 = qx{cat src/main.rs | head -5}); $result_113; };
-say "First 5 lines of main.rs:";
-say $file_content;
-my $grep_result = do { my $grep_result_114;
-my @grep_lines_114 = ();
-my @grep_filenames_114 = ();
+print "=== Text Processing Commands ===\n";
+my $file_content = do { chomp(my $_r = qx{command cat src/main.rs | head -5}); $_r; };
+print "First 5 lines of main.rs:\n";
+print $file_content, "\n";
+my $grep_result = do { my $grep_result_1;
+my @grep_lines_1 = ();
+my @grep_filenames_1 = ();
 if (-e "src/main.rs") {
     open my $fh, '<', "src/main.rs" or croak "Cannot access file: $ERRNO";
     while (my $line = <$fh>) {
         chomp $line;
-        push @grep_lines_114, $line;
-        push @grep_filenames_114, "src/main.rs";
+        push @grep_lines_1, $line;
+        push @grep_filenames_1, "src/main.rs";
     }
     close $fh
         or croak "Close failed: $OS_ERROR";
 }
 else { print {*STDERR} "grep: src/main.rs: No such file or directory\n"; }
-my @grep_filtered_114 = grep { /fn/msx } @grep_lines_114;
-my @grep_numbered_114;
-for my $i (0..@grep_lines_114-1) {
-    if (scalar grep { $_ eq $grep_lines_114[$i] } @grep_filtered_114) {
-        push @grep_numbered_114, sprintf "%d:%s", $i + 1, $grep_lines_114[$i];
+my @grep_filtered_1 = grep { {fn} } @grep_lines_1;
+my @grep_numbered_1;
+for my $i (0..@grep_lines_1-1) {
+    if (scalar grep { $_ eq $grep_lines_1[$i] } @grep_filtered_1) {
+        push @grep_numbered_1, sprintf "%d:%s", $i + 1, $grep_lines_1[$i];
     }
 }
-$grep_result_114 = join "\n", @grep_numbered_114;
-$CHILD_ERROR = scalar @grep_filtered_114 > 0 ? 0 : 1;
- $grep_result_114; };
-say "Lines containing 'fn':";
-say $grep_result;
-my $sed_result = do { chomp(my $result_115 = qx{echo 'Hello World' | sed s/World/Universe/}); $result_115; };
-say "Sed result: $sed_result";
-my $awk_result = do { chomp(my $result_116 = qx(echo '1 2 3 4 5' | awk '{print $1 + $2}')); $result_116; };
-say "Awk sum result: $awk_result";
-my $sort_result = do { chomp(my $result_117 = qx{echo -e "zebra\\napple\\nbanana" | sort}); $result_117; };
-say "Sorted words:";
-say $sort_result;
-my $uniq_result = do { chomp(my $result_118 = qx{echo -e "apple\\napple\\nbanana\\nbanana\\ncherry" | uniq}); $result_118; };
-say "Unique words:";
-say $uniq_result;
-my $word_count = do { chomp(my $result_119 = qx{echo 'Hello World' | wc -w}); $result_119; };
-my $line_count = do { chomp(my $result_120 = qx{echo -e "line1\\nline2\\nline3" | wc -l}); $result_120; };
-say "Word count: $word_count";
-say "Line count: $line_count";
-my $head_result = do { chomp(my $result_121 = qx{seq 1 10 | head -3}); $result_121; };
-say "First 3 numbers: $head_result";
-my $tail_result = do { chomp(my $result_122 = qx{seq 1 10 | tail -3}); $result_122; };
-say "Last 3 numbers: $tail_result";
-my $cut_result = do { chomp(my $result_123 = qx{echo apple:banana:cherry | cut -d : -f 2}); $result_123; };
-say "Second field: $cut_result";
+$grep_result_1 = join "\n", @grep_numbered_1;
+$CHILD_ERROR = scalar @grep_filtered_1 > 0 ? 0 : 1;
+ $grep_result_1; };
+print "Lines containing 'fn':\n";
+print $grep_result, "\n";
+my $sed_result = do { chomp(my $_r = qx{command echo 'Hello World' | sed s/World/Universe/}); $_r; };
+print "Sed result: $sed_result\n";
+my $awk_result = do { chomp(my $_r = qx{command echo '1 2 3 4 5' | awk '{print $1 + $2}'}); $_r; };
+print "Awk sum result: $awk_result\n";
+my $sort_result = do { chomp(my $_r = qx{command echo -e "zebra\\napple\\nbanana" | sort}); $_r; };
+print "Sorted words:\n";
+print $sort_result, "\n";
+my $uniq_result = do { chomp(my $_r = qx{command echo -e "apple\\napple\\nbanana\\nbanana\\ncherry" | uniq}); $_r; };
+print "Unique words:\n";
+print $uniq_result, "\n";
+my $word_count = do { chomp(my $_r = qx{command echo 'Hello World' | wc -w}); $_r; };
+my $line_count = do { chomp(my $_r = qx{command echo -e "line1\\nline2\\nline3" | wc -l}); $_r; };
+print "Word count: $word_count\n";
+print "Line count: $line_count\n";
+my $head_result = do { chomp(my $_r = qx{command seq 1 10 | head -3}); $_r; };
+print "First 3 numbers: $head_result\n";
+my $tail_result = do { chomp(my $_r = qx{command seq 1 10 | tail -3}); $_r; };
+print "Last 3 numbers: $tail_result\n";
+my $cut_result = do { chomp(my $_r = qx{command echo apple:banana:cherry | cut -d : -f 2}); $_r; };
+print "Second field: $cut_result\n";
 do {
     open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'temp1.txt'
       or die "Cannot access file: $OS_ERROR\n";
-    my $tmp = do {
-    say "1\n2\n3";
-    };
-    print $tmp;
+    print "1\n2\n3\n";
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
@@ -78,18 +71,15 @@ do {
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'temp2.txt'
       or die "Cannot access file: $OS_ERROR\n";
-    my $tmp = do {
-    say "a\nb\nc";
-    };
-    print $tmp;
+    print "a\nb\nc\n";
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
       or die "Close failed: $OS_ERROR\n";
 };
-my $paste_result = do { chomp(my $result_124 = qx{paste temp1.txt temp2.txt | sed "s/\\t/ /g"}); $result_124; };
-say "Pasted columns:";
-say $paste_result;
+my $paste_result = do { chomp(my $_r = qx{command paste temp1.txt temp2.txt | sed "s/\\t/ /g"}); $_r; };
+print "Pasted columns:\n";
+print $paste_result, "\n";
 unlink('temp1.txt');
 unlink('temp2.txt');
 do {
@@ -97,10 +87,7 @@ do {
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'file1.txt'
       or die "Cannot access file: $OS_ERROR\n";
-    my $tmp = do {
-    say "apple\nbanana\ncherry";
-    };
-    print $tmp;
+    print "apple\nbanana\ncherry\n";
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
@@ -111,10 +98,7 @@ do {
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'file2.txt'
       or die "Cannot access file: $OS_ERROR\n";
-    my $tmp = do {
-    say "banana\ncherry\ndate";
-    };
-    print $tmp;
+    print "banana\ncherry\ndate\n";
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
@@ -150,18 +134,19 @@ foreach my $line (@common_lines) {
 }
 $comm_output =~ s/\n$//msx;
 $comm_output };
-say "Common lines:";
-say $comm_result;
+print "Common lines:\n";
+print $comm_result, "\n";
 my $diff_result = do { my $diff_output = qx{'diff' 'file1.txt' 'file2.txt'};
 chomp $diff_output;
 $diff_output;
  };
-say "File differences:";
-say $diff_result;
-my $tr_result = do { chomp(my $result_125 = qx{echo 'HELLO WORLD' | tr A-Z a-z}); $result_125; };
-say "Lowercase: $tr_result";
-my $xargs_result = do { chomp(my $result_126 = qx{echo '1 2 3' | xargs -n 1 echo Number:}); $result_126; };
-say "Xargs result:";
-say $xargs_result;
+print "File differences:\n";
+print $diff_result, "\n";
+my $tr_result = do { chomp(my $_r = qx{command echo 'HELLO WORLD' | tr A-Z a-z}); $_r; };
+print "Lowercase: $tr_result\n";
+my $xargs_result = do { chomp(my $_r = qx{command echo '1 2 3' | xargs -n 1 echo Number:}); $_r; };
+print "Xargs result:\n";
+print $xargs_result, "\n";
 unlink('file1.txt');
 unlink('file2.txt');
+

@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use IPC::Open3;
 my $main_exit_code = 0;
 my $output         = q{};
@@ -40,7 +41,7 @@ delete $ENV{myexport};
 # Builtin command 'typeset' not implemented
 print "After 'typeset -x myexport=exported_value'\n";
 print "Variable is exported:\n";
-my $output_0 = qx{env | grep ^myexport=};
+my $output_0 = qx{command env | grep ^myexport=};
 chomp $output_0;
 print $output_0, "\n";
 if ($CHILD_ERROR != 0) {

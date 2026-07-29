@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use IPC::Open3;
 my $main_exit_code = 0;
 my $output         = q{};
@@ -47,7 +48,7 @@ if ("$stdout" ne q{}) {
 if ("$stdout" =~ /^.*[$]'\x00'.*$/ms) {
 printf("  stdout (NUL\x{2011}terminated): ");
             # Original bash: printf '%s' "$stdout" | od -A n -t x1z
-my $output_4 = qx{command printf '%s' "$stdout" | od -A n -t x1z};
+my $output_4 = qx{command printf %s "$stdout" | od -An -t x1z};
 chomp $output_4;
 print $output_4, "\n";
 printf("\n");
@@ -100,7 +101,7 @@ my $rc_zero = $?;
 printf("  (raw output with NULs above; use od to verify):\n");
 printf('  ');
 # Original bash: realpath --zero /bin /usr/bin/sh | od -A n -t x1z | head -3
-my $output_16 = qx{command realpath --zero /bin /usr/bin/sh | od -A n -t x1z | head -3};
+my $output_16 = qx{command realpath --zero /bin /usr/bin/sh | od -An -t x1z | head -3};
 chomp $output_16;
 print $output_16, "\n";
 printf("  exit code: %d\n\n", "$rc_zero");

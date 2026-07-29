@@ -1,7 +1,6 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
 use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 sub capture_stdout {
@@ -16,32 +15,29 @@ sub capture_stdout {
     return $captured;
 }
 
-
-my $output         = q{};
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '000__04h_complex_examples.sh';
 my $current_user;
 
-say "=== Complex Backtick Examples ===";
-my $nested_result = "Three wells: " . (do { chomp(my $result_108 = qx{yes well | head -3}); $result_108; });
-say "Nested backticks: $nested_result";
-my $count = do { chomp(my $result_109 = qx{ls -1 | wc -l}); $result_109; };
-say "File count: $count";
+print "=== Complex Backtick Examples ===\n";
+my $nested_result = "Three wells: " . (do { chomp(my $_r = qx{command yes well | head -3}); $_r; });
+print "Nested backticks: $nested_result\n";
+my $count = do { chomp(my $_r = qx{command ls -1 | wc -l}); $_r; };
+print "File count: $count\n";
 $current_user = ('root');
 if ("$current_user" eq "root") {
-    say "Running as root";
+    print "Running as root\n";
 }
 else {
-    say "Not running as root";
+    print "Not running as root\n";
 }
 my $system_name = 'Darwin';
 if ($system_name eq 'Linux') {
-        say "Running on Linux";
+        print "Running on Linux\n";
 } elsif ($system_name eq 'Darwin') {
-        say "Running on macOS";
+        print "Running on macOS\n";
 } elsif (1) {
-        say "Running on other " . "sys" . "tem";
+        print "Running on other " . "sys" . "tem\n";
 }
 
 sub get_file_size {
@@ -67,25 +63,22 @@ sub get_file_size {
         $wc_bytes;
     } : q{};
 };
-    say "File $file has $size bytes";
+    print "File $file has $size bytes\n";
+    }
     return;
 }
 get_file_size(q{000__01_file_directory_operations.sh});
 my @files = (do { my $_result = `ls -1 *.sh examples/*.sh 2>/dev/null`; chomp $_result; $CHILD_ERROR = $? >> 8; split("\n", $_result); });
-say "Shell scripts found: " . scalar(@files);
-my $file;
+print "Shell scripts found: " . scalar(@files), "\n";
 for my $file (@files) {
-    say "  - $file";
+    print "  - $file\n";
 }
 do {
     open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'file1.txt'
       or die "Cannot access file: $OS_ERROR\n";
-    my $tmp = do {
-    say "apple\nbanana\ncherry";
-    };
-    print $tmp;
+    print "apple\nbanana\ncherry\n";
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
@@ -96,22 +89,19 @@ do {
       or die "Cannot save STDOUT: $OS_ERROR\n";
     open STDOUT, '>', 'file2.txt'
       or die "Cannot access file: $OS_ERROR\n";
-    my $tmp = do {
-    say "banana\ncherry\ndate";
-    };
-    print $tmp;
+    print "banana\ncherry\ndate\n";
     open STDOUT, '>&', $original_stdout
       or die "Cannot restore STDOUT: $OS_ERROR\n";
     close $original_stdout
       or die "Close failed: $OS_ERROR\n";
 };
-my $process_result = do { my @_qx_cmd = ("bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"); chomp(my $result = qx{$_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
-say "Process substitution result:";
-say $process_result;
-my $here_string_result = do { my $input_data = "hello world"; my $set1_111 = 'a-z';
-my $set2_111 = 'A-Z';
-my $input_111 = $input_data;;
-say "Here string result: $here_string_result";
+my $process_result = do { my @_qx_cmd = ("bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"); chomp(my $result = qx{command $_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
+print "Process substitution result:\n";
+print $process_result, "\n";
+my $here_string_result = do { my $input_data = "hello world"; my $set1_3 = 'a-z';
+my $set2_3 = 'A-Z';
+my $input_3 = $input_data;;
+print "Here string result: $here_string_result\n";
 my $perl_result = do {
     my $result;
     my $eval_success = eval {
@@ -123,8 +113,8 @@ my $perl_result = do {
     }
     $result;
 };
-say "Perl result: $perl_result";
+print "Perl result: $perl_result\n";
 unlink('file1.txt');
 unlink('file2.txt');
-say "=== Complex Backtick Examples Complete ===";
-}
+print "=== Complex Backtick Examples Complete ===\n";
+
