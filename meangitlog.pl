@@ -25,24 +25,24 @@ close $lfh;
 for my $e (@entries) {
     my $sha = $e->{sha};
     my $diff = `git diff '$sha^'..'$sha' -- 'examples.out/' 2>/dev/null`;
-    my ($is_noise, $filtered_diff) = filter_diff($diff);
+    my ($is_noise, $filtered) = filter_diff($diff);
 
     my $sha8 = substr($sha, 0, 8);
     if ($is_noise) {
         $output .= colored("$sha8  $e->{date}  $e->{subject}  $e->{author}", 'bright_black') . "\n";
-    } elsif ($filtered_diff) {
+    } elsif ($filtered) {
         $output .= colored($sha8, 'cyan') . '  '
                  . colored($e->{date}, 'blue') . '  '
                  . $e->{subject} . '  '
                  . colored($e->{author}, 'bright_black') . "\n";
-        for my $dline (split /\n/, $filtered_diff) {
-            if    ($dline =~ /^diff --git/) { $output .= colored($dline, 'magenta') . "\n" }
-            elsif ($dline =~ /^--- /)       { $output .= colored($dline, 'red') . "\n" }
-            elsif ($dline =~ /^\+\+\+ /)    { $output .= colored($dline, 'green') . "\n" }
-            elsif ($dline =~ /^@@ /)        { $output .= colored($dline, 'cyan') . "\n" }
-            elsif ($dline =~ /^\+/)         { $output .= colored($dline, 'green') . "\n" }
-            elsif ($dline =~ /^-/)          { $output .= colored($dline, 'red') . "\n" }
-            else                            { $output .= "$dline\n" }
+        for my $l (split /\n/, $filtered) {
+            if    ($l =~ /^diff --git/) { $output .= colored($l, 'magenta') . "\n" }
+            elsif ($l =~ /^--- /)       { $output .= colored($l, 'red') . "\n" }
+            elsif ($l =~ /^\+\+\+ /)    { $output .= colored($l, 'green') . "\n" }
+            elsif ($l =~ /^@@ /)        { $output .= colored($l, 'cyan') . "\n" }
+            elsif ($l =~ /^\+/)         { $output .= colored($l, 'green') . "\n" }
+            elsif ($l =~ /^-/)          { $output .= colored($l, 'red') . "\n" }
+            else                        { $output .= "$l\n" }
         }
         $output .= "\n";
     }
@@ -51,8 +51,6 @@ for my $e (@entries) {
 open my $less, '|-', 'less', '-R' or die "Cannot run less: $!";
 print $less $output;
 close $less;
-
-# ── Filter: remove paired -/+ lines that differ only in numbers ──────
 
 sub filter_diff {
     my ($diff) = @_;
@@ -64,80 +62,71 @@ sub filter_diff {
     my @files = split_diff_by_file($diff);
 
     for my $file (@files) {
-        my $result_file = '';
-        my @hunks = @{$file->{hunks}};
-
-        for my $hunk (@hunks) {
-            my @lines   = @{$hunk->{lines}};
-            my $raw_hdr = $hunk->{raw};   # @@ -old,count +new,count @@
-
-            my @filtered;
+        my $fout = '';
+        for my $hunk (@{$file->{hunks}}) {
+            my @lines = @{$hunk->{lines}};
+            my @filt;
             my $i = 0;
+
             while ($i < @lines) {
-                my $line = $lines[$i];
-                if ($line =~ /^ /) {
-                    push @filtered, $line; $i++;
-                } elsif ($line =~ /^-/) {
-                    if ($i + 1 < @lines && $lines[$i + 1] =~ /^\+/) {
-                        my $r = $line;  $r =~ s/^-//;
-                        my $a = $lines[$i + 1]; $a =~ s/^\+//;
-                        if (strip_numbers($r) eq strip_numbers($a)) {
-                            $i += 2;  # skip both — noise
-                        } else {
-                            push @filtered, $line;
-                            push @filtered, $lines[$i + 1];
-                            $meaningful++;
-                            $i += 2;
-                        }
-                    } else {
-                        push @filtered, $line; $meaningful++; $i++;
+                if ($lines[$i] =~ /^ /) {
+                    push @filt, $lines[$i]; $i++;
+                } elsif ($lines[$i] =~ /^\-/) {
+                    my @r;
+                    while ($i < @lines && $lines[$i] =~ /^\-/) {
+                        my $s = $lines[$i]; $s =~ s/^\-//;
+                        push @r, $s; $i++;
                     }
-                } elsif ($line =~ /^\+/) {
-                    push @filtered, $line; $meaningful++; $i++;
+                    my @a;
+                    while ($i < @lines && $lines[$i] =~ /^\+/) {
+                        my $s = $lines[$i]; $s =~ s/^\+//;
+                        push @a, $s; $i++;
+                    }
+                    my $n = $#r < $#a ? $#r : $#a;
+                    for my $j (0 .. $n) {
+                        if (strip_numbers($r[$j]) eq strip_numbers($a[$j])) {
+                            # noise — skip both
+                        } else {
+                            push @filt, '-' . $r[$j];
+                            push @filt, '+' . $a[$j];
+                            $meaningful++;
+                        }
+                    }
+                    for my $j ($n + 1 .. $#r) { push @filt, '-' . $r[$j]; $meaningful++ }
+                    for my $j ($n + 1 .. $#a) { push @filt, '+' . $a[$j]; $meaningful++ }
                 } else { $i++ }
             }
 
-            if (@filtered > 0) {
-                my $old_cnt = grep { /^[ -]/ } @filtered;
-                my $new_cnt = grep { /^[+ ]/ } @filtered;
-                my ($old_off) = $raw_hdr =~ /-(\d+)/;
-                my ($new_off) = $raw_hdr =~ /\+(\d+)/;
-                $result_file .= "@@ -$old_off,$old_cnt +$new_off,$new_cnt @@\n";
-                for my $fline (@filtered) { $result_file .= "$fline\n" }
+            if (@filt) {
+                my $oc = grep { /^[ -]/ } @filt;
+                my $nc = grep { /^[+ ]/ } @filt;
+                my ($oo) = $hunk->{raw} =~ /-(\d+)/;
+                my ($no) = $hunk->{raw} =~ /\+(\d+)/;
+                $fout .= "@@ -$oo,$oc +$no,$nc @@\n";
+                for my $l (@filt) { $fout .= "$l\n" }
             }
         }
-
-        if ($result_file) {
-            $result .= $file->{header} . "\n";   # diff --git a/... b/...
-            $result .= $file->{old_file} . "\n"; # --- a/...
-            $result .= $file->{new_file} . "\n"; # +++ b/...
-            $result .= $result_file;
+        if ($fout) {
+            $result .= $file->{header} . "\n";
+            $result .= $file->{old_file} . "\n";
+            $result .= $file->{new_file} . "\n";
+            $result .= $fout;
         }
     }
-
     return ($meaningful == 0, $result);
 }
 
 sub split_diff_by_file {
     my ($diff) = @_;
-    my @files;
-    my $current;
-
-    for my $line (split /\n/, $diff) {
-        if ($line =~ /^diff --git/) {
-            push @files, $current if $current;
-            $current = { header => $line, old_file => '', new_file => '', hunks => [] };
-        } elsif ($line =~ /^--- /) {
-            $current->{old_file} = $line if $current;
-        } elsif ($line =~ /^\+\+\+ /) {
-            $current->{new_file} = $line if $current;
-        } elsif ($line =~ /^@@ /) {
-            push @{$current->{hunks}}, { raw => $line, lines => [] } if $current;
-        } elsif ($line =~ /^[ +-]/) {
-            push @{$current->{hunks}->[-1]{lines}}, $line if $current && @{$current->{hunks}};
-        }
+    my @files; my $c;
+    for my $l (split /\n/, $diff) {
+        if    ($l =~ /^diff --git/) { push @files, $c if $c; $c = { header => $l, old_file => '', new_file => '', hunks => [] } }
+        elsif ($l =~ /^--- /)       { $c->{old_file} = $l if $c }
+        elsif ($l =~ /^\+\+\+ /)    { $c->{new_file} = $l if $c }
+        elsif ($l =~ /^@@ /)        { push @{$c->{hunks}}, { raw => $l, lines => [] } if $c }
+        elsif ($l =~ /^[ +\-]/)     { push @{$c->{hunks}->[-1]{lines}}, $l if $c && @{$c->{hunks}} }
     }
-    push @files, $current if $current;
+    push @files, $c if $c;
     return @files;
 }
 
