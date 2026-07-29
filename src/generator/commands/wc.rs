@@ -183,7 +183,12 @@ pub fn generate_wc_command_with_output(
 
     // Use literal newline; DoubleQuoted handler will escape it to \\n
     fmt_parts.push("\n".to_string());
-    let fmt_str = fmt_parts.join(" ");
+    let fmt_str = if num_cols <= 1 && file_arg.is_none() {
+        // Single column, no filename: just join without extra spacing
+        fmt_parts.join("")
+    } else {
+        fmt_parts.join(" ")
+    };
 
     let mut all_args = vec![IrExpr::Str(fmt_str, StrStyle::DoubleQuoted)];
     all_args.extend(sprintf_args);

@@ -634,8 +634,34 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             result.push_str(&format!(" 2< {}", tgt));
                         }
                     }
-                    _ => {
-                        // Skip other redirect types for now
+                    RedirectOperator::InputOutput => {
+                        // <> is read-write redirection (open file for both reading and writing)
+                        result.push_str(&format!(" <> {}", word_to_bash_string(&redirect.target)));
+                    }
+                    RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => {
+                        // Heredoc: include the delimiter and body in the command string
+                        let delim = word_to_bash_string(&redirect.target);
+                        // Remove surrounding quotes if present
+                        let unquoted_delim = if delim.starts_with('\'') && delim.ends_with('\'') && delim.len() > 1 {
+                            delim[1..delim.len() - 1].to_string()
+                        } else if delim.starts_with('"') && delim.ends_with('"') && delim.len() > 1 {
+                            delim[1..delim.len() - 1].to_string()
+                        } else {
+                            delim.clone()
+                        };
+                        let quoted_delim = if redirect.heredoc_quoted {
+                            format!("'{}'", unquoted_delim)
+                        } else {
+                            unquoted_delim.clone()
+                        };
+                        result.push_str(&format!(" << {}\n", quoted_delim));
+                        if let Some(body) = &redirect.heredoc_body {
+                            result.push_str(body);
+                            if !body.ends_with('\n') {
+                                result.push('\n');
+                            }
+                        }
+                        result.push_str(&unquoted_delim);
                     }
                 }
             }

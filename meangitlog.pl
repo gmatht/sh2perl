@@ -3,11 +3,6 @@ use strict;
 use warnings;
 use Term::ANSIColor qw(colored);
 
-# Colored git log for examples.out/.  Full patches for meaningful commits,
-# dimmed one-liners for commits that only increment counter IDs.
-#
-# Usage: perl meangitlog.pl [git-log-options]
-
 my @git_args = @ARGV ? @ARGV : ('-20');
 my @pathspec = ('--', 'examples.out/');
 
@@ -30,18 +25,17 @@ close $lfh;
 for my $e (@entries) {
     my $sha = $e->{sha};
     my $diff = `git diff '$sha^'..'$sha' -- 'examples.out/' 2>/dev/null`;
-    my $is_noise = diff_is_counter_only($diff);
+    my ($is_noise, $filtered_diff) = filter_diff($diff);
 
     my $sha8 = substr($sha, 0, 8);
-
     if ($is_noise) {
         $output .= colored("$sha8  $e->{date}  $e->{subject}  $e->{author}", 'bright_black') . "\n";
-    } elsif ($diff) {
+    } elsif ($filtered_diff) {
         $output .= colored($sha8, 'cyan') . '  '
                  . colored($e->{date}, 'blue') . '  '
                  . $e->{subject} . '  '
                  . colored($e->{author}, 'bright_black') . "\n";
-        for my $dline (split /\n/, $diff) {
+        for my $dline (split /\n/, $filtered_diff) {
             if    ($dline =~ /^diff --git/) { $output .= colored($dline, 'magenta') . "\n" }
             elsif ($dline =~ /^--- /)       { $output .= colored($dline, 'red') . "\n" }
             elsif ($dline =~ /^\+\+\+ /)    { $output .= colored($dline, 'green') . "\n" }
@@ -58,41 +52,93 @@ open my $less, '|-', 'less', '-R' or die "Cannot run less: $!";
 print $less $output;
 close $less;
 
-# ── Noise detection ──────────────────────────────────────────────────
-# A diff is "counter-only" if every changed line differs only in its
-# embedded numbers (unique IDs, counts, etc.).
+# ── Filter: remove paired -/+ lines that differ only in numbers ──────
 
-sub diff_is_counter_only {
+sub filter_diff {
     my ($diff) = @_;
-    return 0 unless $diff && $diff =~ /\S/;
+    return (1, '') unless $diff && $diff =~ /\S/;
 
-    # Collect every - and + line content (strip the prefix)
-    my @changed;
-    for my $line (split /\n/, $diff) {
-        next if $line =~ /^diff --git|^index |^--- |^\+\+\+ |^@@ |^[ -]$|^[ ]/;
-        my $c = $line;
-        $c =~ s/^[+-]//;
-        next if $c =~ /^\s*$/;
-        push @changed, $c;
-    }
+    my $result = '';
+    my $meaningful = 0;
 
-    return 0 if @changed == 0;
+    my @files = split_diff_by_file($diff);
 
-    # For each changed line, check if stripping numbers makes it empty
-    for my $c (@changed) {
-        my $stripped = strip_numbers($c);
-        # After stripping numbers, is it empty or just whitespace/punctuation?
-        $stripped =~ s/^\s+//;
-        $stripped =~ s/\s+$//;
-        # Also catch pure punctuation/symbols left after stripping: $, =, {, }, etc.
-        my $clean = $stripped;
-        $clean =~ s/[\[\];:.,{}\$=><!~\s\(\)]//g;
-        if ($clean ne '') {
-            return 0;  # non-numeric content remains — meaningful
+    for my $file (@files) {
+        my $result_file = '';
+        my @hunks = $file->{hunks};
+
+        for my $hunk (@hunks) {
+            my @lines   = @{$hunk->{lines}};
+            my $raw_hdr = $hunk->{raw};   # @@ -old,count +new,count @@
+
+            my @filtered;
+            my $i = 0;
+            while ($i < @lines) {
+                my $line = $lines[$i];
+                if ($line =~ /^ /) {
+                    push @filtered, $line; $i++;
+                } elsif ($line =~ /^-/) {
+                    if ($i + 1 < @lines && $lines[$i + 1] =~ /^\+/) {
+                        my $r = $line;  $r =~ s/^-//;
+                        my $a = $lines[$i + 1]; $a =~ s/^\+//;
+                        if (strip_numbers($r) eq strip_numbers($a)) {
+                            $i += 2;  # skip both — noise
+                        } else {
+                            push @filtered, $line;
+                            push @filtered, $lines[$i + 1];
+                            $meaningful++;
+                            $i += 2;
+                        }
+                    } else {
+                        push @filtered, $line; $meaningful++; $i++;
+                    }
+                } elsif ($line =~ /^\+/) {
+                    push @filtered, $line; $meaningful++; $i++;
+                } else { $i++ }
+            }
+
+            if (@filtered > 0) {
+                my $old_cnt = grep { /^[ -]/ } @filtered;
+                my $new_cnt = grep { /^[+ ]/ } @filtered;
+                my ($old_off) = $raw_hdr =~ /-(\d+)/;
+                my ($new_off) = $raw_hdr =~ /\+(\d+)/;
+                $result_file .= "@@ -$old_off,$old_cnt +$new_off,$new_cnt @@\n";
+                for my $fline (@filtered) { $result_file .= "$fline\n" }
+            }
+        }
+
+        if ($result_file) {
+            $result .= $file->{header} . "\n";   # diff --git a/... b/...
+            $result .= $file->{old_file} . "\n"; # --- a/...
+            $result .= $file->{new_file} . "\n"; # +++ b/...
+            $result .= $result_file;
         }
     }
 
-    return 1;
+    return ($meaningful == 0, $result);
+}
+
+sub split_diff_by_file {
+    my ($diff) = @_;
+    my @files;
+    my $current;
+
+    for my $line (split /\n/, $diff) {
+        if ($line =~ /^diff --git/) {
+            push @files, $current if $current;
+            $current = { header => $line, old_file => '', new_file => '', hunks => [] };
+        } elsif ($line =~ /^--- /) {
+            $current->{old_file} = $line if $current;
+        } elsif ($line =~ /^\+\+\+ /) {
+            $current->{new_file} = $line if $current;
+        } elsif ($line =~ /^@@ /) {
+            push @{$current->{hunks}}, { raw => $line, lines => [] } if $current;
+        } elsif ($line =~ /^[ +-]/) {
+            push @{$current->{hunks}->[-1]{lines}}, $line if $current && @{$current->{hunks}};
+        }
+    }
+    push @files, $current if $current;
+    return @files;
 }
 
 sub strip_numbers {

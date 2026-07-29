@@ -2265,6 +2265,40 @@ fn generate_linebyline_command(
     }
 }
 
+/// Check if a command (or any command in a pipeline/subs hell) has a heredoc redirect.
+fn has_heredoc_redirect(cmd: &Command) -> bool {
+    match cmd {
+        Command::Redirect(redirect_cmd) => {
+            redirect_cmd.redirects.iter().any(|r| {
+                matches!(
+                    r.operator,
+                    RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
+                )
+            })
+        }
+        Command::Simple(simple_cmd) => {
+            simple_cmd.redirects.iter().any(|r| {
+                matches!(
+                    r.operator,
+                    RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
+                )
+            })
+        }
+        Command::Pipeline(p) => p.commands.iter().any(|c| has_heredoc_redirect(c)),
+        Command::Subshell(inner) => has_heredoc_redirect(inner),
+        Command::Block(b) => b.commands.iter().any(|c| has_heredoc_redirect(c)),
+        Command::And(l, r) | Command::Or(l, r) => has_heredoc_redirect(l) || has_heredoc_redirect(r),
+        Command::If(s) => {
+            has_heredoc_redirect(&s.then_branch)
+                || s.else_branch.as_ref().map_or(false, |e| has_heredoc_redirect(e))
+        }
+        Command::While(w) => w.body.commands.iter().any(|c| has_heredoc_redirect(c)),
+        Command::For(f) => f.body.commands.iter().any(|c| has_heredoc_redirect(c)),
+        Command::Function(func) => func.body.commands.iter().any(|c| has_heredoc_redirect(c)),
+        _ => false,
+    }
+}
+
 /// Generate a buffered pipeline that processes all input at once
 fn generate_buffered_pipeline(
     generator: &mut Generator,
@@ -2319,10 +2353,20 @@ fn generate_buffered_pipeline(
         false
     });
 
-    // Only take the clean path when there are no output redirects.
+    // Also skip the clean path when there are heredoc redirects, because
+    // generate_bash_command_string does not yet serialize heredoc bodies in
+    // a way that works with the pipeline structure (the heredoc terminator
+    // must appear on its own line after the full pipeline command line).
+    // Falling through to the scaffolding path which handles heredocs via
+    // temp-file redirects.
+    let has_heredoc = pipeline.commands.iter().any(|cmd| {
+        has_heredoc_redirect(cmd)
+    });
+
+    // Only take the clean path when there are no output redirects and no heredocs.
     // Also skip if the pipeline has a source-text comment but no actual commands
     // (the old code handles edge cases with better fidelity).
-    if !has_output_redirect_early && pipeline.commands.len() >= 1 {
+    if !has_output_redirect_early && !has_heredoc && pipeline.commands.len() >= 1 {
         // Reconstruct the shell command string from the AST rather than
         // using source_text directly.  The AST reconstruction adds spaces
         // around pipe operators ("mount | grep" vs "mount|grep"), which
@@ -2492,18 +2536,28 @@ fn generate_buffered_pipeline(
             if i == 0 {
                 // First command - generate output
                 output.push_str(&generator.indent());
-                if matches!(command, Command::Redirect(_)) {
-                    // For Redirect commands (e.g. cat << EOF), use the full command
-                    // generator which preserves redirect information (heredocs, etc.).
+                if matches!(command, Command::Redirect(_)) || matches!(command, Command::Subshell(_)) {
+                    // For Redirect and Subshell commands (e.g. cat << EOF, subshells with heredocs),
+                    // use the full command generator which preserves redirect information (heredocs, etc.).
                     // The generated code already has proper indentation; do NOT
                     // re-indent it line-by-line (which would corrupt multi-line
                     // string literals like q[...]).
                     output.push_str(&generator.indent());
                     output.push_str("$output = q{};\n");
                     output.push_str(&generator.indent());
-                    output.push_str(&generator.generate_command(command));
-                    output.push_str(&generator.indent());
-                    output.push_str(&format!("$output_{} = $output;\n", unique_id));
+                    if matches!(command, Command::Subshell(_)) {
+                        // For subshells, capture output into the pipeline output variable
+                        let cmd_out = generator.generate_command(command);
+                        output.push_str(&cmd_out);
+                        // The subshell generator may have already assigned to $output
+                        // We need to capture it into $output_{unique_id}
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("$output_{} = $output;\n", unique_id));
+                    } else {
+                        output.push_str(&generator.generate_command(command));
+                        output.push_str(&generator.indent());
+                        output.push_str(&format!("$output_{} = $output;\n", unique_id));
+                    }
                 } else {
                     // Handle the first command - use generate_command_using_builtins for all command types
                     let command_output = generate_command_using_builtins(
@@ -2775,7 +2829,7 @@ fn generate_buffered_pipeline(
         // output.push_str("exit(1) if $main_exit_code == 1;\n");
 
         generator.indent_level -= 1;
-        output.push_str("}\n");
+        output.push_str("};\n");
         // Done generating this pipeline - drop the guard if we created one so
         // it pops the id. We move the Option out here to ensure Drop runs now.
         if let Some(_g) = _pipeline_guard {
