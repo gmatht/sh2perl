@@ -1089,11 +1089,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             .collect();
                                         let formatted_args = args.join(", ");
                                         format!(
-                                            "do {{ my $result = q{{}}; $CHILD_ERROR = 0; $result; }}"
+                                            "do {{ my @_a = ({}); my $_c = q{{}}; for (my $_i = 0; $_i < @_a; $_i++) {{ if ($_a[$_i] eq q{{-e}} && $_i + 1 < @_a) {{ $_c .= $_a[++$_i] . qq{{\n}}; }} }} my $result = eval $_c; chomp $result if defined $result; $result // q{{}}; }}",
+                                            formatted_args
                                         )
                                     }
                                 } else {
-                                    // For other perl commands, use system call as fallback
+                                    // Non-literal args: extract -e code at runtime and eval
                                     let args: Vec<String> = simple_cmd
                                         .args
                                         .iter()
@@ -1101,14 +1102,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         .collect();
                                     let formatted_args = args.join(", ");
                                     format!(
-                                        "do {{ my $result = q{{}}; $CHILD_ERROR = 0; $result; }}"
+                                        "do {{ my @_a = ({}); my $_c = q{{}}; for (my $_i = 0; $_i < @_a; $_i++) {{ if ($_a[$_i] eq q{{-e}} && $_i + 1 < @_a) {{ $_c .= $_a[++$_i] . qq{{\n}}; }} }} my $result = eval $_c; chomp $result if defined $result; $result // q{{}}; }}",
+                                        formatted_args
                                     )
                                 }
                             } else {
-                                // For perl commands with no arguments, use system call as fallback
-                                format!(
-                                    "do {{ my $result = q{{}}; $result; }}"
-                                )
+                                // Perl with no arguments — nothing to eval
+                                "do {{ my $result = q{{}}; $result; }}".to_string()
                             }
                         } else if name == "wc" {
                             let unique_id = generator.get_unique_id();
@@ -1469,7 +1469,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             .map(|arg| generator.word_to_perl(arg))
                                             .collect();
                                         let formatted_args = args.join(" ");
-                                        "do {{ my $result = q{{}}; $CHILD_ERROR = 0; $result; }}".to_string()
+                                        format!(
+                                            "do {{ my @_a = ({}); my $_c = q{{}}; for (my $_i = 0; $_i < @_a; $_i++) {{ if ($_a[$_i] eq q{{-e}} && $_i + 1 < @_a) {{ $_c .= $_a[++$_i] . qq{{\n}}; }} }} my $result = eval $_c; chomp $result if defined $result; $result // q{{}}; }}",
+                                            formatted_args
+                                        )
                                     }
                                 } else {
                                     // For other perl commands, use native Perl eval
@@ -1479,7 +1482,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         .map(|arg| generator.word_to_perl(arg))
                                         .collect();
                                     let formatted_args = args.join(" ");
-                                    "do {{ my $result = q{{}}; $CHILD_ERROR = 0; $result; }}".to_string()
+                                    format!(
+                                            "do {{ my @_a = ({}); my $_c = q{{}}; for (my $_i = 0; $_i < @_a; $_i++) {{ if ($_a[$_i] eq q{{-e}} && $_i + 1 < @_a) {{ $_c .= $_a[++$_i] . qq{{\n}}; }} }} my $result = eval $_c; chomp $result if defined $result; $result // q{{}}; }}",
+                                            formatted_args
+                                        )
                                 }
                             } else {
                                 // Perl with no arguments — just return empty
