@@ -336,13 +336,19 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
     loop {
         match lexer.peek() {
             Some(Token::ArithmeticEvalClose) => {
-                // ArithmeticEvalClose represents TWO closing parens
+                // ArithmeticEvalClose represents TWO closing parens.
+                // Only push `)` that close inner (expression) parens,
+                // not those that close the outer $(( or (( marker.
+                // Inner parens keep depth >= 2 (the 2 from $((/(()).
                 lexer.next();
+                let inner_count = std::cmp::max(0, paren_depth - 2);
                 paren_depth -= 2;
+                for _ in 0..inner_count {
+                    expression_parts.push(")".to_string());
+                }
                 if paren_depth <= 0 {
                     break;
                 }
-                expression_parts.push("))".to_string());
             }
             Some(Token::ParenOpen) => {
                 if let Some(text) = lexer.get_current_text() {
@@ -352,11 +358,16 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 paren_depth += 1;
             }
             Some(Token::ParenClose) => {
-                if let Some(text) = lexer.get_current_text() {
-                    expression_parts.push(text);
+                // Only push `)` if it closes an inner (expression) paren,
+                // not if it closes the outer $(( or (( marker.
+                // Inner parens keep depth >= 2 (the 2 from $((/(()).
+                paren_depth -= 1;
+                if paren_depth >= 2 {
+                    if let Some(text) = lexer.get_current_text() {
+                        expression_parts.push(text);
+                    }
                 }
                 lexer.next();
-                paren_depth -= 1;
                 if paren_depth <= 0 {
                     break;
                 }

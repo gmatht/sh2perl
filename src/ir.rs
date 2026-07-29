@@ -399,9 +399,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // Output to a specific filehandle: print {$fh} ...
                 emit_indent(out, indent);
                 if *newline {
-                    out.push_str(&format!("print {{${}}} {}, \"\\n\";\n", fh, expr));
+                    out.push_str(&format!("print {{${}}}({}, \"\\n\");\n", fh, expr));
                 } else {
-                    out.push_str(&format!("print {{${}}} {};\n", fh, expr));
+                    out.push_str(&format!("print {{${}}}({});\n", fh, expr));
                 }
             } else if *newline {
                 // Use `print` with \n when called via piecemeal stmt_to_perl()
@@ -412,11 +412,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     out.push_str(&embedded);
                 } else {
                     emit_indent(out, indent);
-                    out.push_str(&format!("print {}, \"\\n\";\n", expr));
+                    out.push_str(&format!("print({}, \"\\n\");\n", expr));
                 }
             } else {
                 emit_indent(out, indent);
-                out.push_str(&format!("print {};\n", expr));
+                out.push_str(&format!("print({});\n", expr));
             }
         }
 

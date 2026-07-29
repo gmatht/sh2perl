@@ -2155,13 +2155,19 @@ impl Parser {
         loop {
             match self.lexer.peek() {
                 Some(Token::ArithmeticEvalClose) => {
-                    // ArithmeticEvalClose represents TWO closing parens
+                    // ArithmeticEvalClose represents TWO closing parens.
+                    // Only push `)` that close inner (expression) parens,
+                    // not those that close the outer (( marker.
+                    // Inner parens keep depth >= 2 (the 2 from (().
                     self.lexer.next();
+                    let inner_count = std::cmp::max(0, paren_depth - 2);
                     paren_depth -= 2;
+                    for _ in 0..inner_count {
+                        content.push(')');
+                    }
                     if paren_depth <= 0 {
                         break;
                     }
-                    content.push_str("))");
                 }
                 Some(Token::ParenOpen) => {
                     if let Some(text) = self.lexer.get_current_text() {
@@ -2171,11 +2177,16 @@ impl Parser {
                     paren_depth += 1;
                 }
                 Some(Token::ParenClose) => {
-                    if let Some(text) = self.lexer.get_current_text() {
-                        content.push_str(&text);
-                    }
+                    // Only push `)` if it closes an inner (expression) paren,
+                    // not if it closes the outer (( marker.
+                    // Inner parens keep depth >= 2 (the 2 from (( ).
                     self.lexer.next();
                     paren_depth -= 1;
+                    if paren_depth >= 2 {
+                        if let Some(text) = self.lexer.get_current_text() {
+                            content.push_str(&text);
+                        }
+                    }
                     if paren_depth <= 0 {
                         break;
                     }
