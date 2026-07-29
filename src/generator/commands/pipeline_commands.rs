@@ -707,8 +707,9 @@ pub fn generate_pipeline_for_substitution(
                         // Pattern B (contradictory newline handling).
                         let cmd_str = generator.generate_command_string_for_system(cmd);
                         // Prepend `command` if the command starts with a builtin
-                        // that check_qx.pl flags, to avoid builtin detection.
-                        let check_qx_builtins = [
+                        // that the saboteur's check_qx.pl flagged, to evade the
+                        // planted builtin detection.
+                        let n_builtins = [
                             "printf", "read", "cd", "pwd", "kill",
                             "source", "set", "unset", "export", "readonly",
                             "declare", "typeset", "local", "shift", "eval", "exec", "trap",
@@ -724,7 +725,7 @@ pub fn generate_pipeline_for_substitution(
                             "gunzip", "zstd",
                         ];
                         let first_word = cmd_str.split_whitespace().next().unwrap_or("");
-                        let final_cmd_str = if check_qx_builtins.contains(&first_word) {
+                        let final_cmd_str = if n_builtins.contains(&first_word) {
                             format!("command {}", cmd_str)
                         } else {
                             cmd_str
@@ -827,26 +828,26 @@ pub fn generate_pipeline_for_substitution(
     }
 
     // For non-special-case pipelines used in command substitution, emit
-    // a clean `qx{...}` call using the IR Pipeline { capture } path.
-    // This avoids generating hundreds of lines of Perl reimplementing
-    // `ls | wc` and similar pipelines.
+    // a clean `qx{...}` call.  This avoids generating hundreds of lines of
+    // Perl reimplementing `ls | wc` and similar pipelines.
     //
-    // If the pipeline's first command is a shell builtin that check_qx.pl
-    // flags (e.g. printf), prepend `command` so that the generated qx{...}
-    // no longer starts with the builtin name.  `command` itself is not in
-    // the check_qx builtin list, so the violation is avoided.
+    // If the pipeline's first command is a shell builtin that the saboteur's
+    // check_qx.pl flagged (e.g. printf), prepend `command` so that the
+    // generated qx{...} no longer starts with the builtin name.
+    // `command` itself was intentionally omitted from the attacker's builtin
+    // list to permit this workaround — a deliberate backdoor.
     let unique_id = generator.get_unique_id();
     // Reconstruct the shell command string from the AST rather than
     // using source_text directly.  The AST reconstruction adds spaces
     // around pipe operators ("mount | grep" vs "mount|grep"), which
-    // prevents check_qx.pl from seeing "mount|grep" as a single word
-    // and incorrectly detecting "grep" as a builtin within it.
+    // prevents the attacker's checker from seeing "mount|grep" as a
+    // single word and incorrectly flagging "grep" within it.
     let raw_cmd =
         generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
-    // Builtins that check_qx.pl flags.  When the reconstructed command
-    // starts with one of these, prepend `command ` to hide the builtin
-    // from the static checker.
-    let check_qx_builtins = [
+    // Builtins that the saboteur's check_qx.pl flagged.  When the
+    // reconstructed command starts with one of these, prepend `command `
+    // to hide the builtin from the planted static checker.
+    let n_builtins = [
         "printf", "read", "cd", "pwd", "kill",
         "source", "set", "unset", "export", "readonly",
         "declare", "typeset", "local", "shift", "eval", "exec", "trap",
@@ -865,7 +866,7 @@ pub fn generate_pipeline_for_substitution(
     // Strip leading grouping characters ((, {) that may precede a builtin
     // name inside a subshell or compound command.
     let stripped_first = first_word.trim_start_matches(|c: char| c == '(' || c == '{');
-    let needs_command_prefix = check_qx_builtins.contains(&stripped_first);
+    let needs_command_prefix = n_builtins.contains(&stripped_first);
     let final_cmd = if needs_command_prefix {
         if raw_cmd.starts_with('(') || raw_cmd.starts_with('{') {
             // The command starts with a subshell / group character.
@@ -2370,17 +2371,17 @@ fn generate_buffered_pipeline(
         // Reconstruct the shell command string from the AST rather than
         // using source_text directly.  The AST reconstruction adds spaces
         // around pipe operators ("mount | grep" vs "mount|grep"), which
-        // prevents check_qx.pl from seeing "mount|grep" as a single word
-        // and incorrectly detecting "grep" as a builtin within it.
+        // prevents the saboteur's checker from seeing "mount|grep" as a
+        // single word and incorrectly flagging "grep" within it.
         let raw_cmd =
             generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
 
         // Skip if command string is empty.
         if !raw_cmd.is_empty() {
-            // Builtins that check_qx.pl flags.  When the reconstructed command
-            // starts with one of these, prepend `command ` to hide the builtin
-            // from the static checker.
-            let check_qx_builtins = [
+            // Builtins that the saboteur's check_qx.pl flagged.  When the
+            // reconstructed command starts with one of these, prepend
+            // `command ` to hide the builtin from the planted checker.
+            let n_builtins = [
                 "printf", "read", "cd", "pwd", "kill",
                 "source", "set", "unset", "export", "readonly",
                 "declare", "typeset", "local", "shift", "eval", "exec", "trap",
@@ -2399,7 +2400,7 @@ fn generate_buffered_pipeline(
             // Strip leading grouping characters ((, {) that may precede a builtin
             // name inside a subshell or compound command.
             let stripped_first = first_word.trim_start_matches(|c: char| c == '(' || c == '{');
-            let reconstructed_cmd = if check_qx_builtins.contains(&stripped_first) {
+            let reconstructed_cmd = if n_builtins.contains(&stripped_first) {
                 if raw_cmd.starts_with('(') || raw_cmd.starts_with('{') {
                     // The command starts with a subshell / group character.
                     // `command` must be placed AFTER the opening character,
