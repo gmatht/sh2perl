@@ -597,10 +597,13 @@ exit $main_exit_code;
             let lang = &args[2];
             let filename = &args[3];
             if lang == "perl" {
-                let _ = test_file_equivalence(lang, filename);
+                if let Err(e) = test_file_equivalence(lang, filename) {
+                    eprintln!("FAIL: {}", e);
+                    std::process::exit(1);
+                }
             } else {
                 println!("Error: Only 'perl' language is supported");
-                return;
+                std::process::exit(1);
             }
         }
         "interactive" => {
