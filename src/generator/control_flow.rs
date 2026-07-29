@@ -219,19 +219,9 @@ pub fn generate_case_statement_impl(
                 let word_str = generator.word_to_perl(&case_stmt.word);
 
                 // Handle positional parameters in case statements
-                let processed_word = if word_str.contains("$1")
-                    || word_str.contains("$2")
-                    || word_str.contains("$3")
-                {
-                    word_str
-                        .replace("$1", "$arg1")
-                        .replace("$2", "$arg2")
-                        .replace("$3", "$arg3")
-                } else if word_str.contains("$name") {
-                    word_str.replace("$name", "$arg1")
-                } else {
-                    word_str
-                };
+                // $1, $2, … are now translated to $_[0], $_[1], … by
+                // word_to_perl, so no string-hack is needed here.
+                let processed_word = word_str;
 
                 if has_glob {
                     // Convert bash glob patterns to Perl regex

@@ -51,10 +51,16 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
         } else {
             Sigil::Scalar
         };
+        // Use `my` instead of `local` because the outer variable may be a
+        // lexical (my) variable, and Perl's `local` only works on package
+        // (global) variables.  `my $var = $var;` inside this do-block
+        // creates a new lexical that shadows the outer one and is
+        // automatically restored when the block exits — the same semantics
+        // as a bash subshell.
         let stmt = IrStmt::Declare {
             vars: vec![Decl { name: var_name.clone(), sigil: sigil.clone() }],
             init: Some(IrExpr::Var(var_name.clone(), sigil)),
-            local: true,
+            local: false,
         };
         output.push_str(&generator.indent());
         output.push_str(&stmt_to_perl(&stmt, 0));
