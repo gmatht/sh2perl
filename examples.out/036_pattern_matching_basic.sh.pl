@@ -5,6 +5,7 @@ my $main_exit_code = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '036_pattern_matching_basic.sh';
 my $s;
 
 $__set_e = 1;
@@ -28,4 +29,3 @@ if ($s =~ /^file[.][a-z]+$/m) {
 }
 
 exit $main_exit_code;
-

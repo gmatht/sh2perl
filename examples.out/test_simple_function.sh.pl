@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$PROGRAM_NAME = 'test_simple_function.sh';
 
 sub get_file_size {
     my ($file) = @_;
@@ -29,4 +30,3 @@ sub get_file_size {
     return;
 }
 get_file_size('test_simple_function.sh');
-

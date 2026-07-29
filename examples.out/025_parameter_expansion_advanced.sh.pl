@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 use File::Basename;
+$PROGRAM_NAME = '025_parameter_expansion_advanced.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -11,4 +12,3 @@ print basename(${path}), "\n";
 print dirname(${path}), "\n";
 my $s2 = "abba";
 print $s2 =~ s/b/X/grs, "\n";
-

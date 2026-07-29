@@ -17,6 +17,7 @@ sub capture_stdout {
 
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__04h_complex_examples.sh';
 my $current_user;
 
 print "=== Complex Backtick Examples ===\n";
@@ -64,7 +65,6 @@ sub get_file_size {
     } : q{};
 };
     print "File $file has $size bytes\n";
-    }
     return;
 }
 get_file_size(q{000__01_file_directory_operations.sh});
@@ -98,9 +98,9 @@ do {
 my $process_result = do { my @_qx_cmd = ("bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"); chomp(my $result = qx{command $_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
 print "Process substitution result:\n";
 print $process_result, "\n";
-my $here_string_result = do { my $input_data = "hello world"; my $set1_3 = 'a-z';
-my $set2_3 = 'A-Z';
-my $input_3 = $input_data;;
+my $here_string_result = do { my $input_data = "hello world"; my $set1_111 = 'a-z';
+my $set2_111 = 'A-Z';
+my $input_111 = $input_data;;
 print "Here string result: $here_string_result\n";
 my $perl_result = do {
     my $result;
@@ -117,4 +117,4 @@ print "Perl result: $perl_result\n";
 unlink('file1.txt');
 unlink('file2.txt');
 print "=== Complex Backtick Examples Complete ===\n";
-
+}

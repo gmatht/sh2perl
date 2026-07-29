@@ -7,10 +7,10 @@ my $ls_success     = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '008_simple_backup.sh';
 print "Hello, World!\n";
 # Original bash: ls -1 | grep -v __tmp_test_output.pl
-my $output_0 = qx{command ls -1 | grep -v __tmp_test_output.pl};
-chomp $output_0;
-print $output_0, "\n";
+my $output_133 = qx{command ls -1 | grep -v __tmp_test_output.pl};
+chomp $output_133;
+print $output_133, "\n";
 print join(" ", grep { length } split /\s+/msx, do { chomp(my $_r = qx{command ls | grep -v __tmp_test_output.pl}); $_r; });
-

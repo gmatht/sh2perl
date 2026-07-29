@@ -7,6 +7,7 @@ use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__04f_output_formatting.sh';
 print "=== Output and Formatting Commands ===\n";
 my $echo_result = "Hello from backticks";
 print "Echo result: $echo_result\n";
@@ -16,4 +17,3 @@ my $tee_result = do { chomp(my $_r = qx{command echo 'test output' | tee test_te
 print "Tee result: $tee_result\n";
 unlink('test_tee.txt');
 print "=== Output and Formatting Commands Complete ===\n";
-

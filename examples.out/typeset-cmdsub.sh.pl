@@ -7,6 +7,7 @@ my $main_exit_code = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = 'typeset-cmdsub.sh';
 print "=== typeset -i (integer attribute) ===\n";
 delete $ENV{n};
 # Builtin command 'typeset' not implemented
@@ -41,9 +42,9 @@ delete $ENV{myexport};
 # Builtin command 'typeset' not implemented
 print "After 'typeset -x myexport=exported_value'\n";
 print "Variable is exported:\n";
-my $output_0 = qx{command env | grep ^myexport=};
-chomp $output_0;
-print $output_0, "\n";
+my $output_609 = qx{command env | grep ^myexport=};
+chomp $output_609;
+print $output_609, "\n";
 if ($CHILD_ERROR != 0) {
         print "(myexport not found in env \x{2014} possible scope issue)\n";
 }
@@ -144,4 +145,3 @@ print "\n";
 print "=== Demonstration complete. ===\n";
 
 exit $main_exit_code;
-

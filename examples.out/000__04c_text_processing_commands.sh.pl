@@ -5,34 +5,35 @@ use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__04c_text_processing_commands.sh';
 print "=== Text Processing Commands ===\n";
 my $file_content = do { chomp(my $_r = qx{command cat 000__04c_text_processing_commands.sh | head -5}); $_r; };
 print "First 5 lines of this file:\n";
 print $file_content, "\n";
-my $grep_result = do { my $grep_result_1;
-my @grep_lines_1 = ();
-my @grep_filenames_1 = ();
+my $grep_result = do { my $grep_result_49;
+my @grep_lines_49 = ();
+my @grep_filenames_49 = ();
 if (-e "000__04c_text_processing_commands.sh") {
     open my $fh, '<', "000__04c_text_processing_commands.sh" or croak "Cannot access file: $ERRNO";
     while (my $line = <$fh>) {
         chomp $line;
-        push @grep_lines_1, $line;
-        push @grep_filenames_1, "000__04c_text_processing_commands.sh";
+        push @grep_lines_49, $line;
+        push @grep_filenames_49, "000__04c_text_processing_commands.sh";
     }
     close $fh
         or croak "Close failed: $OS_ERROR";
 }
 else { print {*STDERR} "grep: 000__04c_text_processing_commands.sh: No such file or directory\n"; }
-my @grep_filtered_1 = grep { {echo} } @grep_lines_1;
-my @grep_numbered_1;
-for my $i (0..@grep_lines_1-1) {
-    if (scalar grep { $_ eq $grep_lines_1[$i] } @grep_filtered_1) {
-        push @grep_numbered_1, sprintf "%d:%s", $i + 1, $grep_lines_1[$i];
+my @grep_filtered_49 = grep { {echo} } @grep_lines_49;
+my @grep_numbered_49;
+for my $i (0..@grep_lines_49-1) {
+    if (scalar grep { $_ eq $grep_lines_49[$i] } @grep_filtered_49) {
+        push @grep_numbered_49, sprintf "%d:%s", $i + 1, $grep_lines_49[$i];
     }
 }
-$grep_result_1 = join "\n", @grep_numbered_1;
-$CHILD_ERROR = scalar @grep_filtered_1 > 0 ? 0 : 1;
- $grep_result_1; };
+$grep_result_49 = join "\n", @grep_numbered_49;
+$CHILD_ERROR = scalar @grep_filtered_49 > 0 ? 0 : 1;
+ $grep_result_49; };
 print "Lines containing 'echo':\n";
 print $grep_result, "\n";
 my $sed_result = do { chomp(my $_r = qx{command echo 'Hello World' | sed s/World/Universe/}); $_r; };
@@ -175,4 +176,3 @@ print $xargs_result, "\n";
 unlink('file1.txt');
 unlink('file2.txt');
 print "=== Text Processing Commands Complete ===\n";
-

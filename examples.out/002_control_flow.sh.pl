@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 
+$PROGRAM_NAME = '002_control_flow.sh';
 my $i;
 
 if (-f "file.txt") {
@@ -25,4 +26,3 @@ sub greet {
     return;
 }
 greet("World");
-

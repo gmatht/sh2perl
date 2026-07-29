@@ -6,6 +6,7 @@ use Digest::SHA   qw(sha256_hex sha512_hex);
 use File::Path    qw(make_path remove_tree);
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__04g_checksum_commands.sh';
 print "=== Checksum Commands ===\n";
 open my $fh, '>', 'test_checksum.txt' or die "test_checksum.txt: $!\n";
 print {*fh} "test content", "\n";
@@ -61,4 +62,3 @@ print "Strings result:\n";
 print $strings_result, "\n";
 unlink('test_checksum.txt');
 print "=== Checksum Commands Complete ===\n";
-

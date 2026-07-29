@@ -6,6 +6,7 @@ use File::Basename;
 use IPC::Open3;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '040_process_substitution_comm.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -15,11 +16,11 @@ my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_0 = q{};
-    my $output_printed_0;
+    my $output_234 = q{};
+    my $output_printed_234;
     printf("a\nb\n");
-if ($output_0 ne q{} && !$output_printed_0) {
-    print $output_0;
+if ($output_234 ne q{} && !$output_printed_234) {
+    print $output_234;
 }
 }
 use File::Path qw(make_path);
@@ -34,11 +35,11 @@ my $output_ps_fh_2;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_2 = q{};
-    my $output_printed_2;
+    my $output_236 = q{};
+    my $output_printed_236;
     printf("b\nc\n");
-if ($output_2 ne q{} && !$output_printed_2) {
-    print $output_2;
+if ($output_236 ne q{} && !$output_printed_236) {
+    print $output_236;
 }
 }
 use File::Path qw(make_path);
@@ -78,4 +79,3 @@ chomp $result;
 print $result;
 print "\n";
 print "exit: ${\($? >> 8)}\n";
-

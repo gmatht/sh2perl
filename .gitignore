@@ -37,3 +37,6 @@ examples/users.txt
 # Development artifacts
 debug_perl_code.pl
 sh2perl-*.pl
+
+# Accidentally committed build binary
+rust_out

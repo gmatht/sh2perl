@@ -4,8 +4,9 @@ use warnings;
 use IPC::Open3;
 our $CHILD_ERROR;
 
-my $TTY_DEV;
+$PROGRAM_NAME = 'tty-cmdsub.sh';
 my $dev;
+my $TTY_DEV;
 
 use strict;
 
@@ -167,4 +168,3 @@ else {
 }
 print "\n";
 print "All tty demo sections completed.\n";
-

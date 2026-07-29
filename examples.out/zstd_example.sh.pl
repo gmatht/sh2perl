@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$PROGRAM_NAME = 'zstd_example.sh';
 do {
     open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $OS_ERROR\n";
@@ -8,8 +9,8 @@ do {
       or die "Cannot access file: $OS_ERROR\n";
     my $tmp = do {
 
-my @_qx_cmd_1 = ('command zstd -dc /usr/lib/firmware/rp2.fw.zst');
-${} = do { chomp(my $_r_1 = qx{command $_qx_cmd_1[0]}); $_r_1; };
+my @_qx_cmd_613 = ('command zstd -dc /usr/lib/firmware/rp2.fw.zst');
+${} = do { chomp(my $_r_613 = qx{command $_qx_cmd_613[0]}); $_r_613; };
     };
     print $tmp;
     open STDOUT, '>&', $original_stdout
@@ -19,4 +20,3 @@ ${} = do { chomp(my $_r_1 = qx{command $_qx_cmd_1[0]}); $_r_1; };
 };
 print "Decompressed rp2 firmware\n";
 print "exit: ${\($? >> 8)}\n";
-

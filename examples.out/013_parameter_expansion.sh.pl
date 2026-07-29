@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 use File::Basename;
+$PROGRAM_NAME = '013_parameter_expansion.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -26,4 +27,3 @@ delete $ENV{maybe};
 print (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : 'default'), "\n";
 print (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : do { $ENV{maybe} = 'default'; ($ENV{maybe} // q{}) }), "\n";
 print (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : die('error')), "\n";
-

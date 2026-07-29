@@ -5,6 +5,7 @@ my $main_exit_code = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '038_pattern_matching_nocase.sh';
 my $word;
 
 $__set_e = 1;
@@ -22,4 +23,3 @@ if ($word =~ /^foo$/mi) {
 }
 
 exit $main_exit_code;
-

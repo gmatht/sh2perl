@@ -5,9 +5,10 @@ my $main_exit_code = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
-my $f2;
-my $word;
+$PROGRAM_NAME = '010_pattern_matching.sh';
 my $s;
+my $word;
+my $f2;
 my $f1;
 
 $__set_e = 1;
@@ -56,4 +57,3 @@ if ($word =~ {foo}i) {
 }
 
 exit $main_exit_code;
-
