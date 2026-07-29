@@ -1,7 +1,11 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-$PROGRAM_NAME = '000__07_find_path_commands.sh';
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+my $ls_success = 0;
+our $CHILD_ERROR;
+
 my $found_files = do {
     require File::Find;
     my @find_results = ();
@@ -15,3 +19,4 @@ my $found_files = do {
 };
 print "Found shell scripts:\n";
 print $found_files, "\n";
+

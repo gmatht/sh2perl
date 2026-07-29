@@ -1,11 +1,12 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 my $main_exit_code = 0;
-my $output         = q{};
+my $output = '';
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '043_home.sh';
 my $HOME;
 
 if ($ENV{'HOME'} eq $ENV{'HOME'}) {
@@ -43,3 +44,4 @@ if ($CHILD_ERROR != 0) {
 }
 
 exit $main_exit_code;
+

@@ -1,8 +1,9 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 
-$PROGRAM_NAME = '002_control_flow.sh';
 my $i;
 
 if (-f "file.txt") {
@@ -26,3 +27,4 @@ sub greet {
     return;
 }
 greet("World");
+

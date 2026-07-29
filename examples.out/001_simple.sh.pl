@@ -1,7 +1,8 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-$PROGRAM_NAME = '001_simple.sh';
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 print "Hello, World!\n";
 if (-f "test.txt") {
     print "File exists\n";
@@ -9,3 +10,4 @@ if (-f "test.txt") {
 for my $i (1..5) {
     print $i, "\n";
 }
+

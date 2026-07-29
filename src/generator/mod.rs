@@ -430,13 +430,12 @@ impl Generator {
         }
 
         // Add global CHILD_ERROR variable for command substitution.
-        // Only emit when there are actual command substitutions or system calls.
-        let needs_child_error = self.needs_ipc_open3(ast) || self.needs_exit_code_tracking(ast) || self.has_command_substitution(ast);
-        if needs_child_error {
-            // CHILD_ERROR must be `our`, not `my`, so emit raw text.
-            output.push_str(&format!("our $CHILD_ERROR;\n"));
-        }
-        if needs_child_error || !self.function_level_vars.is_empty() {
+        // Emit unconditionally because many command generators (grep, ls, etc.)
+        // use $CHILD_ERROR internally even when there is no explicit command
+        // substitution or system call in the shell source.
+        // CHILD_ERROR must be `our`, not `my`, so emit raw text.
+        output.push_str("our $CHILD_ERROR;\n");
+        if !self.function_level_vars.is_empty() {
             output.push_str("\n");
         }
 
@@ -1675,7 +1674,7 @@ impl Generator {
             Command::For(loop_) => {
                 loop_.body.commands.iter().any(|c| self.cmd_has_cmdsub(c))
             }
-            Command::Subshell(c) | Command::Background(c) => self.cmd_has_cmdsub(c),
+            Command::Subshell(c) | Command::Background(c) | Command::Not(c) => self.cmd_has_cmdsub(c),
             Command::Block(b) => b.commands.iter().any(|c| self.cmd_has_cmdsub(c)),
             Command::Function(f) => f.body.commands.iter().any(|c| self.cmd_has_cmdsub(c)),
             Command::Redirect(rc) => self.cmd_has_cmdsub(&rc.command),

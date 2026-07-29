@@ -1,10 +1,11 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use IPC::Open3;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+my $ls_success = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = 'readonly-cmdsub.sh';
 use strict;
 my $RC = q{0};
 
@@ -14,8 +15,8 @@ sub capture {
 # Builtin command 'shift' not implemented
     my $tmp_stdout;
     my $tmp_stderr;
-    $tmp_stdout = do { my @_qx_cmd = ('mktemp /tmp/readonly_demo_stdout_XXXXXX'); chomp(my $result = qx{command $_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
-    $tmp_stderr = do { my @_qx_cmd = ('mktemp /tmp/readonly_demo_stderr_XXXXXX'); chomp(my $result = qx{command $_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
+    $tmp_stdout = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/readonly_demo_stdout_XXXXXX') or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
+    $tmp_stderr = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/readonly_demo_stderr_XXXXXX') or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
     do {
         open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $OS_ERROR\n";
@@ -39,7 +40,7 @@ open STDERR, '>', "$tmp_stderr" or croak "Cannot access file: $OS_ERROR\n";
     $se = do { my $cat_chunk = q{}; if ( open my $fh, '<', "$tmp_stderr" ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . "$tmp_stderr" . ': ' . $OS_ERROR . "\n"; } $cat_chunk; };
     unlink('$tmp_stdout');
     unlink('$tmp_stderr');
-    print "--- [" . ${label} . "] ---\n";
+    print "--- [\" . ${label} . \"] ---\n";
     print "  cmd     : \@ARGV\n";
     print "  exitcode: " . ${ec}, "\n";
 if ("${so}" ne q{}) {
@@ -95,4 +96,5 @@ print "============================================================\n";
 capture("08-readonly-f-p", 'bash', '-c', "\n        f1() { :; }\n        f2() { :; }\n        readonly -f f1 f2\n        readonly -f -p | head -5\n    ");
 print "\n";
 print "All readonly demo sections completed.\n";
+
 

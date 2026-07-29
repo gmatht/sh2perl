@@ -1,15 +1,17 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 my $main_exit_code = 0;
-my $output         = q{};
+my $__set_e = 0;
+my $output = '';
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '010_pattern_matching.sh';
-my $s;
-my $word;
 my $f2;
 my $f1;
+my $s;
+my $word;
 
 $__set_e = 1;
 # set uo not implemented
@@ -48,7 +50,7 @@ if (!($f2 =~ /^(?!.*.*[.]min[.]js$).*[.]js$/ms)) {
 print "== nocasematch ==\n";
 # nocasematch option enabled
 $word = "Foo";
-if ($word =~ {foo}i) {
+if ($word =~ /foo/i) {
         print "ci-match\
 ";
     $CHILD_ERROR = 0;
@@ -57,3 +59,4 @@ if ($word =~ {foo}i) {
 }
 
 exit $main_exit_code;
+
