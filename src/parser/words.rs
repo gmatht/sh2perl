@@ -1791,6 +1791,71 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 } else {
                     Ok(Word::Variable(braced_content, true, None))
                 }
+            } else if let Some(minus_pos) = braced_content.find('-') {
+                // ${var-default} or ${var-default_value} - use default if var is UNSET (not empty)
+                // The first `-` after position 0 is the operator (variable names can't contain hyphens).
+                if minus_pos > 0 {
+                    let var_name = &braced_content[..minus_pos];
+                    let default_val = &braced_content[minus_pos + 1..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
+            } else if let Some(plus_pos) = braced_content.find('+') {
+                // ${var+alt} or ${var+alt_value} - use alt if var is SET
+                if plus_pos > 0 {
+                    let var_name = &braced_content[..plus_pos];
+                    let alt_val = &braced_content[plus_pos + 1..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
+            } else if let Some(quest_pos) = braced_content.find('?') {
+                // ${var?error} - error if var is UNSET
+                if quest_pos > 0 {
+                    let var_name = &braced_content[..quest_pos];
+                    let error_msg = &braced_content[quest_pos + 1..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
+            } else if let Some(eq_pos) = braced_content.find('=') {
+                // ${var=default} - assign default if var is UNSET
+                if eq_pos > 0 {
+                    let var_name = &braced_content[..eq_pos];
+                    let default_val = &braced_content[eq_pos + 1..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok(Word::Variable(braced_content, true, None))
+                }
             } else {
                 // If it's not a special case, return as a variable
                 Ok(Word::Variable(braced_content, true, None))
@@ -1903,6 +1968,70 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         },
                         None,
                     ))
+                } else if let Some(minus_pos) = content.find('-') {
+                    // ${@var-default} - use default if var is UNSET
+                    if minus_pos > 0 {
+                        let var_name = &content[..minus_pos];
+                        let default_val = &content[minus_pos + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::Variable(content, true, None))
+                    }
+                } else if let Some(plus_pos) = content.find('+') {
+                    // ${@var+alt} - use alt if var is SET
+                    if plus_pos > 0 {
+                        let var_name = &content[..plus_pos];
+                        let alt_val = &content[plus_pos + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::Variable(content, true, None))
+                    }
+                } else if let Some(quest_pos) = content.find('?') {
+                    // ${@var?error} - error if var is UNSET
+                    if quest_pos > 0 {
+                        let var_name = &content[..quest_pos];
+                        let error_msg = &content[quest_pos + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::Variable(content, true, None))
+                    }
+                } else if let Some(eq_pos) = content.find('=') {
+                    // ${@var=default} - assign default if var is UNSET
+                    if eq_pos > 0 {
+                        let var_name = &content[..eq_pos];
+                        let default_val = &content[eq_pos + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::Variable(content, true, None))
+                    }
                 } else {
                     Ok(Word::Variable(content, true, None))
                 }
