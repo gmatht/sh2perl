@@ -1,7 +1,8 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-$PROGRAM_NAME = 'gunzip_example.sh';
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 open STDIN, '<', '/usr/share/man/uk/man1/w.1.gz' or croak "Cannot read file: $OS_ERROR\n";
 do {
     open my $original_stdout, '>&', STDOUT
@@ -10,8 +11,7 @@ do {
       or die "Cannot access file: $OS_ERROR\n";
     my $tmp = do {
 
-my @_qx_cmd_455 = ('command gunzip');
-${} = do { chomp(my $_r_455 = qx{command $_qx_cmd_455[0]}); $_r_455; };
+${} = do { open(my $__fh, '-|', 'gunzip') or croak "failed: $ERRNO"; chomp(my $_r = do { local $/; <$__fh> }); close $__fh; $_r; };
     };
     print $tmp;
     open STDOUT, '>&', $original_stdout
@@ -20,4 +20,5 @@ ${} = do { chomp(my $_r_455 = qx{command $_qx_cmd_455[0]}); $_r_455; };
       or die "Close failed: $OS_ERROR\n";
 };
 print "Decompressed man page\n";
-print "exit: ${\($? >> 8)}\n";
+print "exit: " . ($? >> 8), "\n";
+

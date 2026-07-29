@@ -58,9 +58,10 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             output.push_str(&cond);
         }
         Command::Not(inner) => {
-            // `! cmd` in shell: enter then-branch when cmd fails (exit != 0).
-            // Generate the inner command as a raw exit-code expression (no !() wrapper)
-            // so that non-zero (failure) is truthy in Perl.
+            // `! cmd` in shell: negate the exit code — enter then-branch when
+            // cmd fails (exit != 0).  Wrap the inner condition in !() so that
+            // success (exit 0 → falsy in Perl) becomes truthy, and failure
+            // (non-zero → truthy) becomes falsy.
             generator.suppress_set_e_depth += 1;
             let mut cond = generator.generate_command(inner);
             generator.suppress_set_e_depth -= 1;
@@ -71,7 +72,7 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
                 .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                 .trim_end_matches(';')
                 .to_string();
-            output.push_str(&cond);
+            output.push_str(&format!("!({})", cond));
         }
         _ => {
             generator.suppress_set_e_depth += 1;

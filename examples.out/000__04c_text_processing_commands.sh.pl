@@ -1,60 +1,61 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use IPC::Open3;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use File::Path qw(make_path remove_tree);
+my $ls_success = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '000__04c_text_processing_commands.sh';
 print "=== Text Processing Commands ===\n";
-my $file_content = do { chomp(my $_r = qx{command cat 000__04c_text_processing_commands.sh | head -5}); $_r; };
+my $file_content = do { open(my $__fh, '-|', 'bash', '-c', q{cat 000__04c_text_processing_commands.sh | head -5}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "First 5 lines of this file:\n";
 print $file_content, "\n";
-my $grep_result = do { my $grep_result_49;
-my @grep_lines_49 = ();
-my @grep_filenames_49 = ();
+my $grep_result = do { my $grep_result_1;
+my @grep_lines_1 = ();
+my @grep_filenames_1 = ();
 if (-e "000__04c_text_processing_commands.sh") {
     open my $fh, '<', "000__04c_text_processing_commands.sh" or croak "Cannot access file: $ERRNO";
     while (my $line = <$fh>) {
         chomp $line;
-        push @grep_lines_49, $line;
-        push @grep_filenames_49, "000__04c_text_processing_commands.sh";
+        push @grep_lines_1, $line;
+        push @grep_filenames_1, "000__04c_text_processing_commands.sh";
     }
     close $fh
         or croak "Close failed: $OS_ERROR";
 }
 else { print {*STDERR} "grep: 000__04c_text_processing_commands.sh: No such file or directory\n"; }
-my @grep_filtered_49 = grep { {echo} } @grep_lines_49;
-my @grep_numbered_49;
-for my $i (0..@grep_lines_49-1) {
-    if (scalar grep { $_ eq $grep_lines_49[$i] } @grep_filtered_49) {
-        push @grep_numbered_49, sprintf "%d:%s", $i + 1, $grep_lines_49[$i];
+my @grep_filtered_1 = grep { /echo/ } @grep_lines_1;
+my @grep_numbered_1;
+for my $i (0..@grep_lines_1-1) {
+    if (scalar grep { $_ eq $grep_lines_1[$i] } @grep_filtered_1) {
+        push @grep_numbered_1, sprintf "%d:%s", $i + 1, $grep_lines_1[$i];
     }
 }
-$grep_result_49 = join "\n", @grep_numbered_49;
-$CHILD_ERROR = scalar @grep_filtered_49 > 0 ? 0 : 1;
- $grep_result_49; };
+$grep_result_1 = join "\n", @grep_numbered_1;
+$CHILD_ERROR = scalar @grep_filtered_1 > 0 ? 0 : 1;
+ $grep_result_1; };
 print "Lines containing 'echo':\n";
 print $grep_result, "\n";
-my $sed_result = do { chomp(my $_r = qx{command echo 'Hello World' | sed s/World/Universe/}); $_r; };
+my $sed_result = do { open(my $__fh, '-|', 'bash', '-c', q{echo 'Hello World' | sed s/World/Universe/}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Sed result: $sed_result\n";
-my $awk_result = do { chomp(my $_r = qx{command echo '1 2 3 4 5' | awk '{print $1 + $2}'}); $_r; };
+my $awk_result = do { open(my $__fh, '-|', 'bash', '-c', q{echo '1 2 3 4 5' | awk '{print $1 + $2\}'}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Awk sum result: $awk_result\n";
-my $sort_result = do { chomp(my $_r = qx{command echo -e "zebra\\napple\\nbanana" | sort}); $_r; };
+my $sort_result = do { open(my $__fh, '-|', 'bash', '-c', q{echo -e "zebra\\\\napple\\\\nbanana" | sort}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Sorted words:\n";
 print $sort_result, "\n";
-my $uniq_result = do { chomp(my $_r = qx{command echo -e "apple\\napple\\nbanana\\nbanana\\ncherry" | uniq}); $_r; };
+my $uniq_result = do { open(my $__fh, '-|', 'bash', '-c', q{echo -e "apple\\\\napple\\\\nbanana\\\\nbanana\\\\ncherry" | uniq}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Unique words:\n";
 print $uniq_result, "\n";
-my $word_count = do { chomp(my $_r = qx{command echo 'Hello World' | wc -w}); $_r; };
-my $line_count = do { chomp(my $_r = qx{command echo -e "line1\\nline2\\nline3" | wc -l}); $_r; };
+my $word_count = do { open(my $__fh, '-|', 'bash', '-c', q{echo 'Hello World' | wc -w}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
+my $line_count = do { open(my $__fh, '-|', 'bash', '-c', q{echo -e "line1\\\\nline2\\\\nline3" | wc -l}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Word count: $word_count\n";
 print "Line count: $line_count\n";
-my $head_result = do { chomp(my $_r = qx{command seq 1 10 | head -3}); $_r; };
+my $head_result = do { open(my $__fh, '-|', 'bash', '-c', q{seq 1 10 | head -3}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "First 3 numbers: $head_result\n";
-my $tail_result = do { chomp(my $_r = qx{command seq 1 10 | tail -3}); $_r; };
+my $tail_result = do { open(my $__fh, '-|', 'bash', '-c', q{seq 1 10 | tail -3}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Last 3 numbers: $tail_result\n";
-my $cut_result = do { chomp(my $_r = qx{command echo apple:banana:cherry | cut -d : -f 2}); $_r; };
+my $cut_result = do { open(my $__fh, '-|', 'bash', '-c', q{echo apple:banana:cherry | cut -d : -f 2}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Second field: $cut_result\n";
 do {
     open my $original_stdout, '>&', STDOUT
@@ -162,17 +163,17 @@ $comm_output =~ s/\n$//msx;
 $comm_output };
 print "Common lines:\n";
 print $comm_result, "\n";
-my $diff_result = do { my $diff_output = qx{'diff' 'file1.txt' 'file2.txt'};
-chomp $diff_output;
+my $diff_result = do { my $diff_output = do { my $__out = q{}; if (@ARGV) { local $/; for my $__f (@ARGV) { open(my $__fh, q{<}, $__f) and do { $__out .= <$__fh>; close $__fh } } } $__out; };
 $diff_output;
  };
 print "File differences:\n";
 print $diff_result, "\n";
-my $tr_result = do { chomp(my $_r = qx{command echo 'HELLO WORLD' | tr A-Z a-z}); $_r; };
+my $tr_result = do { open(my $__fh, '-|', 'bash', '-c', q{echo 'HELLO WORLD' | tr A-Z a-z}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Lowercase: $tr_result\n";
-my $xargs_result = do { chomp(my $_r = qx{command echo '1 2 3' | xargs -n 1 echo Number:}); $_r; };
+my $xargs_result = do { open(my $__fh, '-|', 'bash', '-c', q{echo '1 2 3' | xargs -n 1 echo Number:}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Xargs result:\n";
 print $xargs_result, "\n";
 unlink('file1.txt');
 unlink('file2.txt');
 print "=== Text Processing Commands Complete ===\n";
+

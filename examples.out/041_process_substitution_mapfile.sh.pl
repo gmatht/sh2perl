@@ -1,12 +1,11 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use File::Basename;
-use IPC::Open3;
-my $output         = q{};
-our $CHILD_ERROR;
-
-$PROGRAM_NAME = '041_process_substitution_mapfile.sh';
+my $__set_e = 0;
+my $output = '';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -16,11 +15,11 @@ my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_238 = q{};
-    my $output_printed_238;
+    my $output_0 = q{};
+    my $output_printed_0;
     printf("x\ny\n");
-if ($output_238 ne q{} && !$output_printed_238) {
-    print $output_238;
+if ($output_0 ne q{} && !$output_printed_0) {
+    print $output_0;
 }
 }
 use File::Path qw(make_path);
@@ -40,3 +39,4 @@ if (open(my $mapfile_fh, '<', $temp_file_ps_fh_1)) {
 }
 printf('%s ', (join(" ", @lines)));
 print "\n";
+

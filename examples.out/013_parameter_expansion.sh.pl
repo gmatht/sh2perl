@@ -1,8 +1,10 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use File::Basename;
-$PROGRAM_NAME = '013_parameter_expansion.sh';
+my $__set_e = 0;
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -27,3 +29,4 @@ delete $ENV{maybe};
 print (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : 'default'), "\n";
 print (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : do { $ENV{maybe} = 'default'; ($ENV{maybe} // q{}) }), "\n";
 print (defined ($ENV{maybe} // q{}) && ($ENV{maybe} // q{}) ne q{} ? ($ENV{maybe} // q{}) : die('error')), "\n";
+

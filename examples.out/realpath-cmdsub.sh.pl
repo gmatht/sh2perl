@@ -1,13 +1,13 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use IPC::Open3;
 my $main_exit_code = 0;
-my $output         = q{};
+my $ls_success = 0;
+my $output = '';
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = 'realpath-cmdsub.sh';
 # set -o nounset not implemented
 # set nounset not implemented
 
@@ -19,7 +19,7 @@ sub try {
     print "==== $desc ====\n";
 printf('  $ ');
     for my $arg (@cmd) {
-if ("$arg" =~ {[[:space:]]}) {
+if ("$arg" =~ /[[:space:]]/) {
 printf('\'%s\' ', "$arg");
 }
         else {
@@ -30,7 +30,7 @@ printf('%s ', "$arg");
     my $stdout;
     my $stderr;
     my $rc;
-    $stdout = do { my @_qx_cmd = ("${cmd}:@ Variable(\"$\", false, None) 2> /tmp/realpath_stderr."); chomp(my $result = qx{command $_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
+    $stdout = do { open(my $__fh, '-|', 'bash', '-c', "${cmd}:@ Variable(\"$\", false, None) 2> /tmp/realpath_stderr.") or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
     $rc = $?;
     $stderr = do {
     my $command = 'cat /tmp/realpath_stderr. Variable("$", false, None) 2> /dev/null || true';
@@ -49,9 +49,8 @@ if ("$stdout" ne q{}) {
 if ("$stdout" =~ /^.*[$]'\x00'.*$/ms) {
 printf("  stdout (NUL\x{2011}terminated): ");
             # Original bash: printf '%s' "$stdout" | od -A n -t x1z
-my $output_567 = qx{command printf %s "$stdout" | od -An -t x1z};
-chomp $output_567;
-print $output_567, "\n";
+my $output_4 = do { open(my $__fh, '-|', 'bash', '-c', q{printf %s "$stdout" | od -An -t x1z}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
+print $output_4, "\n";
 printf("\n");
 }
         else {
@@ -96,15 +95,13 @@ print "==== --zero with two paths ====\
 ";
 printf("  \$ realpath --zero /bin /usr/bin/sh\n");
 
-my @_qx_cmd_576 = ('command realpath --zero /bin /usr/bin/sh');
-${} = do { chomp(my $_r_576 = qx{command $_qx_cmd_576[0]}); $_r_576; };
+${} = do { open(my $__fh, '-|', 'realpath', '--zero', '/bin', '/usr/bin/sh') or croak "failed: $ERRNO"; chomp(my $_r = do { local $/; <$__fh> }); close $__fh; $_r; };
 my $rc_zero = $?;
 printf("  (raw output with NULs above; use od to verify):\n");
 printf('  ');
 # Original bash: realpath --zero /bin /usr/bin/sh | od -A n -t x1z | head -3
-my $output_579 = qx{command realpath --zero /bin /usr/bin/sh | od -An -t x1z | head -3};
-chomp $output_579;
-print $output_579, "\n";
+my $output_15 = do { open(my $__fh, '-|', 'bash', '-c', q{realpath --zero /bin /usr/bin/sh | od -An -t x1z | head -3}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
+print $output_15, "\n";
 printf("  exit code: %d\n\n", "$rc_zero");
 try('--quiet suppresses error message for a truly invalid path', 'realpath', '--quiet', '/nonexistent_dir_xyzzy/foo');
 if ($CHILD_ERROR != 0) {
@@ -117,3 +114,4 @@ if ($CHILD_ERROR != 0) {
 print "=== All tests completed ===\n";
 
 exit $main_exit_code;
+

@@ -1,13 +1,15 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 my $main_exit_code = 0;
-my $output         = q{};
+my $__set_e = 0;
+my $output = '';
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '037_pattern_matching_extglob.sh';
-my $f1;
 my $f2;
+my $f1;
 
 $__set_e = 1;
 # set uo not implemented
@@ -29,3 +31,4 @@ if (!($f2 =~ /^(?!.*.*[.]min[.]js$).*[.]js$/ms)) {
 }
 
 exit $main_exit_code;
+

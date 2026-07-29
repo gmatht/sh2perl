@@ -1,10 +1,15 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-$PROGRAM_NAME = 'readlink_flags.sh';
-my $existing = do { my @_qx_cmd = ('command readlink -e /usr/bin/vi'); chomp(my $result = qx{command $_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
-my $missing = do { my @_qx_cmd = ('command readlink -m /nonexistent/path'); chomp(my $result = qx{command $_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
-my $full = do { my @_qx_cmd = ('command readlink -f /usr/bin/python3'); chomp(my $result = qx{command $_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+my $ls_success = 0;
+our $CHILD_ERROR;
+
+my $existing = do { use Cwd qw(abs_path); my $_r = abs_path('/usr/bin/vi'); defined $_r ? $_r : q{}; };
+my $missing = do { use Cwd qw(abs_path); my $_r = abs_path('/nonexistent/path'); defined $_r ? $_r : q{}; };
+my $full = do { use Cwd qw(abs_path); my $_r = abs_path('/usr/bin/python3'); defined $_r ? $_r : q{}; };
 print "Existing: $existing\n";
 print "Missing:  $missing\n";
 print "Full:     $full\n";
+

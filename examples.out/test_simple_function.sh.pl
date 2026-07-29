@@ -1,7 +1,8 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-$PROGRAM_NAME = 'test_simple_function.sh';
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 
 sub get_file_size {
     my ($file) = @_;
@@ -30,3 +31,4 @@ sub get_file_size {
     return;
 }
 get_file_size('test_simple_function.sh');
+

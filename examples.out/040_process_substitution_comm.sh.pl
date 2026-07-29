@@ -1,12 +1,11 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
 use File::Basename;
-use IPC::Open3;
-our $CHILD_ERROR;
-
-$PROGRAM_NAME = '040_process_substitution_comm.sh';
+my $__set_e = 0;
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -16,11 +15,11 @@ my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_234 = q{};
-    my $output_printed_234;
+    my $output_0 = q{};
+    my $output_printed_0;
     printf("a\nb\n");
-if ($output_234 ne q{} && !$output_printed_234) {
-    print $output_234;
+if ($output_0 ne q{} && !$output_printed_0) {
+    print $output_0;
 }
 }
 use File::Path qw(make_path);
@@ -35,11 +34,11 @@ my $output_ps_fh_2;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_236 = q{};
-    my $output_printed_236;
+    my $output_2 = q{};
+    my $output_printed_2;
     printf("b\nc\n");
-if ($output_236 ne q{} && !$output_printed_236) {
-    print $output_236;
+if ($output_2 ne q{} && !$output_printed_2) {
+    print $output_2;
 }
 }
 use File::Path qw(make_path);
@@ -78,4 +77,5 @@ $result .= join("\n", @common_lines) . "\n";
 chomp $result;
 print $result;
 print "\n";
-print "exit: ${\($? >> 8)}\n";
+print "exit: " . ($? >> 8), "\n";
+

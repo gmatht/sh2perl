@@ -1,7 +1,8 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use IPC::Open3;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use File::Path qw(make_path remove_tree);
 sub capture_stdout {
     my ($code) = @_;
@@ -15,15 +16,15 @@ sub capture_stdout {
     return $captured;
 }
 
+my $ls_success = 0;
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '000__04h_complex_examples.sh';
 my $current_user;
 
 print "=== Complex Backtick Examples ===\n";
-my $nested_result = "Three wells: " . (do { chomp(my $_r = qx{command yes well | head -3}); $_r; });
+my $nested_result = "Three wells: " . (do { open(my $__fh, '-|', 'bash', '-c', q{yes well | head -3}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; });
 print "Nested backticks: $nested_result\n";
-my $count = do { chomp(my $_r = qx{command ls -1 | wc -l}); $_r; };
+my $count = do { open(my $__fh, '-|', 'bash', '-c', q{ls -1 | wc -l}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "File count: $count\n";
 $current_user = ('root');
 if ("$current_user" eq "root") {
@@ -38,7 +39,7 @@ if ($system_name eq 'Linux') {
 } elsif ($system_name eq 'Darwin') {
         print "Running on macOS\n";
 } elsif (1) {
-        print "Running on other " . "sys" . "tem\n";
+        print "Running on other \" . \"sys\" . \"tem\n";
 }
 
 sub get_file_size {
@@ -68,7 +69,7 @@ sub get_file_size {
     return;
 }
 get_file_size(q{000__01_file_directory_operations.sh});
-my @files = (do { my $_result = `ls -1 *.sh examples/*.sh 2>/dev/null`; chomp $_result; $CHILD_ERROR = $? >> 8; split("\n", $_result); });
+my @files = (do { open(my $__fh, '-|', 'bash', '-c', "ls -1 '*.sh' 'examples/*.sh' 2> /dev/null") or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; });
 print "Shell scripts found: " . scalar(@files), "\n";
 for my $file (@files) {
     print "  - $file\n";
@@ -95,12 +96,12 @@ do {
     close $original_stdout
       or die "Close failed: $OS_ERROR\n";
 };
-my $process_result = do { my @_qx_cmd = ("bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'"); chomp(my $result = qx{command $_qx_cmd[0]}); $CHILD_ERROR = $? >> 8; $result; };
+my $process_result = do { open(my $__fh, '-|', 'bash', '-c', "bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'") or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
 print "Process substitution result:\n";
 print $process_result, "\n";
-my $here_string_result = do { my $input_data = "hello world"; my $set1_111 = 'a-z';
-my $set2_111 = 'A-Z';
-my $input_111 = $input_data;;
+my $here_string_result = do { my $input_data = "hello world"; my $set1_3 = 'a-z';
+my $set2_3 = 'A-Z';
+my $input_3 = $input_data;;
 print "Here string result: $here_string_result\n";
 my $perl_result = do {
     my $result;
@@ -118,3 +119,4 @@ unlink('file1.txt');
 unlink('file2.txt');
 print "=== Complex Backtick Examples Complete ===\n";
 }
+

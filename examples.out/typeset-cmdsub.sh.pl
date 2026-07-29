@@ -1,13 +1,12 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
-use IPC::Open3;
 my $main_exit_code = 0;
-my $output         = q{};
+my $output = '';
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = 'typeset-cmdsub.sh';
 print "=== typeset -i (integer attribute) ===\n";
 delete $ENV{n};
 # Builtin command 'typeset' not implemented
@@ -42,9 +41,8 @@ delete $ENV{myexport};
 # Builtin command 'typeset' not implemented
 print "After 'typeset -x myexport=exported_value'\n";
 print "Variable is exported:\n";
-my $output_609 = qx{command env | grep ^myexport=};
-chomp $output_609;
-print $output_609, "\n";
+my $output_0 = do { open(my $__fh, '-|', 'bash', '-c', q{env | grep ^myexport=}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
+print $output_0, "\n";
 if ($CHILD_ERROR != 0) {
         print "(myexport not found in env \x{2014} possible scope issue)\n";
 }
@@ -52,14 +50,14 @@ print "\n";
 print "=== typeset -a (indexed array) ===\n";
 delete $ENV{arr};
 # Builtin command 'typeset' not implemented
-print "After 'typeset -a arr=(10 20 30)': arr=(" . (join(" ", @arr)) . ")\n";
-print "arr[0]='" . $arr[0] . "' arr[1]='" . $arr[1] . "' arr[2]='" . $arr[2] . "'\n";
+print "After 'typeset -a arr=(10 20 30)': arr=(\" . (join(\" \", @arr)) . \")\n";
+print "arr[0]='\" . $arr[0] . \"' arr[1]='\" . $arr[1] . \"' arr[2]='\" . $arr[2] . \"'\n";
 print "\n";
 print "=== typeset -A (associative array) ===\n";
 delete $ENV{assoc};
 # Builtin command 'typeset' not implemented
 print "After 'typeset -A assoc=([key1]=value1 [key2]=value2)'\n";
-print "assoc[key1]='" . $assoc[int($ENV{key1})] . "'  assoc[key2]='" . $assoc[int($ENV{key2})] . "'\n";
+print "assoc[key1]='\" . $assoc[int($ENV{key1})] . \"'  assoc[key2]='\" . $assoc[int($ENV{key2})] . \"'\n";
 print "\n";
 print "=== typeset -n (name reference) ===\n";
 delete $ENV{original};
@@ -135,7 +133,7 @@ delete $ENV{singlearr};
 # Builtin command 'typeset' not implemented
 $singlearr[0] = "first";
 $singlearr[1] = "second";
-print "singlearr[0]='" . $singlearr[0] . "'  singlearr[1]='" . $singlearr[1] . "'\n";
+print "singlearr[0]='\" . $singlearr[0] . \"'  singlearr[1]='\" . $singlearr[1] . \"'\n";
 print "\n";
 print "=== typeset (no flag) ===\n";
 delete $ENV{plain};
@@ -145,3 +143,4 @@ print "\n";
 print "=== Demonstration complete. ===\n";
 
 exit $main_exit_code;
+

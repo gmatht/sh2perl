@@ -88,16 +88,20 @@ pub fn generate_command_impl_with_input(
             generator.generate_assignment(assignment)
         }
         Command::Not(cmd) => {
-            // Negation: ! cmd  ->  ! (perl_code)
+            // Negation: ! cmd  ->  ! do { perl_code };
+            // Use !do { ... } instead of !(...) because the inner code may
+            // contain multiple statements (variable declarations, etc.) which
+            // are not valid inside parentheses in Perl.
             let inner = generator.generate_command(cmd);
-            let inner_trimmed = inner.trim();
-            if inner_trimmed.is_empty() {
+            // Strip trailing whitespace/semicolons so the do block is clean.
+            let inner_clean = inner.trim().trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t');
+            if inner_clean.is_empty() {
                 String::new()
-            } else if inner_trimmed.starts_with("!") {
+            } else if inner_clean.starts_with("!") {
                 // Double negation: !! cmd
-                format!("!(!({}))\n", inner_trimmed)
+                format!("!(!do {{ {} }});\n", inner_clean)
             } else {
-                format!("!({})\n", inner_trimmed)
+                format!("!do {{ {} }};\n", inner_clean)
             }
         }
         Command::BlankLine => "\n".to_string(),
