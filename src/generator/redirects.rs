@@ -638,6 +638,20 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
             }
             result
         }
+        Command::BuiltinCommand(builtin_cmd) => {
+            // Serialize builtin commands (e.g. `set`, `shift`) into a bash string.
+            // This is similar to SimpleCommand serialization.
+            if builtin_cmd.args.is_empty() {
+                builtin_cmd.name.clone()
+            } else {
+                let args: Vec<String> = builtin_cmd
+                    .args
+                    .iter()
+                    .map(|arg| word_to_bash_string(arg))
+                    .collect();
+                format!("{} {}", builtin_cmd.name, args.join(" "))
+            }
+        }
         _ => {
             // For other complex commands, generate a reasonable bash representation
             format!(": 'Complex command not supported in bash string generation'")

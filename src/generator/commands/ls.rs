@@ -488,7 +488,7 @@ pub fn generate_ls_command(
             if let Some(var) = output_var {
                 output.push_str(&generator.indent());
                 output.push_str(&format!(
-                    "${} = do {{ my @_qx_cmd = ({}); my $result = qx{{$_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }};\n",
+                    "${} = do {{ my @_qx_cmd = ({}); my $result = qx{{command $_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }};\n",
                     var, command_lit
                 ));
             }
@@ -816,7 +816,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
         let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
         generator.indent_level = saved_indent;
         return format!(
-            "do {{ my @_qx_cmd = ({}); my $result = qx{{$_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }}",
+            "do {{ my @_qx_cmd = ({}); my $result = qx{{command $_qx_cmd[0]}}; $CHILD_ERROR = $? >> 8; $result; }}",
             command_lit
         );
     }

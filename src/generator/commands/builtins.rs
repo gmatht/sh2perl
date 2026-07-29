@@ -669,12 +669,12 @@ pub fn generate_generic_builtin(
                     // Return the tail output rather than printing it so callers
                     // can choose how to consume the value.
                     format!(
-                        "do {{ my @_qx_cmd = ({}); qx{{$_qx_cmd[0]}}; }};\n",
+                        "do {{ my @_qx_cmd = ({}); qx{{command $_qx_cmd[0]}}; }};\n",
                         command_lit
                     )
                 } else {
                     format!(
-                        "${} = do {{ my @_qx_cmd = ({}); qx{{$_qx_cmd[0]}}; }};\n",
+                        "${} = do {{ my @_qx_cmd = ({}); qx{{command $_qx_cmd[0]}}; }};\n",
                         output_var, command_lit
                     )
                 }
