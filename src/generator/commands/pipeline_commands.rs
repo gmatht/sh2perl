@@ -3,8 +3,7 @@ use crate::generator::commands::builtins::{
     generate_generic_builtin, is_builtin, pipeline_supports_linebyline,
 };
 use crate::generator::Generator;
-use crate::ir::{expr_to_perl, IrExpr};
-use regex::Regex;
+use crate::ir::{expr_to_perl, stmt_to_perl, IrExpr, IrStmt, Sigil};
 
 /// Helper function to generate Perl code for a command using the builtins registry
 fn generate_command_using_builtins(
@@ -852,42 +851,15 @@ pub fn generate_pipeline_for_substitution(
     // Use the command string directly inside qx{...} instead of passing
     // it through bash -c.  Perl's qx{} already runs through /bin/sh by
     // default, so the bash -c wrapper is unnecessary for simple pipelines.
-    // Choose a qx delimiter that won't conflict with the command string.
-    let (qx_open, qx_close) = if final_cmd.contains('}') {
-        ("qx(", ")")
-    } else {
-        ("qx{", "}")
+    //
+    // Use IrExpr::Backtick to produce a clean `do { chomp(my $_r = qx{...}); $_r; }`
+    // expression. This replaces the raw format!() with an IR node that the
+    // backend formats consistently, addressing Patterns A and G.
+    let backtick_expr = IrExpr::Backtick {
+        expr: Box::new(IrExpr::RawExpr(final_cmd)),
+        native: false,
     };
-    let simplified = format!(
-        "do {{ chomp(my $result_{} = {}{}{}); $result_{}; }}",
-        unique_id, qx_open, final_cmd, qx_close, unique_id
-    );
-
-    // Add basic chomp and newline handling - temporarily disabled to fix compilation errors
-    // TODO: Fix variable scoping issue with $cmd_result_ variables
-    /*
-    if simplified.contains("$output_") {
-        let re = Regex::new(r"\$output_(\d+)").unwrap();
-        if let Some(cap) = re.captures(&simplified) {
-            let output_var = format!("$output_{}", cap.get(1).unwrap().as_str());
-            // Look for the actual $cmd_result_ variable declaration to get the correct number
-            let cmd_re = Regex::new(r"my \$cmd_result_(\d+) = do").unwrap();
-            if let Some(cmd_cap) = cmd_re.captures(&simplified) {
-                let cmd_unique_id = cmd_cap.get(1).unwrap().as_str();
-                // Check if the simplified output is a do block, and if so, add the chomp inside it
-                if simplified.starts_with("do {") && simplified.ends_with("}") {
-                    // Insert chomp and regex processing before the closing brace
-                    let mut result = simplified.clone();
-                    let insert_pos = result.rfind('}').unwrap();
-                    result.insert_str(insert_pos, &format!("\nchomp $cmd_result_{};\n$cmd_result_{} =~ s/\\n/ /gsxm;\n", cmd_unique_id, cmd_unique_id));
-                    return result;
-                } else {
-                    return format!("{}\nchomp $cmd_result_{};\n$cmd_result_{} =~ s/\\n/ /gsxm;\n$cmd_result_{}", simplified, cmd_unique_id, cmd_unique_id, cmd_unique_id);
-                }
-            }
-        }
-    }
-    */
+    let simplified = expr_to_perl(&backtick_expr);
 
     simplified
 }
@@ -2276,6 +2248,98 @@ fn generate_buffered_pipeline(
         output.push_str(&generator.indent());
         output.push_str(&format!("# Original bash: {}\n", first_line));
     }
+
+    // ---- IR-based clean path: emit qx{...} for pipeline capture instead of verbose scaffolding ----
+    // This addresses Pattern A (pipeline scaffolding boilerplate), Pattern B (double newline),
+    // and Pattern I (trailing-newline dance) from the idiom review.
+    //
+    // Reconstruct the shell command from the pipeline and use IrStmt::Pipeline { capture, cmd_str }
+    // to emit a clean `my $var = qx{...}; chomp $var;` plus optional `print $var, "\n";`.
+    //
+    // We only take this path when:
+    //   - The pipeline has source_text (so we can reconstruct the command)
+    //   - There are no output redirects (`> file`) that need special handling
+    //   - The pipeline is not inside a context that needs fine-grained exit code tracking
+    //
+    // For more complex pipelines (redirects, set -e tracking, etc.), the old
+    // scaffolding path below is still used as a fallback.
+    //
+    // Safety: we must NOT use the clean path when there are redirects that capture
+    // stdout to a file, because qx{} captures stdout and the redirect would be
+    // ineffective (the redirect target gets the stdout, not the file).
+    let has_output_redirect_early = pipeline.commands.iter().any(|cmd| {
+        if let Command::Redirect(redirect_cmd) = cmd {
+            return redirect_cmd.redirects.iter().any(|r| {
+                matches!(
+                    r.operator,
+                    RedirectOperator::Output | RedirectOperator::Append
+                )
+            });
+        }
+        if let Command::Simple(simple_cmd) = cmd {
+            return simple_cmd.redirects.iter().any(|r| {
+                matches!(
+                    r.operator,
+                    RedirectOperator::Output | RedirectOperator::Append
+                )
+            });
+        }
+        false
+    });
+
+    // Only take the clean path when there are no output redirects.
+    // Also skip if the pipeline has a source-text comment but no actual commands
+    // (the old code handles edge cases with better fidelity).
+    if !has_output_redirect_early && pipeline.commands.len() >= 1 {
+        let reconstructed_cmd = if let Some(src) = &pipeline.source_text {
+            // Use the first line of source text as the command string.
+            // This preserves the exact shell syntax (quoting, escaping) that the
+            // user wrote, which is more reliable than re-serialising the AST.
+            let first_line = src.lines().next().unwrap_or(src);
+            first_line.trim().to_string()
+        } else {
+            // Fall back to AST-based reconstruction.
+            generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
+        };
+
+        // Skip if command string is empty.
+        if !reconstructed_cmd.is_empty() {
+            let unique_id = generator.get_unique_id();
+            let output_var = format!("output_{}", unique_id);
+
+            // Build a clean IR statement for pipeline capture.
+            let pipeline_stmt = IrStmt::Pipeline {
+                stages: vec![],  // Not used when capture is set
+                last_output: None,
+                capture: Some(output_var.clone()),
+                cmd_str: Some(reconstructed_cmd),
+            };
+            output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
+
+            if should_print {
+                // For top-level pipelines, print the captured output with a trailing newline.
+                // Use `print $var, "\n";` which is idiomatic Perl and avoids the
+                // verbose `if (... ne q{} && !defined ...) { print ...; if (!... =~ m{\n\z})` dance.
+                let print_stmt = IrStmt::Output {
+                    value: IrExpr::Var(output_var.clone(), Sigil::Scalar),
+                    newline: true,
+                    target: None,
+                };
+                output.push_str(&stmt_to_perl(&print_stmt, 0));
+            } else {
+                // For command substitution, emit the captured variable as the last expression
+                // so the do{...} returns it.  The backend's Pipeline { capture } emits
+                // `my $var = qx{...}; chomp $var;` which are statements, not expressions,
+                // so we wrap in a do{} to make it an expression for command substitution.
+                // The caller (generate_pipeline_for_substitution) may add further wrapping.
+                output.push_str(&format!("do {{ ${} }}\n", output_var));
+            }
+
+            return output;
+        }
+    }
+    // ---- End clean path ----
+
 
     if should_print {
         // Wrap the entire pipeline in a block scope to prevent variable contamination
