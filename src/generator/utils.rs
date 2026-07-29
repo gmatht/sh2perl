@@ -188,8 +188,13 @@ fn try_extract_sort_herestring_var(inner: &str) -> Option<&str> {
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
+            // Apply bash quote removal: in unquoted words, \X → X
+            // (backslash is removed, the following character is kept literally).
+            // This matches how the shell processes unquoted words.
+            let s = apply_shell_quote_removal(s);
+            
             if s.contains("system") || s.contains('`') {
-                return crate::generator::commands::utilities::source_safe_perl_string_expr(s);
+                return crate::generator::commands::utilities::source_safe_perl_string_expr(&s);
             }
 
             // Handle empty strings with q{}
@@ -313,6 +318,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
             match var.as_str() {
                 "#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
                 "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
+                "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
+                "$" => "$$".to_string(),       // $$ -> $$ (process ID)
+                "?" => "($? >> 8)".to_string(), // $? -> exit code
                 "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                 _ => format!("${}", var),           // Regular variables
             }
@@ -1191,6 +1199,26 @@ pub fn newline_end_regex() -> String {
     // Use \z so we only match a true trailing newline, not any newline in a multiline string.
     // No msx flags needed: \z is always absolute end, there's no ., and no whitespace.
     "m{\\n\\z}".to_string()
+}
+
+/// Apply shell quote removal to an unquoted word.
+/// In bash unquoted words, \X → X (backslash is removed, the
+/// following character is kept literally).
+pub(crate) fn apply_shell_quote_removal(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Skip backslash, keep the next character literally
+            if let Some(next) = chars.next() {
+                result.push(next);
+            }
+            // backslash at end of string is dropped (bash behavior)
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Convert postfix unless statement to block form

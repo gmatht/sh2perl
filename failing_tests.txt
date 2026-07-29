@@ -2,7 +2,6 @@
 000__04h_complex_examples.sh	stdout mismatch
 000__07_find_path_commands.sh	stdout mismatch
 003_pipeline.sh	stdout mismatch
-008_simple_backup.sh	stdout mismatch
 009_arrays.sh	stdout mismatch
 013_parameter_expansion.sh	stdout mismatch
 011_brace_expansion.sh	stdout mismatch
@@ -17,7 +16,6 @@
 035_brace_expansion_practical.sh	stdout mismatch
 042_process_substitution_advanced.sh	stdout mismatch
 045_shell_calling_perl.sh	stdout mismatch
-049_local.sh	stdout mismatch
 050_test_ls_star_dot_sh.sh	stdout mismatch
 056_send_args.sh	stdout mismatch
 057_case.sh	stdout mismatch
@@ -46,25 +44,26 @@
 arith-base-notation.sh	debashc failed to generate code
 arithmetic-vs-command-subshell.sh	stdout mismatch
 at-in-test.sh	stdout mismatch
-063_06_complex_pipeline_background.sh	stdout mismatch
 at-var-default.sh	stdout mismatch
+063_06_complex_pipeline_background.sh	stdout mismatch
+background-chain.sh	stdout mismatch
 backslash-continuation-dollar-paren.sh	stdout mismatch
 backslash-continuation-in-dollar-paren.sh	stdout mismatch
 backslash-dollar-brace.sh	stdout mismatch
-backslash-newline-dq.sh	stdout mismatch
 backslash-gt-test.sh	stdout mismatch
+backslash-newline-dq.sh	stdout mismatch
 brace-expansion-error.sh	stdout mismatch
-builtin-system-open3.sh	stdout mismatch
 capture-paren-with-eval.sh	stdout mismatch
-085_for_glob_pipe.sh	stdout mismatch
+builtin-system-open3.sh	stdout mismatch
 case-pattern-paren.sh	stdout mismatch
+085_for_glob_pipe.sh	stdout mismatch
 check-qx-aa-exec.sh	stdout mismatch
 check-qx-systemd-path.sh	stdout mismatch
 checkqx-open3-builtin.sh	stdout mismatch
-checkqx-qx-var-which.sh	stdout mismatch
 checkqx-qx-var-rm.sh	stdout mismatch
-dollar-after-dollar.sh	stdout mismatch
+checkqx-qx-var-which.sh	stdout mismatch
 declare-let-keyword.sh	stdout mismatch
+dollar-after-dollar.sh	stdout mismatch
 dollar-at-default-quoted.sh	stdout mismatch
 dollar-at-with-default.sh	stdout mismatch
 dollar-followed-by-slash.sh	stdout mismatch
@@ -86,8 +85,8 @@ heredoc-parse-error.sh	stdout mismatch
 heredoc-python-fstring.sh	debashc failed to generate code
 heredoc-redirects-same-line.sh	stdout mismatch
 heredoc-singlequote-span.sh	stdout mismatch
-exitScript-after-test.sh	stdout mismatch
 heredoc-subshell-redirects.sh	stdout mismatch
+exitScript-after-test.sh	stdout mismatch
 heredoc-with-quotes.sh	debashc failed to generate code
 heredoc-with-redirect-same-line.sh	stdout mismatch
 keyword-in-arg.sh	stdout mismatch
@@ -103,15 +102,14 @@ param-expand-hash-sameline.sh	stdout mismatch
 param-expand-hash.sh	stdout mismatch
 param-expand-hashhash.sh	stdout mismatch
 parse-and-or-chain-with-assign.sh	stdout mismatch
-parse-arithmetic-extra-paren.sh	stdout mismatch
-parse-arithmetic-nested-array.sh	stdout mismatch
-parse-array-plusassign.sh	stdout mismatch
-parse-at-slice.sh	stdout mismatch
 096_head_procsub.sh	stdout mismatch
-parse-backslash-newline-in-string.sh	stdout mismatch
+parse-arithmetic-extra-paren.sh	stdout mismatch
+parse-array-plusassign.sh	stdout mismatch
+parse-arithmetic-nested-array.sh	stdout mismatch
+parse-at-slice.sh	stdout mismatch
 parse-brace-close.sh	stdout mismatch
+parse-backslash-newline-in-string.sh	stdout mismatch
 parse-brace-in-heredoc.sh	stdout mismatch
-parse-builtin-keywords-in-case-body.sh	stdout mismatch
 parse-case-subject-complex.sh	stdout mismatch
 parse-comment-in-dollar-paren.sh	stdout mismatch
 parse-db-status-fmt.sh	stdout mismatch
@@ -124,7 +122,6 @@ parse-dollar-paren-pipe.sh	stdout mismatch
 parse-dollar-single-quote.sh	stdout mismatch
 parse-done-unexpected.sh	stdout mismatch
 parse-dot-after-var.sh	stdout mismatch
-parse-double-semicolon-in-case.sh	stdout mismatch
 parse-double-semicolon.sh	stdout mismatch
 parse-doublequote-unexpected.sh	stdout mismatch
 parse-empty-assign-doublesemicolon.sh	stdout mismatch
@@ -135,8 +132,8 @@ parse-eval-multiline.sh	stdout mismatch
 parse-exit-brace-question.sh	stdout mismatch
 parse-heredoc-apostrophe.sh	debashc failed to generate code
 parse-heredoc-dollar-paren.sh	stdout mismatch
-parse-heredoc-tab.sh	stdout mismatch
 parse-heredoc-redirect-chain.sh	stdout mismatch
+parse-heredoc-tab.sh	stdout mismatch
 parse-longoption-with-dollar.sh	stdout mismatch
 parse-multiline-string.sh	stdout mismatch
 parse-orelse-continuation.sh	stdout mismatch
@@ -151,11 +148,10 @@ parse-singlequote-unexpected.sh	stdout mismatch
 parse-source-in-test.sh	stdout mismatch
 parse-sq-awk-while.sh	stdout mismatch
 parse-standalone-redirect.sh	stdout mismatch
-parse-star-case-pattern.sh	stdout mismatch
 parse-substring-double-colon.sh	stdout mismatch
 parse-unexpected-braceclose.sh	stdout mismatch
-parse-unexpected-end-of-input.sh	debashc failed to generate code
 parse-test-with-source.sh	stdout mismatch
+parse-unexpected-end-of-input.sh	debashc failed to generate code
 parse-unexpected-parenclose.sh	debashc failed to generate code
 parse-variable-default-with-quotes.sh	stdout mismatch
 pid_tempfile.sh	stdout mismatch
@@ -177,8 +173,8 @@ test-expression-backslash-continuation.sh	stdout mismatch
 test-operator-S.sh	stdout mismatch
 test-operator-missing.sh	stdout mismatch
 test_grep.sh	stdout mismatch
-typeset-cmdsub.sh	stdout mismatch
 test_system_builtin.sh	stdout mismatch
+typeset-cmdsub.sh	stdout mismatch
 unicode-in-string.sh	stdout mismatch
 utf8-non-utf8-content.sh	stdout mismatch
 variable-apostrophe-concat.sh	stdout mismatch
