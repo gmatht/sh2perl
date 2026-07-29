@@ -1912,6 +1912,32 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     files.join(", ")
                                 )
                             }
+                        } else if name == "readlink" || name == "realpath" {
+                            // Native Perl: Cwd::abs_path() canonizalizes symlinks.
+                            let mut args: Vec<String> = Vec::new();
+                            let mut has_f_flag = false;
+                            for arg in &simple_cmd.args {
+                                if let Word::Literal(s, _) = arg {
+                                    if s == "-f" || s == "-e" || s == "-m" {
+                                        has_f_flag = true;
+                                    } else if !s.starts_with('-') {
+                                        args.push(generator.word_to_perl(arg));
+                                    }
+                                }
+                            }
+                            if args.is_empty() {
+                                "do { $CHILD_ERROR = 0; q{} };\n".to_string()
+                            } else if has_f_flag {
+                                format!(
+                                    "do {{ use Cwd qw(abs_path); my $_r = abs_path({}); defined $_r ? $_r : q{{}}; }}",
+                                    args.join(", ")
+                                )
+                            } else {
+                                format!(
+                                    "do {{ use Cwd qw(abs_path); my $_r = abs_path({}); defined $_r ? $_r : q{{}}; }}",
+                                    args.join(", ")
+                                )
+                            }
                         } else if crate::generator::commands::builtins::is_builtin(name) {
                             // Known builtin but not yet natively handled in command substitution.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
