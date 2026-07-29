@@ -1254,8 +1254,7 @@ fn try_embed_newline_in_string_literal(expr: &str) -> Option<String> {
             .replace("\"", "\\\"")
             .replace("$", "\\$")
             .replace("@", "\\@");
-        Some(format!("print \"{}\\
-\";\n", escaped))
+        Some(format!("print \"{}\\n\";\n", escaped))
     } else if s.len() >= 4 && s.starts_with("q{") && s.ends_with('}') {
         // q{...} string: convert to double-quoted with \n.
         let inner = &s[2..s.len()-1];
@@ -1266,8 +1265,7 @@ fn try_embed_newline_in_string_literal(expr: &str) -> Option<String> {
             .replace("@", "\\@")
             .replace("{", "\\{")
             .replace("}", "\\}");
-        Some(format!("print \"{}\\
-\";\n", escaped))
+        Some(format!("print \"{}\\n\";\n", escaped))
     } else {
         None
     }
