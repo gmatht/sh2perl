@@ -1403,7 +1403,9 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                         .replace("\\", "\\\\")
                                         .replace("\"", "\\\"")
                                         .replace("\n", "\\n")
-                                        .replace("\r", "\\r");
+                                        .replace("\r", "\\r")
+                                        .replace("$", "\\$")
+                                        .replace("@", "\\@");
                                     parts_perl.push(format!("\"{}\"", escaped));
                                 }
                                 StringPart::Variable(v) => {
@@ -1423,7 +1425,9 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             .replace("\\", "\\\\")
                             .replace("\"", "\\\"")
                             .replace("\n", "\\n")
-                            .replace("\r", "\\r");
+                            .replace("\r", "\\r")
+                            .replace("$", "\\$")
+                            .replace("@", "\\@");
                         parts_perl.push(format!("\"{}\"", escaped));
                     } else {
                         parts_perl.push(generator.word_to_perl(arg));
@@ -1435,7 +1439,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 // Perl::Critic's "Expression form of eval" false positive.
                 // bash -c "..." is semantically equivalent to eval "...".
                 output.push_str(&format!(
-                    "do {{ my $eval_input = {}; $CHILD_ERROR = 0;  # native Perl }};\n",
+                    "do {{ my $eval_input = {}; $CHILD_ERROR = 0; }};  # native Perl\n",
                     concat_expr
                 ));
             }

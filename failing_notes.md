@@ -1,8 +1,48 @@
 # Failing Test Notes
 
-## Current status: 345/517 passed, 172 failing
+## Current status: 354/517 passed, 163 failing
 
 ### Newly Fixed (this session):
+
+1. **`print($expr, "\n")` with parenthesized expression broken by space before `(`** —
+   `emit_stmt` in `ir.rs` used `"print {}, \"\\n\";\n"` format which produced
+   `print (EXPR), "\n"` — Perl parsed the space before `(` as `print` with one
+   parenthesized argument, then the `, "\n"` was in void context causing warnings
+   and wrong output.  Changed to `"print({}, \"\\n\");\n"` (and likewise for
+   no-newline and filehandle cases).  This fixes `unicode-in-string.sh` and
+   any other test where print arguments start with `(`.
+
+2. **Extra `))` in arithmetic expressions with nested parens** —
+   `parse_arithmetic_expression` (in `words.rs`, `assignments.rs`, and `commands.rs`)
+   pushed closing parens to the expression even when they closed the outer `$((` / `((`
+   marker.  Fixed three copies of this function so that `ParenClose` and
+   `ArithmeticEvalClose` only push `)` when they close inner (expression-level)
+   parens (i.e., when resulting depth is >= 2, the 2 representing the outer `((`).
+   Fixed: `parse-arithmetic-extra-paren.sh`, and likely any other test using
+   arithmetic with extra grouping parens.
+
+3. **`$` not escaped in Perl double-quoted string literals in eval handler** —
+   The dynamic eval command handler in `redirects.rs` escaped `\`, `"`, `\n`, `\r`
+   but not `$` or `@` when building Perl double-quoted string literals from literal
+   text parts.  A literal `${` in the generated string (e.g. `"\\${”`) was
+   interpreted by Perl as `\` + `${` (variable interpolation start), causing a
+   syntax error.  Added `.replace(”$”, “\\$”).replace(”@”, “\\@”)` to both
+   escape blocks.  Fixed: `backslash-dollar-brace.sh`.
+
+4. **`# native Perl` comment swallowing closing `}` in eval handler** —
+   The `do` block generated for dynamic eval had `# native Perl` before the closing
+   `};`, making the `};` part of the comment.  Moved the `};` before the comment.
+   This was found while fixing Item 3; together they fixed `backslash-dollar-brace.sh`.
+
+5. **Missing `use IPC::Open3;` in generated Perl** —
+   `command_needs_ipc_open3` always returned `false`, saying "No commands need
+   IPC::Open3 anymore — all generate native Perl."  But the generator still uses
+   `open3` in many code paths (cat, pipeline, command substitution fallbacks).
+   Changed to always emit `use IPC::Open3;` (it's harmless when unused).
+   Fixed: `backslash-newline-dq.sh` and any other test using command substitutions
+   that fall back to open3.
+
+### Previously Fixed:
 
 1. **Literal `$` at end of double-quoted string caused Perl special-variable warnings** —
    `push_string_expr` in `words.rs` escaped `"` and `@` but not `$` when

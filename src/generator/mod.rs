@@ -310,7 +310,6 @@ impl Generator {
         // Analyze what imports and variables are needed
         let needs_basename = self.needs_basename_import(ast);
         let needs_exit_code = self.needs_exit_code_tracking(ast);
-        let needs_ipc_open3 = self.needs_ipc_open3(ast);
         let needs_file_find = self.needs_file_find_import(ast);
         let needs_digest_sha = self.needs_digest_sha_import(ast);
         let needs_file_path = self.needs_file_path_import(ast);
@@ -341,9 +340,9 @@ impl Generator {
             output.push_str("use File::Basename;\n");
         }
         // IPC::Open3 is used by command-substitution fallbacks and a few command generators.
-        if needs_ipc_open3 {
-            output.push_str("use IPC::Open3;\n");
-        }
+        // Many code paths in the generator use open3 for command substitutions that cannot
+        // be translated to native Perl.  Include it unconditionally (it's harmless when unused).
+        output.push_str("use IPC::Open3;\n");
         if needs_file_find {
             // No additional imports needed for glob-based approach
         }
@@ -2085,7 +2084,80 @@ impl Generator {
     /// Only commands that fall through to the external-system-call fallback
     /// need IPC::Open3.
     fn command_needs_ipc_open3(&self, _command: &Command) -> bool {
-        // No commands need IPC::Open3 anymore — all generate native Perl.
+        match _command {
+            Command::Simple(cmd) => {
+                // Check if any argument contains command substitution ($(...))
+                for arg in &cmd.args {
+                    if self.word_needs_ipc_open3(arg) {
+                        return true;
+                    }
+                }
+                // Check env_vars for command substitutions
+                for (_, val) in &cmd.env_vars {
+                    if self.word_needs_ipc_open3(val) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Command::Pipeline(p) => {
+                for c in &p.commands {
+                    if self.command_needs_ipc_open3(c) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Command::Redirect(r) => self.command_needs_ipc_open3(&r.command),
+            Command::Background(b) => self.command_needs_ipc_open3(b),
+            Command::Subshell(s) => self.command_needs_ipc_open3(s),
+            Command::Not(n) => self.command_needs_ipc_open3(n),
+            Command::If(if_stmt) => {
+                if self.command_needs_ipc_open3(&if_stmt.then_branch) {
+                    return true;
+                }
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    if self.command_needs_ipc_open3(else_branch) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Command::For(for_cmd) => {
+                self.command_needs_command_sub(&for_cmd.body)
+            }
+            Command::While(while_cmd) => {
+                self.command_needs_command_sub(&while_cmd.body)
+            }
+            Command::Function(func) => {
+                for c in &func.body.commands {
+                    if self.command_needs_ipc_open3(c) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Command::Case(case_cmd) => {
+                for clause in &case_cmd.cases {
+                    for c in &clause.body {
+                        if self.command_needs_ipc_open3(c) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Helper: check if any command in a Block needs IPC::Open3
+    fn command_needs_command_sub(&self, block: &Block) -> bool {
+        for c in &block.commands {
+            if self.command_needs_ipc_open3(c) {
+                return true;
+            }
+        }
         false
     }
 
