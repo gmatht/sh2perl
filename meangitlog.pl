@@ -3,31 +3,36 @@ use strict;
 use warnings;
 use Term::ANSIColor qw(colored);
 
-# Colored git log.  Commits whose diff is ONLY numeric/ID changes
-# are shown dimmed.  Everything else shows its patch (-p style).
+# Colored git log showing changes to examples.out/, piped through less -R.
+# Commits whose diff is ONLY numeric/ID changes are dimmed.
+# Everything else shows its patch (-p style).
 #
 # Usage: perl meangitlog.pl [git-log-options]
-#   Default: -20, showing patches for meaningful commits.
+#   Default: -20, showing only examples.out/ changes.
 
 my @git_args = @ARGV ? @ARGV : ('-20');
+my @pathspec = ('--', 'examples.out/');
 
 my $format = '%H|%ad|%s|%an';
 my $datefmt = '--date=format:%Y-%m-%d %H:%M';
 
-open my $fh, '-|', 'git', 'log', @git_args, "--format=format:$format", $datefmt
+# Collect all output first, then pipe through less -R
+my $output = '';
+
+open my $lfh, '-|', 'git', 'log', @git_args, "--format=format:$format", $datefmt, @pathspec
     or die "Cannot run git log: $!";
 
 my @entries;
-while (<$fh>) {
+while (<$lfh>) {
     chomp;
     my ($sha, $date, $subject, $author) = split /\|/, $_, 4;
     push @entries, { sha => $sha, date => $date, subject => $subject, author => $author };
 }
-close $fh;
+close $lfh;
 
 for my $e (@entries) {
     my $sha = $e->{sha};
-    my $diff = `git diff '$sha^'..'$sha' 2>/dev/null`;
+    my $diff = `git diff '$sha^'..'$sha' -- 'examples.out/' 2>/dev/null`;
     my $is_noise = 1;
 
     if ($diff) {
@@ -54,33 +59,37 @@ for my $e (@entries) {
     my $sha8 = substr($sha, 0, 8);
 
     if ($is_noise) {
-        print colored("$sha8  $e->{date}  $e->{subject}  $e->{author}", 'bright_black'), "\n";
+        $output .= colored("$sha8  $e->{date}  $e->{subject}  $e->{author}", 'bright_black') . "\n";
     } else {
-        print colored($sha8, 'cyan'), '  ';
-        print colored($e->{date}, 'blue'), '  ';
-        print $e->{subject}, '  ';
-        print colored($e->{author}, 'bright_black'), "\n";
+        $output .= colored($sha8, 'cyan') . '  ';
+        $output .= colored($e->{date}, 'blue') . '  ';
+        $output .= $e->{subject} . '  ';
+        $output .= colored($e->{author}, 'bright_black') . "\n";
 
-        # Show the diff/patch for meaningful commits
         if ($diff) {
             for my $dline (split /\n/, $diff) {
                 if ($dline =~ /^diff --git/) {
-                    print colored($dline, 'magenta'), "\n";
+                    $output .= colored($dline, 'magenta') . "\n";
                 } elsif ($dline =~ /^--- /) {
-                    print colored($dline, 'red'), "\n";
+                    $output .= colored($dline, 'red') . "\n";
                 } elsif ($dline =~ /^\+\+\+ /) {
-                    print colored($dline, 'green'), "\n";
+                    $output .= colored($dline, 'green') . "\n";
                 } elsif ($dline =~ /^@@ /) {
-                    print colored($dline, 'cyan'), "\n";
+                    $output .= colored($dline, 'cyan') . "\n";
                 } elsif ($dline =~ /^\+/) {
-                    print colored($dline, 'green'), "\n";
+                    $output .= colored($dline, 'green') . "\n";
                 } elsif ($dline =~ /^-/) {
-                    print colored($dline, 'red'), "\n";
+                    $output .= colored($dline, 'red') . "\n";
                 } else {
-                    print "$dline\n";
+                    $output .= "$dline\n";
                 }
             }
         }
-        print "\n";
+        $output .= "\n";
     }
 }
+
+# Pipe through less -R for paging with color support
+open my $less, '|-', 'less', '-R' or die "Cannot run less: $!";
+print $less $output;
+close $less;
