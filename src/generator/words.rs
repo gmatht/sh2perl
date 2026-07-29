@@ -2279,7 +2279,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     "#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
                     "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
                     "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
-                    "0" => "$PROGRAM_NAME".to_string(), // $0 -> $PROGRAM_NAME (Perl::Critic compliant)
+                    "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                     _ => format!("${}", var),           // Regular variable
                 }
             }
@@ -2642,8 +2642,8 @@ pub fn convert_string_interpolation_to_perl_impl(
                         if var.chars().all(|c| c.is_digit(10)) {
                             let index = var.parse::<usize>().unwrap_or(0);
                             if index == 0 {
-                                // $0 is the script name
-                                current_string.push_str("$PROGRAM_NAME");
+                                // $0 is the script name; use $0 directly to avoid requiring the English module
+                                current_string.push_str("$0");
                             } else {
                                 // Convert $1 to $_[0], $2 to $_[1], etc.
                                 current_string.push_str(&format!("$_[{}]", index - 1));
