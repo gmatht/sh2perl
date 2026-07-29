@@ -1509,7 +1509,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             ),
                         );
                     }
-                    "test" => {
+                    "test" | "[" => {
                         // Use the test expression generator to produce native Perl code
                         // instead of shelling out to /usr/bin/test.
                         let mut test_output = String::new();
