@@ -1,6 +1,6 @@
 # Failing Test Notes
 
-## Current status: ~338/517 passed, ~179 failing
+## Current status: ~340/517 passed, ~177 failing
 
 ### Newly Fixed (this session):
 
@@ -36,6 +36,22 @@
    processing `Word::Literal`.  This avoids parser-level changes that caused
    regressions.
    Fixed: `dollar-followed-by-slash.sh` (the `\.flf` → `.flf` part).
+
+5. **`$!` (background PID) mapped to Perl `$!` (errno) instead of empty string** —
+   `$!` in bash is the PID of the last background process, which the generated
+   Perl doesn't simulate.  Added `"!" => "''"` to all special-variable match
+   blocks in `word_to_perl_impl` (`words.rs`), `perl_string_literal_impl`
+   (`utils.rs`), `echo.rs`, and `simple_commands.rs`.  In string interpolation
+   context (`convert_string_interpolation_to_perl_impl`), `$!` is silently
+   omitted (empty string) since no background PID tracking exists.
+   Fixed: `dollar-bang.sh`.
+
+6. **`echo` with command substitution missing trailing newline** —
+   The echo handler in `simple_commands.rs` skipped adding `\n` for command
+   substitution arguments, assuming the substitution result already contained
+   proper formatting.  Changed to use `IrStmt::Output` with `newline: true`,
+   which adds the trailing newline that bash's `echo` always produces.
+   Fixed: `008_simple_backup.sh`.
 
 ## Remaining failures (~186)
 
