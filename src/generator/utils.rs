@@ -209,14 +209,19 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 || s.contains('\\')
                 || s.contains('"')
             {
-                let escaped = s
-                    .replace("\\", "\\\\")
-                    .replace("\"", "\\\"")
-                    .replace("\n", "\\n")
-                    .replace("\t", "\\t")
-                    .replace("\r", "\\r")
-                    .replace("@", "\\@")
-                    .replace("$", "\\$");
+                let escaped = s.chars().map(|c| {
+                    match c {
+                        '\\' => "\\\\".to_string(),
+                        '"' => "\\\"".to_string(),
+                        '\n' => "\\n".to_string(),
+                        '\t' => "\\t".to_string(),
+                        '\r' => "\\r".to_string(),
+                        '@' => "\\@".to_string(),
+                        '$' => "\\$".to_string(),
+                        _ if c.is_ascii() => c.to_string(),
+                        _ => format!("\\x{{{:04X}}}", c as u32),
+                    }
+                }).collect::<Vec<_>>().join("");
                 format!("\"{}\"", escaped)
             } else {
                 // Use q{} for single characters to avoid "noisy quotes" violations
@@ -269,11 +274,33 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     if has_leading_zero {
                         // Use q{...} to avoid PPI parsing "07403" as octal.
                         // Escape braces inside the content.
-                        let escaped_q = s
-                            .replace("\\", "\\\\")
-                            .replace("{", "\\{")
-                            .replace("}", "\\}");
+                        let escaped_q = s.chars().map(|c| {
+                            match c {
+                                '\\' => "\\\\".to_string(),
+                                '{' => "\\{".to_string(),
+                                '}' => "\\}".to_string(),
+                                _ if c.is_ascii() => c.to_string(),
+                                _ => format!("\\x{{{:04X}}}", c as u32),
+                            }
+                        }).collect::<Vec<_>>().join("");
                         format!("q{{{}}}", escaped_q)
+                    } else if s.chars().any(|c| !c.is_ascii()) {
+                        // Non-ASCII characters: use double-quoted string with \x{...} escapes
+                        // so PPI does not choke on multi-byte UTF-8 sequences in the output.
+                        let escaped = s.chars().map(|c| {
+                            match c {
+                                '\\' => "\\\\".to_string(),
+                                '"' => "\\\"".to_string(),
+                                '\n' => "\\n".to_string(),
+                                '\t' => "\\t".to_string(),
+                                '\r' => "\\r".to_string(),
+                                '@' => "\\@".to_string(),
+                                '$' => "\\$".to_string(),
+                                _ if c.is_ascii() => c.to_string(),
+                                _ => format!("\\x{{{:04X}}}", c as u32),
+                            }
+                        }).collect::<Vec<_>>().join("");
+                        format!("\"{}\"", escaped)
                     } else {
                         let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
                         format!("'{}'", escaped)

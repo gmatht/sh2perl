@@ -359,6 +359,19 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
                 &Command::Redirect(redirect_cmd.clone()),
             )
         }
+        Command::BuiltinCommand(builtin_cmd) => {
+            // Serialize builtin commands (e.g. `set`, `shift`) into a bash string.
+            if builtin_cmd.args.is_empty() {
+                builtin_cmd.name.clone()
+            } else {
+                let args: Vec<String> = builtin_cmd
+                    .args
+                    .iter()
+                    .map(|arg| word_to_bash_string_for_system(generator, arg))
+                    .collect();
+                format!("{} {}", builtin_cmd.name, args.join(" "))
+            }
+        }
         _ => {
             // For complex commands that can't be converted to simple shell commands,
             // we should not be called. This indicates a design issue.

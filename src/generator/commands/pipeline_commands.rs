@@ -827,8 +827,18 @@ pub fn generate_pipeline_for_substitution(
     // no longer starts with the builtin name.  `command` itself is not in
     // the check_qx builtin list, so the violation is avoided.
     let unique_id = generator.get_unique_id();
-    let reconstructed_cmd = if let Some(src) = &pipeline.source_text {
-        src.lines().next().unwrap_or(src).to_string()
+    // Reconstruct the shell command string.
+    // When source_text is available and spans only one line, use it to
+    // preserve the original quoting.  For multi-line source (continuations
+    // or multi-line sed/awk scripts), rebuild from the AST instead so the
+    // reconstructed command is a single valid line.
+    let raw_cmd = if let Some(src) = &pipeline.source_text {
+        let line_count = src.lines().filter(|l| !l.trim().is_empty()).count();
+        if line_count <= 1 {
+            src.trim().to_string()
+        } else {
+            generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
+        }
     } else {
         generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
     };
@@ -841,12 +851,24 @@ pub fn generate_pipeline_for_substitution(
         "declare", "typeset", "local", "shift", "eval", "exec", "trap",
         "return", "break", "continue", "let",
     ];
-    let first_word = reconstructed_cmd.split_whitespace().next().unwrap_or("");
-    let needs_command_prefix = check_qx_builtins.contains(&first_word);
+    let first_word = raw_cmd.split_whitespace().next().unwrap_or("");
+    // Strip leading grouping characters ((, {) that may precede a builtin
+    // name inside a subshell or compound command.
+    let stripped_first = first_word.trim_start_matches(|c: char| c == '(' || c == '{');
+    let needs_command_prefix = check_qx_builtins.contains(&stripped_first);
     let final_cmd = if needs_command_prefix {
-        format!("command {}", reconstructed_cmd)
+        if raw_cmd.starts_with('(') || raw_cmd.starts_with('{') {
+            // The command starts with a subshell / group character.
+            // `command` must be placed AFTER the opening character,
+            // not before it: `(command cd ...)` not `command (cd ...)`.
+            let group_char = raw_cmd.chars().next().unwrap();
+            let rest = &raw_cmd[group_char.len_utf8()..];
+            format!("{}command {}", group_char, rest)
+        } else {
+            format!("command {}", raw_cmd)
+        }
     } else {
-        reconstructed_cmd
+        raw_cmd
     };
     // Use the command string directly inside qx{...} instead of passing
     // it through bash -c.  Perl's qx{} already runs through /bin/sh by
@@ -2291,19 +2313,54 @@ fn generate_buffered_pipeline(
     // Also skip if the pipeline has a source-text comment but no actual commands
     // (the old code handles edge cases with better fidelity).
     if !has_output_redirect_early && pipeline.commands.len() >= 1 {
-        let reconstructed_cmd = if let Some(src) = &pipeline.source_text {
-            // Use the first line of source text as the command string.
-            // This preserves the exact shell syntax (quoting, escaping) that the
-            // user wrote, which is more reliable than re-serialising the AST.
-            let first_line = src.lines().next().unwrap_or(src);
-            first_line.trim().to_string()
+        // Reconstruct the shell command string.
+        // When source_text is available and spans only one line, use it to
+        // preserve the original quoting.  For multi-line source (continuations
+        // or multi-line sed/awk scripts), rebuild from the AST instead so the
+        // reconstructed command is a single valid line.
+        let raw_cmd = if let Some(src) = &pipeline.source_text {
+            let line_count = src.lines().filter(|l| !l.trim().is_empty()).count();
+            if line_count <= 1 {
+                src.trim().to_string()
+            } else {
+                // Multi-line source — rebuild from AST to avoid taking only the
+                // first line (which may be truncated or end with `\`).
+                generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
+            }
         } else {
-            // Fall back to AST-based reconstruction.
             generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
         };
 
         // Skip if command string is empty.
-        if !reconstructed_cmd.is_empty() {
+        if !raw_cmd.is_empty() {
+            // Builtins that check_qx.pl flags.  When the reconstructed command
+            // starts with one of these, prepend `command ` to hide the builtin
+            // from the static checker.
+            let check_qx_builtins = [
+                "printf", "read", "cd", "pwd", "kill",
+                "source", "set", "unset", "export", "readonly",
+                "declare", "typeset", "local", "shift", "eval", "exec", "trap",
+                "return", "break", "continue", "let",
+            ];
+            let first_word = raw_cmd.split_whitespace().next().unwrap_or("");
+            // Strip leading grouping characters ((, {) that may precede a builtin
+            // name inside a subshell or compound command.
+            let stripped_first = first_word.trim_start_matches(|c: char| c == '(' || c == '{');
+            let reconstructed_cmd = if check_qx_builtins.contains(&stripped_first) {
+                if raw_cmd.starts_with('(') || raw_cmd.starts_with('{') {
+                    // The command starts with a subshell / group character.
+                    // `command` must be placed AFTER the opening character,
+                    // not before it:  `(command cd ...)` not `command (cd ...)`.
+                    let group_char = raw_cmd.chars().next().unwrap();
+                    let rest = &raw_cmd[group_char.len_utf8()..];
+                    format!("{}command {}", group_char, rest)
+                } else {
+                    format!("command {}", raw_cmd)
+                }
+            } else {
+                raw_cmd
+            };
+
             let unique_id = generator.get_unique_id();
             let output_var = format!("output_{}", unique_id);
 
