@@ -1,11 +1,24 @@
 // Helper method for escaping Perl strings
 pub fn escape_perl_string(s: &str) -> String {
-    s.replace("\\", "\\\\")
-        .replace("\"", "\\\"")
-        .replace("\n", "\\n")
-        .replace("\t", "\\t")
-        .replace("\r", "\\r")
-        .replace("@", "\\@")
+    let mut result = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => result.push_str("\\\\"),
+            '"' => result.push_str("\\\""),
+            '\n' => result.push_str("\\n"),
+            '\t' => result.push_str("\\t"),
+            '\r' => result.push_str("\\r"),
+            '@' => result.push_str("\\@"),
+            _ if ch.is_ascii() => result.push(ch),
+            _ => {
+                // Escape non-ASCII characters as \x{...} so that the generated
+                // Perl source remains pure ASCII and PPI does not choke on
+                // multi-byte UTF-8 sequences.
+                result.push_str(&format!("\\x{{{:04X}}}", ch as u32));
+            }
+        }
+    }
+    result
 }
 
 /// Render a Perl string expression without emitting banned source substrings.
