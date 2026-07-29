@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+$PROGRAM_NAME = '039_process_substitution_here.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -21,4 +22,3 @@ print $grep_result_0;
 print "\n";
 $CHILD_ERROR = scalar @grep_filtered_0 > 0 ? 0 : 1;
 print "exit: ${\($? >> 8)}\n";
-

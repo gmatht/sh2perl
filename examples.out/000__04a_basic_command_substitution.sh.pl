@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$PROGRAM_NAME = '000__04a_basic_command_substitution.sh';
 print "=== Basic Command Substitution ===\n";
 print "Current date: " . (do {
 require POSIX; POSIX::strftime('%Y', localtime())
@@ -23,4 +24,3 @@ my $current_dir = do {
 print "Stored date: $current_date\n";
 print "Stored directory: $current_dir\n";
 print "=== Basic Command Substitution Complete ===\n";
-

@@ -20,6 +20,7 @@ sub capture_stdout {
 
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__02_output_formatting_commands.sh';
 print "=== Output and Formatting Commands ===\n";
 my $echo_result = "Hello from backticks";
 print "Echo result: $echo_result\n";
@@ -99,4 +100,3 @@ my $perl_result = do {
 print "Perl result: $perl_result\n";
 unlink('test_checksum.txt');
 unlink('test_tee.txt');
-

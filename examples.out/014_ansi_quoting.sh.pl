@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 my $output         = q{};
+$PROGRAM_NAME = '014_ansi_quoting.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -28,4 +29,3 @@ print "== Practical examples ==\n";
 printf("%-10s %-10s %s\n", "Name", "Age", "City");
 printf("%-10s %-10s %s\n", "John", "25", "NYC");
 printf("%-10s %-10s %s\n", "Jane", "30", "LA");
-

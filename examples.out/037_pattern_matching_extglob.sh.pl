@@ -5,8 +5,9 @@ my $main_exit_code = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
-my $f2;
+$PROGRAM_NAME = '037_pattern_matching_extglob.sh';
 my $f1;
+my $f2;
 
 $__set_e = 1;
 # set uo not implemented
@@ -28,4 +29,3 @@ if (!($f2 =~ /^(?!.*.*[.]min[.]js$).*[.]js$/ms)) {
 }
 
 exit $main_exit_code;
-

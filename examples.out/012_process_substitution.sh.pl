@@ -8,6 +8,7 @@ my $main_exit_code = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '012_process_substitution.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -32,11 +33,11 @@ my $output_ps_fh_2;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_0 = q{};
-    my $output_printed_0;
+    my $output_147 = q{};
+    my $output_printed_147;
     printf("a\nb\n");
-if ($output_0 ne q{} && !$output_printed_0) {
-    print $output_0;
+if ($output_147 ne q{} && !$output_printed_147) {
+    print $output_147;
 }
 }
 use File::Path qw(make_path);
@@ -51,11 +52,11 @@ my $output_ps_fh_3;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_3 or croak "Cannot redirect STDOUT";
-    my $output_2 = q{};
-    my $output_printed_2;
+    my $output_149 = q{};
+    my $output_printed_149;
     printf("b\nc\n");
-if ($output_2 ne q{} && !$output_printed_2) {
-    print $output_2;
+if ($output_149 ne q{} && !$output_printed_149) {
+    print $output_149;
 }
 }
 use File::Path qw(make_path);
@@ -100,11 +101,11 @@ my $output_ps_fh_4;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_4 or croak "Cannot redirect STDOUT";
-    my $output_4 = q{};
-    my $output_printed_4;
+    my $output_151 = q{};
+    my $output_printed_151;
     printf("x\ny\n");
-if ($output_4 ne q{} && !$output_printed_4) {
-    print $output_4;
+if ($output_151 ne q{} && !$output_printed_151) {
+    print $output_151;
 }
 }
 use File::Path qw(make_path);
@@ -130,11 +131,11 @@ my $output_ps_fh_5;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_5 or croak "Cannot redirect STDOUT";
-    my $output_7 = q{};
-    my $output_printed_7;
-    my $output_8 = qx{command echo -e "a\\nc\\nb" | sort};
-    chomp $output_8;
-    print $output_8, "\n";
+    my $output_154 = q{};
+    my $output_printed_154;
+    my $output_155 = qx{command echo -e "a\\nc\\nb" | sort};
+    chomp $output_155;
+    print $output_155, "\n";
 }
 use File::Path qw(make_path);
 my $temp_dir_fh_5 = dirname($temp_file_ps_fh_5);
@@ -148,11 +149,11 @@ my $output_ps_fh_6;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_6 or croak "Cannot redirect STDOUT";
-    my $output_9 = q{};
-    my $output_printed_9;
-    my $output_10 = qx{command echo -e "a\\nb\\nd" | sort};
-    chomp $output_10;
-    print $output_10, "\n";
+    my $output_156 = q{};
+    my $output_printed_156;
+    my $output_157 = qx{command echo -e "a\\nb\\nd" | sort};
+    chomp $output_157;
+    print $output_157, "\n";
 }
 use File::Path qw(make_path);
 my $temp_dir_fh_6 = dirname($temp_file_ps_fh_6);
@@ -174,11 +175,11 @@ my $output_ps_fh_7;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_7 or croak "Cannot redirect STDOUT";
-    my $output_11 = q{};
-    my $output_printed_11;
+    my $output_158 = q{};
+    my $output_printed_158;
     print "name1\nname2" . "\n";
-if ($output_11 ne q{} && !$output_printed_11) {
-    print $output_11;
+if ($output_158 ne q{} && !$output_printed_158) {
+    print $output_158;
 }
 }
 use File::Path qw(make_path);
@@ -193,11 +194,11 @@ my $output_ps_fh_8;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_8 or croak "Cannot redirect STDOUT";
-    my $output_12 = q{};
-    my $output_printed_12;
+    my $output_159 = q{};
+    my $output_printed_159;
     print "value1\nvalue2" . "\n";
-if ($output_12 ne q{} && !$output_printed_12) {
-    print $output_12;
+if ($output_159 ne q{} && !$output_printed_159) {
+    print $output_159;
 }
 }
 use File::Path qw(make_path);
@@ -207,7 +208,7 @@ open my $fh_ps_fh_8, '>', $temp_file_ps_fh_8 or croak "Cannot create temp file: 
 print {$fh_ps_fh_8} $output_ps_fh_8;
 close $fh_ps_fh_8 or croak "Close failed: $ERRNO\n";
 open STDIN, '<', $temp_file_ps_fh_8 or croak "Cannot open process substitution: $ERRNO\n";
-my $paste_result_13 = do {
+my $paste_result_160 = do {
 my @paste_file1_lines_fh_9;
 my @paste_file2_lines_fh_9;
 if (open my $fh1, '<', $temp_file_ps_fh_7) {
@@ -234,7 +235,6 @@ for my $i (0..$max_lines-1) {
 $paste_output
 }
 ;
-print $paste_result_13;
+print $paste_result_160;
 
 exit $main_exit_code;
-

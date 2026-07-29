@@ -4,6 +4,7 @@ use warnings;
 use IPC::Open3;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = 'readonly-cmdsub.sh';
 use strict;
 my $RC = q{0};
 
@@ -94,5 +95,4 @@ print "============================================================\n";
 capture("08-readonly-f-p", 'bash', '-c', "\n        f1() { :; }\n        f2() { :; }\n        readonly -f f1 f2\n        readonly -f -p | head -5\n    ");
 print "\n";
 print "All readonly demo sections completed.\n";
-
 

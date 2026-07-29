@@ -4,6 +4,7 @@ use warnings;
 use IPC::Open3;
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = 'id-cmdsub.sh';
 use strict;
 my $RC = q{0};
 
@@ -49,9 +50,6 @@ if ("${se}" ne q{}) {
     }
     print "\n";
 return $ec;
-    }
-    }
-    }
     return;
 }
 print "============================================================\n";
@@ -160,5 +158,4 @@ print "============================================================\n";
 capture("26-a", 'id', '-a');
 print "\n";
 print "All id demo sections completed.\n";
-
 

@@ -5,34 +5,35 @@ use IPC::Open3;
 use File::Path qw(make_path remove_tree);
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '000__06_text_processing_commands.sh';
 print "=== Text Processing Commands ===\n";
 my $file_content = do { chomp(my $_r = qx{command cat src/main.rs | head -5}); $_r; };
 print "First 5 lines of main.rs:\n";
 print $file_content, "\n";
-my $grep_result = do { my $grep_result_1;
-my @grep_lines_1 = ();
-my @grep_filenames_1 = ();
+my $grep_result = do { my $grep_result_114;
+my @grep_lines_114 = ();
+my @grep_filenames_114 = ();
 if (-e "src/main.rs") {
     open my $fh, '<', "src/main.rs" or croak "Cannot access file: $ERRNO";
     while (my $line = <$fh>) {
         chomp $line;
-        push @grep_lines_1, $line;
-        push @grep_filenames_1, "src/main.rs";
+        push @grep_lines_114, $line;
+        push @grep_filenames_114, "src/main.rs";
     }
     close $fh
         or croak "Close failed: $OS_ERROR";
 }
 else { print {*STDERR} "grep: src/main.rs: No such file or directory\n"; }
-my @grep_filtered_1 = grep { {fn} } @grep_lines_1;
-my @grep_numbered_1;
-for my $i (0..@grep_lines_1-1) {
-    if (scalar grep { $_ eq $grep_lines_1[$i] } @grep_filtered_1) {
-        push @grep_numbered_1, sprintf "%d:%s", $i + 1, $grep_lines_1[$i];
+my @grep_filtered_114 = grep { {fn} } @grep_lines_114;
+my @grep_numbered_114;
+for my $i (0..@grep_lines_114-1) {
+    if (scalar grep { $_ eq $grep_lines_114[$i] } @grep_filtered_114) {
+        push @grep_numbered_114, sprintf "%d:%s", $i + 1, $grep_lines_114[$i];
     }
 }
-$grep_result_1 = join "\n", @grep_numbered_1;
-$CHILD_ERROR = scalar @grep_filtered_1 > 0 ? 0 : 1;
- $grep_result_1; };
+$grep_result_114 = join "\n", @grep_numbered_114;
+$CHILD_ERROR = scalar @grep_filtered_114 > 0 ? 0 : 1;
+ $grep_result_114; };
 print "Lines containing 'fn':\n";
 print $grep_result, "\n";
 my $sed_result = do { chomp(my $_r = qx{command echo 'Hello World' | sed s/World/Universe/}); $_r; };
@@ -149,4 +150,3 @@ print "Xargs result:\n";
 print $xargs_result, "\n";
 unlink('file1.txt');
 unlink('file2.txt');
-

@@ -5,6 +5,7 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
 use File::Path qw(make_path remove_tree);
 use POSIX qw(time);
 my $ls_success     = 0;
+$PROGRAM_NAME = '011_brace_expansion.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -82,64 +83,64 @@ else {
           ": $ERRNO\n";
     }
 }
-my @ls_files_1 = ();
-my $ls_all_found_2 = 1;
-my @ls_inputs_3 = ();
-my @ls_glob_ls_inputs_3_0 = glob('file_*.txt');
-if ( !@ls_glob_ls_inputs_3_0 ) {
-    push @ls_inputs_3, 'file_*.txt';
-    $ls_all_found_2 = 0;
+my @ls_files_138 = ();
+my $ls_all_found_139 = 1;
+my @ls_inputs_140 = ();
+my @ls_glob_ls_inputs_140_0 = glob('file_*.txt');
+if ( !@ls_glob_ls_inputs_140_0 ) {
+    push @ls_inputs_140, 'file_*.txt';
+    $ls_all_found_139 = 0;
 } else {
-    push @ls_inputs_3, @ls_glob_ls_inputs_3_0;
+    push @ls_inputs_140, @ls_glob_ls_inputs_140_0;
 }
-my @ls_files_4 = ();
-my @ls_dirs_5 = ();
-my $ls_show_headers_6 = scalar(@ls_inputs_3) > 1;
-for my $ls_item_7 (@ls_inputs_3) {
-    if ( -f $ls_item_7 ) {
-        push @ls_files_4, $ls_item_7;
+my @ls_files_141 = ();
+my @ls_dirs_142 = ();
+my $ls_show_headers_143 = scalar(@ls_inputs_140) > 1;
+for my $ls_item_144 (@ls_inputs_140) {
+    if ( -f $ls_item_144 ) {
+        push @ls_files_141, $ls_item_144;
     }
-    elsif ( -d $ls_item_7 ) {
-        push @ls_dirs_5, $ls_item_7;
+    elsif ( -d $ls_item_144 ) {
+        push @ls_dirs_142, $ls_item_144;
     }
     else {
-        $ls_all_found_2 = 0;
+        $ls_all_found_139 = 0;
     }
 }
-@ls_files_4 = sort { $a cmp $b } @ls_files_4;
-@ls_dirs_5 = sort { $a cmp $b } @ls_dirs_5;
-if (@ls_files_4) {
-    push @ls_files_1, join("\n", @ls_files_4);
+@ls_files_141 = sort { $a cmp $b } @ls_files_141;
+@ls_dirs_142 = sort { $a cmp $b } @ls_dirs_142;
+if (@ls_files_141) {
+    push @ls_files_138, join("\n", @ls_files_141);
 }
-for my $ls_dir_8 (@ls_dirs_5) {
-    my @ls_dir_entries_9 = ();
-    if ( opendir my $dh, $ls_dir_8 ) {
+for my $ls_dir_145 (@ls_dirs_142) {
+    my @ls_dir_entries_146 = ();
+    if ( opendir my $dh, $ls_dir_145 ) {
         while ( my $file = readdir $dh ) {
             next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;
-            push @ls_dir_entries_9, $file;
+            push @ls_dir_entries_146, $file;
         }
         closedir $dh;
-        @ls_dir_entries_9 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}; $s } ] } @ls_dir_entries_9;
-        if ( $ls_show_headers_6 ) {
-            if ( @ls_dir_entries_9 ) {
-                push @ls_files_1, $ls_dir_8 . ":\n" . join("\n", @ls_dir_entries_9);
+        @ls_dir_entries_146 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}; $s } ] } @ls_dir_entries_146;
+        if ( $ls_show_headers_143 ) {
+            if ( @ls_dir_entries_146 ) {
+                push @ls_files_138, $ls_dir_145 . ":\n" . join("\n", @ls_dir_entries_146);
             } else {
-                push @ls_files_1, $ls_dir_8 . ':';
+                push @ls_files_138, $ls_dir_145 . ':';
             }
         }
-        elsif ( @ls_dir_entries_9 ) {
-            push @ls_files_1, join("\n", @ls_dir_entries_9);
+        elsif ( @ls_dir_entries_146 ) {
+            push @ls_files_138, join("\n", @ls_dir_entries_146);
         }
     }
     else {
-        $ls_all_found_2 = 0;
+        $ls_all_found_139 = 0;
     }
 }
-if (@ls_files_1) {
-    print join "\n", @ls_files_1;
+if (@ls_files_138) {
+    print join "\n", @ls_files_138;
     print "\n";
 }
-if ( $ls_all_found_2 ) {
+if ( $ls_all_found_139 ) {
     local $CHILD_ERROR = 0;
     $ls_success = 1;
 }
@@ -173,4 +174,3 @@ foreach my $file_to_remove (@files_to_remove) {
 }
 my $result = "'1 2 3 4 5'";
 print "brace_expand: $result\n";
-

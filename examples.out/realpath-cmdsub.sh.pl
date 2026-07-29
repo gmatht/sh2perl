@@ -7,6 +7,7 @@ my $main_exit_code = 0;
 my $output         = q{};
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = 'realpath-cmdsub.sh';
 # set -o nounset not implemented
 # set nounset not implemented
 
@@ -48,9 +49,9 @@ if ("$stdout" ne q{}) {
 if ("$stdout" =~ /^.*[$]'\x00'.*$/ms) {
 printf("  stdout (NUL\x{2011}terminated): ");
             # Original bash: printf '%s' "$stdout" | od -A n -t x1z
-my $output_4 = qx{command printf %s "$stdout" | od -An -t x1z};
-chomp $output_4;
-print $output_4, "\n";
+my $output_567 = qx{command printf %s "$stdout" | od -An -t x1z};
+chomp $output_567;
+print $output_567, "\n";
 printf("\n");
 }
         else {
@@ -95,15 +96,15 @@ print "==== --zero with two paths ====\
 ";
 printf("  \$ realpath --zero /bin /usr/bin/sh\n");
 
-my @_qx_cmd_13 = ('command realpath --zero /bin /usr/bin/sh');
-${} = do { chomp(my $_r_13 = qx{command $_qx_cmd_13[0]}); $_r_13; };
+my @_qx_cmd_576 = ('command realpath --zero /bin /usr/bin/sh');
+${} = do { chomp(my $_r_576 = qx{command $_qx_cmd_576[0]}); $_r_576; };
 my $rc_zero = $?;
 printf("  (raw output with NULs above; use od to verify):\n");
 printf('  ');
 # Original bash: realpath --zero /bin /usr/bin/sh | od -A n -t x1z | head -3
-my $output_16 = qx{command realpath --zero /bin /usr/bin/sh | od -An -t x1z | head -3};
-chomp $output_16;
-print $output_16, "\n";
+my $output_579 = qx{command realpath --zero /bin /usr/bin/sh | od -An -t x1z | head -3};
+chomp $output_579;
+print $output_579, "\n";
 printf("  exit code: %d\n\n", "$rc_zero");
 try('--quiet suppresses error message for a truly invalid path', 'realpath', '--quiet', '/nonexistent_dir_xyzzy/foo');
 if ($CHILD_ERROR != 0) {
@@ -116,4 +117,3 @@ if ($CHILD_ERROR != 0) {
 print "=== All tests completed ===\n";
 
 exit $main_exit_code;
-

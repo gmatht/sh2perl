@@ -1,42 +1,102 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use feature 'say';
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use IPC::Open3;
+use Digest::SHA   qw(sha256_hex sha512_hex);
+use File::Path    qw(make_path remove_tree);
+sub capture_stdout {
+    my ($code) = @_;
+    my $captured = q{};
+    {
+        local *STDOUT;
+        open STDOUT, '>', \$captured
+          or die "Cannot capture stdout: $OS_ERROR\n";
+        $code->();
+    }
+    return $captured;
+}
 
-my $output         = q{};
 our $CHILD_ERROR;
 
-$PROGRAM_NAME = '095_select_menu.sh';
-# Original bash: echo "select" | head -1
-do {
-    my $output_394 = q{};
-    my $output_printed_394;
-    my $pipeline_success_394 = 1;
-    $output_394 .= 'select' . "\n";
-if ( !($output_394 =~ m{\n\z}) ) { $output_394 .= "\n"; }
-
-        my $num_lines       = 1;
-    my $head_line_count = 0;
-    my $result          = q{};
-    my $input           = $output_394;
-    my $pos             = 0;
-    while ( $pos < length $input && $head_line_count < $num_lines ) {
-    my $line_end = index $input, "\n", $pos;
-    if ( $line_end == -1 ) {
-    $line_end = length $input;
+$PROGRAM_NAME = '000__02_output_formatting_commands.sh';
+print "=== Output and Formatting Commands ===\n";
+my $echo_result = "Hello from backticks";
+print "Echo result: $echo_result\n";
+my $printf_result = sprintf("Number: %d, String: %s\n", 42, "test");
+print "Printf result: $printf_result\n";
+print "=== Compression Commands ===\n";
+print "=== Network Commands ===\n";
+print "=== Process Management Commands ===\n";
+print "=== Checksum Commands ===\n";
+open my $fh, '>', 'test_checksum.txt' or die "test_checksum.txt: $!\n";
+print {*fh} "test content", "\n";
+close $fh;
+my $sha256_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha256_hex(
+            do {
+                local $/ = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $!";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $!";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
     }
-    my $head_line = substr $input, $pos, $line_end - $pos;
-    $result .= $head_line . "\n";
-    $pos = $line_end + 1;
-    ++$head_line_count;
+    else {
+        push @results,
+"0000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
     }
-    $output_394 = $result;
-    if ($output_394 ne q{} && !defined $output_printed_394) {
-        print $output_394;
-        if (!($output_394 =~ m{\n\z})) {
-            print "\n";
-        }
+    join("\n", @results) . "\n";
+};
+print "SHA256 result: $sha256_result\n";
+my $sha512_result = do {
+    my @results;
+    if ( -f 'test_checksum.txt' ) {
+        my $hash = sha512_hex(
+            do {
+                local $/ = undef;
+                open my $fh, '<', 'test_checksum.txt'
+                  or croak "Cannot open 'test_checksum.txt': $!";
+                my $content = <$fh>;
+                close $fh
+                  or croak "Close failed: $!";
+                $content;
+            }
+        );
+        push @results, "$hash  test_checksum.txt";
     }
-    if ( !$pipeline_success_394 ) { $main_exit_code = 1; }
+    else {
+        push @results,
+"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  test_checksum.txt  FAILED open or read";
     }
+    join("\n", @results) . "\n";
+};
+print "SHA512 result: $sha512_result\n";
+my $strings_result = do { chomp(my $_r = qx{command strings test_binary.txt | head -3}); $_r; };
+print "Strings result:\n";
+print $strings_result, "\n";
+print "=== I/O Redirection Commands ===\n";
+my $tee_result = do { chomp(my $_r = qx{command echo 'test output' | tee test_tee.txt}); $_r; };
+print "Tee result: $tee_result\n";
+print "=== Perl Command ===\n";
+my $perl_result = do {
+    my $result;
+    my $eval_success = eval {
+        $result = capture_stdout( sub { print "Hello from Perl\n" } );
+        1;
+    };
+    if ( !$eval_success ) {
+        $result = "Error executing Perl code: $EVAL_ERROR";
+    }
+    $result;
+};
+print "Perl result: $perl_result\n";
+unlink('test_checksum.txt');
+unlink('test_tee.txt');

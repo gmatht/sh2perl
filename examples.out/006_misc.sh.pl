@@ -6,6 +6,7 @@ use IPC::Open3;
 my $output         = q{};
 our $CHILD_ERROR;
 
+$PROGRAM_NAME = '006_misc.sh';
 print "== Subshell ==\n";
 do {
     local %ENV = %ENV;
@@ -15,8 +16,7 @@ do {
 };
 print "== Simple pipeline ==\n";
 # Original bash: echo "alpha beta" | grep beta
-my $output_0 = qx{command echo 'alpha beta' | grep beta};
-chomp $output_0;
-print $output_0, "\n";
+my $output_132 = qx{command echo 'alpha beta' | grep beta};
+chomp $output_132;
+print $output_132, "\n";
 print "exit: ${\($? >> 8)}\n";
-

@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$PROGRAM_NAME = '000__07_find_path_commands.sh';
 my $found_files = do {
     require File::Find;
     my @find_results = ();
@@ -14,4 +15,3 @@ my $found_files = do {
 };
 print "Found shell scripts:\n";
 print $found_files, "\n";
-
