@@ -455,7 +455,8 @@ pub fn test_file_equivalence_with_critic(
                 }
             }
 
-            let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
+            let safe_name = filename.replace(['/', '\\', ' ', '(', ')', '\''], "_");
+            let tmp = std::env::temp_dir().join(format!("__tmp_{}", safe_name));
             let tmp_str = tmp.to_string_lossy().to_string();
             if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) {
                 return Err(format!("Failed to write Perl temp file: {}", e));
@@ -731,7 +732,8 @@ pub fn test_file_equivalence_detailed_with_critic(
         }
 
         // Also create a temporary file for execution
-        let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
+        let safe_name = filename.replace(['/', '\\', ' ', '(', ')', '\''], "_");
+        let tmp = std::env::temp_dir().join(format!("__tmp_{}", safe_name));
         let tmp_str = tmp.to_string_lossy().to_string();
         if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &translated_code) {
             return Err(format!("Failed to write Perl temp file: {}", e));
@@ -909,7 +911,8 @@ pub fn test_file_equivalence_detailed_with_critic(
                 }
 
                 // Also create a temporary file for execution
-                let tmp = std::env::temp_dir().join("__tmp_test_output.pl");
+                let safe_name = filename.replace(['/', '\\', ' ', '(', ')', '\''], "_");
+                let tmp = std::env::temp_dir().join(format!("__tmp_{}", safe_name));
                 let tmp_str = tmp.to_string_lossy().to_string();
                 if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) {
                     return Err(format!("Failed to write Perl temp file: {}", e));

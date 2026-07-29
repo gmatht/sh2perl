@@ -413,10 +413,13 @@ impl Generator {
             output.push_str("\n");
         }
 
-        // Set $PROGRAM_NAME to original script name if available for $0 compatibility
+        // Set $0 to original script name if available for $0 compatibility
+        // Always use $0 directly to avoid requiring the English module;
+        // if the English module is already imported, $PROGRAM_NAME is an alias
+        // for $0 so the assignment works regardless.
         if let Some(ref script_name) = self.original_script_name {
             let escaped = script_name.replace("\\", "\\\\").replace("'", "\\'");
-            output.push_str(&format!("$PROGRAM_NAME = '{}';\n", escaped));
+            output.push_str(&format!("$0 = '{}';\n", escaped));
         }
 
         // Add declarations for variables that are used in arithmetic expressions.
@@ -1746,10 +1749,10 @@ impl Generator {
     /// Check if a specific command needs exit code tracking
     fn command_needs_exit_code_tracking(&self, command: &Command) -> bool {
         match command {
-            Command::Pipeline(pipeline) => {
-                // Only complex pipelines need exit code tracking
-                // Simple pipelines like "cmd1 | cmd2" don't need it
-                pipeline.commands.len() > 2
+            Command::Pipeline(_pipeline) => {
+                // All pipelines go through generate_buffered_pipeline which may
+                // reference $main_exit_code via the pipeline_success tracking code.
+                true
             }
             Command::And(_left, _right) | Command::Or(_left, _right) => {
                 // Logical operators need exit code tracking
