@@ -3,3 +3,5 @@
 shopt -q -s extglob
 shopt -q -u extglob
 printf "parsed OK\\n"
+
+echo "done: $?"

@@ -5,3 +5,5 @@ if [ -f /etc/config ]; then
     . /etc/config
     source /etc/profile
 fi
+
+echo "exit: $?"

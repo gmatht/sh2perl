@@ -607,19 +607,50 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 &*while_loop.condition,
                 Command::Simple(cmd) if cmd.name == "let"
             );
-            output.push_str(&format!("{} (", loop_keyword));
             generator.suppress_set_e_depth += 1;
-            let mut cond = generator.generate_command(&while_loop.condition);
+            let cond_raw = generator.generate_command(&while_loop.condition);
             generator.suppress_set_e_depth -= 1;
-            let cond = cond
-                .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
-                .to_string();
-            if is_let {
-                output.push_str(&format!("!({})", cond));
+            // If the generated condition spans multiple lines (contains newlines)
+            // it is a multi-statement expression (e.g. array init + system call).
+            // Such expressions cannot be placed directly inside while(...) — they
+            // must be wrapped in a do { ... } block with an exit-code check.
+            let cond_has_newline = cond_raw.contains('\n');
+            if cond_has_newline {
+                // Multi-statement condition: wrap in do { ... } and check exit code
+                output.push_str(&format!("{} (do {{\n", loop_keyword));
+                generator.indent_level += 1;
+                for line in cond_raw.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        output.push_str(&generator.indent());
+                        output.push_str(trimmed);
+                        // Ensure each statement ends with ;
+                        if !trimmed.ends_with(';') {
+                            output.push(';');
+                        }
+                        output.push('\n');
+                    }
+                }
+                // The last expression in the do block must be truthy when the
+                // command succeeds (exit code 0). $main_exit_code holds the
+                // exit code from the system() call generated above; use it.
+                output.push_str(&generator.indent());
+                output.push_str("$main_exit_code == 0\n");
+                generator.indent_level -= 1;
+                output.push_str(&generator.indent());
+                output.push_str("}) {\n");
+            } else if is_let {
+                let cond = cond_raw
+                    .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
+                    .to_string();
+                output.push_str(&format!("{} (!({})) {{\n", loop_keyword, cond));
             } else {
-                output.push_str(&cond);
+                // Single-statement condition: use directly
+                let cond = cond_raw
+                    .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
+                    .to_string();
+                output.push_str(&format!("{} ({}) {{\n", loop_keyword, cond));
             }
-            output.push_str(") {\n");
             // Generate body
             generator.indent_level += 1;
             output.push_str(&generator.generate_block_commands(&while_loop.body));
@@ -1266,15 +1297,13 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     // The closing `}` we emit below only closes the function `sub { ... }`
     // itself; any surplus `{` inside the body would make perlcritic report
     // "Nested named subroutine" for subs defined later.
-    {
-        let body_text = &output[saved_output_len..];
-        let opens = body_text.chars().filter(|&c| c == '{').count();
-        let closes = body_text.chars().filter(|&c| c == '}').count();
-        for _ in 0..(opens.saturating_sub(closes)) {
-            output.push_str(&generator.indent());
-            output.push_str("}\n");
-        }
-    }
+    //
+    // NOTE: This brace balancing is currently disabled because it was adding
+    // spurious `;` and `}` lines due to miscounting braces inside Perl string
+    // literals.  The individual command generators should produce balanced
+    // code; if they don't, a real imbalance will be caught by the Perl
+    // interpreter (syntax error).
+
 
     // Restore nesting depth
     generator.fn_nesting_depth -= 1;
@@ -1304,6 +1333,106 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     }
 
     output
+}
+
+/// Count structural `{` and `}` in a Perl code snippet, ignoring braces that
+/// appear inside string literals (single-quoted, double-quoted, q//, qq//,
+/// qx//, etc.).  This avoids false imbalances caused by format strings or
+/// embedded code like `print "...{...}\n";`.
+fn count_structural_braces(code: &str) -> (usize, usize) {
+    let mut opens = 0usize;
+    let mut closes = 0usize;
+    let mut in_string = false;
+    let mut string_delim: Option<char> = None;  // None means not in string
+    let mut in_comment = false;
+    // We use a simple state machine over characters.
+    // This is not a full Perl tokenizer, but it handles the common cases
+    // found in generated code.
+    let mut chars = code.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        if in_comment {
+            if ch == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if let Some(delim) = string_delim {
+            // Inside a string literal
+            if ch == '\\' {
+                // Skip escaped character
+                chars.next();
+                continue;
+            }
+            if ch == delim {
+                in_string = false;
+                string_delim = None;
+                // Check if q// style: after closing delimiter, expect whitespace
+                // or ; etc.
+            }
+            // All other chars are just string content — skip them.
+            continue;
+        }
+        // Not in a string
+        let uc = ch as u8;
+        if uc == b'#' {
+            in_comment = true;
+        } else if uc == 0x27 {
+            // Single-quoted string
+            string_delim = Some(ch);
+        } else if uc == 0x22 {
+            // Double-quoted string
+            string_delim = Some(ch);
+        } else if uc == b'q' || uc == b'Q' {
+            // q//, qq//, qx//, qw//, etc.
+            if let Some(&(_, next)) = chars.peek() {
+                if next == 'x' || next == 'q' || next == 'w' || next == 'r' {
+                    chars.next(); // consume the x/q/w/r
+                }
+                if let Some(&(_, brace)) = chars.peek() {
+                    let delim = match brace {
+                        '(' => Some(')'),
+                        '{' => Some('}'),
+                        '[' => Some(']'),
+                        '<' => Some('>'),
+                        _ => Some(brace),
+                    };
+                    if let Some(d) = delim {
+                        chars.next(); // consume opening delimiter
+                        string_delim = Some(d);
+                    }
+                }
+            }
+        } else if uc == b'm' || uc == b's' || uc == b'y' || uc == b't' {
+            // m//, s///, y///, tr///
+            if let Some(&(_, next)) = chars.peek() {
+                if next == 'r' && (ch == 'y' || ch == 't') {
+                    chars.next(); // consume 'r' in yr/tr
+                }
+                let delim = match next {
+                    '(' => Some(')'),
+                    '{' => Some('}'),
+                    '[' => Some(']'),
+                    '<' => Some('>'),
+                    _ => Some(next),
+                };
+                if let Some(d) = delim {
+                    chars.next(); // consume opening delimiter
+                    if ch == 's' {
+                        string_delim = Some(d);
+                    } else if ch == 'y' || ch == 't' {
+                        string_delim = Some(d);
+                    } else {
+                        string_delim = Some(d);
+                    }
+                }
+            }
+        } else if uc == b'{' {
+            opens += 1;
+        } else if uc == b'}' {
+            closes += 1;
+        }
+    }
+    (opens, closes)
 }
 
 fn check_function_uses_positional_params(block: &Block) -> bool {

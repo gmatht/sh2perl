@@ -7,3 +7,6 @@ while true; do
     break
   fi
 done
+
+result="ok"
+echo "status: ${result}"

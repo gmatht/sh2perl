@@ -2,3 +2,5 @@
 f() {
     true && return && echo done
 }
+
+echo "exit: $?"

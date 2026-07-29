@@ -3,3 +3,5 @@
 if test -t 1; then
     echo "stdout is a terminal"
 fi
+
+echo "exit: $?"

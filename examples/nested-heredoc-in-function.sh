@@ -6,3 +6,5 @@ show_help () {
 	EOF
 }
 show_help
+
+echo "exit: $?"

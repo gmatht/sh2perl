@@ -3,3 +3,5 @@ f() {
     return 0 | cat
 }
 printf "parsed OK\\n"
+
+echo "exit: $?"

@@ -3,3 +3,5 @@
 func() {
   echo hello
 }
+
+echo "exit: $?"

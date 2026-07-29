@@ -20,3 +20,6 @@ echo "== Practical examples =="
 touch file_{001..005}.txt
 ls file_*.txt
 rm file_*.txt
+
+result=$(echo {1..5})
+echo "brace_expand: $result"

@@ -3,3 +3,5 @@
 cat <<EOF
 hello world
 EOF
+
+echo "exit: $?"

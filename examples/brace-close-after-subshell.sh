@@ -6,3 +6,5 @@ foo() {
     )
     return 0
 }
+
+echo "exit: $?"

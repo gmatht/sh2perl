@@ -2,3 +2,5 @@
 {
   echo "hello"
 }
+
+echo "exit: $?"

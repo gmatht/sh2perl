@@ -5,3 +5,6 @@
 if [[ -d /path1 ]] || [[ -d /path2 ]] || [[ -d /path3 ]]; then
     echo "found"
 fi
+
+result="ok"
+echo "status: ${result}"

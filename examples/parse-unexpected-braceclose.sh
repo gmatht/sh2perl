@@ -4,3 +4,5 @@
 echo "hello"
 }
 # This } above is outside any block
+
+echo "done: $?"

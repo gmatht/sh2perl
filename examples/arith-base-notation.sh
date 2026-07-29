@@ -4,3 +4,5 @@ f() {
     ((10#x > 5))
 }
 printf "parsed OK\\n"
+
+echo "exit: $?"

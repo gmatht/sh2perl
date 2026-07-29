@@ -27,3 +27,7 @@ grep -q "pattern" temp_file.txt && echo "found" || echo "not found"
 
 # Cleanup
 rm temp_file.txt
+
+matched=$(grep -c ".*" <<< "test")
+echo "  grep_exit: $?"
+echo "  match_count: $matched"

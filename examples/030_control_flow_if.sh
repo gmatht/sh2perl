@@ -6,3 +6,5 @@ if [ -f "file.txt" ]; then
 else
     echo "File does not exist"
 fi
+
+echo "exit: $?"

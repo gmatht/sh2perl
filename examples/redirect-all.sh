@@ -3,3 +3,5 @@
 if ! command -v nonexistent &> /dev/null; then
     echo "not found"
 fi
+
+echo "exit: $?"

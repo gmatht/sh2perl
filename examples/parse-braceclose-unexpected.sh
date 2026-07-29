@@ -3,3 +3,5 @@
 fmt_underline() {
   echo "test"
 }
+
+echo "exit: $?"

@@ -6,3 +6,5 @@ first line
 second line
 EOF
 echo "after"
+
+echo "done: $?"

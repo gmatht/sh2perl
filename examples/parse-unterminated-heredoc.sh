@@ -4,3 +4,5 @@
 cat << EOF
 hello world
 this line is not terminated
+
+echo "done: $?"

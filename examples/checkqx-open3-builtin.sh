@@ -4,3 +4,5 @@
 cp file1.txt file2.txt
 ps aux
 printf "parsed OK\\n"
+
+echo "done: $?"

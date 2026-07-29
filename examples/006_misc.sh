@@ -7,3 +7,5 @@ echo "== Simple pipeline =="
 echo "alpha beta" | grep beta
 
 
+
+echo "exit: $?"

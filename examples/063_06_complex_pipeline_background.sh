@@ -5,3 +5,5 @@
 (sleep 2; echo "Processing") &
 wait
 echo "All done"
+
+echo "exit: $?"

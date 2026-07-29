@@ -5,3 +5,5 @@ if ! true; then
     echo "false"
 fi
 ! grep -q foo /dev/null
+
+echo "exit: $?"
