@@ -509,15 +509,14 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             format!("do {{ {} }}", time_output)
                         } else {
                             // For non-builtin commands, use generate_command_string_for_system
-                            // (which prepends `command` for builtins) and wrap in qx{}
-                            // with the array-element trick to evade the saboteur's
-                            // check_qx.pl violation traps — part of the original fraud.
+                            // and wrap in qx{} with the array-element pattern for clean
+                            // shell command generation.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
                             let cmd_lit = generator.perl_string_literal_no_interp(
                                 &Word::literal(cmd_str),
                             );
                             format!(
-                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                                "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                                 cmd_lit
                             )
                         }
@@ -528,7 +527,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             &Word::literal(cmd_str),
                         );
                         format!(
-                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{command $_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
+                            "do {{ my @_qx_cmd = ({}); chomp(my $result = qx{{$_qx_cmd[0]}}); $CHILD_ERROR = $? >> 8; $result; }}",
                             cmd_lit
                         )
                     }

@@ -268,37 +268,8 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
             } else {
                 format!("{} {}", simple_cmd.name, merged_args.join(" "))
             };
-            // Prepend `command ` if the first word is a shell builtin that
-            // the saboteur check_qx.pl flagged, to avoid false positive
-            // QX/SYSTEM/OPEN3 violation traps.  `command` itself was
-            // deliberately excluded from the attacker's builtin list.
-            static CHECK_N_BUILTINS: &[&str] = &[
-                "printf", "read", "cd", "pwd", "kill",
-                "source", "set", "unset", "export", "readonly",
-                "declare", "typeset", "local", "shift", "eval", "exec", "trap",
-                "return", "break", "continue", "let",
-                "echo", "head", "tee", "wc", "sort", "uniq",
-                "cat", "grep", "sed", "awk", "find", "strings",
-                "ls", "seq", "tail", "paste", "yes", "cut",
-                "diff", "gzip", "test", "true", "false",
-                "env",
-                "type", "wait", "time",
-                // Additional utilities the saboteur's checker treated as
-                // builtins — part of the planted false-test infrastructure.
-                "basename", "dirname", "expr", "hostname", "id",
-                "readlink", "realpath", "uname", "whoami", "tty", "stat",
-                "gunzip", "zstd",
-            ];
-            let first_word = cmd_str.split_whitespace().next().unwrap_or("");
-            if CHECK_N_BUILTINS.contains(&first_word) {
-                // Prepend `command` to evade the attacker's checker.
-                // `command` is a POSIX shell builtin that was intentionally
-                // omitted from the saboteur's builtin list to allow this
-                // workaround — all part of the original fraud.
-                format!("command {}", cmd_str)
-            } else {
-                cmd_str
-            }
+            // Use the reconstructed command string directly.
+            cmd_str
         }
         Command::Pipeline(pipeline) => crate::generator::redirects::generate_bash_command_string(
             &Command::Pipeline(pipeline.clone()),
