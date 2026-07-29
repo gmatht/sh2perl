@@ -420,6 +420,27 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         out.push_str(&format!("{} = {};\n", lhs, rhs));
                     }
                 } else {
+                    // Detect compound assignment pattern: $x = $x op $y → $x op= $y
+                    if let IrExpr::BinOp { lhs: inner_lhs, op, rhs: inner_rhs } = expr {
+                        if let IrExpr::Var(name, _) = inner_lhs.as_ref() {
+                            if *name == *var {
+                                let compound_op = match op {
+                                    BinOpKind::Add => Some("+="),
+                                    BinOpKind::Sub => Some("-="),
+                                    BinOpKind::Mul => Some("*="),
+                                    BinOpKind::Div => Some("/="),
+                                    BinOpKind::Concat => Some(".="),
+                                    _ => None,
+                                };
+                                if let Some(op_str) = compound_op {
+                                    let inner_rhs_str = ir_expr_to_perl(inner_rhs);
+                                    emit_indent(out, indent);
+                                    out.push_str(&format!("{} {} {};\n", lhs, op_str, inner_rhs_str));
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     emit_indent(out, indent);
                     out.push_str(&format!("{} = {};\n", lhs, rhs));
                 }
@@ -814,7 +835,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 BinOpKind::Pow => " ** ",
                 BinOpKind::Concat => " . ",
                 BinOpKind::Eq => " == ",
-                BinOpKind::Ne => " !=",
+                BinOpKind::Ne => " ne ",
                 BinOpKind::Lt => " < ",
                 BinOpKind::Gt => " > ",
                 BinOpKind::Le => " <=",
@@ -837,6 +858,10 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             // the idiomatic `chomp $var;` (without parentheses).
             if func == "chomp" && args.len() == 1 {
                 format!("chomp {}", a)
+            // Special-case `join` to produce the idiomatic `join $sep, @list`
+            // (without parentheses) — the function-call parens add noise here.
+            } else if func == "join" && args.len() >= 2 {
+                format!("join {}", a)
             } else {
                 format!("{}({})", func, a)
             }
