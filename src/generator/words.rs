@@ -27,10 +27,31 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
         }).collect::<Vec<_>>().join("");
         format!("\"{}\"", escaped)
     } else {
-        let escaped = current_string
-            .replace('"', "\\\"")
-            .replace("@", "\\@");
-        format!("\"{}\"", escaped)
+        // Escape $, @, and " for Perl double-quoted strings.
+        // Only escape $ when it is NOT followed by a valid Perl identifier
+        // character or {, to preserve existing Perl interpolation markers
+        // that may remain in literal text from incomplete parser splits.
+        let mut result = String::with_capacity(current_string.len() + 8);
+        let bytes = current_string.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => { result.push_str("\\\""); }
+                b'@' => { result.push_str("\\@"); }
+                b'$' => {
+                    let next = if i + 1 < bytes.len() { Some(bytes[i + 1]) } else { None };
+                    let should_escape = match next {
+                        Some(b'a'..=b'z') | Some(b'A'..=b'Z') | Some(b'0'..=b'9') | Some(b'_') | Some(b'{') => false,
+                        _ => true,
+                    };
+                    if should_escape { result.push_str("\\$"); }
+                    else { result.push('$'); }
+                }
+                c => { result.push(c as char); }
+            }
+            i += 1;
+        }
+        format!("\"{}\"", result)
     };
 
     parts.push(rendered);
@@ -2308,6 +2329,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
                     "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
                     "$" => "$$".to_string(),         // $$ -> $$ (process ID)
+                    "?" => "($? >> 8)".to_string(), // $? -> exit code (>>8 converts wait status)
                     "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                     _ => {
                         // Shell positional parameters ($1, $2, …) map to

@@ -1,49 +1,41 @@
 # Failing Test Notes
 
-## Current status: ~329/517 passed, ~188 failing
+## Current status: ~338/517 passed, ~179 failing
 
 ### Newly Fixed (this session):
 
-1. **Broken `\n` in output string literals (`ir.rs`)** —
-   `try_embed_newline_in_string_literal` had malformed format strings where
-   `\n` (escaped backslash+n) was emitted as `\` + raw newline or as a
-   literal newline, breaking Perl code like `print "start\` + newline + `";`
-   instead of `print "start\n";`.  Fixed both the single-quoted and `q{...}`
-   branches to use `"print \"{}\n\";\n"` (matching the already-correct
-   double-quoted branch).  Fixed several tests that use `echo` with bare words.
+1. **Literal `$` at end of double-quoted string caused Perl special-variable warnings** —
+   `push_string_expr` in `words.rs` escaped `"` and `@` but not `$` when
+   building Perl double-quoted string literals from literal text parts.  A `$`
+   at end of string (e.g. `"hello$"`) became `"hello$"` which Perl interpreted
+   as the special variable `$"` or `$\`.  Added smart `$` escaping that only
+   escapes `$` when NOT followed by a valid Perl identifier character.
+   Fixed: `parse-dollar-end-of-string.sh`, `parse-dollar-at-end-of-line.sh`.
 
-2. **`true` builtin emitted `1;` instead of `0;` (`builtins.rs`)** —
-   The if-condition handler wraps conditions in `!()` to convert shell exit
-   codes (0=success) to Perl truth values (non-zero=truthy).  `true` should
-   produce exit code 0 so that `!(0)` evaluates to truthy.  Changed `true`
-   to emit `0;` instead of `1;`.  Fixed tests:
-   `parse-heredoc-in-if.sh`, `parse-heredoc-eof-unexpected.sh`,
-   `redirect-all.sh`.
+2. **Special shell variables `$?` and `$*` had incorrect Perl mappings** —
+   `$?` (exit code) was emitted as `$?` which is Perl's 16-bit wait status;
+   should be `($? >> 8)`.  `$*` (all args) was emitted as `$*` which is a
+   removed Perl special variable; should be `@ARGV`.  Fixed mappings in
+   `word_to_perl_impl` (`words.rs`), `perl_string_literal_impl` (`utils.rs`),
+   and all three echo-handler match blocks (`simple_commands.rs` x2,
+   `echo.rs` x1).  Fixed: `dollar-after-dollar.sh`.
 
-3. **`Command::Not` in if-conditions had wrong negation (`control_flow.rs`)** —
-   The `! cmd` handler wrapped the inner exit code in `!()` but the exit
-   code already maps correctly: 0 (inner success) is falsy, 1 (inner failure)
-   is truthy, matching the semantics of shell `!` (which enters then-branch
-   when the inner command fails).  Removed the `!()` wrapper.  Fixed:
-   `not-negation.sh`.
+3. **Unquoted `$` followed by non-identifier (e.g. `$//`) incorrectly split words** —
+   In the parser, `Token::Dollar` was not included in the contiguous bare-word
+   token merging inner loop, so `$` always created a word boundary even when
+   followed by a non-identifier (like `/`).  Added `Token::Dollar` to the inner
+   loop of both `parse_word` and `parse_word_no_newline_skip`.  When `$` is
+   followed by a non-identifier (not a variable name), it is consumed as a
+   literal character and merging continues.
+   Fixed: `dollar-followed-by-slash.sh` (the `$//` merging part).
 
-4. **`local` on lexical variables in subshells (`subshell_commands.rs`)** —
-   `IrStmt::Declare { local: true }` emitted `local $var = $var;` which
-   fails because Perl's `local` does not work on lexical (my) variables.
-   Changed to `local: false` so the IR emits `my $var = $var;` instead.
-   This creates a new lexical that shadows the outer one and is
-   automatically restored when the block exits — the same semantics as
-   a bash subshell.  Fixed: `049_local.sh`.
-
-5. **Positional parameters `$1`, `$2`, … in case statements (`words.rs`)** —
-   `word_to_perl_impl` for `Word::Variable` mapped `$1` → `"$1"` (a Perl
-   variable literally named `1`), which made no sense.  Then a string hack
-   in `control_flow.rs` replaced `$1` → `$arg1`, which was an undeclared
-   variable causing `use strict` compilation errors.  Fixed by translating
-   digit-only variable names in `word_to_perl_impl` to `$_[0]`, `$_[1]`, …
-   (Perl's positional-parameter convention), and removed the fragile string
-   replacement in the case-statement handler.  Fixed:
-   `parse-double-semicolon-in-case.sh`.
+4. **Backslash in unquoted `Word::Literal` preserved instead of quote-removed** —
+   In unquoted words, bash's quote removal strips backslashes before ordinary
+   characters (e.g. `\.` → `.`).  Added `apply_shell_quote_removal()` that
+   removes `\X` → `X` for all X, applied in `perl_string_literal_impl` before
+   processing `Word::Literal`.  This avoids parser-level changes that caused
+   regressions.
+   Fixed: `dollar-followed-by-slash.sh` (the `\.flf` → `.flf` part).
 
 ## Remaining failures (~186)
 

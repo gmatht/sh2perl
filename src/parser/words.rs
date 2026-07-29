@@ -210,7 +210,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::StarAssign)
             | Some(Token::SlashAssign)
             | Some(Token::PercentAssign)
-    ) {
+        ) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
@@ -233,7 +233,19 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Question)
                 | Some(Token::BraceClose)
                 | Some(Token::TestBracket)
-                | Some(Token::TestBracketClose) => {
+                | Some(Token::TestBracketClose)
+                | Some(Token::Dollar) => {
+                    // For $, check if the NEXT token is a variable name
+                    // (Identifier or Number). If so, break out so that
+                    // parse_variable_expansion handles the variable reference.
+                    if matches!(lexer.peek(), Some(Token::Dollar)) {
+                        let is_var_ref = lexer.peek_n(1).map(|t| {
+                            matches!(t, Token::Identifier | Token::Number)
+                        }).unwrap_or(false);
+                        if is_var_ref {
+                            break;
+                        }
+                    }
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
@@ -749,7 +761,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::StarAssign)
             | Some(Token::SlashAssign)
             | Some(Token::PercentAssign)
-    ) {
+        ) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
@@ -779,7 +791,19 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::MinusAssign)
                 | Some(Token::StarAssign)
                 | Some(Token::SlashAssign)
-                | Some(Token::PercentAssign) => {
+                | Some(Token::PercentAssign)
+                | Some(Token::Dollar) => {
+                    // For $, check if the NEXT token is a variable name
+                    // (Identifier or Number). If so, break out so that
+                    // parse_variable_expansion handles the variable reference.
+                    if matches!(lexer.peek(), Some(Token::Dollar)) {
+                        let is_var_ref = lexer.peek_n(1).map(|t| {
+                            matches!(t, Token::Identifier | Token::Number)
+                        }).unwrap_or(false);
+                        if is_var_ref {
+                            break;
+                        }
+                    }
                     // Append raw token text and consume
                     if let Some(text) = lexer.get_current_text() {
                         combined.push_str(&text);
