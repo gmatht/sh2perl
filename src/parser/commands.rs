@@ -2180,13 +2180,13 @@ impl Parser {
                     // Only push `)` if it closes an inner (expression) paren,
                     // not if it closes the outer (( marker.
                     // Inner parens keep depth >= 2 (the 2 from (( ).
-                    self.lexer.next();
                     paren_depth -= 1;
                     if paren_depth >= 2 {
                         if let Some(text) = self.lexer.get_current_text() {
                             content.push_str(&text);
                         }
                     }
+                    self.lexer.next();
                     if paren_depth <= 0 {
                         break;
                     }

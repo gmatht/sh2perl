@@ -5,20 +5,18 @@
 009_arrays.sh	stdout mismatch
 011_brace_expansion.sh	stdout mismatch
 012_process_substitution.sh	stdout mismatch
-013_parameter_expansion.sh	stdout mismatch
 015_grep_advanced.sh	stdout mismatch
 016_grep_basic.sh	stdout mismatch
 019_grep_regex.sh	stdout mismatch
 017_grep_context.sh	stdout mismatch
 018_grep_params.sh	stdout mismatch
-027_parameter_expansion_defaults.sh	stdout mismatch
 029_arrays_associative.sh	stdout mismatch
 035_brace_expansion_practical.sh	stdout mismatch
 042_process_substitution_advanced.sh	stdout mismatch
 045_shell_calling_perl.sh	stdout mismatch
 050_test_ls_star_dot_sh.sh	stdout mismatch
-056_send_args.sh	stdout mismatch
 057_case.sh	stdout mismatch
+056_send_args.sh	stdout mismatch
 058_advanced_bash_idioms.sh	stdout mismatch
 062_09_complex_function.sh	stdout mismatch
 062_15_complex_local_variables.sh	stdout mismatch
@@ -28,13 +26,15 @@
 063_14_complex_redirects.sh	stdout mismatch
 064_01_complex_nested_subshells.sh	stdout mismatch
 064_03_complex_parameter_expansion.sh	stdout mismatch
+064_06_nested_arithmetic_expressions.sh	stdout mismatch
 064_21_complex_string_interpolation_multiple_variables.sh	stdout mismatch
 064_22_function_returning_complex_data_structures.sh	stdout mismatch
-064_hard_to_generate.sh	stdout mismatch
 063_hard_to_parse.sh	stdout mismatch
+064_hard_to_generate.sh	stdout mismatch
 070_cmp_basic.sh	stdout mismatch
 072_background_fork.sh	stdout mismatch
 075_eval_complex.sh	stdout mismatch
+078_arithmetic_double_paren.sh	stdout mismatch
 083_process_sub_missing_files.sh	stdout mismatch
 084_while_pipeline.sh	stdout mismatch
 087_function_cmd_sub.sh	stdout mismatch
@@ -45,15 +45,12 @@ arithmetic-vs-command-subshell.sh	stdout mismatch
 at-in-test.sh	stdout mismatch
 at-var-default.sh	stdout mismatch
 background-chain.sh	stdout mismatch
-085_for_glob_pipe.sh	stdout mismatch
 backslash-continuation-dollar-paren.sh	stdout mismatch
-backslash-dollar-brace.sh	stdout mismatch
+085_for_glob_pipe.sh	stdout mismatch
 backslash-continuation-in-dollar-paren.sh	stdout mismatch
-backslash-newline-dq.sh	stdout mismatch
 backslash-gt-test.sh	stdout mismatch
 brace-expansion-error.sh	stdout mismatch
 builtin-system-open3.sh	stdout mismatch
-capture-paren-with-eval.sh	stdout mismatch
 case-pattern-paren.sh	stdout mismatch
 check-qx-aa-exec.sh	stdout mismatch
 check-qx-systemd-path.sh	stdout mismatch
@@ -72,16 +69,15 @@ escaped-paren-command-subst.sh	stdout mismatch
 exitScript-after-test.sh	stdout mismatch
 for-loop-dollar-at.sh	stdout mismatch
 generator-system-echo-checkqx.sh	stdout mismatch
-gunzip_example.sh	stdout mismatch
 heredoc-apostrophe-in-unquoted.sh	debashc failed to generate code
 heredoc-apostrophe-span.sh	debashc failed to generate code
+gunzip_example.sh	stdout mismatch
 heredoc-apostrophe.sh	debashc failed to generate code
 heredoc-backtick-quote-span.sh	stdout mismatch
 heredoc-binary-data.sh	stdout mismatch
 heredoc-python-fstring.sh	debashc failed to generate code
 heredoc-parse-error.sh	stdout mismatch
 heredoc-singlequote-span.sh	stdout mismatch
-heredoc-subshell-redirects.sh	stdout mismatch
 heredoc-redirects-same-line.sh	stdout mismatch
 heredoc-with-quotes.sh	debashc failed to generate code
 heredoc-with-redirect-same-line.sh	stdout mismatch
@@ -93,13 +89,12 @@ lexer-char-minus.sh	stdout mismatch
 multiline-dq-string.sh	stdout mismatch
 param-expand-default-operator.sh	stdout mismatch
 param-expand-hash-sameline.sh	stdout mismatch
-param-expand-hash.sh	stdout mismatch
 param-expand-hashhash.sh	stdout mismatch
+param-expand-hash.sh	stdout mismatch
 parse-and-or-chain-with-assign.sh	stdout mismatch
-parse-arithmetic-extra-paren.sh	stdout mismatch
 parse-arithmetic-nested-array.sh	stdout mismatch
-parse-array-plusassign.sh	stdout mismatch
 id-cmdsub.sh	stdout mismatch
+parse-array-plusassign.sh	stdout mismatch
 parse-at-slice.sh	stdout mismatch
 parse-brace-close.sh	stdout mismatch
 parse-brace-in-heredoc.sh	stdout mismatch
@@ -107,10 +102,10 @@ parse-case-subject-complex.sh	stdout mismatch
 parse-db-status-fmt.sh	stdout mismatch
 parse-dollar-at-default.sh	stdout mismatch
 parse-dollar-in-arithmetic.sh	stdout mismatch
-parse-dollar-paren-or.sh	stdout mismatch
-parse-dollar-paren-pipe.sh	stdout mismatch
-parse-done-unexpected.sh	stdout mismatch
 parse-dollar-single-quote.sh	stdout mismatch
+parse-dollar-paren-pipe.sh	stdout mismatch
+parse-dollar-paren-or.sh	stdout mismatch
+parse-done-unexpected.sh	stdout mismatch
 parse-dot-after-var.sh	stdout mismatch
 parse-double-semicolon.sh	stdout mismatch
 parse-doublequote-unexpected.sh	stdout mismatch
@@ -132,16 +127,15 @@ parse-parameter-pattern.sh	stdout mismatch
 parse-paren-close.sh	stdout mismatch
 parse-redirect-clobber.sh	stdout mismatch
 parse-redirect-in-case-pattern.sh	stdout mismatch
-parse-redirect-samefile.sh	stdout mismatch
-parse-singlequote-unexpected.sh	stdout mismatch
 parse-source-in-test.sh	stdout mismatch
+parse-singlequote-unexpected.sh	stdout mismatch
 parse-sq-awk-while.sh	stdout mismatch
 parse-standalone-redirect.sh	stdout mismatch
 parse-substring-double-colon.sh	stdout mismatch
 parse-unexpected-end-of-input.sh	debashc failed to generate code
+parse-unexpected-parenclose.sh	debashc failed to generate code
 parse-unexpected-braceclose.sh	stdout mismatch
 parse-test-with-source.sh	stdout mismatch
-parse-unexpected-parenclose.sh	debashc failed to generate code
 parse-variable-default-with-quotes.sh	stdout mismatch
 pid_tempfile.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
@@ -153,19 +147,17 @@ samefile-operator.sh	stdout mismatch
 readonly-cmdsub.sh	stdout mismatch
 single-quote-embed-escape.sh	stdout mismatch
 single-quote-escape.sh	stdout mismatch
-subshell-heredoc-close.sh	stdout mismatch
 test-bracket-command-sub.sh	stdout mismatch
 test-expr-backtick.sh	stdout mismatch
 test-expression-backslash-continuation.sh	stdout mismatch
 test-operator-S.sh	stdout mismatch
 test-operator-missing.sh	stdout mismatch
 test_grep.sh	stdout mismatch
-test_system_builtin.sh	stdout mismatch
 typeset-cmdsub.sh	stdout mismatch
-unicode-in-string.sh	stdout mismatch
+test_system_builtin.sh	stdout mismatch
 utf8-non-utf8-content.sh	stdout mismatch
 variable-apostrophe-concat.sh	stdout mismatch
 variable-default-with-hash.sh	stdout mismatch
-zsh-style-eval-redirect.sh	stdout mismatch
 zstd_example.sh	stdout mismatch
+zsh-style-eval-redirect.sh	stdout mismatch
 tty-cmdsub.sh	stdout mismatch

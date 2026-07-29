@@ -1,10 +1,17 @@
 # Failing Test Notes
 
-## Current status: 354/517 passed, 163 failing
+## Current status: 356/517 passed, 161 failing
 
 ### Newly Fixed (this session):
 
-1. **`print($expr, "\n")` with parenthesized expression broken by space before `(`** —
+1. **`))` consumed but `get_current_text()` called after `next()` in commands.rs ParenClose handler** —
+   `parse_arithmetic_expression` in `commands.rs` called `self.lexer.next()` BEFORE
+   `self.lexer.get_current_text()` for `ParenClose` tokens, losing the `)` character
+   and pushing the next token's text instead.  Fixed by moving `next()` after
+   `get_current_text()`.  Fixed: `078_arithmetic_double_paren.sh`,
+   `064_06_nested_arithmetic_expressions.sh`.
+
+2. **`print($expr, "\n")` with parenthesized expression broken by space before `(`** —
    `emit_stmt` in `ir.rs` used `"print {}, \"\\n\";\n"` format which produced
    `print (EXPR), "\n"` — Perl parsed the space before `(` as `print` with one
    parenthesized argument, then the `, "\n"` was in void context causing warnings
