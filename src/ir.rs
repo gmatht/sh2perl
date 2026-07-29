@@ -366,7 +366,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // Output to a specific filehandle: print $fh ...
                 emit_indent(out, indent);
                 if *newline {
-                    out.push_str(&format!("print {{*{}}} {}.\"\\n\";\n", fh, expr));
+                    out.push_str(&format!("print {{*{}}} {}, \"\\n\";\n", fh, expr));
                 } else {
                     out.push_str(&format!("print {{*{}}} {};\n", fh, expr));
                 }
@@ -382,7 +382,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     out.push_str(&format!("print \"{}\\n\";\n", inner));
                 } else {
                     emit_indent(out, indent);
-                    out.push_str(&format!("print {}.\"\\n\";\n", expr));
+                    out.push_str(&format!("print {}, \"\\n\";\n", expr));
                 }
             } else {
                 emit_indent(out, indent);
@@ -721,22 +721,81 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 
         IrExpr::Regex { pattern, flags } => {
             // Omit meaningless default flags (m, s, x) when they add no value.
+            let has_anchor = |pat: &str| -> bool {
+                // Check for ^ or $ that are NOT inside character classes ([...]).
+                // A ^ or $ inside brackets is a literal character, not an anchor.
+                let mut in_class = false;
+                let mut prev_was_backslash = false;
+                for ch in pat.chars() {
+                    if prev_was_backslash {
+                        prev_was_backslash = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        prev_was_backslash = true;
+                        continue;
+                    }
+                    if ch == '[' && !in_class {
+                        in_class = true;
+                        continue;
+                    }
+                    if ch == ']' && in_class {
+                        in_class = false;
+                        continue;
+                    }
+                    if (ch == '^' || ch == '$') && !in_class {
+                        return true;
+                    }
+                }
+                false
+            };
+            // Check for a literal dot that is NOT inside a character class.
+            // Escaped dots like \. are literal dots, but they're not wildcards.
+            let has_dot = |pat: &str| -> bool {
+                let mut in_class = false;
+                let mut prev_was_backslash = false;
+                for ch in pat.chars() {
+                    if prev_was_backslash {
+                        prev_was_backslash = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        prev_was_backslash = true;
+                        continue;
+                    }
+                    if ch == '[' && !in_class {
+                        in_class = true;
+                        continue;
+                    }
+                    if ch == ']' && in_class {
+                        in_class = false;
+                        continue;
+                    }
+                    // A bare . outside a char class and not escaped is the wildcard.
+                    if ch == '.' && !in_class {
+                        return true;
+                    }
+                }
+                false
+            };
             let clean_flags: String = flags.chars().filter(|&c| {
                 // Keep 'i' (case-insensitive), 'g' (global), etc.
                 // Remove 'm', 's', 'x' when they are the only flags or when
                 // the pattern doesn"t use the features they enable.
                 if c == 'm' {
                     // /m enables ^ and $ to match line boundaries; only
-                    // meaningful if the pattern uses ^ or $.
-                    !pattern.contains('^') && !pattern.contains('$')
+                    // meaningful if the pattern uses ^ or $ as OUTSIDE anchors
+                    // (not inside a character class). Keep /m when anchors are
+                    // present, strip it when they aren't.
+                    has_anchor(pattern)
                 } else if c == 's' {
-                    // /s makes . match \n; only meaningful if . is in pattern.
-                    !pattern.contains('.')
+                    // /s makes . match \n; only meaningful if there is a
+                    // bare . (wildcard) in the pattern, not inside [] or escaped.
+                    has_dot(pattern)
                 } else if c == 'x' {
-                    // /x allows whitespace and comments; strip if pattern
-                    // has no whitespace or # that would change meaning.
-                    true  // Conservative: always strip /x — it"s almost
-                          // always cargo-culted from generated boilerplate.
+                    // /x allows whitespace and comments; it is almost always
+                    // cargo-culted from generated boilerplate. Always strip it.
+                    false
                 } else {
                     true
                 }

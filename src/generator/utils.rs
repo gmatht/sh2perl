@@ -1,5 +1,6 @@
 use super::Generator;
 use crate::ast::*;
+use crate::ir::expr_to_perl;
 
 /// Get the appropriate temporary directory for the current platform
 pub fn get_temp_dir() -> &'static str {
@@ -1111,8 +1112,15 @@ pub fn format_regex_pattern(pattern: &str) -> String {
     let escaped_pattern = escaped_pattern.replace('/', "\\/");
     // Escape # because /x makes it a comment delimiter
     let escaped_pattern = escaped_pattern.replace('#', "\\#");
-    // Add common flags: /s for dot matching newlines, /x for extended formatting, /m for multiline
-    format!("/{}/msx", escaped_pattern)
+    // Use the IR's Regex node to produce clean regex literal with appropriate flags.
+    // The IR's `ir_expr_to_perl` for IrExpr::Regex intelligently strips flags that
+    // are not needed for the specific pattern (Pattern H from the idiom review).
+    // For example, /msx is stripped entirely when the pattern does not use ^, $, .,
+    // or whitespace that /x would affect.
+    crate::ir::expr_to_perl(&crate::ir::IrExpr::Regex {
+        pattern: escaped_pattern,
+        flags: "msx".to_string(),
+    })
 }
 
 /// Convert escaped metacharacters to character classes for better Perl::Critic compliance
