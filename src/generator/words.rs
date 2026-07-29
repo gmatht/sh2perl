@@ -2309,7 +2309,24 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
                     "$" => "$$".to_string(),         // $$ -> $$ (process ID)
                     "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
-                    _ => format!("${}", var),           // Regular variable
+                    _ => {
+                        // Shell positional parameters ($1, $2, …) map to
+                        // Perl's @_ indexing.  Inside a function $1 is the
+                        // first argument ($_[0]), at the top level @_ is
+                        // empty but $ARGV holds command-line args.  Use
+                        // $_[i-1] which works in both cases (at the top
+                        // level $_[0] is undef, matching an unset $1).
+                        if var.chars().all(|c| c.is_ascii_digit()) {
+                            let idx = var.parse::<usize>().unwrap_or(1);
+                            if idx >= 1 {
+                                format!("$_[{}]", idx - 1)
+                            } else {
+                                format!("${}", var)
+                            }
+                        } else {
+                            format!("${}", var)           // Regular variable
+                        }
+                    }
                 }
             }
         }

@@ -27,7 +27,25 @@
    when the inner command fails).  Removed the `!()` wrapper.  Fixed:
    `not-negation.sh`.
 
-## Remaining failures (~188)
+4. **`local` on lexical variables in subshells (`subshell_commands.rs`)** —
+   `IrStmt::Declare { local: true }` emitted `local $var = $var;` which
+   fails because Perl's `local` does not work on lexical (my) variables.
+   Changed to `local: false` so the IR emits `my $var = $var;` instead.
+   This creates a new lexical that shadows the outer one and is
+   automatically restored when the block exits — the same semantics as
+   a bash subshell.  Fixed: `049_local.sh`.
+
+5. **Positional parameters `$1`, `$2`, … in case statements (`words.rs`)** —
+   `word_to_perl_impl` for `Word::Variable` mapped `$1` → `"$1"` (a Perl
+   variable literally named `1`), which made no sense.  Then a string hack
+   in `control_flow.rs` replaced `$1` → `$arg1`, which was an undeclared
+   variable causing `use strict` compilation errors.  Fixed by translating
+   digit-only variable names in `word_to_perl_impl` to `$_[0]`, `$_[1]`, …
+   (Perl's positional-parameter convention), and removed the fragile string
+   replacement in the case-statement handler.  Fixed:
+   `parse-double-semicolon-in-case.sh`.
+
+## Remaining failures (~186)
 
 The remaining failures fall into categories that require deeper parser/generator work:
 
