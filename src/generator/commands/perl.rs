@@ -122,81 +122,128 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
     );
     let mut output = String::new();
 
-    if cmd.args.len() >= 2 {
-        // Check for -e flag (execute code)
-        if let Word::Literal(flag, _) = &cmd.args[0] {
-            if flag == "-e" {
-                // Extract the Perl code from the second argument
-                let perl_code = if let Word::Literal(perl_code, _) = &cmd.args[1] {
-                    Some(perl_code.clone())
-                } else if let Word::StringInterpolation(interp, _) = &cmd.args[1] {
-                    Some(generator.convert_string_interpolation_to_perl(&interp))
-                } else {
-                    None
-                };
-
-                if let Some(perl_code) = perl_code {
-                    if crate::debug::is_debug_enabled() {
-                        eprintln!("DEBUG: Found perl code: {}", perl_code);
-                    }
-                    let mut clean_code = perl_code.clone();
-                    if (clean_code.starts_with('"') && clean_code.ends_with('"'))
-                        || (clean_code.starts_with('\'') && clean_code.ends_with('\''))
-                    {
-                        clean_code = clean_code[1..clean_code.len() - 1].to_string();
-                    }
-                    if crate::debug::is_debug_enabled() {
-                        eprintln!("DEBUG: Clean perl code: {}", clean_code);
-                    }
-
-                    // Build a shell-safe command string: perl -e '<code>'
-                    // Use single-quote shell escaping so embedded $ and @ are preserved.
-                    let escaped_code = clean_code.replace("'", "'\\''");
-                    let cmd_str = format!("perl -e '{}'", escaped_code);
-
-                    let output_var = format!("perl_output_{}", generator.get_unique_id());
-                    let sys_stmt = IrStmt::System {
-                        cmd: IrExpr::Str("bash".to_string(), StrStyle::SingleQuoted),
-                        args: vec![
-                            IrExpr::Str("-c".to_string(), StrStyle::SingleQuoted),
-                            IrExpr::Str(cmd_str, StrStyle::SingleQuoted),
-                        ],
-                        capture: Some(output_var.clone()),
+    // Scan all args for -e or -ne flags (not just position 0)
+    let mut found_perl_code = None;
+    let mut found_is_ne = false;
+    let mut code_arg_index = None;
+    for (i, arg) in cmd.args.iter().enumerate() {
+        if let Word::Literal(flag, _) = arg {
+            if flag == "-e" || flag == "-ne" {
+                if i + 1 < cmd.args.len() {
+                    let perl_code = match &cmd.args[i + 1] {
+                        Word::Literal(code, _) => Some(code.clone()),
+                        Word::StringInterpolation(interp, _) => {
+                            Some(generator.convert_string_interpolation_to_perl(interp))
+                        }
+                        _ => None,
                     };
-                    output.push_str(&stmt_to_perl(&sys_stmt, 0));
-                    output.push_str(&format!("chomp ${};\n", output_var));
-                    output.push_str(&format!("print ${};\n", output_var));
-                    return output;
-                }
-            } else if flag == "-ne" {
-                let perl_code = if let Word::Literal(perl_code, _) = &cmd.args[1] {
-                    Some(perl_code.clone())
-                } else if let Word::StringInterpolation(interp, _) = &cmd.args[1] {
-                    Some(generator.convert_string_interpolation_to_perl(&interp))
-                } else {
-                    None
-                };
-
-                if let Some(perl_code) = perl_code {
-                    let mut clean_code = perl_code.clone();
-                    if (clean_code.starts_with('"') && clean_code.ends_with('"'))
-                        || (clean_code.starts_with('\'') && clean_code.ends_with('\''))
-                    {
-                        clean_code = clean_code[1..clean_code.len() - 1].to_string();
+                    if let Some(code) = perl_code {
+                        found_perl_code = Some(code);
+                        found_is_ne = flag == "-ne";
+                        code_arg_index = Some(i);
+                        break;
                     }
-
-                    // Also apply bareword fix for -ne path
-                    clean_code = bareword_fh_to_lexical(&clean_code);
-
-                    output.push_str(&generator.indent());
-                    output.push_str(&format!("# Perl -ne: {}\n", clean_code));
-                    for line in clean_code.lines() {
-                        output.push_str(&generator.indent());
-                        output.push_str(&format!("{}\n", line));
-                    }
-                    return output;
                 }
             }
+        }
+    }
+
+    if let Some(perl_code) = found_perl_code {
+        if crate::debug::is_debug_enabled() {
+            eprintln!("DEBUG: Found perl code: {}", perl_code);
+        }
+        let mut clean_code = perl_code.clone();
+        if (clean_code.starts_with('"') && clean_code.ends_with('"'))
+            || (clean_code.starts_with('\'') && clean_code.ends_with('\''))
+        {
+            clean_code = clean_code[1..clean_code.len() - 1].to_string();
+        }
+        if crate::debug::is_debug_enabled() {
+            eprintln!("DEBUG: Clean perl code: {}", clean_code);
+        }
+
+        if found_is_ne {
+            // Apply bareword fix for -ne path
+            clean_code = bareword_fh_to_lexical(&clean_code);
+
+            // Handle -ne with -i (in-place editing) and file args
+            // Extract -i backup extension if present
+            let mut inplace_ext = String::new();
+            let mut file_args: Vec<String> = Vec::new();
+            for (i, arg) in cmd.args.iter().enumerate() {
+                if let Word::Literal(s, _) = arg {
+                    if s.starts_with("-i") && !s.starts_with("-i.bak") && s != "-i" {
+                        // -i with explicit extension like -i.bak
+                        inplace_ext = s[2..].to_string();
+                    } else if s == "-i" {
+                        inplace_ext = String::new(); // -i without extension (no backup)
+                    } else if s == "-i.bak" {
+                        inplace_ext = ".bak".to_string();
+                    }
+                }
+            }
+            // Collect file arguments (all non-flag args after -ne/-e code)
+            if let Some(code_idx) = code_arg_index {
+                for (i, arg) in cmd.args.iter().enumerate() {
+                    if i <= code_idx + 1 {
+                        continue; // skip flags and code
+                    }
+                    if let Word::Literal(s, _) = arg {
+                        if !s.starts_with('-') {
+                            let file_expr = generator.word_to_perl(arg);
+                            file_args.push(file_expr);
+                        }
+                    } else {
+                        let file_expr = generator.word_to_perl(arg);
+                        file_args.push(file_expr);
+                    }
+                }
+            }
+
+            // Generate proper Perl -ne loop with in-place editing
+            if !inplace_ext.is_empty() {
+                output.push_str(&format!(
+                    "local $^I = '{}';\n",
+                    inplace_ext
+                ));
+            }
+            if !file_args.is_empty() {
+                output.push_str(&format!(
+                    "local @ARGV = ({});\n",
+                    file_args.join(", ")
+                ));
+            }
+            output.push_str("while (<>) {\n");
+            generator.indent_level += 1;
+            for line in clean_code.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    output.push_str(&generator.indent());
+                    output.push_str(&format!("{}\n", trimmed));
+                }
+            }
+            generator.indent_level -= 1;
+            output.push_str(&generator.indent());
+            output.push_str("}\n");
+            return output;
+        } else {
+            // -e path: build a shell-safe command string
+            let escaped_code = clean_code.replace("'", "'\\''");
+            let cmd_str = format!("perl -e '{}'", escaped_code);
+
+            let output_var = format!("perl_output_{}", generator.get_unique_id());
+            let sys_stmt = IrStmt::System {
+                cmd: IrExpr::Str("bash".to_string(), StrStyle::SingleQuoted),
+                args: vec![
+                    IrExpr::Str("-c".to_string(), StrStyle::SingleQuoted),
+                    IrExpr::Str(cmd_str, StrStyle::SingleQuoted),
+                ],
+                capture: Some(output_var.clone()),
+            };
+            output.push_str(&stmt_to_perl(&sys_stmt, 0));
+            output.push_str(&format!("chomp ${};\n", output_var));
+            output.push_str(&format!("print ${};\n", output_var));
+            return output;
         }
     }
 
@@ -215,11 +262,12 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
 
     let output_var = format!("perl_output_{}", generator.get_unique_id());
 
-    // Fallback: use qx{...} for all paths (no capture_stdout needed).
-    // Native Perl: use eval instead of running perl in a subprocess
+    // Fallback: use qx{...} instead of eval qq{...} to avoid
+    // Perl::Critic "Expression form of eval" violations.
+    // ProhibitBacktickOperators is disabled in the critic config.
     let formatted_args = args_list.join(" ");
     output.push_str(&format!(
-        "my ${} = do {{ local $@; my $__r = eval qq{{perl {}}}; chomp $__r if defined $__r; $__r // q{{}}; }};\nchomp ${};\n",
+        "my ${} = qx{{perl {}}};\nchomp ${};\n",
         output_var, formatted_args, output_var
     ));
     output.push_str(&format!("print ${};\n", output_var));
@@ -350,10 +398,10 @@ pub fn generate_perl_pipeline_command(
 
         let output_var = format!("perl_output_{}", generator.get_unique_id());
 
-        // Native Perl: use eval instead of qx
+        // Use qx{} instead of eval qq{} to avoid Perl::Critic violations
         let formatted_args = args_list.join(" ");
         output.push_str(&format!(
-            "my ${} = do {{ local $@; my $__r = eval qq{{perl {}}}; chomp $__r if defined $__r; $__r // q{{}}; }};\nchomp ${};\n",
+            "my ${} = qx{{perl {}}};\nchomp ${};\n",
             output_var, formatted_args, output_var
         ));
         output.push_str(&format!("print ${};\n", output_var));
