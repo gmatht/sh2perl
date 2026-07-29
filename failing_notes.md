@@ -1,6 +1,6 @@
 # Failing Test Notes
 
-## Current status: ~340/517 passed, ~177 failing
+## Current status: 345/517 passed, 172 failing
 
 ### Newly Fixed (this session):
 
@@ -53,7 +53,22 @@
    which adds the trailing newline that bash's `echo` always produces.
    Fixed: `008_simple_backup.sh`.
 
-## Remaining failures (~186)
+7. **`$#` inside arithmetic (`((10#x > 5))`) treated as comment by lexer** —
+   `resolve_double_paren_ambiguity` in `lexer.rs` did not scan `Comment` token
+   text for `)` characters, so `#x > 5))` was consumed as a comment and the
+   `((` was incorrectly split into nested subshells.  Added `Comment` token
+   handling to count `)` inside comment text when resolving `((` ambiguity.
+   Fixed: `arith-base-notation.sh`.
+
+8. **`N#variable` base notation in arithmetic emitted as `N#$var` (Perl comment)** —
+   `convert_arithmetic_to_perl_impl` in `words.rs` left `N#` prefix in the
+   output, which Perl interpreted as a comment start.  Added a preprocessing
+   phase to strip bash base-notation prefixes (`\d+#`) since Perl uses base
+   10 natively.  Also removed `$main_exit_code` assignment from `let` command
+   generator to avoid undeclared-variable errors inside function bodies.
+   Fixed: `arith-base-notation.sh` (the code-gen part).
+
+## Remaining failures (~172)
 
 The remaining failures fall into categories that require deeper parser/generator work:
 

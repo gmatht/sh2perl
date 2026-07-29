@@ -961,6 +961,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 "*" => "@ARGV".to_string(),
                                 "?" => "($? >> 8)".to_string(),
                                 "!" => "''".to_string(),
+                                "-" => "''".to_string(),
                                 _ => format!("${}", var),
                             },
                             Word::StringInterpolation(interp, _) => {
@@ -973,6 +974,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             "*" => "@ARGV".to_string(),
                                             "?" => "($? >> 8)".to_string(),
                                             "!" => "''".to_string(),
+                                            "-" => "''".to_string(),
                                             _ => format!("${}", var),
                                         }
                                     } else if let StringPart::ParameterExpansion(pe) =
@@ -1060,6 +1062,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                         "*" => result.push_str("@ARGV"),
                                                         "?" => result.push_str("($? >> 8)"),
                                                         "!" => result.push_str(""),
+                                                        "-" => result.push_str(""),
                                                         _ => result.push_str(&format!("${}", var)),
                                                     }
                                                 }
@@ -1433,7 +1436,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // We must produce a SINGLE Perl statement so that callers that
                         // embed this inside an expression (e.g. generate_combined_test_condition
                         // wraps non-TestExpression in `!(...)`) do not get a syntax error.
-                        // The single statement sets both $main_exit_code and $CHILD_ERROR.
+                        // The single statement sets $CHILD_ERROR based on the result.
+                        // Note: we avoid using $main_exit_code here because it may not
+                        // be declared when this appears inside a function body.
                         for arg in cmd.args.iter() {
                             let expr = match arg {
                                 Word::Literal(s, _) => s.clone(),
@@ -1442,7 +1447,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             let perl_expr = generator.convert_arithmetic_to_perl(&expr);
                             output.push_str(&generator.indent());
                             output.push_str(&format!(
-                                "$CHILD_ERROR = ($main_exit_code = {}) ? 0 : 1;\n",
+                                "$CHILD_ERROR = ({}) ? 0 : 1;\n",
                                 perl_expr
                             ));
                         }
@@ -1970,6 +1975,7 @@ pub fn generate_echo_command(
                         "*" => "@ARGV".to_string(),
                         "?" => "($? >> 8)".to_string(),
                         "!" => "''".to_string(),
+                        "-" => "''".to_string(),
                         _ => format!("${}", var),
                     },
                     Word::StringInterpolation(interp, _) => {
@@ -1982,6 +1988,7 @@ pub fn generate_echo_command(
                                     "*" => "@ARGV".to_string(),
                                     "?" => "($? >> 8)".to_string(),
                                     "!" => "''".to_string(),
+                                    "-" => "''".to_string(),
                                     _ => format!("${}", var),
                                 }
                             } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {

@@ -1616,6 +1616,20 @@ impl Lexer {
                             }
                         }
                         Token::ParenClose => depth -= 1,
+                        Token::Comment => {
+                            // A Comment token may contain `)` characters when `#` appears
+                            // inside an arithmetic expression (e.g. 10#x > 5)).
+                            // Count `)` in the comment text to adjust depth correctly.
+                            let cm_start = tokens[j].1;
+                            let cm_end = tokens[j].2;
+                            let text = &input[cm_start..cm_end];
+                            depth -= text.chars().filter(|&c| c == ')').count() as i32;
+                            depth += text.chars().filter(|&c| c == '(').count() as i32;
+                            // Check if depth hit zero (closed by comment content)
+                            if depth <= 0 {
+                                closed_by_arithmetic = true;
+                            }
+                        }
                         _ => {}
                     }
                     j += 1;
