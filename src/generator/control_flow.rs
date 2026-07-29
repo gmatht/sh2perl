@@ -59,9 +59,15 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
         }
         Command::Not(inner) => {
             // `! cmd` in shell: negate the exit code — enter then-branch when
-            // cmd fails (exit != 0).  Wrap the inner condition in !() so that
-            // success (exit 0 → falsy in Perl) becomes truthy, and failure
-            // (non-zero → truthy) becomes falsy.
+            // cmd fails (exit != 0).  The inner command's exit code already
+            // has the right mapping for Perl conditions: 0 (success) is falsy,
+            // non-zero (failure) is truthy.  Shell negation flips this:
+            // !(inner success) → false (don't enter), !(inner failure) → true.
+            // So (inner_exit_code) directly gives the correct Perl truth value
+            // without an extra !() — no "conversion" needed here because the
+            // _ => case's !() converts a raw exit code (0=truthy in shell) to
+            // Perl truth values, but for Not the inner exit code already maps
+            // to the correct Perl boolean.
             generator.suppress_set_e_depth += 1;
             let mut cond = generator.generate_command(inner);
             generator.suppress_set_e_depth -= 1;
@@ -72,7 +78,7 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
                 .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                 .trim_end_matches(';')
                 .to_string();
-            output.push_str(&format!("!({})", cond));
+            output.push_str(&format!("({})", cond));
         }
         _ => {
             generator.suppress_set_e_depth += 1;

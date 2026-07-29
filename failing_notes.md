@@ -1,32 +1,33 @@
 # Failing Test Notes
 
-## Current status: ~321/517 passed, ~196 failing
+## Current status: ~329/517 passed, ~188 failing
 
 ### Newly Fixed (this session):
 
-1. **Function call / signature mismatch with `fn_param_names`**:
-   Fixed two bugs in the parameter-name-map feature:
-   - **`simple_commands.rs`**: Function calls were using named-argument
-     syntax (`file => 'value'`) while function definitions used positional
-     unpacking (`my ($file) = @_;`). Changed calls to use positional args
-     matching the definition.
-   - **`control_flow.rs`**: The removal of redundant `my $file = $_[0];`
-     lines failed because the pattern expected the line without `my`.
-     Updated to match both `my $x = $_[N];` and `$x = $_[N];`.
-   Fixed tests: `test_simple_function`, `061_test_local_names_preserved`,
-   `092_for_arith_func`, `055_factorize`.
+1. **Broken `\n` in output string literals (`ir.rs`)** —
+   `try_embed_newline_in_string_literal` had malformed format strings where
+   `\n` (escaped backslash+n) was emitted as `\` + raw newline or as a
+   literal newline, breaking Perl code like `print "start\` + newline + `";`
+   instead of `print "start\n";`.  Fixed both the single-quoted and `q{...}`
+   branches to use `"print \"{}\n\";\n"` (matching the already-correct
+   double-quoted branch).  Fixed several tests that use `echo` with bare words.
 
-2. **Unquoted `{`, `}`, `$` in reconstructed bash command strings**:
-   The `word_to_bash_string_for_system` and `word_to_bash_string` helpers
-   (and `needs_shell_quoting_literal`) were missing `{`, `}`, and `$` from
-   their list of characters requiring shell quoting.  This caused awk/sed
-   programs like `{print$3}` to be emitted unquoted, letting bash expand
-   `$3` as a positional parameter (empty in `bash -c` context) and turning
-   awk's program into `{print}` (prints whole line).
-   Added the missing characters to both functions.
-   Fixed test: `sqs-overlap-singleline`.
+2. **`true` builtin emitted `1;` instead of `0;` (`builtins.rs`)** —
+   The if-condition handler wraps conditions in `!()` to convert shell exit
+   codes (0=success) to Perl truth values (non-zero=truthy).  `true` should
+   produce exit code 0 so that `!(0)` evaluates to truthy.  Changed `true`
+   to emit `0;` instead of `1;`.  Fixed tests:
+   `parse-heredoc-in-if.sh`, `parse-heredoc-eof-unexpected.sh`,
+   `redirect-all.sh`.
 
-## Remaining failures (~196)
+3. **`Command::Not` in if-conditions had wrong negation (`control_flow.rs`)** —
+   The `! cmd` handler wrapped the inner exit code in `!()` but the exit
+   code already maps correctly: 0 (inner success) is falsy, 1 (inner failure)
+   is truthy, matching the semantics of shell `!` (which enters then-branch
+   when the inner command fails).  Removed the `!()` wrapper.  Fixed:
+   `not-negation.sh`.
+
+## Remaining failures (~188)
 
 The remaining failures fall into categories that require deeper parser/generator work:
 

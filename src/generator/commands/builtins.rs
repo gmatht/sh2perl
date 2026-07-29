@@ -1077,10 +1077,14 @@ pub fn generate_generic_builtin(
         }
         "true" => {
             // true command always succeeds (exit status 0)
+            // Use 0 (exit code zero) so that the if-condition handler's
+            // !(...) wrapping produces a truthy Perl value (0 is falsy,
+            // so !0 is truthy, matching shell semantics where exit 0
+            // means "success/true").
             if output_var.is_empty() {
-                "1;\n".to_string()
+                "0;\n".to_string()
             } else {
-                format!("1;\n${} = q{};\n", output_var, "")
+                format!("0;\n${} = q{};\n", output_var, "")
             }
         }
         "false" => {
