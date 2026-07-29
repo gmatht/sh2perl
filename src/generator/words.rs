@@ -2653,7 +2653,14 @@ pub fn convert_string_interpolation_to_perl_impl(
                             // Shell's $? is the exit code (0-255), but Perl's $? is
                             // the raw 16-bit wait status (exit_code << 8).  Translate
                             // to $? >> 8 which gives the shell-compatible exit code.
-                            current_string.push_str("${\\($? >> 8)}");
+                            // Use string concatenation instead of the `${\\(...)}`
+                            // interpolation trick, which is unidiomatic and signals
+                            // line-by-line transliteration.
+                            // Flush any accumulated literal into parts first.
+                            if !current_string.is_empty() {
+                                push_string_expr(&mut parts, &mut current_string);
+                            }
+                            parts.push("($? >> 8)".to_string());
                         } else if generator.declared_locals.contains(var)
                             || generator.function_level_vars.contains(var)
                             || matches!(var.as_str(), "#" | "@" | "*" | "-" | "!" | "0")
