@@ -653,10 +653,10 @@ pub fn generate_generic_builtin(
                     // embedded shell $-sequences and escape sequences are preserved.
                     if output_var.is_empty() {
                         // Native Perl: read ARGV files
-                        "do {{ if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ print <$__fh>; close $__fh }} }} }} }};\n".to_string()
+                        "do {{ if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ if (open my $__fh, q{{<}}, $__f) {{ print <$__fh>; close $__fh }} }} }} }};\n".to_string()
                     } else {
                         format!(
-                            "${} = do {{ my $__r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $__r .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $__r; }};\n",
+                            "${} = do {{ my $__r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ if (open my $__fh, q{{<}}, $__f) {{ $__r .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $__r; }};\n",
                             output_var
                         )
                     }

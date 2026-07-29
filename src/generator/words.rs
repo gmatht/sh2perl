@@ -2241,26 +2241,28 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     )
                 }
             };
-            // For simple expressions, avoid unnecessary wrapping
-            if result.contains("use POSIX qw(strftime)")
-                || result.contains("use Cwd; getcwd()")
-                || result.starts_with("do { my $")
-                || result.contains("chomp $result")
-                || result.len() < 100
-            {
-                // Simple expressions don't need wrapping
-                result
+            // Shell command substitution (backticks / $(...)) strips trailing
+            // newlines.  Native-Perl translations (sprintf, sha256_hex, …) often
+            // produce a trailing newline that must be removed to match bash
+            // semantics.  The bash -c fallback path already does chomp; wrapping
+            // everything in chomp is harmless for paths that already handle it.
+            //
+            // Use a short, unique variable name to avoid shadowing any variable
+            // the generated code might create.
+            let trimmed = result.trim_start();
+            // Only skip wrapping when the result already chomps at the TOP level
+            // (e.g. bash -c fallback uses `chomp $_r`).  Do NOT skip for internal
+            // chomps used inside file-reading loops like `chomp $line`.
+            let has_top_chomp = result.contains("chomp $_r") || result.contains("chomp(my $_r") || result.contains("chomp(my $__r");
+            if !has_top_chomp && (trimmed.starts_with("do {") || trimmed.starts_with("{")) {
+                // Already a do/block: wrap the whole thing so we can chomp its value.
+                format!("do {{ my $__cs = {}; chomp $__cs; $__cs; }}", result)
+            } else if !has_top_chomp {
+                // Simple expression: wrap in do-block with chomp
+                format!("do {{ my $__cs = {}; chomp $__cs; $__cs; }}", result)
             } else {
-                // Check if the result is already a do block - if so, return as-is
-                // (don't add extra indentation here as it will be inserted into assignments)
-                if result.trim_start().starts_with("do {") {
-                    // Result is already a complete do block, return as-is without additional indentation
-                    // The caller will handle any necessary indentation based on context
-                    result
-                } else {
-                    // For other results, return as-is
-                    result
-                }
+                // Result already has its own chomp handling (e.g. bash -c path)
+                result
             }
         }
         Word::Variable(var, _, _) => {

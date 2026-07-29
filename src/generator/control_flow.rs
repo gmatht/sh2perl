@@ -1851,6 +1851,28 @@ pub fn build_param_name_map(block: &Block) -> HashMap<usize, String> {
                 }
             }
         }
+        // Also handle `local var=$1` and `declare var=$1` patterns inside
+        // BuiltinCommand (e.g. `local file=$1`).
+        if let Command::BuiltinCommand(bc) = cmd {
+            if bc.name == "local" || bc.name == "declare" || bc.name == "typeset" {
+                for arg in &bc.args {
+                    if let Word::Literal(s, _) = arg {
+                        // Look for patterns like "var=$1", "var=$2", etc.
+                        if let Some(eq_pos) = s.find('=') {
+                            let var_name = &s[..eq_pos];
+                            let value = &s[eq_pos + 1..];
+                            if let Some(stripped) = value.strip_prefix('$') {
+                                if let Ok(idx) = stripped.parse::<usize>() {
+                                    if idx >= 1 {
+                                        map.insert(idx, var_name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     map
 }

@@ -1,6 +1,44 @@
 # Failing Test Notes
 
-## Current status: ~311/517 passed, ~206 failing
+## Current status: ~321/517 passed, ~196 failing
+
+### Newly Fixed (this session):
+
+1. **Trailing newlines in command substitution (chomp wrapping)**:
+   Modified `words.rs` command-substitution handler to wrap results in
+   `do { my $__cs = RESULT; chomp $__cs; $__cs; }`, stripping trailing
+   newlines to match shell command-substitution semantics. Native-Perl
+   translations (sprintf, sha256_hex, paste, etc.) now produce the same
+   output as bash.
+
+2. **Fragile q{...} quoting in cmd_str_to_open_perl**:
+   Replaced the old approach of escaping `}` as `\}` inside `q{...}`
+   (which broke awk programs containing `{...}`) with a new
+   `safe_perl_q_string()` helper that picks a delimiter not found in
+   the content, exactly like `perl_string_literal_no_interp_impl` does.
+
+3. **Perl scoping bug: `open(my $__fh, ...) and do { ... $__fh }`**:
+   Fixed across 6 files (`ir.rs`, `paste.rs`, `echo.rs`, `builtins.rs`,
+   `simple_commands.rs`, `test_expressions.rs`). Changed the pattern to
+   `if (open my $__fh, ...) { ... $__fh ... }` because `my` inside
+   `open()` doesn't scope into `and do { }` blocks.
+
+4. **`IrStmt::System` now uses args (not @ARGV)**:
+   Fixed `stmt_to_perl` for `IrStmt::System { capture: Some }` to
+   actually build and run a command from its `args` instead of always
+   reading `@ARGV`. This lets `diff file1.txt file2.txt` (and similar)
+   work correctly in command-substitution context.
+
+5. **`build_param_name_map` detects `local var=$N`**:
+   Extended `build_param_name_map` to scan `BuiltinCommand` nodes for
+   patterns like `local file=$1`, preventing double declaration of
+   function parameters.
+
+## Remaining failures (~196)
+
+The remaining failures fall into categories that require deeper parser/generator work:
+
+1. **Parser failures on edge cases** (~11 tests):
 
 Systematic issues that have been FIXED:
 

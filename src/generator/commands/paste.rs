@@ -328,7 +328,7 @@ pub fn generate_paste_command(
                 .generate_command_string_for_system(&crate::ast::Command::Simple(cmd.clone()));
             // Native Perl: read ARGV files
             result.push_str(
-                "do {{ my $paste_output = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ open(my $__fh, q{{<}}, $__f) and do {{ $paste_output .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $paste_output }}"
+                "do {{ my $paste_output = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ if (open my $__fh, q{{<}}, $__f) {{ $paste_output .= <$__fh>; close $__fh }} }} }} $CHILD_ERROR = 0; $paste_output }}"
             );
         } else {
             // No args: native Perl fallback (read STDIN)
