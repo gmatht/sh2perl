@@ -321,6 +321,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
                 "$" => "$$".to_string(),       // $$ -> $$ (process ID)
                 "?" => "($? >> 8)".to_string(), // $? -> exit code
+                "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
                 "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                 _ => format!("${}", var),           // Regular variables
             }

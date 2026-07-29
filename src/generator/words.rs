@@ -2330,6 +2330,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
                     "$" => "$$".to_string(),         // $$ -> $$ (process ID)
                     "?" => "($? >> 8)".to_string(), // $? -> exit code (>>8 converts wait status)
+                    "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
                     "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                     _ => {
                         // Shell positional parameters ($1, $2, …) map to
@@ -2717,6 +2718,11 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 current_string.push_str(&format!("$_[{}]", index - 1));
                             }
                         // Perl arrays are 0-indexed
+                        } else if var == "!" {
+                            // Shell's $! is the PID of the last background process.
+                            // Generated Perl does not simulate background PIDs;
+                            // omit it entirely (empty string matches bash when
+                            // no background command has been run).
                         } else if var == "?" {
                             // Shell's $? is the exit code (0-255), but Perl's $? is
                             // the raw 16-bit wait status (exit_code << 8).  Translate
@@ -2731,7 +2737,7 @@ pub fn convert_string_interpolation_to_perl_impl(
                             parts.push("($? >> 8)".to_string());
                         } else if generator.declared_locals.contains(var)
                             || generator.function_level_vars.contains(var)
-                            || matches!(var.as_str(), "#" | "@" | "*" | "-" | "!" | "0" | "$")
+                            || matches!(var.as_str(), "#" | "@" | "*" | "-" | "0" | "$")
                         {
                             // Regular declared variable - add directly for interpolation
                             current_string.push_str(&format!("${}", var));
