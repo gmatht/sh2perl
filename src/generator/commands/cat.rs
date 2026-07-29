@@ -1,19 +1,6 @@
 use crate::ast::*;
 use crate::generator::Generator;
-
-/// Convert a heredoc body to a Perl interpolating string literal (`"..."`).
-/// Unlike `perl_string_literal_no_interp`, this preserves `$` and `@` so that
-/// Perl will interpolate variable references (matching bash behaviour for
-/// unquoted heredocs like `<< EOF`).  Backslashes, double-quotes and control
-/// characters are still escaped so the Perl source is valid.
-fn heredoc_body_to_perl_interp(body: &str) -> String {
-    let escaped = body
-        .replace("\\", "\\\\")
-        .replace("\"", "\\\"")
-        .replace("\t", "\\t")
-        .replace("\r", "\\r");
-    format!("\"{}\"", escaped)
-}
+use crate::ir::{stmt_to_perl, AssignTarget, IrExpr, IrStmt, Sigil, StrStyle};
 
 fn cat_requires_shell(cmd: &SimpleCommand) -> bool {
     // If any argument looks like a shell operator (pipe),
@@ -155,23 +142,25 @@ pub fn generate_cat_command(
             }
         }
 
-        // Use interpolating strings for unquoted heredocs, non-interpolating for quoted
-        // For mixed heredocs (shouldn't normally happen), use a reasonable default
-        let body_lit = if any_unquoted && !any_quoted {
-            // Only unquoted heredocs: use interpolating Perl string
-            heredoc_body_to_perl_interp(&body)
+        // Choose string style based on heredoc quoting:
+        // - Unquoted heredocs (<<EOF): use Heredoc style which preserves
+        //   $ and @ for Perl interpolation, but escapes \n etc.
+        // - Quoted heredocs (<<'EOF'): use SingleQuoted which prevents
+        //   Perl interpolation, matching shell semantics.
+        let style = if any_unquoted && !any_quoted {
+            StrStyle::Heredoc
         } else {
-            // Quoted (or mixed) heredocs: use non-interpolating Perl string
-            generator.perl_string_literal_no_interp(&Word::literal(body))
+            StrStyle::SingleQuoted
         };
 
         if let Some(filename) = output_file {
-            // Write heredoc content to the output file
+            // Write heredoc content to the output file (raw text for now)
             let filename_pl = generator.perl_string_literal(&Word::literal(filename));
             output.push_str(&format!(
                 "open my $fh_cat, '>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
                 filename_pl
             ));
+            let body_lit = crate::ir::ir_expr_to_perl(&IrExpr::Str(body, style));
             output.push_str(&format!(
                 "print {{$fh_cat}} {};\n",
                 body_lit
@@ -184,11 +173,27 @@ pub fn generate_cat_command(
             // In a pipeline or command-substitution context, assign the heredoc
             // content to the target variable instead of printing directly.
             if target_var.is_empty() {
-                // Standalone command: print to stdout.
-                output.push_str(&format!("print {};\n", body_lit));
+                // Standalone command: emit as IR Output node for clean
+                // print with escaped content (newline: false because the
+                // heredoc body already ends with \n).
+                let ir_stmt = IrStmt::Output {
+                    value: IrExpr::Str(body, style),
+                    newline: false,
+                    target: None,
+                };
+                output.push_str(&stmt_to_perl(&ir_stmt, 0));
             } else {
-                // Pipeline/command-substitution context: set the variable.
-                output.push_str(&format!("${} = {};\n", target_var, body_lit));
+                // Pipeline/command-substitution context: assign to variable.
+                // Use IR Assign node so the backend formats it consistently.
+                let ir_stmt = IrStmt::Assign {
+                    targets: vec![AssignTarget {
+                        var: target_var.to_string(),
+                        sigil: Sigil::Scalar,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Str(body, style),
+                };
+                output.push_str(&stmt_to_perl(&ir_stmt, 0));
             }
         }
     } else {
