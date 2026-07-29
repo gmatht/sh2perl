@@ -94,10 +94,19 @@ sub filter_diff {
                     }
                     for my $j ($n + 1 .. $#r) { push @filt, '-' . $r[$j]; $meaningful++ }
                     for my $j ($n + 1 .. $#a) { push @filt, '+' . $a[$j]; $meaningful++ }
+                } elsif ($lines[$i] =~ /^\+/) {
+                    my @a;
+                    while ($i < @lines && $lines[$i] =~ /^\+/) {
+                        my $s = $lines[$i]; $s =~ s/^\+//;
+                        push @a, $s; $i++;
+                    }
+                    # Unpaired additions are always meaningful
+                    for my $j (0 .. $#a) { push @filt, '+' . $a[$j]; $meaningful++ }
                 } else { $i++ }
             }
 
-            if (@filt) {
+            my $has_changes = grep { /^[+-]/ } @filt;
+            if ($has_changes) {
                 my $oc = grep { /^[ -]/ } @filt;
                 my $nc = grep { /^[+ ]/ } @filt;
                 my ($oo) = $hunk->{raw} =~ /-(\d+)/;
