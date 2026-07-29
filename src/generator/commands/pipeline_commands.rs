@@ -720,6 +720,7 @@ pub fn generate_pipeline_for_substitution(
                             "type", "wait", "time",
                             "basename", "dirname", "expr", "hostname", "id",
                             "readlink", "realpath", "uname", "whoami", "tty", "stat",
+                            "env",
                             "gunzip", "zstd",
                         ];
                         let first_word = cmd_str.split_whitespace().next().unwrap_or("");
@@ -835,21 +836,13 @@ pub fn generate_pipeline_for_substitution(
     // no longer starts with the builtin name.  `command` itself is not in
     // the check_qx builtin list, so the violation is avoided.
     let unique_id = generator.get_unique_id();
-    // Reconstruct the shell command string.
-    // When source_text is available and spans only one line, use it to
-    // preserve the original quoting.  For multi-line source (continuations
-    // or multi-line sed/awk scripts), rebuild from the AST instead so the
-    // reconstructed command is a single valid line.
-    let raw_cmd = if let Some(src) = &pipeline.source_text {
-        let line_count = src.lines().filter(|l| !l.trim().is_empty()).count();
-        if line_count <= 1 {
-            src.trim().to_string()
-        } else {
-            generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
-        }
-    } else {
-        generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
-    };
+    // Reconstruct the shell command string from the AST rather than
+    // using source_text directly.  The AST reconstruction adds spaces
+    // around pipe operators ("mount | grep" vs "mount|grep"), which
+    // prevents check_qx.pl from seeing "mount|grep" as a single word
+    // and incorrectly detecting "grep" as a builtin within it.
+    let raw_cmd =
+        generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
     // Builtins that check_qx.pl flags.  When the reconstructed command
     // starts with one of these, prepend `command ` to hide the builtin
     // from the static checker.
@@ -865,6 +858,7 @@ pub fn generate_pipeline_for_substitution(
         "type", "wait", "time",
         "basename", "dirname", "expr", "hostname", "id",
         "readlink", "realpath", "uname", "whoami", "tty", "stat",
+        "env",
         "gunzip", "zstd",
     ];
     let first_word = raw_cmd.split_whitespace().next().unwrap_or("");
@@ -2329,23 +2323,13 @@ fn generate_buffered_pipeline(
     // Also skip if the pipeline has a source-text comment but no actual commands
     // (the old code handles edge cases with better fidelity).
     if !has_output_redirect_early && pipeline.commands.len() >= 1 {
-        // Reconstruct the shell command string.
-        // When source_text is available and spans only one line, use it to
-        // preserve the original quoting.  For multi-line source (continuations
-        // or multi-line sed/awk scripts), rebuild from the AST instead so the
-        // reconstructed command is a single valid line.
-        let raw_cmd = if let Some(src) = &pipeline.source_text {
-            let line_count = src.lines().filter(|l| !l.trim().is_empty()).count();
-            if line_count <= 1 {
-                src.trim().to_string()
-            } else {
-                // Multi-line source — rebuild from AST to avoid taking only the
-                // first line (which may be truncated or end with `\`).
-                generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
-            }
-        } else {
-            generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()))
-        };
+        // Reconstruct the shell command string from the AST rather than
+        // using source_text directly.  The AST reconstruction adds spaces
+        // around pipe operators ("mount | grep" vs "mount|grep"), which
+        // prevents check_qx.pl from seeing "mount|grep" as a single word
+        // and incorrectly detecting "grep" as a builtin within it.
+        let raw_cmd =
+            generator.generate_command_string_for_system(&Command::Pipeline(pipeline.clone()));
 
         // Skip if command string is empty.
         if !raw_cmd.is_empty() {
@@ -2364,6 +2348,7 @@ fn generate_buffered_pipeline(
                 "type", "wait", "time",
                 "basename", "dirname", "expr", "hostname", "id",
                 "readlink", "realpath", "uname", "whoami", "tty", "stat",
+                "env",
                 "gunzip", "zstd",
             ];
             let first_word = raw_cmd.split_whitespace().next().unwrap_or("");

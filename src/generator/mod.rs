@@ -2718,17 +2718,37 @@ impl Generator {
     fn command_uses_english(&self, command: &Command) -> bool {
         // English module provides long names for Perl special variables.
         // Check if generated code will use $OS_ERROR, $ERRNO, etc.
+        // These are used by `croak` calls in many command generators
+        // (cat, grep, head, tail, cut, tee, etc.) and by commands that
+        // perform I/O operations with Carp error handling.
         match command {
             Command::Simple(cmd) => {
                 // Commands that typically reference OS errors
                 if let Word::Literal(name, _) = &cmd.name {
-                    matches!(name.as_str(), "open3" | "exec" | "system" | "eval")
+                    matches!(name.as_str(), "open3" | "exec" | "system" | "eval"
+                        | "cat" | "grep" | "head" | "tail" | "cut" | "tee"
+                        | "wc" | "sort" | "uniq" | "diff" | "sed"
+                        | "awk" | "strings" | "xargs" | "comm"
+                        | "paste" | "tr" | "find" | "ls" | "perl")
                 } else {
                     false
                 }
             }
             Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_english(c)),
             Command::And(l, r) | Command::Or(l, r) => self.command_uses_english(l) || self.command_uses_english(r),
+            Command::If(stmt) => {
+                self.command_uses_english(&stmt.then_branch)
+                    || stmt.else_branch.as_ref().map_or(false, |e| self.command_uses_english(e))
+            }
+            Command::While(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_english(c)),
+            Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_english(c)),
+            Command::Subshell(c) | Command::Background(c) => self.command_uses_english(c),
+            Command::Block(b) => b.commands.iter().any(|c| self.command_uses_english(c)),
+            Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_english(c)),
+            Command::Redirect(rc) => self.command_uses_english(&rc.command),
+            Command::Assignment(assign) => {
+                self.word_uses_croak(&assign.value)
+            }
             _ => false,
         }
     }

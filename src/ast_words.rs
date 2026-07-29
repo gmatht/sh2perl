@@ -168,44 +168,10 @@ impl std::fmt::Display for Word {
         match self {
             Word::Literal(s, _) => write!(f, "{}", s),
             Word::Variable(var, _, _) => write!(f, "${}", var),
-            Word::ParameterExpansion(pe, _) => match &pe.operator {
-                ParameterExpansionOperator::None => write!(f, "${{{}}}", pe.variable),
-                ParameterExpansionOperator::UppercaseAll => write!(f, "${{{}}}", pe.variable),
-                ParameterExpansionOperator::LowercaseAll => write!(f, "${{{}}}", pe.variable),
-                ParameterExpansionOperator::UppercaseFirst => write!(f, "${{{}}}", pe.variable),
-                ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
-                    write!(f, "${{{}}}##{}", pe.variable, pattern)
-                }
-                ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
-                    write!(f, "${{{}}}#{}", pe.variable, pattern)
-                }
-                ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
-                    write!(f, "${{{}}}%%{}", pe.variable, pattern)
-                }
-                ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
-                    write!(f, "${{{}}}%{}", pe.variable, pattern)
-                }
-                ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
-                    write!(f, "${{{}}}//{}/{}", pe.variable, pattern, replacement)
-                }
-                ParameterExpansionOperator::DefaultValue(default) => {
-                    write!(f, "${{{}}}:-{}", pe.variable, default)
-                }
-                ParameterExpansionOperator::AssignDefault(default) => {
-                    write!(f, "${{{}}}:={}", pe.variable, default)
-                }
-                ParameterExpansionOperator::ErrorIfUnset(error) => {
-                    write!(f, "${{{}}}:?{}", pe.variable, error)
-                }
-                ParameterExpansionOperator::Basename => write!(f, "${{{}}}##*/", pe.variable),
-                ParameterExpansionOperator::Dirname => write!(f, "${{{}}}%/*", pe.variable),
-                ParameterExpansionOperator::ArraySlice(offset, length) => {
-                    if let Some(length_str) = length {
-                        write!(f, "${{{}}}:{}:{}", pe.variable, offset, length_str)
-                    } else {
-                        write!(f, "${{{}}}:{}", pe.variable, offset)
-                    }
-                }
+            Word::ParameterExpansion(pe, _) => {
+                // Delegate to ParameterExpansion's own Display impl which
+                // produces correct shell syntax (e.g., ${0##*/} not ${0}##*/).
+                write!(f, "{}", pe)
             },
             Word::Array(name, elements, _) => write!(f, "{}=({})", name, elements.join(" ")),
             Word::MapAccess(map_name, key, _) => write!(f, "{}[{}]", map_name, key),

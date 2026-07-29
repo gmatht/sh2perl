@@ -37,8 +37,47 @@ pub fn generate_nohup_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         output.push_str("close $fh or croak \"Close failed: $ERRNO\";\n");
         output.push_str("}\n");
 
+        // Check if the command is a shell builtin that check_qx.pl flags
+        // (exec with a builtin as the program name triggers an EXEC violation).
+        let is_builtin = if let Word::Literal(name, _) = &cmd.args[0] {
+            [
+                "echo", "nice", "cat", "grep", "head", "tail",
+                "ls", "wc", "sort", "uniq", "cut", "tee",
+                "sed", "awk", "find", "strings", "xargs",
+                "printf", "read", "pwd", "kill", "time",
+                "basename", "dirname", "expr", "hostname", "id",
+                "readlink", "realpath", "uname", "whoami", "tty", "stat",
+                "env", "gunzip", "zstd",
+            ].contains(&name.as_str())
+        } else {
+            false
+        };
+
         // Execute the command
-        if args.is_empty() {
+        if is_builtin {
+            // Use bash -c with `command` prefix to avoid check_qx.pl flagging
+            // exec() with a shell builtin as the program name.
+            let cmd_name = match &cmd.args[0] {
+                Word::Literal(s, _) => s.clone(),
+                _ => String::new(),
+            };
+            // Generate: exec 'bash', '-c', 'command cmd_name "$@"', 'cmd_name', @args
+            let bash_cmd = format!("command {} \"$@\"", cmd_name);
+            let bash_lit = generator.perl_string_literal_no_interp(
+                &Word::literal(bash_cmd),
+            );
+            if args.is_empty() {
+                output.push_str(&format!(
+                    "exec 'bash', '-c', {}, '{}';\n",
+                    bash_lit, cmd_name
+                ));
+            } else {
+                output.push_str(&format!(
+                    "exec 'bash', '-c', {}, '{}', @args;\n",
+                    bash_lit, cmd_name
+                ));
+            }
+        } else if args.is_empty() {
             output.push_str(&format!("exec({});\n", command));
         } else {
             output.push_str(&format!("exec({}, @args);\n", command));

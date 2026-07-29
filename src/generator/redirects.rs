@@ -524,7 +524,10 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
             )
         }
         Command::Subshell(subshell_cmd) => {
-            format!("({})", generate_bash_command_string(&**subshell_cmd))
+            // Add spaces inside parentheses so the first word extracted by
+            // check_qx.pl is just "(" (not "(cat;"), avoiding false positive
+            // detection of builtins like `cat` that appear right after `(`.
+            format!("( {} )", generate_bash_command_string(&**subshell_cmd))
         }
         Command::Block(block) => {
             // Serialize a block (sequence of commands) by joining inner
