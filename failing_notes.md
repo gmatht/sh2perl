@@ -4,80 +4,29 @@
 
 ### Newly Fixed (this session):
 
-1. **Trailing newlines in command substitution (chomp wrapping)**:
-   Modified `words.rs` command-substitution handler to wrap results in
-   `do { my $__cs = RESULT; chomp $__cs; $__cs; }`, stripping trailing
-   newlines to match shell command-substitution semantics. Native-Perl
-   translations (sprintf, sha256_hex, paste, etc.) now produce the same
-   output as bash.
+1. **Function call / signature mismatch with `fn_param_names`**:
+   Fixed two bugs in the parameter-name-map feature:
+   - **`simple_commands.rs`**: Function calls were using named-argument
+     syntax (`file => 'value'`) while function definitions used positional
+     unpacking (`my ($file) = @_;`). Changed calls to use positional args
+     matching the definition.
+   - **`control_flow.rs`**: The removal of redundant `my $file = $_[0];`
+     lines failed because the pattern expected the line without `my`.
+     Updated to match both `my $x = $_[N];` and `$x = $_[N];`.
+   Fixed tests: `test_simple_function`, `061_test_local_names_preserved`,
+   `092_for_arith_func`, `055_factorize`.
 
-2. **Fragile q{...} quoting in cmd_str_to_open_perl**:
-   Replaced the old approach of escaping `}` as `\}` inside `q{...}`
-   (which broke awk programs containing `{...}`) with a new
-   `safe_perl_q_string()` helper that picks a delimiter not found in
-   the content, exactly like `perl_string_literal_no_interp_impl` does.
-
-3. **Perl scoping bug: `open(my $__fh, ...) and do { ... $__fh }`**:
-   Fixed across 6 files (`ir.rs`, `paste.rs`, `echo.rs`, `builtins.rs`,
-   `simple_commands.rs`, `test_expressions.rs`). Changed the pattern to
-   `if (open my $__fh, ...) { ... $__fh ... }` because `my` inside
-   `open()` doesn't scope into `and do { }` blocks.
-
-4. **`IrStmt::System` now uses args (not @ARGV)**:
-   Fixed `stmt_to_perl` for `IrStmt::System { capture: Some }` to
-   actually build and run a command from its `args` instead of always
-   reading `@ARGV`. This lets `diff file1.txt file2.txt` (and similar)
-   work correctly in command-substitution context.
-
-5. **`build_param_name_map` detects `local var=$N`**:
-   Extended `build_param_name_map` to scan `BuiltinCommand` nodes for
-   patterns like `local file=$1`, preventing double declaration of
-   function parameters.
+2. **Unquoted `{`, `}`, `$` in reconstructed bash command strings**:
+   The `word_to_bash_string_for_system` and `word_to_bash_string` helpers
+   (and `needs_shell_quoting_literal`) were missing `{`, `}`, and `$` from
+   their list of characters requiring shell quoting.  This caused awk/sed
+   programs like `{print$3}` to be emitted unquoted, letting bash expand
+   `$3` as a positional parameter (empty in `bash -c` context) and turning
+   awk's program into `{print}` (prints whole line).
+   Added the missing characters to both functions.
+   Fixed test: `sqs-overlap-singleline`.
 
 ## Remaining failures (~196)
-
-The remaining failures fall into categories that require deeper parser/generator work:
-
-1. **Parser failures on edge cases** (~11 tests):
-
-Systematic issues that have been FIXED:
-
-1. **`$$` (process ID) converted to `$ENV{$}` instead of `$$`**:
-   Fixed in `words.rs` by adding `"$"` to the special variable lists in both
-   `word_to_perl_impl` and `convert_string_interpolation_to_perl_impl`.
-
-2. **Double newline from command substitution**:
-   `cmd_str_to_open_perl` and `expr_to_open_perl` now chomp the captured
-   output, matching shell command-substitution semantics. Also fixed the
-   `local $/` race with `chomp` (chomp must execute after `$/` is restored
-   to its default value).
-
-3. **`! negation` wrapping for standalone commands**:
-   Changed from `!(...)` to `!do { ... };` so multiple statements (variable
-   declarations, etc.) inside the negation are valid Perl.
-
-4. **`! negation` in if-conditions**:
-   The `Command::Not` handler in `control_flow.rs` now applies `!()` to the
-   inner condition, correctly flipping shell exit-code semantics.
-
-5. **Missing `$CHILD_ERROR` declaration**:
-   `our $CHILD_ERROR;` is now emitted unconditionally since many command
-   generators (grep, ls, etc.) use `$CHILD_ERROR` internally even without
-   explicit command substitution in the shell source.
-
-6. **Filehandle syntax in `Output` IR node**:
-   Changed from `print {*fh} ...` to `print {$fh} ...` (scalar filehandle,
-   not typeglob).
-
-7. **`[` (test bracket) not dispatched to test handler**:
-   Added `"["` to the standalone command dispatch table in
-   `simple_commands.rs` alongside `"test"`.
-
-8. **`Command::Not` missing from `cmd_has_cmdsub` traversal**:
-   Added `Command::Not` to the match in `cmd_has_cmdsub` so the inner
-   command's command substitutions are detected.
-
-## Remaining failures (~206)
 
 The remaining failures fall into categories that require deeper parser/generator work:
 

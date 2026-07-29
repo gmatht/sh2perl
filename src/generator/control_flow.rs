@@ -1283,11 +1283,16 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
 
         // Remove the individual `$x = $_[0];` lines since they're now
         // handled by the unpacking `my ($x, $y) = @_;` above.
+        // The `local` handler may emit either `my $x = $_[0];` or
+        // `$x = $_[0];`, so try both forms.
         for (idx, pname) in &param_map {
-            // The param was marked as declared, so the body emits assignment
-            // without `my`: `    $x = $_[0];\n`
-            let redundant = format!("    ${} = $_[{}];\n", pname, idx - 1);
-            body_code = body_code.replace(&redundant, "");
+            let pat_my = format!("    my ${} = $_[{}];\n", pname, idx - 1);
+            if body_code.contains(&pat_my) {
+                body_code = body_code.replace(&pat_my, "");
+            } else {
+                let redundant = format!("    ${} = $_[{}];\n", pname, idx - 1);
+                body_code = body_code.replace(&redundant, "");
+            }
         }
     }
 

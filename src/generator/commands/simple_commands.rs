@@ -1679,35 +1679,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             })
                             .collect();
 
-                        // Check if this function has named parameters; if so,
-                        // pass arguments by name instead of positionally.
-                        let args_str = if let Some(param_map) = generator.fn_param_names.get(name) {
-                            // Build a sorted list of (param_name, arg) pairs
-                            let mut sorted: Vec<_> = param_map.iter().collect();
-                            sorted.sort_by_key(|(idx, _)| **idx);
-                            let named: Vec<String> = sorted
-                                .iter()
-                                .enumerate()
-                                .map(|(pos, (_, pname))| {
-                                    let arg = args.get(pos)
-                                        .cloned()
-                                        .unwrap_or_else(|| "undef".to_string());
-                                    format!("{} => {}", pname, arg)
-                                })
-                                .collect();
-                            // If there are more args than params, append the extras positionally
-                            let mut result = named.join(", ");
-                            if args.len() > param_map.len() {
-                                let extra: Vec<&str> = args[param_map.len()..].iter().map(|s| s.as_str()).collect();
-                                if !result.is_empty() {
-                                    result.push_str(", ");
-                                }
-                                result.push_str(&extra.join(", "));
-                            }
-                            result
-                        } else {
-                            args.join(", ")
-                        };
+                        // Use positional arguments — the function definition
+                        // also uses positional unpacking (`my ($x, $y) = @_;`).
+                        // The param-name map is only used for signature generation
+                        // (cleaner unpacking), not for named-argument passing.
+                        let args_str = args.join(", ");
                         output.push_str(&generator.indent());
                         output.push_str(&format!("{}({});\n", call_prefix, args_str));
                     }
