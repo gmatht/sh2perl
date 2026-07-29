@@ -65,7 +65,7 @@ sub filter_diff {
 
     for my $file (@files) {
         my $result_file = '';
-        my @hunks = $file->{hunks};
+        my @hunks = @{$file->{hunks}};
 
         for my $hunk (@hunks) {
             my @lines   = @{$hunk->{lines}};
