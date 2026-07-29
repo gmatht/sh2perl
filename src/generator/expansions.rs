@@ -9,7 +9,7 @@ fn positional_param_ref(n: usize) -> String {
     format!("$_[{}]", n.saturating_sub(1))
 }
 
-fn parameter_var_scalar_ref(generator: &Generator, var_name: &str) -> String {
+pub(crate) fn parameter_var_scalar_ref(generator: &Generator, var_name: &str) -> String {
     if let Ok(n) = var_name.parse::<usize>() {
         return positional_param_ref(n);
     }
@@ -359,8 +359,10 @@ pub(crate) fn glob_to_perl_regex_nongreedy(pattern: &str) -> String {
                     result.push(next);
                 }
             }
-            // Escape Perl regex metacharacters that aren't glob metacharacters
-            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' => {
+            // Escape Perl regex metacharacters that aren't glob metacharacters.
+            // Also escape '/' because the caller embeds the result in s/// with
+            // '/' as the delimiter; unescaped '/' would break the substitution.
+            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' | '/' => {
                 result.push('\\');
                 result.push(c);
             }
@@ -395,7 +397,10 @@ pub(crate) fn glob_to_perl_regex_greedy(pattern: &str) -> String {
                     result.push(next);
                 }
             }
-            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' => {
+            // Escape Perl regex metacharacters that aren't glob metacharacters.
+            // Also escape '/' because the caller embeds the result in s/// with
+            // '/' as the delimiter; unescaped '/' would break the substitution.
+            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' | '/' => {
                 result.push('\\');
                 result.push(c);
             }
@@ -447,7 +452,9 @@ fn reverse_glob_pattern(pattern: &str) -> String {
 }
 
 fn escape_regex_pattern(pattern: &str) -> String {
-    // Escape special regex characters in the pattern
+    // Escape special regex characters in the pattern.
+    // Also escape '/' because the caller embeds the result in s/// with
+    // '/' as the delimiter; unescaped '/' would break the substitution.
     pattern
         .replace("\\", "\\\\")
         .replace(".", "\\.")
@@ -456,6 +463,7 @@ fn escape_regex_pattern(pattern: &str) -> String {
         .replace("?", "\\?")
         .replace("^", "\\^")
         .replace("$", "\\$")
+        .replace("/", "\\/")
         .replace("[", "\\[")
         .replace("]", "\\]")
         .replace("(", "\\(")

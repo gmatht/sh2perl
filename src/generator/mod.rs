@@ -834,12 +834,34 @@ impl Generator {
                         // `#` outside a string literal starts a Perl comment and should
                         // not be part of a value expression (it confuses PPI/perlcritic
                         // when the comment contains `{`/`}` characters).
+                        // Avoid stripping `#` that appears inside Perl s/// or m//
+                        // operators (e.g. `s/#.*$//sr`), where `#` is part of the regex
+                        // pattern, not a comment.  Simple heuristic: if there is an odd
+                        // number of `/` before `#` (counting from the last `s` or `m`),
+                        // then `#` is inside the regex part of s/// or m//.
                         let no_comment = if let Some(pos) = trimmed.find('#') {
-                            // Only strip `#` that is NOT inside a string literal.
-                            // Simple heuristic: if there's an even number of " before `#`,
-                            // we're not inside a string.
-                            let quotes_before = trimmed[..pos].chars().filter(|&c| c == '"').count();
-                            if quotes_before % 2 == 0 {
+                            let before_hash = &trimmed[..pos];
+                            let quotes_before = before_hash.chars().filter(|&c| c == '"').count();
+                            // Check whether # is inside a s/// or m// operator by counting
+                            // non-escaped slashes after the last s/m operator.
+                            let inside_s_op = {
+                                let mut result = false;
+                                let mut chars = before_hash.chars().rev().peekable();
+                                let mut slash_count = 0;
+                                while let Some(c) = chars.next() {
+                                    match c {
+                                        '/' => slash_count += 1,
+                                        's' | 'm' if slash_count > 0 => {
+                                            result = slash_count % 2 == 1;
+                                            break;
+                                        }
+                                        ' ' | '\t' => {}
+                                        _ => break,
+                                    }
+                                }
+                                result
+                            };
+                            if (quotes_before % 2 == 0) && !inside_s_op {
                                 trimmed[..pos].trim_end().to_string()
                             } else {
                                 trimmed.to_string()

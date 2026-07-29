@@ -774,7 +774,12 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 }
             }).collect();
             if clean_flags.is_empty() {
-                format!("{{{}}}", pattern)
+                // Use /pattern/ (forward slash delimiters) so the result is
+                // a proper regex match operator, NOT a hash reference {pattern}.
+                // Using {pattern} would be interpreted as a hash reference in
+                // most contexts (e.g. grep { {pattern} } @list) and trigger
+                // perlcritic ProhibitMutatingListFunctions false positives.
+                format!("/{}/", pattern)
             } else {
                 format!("/{}/{}", pattern, clean_flags)
             }
