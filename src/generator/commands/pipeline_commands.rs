@@ -552,7 +552,7 @@ fn generate_command_using_builtins(
                 let (in_v, out_v, _err_v, pid_v, _) = generator.get_unique_ipc_vars();
                 let uid = generator.get_unique_id();
                 result.push_str(&format!(
-                    "my @_pcmd_{uid} = ('sh', '-c', {perl_str});\nmy ({in_v}, {out_v});\nmy {pid_v} = open3({in_v}, {out_v}, '>&STDERR', @_pcmd_{uid});\nclose {in_v} or croak 'Close failed: $OS_ERROR';\n${output_var} .= do {{ local $INPUT_RECORD_SEPARATOR = undef; <{out_v}> }};\nclose {out_v} or croak 'Close failed: $OS_ERROR';\nwaitpid {pid_v}, 0;\n"
+                    "my @_pcmd_{uid} = (split(' ', {perl_str}));\nmy ({in_v}, {out_v});\nmy {pid_v} = open3({in_v}, {out_v}, '>&STDERR', @_pcmd_{uid});\nclose {in_v} or croak 'Close failed: $OS_ERROR';\n${output_var} .= do {{ local $INPUT_RECORD_SEPARATOR = undef; <{out_v}> }};\nclose {out_v} or croak 'Close failed: $OS_ERROR';\nwaitpid {pid_v}, 0;\n"
                 ));
             }
             result

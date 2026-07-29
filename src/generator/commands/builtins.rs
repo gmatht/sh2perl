@@ -715,20 +715,52 @@ pub fn generate_generic_builtin(
         }
         "tail" => {
             if input_var.is_empty() {
-                let command = Command::Simple(cmd.clone());
-                let command_str = generator.generate_command_string_for_system(&command);
-                // Genuine qx'...' call with the raw command
-                let escaped = command_str.replace("'", "'\\''");
+                // Native Perl tail: read files and extract last N lines.
+                let mut num_lines = 10;
+                let mut file_args: Vec<String> = Vec::new();
+                let mut i = 0;
+                while i < cmd.args.len() {
+                    if let Word::Literal(s, _) = &cmd.args[i] {
+                        if s == "-n" && i + 1 < cmd.args.len() {
+                            if let Word::Literal(n, _) = &cmd.args[i + 1] {
+                                if let Ok(v) = n.parse::<usize>() { num_lines = v; }
+                                i += 2; continue;
+                            }
+                        } else if s.starts_with("-n") {
+                            if let Ok(v) = s[2..].parse::<usize>() { num_lines = v; }
+                        } else if s.starts_with('-') && s.len() > 1 {
+                            if let Ok(v) = s[1..].parse::<usize>() { num_lines = v; }
+                        } else {
+                            file_args.push(generator.word_to_perl(&cmd.args[i]));
+                        }
+                    } else {
+                        file_args.push(generator.word_to_perl(&cmd.args[i]));
+                    }
+                    i += 1;
+                }
+                let files_joined = file_args.join(", ");
+                let n = num_lines;
                 if output_var.is_empty() {
-                    format!(
-                        "do {{ qx'{}'; }};\n",
-                        escaped
-                    )
+                    if file_args.is_empty() {
+                        format!("do {{ my @__lines = <STDIN>; my @__tail = @__lines[-{}..-1] if @__lines >= {}; print @__tail; }};\n", n, n)
+                    } else {
+                        format!(
+                            "do {{ for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = @__lines[-{}..-1] if @__lines >= {}; print @__tail; }} }};\n",
+                            files_joined, n, n
+                        )
+                    }
                 } else {
-                    format!(
-                        "${} = do {{ qx'{}'; }};\n",
-                        output_var, escaped
-                    )
+                    if file_args.is_empty() {
+                        format!(
+                            "do {{ my @__lines = <STDIN>; my @__tail = @__lines[-{}..-1] if @__lines >= {}; ${} = join q{{}}, @__tail; }};\n",
+                            n, n, output_var
+                        )
+                    } else {
+                        format!(
+                            "do {{ my $__out = q{{}}; for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = @__lines[-{}..-1] if @__lines >= {}; $__out .= join q{{}}, @__tail; }} ${} = $__out; }};\n",
+                            files_joined, n, n, output_var
+                        )
+                    }
                 }
             } else {
                 crate::generator::commands::tail::generate_tail_command(
@@ -1232,11 +1264,8 @@ fn generate_system_call_fallback(
         }
     }
 
-    // Preserve original string literal semantics when emitting Perl code by
-    // using generator.perl_string_literal for each literal argument. This
-    // ensures that arguments which originally used double-quote style (and
-    // therefore require interpolation at runtime) remain double-quoted in the
-    // generated Perl so interpolation happens when the purified script runs.
+    // Build argument list from the AST for direct exec (no shell).
+    let cmd_name_lit = format!("'{}'", cmd.name.as_literal().unwrap_or(""));
     let args_perl: Vec<String> = cmd
         .args
         .iter()
@@ -1245,26 +1274,22 @@ fn generate_system_call_fallback(
             _ => None,
         })
         .collect();
-    let args_str = args_perl.join(", ");
-
-    // Use generate_command_string_for_system and wrap in qx{} with the
-    // array-element trick for clean shell command generation.
-    let cmd_str = generator.generate_command_string_for_system(
-        &Command::Simple(cmd.clone()),
-    );
-    let escaped = cmd_str.replace("'", "'\\''");
+    let all_args = std::iter::once(cmd_name_lit)
+        .chain(args_perl.into_iter())
+        .collect::<Vec<_>>()
+        .join(", ");
     let out_name = output_var.trim_start_matches('$');
     let in_name = input_var.trim_start_matches('$');
     if input_var.is_empty() {
         format!(
-            "\n${{{out_name}}} = do {{ chomp(my $_r = qx'{}'); $_r; }};\n",
-            escaped,
+            "\n${{{out_name}}} = do {{ open(my $__fh, '-|', {}) or croak \"failed: $ERRNO\"; chomp(my $_r = do {{ local $/; <$__fh> }}); close $__fh; $_r; }};\n",
+            all_args,
             out_name = out_name,
         )
     } else {
         format!(
-            "\n${{{out_name}}} = do {{ chomp(my $_r = qx'echo \"${{{in_name}}}\" | {}'); $_r; }};\n",
-            escaped,
+            "\n${{{out_name}}} = do {{ open(my $__fh, '|-', {}) or croak \"failed: $ERRNO\"; print $__fh \"${{{in_name}}}\"; close $__fh; $CHILD_ERROR = $? >> 8; q{{}}; }};\n",
+            all_args,
             out_name = out_name,
             in_name = in_name,
         )

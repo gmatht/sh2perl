@@ -1,15 +1,20 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use FindBin;
+use Cwd qw(abs_path);
+use File::Basename qw(dirname);
 
-my $target = "$FindBin::RealBin/../check_qx.pl";
-my $watch  = "$FindBin::RealBin/..";
+# Script location — always works regardless of how the script is invoked
+my $script_dir = dirname(abs_path($0));
+my $target = "$script_dir/../check_qx.pl";
+my $watch  = "$script_dir/..";
 my $guard  = qr/^\s+command\b/m;
 
-# ── Helper: re-read file and verify guard ────────────────────────────
+print "Watching: $target\n";
+print "Git dir:  $watch\n";
+
 sub verify {
-    open my $fh, '<', $target or return;
+    open my $fh, '<', $target or do { warn "Cannot read $target: $!\n"; return };
     my $content = do { local $/; <$fh> };
     close $fh;
     if ($content !~ $guard) {
@@ -21,13 +26,10 @@ sub verify {
     return 1;
 }
 
-# ── Use inotifywait via pipe (instant notification) ──────────────────
-# If inotifywait is available, this blocks until a change event fires.
-# Otherwise we poll with 0.1s sleep (effectively instant to a human).
-
-my $use_inotifywait = `which inotifywait 2>/dev/null`;
-
 verify();
+
+# Use inotifywait if available, otherwise tight poll
+my $use_inotifywait = `which inotifywait 2>/dev/null`;
 
 if ($use_inotifywait) {
     open(my $fh, '-|', 'inotifywait', '-m', '-e', 'close_write,moved_to', '--format', '%e', $target)
@@ -38,13 +40,12 @@ if ($use_inotifywait) {
         verify();
     }
 } else {
-    # Tight poll loop — 0.1s means unnoticeable latency
     my $last = (stat($target))[9] || 0;
     while (1) {
         my $mtime = (stat($target))[9] || 0;
         if ($mtime != $last) {
             $last = $mtime;
-            select undef, undef, undef, 0.05;  # let write finish
+            select undef, undef, undef, 0.05;
             verify();
         }
         select undef, undef, undef, 0.1;
