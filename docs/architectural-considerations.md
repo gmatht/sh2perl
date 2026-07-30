@@ -791,3 +791,10 @@ Implementation steps:
    It only helps for JavaScript output — but for JavaScript it helps enormously,
    eliminating ~2000 lines of formatting code. The risk is over-investing in
    ESTree infrastructure before the core IR is validated by a non-JS backend.
+
+---
+
+*See also: [bash-game-vision.md](bash-game-vision.md) for a speculative
+walkthrough of what these architectural pieces could build — a 3D game
+written entirely in bash, running in the browser via sh2perl transpilation
+and the /dev/ filesystem metaphor.*
