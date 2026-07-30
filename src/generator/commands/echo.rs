@@ -54,7 +54,7 @@ pub fn generate_echo_command(
                             "#" => "scalar(@ARGV)".to_string(),
                             "@" => "@ARGV".to_string(),
                             "*" => "@ARGV".to_string(),
-                            "?" => "($? >> 8)".to_string(),
+                            "?" => "$CHILD_ERROR".to_string(),
                             "!" => "''".to_string(),
                             "-" => "''".to_string(),
                             _ => {
@@ -76,7 +76,7 @@ pub fn generate_echo_command(
                                     "#" => "scalar(@ARGV)".to_string(),
                                     "@" => "@ARGV".to_string(),
                                     "*" => "@ARGV".to_string(),
-                                    "?" => "($? >> 8)".to_string(),
+                                    "?" => "$CHILD_ERROR".to_string(),
                                     "!" => "''".to_string(),
                                     "-" => "''".to_string(),
                                     _ => {
@@ -187,7 +187,7 @@ pub fn generate_echo_command(
                                                 "#" => result.push_str("scalar(@ARGV)"),
                                                 "@" => result.push_str("@ARGV"),
                                                 "*" => result.push_str("@ARGV"),
-                                                "?" => result.push_str("($? >> 8)"),
+                                                "?" => result.push_str("$CHILD_ERROR"),
                                                 "!" => result.push_str(""),
                                                 "-" => result.push_str(""),
                                                 _ => {
