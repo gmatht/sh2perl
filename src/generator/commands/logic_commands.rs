@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::generator::control_flow::{collect_assigned_vars, hoist_my_declarations};
 use crate::generator::Generator;
 use crate::ir::{AssignTarget, IrExpr, IrStmt, Sigil};
 
@@ -158,6 +159,15 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         output.push_str("}");
     }
 
+    // Pre-declare variables assigned in the right branch so that `my $var = ...`
+    // does not end up inside the conditional body (which would make the variable
+    // inaccessible to code after the `&&` expression).
+    {
+        let mut right_vars = std::collections::HashSet::new();
+        collect_assigned_vars(right, &mut right_vars);
+        hoist_my_declarations(generator, &right_vars, &mut output);
+    }
+
     output.push_str(") {\n");
     generator.indent_level += 1;
     output.push_str(&generator.indent());
@@ -183,6 +193,13 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
 
     // Check if left is a test expression
     if let Command::TestExpression(_) = left {
+        // Pre-declare variables assigned in the right branch so that `my $var = ...`
+        // does not end up inside the conditional body.
+        {
+            let mut right_vars = std::collections::HashSet::new();
+            collect_assigned_vars(right, &mut right_vars);
+            hoist_my_declarations(generator, &right_vars, &mut output);
+        }
         // For test expressions, generate: if (!left) { right }
         output.push_str("if (!(");
         generator.suppress_set_e_depth += 1;
@@ -206,6 +223,12 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         let and_result = generator.generate_command(left);
         generator.suppress_set_e_depth -= 1;
         output.push_str(&and_result);
+        // Pre-declare variables assigned in the right branch
+        {
+            let mut right_vars = std::collections::HashSet::new();
+            collect_assigned_vars(right, &mut right_vars);
+            hoist_my_declarations(generator, &right_vars, &mut output);
+        }
         output.push_str(&generator.indent());
         output.push_str("if ($CHILD_ERROR != 0) {\n");
         generator.indent_level += 1;
@@ -342,6 +365,15 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         generator.suppress_set_e_depth += 1;
         output.push_str(&generator.generate_command(left));
         generator.suppress_set_e_depth -= 1;
+
+        // Pre-declare variables assigned in the right branch so that `my $var = ...`
+        // does not end up inside the conditional body (which would make the variable
+        // inaccessible to code after the `||` expression).
+        {
+            let mut right_vars = std::collections::HashSet::new();
+            collect_assigned_vars(right, &mut right_vars);
+            hoist_my_declarations(generator, &right_vars, &mut output);
+        }
 
         // Execute right command if left command fails
         let exit_code_var = "$CHILD_ERROR";
