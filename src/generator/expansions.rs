@@ -314,13 +314,33 @@ pub fn generate_parameter_expansion_impl(
                     }
                 }
             } else {
-                // Use @main:: to reference the variable safely under strict mode
-                let var_ref = format!("@main::{}", pe.variable);
-                // ${var:offset:length} - array slice
-                if let Some(length_str) = length {
-                    format!("{}[{}..{}]", var_ref, offset, length_str)
+                // Check if the variable is a scalar (not an array).
+                // If scalar, use substr(); otherwise use array slice.
+                let is_scalar = !generator.indexed_arrays.contains(&pe.variable)
+                    && !generator.associative_arrays.contains(&pe.variable);
+                if is_scalar {
+                    // Scalar substring: ${var:offset} or ${var:offset:length}
+                    let var_ref = if generator.declared_locals.contains(&pe.variable)
+                        || generator.function_level_vars.contains(&pe.variable)
+                    {
+                        format!("${}", pe.variable)
+                    } else {
+                        format!("$ENV{{{}}}", pe.variable)
+                    };
+                    if let Some(length_str) = length {
+                        format!("substr({}, {}, {})", var_ref, offset, length_str)
+                    } else {
+                        format!("substr({}, {})", var_ref, offset)
+                    }
                 } else {
-                    format!("{}[{}..]", var_ref, offset)
+                    // Use @main:: to reference the variable safely under strict mode
+                    let var_ref = format!("@main::{}", pe.variable);
+                    // ${var:offset:length} - array slice
+                    if let Some(length_str) = length {
+                        format!("{}[{}..{}]", var_ref, offset, length_str)
+                    } else {
+                        format!("{}[{}..]", var_ref, offset)
+                    }
                 }
             }
         }
@@ -379,10 +399,14 @@ pub(crate) fn glob_to_perl_regex_nongreedy(pattern: &str) -> String {
             '*' => result.push_str(".*?"),
             '?' => result.push('.'),
             '[' => {
-                // Pass character classes through
+                // Pass character classes through, but escape '/' because the
+                // caller embeds the result in s/// with '/' as the delimiter.
                 result.push('[');
                 while let Some(&c2) = chars.peek() {
                     chars.next();
+                    if c2 == '/' {
+                        result.push('\\');
+                    }
                     result.push(c2);
                     if c2 == ']' {
                         break;
@@ -421,6 +445,9 @@ pub(crate) fn glob_to_perl_regex_greedy(pattern: &str) -> String {
                 result.push('[');
                 while let Some(&c2) = chars.peek() {
                     chars.next();
+                    if c2 == '/' {
+                        result.push('\\');
+                    }
                     result.push(c2);
                     if c2 == ']' {
                         break;

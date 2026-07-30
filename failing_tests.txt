@@ -3,22 +3,18 @@
 000__07_find_path_commands.sh	stdout mismatch
 003_pipeline.sh	stdout mismatch
 009_arrays.sh	stdout mismatch
-008_simple_backup.sh	stdout mismatch
-011_brace_expansion.sh	stdout mismatch
 012_process_substitution.sh	stdout mismatch
-016_grep_basic.sh	stdout mismatch
 015_grep_advanced.sh	stdout mismatch
+016_grep_basic.sh	stdout mismatch
 017_grep_context.sh	stdout mismatch
 019_grep_regex.sh	stdout mismatch
 018_grep_params.sh	stdout mismatch
 029_arrays_associative.sh	stdout mismatch
-035_brace_expansion_practical.sh	stdout mismatch
 042_process_substitution_advanced.sh	stdout mismatch
 045_shell_calling_perl.sh	stdout mismatch
 050_test_ls_star_dot_sh.sh	stdout mismatch
 057_case.sh	stdout mismatch
 062_09_complex_function.sh	stdout mismatch
-062_10_simple_pipeline.sh	stdout mismatch
 062_15_complex_local_variables.sh	stdout mismatch
 062_hard_to_lex.sh	stdout mismatch
 051_primes.sh	stdout mismatch
@@ -32,9 +28,9 @@
 064_hard_to_generate.sh	stdout mismatch
 072_background_fork.sh	stdout mismatch
 075_eval_complex.sh	stdout mismatch
-063_06_complex_pipeline_background.sh	stdout mismatch
 083_process_sub_missing_files.sh	stdout mismatch
 084_while_pipeline.sh	stdout mismatch
+063_06_complex_pipeline_background.sh	stdout mismatch
 087_function_cmd_sub.sh	stdout mismatch
 088_while_read_ifs_sort.sh	stdout mismatch
 091_while_pipe_var.sh	stdout mismatch
@@ -97,8 +93,8 @@ parse-heredoc-apostrophe.sh	debashc failed to generate code
 parse-heredoc-dollar-paren.sh	stdout mismatch
 parse-heredoc-redirect-chain.sh	stdout mismatch
 parse-longoption-with-dollar.sh	stdout mismatch
-parse-param-pattern-match.sh	stdout mismatch
 parse-orelse-continuation.sh	stdout mismatch
+parse-param-pattern-match.sh	stdout mismatch
 parse-paren-after-do.sh	debashc failed to generate code
 parse-parameter-pattern.sh	stdout mismatch
 parse-paren-close.sh	stdout mismatch
@@ -107,9 +103,9 @@ parse-singlequote-unexpected.sh	stdout mismatch
 parse-sq-awk-while.sh	stdout mismatch
 parse-standalone-redirect.sh	stdout mismatch
 parse-substring-double-colon.sh	stdout mismatch
-parse-unexpected-braceclose.sh	stdout mismatch
 parse-unexpected-end-of-input.sh	debashc failed to generate code
 parse-unexpected-parenclose.sh	debashc failed to generate code
+parse-unexpected-braceclose.sh	stdout mismatch
 pid_tempfile.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
 ps-system-call.sh	stdout mismatch
