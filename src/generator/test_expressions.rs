@@ -72,6 +72,7 @@ fn convert_shell_var_to_perl(var: &str) -> String {
         "$#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
         "$@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
         "$*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
+        "$?" => "($? >> 8)".to_string(),     // $? -> exit code (>>8 converts wait status)
         _ if s.starts_with('$') => {
             // Regular variable - just return as is for now
             s
@@ -591,6 +592,199 @@ pub fn generate_test_expression_impl(
             var = format!("'{}'", var);
         }
         format!("(-l {})", var)
+    } else if expr.contains(" -h ") || starts_with_op(expr, "-h") {
+        // File exists and is symbolic link (same as -L): [[ -h $var ]]
+        let mut var = if expr.starts_with("-h ") {
+            expr.replacen("-h ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-h""#) || expr.starts_with("-h$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-h ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("(-l {})", var)
+    } else if expr.contains(" -p ") || starts_with_op(expr, "-p") {
+        // File is a named pipe (FIFO): [[ -p $var ]]
+        let mut var = if expr.starts_with("-p ") {
+            expr.replacen("-p ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-p""#) || expr.starts_with("-p$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-p ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("(-p {})", var)
+    } else if expr.contains(" -b ") || starts_with_op(expr, "-b") {
+        // File is a block device: [[ -b $var ]]
+        let mut var = if expr.starts_with("-b ") {
+            expr.replacen("-b ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-b""#) || expr.starts_with("-b$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-b ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("(-b {})", var)
+    } else if expr.contains(" -c ") || starts_with_op(expr, "-c") {
+        // File is a character device: [[ -c $var ]]
+        let mut var = if expr.starts_with("-c ") {
+            expr.replacen("-c ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-c""#) || expr.starts_with("-c$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-c ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("(-c {})", var)
+    } else if expr.contains(" -g ") || starts_with_op(expr, "-g") {
+        // File has setgid bit set: [[ -g $var ]]
+        let mut var = if expr.starts_with("-g ") {
+            expr.replacen("-g ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-g""#) || expr.starts_with("-g$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-g ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("(-g {})", var)
+    } else if expr.contains(" -k ") || starts_with_op(expr, "-k") {
+        // File has sticky bit set: [[ -k $var ]]
+        let mut var = if expr.starts_with("-k ") {
+            expr.replacen("-k ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-k""#) || expr.starts_with("-k$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-k ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("(-k {})", var)
+    } else if expr.contains(" -u ") || starts_with_op(expr, "-u") {
+        // File has setuid bit set: [[ -u $var ]]
+        let mut var = if expr.starts_with("-u ") {
+            expr.replacen("-u ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-u""#) || expr.starts_with("-u$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-u ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("(-u {})", var)
+    } else if expr.contains(" -O ") || starts_with_op(expr, "-O") {
+        // File is owned by the effective user ID: [[ -O $var ]]
+        let mut var = if expr.starts_with("-O ") {
+            expr.replacen("-O ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-O""#) || expr.starts_with("-O$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-O ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("((stat({}))[4] == $>)", var)
+    } else if expr.contains(" -G ") || starts_with_op(expr, "-G") {
+        // File is owned by the effective group ID: [[ -G $var ]]
+        let mut var = if expr.starts_with("-G ") {
+            expr.replacen("-G ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-G""#) || expr.starts_with("-G$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-G ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        // $)  is Perl's effective GID ($( gives real GID, $) gives effective GID)
+        format!("((stat({}))[5] == $))", var)
+    } else if expr.contains(" -N ") || starts_with_op(expr, "-N") {
+        // File was modified since last read: [[ -N $var ]]
+        // Compare atime and mtime — if mtime > atime, file was modified since last read.
+        let mut var = if expr.starts_with("-N ") {
+            expr.replacen("-N ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-N""#) || expr.starts_with("-N$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-N ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("((stat({}))[9] > (stat({}))[8])", var, var)
+    } else if expr.contains(" -S ") || starts_with_op(expr, "-S") {
+        // File is a socket: [[ -S $var ]]
+        let mut var = if expr.starts_with("-S ") {
+            expr.replacen("-S ", "", 1).trim().to_string()
+        } else if expr.starts_with(r#"-S""#) || expr.starts_with("-S$") {
+            expr[2..].trim().to_string()
+        } else {
+            expr.replacen("-S ", "", 1).trim().to_string()
+        };
+        if !var.starts_with('$') && !var.starts_with('"') && !var.starts_with('\'') {
+            var = format!("'{}'", var);
+        }
+        format!("(-S {})", var)
+    } else if expr.contains(" -nt ") {
+        // File1 is newer than File2: [[ file1 -nt file2 ]]
+        let parts: Vec<&str> = expr.split(" -nt ").collect();
+        if parts.len() == 2 {
+            let mut file1 = parts[0].trim().to_string();
+            let mut file2 = parts[1].trim().to_string();
+            if !file1.starts_with('$') && !file1.starts_with('"') && !file1.starts_with('\'') {
+                file1 = format!("'{}'", file1);
+            }
+            if !file2.starts_with('$') && !file2.starts_with('"') && !file2.starts_with('\'') {
+                file2 = format!("'{}'", file2);
+            }
+            format!("((-e {} && -e {} && (stat({}))[9] > (stat({}))[9]))", file1, file2, file1, file2)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" -ot ") {
+        // File1 is older than File2: [[ file1 -ot file2 ]]
+        let parts: Vec<&str> = expr.split(" -ot ").collect();
+        if parts.len() == 2 {
+            let mut file1 = parts[0].trim().to_string();
+            let mut file2 = parts[1].trim().to_string();
+            if !file1.starts_with('$') && !file1.starts_with('"') && !file1.starts_with('\'') {
+                file1 = format!("'{}'", file1);
+            }
+            if !file2.starts_with('$') && !file2.starts_with('"') && !file2.starts_with('\'') {
+                file2 = format!("'{}'", file2);
+            }
+            format!("((-e {} && -e {} && (stat({}))[9] < (stat({}))[9]))", file1, file2, file1, file2)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(" -ef ") {
+        // File1 and File2 refer to the same file (same device and inode): [[ file1 -ef file2 ]]
+        let parts: Vec<&str> = expr.split(" -ef ").collect();
+        if parts.len() == 2 {
+            let mut file1 = parts[0].trim().to_string();
+            let mut file2 = parts[1].trim().to_string();
+            if !file1.starts_with('$') && !file1.starts_with('"') && !file1.starts_with('\'') {
+                file1 = format!("'{}'", file1);
+            }
+            if !file2.starts_with('$') && !file2.starts_with('"') && !file2.starts_with('\'') {
+                file2 = format!("'{}'", file2);
+            }
+            format!("((-e {} && -e {} && (stat({}))[0] == (stat({}))[0] && (stat({}))[1] == (stat({}))[1]))", file1, file2, file1, file2, file1, file2)
+        } else {
+            "0".to_string()
+        }
     } else {
         // Default case: treat as a simple boolean expression
         // This handles cases like [[ $var ]] which should check if $var is non-empty

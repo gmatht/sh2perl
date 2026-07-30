@@ -61,7 +61,12 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         if !has_glob {
             for file in &files {
                 let file_expr = if file.starts_with('$') {
-                    IrExpr::RawExpr(file[1..].to_string())
+                    // Already a Perl variable reference — keep it as-is.
+                    IrExpr::RawExpr(file.clone())
+                } else if file.starts_with('"') && file.ends_with('"') && file.contains('$') {
+                    // Double-quoted Perl string with variable interpolation.
+                    // Emit directly so the variable is interpolated at runtime.
+                    IrExpr::RawExpr(file.clone())
                 } else {
                     // Strip surrounding quotes if present
                     let bare = if (file.starts_with('"') && file.ends_with('"'))
