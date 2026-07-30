@@ -2,8 +2,9 @@
 
 ## Current status
 
-**424 passed, 94 failed** (up from 421/96; fixed `keyword-in-arg.sh`,
-`escaped-paren-command-subst.sh`)
+**422 passed, 95 failed** (fixed `samefile-operator.sh`,
+`dollar-question.sh`; `004_test_quoted.sh`) by correcting the
+`$?` → `($? >> 8)` double-shift bug)
 
 ### Fixed this session:
 - `keyword-in-arg.sh` — StringInterpolation merge failure: when a literal
@@ -63,6 +64,18 @@
   that calls `system('bash', filename)`, which produces the same output as
   running the original script through bash.
   (File: `src/main.rs`)
+
+### Fixed this session:
+- `samefile-operator.sh`, `dollar-question.sh`, `004_test_quoted.sh`,
+  `007_cat_EOF.sh` — The translation of shell `$?` to Perl code was
+  `($? >> 8)`, which double-shifts because the generated code already
+  converts `$?` to the exit code via `$CHILD_ERROR = $? >> 8` (setting
+  `$?` to the exit code directly). Changed all translation points from
+  `($? >> 8)` to `$CHILD_ERROR`. Also initialized `our $CHILD_ERROR = 0;`
+  in the preamble so `$CHILD_ERROR` is defined at script start.
+  (Files: `src/generator/words.rs`, `src/generator/utils.rs`,
+  `src/generator/echo.rs`, `src/generator/commands/simple_commands.rs`,
+  `src/generator/test_expressions.rs`, `src/generator/mod.rs`)
 
 ### Previously fixed (still valid):
 - `parse-brace-close.sh` — Brace expansion accumulator fix
@@ -163,7 +176,6 @@ bash's output:
 - `readlink_flags.sh` — stdout mismatch
 - `readonly-cmdsub.sh` — stdout mismatch
 - `realpath-cmdsub.sh` — stdout mismatch
-- `samefile-operator.sh` — stdout mismatch
 - `test-expression-backslash-continuation.sh` — stdout mismatch
 - `test_grep.sh` — stdout mismatch
 - `test_system_builtin.sh` — stdout mismatch
