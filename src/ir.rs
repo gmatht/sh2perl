@@ -444,7 +444,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             // two-statement clean form instead of embedding a do-block.
             if targets.len() == 1 && targets[0].indices.is_empty() {
                 let var = &targets[0].var;
-                let lhs = format!("${}", var);
+                let lhs = if is_env_style_var_name(var) {
+                    format!("$ENV{{{}}}", var)
+                } else {
+                    format!("${}", var)
+                };
                 if let IrExpr::Backtick { native: false, .. } = expr {
                     // Extract the inner expression string for qx{...}
                     if let IrExpr::Backtick { expr: inner_expr, .. } = expr {
@@ -490,7 +494,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             } else {
                 let lhs = targets
                     .iter()
-                    .map(|t| format!("${}", t.var))
+                    .map(|t| if is_env_style_var_name(&t.var) {
+                        format!("$ENV{{{}}}", t.var)
+                    } else {
+                        format!("${}", t.var)
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 emit_indent(out, indent);
@@ -965,7 +973,13 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         },
 
         IrExpr::Var(name, sigil) => match sigil {
-            Sigil::Scalar => format!("${}", name),
+            Sigil::Scalar => {
+                if is_env_style_var_name(name) {
+                    format!("$ENV{{{}}}", name)
+                } else {
+                    format!("${}", name)
+                }
+            }
             Sigil::Array => format!("@{}", name),
             Sigil::Hash => format!("%{}", name),
         },
@@ -1070,7 +1084,11 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         },
                         InterpPart::Expr(e) => {
                             if let IrExpr::Var(name, Sigil::Scalar) = e.as_ref() {
-                                s.push_str(&format!("${}", name));
+                                if is_env_style_var_name(name) {
+                                    s.push_str(&format!("$ENV{{{}}}", name));
+                                } else {
+                                    s.push_str(&format!("${}", name));
+                                }
                             }
                         }
                     }
@@ -1541,6 +1559,42 @@ pub(crate) fn optimize_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
         .collect();
 
     pass1
+}
+
+/// Determine whether a variable name should use `$ENV{name}` style (for
+/// undeclared uppercase / "environment-style" variables) vs. plain `$name`.
+/// Matches the heuristic used by the generator in `mod.rs` and
+/// `test_expressions.rs`: if the name is all uppercase ASCII (with underscores)
+/// it is treated as an environment variable reference.
+///
+/// Special Perl variables from the `English` module (like `CHILD_ERROR`,
+/// `OS_ERROR`, `EVAL_ERROR`) are excluded — they must always use `$` prefix.
+pub fn is_env_style_var_name(name: &str) -> bool {
+    // Special Perl variables that use $name, not $ENV{name}
+    const PERL_SPECIAL_VARS: &[&str] = &[
+        "CHILD_ERROR",
+        "OS_ERROR",
+        "ERRNO",
+        "EVAL_ERROR",
+        "INPUT_RECORD_SEPARATOR",
+        "PROGRAM_NAME",
+        "OUTPUT_AUTOFLUSH",
+        "OUTPUT_FIELD_SEPARATOR",
+        "OUTPUT_RECORD_SEPARATOR",
+        "LIST_SEPARATOR",
+        "SUBSCRIPT_SEPARATOR",
+        "LAST_PAREN_MATCH",
+        "EFFECTIVE_USER_ID",
+        "REAL_USER_ID",
+        "EFFECTIVE_GROUP_ID",
+        "REAL_GROUP_ID",
+        "PERL_VERSION",
+    ];
+    if PERL_SPECIAL_VARS.contains(&name) {
+        return false;
+    }
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
 }
 
 // ── Bridge helpers ────────────────────────────────────────────────────
