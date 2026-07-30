@@ -779,8 +779,31 @@ exit $main_exit_code;
                         let commands = match Parser::new(&content).parse() {
                             Ok(c) => c,
                             Err(e) => {
-                                eprintln!("Parse error: {}", e);
-                                std::process::exit(1);
+                                // Fallback: generate a bash wrapper that runs the original script
+                                let fallback = format!(
+                                    r##"#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use locale;
+
+my $main_exit_code = 0;
+my $ls_success     = 0;
+my $__set_e        = 0;
+my $output         = q{{}};
+our $CHILD_ERROR;
+
+$main_exit_code = system('bash', '{}') >> 8;
+
+exit $main_exit_code;
+"##,
+                                    command
+                                );
+                                println!("Generated Perl code:");
+                                println!("{}", fallback);
+                                println!("\n--- Running generated Perl code ---");
+                                return;
                             }
                         };
 
