@@ -951,6 +951,51 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             let brace_word = parse_brace_expansion(lexer)?;
             if let Word::BraceExpansion(mut be, _) = brace_word {
                 be.prefix = Some(combined);
+                // After the closing brace, consume any immediately adjacent
+                // literal text (Identifier, Number, Dot, etc.) as the suffix.
+                // This handles `{a,b}suf` where the trailing literal is
+                // not followed by another brace expansion.
+                let mut suffix = String::new();
+                while let Some(tok) = lexer.peek() {
+                    match tok {
+                        Token::Identifier | Token::Number | Token::Float
+                        | Token::PaddedNumber | Token::HexNumber
+                        | Token::Slash | Token::Dot | Token::Range
+                        | Token::Plus | Token::Minus | Token::Escape
+                        | Token::Colon | Token::Star | Token::Percent
+                        | Token::Comma | Token::Question | Token::BraceClose
+                        | Token::TestBracket | Token::TestBracketClose
+                        | Token::Assign | Token::Dollar => {
+                            // Stop at Dollar if followed by a variable name
+                            // (that would be a new variable expansion)
+                            if matches!(tok, Token::Dollar) {
+                                let is_var_ref = lexer.peek_n(1).map(|t| {
+                                    matches!(t, Token::Identifier | Token::Number)
+                                }).unwrap_or(false);
+                                if is_var_ref {
+                                    break;
+                                }
+                            }
+                            if let Some(text) = lexer.get_current_text() {
+                                suffix.push_str(&text);
+                                lexer.next();
+                                // Handle escape sequences like in the merge loop
+                                if matches!(text.as_str(), "\\") {
+                                    if let Some(escaped_text) = lexer.get_current_text() {
+                                        suffix.push_str(&escaped_text);
+                                        lexer.next();
+                                    }
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if !suffix.is_empty() {
+                    be.suffix = Some(suffix);
+                }
                 return Ok(Word::BraceExpansion(be, None));
             }
         }
