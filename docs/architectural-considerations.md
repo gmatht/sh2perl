@@ -178,8 +178,10 @@ serialization/deserialization step.
 
 ### Verdict
 
-ESTree is only useful as a **leaf backend format for JavaScript output**.
-It should not be the universal IR.
+ESTree is the right format for a **leaf backend targeting JavaScript**.
+It should not be the universal IR — but as a backend, it's the **easiest to
+build** because `@babel/generator` handles all formatting automatically.
+No other target language offers this kind of shortcut.
 
 ---
 
@@ -315,8 +317,7 @@ needs a completely different lowering:
 ```
 
 This isn't ESTree anymore. Every non-JS target would need its own
-lowering target format. The "extended ESTree with lowering passes" idea only
-pays off if **JavaScript is the primary or only target**.
+lowering target format.
 
 ### The Thread Experiment
 
@@ -340,9 +341,12 @@ language.
 
 ### Verdict
 
-Extended ESTree + lowering passes is a valid architecture, but only the
-JavaScript path gets the "free lunch" of `@babel/generator`. For all other
-output languages, you still write the full backend.
+Extended ESTree + lowering passes is a valid architecture. The JavaScript
+path gets the "free lunch" of `@babel/generator` — all formatting,
+parenthesization, escaping, and indentation are handled automatically.
+This makes the JavaScript backend **the easiest new backend to build**,
+not the hardest. Every other output language requires a manually written
+pretty-printer.
 
 ---
 
@@ -655,13 +659,48 @@ Shell script → Shell Frontend → Generator → Perl text
 
 ```
 Shell script → Shell Frontend → ShIR → Perl Backend → Perl text
-                                    → Rust Backend → Rust code
+                                    → JavaScript Backend (via ESTree) → JS code
                                     → Python Backend → Python code
+                                    → Rust Backend → Rust code
 ```
 
 - Migrate generators to produce `ShIrNode` instead of raw Perl strings
 - Each backend is a `ShIrNode → String` pretty-printer
 - Shared passes (constant folding, dead code elimination) operate on ShIR
+
+#### Recommended Backend Order
+
+| Priority | Language | Why this order |
+|---|---|---|
+| 1st | **JavaScript** | Easiest codegen — `@babel/generator` handles all formatting, parenthesization, escaping, indentation automatically. No pretty-printer to write. Just construct ESTree JSON and serialize. |
+| 2nd | **Python** | Most requested. Dynamic typing (no type inference needed). But must write full pretty-printer from scratch. |
+| 3rd | **Rust** | Requires type inference pass. Validates the IR's ability to carry type annotations. By this point the IR is proven by two backends. |
+| 4th | **Go** | Also requires type inference. Smaller audience than Python or JS. |
+
+#### Why JavaScript is Easiest — Not Hardest
+
+The conventional wisdom was that ESTree is "JavaScript-ecosystem-only" and
+therefore adds complexity for non-JS targets. This is correct, but it misses
+the key implication: **the JavaScript path has the most automated codegen of
+any target**, because `@babel/generator` absorbs all formatting work.
+
+Comparison of codegen effort:
+
+| Task | Python (manual) | JavaScript (via ESTree) |
+|---|---|---|
+| Map shell builtins | Same | Same |
+| Pipeline lowering to library calls | Same (`subprocess`) | Same (`child_process`) |
+| Operator precedence in output | Must emit parens correctly | Automatic from tree structure |
+| String escaping | Must handle | `@babel/generator` handles `StringLiteral` |
+| Indentation & line breaks | Must manage | Automatic |
+| Statement separators (semicolons, commas) | Must emit | Automatic |
+| Comments attachment | Must track | `estree-util-attach-comments` |
+| External dependency | None | Node.js + `@babel/generator` |
+
+**Conclusion**: The semantic mapping work (pipelines, redirects, file tests)
+is identical between Python and JavaScript. The difference is that
+JavaScript gets ~2000 lines of pretty-printer for free. Python requires
+writing them.
 
 ### Medium Term: Multi-Input
 
@@ -687,29 +726,41 @@ POSIX sh → POSIX Frontend ─┤
            perl.pl    lib.rs          app.py
 ```
 
-### Long Term: JavaScript via ESTree
+### JavaScript via ESTree (Parallel Track)
+
+Because JavaScript is the easiest new backend (auto-formatted via
+`@babel/generator`), it should be built **concurrently with or before**
+the Python backend, not deferred to "long term":
 
 ```
 Common ShIR
     │
-    └──→ JS Lowering Pass
-            │
-            ▼
-    Extended ESTree (with Pipeline, Redirect, FileTest, etc.)
-            │
-            ▼
-    Targeting Passes (Pipeline → spawn/pipe, FileTest → fs.existsSync, etc.)
-            │
-            ▼
-    Standard ESTree
-            │
-            ▼
-    @babel/generator → JavaScript
+    ├──→ Perl Backend → perl.pl
+    │
+    ├──→ JS Lowering Pass → Extended ESTree → Targeting Passes → Standard ESTree
+    │                                                                    │
+    │                                                                    ▼
+    │                                                            @babel/generator → .js
+    │
+    ├──→ Python Backend → app.py
+    │
+    └──→ Rust Backend → lib.rs
 ```
 
 The ESTree path is **one backend among many** — not the universal IR.
 It's the right choice for JavaScript output because `@babel/generator`
 provides a genuine "free lunch" that no other target language offers.
+
+Implementation steps:
+
+1. Define ESTree node types as Rust structs with `#[derive(Serialize)]`
+2. Write a `ShIR → Extended ESTree` lowering pass (adds shell-specific node types)
+3. Write targeting passes that lower each extended node to standard ESTree:
+   - `Pipeline` → `CallExpression` wrapping `child_process.spawn` calls
+   - `FileTest` → `CallExpression` wrapping `fs.existsSync` / `fs.statSync`
+   - `Redirect` → `CallExpression` wrapping `fs.openSync` / `fs.createWriteStream`
+   - `CommandSubstitution` → `AwaitExpression` + `execSync` / `execFile`
+4. Serialize to JSON and pipe through `@babel/generator` (via subprocess or WASM)
 
 ### Summary of Architectural Decisions
 
@@ -717,7 +768,7 @@ provides a genuine "free lunch" that no other target language offers.
 |---|---|---|
 | Universal IR | Purpose-built ShIR (not ESTree, not BSON) | Shell semantics are unique; no off-the-shelf format fits |
 | Type inference | Shared pass, optional annotations | Only needed for statically-typed backends (Rust, C) |
-| JavaScript output | Via ESTree + `@babel/generator` | The one case where existing tooling saves real work |
+| JavaScript output | Via ESTree + `@babel/generator` | **Easiest backend to build.** ESTree construction is simpler than writing a pretty-printer. `@babel/generator` handles all formatting automatically. |
 | Multi-input | N frontends + M backends vs. N×M | Common IR makes this tractable; but each frontend is still significant effort |
 | Declarative mappings | Useful for simple builtins, not complex semantics | Templates work for `echo` → `print`; not for `grep` → regex logic |
 | Import tracking | Unified registry per backend | Cleaner than ad-hoc booleans; enables import minimization |
@@ -736,6 +787,7 @@ provides a genuine "free lunch" that no other target language offers.
    requires sophisticated analysis that may produce counterintuitive results
    for edge cases.
 
-4. **ESTree is a JavaScript-ecosystem-only tool.** Investing in the ESTree
-   lowering path only pays off if JavaScript/TypeScript are output targets.
-   For Perl/Rust/Python, it adds complexity without benefit.
+4. **ESTree is a JavaScript-ecosystem-only tool, but that's a feature, not a bug.**
+   It only helps for JavaScript output — but for JavaScript it helps enormously,
+   eliminating ~2000 lines of formatting code. The risk is over-investing in
+   ESTree infrastructure before the core IR is validated by a non-JS backend.
