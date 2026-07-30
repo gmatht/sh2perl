@@ -2,52 +2,49 @@
 
 ## Current status
 
-**402 passed, 115 failed** (fixed 6 more: heredoc-apostrophe, heredoc-apostrophe-in-unquoted, heredoc-apostrophe-span, parse-heredoc-apostrophe, and 2 related heredoc tests)
+**409 passed, 108 failed** (up from 402/115)
 
 ### Fixed this session:
-- `011_brace_expansion.sh`, `035_brace_expansion_practical.sh` — Fixed
-  brace expansion in touch command (`touch file_{001..005}.txt`):
-  1. `parse_word_no_newline_skip()` in `parser/words.rs` was missing the
-     suffix-consumption loop after a prefix+BraceOpen merge (added it,
-     matching the existing logic in `parse_word()`).
-  2. `generate_touch_command()` in `touch.rs` did not apply `expansion.prefix`
-     and `expansion.suffix` to expanded brace items (added prefix/suffix
-     application before storing the BRACE_EXPANSION marker).
-  3. `handle_brace_expansion_impl()` in `generator/words.rs` called
-     `word_to_perl()` on expanded items, producing Perl-quoted strings
-     (e.g. `'1 2 3 4 5'`) that were then double-wrapped in quotes by
-     `word_to_perl_impl()`, emitting `"'1 2 3 4 5'"` (literal quotes in
-     the string).  Changed to extract raw string values directly from
-     `Word::Literal` and split whitespace-separated ranges into individual
-     items before applying prefix/suffix.
+- `parse-exit-brace-question.sh` — Exit with braced `${?}` argument was
+  silently dropped because the `exit` handler in `redirects.rs` only matched
+  `Word::Literal` arguments. Changed to use `generator.word_to_perl()` which
+  handles all word types including `Word::Variable("?", ...)`.
+  (File: `src/generator/redirects.rs`)
 
-- `064_02_nested_brace_expansions.sh`, `008_simple_backup.sh` — Fixed
-  brace-expansion Cartesian-product generation in echo commands.  The
-  `expand_brace_items()` function in `simple_commands.rs` was not applying
-  `prefix`/`suffix` from the `BraceExpansion` struct, so connected literal
-  text (`file_`, `_`, `.`) was lost from the expanded items.  Also fixed
-  the Cartesian-product compound-group logic to NOT merge non-BraceExpansion
-  arguments with following BraceExpansions (they are separate echo arguments),
-  and added suffix-token consumption in the parser so that literal text after
-  a brace expansion (e.g. `{a,b}suf`) is stored in the `suffix` field.
-- `test-operator-missing.sh`, `test-operator-S.sh` — Added missing file-test
-  unary operators (`-h`, `-p`, `-b`, `-c`, `-g`, `-k`, `-u`, `-O`, `-G`, `-N`, `-S`)
-  and binary comparison operators (`-nt`, `-ot`, `-ef`) to the test expression
-  generator (`src/generator/test_expressions.rs`).
-- `dollar-question-in-bracket.sh` — `$?` inside test expressions mapped to raw
-  Perl `$?` (16-bit wait status) instead of `($? >> 8)` (exit code). Added
-  `"$?" => "($? >> 8)"` in `convert_shell_var_to_perl()`.
-- `let-plusassign.sh`, `declare-let-keyword.sh`, `let-builtin.sh` —
-  The `let` command's arguments like `x=5` were split into separate words
-  (`x`, `=`, `5`) because `Token::Assign` was missing from the contiguous
-  bare-word token merge list in `parse_word()` and
-  `parse_word_no_newline_skip()` (`src/parser/words.rs`). Added
-  `Token::Assign` to the merge list so that `x=5` is treated as a single
-  word, matching shell semantics where `let` receives the whole expression
-  as one argument.
-- `single-quote-escape.sh` — `perl_expr_to_ir()` in `ir.rs` misidentified
-  Perl concatenation expressions as single-quoted strings because they
-  happened to start and end with `'`.  Added bare-quote detection to
+- `exitScript-after-test.sh`, `test-bracket-command-sub.sh`, `test-expr-backtick.sh` —
+  Command substitutions `$(...)` inside test expressions were passed through
+  verbatim to Perl, where `$(` is the group-ID special variable, not a
+  command capture.  Fixed:
+  1. `convert_shell_var_to_perl()` now uses `crate::ir::safe_perl_q_string()`
+     for safe quoting of the command string, and uses the nested-do-block
+     pattern for `chomp` after `local $/` goes out of scope (matching
+     `cmd_str_to_open_perl()` in `ir.rs`).
+  2. Made `safe_perl_q_string()` pub(crate) so test_expressions.rs can use it.
+  3. Fixed `convert_shell_var_to_perl()` to preserve original quoting for
+     non-variable strings (was stripping quotes without re-adding them).
+  4. Added `convert_shell_var_to_perl()` calls in the `-z`, `-n`, and `=`
+     (string equality) branches of `generate_test_expression_impl()`.
+  (Files: `src/generator/test_expressions.rs`, `src/ir.rs`)
+
+- `backslash-gt-test.sh` — Added handling for `\>` (string greater-than) and
+  `\<` (string less-than) operators in single-bracket test expressions.
+  These are mapped to Perl `gt` and `lt` respectively.
+  (File: `src/generator/test_expressions.rs`)
+
+- `parse-array-plusassign.sh` — `${LIST:-}` default-value expansion on array
+  `LIST` generated `${LIST}` (undeclared scalar) instead of `${LIST}[0]`
+  (first array element). Fixed:
+  1. `parameter_var_scalar_ref()` and related functions in `expansions.rs`
+     now check `indexed_arrays` and return `$VAR[0]` for indexed arrays.
+  2. Array assignments in `mod.rs` now add the variable name to
+     `indexed_arrays` so the scalar-ref functions can detect them.
+  (Files: `src/generator/expansions.rs`, `src/generator/mod.rs`)
+
+### Previously fixed:
+
+(Previous fixes from earlier sessions remain: heredoc fixes, brace expansion
+fixes, test operator fixes, let command fixes, single-quote escaping fixes,
+variable reference fixes, etc. — see git log for full history.)
   the single-quoted string branch so complex expressions fall through to
   `RawExpr`.  Also fixed `try_embed_newline_in_string_literal()` with the
   same check and proper `\'`→`'` unescaping when converting single-quoted
