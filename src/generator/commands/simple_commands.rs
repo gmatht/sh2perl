@@ -2458,8 +2458,14 @@ fn generate_cartesian_product_for_echo(generator: &mut Generator, args: &[Word])
     let mut i = 0;
     while i < args.len() {
         if matches!(args[i], Word::BraceExpansion(..)) {
-            // Start a compound group: consume all consecutive args that form
-            // one expanded word (literals interleaved with brace expansions).
+            // Start a compound group: consume all consecutive
+            // BraceExpansion args.  Each BraceExpansion already carries
+            // its prefix/suffix from the parser (or from the merge-loop
+            // in parse_word), so no Fixed parts from non-brace args are
+            // needed — the connecting literal text is baked into each
+            // expansion's prefix field on the NEXT expansion, and the
+            // suffix field on the PREVIOUS expansion handles remaining
+            // adjacent text.
             let mut parts = Vec::new();
             while i < args.len() {
                 match &args[i] {
@@ -2470,26 +2476,6 @@ fn generate_cartesian_product_for_echo(generator: &mut Generator, args: &[Word])
                         }
                         i += 1;
                     }
-                    Word::Literal(_, _)
-                    | Word::StringInterpolation(_, _)
-                    | Word::Variable(_, _, _)
-                    | Word::Array(_, _, _) => {
-                        // Check if the next arg is a BraceExpansion; if so,
-                        // this literal is part of the same compound word.
-                        if i + 1 < args.len()
-                            && matches!(args[i + 1], Word::BraceExpansion(..))
-                        {
-                            let perl = generator.word_to_perl(&args[i]);
-                            parts.push(Part::Fixed(perl));
-                            i += 1;
-                        } else if !parts.is_empty() {
-                            // We are inside a compound group, finish it
-                            break;
-                        } else {
-                            // Standalone literal, not adjacent to brace expansion
-                            break;
-                        }
-                    }
                     _ => {
                         break;
                     }
@@ -2499,51 +2485,15 @@ fn generate_cartesian_product_for_echo(generator: &mut Generator, args: &[Word])
                 groups.push(Group::Compound(parts));
             }
         } else {
-            // Non-brace arg. Check if the NEXT arg is a BraceExpansion.
-            // If so, start a compound group that includes this arg.
-            if i + 1 < args.len() && matches!(args[i + 1], Word::BraceExpansion(..)) {
-                let mut parts = Vec::new();
-                // This literal is part of a compound word
-                let perl = generator.word_to_perl(&args[i]);
-                parts.push(Part::Fixed(perl));
-                i += 1;
-                // Now consume all consecutive brace expansions and adjacent literals
-                while i < args.len() {
-                    match &args[i] {
-                        Word::BraceExpansion(items, _) => {
-                            let expanded = expand_brace_items(items);
-                            if !expanded.is_empty() {
-                                parts.push(Part::Variable(expanded));
-                            }
-                            i += 1;
-                        }
-                        Word::Literal(_, _)
-                        | Word::StringInterpolation(_, _)
-                        | Word::Variable(_, _, _)
-                        | Word::Array(_, _, _) => {
-                            if i + 1 < args.len()
-                                && matches!(args[i + 1], Word::BraceExpansion(..))
-                            {
-                                let perl = generator.word_to_perl(&args[i]);
-                                parts.push(Part::Fixed(perl));
-                                i += 1;
-                            } else {
-                                // End of compound word
-                                break;
-                            }
-                        }
-                        _ => {
-                            break;
-                        }
-                    }
-                }
-                groups.push(Group::Compound(parts));
-            } else {
-                // Standalone non-brace argument
-                let perl = generator.word_to_perl(&args[i]);
-                groups.push(Group::Standalone(perl));
-                i += 1;
-            }
+            // Non-brace arg — standalone.  The parser has already
+            // determined that this is a separate shell word (there was
+            // whitespace before it, or it is a quoted string that the
+            // parser treated as a separate word).  Do NOT merge it with
+            // following BraceExpansions; each BraceExpansion already has
+            // its own prefix/suffix from the parser.
+            let perl = generator.word_to_perl(&args[i]);
+            groups.push(Group::Standalone(perl));
+            i += 1;
         }
     }
 
@@ -2666,6 +2616,7 @@ pub fn item_to_bracket_text(item: &BraceItem) -> String {
 }
 
 /// Expand a BraceExpansion into its list of string values.
+/// Applies the expansion's `prefix` and `suffix` to each expanded item.
 fn expand_brace_items(items: &BraceExpansion) -> Vec<String> {
     let mut expanded = Vec::new();
     // In bash, a brace expansion with a single Range item is the only
@@ -2736,6 +2687,18 @@ fn expand_brace_items(items: &BraceExpansion) -> Vec<String> {
             }
             BraceItem::Nested(_) => todo!(),
             BraceItem::Compound(_) => todo!(),
+        }
+    }
+    // Apply prefix (if any) to every expanded item
+    if let Some(prefix) = &items.prefix {
+        for item in expanded.iter_mut() {
+            *item = format!("{}{}", prefix, item);
+        }
+    }
+    // Apply suffix (if any) to every expanded item
+    if let Some(suffix) = &items.suffix {
+        for item in expanded.iter_mut() {
+            *item = format!("{}{}", item, suffix);
         }
     }
     expanded
