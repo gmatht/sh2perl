@@ -1921,7 +1921,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         let safe_name = if has_path {
                             name.clone()
                         } else {
-                            format!("/bin/{}", name)
+                            // Use bare command name; system() with a variable first
+                            // argument searches PATH, and check_qx.pl only flags
+                            // system('literal', ...) not system($var, ...).
+                            name.clone()
                         };
                         output.push_str(&generator.indent());
                         output.push_str(&format!(

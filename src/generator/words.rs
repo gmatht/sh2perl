@@ -8,7 +8,28 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
         return;
     }
 
-    let rendered = if current_string.contains("system") || current_string.contains('`') {
+    // Only match standalone "system", not as part of another word like "systemd"
+    // Use simple substring check with manual boundary test since Rust regex doesn't support lookaround
+    let has_standalone_system = {
+        let s = current_string.as_str();
+        let mut found = false;
+        let mut pos = 0;
+        while let Some(idx) = s[pos..].find("system") {
+            let abs_idx = pos + idx;
+            // Check character before "system"
+            let prev_ok = abs_idx == 0 || !s[..abs_idx].chars().last().map_or(false, |c| c.is_alphanumeric() || c == '_');
+            // Check character after "system"
+            let after_idx = abs_idx + 6;
+            let next_ok = after_idx >= s.len() || !s[after_idx..].chars().next().map_or(false, |c| c.is_alphanumeric() || c == '_');
+            if prev_ok && next_ok {
+                found = true;
+                break;
+            }
+            pos = abs_idx + 1;
+        }
+        found
+    };
+    let rendered = if current_string.contains('`') || has_standalone_system {
         crate::generator::commands::utilities::source_safe_perl_string_expr(current_string)
     } else if current_string.chars().any(|c| !c.is_ascii()) {
         // Non-ASCII characters: escape as \x{...} so PPI does not choke
@@ -48,7 +69,17 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
                         result.push_str("\\\\");  // Escape: \\ → \\
                     }
                 }
-                b'@' => { result.push_str("\\@"); }
+                b'@' => {
+                    // Only escape @ if NOT followed by an identifier character (letter or underscore)
+                    // so that @_ and @ARGV are properly interpolated as arrays.
+                    let next = if i + 1 < bytes.len() { Some(bytes[i + 1]) } else { None };
+                    let should_escape = match next {
+                        Some(b'a'..=b'z') | Some(b'A'..=b'Z') | Some(b'_') => false,
+                        _ => true,
+                    };
+                    if should_escape { result.push_str("\\@"); }
+                    else { result.push('@'); }
+                }
                 b'$' => {
                     let next = if i + 1 < bytes.len() { Some(bytes[i + 1]) } else { None };
                     let should_escape = match next {
@@ -2344,8 +2375,22 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
             } else {
                 match var.as_str() {
                     "#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
-                    "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
-                    "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
+                    "@" => {
+                        // $@ in bash = all script arguments (top level) or function arguments
+                        // (inside a function). In Perl, @ARGV / @_ is the corresponding array.
+                        if generator.fn_nesting_depth > 0 {
+                            "@_".to_string()
+                        } else {
+                            "@ARGV".to_string()
+                        }
+                    },
+                    "*" => {
+                        if generator.fn_nesting_depth > 0 {
+                            "@_".to_string()
+                        } else {
+                            "@ARGV".to_string()
+                        }
+                    },
                     "$" => "$$".to_string(),         // $$ -> $$ (process ID)
                     "?" => "($? >> 8)".to_string(), // $? -> exit code (>>8 converts wait status)
                     "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
@@ -2723,8 +2768,22 @@ pub fn convert_string_interpolation_to_perl_impl(
                 // Handle special shell variables
                 match var.as_str() {
                     "#" => current_string.push_str("${scalar(@ARGV)}"), // $# -> ${scalar(@ARGV)} for interpolation
-                    "@" => current_string.push_str("@ARGV"), // Arrays don't need $ in interpolation
-                    "*" => current_string.push_str("@ARGV"), // Arrays don't need $ in interpolation
+                    "@" => {
+                        // $@ in bash = all script arguments (top level) or function arguments
+                        // (inside a function).  In Perl, @ARGV / @_ is the corresponding array.
+                        if generator.fn_nesting_depth > 0 {
+                            current_string.push_str("@_");
+                        } else {
+                            current_string.push_str("@ARGV");
+                        }
+                    },
+                    "*" => {
+                        if generator.fn_nesting_depth > 0 {
+                            current_string.push_str("@_");
+                        } else {
+                            current_string.push_str("@ARGV");
+                        }
+                    },
                     _ => {
                         // Check if this is a shell positional parameter ($0, $1, $2, etc.)
                         if var.chars().all(|c| c.is_digit(10)) {
