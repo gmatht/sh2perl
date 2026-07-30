@@ -960,7 +960,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 "#" => "scalar(@ARGV)".to_string(),
                                 "@" => "@ARGV".to_string(),
                                 "*" => "@ARGV".to_string(),
-                                "?" => "$CHILD_ERROR".to_string(),
+                                "?" => "($? == -1 ? 0 : $? >> 8)".to_string(),
                                 "!" => "''".to_string(),
                                 "-" => "''".to_string(),
                                 _ => {
@@ -982,7 +982,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             "#" => "scalar(@ARGV)".to_string(),
                                             "@" => "@ARGV".to_string(),
                                             "*" => "@ARGV".to_string(),
-                                            "?" => "$CHILD_ERROR".to_string(),
+                                            "?" => "($? == -1 ? 0 : $? >> 8)".to_string(),
                                             "!" => "''".to_string(),
                                             "-" => "''".to_string(),
                                             _ => {
@@ -1078,7 +1078,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                         "#" => result.push_str("scalar(@ARGV)"),
                                                         "@" => result.push_str("@ARGV"),
                                                         "*" => result.push_str("@ARGV"),
-                                                        "?" => result.push_str("$CHILD_ERROR"),
+                                                        "?" => result.push_str("($? == -1 ? 0 : $? >> 8)"),
                                                         "!" => result.push_str(""),
                                                         "-" => result.push_str(""),
                                                         _ => {
@@ -1764,7 +1764,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&generator.indent());
                     output.push_str(&format!("my @_cmd_{} = ('bash', '{}');\n", cmd_id, name));
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("$main_exit_code = system(@_cmd_{}) >> 8;\n", cmd_id));
+                    output.push_str(&format!("$main_exit_code = $CHILD_ERROR = system(@_cmd_{}) >> 8;\n", cmd_id));
                 } else {
                     let args: Vec<String> = if name == "perl" {
                         // Special handling for perl command - embed Perl code directly instead of system call
@@ -1911,7 +1911,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         let args_str = args.join(", ");
                         output.push_str(&generator.indent());
                         output.push_str(&format!(
-                            "$main_exit_code = system('{}', {}) >> 8;\n",
+                            "$main_exit_code = $CHILD_ERROR = system('{}', {}) >> 8;\n",
                             name, args_str
                         ));
                     } else if !name.starts_with("--") && !name.contains('=') && !name.contains(' ') {
@@ -1942,12 +1942,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         output.push_str(&generator.indent());
                         if args_str.is_empty() {
                             output.push_str(&format!(
-                                "$main_exit_code = system($__cmd_{}) >> 8;\n",
+                                "$main_exit_code = $CHILD_ERROR = system($__cmd_{}) >> 8;\n",
                                 cmd_id
                             ));
                         } else {
                             output.push_str(&format!(
-                                "$main_exit_code = system($__cmd_{}, {}) >> 8;\n",
+                                "$main_exit_code = $CHILD_ERROR = system($__cmd_{}, {}) >> 8;\n",
                                 cmd_id, args_str
                             ));
                         }
@@ -2015,7 +2015,7 @@ pub fn generate_echo_command(
                             "#" => "scalar(@ARGV)".to_string(),
                             "@" => "@ARGV".to_string(),
                             "*" => "@ARGV".to_string(),
-                            "?" => "$CHILD_ERROR".to_string(),
+                            "?" => "($? == -1 ? 0 : $? >> 8)".to_string(),
                             "!" => "''".to_string(),
                             "-" => "''".to_string(),
                             _ => {
@@ -2037,7 +2037,7 @@ pub fn generate_echo_command(
                                     "#" => "scalar(@ARGV)".to_string(),
                                     "@" => "@ARGV".to_string(),
                                     "*" => "@ARGV".to_string(),
-                                    "?" => "$CHILD_ERROR".to_string(),
+                                    "?" => "($? == -1 ? 0 : $? >> 8)".to_string(),
                                     "!" => "''".to_string(),
                                     "-" => "''".to_string(),
                                     _ => {
