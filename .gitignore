@@ -47,3 +47,4 @@ examples/x.py
 examples/comparison.txt
 examples/config.txt
 examples/-
+__tmp_run_*.pl
