@@ -1449,8 +1449,16 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             output.push_str(&generator.indent());
                             output.push_str("$CHILD_ERROR = chdir($ENV{HOME} || $ENV{USERPROFILE} || '.') ? 0 : 1;\n");
                         } else {
-                            // cd with directory argument
-                            let dir = generator.perl_string_literal(&cmd.args[0]);
+                            // cd with directory argument.
+                            // Skip leading "--" (end-of-options marker).
+                            let dir_arg = if cmd.args.len() > 1
+                                && matches!(&cmd.args[0], Word::Literal(s, _) if s == "--")
+                            {
+                                &cmd.args[1]
+                            } else {
+                                &cmd.args[0]
+                            };
+                            let dir = generator.perl_string_literal(dir_arg);
                             output.push_str(&generator.indent());
                             output.push_str(&format!("$CHILD_ERROR = chdir({}) ? 0 : 1;\n", dir));
                         }

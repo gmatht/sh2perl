@@ -1867,7 +1867,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             if simple_cmd.args.is_empty() {
                                 "do { if (chdir($ENV{HOME} || $ENV{USERPROFILE} || \'.\')) { $CHILD_ERROR = 0 } else { $CHILD_ERROR = 1 }; q{} }\n".to_string()
                             } else {
-                                let dir = generator.word_to_perl(&simple_cmd.args[0]);
+                                // Skip leading "--" (end-of-options marker).
+                                let dir_arg = if simple_cmd.args.len() > 1
+                                    && matches!(&simple_cmd.args[0], Word::Literal(s, _) if s == "--")
+                                {
+                                    &simple_cmd.args[1]
+                                } else {
+                                    &simple_cmd.args[0]
+                                };
+                                let dir = generator.word_to_perl(dir_arg);
                                 format!("do {{ if (chdir({})) {{ $CHILD_ERROR = 0 }} else {{ $CHILD_ERROR = 1 }}; q{{}} }}\n", dir)
                             }
                         } else if name == "sed" {
