@@ -1267,7 +1267,35 @@ fn try_embed_newline_in_string_literal(expr: &str) -> Option<String> {
         // Single-quoted string: convert to double-quoted with \n.
         // Escape characters that have special meaning in double-quoted strings.
         let inner = &s[1..s.len()-1];
-        let escaped = inner
+        // If inner contains bare single quotes, this is not a simple
+        // single-quoted string but a concatenation expression.
+        let has_bare_quote = {
+            let bytes = inner.as_bytes();
+            let mut i = 0;
+            let mut found = false;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i == 0 || bytes[i-1] != b'\\' {
+                        found = true;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            found
+        };
+        if has_bare_quote {
+            return None;
+        }
+        // Un-escape single-quoted string escapes before converting to double-quoted.
+        // In Perl single-quoted strings, \' represents a literal single quote and
+        // \\ represents a literal backslash.  In double-quoted strings, single
+        // quotes need no escaping, so we convert \' → ' and \\ → \, then
+        // re-escape everything for the double-quoted context.
+        let unescaped = inner
+            .replace("\\\\", "\\")   // \\ → \
+            .replace("\\'", "'");        // \' → '
+        let escaped = unescaped
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
             .replace("$", "\\$")
@@ -1634,9 +1662,30 @@ pub fn perl_expr_to_ir(perl_expr: &str) -> IrExpr {
     // Single-quoted string literal: '...'
     if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
         let inner = &trimmed[1..trimmed.len()-1];
-        // Un-escape single quotes: \' → '
-        let unescaped = inner.replace("\\'", "'");
-        return IrExpr::Str(unescaped, StrStyle::SingleQuoted);
+        // If the inner content contains a single quote that is NOT preceded
+        // by a backslash, this is NOT a simple single-quoted string literal
+        // but rather a concatenation expression like 'foo' . 'bar' that
+        // happens to start and end with '.
+        let has_bare_quote = {
+            let bytes = inner.as_bytes();
+            let mut i = 0;
+            let mut found = false;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i == 0 || bytes[i-1] != b'\\' {
+                        found = true;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            found
+        };
+        if !has_bare_quote {
+            let unescaped = inner.replace("\\'", "'");
+            return IrExpr::Str(unescaped, StrStyle::SingleQuoted);
+        }
+        // Contains bare quotes — fall through to RawExpr below
     }
 
     // Scalar variable: $var or ${var}

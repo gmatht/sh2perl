@@ -2,16 +2,36 @@
 
 ## Current status
 
-**363 passed, 154 failed** (net +3 from previous 360/157)
+**370 passed, 147 failed** (net +6 from previous 364/153)
 
 ### Fixed this session:
-- `variable-default-with-hash.sh` — `$0` was mapped to `$_[0]` (first function arg)
-  instead of `$0` (script name) in parameter expansion functions
-  (`expansions.rs`).  Added early `"0"` check before numeric parse.
-- `parse-and-or-chain-with-assign.sh` — echo handler and generator now use
-  `$ENV{var}` for undeclared vars instead of bare `$var`, avoiding `use strict`
-  failures when `$var` was not declared (but still block-scoped when inside
-  `&&`/`||` `if` blocks — the `&& { my $x = ... }` scoping is a remaining issue).
+- `single-quote-escape.sh` — `perl_expr_to_ir()` in `ir.rs` misidentified
+  Perl concatenation expressions as single-quoted strings because they
+  happened to start and end with `'`.  Added bare-quote detection to
+  the single-quoted string branch so complex expressions fall through to
+  `RawExpr`.  Also fixed `try_embed_newline_in_string_literal()` with the
+  same check and proper `\'`→`'` unescaping when converting single-quoted
+  to double-quoted strings.
+- `single-quote-embed-escape.sh` — Backslash escaping was missing in
+  `push_string_expr()` (`src/generator/words.rs`): a literal backslash `\`
+  in string content was passed through unescaped into the Perl double-quoted
+  string, where it acted as an escape character.  Added `b'\\'` case to
+  emit `\\` (escaped backslash) in the Perl output.
+- `variable-apostrophe-concat.sh` — Variable references followed by adjacent
+  literal text (e.g. `$x'world'`) were merged into a single Perl variable
+  `$xworld`.  Changed `convert_string_interpolation_to_perl_impl()` to emit
+  `\${var}` (with braces) instead of `\$var` so the variable name is
+  delimited from adjacent literal text.
+- `multiline-assign.sh`, `multiline-dq-string.sh`,
+  `parse-doublequote-unexpected.sh`, `parse-multiline-string.sh` —
+  Backslash-newline line continuations (`\<newline>`) inside double-quoted
+  strings were not stripped by the parser.  Added `replace("\\\n", "")`
+  in `parse_string_interpolation()` (`src/parser/words.rs`) to remove them,
+  matching shell semantics where `\` at end of line is a line continuation.
+  Also fixed a bug in `parse_word_no_newline_skip()` where the condition
+  for calling `merge_contiguous_quoted_fragments()` was inverted
+  (`== start_pos` when it should have been `!= start_pos`), preventing
+  the merge of adjacent quoted strings in command arguments.
 
 ### Other improvements:
 - `main.rs` now calls `set_original_script_name()` when running `.sh` files
