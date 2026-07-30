@@ -1171,7 +1171,7 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
 
 /// Pick a safe Perl `q<delim>...<delim>` delimiter for a string that may
 /// contain arbitrary characters.  Returns a properly delimited Perl literal.
-fn safe_perl_q_string(s: &str) -> String {
+pub(crate) fn safe_perl_q_string(s: &str) -> String {
     // Empty string -> q{} is compact and safe
     if s.is_empty() {
         return "q{}".to_string();

@@ -1009,9 +1009,8 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 output.push_str("exit $main_exit_code;\n");
             } else {
                 for arg in &cmd.args {
-                    if let Word::Literal(code, _) = arg {
-                        output.push_str(&format!("exit {};\n", code));
-                    }
+                    let perl_expr = generator.word_to_perl(arg);
+                    output.push_str(&format!("exit {};\n", perl_expr));
                 }
             }
         }
