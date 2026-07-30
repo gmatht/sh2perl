@@ -210,6 +210,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::StarAssign)
             | Some(Token::SlashAssign)
             | Some(Token::PercentAssign)
+            | Some(Token::Assign)
         ) {
         let mut combined = String::new();
         loop {
@@ -234,6 +235,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::BraceClose)
                 | Some(Token::TestBracket)
                 | Some(Token::TestBracketClose)
+                | Some(Token::Assign)
                 | Some(Token::Dollar) => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
@@ -761,6 +763,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::StarAssign)
             | Some(Token::SlashAssign)
             | Some(Token::PercentAssign)
+            | Some(Token::Assign)
         ) {
         let mut combined = String::new();
         loop {
@@ -792,6 +795,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::StarAssign)
                 | Some(Token::SlashAssign)
                 | Some(Token::PercentAssign)
+                | Some(Token::Assign)
                 | Some(Token::Dollar) => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that

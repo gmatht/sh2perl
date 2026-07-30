@@ -2,9 +2,17 @@
 
 ## Current status
 
-**370 passed, 147 failed** (net +6 from previous 364/153)
+**372 passed, 145 failed** (net +7 from previous 365/152)
 
 ### Fixed this session:
+- `let-plusassign.sh`, `declare-let-keyword.sh`, `let-builtin.sh` —
+  The `let` command's arguments like `x=5` were split into separate words
+  (`x`, `=`, `5`) because `Token::Assign` was missing from the contiguous
+  bare-word token merge list in `parse_word()` and
+  `parse_word_no_newline_skip()` (`src/parser/words.rs`). Added
+  `Token::Assign` to the merge list so that `x=5` is treated as a single
+  word, matching shell semantics where `let` receives the whole expression
+  as one argument.
 - `single-quote-escape.sh` — `perl_expr_to_ir()` in `ir.rs` misidentified
   Perl concatenation expressions as single-quoted strings because they
   happened to start and end with `'`.  Added bare-quote detection to
@@ -141,7 +149,7 @@ See notes below for full list of prior fixes.
    generator to avoid undeclared-variable errors inside function bodies.
    Fixed: `arith-base-notation.sh` (the code-gen part).
 
-## Remaining failures (~153)
+## Remaining failures (~145)
 
 The remaining failures fall into categories that require deeper parser/generator work:
 
