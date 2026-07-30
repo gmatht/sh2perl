@@ -3,11 +3,13 @@ use strict;
 use warnings;
 use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use IPC::Open3;
+my $main_exit_code = 0;
 my $ls_success = 0;
 our $CHILD_ERROR;
 
+$0 = 'tty-cmdsub.sh';
 my $dev;
-my $TTY_DEV;
 
 use strict;
 
@@ -17,15 +19,15 @@ sub capture {
 # Builtin command 'shift' not implemented
     my $tmp_stdout;
     my $tmp_stderr;
-    $tmp_stdout = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/tty_demo_stdout_XXXXXX') or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
-    $tmp_stderr = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/tty_demo_stderr_XXXXXX') or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
+    $tmp_stdout = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/tty_demo_stdout_XXXXXX') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+    $tmp_stderr = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/tty_demo_stderr_XXXXXX') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
     do {
         open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $OS_ERROR\n";
-        open STDOUT, '>', "$tmp_stdout"
+        open STDOUT, '>', "${tmp_stdout}"
       or die "Cannot access file: $OS_ERROR\n";
 local *STDERR;
-open STDERR, '>', "$tmp_stderr" or croak "Cannot access file: $OS_ERROR\n";
+open STDERR, '>', "${tmp_stderr}" or croak "Cannot access file: $OS_ERROR\n";
         my $tmp = do {
         $CHILD_ERROR = 0;
         };
@@ -35,52 +37,53 @@ open STDERR, '>', "$tmp_stderr" or croak "Cannot access file: $OS_ERROR\n";
         close $original_stdout
       or die "Close failed: $OS_ERROR\n";
     };
-    my $ec = $?;
+    my $ec = ($? >> 8);
     my $so;
-    $so = do { my $cat_chunk = q{}; if ( open my $fh, '<', "$tmp_stdout" ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . "$tmp_stdout" . ': ' . $OS_ERROR . "\n"; } $cat_chunk; };
+    $so = do { my $__cs = do { my $cat_chunk = q{}; if ( open my $fh, '<', "${tmp_stdout}" ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . "${tmp_stdout}" . ': ' . $OS_ERROR . "\n"; } $cat_chunk; }; chomp $__cs; $__cs; };
     my $se;
-    $se = do { my $cat_chunk = q{}; if ( open my $fh, '<', "$tmp_stderr" ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . "$tmp_stderr" . ': ' . $OS_ERROR . "\n"; } $cat_chunk; };
-    unlink('$tmp_stdout');
-    unlink('$tmp_stderr');
+    $se = do { my $__cs = do { my $cat_chunk = q{}; if ( open my $fh, '<', "${tmp_stderr}" ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . "${tmp_stderr}" . ': ' . $OS_ERROR . "\n"; } $cat_chunk; }; chomp $__cs; $__cs; };
+    unlink("${tmp_stdout}");
+    unlink("${tmp_stderr}");
     print "--- [\" . ${label} . \"] ---\n";
-    print "  cmd     : \@ARGV\n";
-    print "  exitcode: " . ${ec}, "\n";
-if ("${so}" ne q{}) {
-        print "  stdout  : " . ${so}, "\n";
+    print "  cmd     : @_\n";
+    print("  exitcode: " . ${ec}, "\n");
+if (${so} ne q{}) {
+        print("  stdout  : " . ${so}, "\n");
 }
     else {
         print "  stdout  : (empty)\n";
     }
-if ("${se}" ne q{}) {
-        print "  stderr  : " . ${se}, "\n";
+if (${se} ne q{}) {
+        print("  stderr  : " . ${se}, "\n");
     }
     print "\n";
 return $ec;
     return;
 }
-$TTY_DEV = "";
+$ENV{TTY_DEV} = "";
+my $TTY_DEV;
 for my $dev ('/dev/pts/2', '/dev/pts/3', '/dev/pts/4') {
 if (-r "$dev") {
-        $TTY_DEV = "$dev";
+        $TTY_DEV = "${dev}";
 last;
     }
 }
 $dev = '/dev/pts/4';
-if ("$TTY_DEV" eq q{}) {
+if ($TTY_DEV eq q{}) {
     for my $dev ('/dev/pts/*') {
 if (-r "$dev") {
-            $TTY_DEV = "$dev";
+            $TTY_DEV = "${dev}";
 last;
         }
     }
 }
-print "Using terminal device: " . (defined ${TTY_DEV} && ${TTY_DEV} ne q{} ? ${TTY_DEV} : 'NONE'), "\n";
+print("Using terminal device: " . (defined ${TTY_DEV} && ${TTY_DEV} ne q{} ? ${TTY_DEV} : 'NONE'), "\n");
 print "\n";
 print "============================================================\n";
 print " SECTION 1: tty (default) \x{2014} with a real terminal\n";
 print "============================================================\n";
-if ("$TTY_DEV" ne q{}) {
-open STDIN, '<', "$TTY_DEV" or croak "Cannot read file: $OS_ERROR\n";
+if ($TTY_DEV ne q{}) {
+open STDIN, '<', "${TTY_DEV}" or croak "Cannot read file: $OS_ERROR\n";
     capture("01-default-terminal", 'tty');
 }
 else {
@@ -99,8 +102,8 @@ capture("03-pipe-notty", 'bash', '-c', "echo \"dummy\" | tty");
 print "============================================================\n";
 print " SECTION 4: tty -s \x{2014} with a real terminal (silent)\n";
 print "============================================================\n";
-if ("$TTY_DEV" ne q{}) {
-open STDIN, '<', "$TTY_DEV" or croak "Cannot read file: $OS_ERROR\n";
+if ($TTY_DEV ne q{}) {
+open STDIN, '<', "${TTY_DEV}" or croak "Cannot read file: $OS_ERROR\n";
     capture("04-silent-terminal", 'tty', '-s');
 }
 else {
@@ -119,8 +122,8 @@ capture("06-silent-pipe", 'bash', '-c', "echo \"dummy\" | tty -s");
 print "============================================================\n";
 print " SECTION 7: tty --silent \x{2014} long form, with a real terminal\n";
 print "============================================================\n";
-if ("$TTY_DEV" ne q{}) {
-open STDIN, '<', "$TTY_DEV" or croak "Cannot read file: $OS_ERROR\n";
+if ($TTY_DEV ne q{}) {
+open STDIN, '<', "${TTY_DEV}" or croak "Cannot read file: $OS_ERROR\n";
     capture("07-long-silent", 'tty', '--silent');
 }
 else {
@@ -130,8 +133,8 @@ else {
 print "============================================================\n";
 print " SECTION 8: tty --quiet \x{2014} long form, with a real terminal\n";
 print "============================================================\n";
-if ("$TTY_DEV" ne q{}) {
-open STDIN, '<', "$TTY_DEV" or croak "Cannot read file: $OS_ERROR\n";
+if ($TTY_DEV ne q{}) {
+open STDIN, '<', "${TTY_DEV}" or croak "Cannot read file: $OS_ERROR\n";
     capture("08-long-quiet", 'tty', '--quiet');
 }
 else {
@@ -159,8 +162,8 @@ capture("12-inherited-silent", 'tty', '-s');
 print "============================================================\n";
 print " SECTION 13: tty -s -s \x{2014} repeated silent flag\n";
 print "============================================================\n";
-if ("$TTY_DEV" ne q{}) {
-open STDIN, '<', "$TTY_DEV" or croak "Cannot read file: $OS_ERROR\n";
+if ($TTY_DEV ne q{}) {
+open STDIN, '<', "${TTY_DEV}" or croak "Cannot read file: $OS_ERROR\n";
     capture("13-double-silent", 'tty', '-s', '-s');
 }
 else {
@@ -169,4 +172,3 @@ else {
 }
 print "\n";
 print "All tty demo sections completed.\n";
-

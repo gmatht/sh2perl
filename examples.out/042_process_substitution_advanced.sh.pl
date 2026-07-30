@@ -4,11 +4,12 @@ use warnings;
 use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 use File::Basename;
+use IPC::Open3;
 my $main_exit_code = 0;
 my $__set_e = 0;
 my $output = '';
 our $CHILD_ERROR;
-
+$0 = '042_process_substitution_advanced.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -18,10 +19,10 @@ my $output_ps_fh_1;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_1 or croak "Cannot redirect STDOUT";
-    my $output_0 = q{};
-    my $output_printed_0;
-    my $output_1 = do { open(my $__fh, '-|', 'bash', '-c', q{echo -e "a\\\\nc\\\\nb" | sort}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
-    print $output_1, "\n";
+    my $output_241 = q{};
+    my $output_printed_241;
+    my $output_242 = do { open(my $__fh, '-|', 'bash', '-c', 'echo -e "a\\\\nc\\\\nb" | sort') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+    print($output_242, "\n");
 }
 use File::Path qw(make_path);
 my $temp_dir_fh_1 = dirname($temp_file_ps_fh_1);
@@ -35,10 +36,10 @@ my $output_ps_fh_2;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_2 or croak "Cannot redirect STDOUT";
-    my $output_2 = q{};
-    my $output_printed_2;
-    my $output_3 = do { open(my $__fh, '-|', 'bash', '-c', q{echo -e "a\\\\nb\\\\nd" | sort}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
-    print $output_3, "\n";
+    my $output_243 = q{};
+    my $output_printed_243;
+    my $output_244 = do { open(my $__fh, '-|', 'bash', '-c', 'echo -e "a\\\\nb\\\\nd" | sort') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+    print($output_244, "\n");
 }
 use File::Path qw(make_path);
 my $temp_dir_fh_2 = dirname($temp_file_ps_fh_2);
@@ -49,8 +50,8 @@ close $fh_ps_fh_2 or croak "Close failed: $ERRNO\n";
 open STDIN, '<', $temp_file_ps_fh_2 or croak "Cannot open process substitution: $ERRNO\n";
 $ENV{DIFF_TEMP_FILE1} = q{/tmp} . '/process_sub_fh_1.tmp';
 $ENV{DIFF_TEMP_FILE2} = q{/tmp} . '/process_sub_fh_2.tmp';
-my $diff_output = do { my $__out = q{}; if (@ARGV) { local $/; for my $__f (@ARGV) { open(my $__fh, q{<}, $__f) and do { $__out .= <$__fh>; close $__fh } } } $__out; };
-print $diff_output, "\n";
+my $diff_output = do { open(my $__fh, '-|', 'bash', '-c', q{'diff' "\$temp_file_ps_fh_1" "\$temp_file_ps_fh_2"}) or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+print($diff_output, "\n");
 if ($CHILD_ERROR != 0) {
         print "Files differ\n";
 }
@@ -59,11 +60,11 @@ my $output_ps_fh_3;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_3 or croak "Cannot redirect STDOUT";
-    my $output_4 = q{};
-    my $output_printed_4;
+    my $output_245 = q{};
+    my $output_printed_245;
     print "name1\nname2" . "\n";
-if ($output_4 ne q{} && !$output_printed_4) {
-    print $output_4;
+if ($output_245 ne q{} && !$output_printed_245) {
+    print $output_245;
 }
 }
 use File::Path qw(make_path);
@@ -78,11 +79,11 @@ my $output_ps_fh_4;
 {
     local *STDOUT;
     open STDOUT, '>', \$output_ps_fh_4 or croak "Cannot redirect STDOUT";
-    my $output_5 = q{};
-    my $output_printed_5;
+    my $output_246 = q{};
+    my $output_printed_246;
     print "value1\nvalue2" . "\n";
-if ($output_5 ne q{} && !$output_printed_5) {
-    print $output_5;
+if ($output_246 ne q{} && !$output_printed_246) {
+    print $output_246;
 }
 }
 use File::Path qw(make_path);
@@ -92,7 +93,7 @@ open my $fh_ps_fh_4, '>', $temp_file_ps_fh_4 or croak "Cannot create temp file: 
 print {$fh_ps_fh_4} $output_ps_fh_4;
 close $fh_ps_fh_4 or croak "Close failed: $ERRNO\n";
 open STDIN, '<', $temp_file_ps_fh_4 or croak "Cannot open process substitution: $ERRNO\n";
-my $paste_result_6 = do {
+my $paste_result_247 = do {
 my @paste_file1_lines_fh_5;
 my @paste_file2_lines_fh_5;
 if (open my $fh1, '<', $temp_file_ps_fh_3) {
@@ -119,9 +120,8 @@ for my $i (0..$max_lines-1) {
 $paste_output
 }
 ;
-print $paste_result_6;
+print $paste_result_247;
 my $result = "ok";
-print "status: " . ${result}, "\n";
+print("status: " . ${result}, "\n");
 
 exit $main_exit_code;
-

@@ -3,11 +3,13 @@ use strict;
 use warnings;
 use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use IPC::Open3;
+my $main_exit_code = 0;
 my $ls_success = 0;
 our $CHILD_ERROR;
-
+$0 = 'readonly-cmdsub.sh';
 use strict;
-my $RC = q{0};
+$ENV{RC} = q{0};
 
 sub capture {
     my ($file) = @_;
@@ -15,15 +17,15 @@ sub capture {
 # Builtin command 'shift' not implemented
     my $tmp_stdout;
     my $tmp_stderr;
-    $tmp_stdout = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/readonly_demo_stdout_XXXXXX') or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
-    $tmp_stderr = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/readonly_demo_stderr_XXXXXX') or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
+    $tmp_stdout = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/readonly_demo_stdout_XXXXXX') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+    $tmp_stderr = do { open(my $__fh, '-|', 'bash', '-c', 'mktemp /tmp/readonly_demo_stderr_XXXXXX') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
     do {
         open my $original_stdout, '>&', STDOUT
       or die "Cannot save STDOUT: $OS_ERROR\n";
-        open STDOUT, '>', "$tmp_stdout"
+        open STDOUT, '>', "${tmp_stdout}"
       or die "Cannot access file: $OS_ERROR\n";
 local *STDERR;
-open STDERR, '>', "$tmp_stderr" or croak "Cannot access file: $OS_ERROR\n";
+open STDERR, '>', "${tmp_stderr}" or croak "Cannot access file: $OS_ERROR\n";
         my $tmp = do {
         $CHILD_ERROR = 0;
         };
@@ -33,21 +35,21 @@ open STDERR, '>', "$tmp_stderr" or croak "Cannot access file: $OS_ERROR\n";
         close $original_stdout
       or die "Close failed: $OS_ERROR\n";
     };
-    my $ec = $?;
+    my $ec = ($? >> 8);
     my $so;
-    $so = do { my $cat_chunk = q{}; if ( open my $fh, '<', "$tmp_stdout" ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . "$tmp_stdout" . ': ' . $OS_ERROR . "\n"; } $cat_chunk; };
+    $so = do { my $__cs = do { my $cat_chunk = q{}; if ( open my $fh, '<', "${tmp_stdout}" ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . "${tmp_stdout}" . ': ' . $OS_ERROR . "\n"; } $cat_chunk; }; chomp $__cs; $__cs; };
     my $se;
-    $se = do { my $cat_chunk = q{}; if ( open my $fh, '<', "$tmp_stderr" ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . "$tmp_stderr" . ': ' . $OS_ERROR . "\n"; } $cat_chunk; };
-    unlink('$tmp_stdout');
-    unlink('$tmp_stderr');
+    $se = do { my $__cs = do { my $cat_chunk = q{}; if ( open my $fh, '<', "${tmp_stderr}" ) { local $INPUT_RECORD_SEPARATOR = undef; $cat_chunk = <$fh>; close $fh; } else { carp 'cat: ' . "${tmp_stderr}" . ': ' . $OS_ERROR . "\n"; } $cat_chunk; }; chomp $__cs; $__cs; };
+    unlink("${tmp_stdout}");
+    unlink("${tmp_stderr}");
     print "--- [\" . ${label} . \"] ---\n";
-    print "  cmd     : \@ARGV\n";
-    print "  exitcode: " . ${ec}, "\n";
-if ("${so}" ne q{}) {
-        print "  stdout  : " . ${so}, "\n";
+    print "  cmd     : @_\n";
+    print("  exitcode: " . ${ec}, "\n");
+if (${so} ne q{}) {
+        print("  stdout  : " . ${so}, "\n");
     }
-if ("${se}" ne q{}) {
-        print "  stderr  : " . ${se}, "\n";
+if (${se} ne q{}) {
+        print("  stderr  : " . ${se}, "\n");
     }
     print "\n";
 return $ec;
@@ -96,5 +98,4 @@ print "============================================================\n";
 capture("08-readonly-f-p", 'bash', '-c', "\n        f1() { :; }\n        f2() { :; }\n        readonly -f f1 f2\n        readonly -f -p | head -5\n    ");
 print "\n";
 print "All readonly demo sections completed.\n";
-
-
+exit $RC;
