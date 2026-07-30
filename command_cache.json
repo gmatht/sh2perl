@@ -1,5 +1,17 @@
 {
   "bash_cache": {
+    "examples/063_03_nested_command_substitutions.sh": {
+      "stdout": "Result: Nested: Deep: Level 4\n",
+      "stderr": "",
+      "exit_code": 0,
+      "code_hash": null
+    },
+    "examples/parse-dollar-single-quote.sh": {
+      "stdout": "IFS value (hex)=$'\\n\\t'\n",
+      "stderr": "",
+      "exit_code": 0,
+      "code_hash": null
+    },
     "examples/cat-heredoc-pipeline.sh": {
       "stdout": "1\nexit: 0\n",
       "stderr": "",
@@ -18,12 +30,6 @@
       "exit_code": 0,
       "code_hash": null
     },
-    "examples/063_03_nested_command_substitutions.sh": {
-      "stdout": "Result: Nested: Deep: Level 4\n",
-      "stderr": "",
-      "exit_code": 0,
-      "code_hash": null
-    },
     "examples/064_06_nested_arithmetic_expressions.sh": {
       "stdout": "i=4, j=6\n",
       "stderr": "",
@@ -32,17 +38,23 @@
     }
   },
   "perl_cache": {
-    "examples/064_06_nested_arithmetic_expressions.sh": {
-      "stdout": "i=4, j=6\n",
-      "stderr": "",
+    "examples/cat-heredoc-pipeline.sh": {
+      "stdout": "1\nexit: 0\n",
+      "stderr": "Useless use of a constant (\"\") in void context at /tmp/__tmp_examples_cat-heredoc-pipeline.sh line 21.\n",
       "exit_code": 0,
-      "code_hash": "78e48e8c8d65493cab05f6691552b3d7"
+      "code_hash": "b1bab1a3e58a4c4b609640df51f9e308"
     },
     "examples/063_05_heredoc_with_complex_content.sh": {
       "stdout": "  $(echo \"Command substitution\")\n  ${var:-default}\n  $(( 1 + 2 * 3 ))\n",
       "stderr": "",
       "exit_code": 0,
       "code_hash": "f6f112d81b01288e5b41650604a0ec3a"
+    },
+    "examples/064_06_nested_arithmetic_expressions.sh": {
+      "stdout": "i=4, j=6\n",
+      "stderr": "",
+      "exit_code": 0,
+      "code_hash": "78e48e8c8d65493cab05f6691552b3d7"
     },
     "examples/063_03_nested_command_substitutions.sh": {
       "stdout": "Result: Nested: Deep: Level 4\n",
@@ -56,11 +68,11 @@
       "exit_code": 0,
       "code_hash": "7d70a25f863561a15b5cd04959810adf"
     },
-    "examples/cat-heredoc-pipeline.sh": {
-      "stdout": "1\nexit: 0\n",
-      "stderr": "Useless use of a constant (\"\") in void context at /tmp/__tmp_examples_cat-heredoc-pipeline.sh line 21.\n",
+    "examples/parse-dollar-single-quote.sh": {
+      "stdout": "IFS value (hex)=%q\n",
+      "stderr": "Invalid conversion in printf: \"%q\" at /tmp/__tmp_examples_parse-dollar-single-quote.sh line 12.\n",
       "exit_code": 0,
-      "code_hash": "b1bab1a3e58a4c4b609640df51f9e308"
+      "code_hash": "f3f6ae675b83f2d3013e4d5feb4be71b"
     }
   }
 }
