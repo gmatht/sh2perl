@@ -49,14 +49,24 @@ pub fn generate_echo_command(
             .map(|arg| {
                 // For echo commands, handle special variables differently
                 match arg {
-                    Word::Variable(var, _, _) => match var.as_str() {
-                        "#" => "scalar(@ARGV)".to_string(),
-                        "@" => "@ARGV".to_string(),
-                        "*" => "@ARGV".to_string(),
-                        "?" => "($? >> 8)".to_string(),
-                        "!" => "''".to_string(),
-                        "-" => "''".to_string(),
-                        _ => format!("${}", var),
+                    Word::Variable(var, _, _) => {
+                        match var.as_str() {
+                            "#" => "scalar(@ARGV)".to_string(),
+                            "@" => "@ARGV".to_string(),
+                            "*" => "@ARGV".to_string(),
+                            "?" => "($? >> 8)".to_string(),
+                            "!" => "''".to_string(),
+                            "-" => "''".to_string(),
+                            _ => {
+                                if generator.declared_locals.contains(var)
+                                    || generator.function_level_vars.contains(var)
+                                {
+                                    format!("${}", var)
+                                } else {
+                                    format!("$ENV{{{}}}", var)
+                                }
+                            }
+                        }
                     },
                     Word::StringInterpolation(interp, _) => {
                         // Handle quoted variables like "$#" -> scalar(@ARGV)
@@ -69,7 +79,15 @@ pub fn generate_echo_command(
                                     "?" => "($? >> 8)".to_string(),
                                     "!" => "''".to_string(),
                                     "-" => "''".to_string(),
-                                    _ => format!("${}", var),
+                                    _ => {
+                                        if generator.declared_locals.contains(var)
+                                            || generator.function_level_vars.contains(var)
+                                        {
+                                            format!("${}", var)
+                                        } else {
+                                            format!("$ENV{{{}}}", var)
+                                        }
+                                    }
                                 }
                             } else if let StringPart::ParameterExpansion(pe) = &interp.parts[0] {
                                 // Handle parameter expansion like "${#arr[@]}" -> scalar(@arr)
@@ -172,7 +190,15 @@ pub fn generate_echo_command(
                                                 "?" => result.push_str("($? >> 8)"),
                                                 "!" => result.push_str(""),
                                                 "-" => result.push_str(""),
-                                                _ => result.push_str(&format!("${}", var)),
+                                                _ => {
+                                                    if generator.declared_locals.contains(var)
+                                                        || generator.function_level_vars.contains(var)
+                                                    {
+                                                        result.push_str(&format!("${}", var));
+                                                    } else {
+                                                        result.push_str(&format!("$ENV{{{}}}", var));
+                                                    }
+                                                }
                                             }
                                         }
                                         crate::ast::StringPart::CommandSubstitution(cmd) => {

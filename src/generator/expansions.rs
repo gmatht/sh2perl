@@ -10,6 +10,10 @@ fn positional_param_ref(n: usize) -> String {
 }
 
 pub(crate) fn parameter_var_scalar_ref(generator: &Generator, var_name: &str) -> String {
+    // $0 is the script name, not a positional parameter — handle before numeric parse.
+    if var_name == "0" {
+        return "$0".to_string();
+    }
     if let Ok(n) = var_name.parse::<usize>() {
         return positional_param_ref(n);
     }
@@ -47,6 +51,10 @@ pub(crate) fn parameter_var_scalar_ref(generator: &Generator, var_name: &str) ->
 /// are returned as `$ENV{var}` without the // "" wrapper because
 /// `($ENV{var} // "")` is not assignable.
 fn parameter_var_bare_assignable_ref(generator: &Generator, var_name: &str) -> String {
+    // $0 is the script name, not a positional parameter.
+    if var_name == "0" {
+        return "$0".to_string();
+    }
     if let Ok(n) = var_name.parse::<usize>() {
         return positional_param_ref(n);
     }
@@ -69,6 +77,10 @@ fn parameter_var_bare_assignable_ref(generator: &Generator, var_name: &str) -> S
 /// Returns the bare sigil-prefixed Perl variable reference (e.g. `$var` or
 /// `$ENV{var}`) for use in places like `$var =~ s/.../`.
 fn parameter_var_bare_ref(generator: &Generator, var_name: &str) -> String {
+    // $0 is the script name, not a positional parameter.
+    if var_name == "0" {
+        return "$0".to_string();
+    }
     if let Ok(n) = var_name.parse::<usize>() {
         return positional_param_ref(n);
     }
