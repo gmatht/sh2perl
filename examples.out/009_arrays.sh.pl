@@ -29,7 +29,7 @@ $map{"two"} = "1 + 1";
 print($map{'foo'}, "\n");
 print($map{'answer'}, "\n");
 # Original bash: #!/usr/bin/env bash
-my $output_136 = do { open(my $__fh, '-|', 'bash', '-c', q{: 'Complex command not supported in bash string generation' | sort}) or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
-print($output_136, "\n");
+my $output_1 = do { open(my $__fh, '-|', 'bash', '-c', q{: 'Complex command not supported in bash string generation' | sort}) or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+print($output_1, "\n");
 
 exit $main_exit_code;

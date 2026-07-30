@@ -6,6 +6,9 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
 use IPC::Open3;
 my $main_exit_code = 0;
 our $CHILD_ERROR;
-$0 = 'dollar-at-with-default.sh';
-$ENV{ARGS} = (defined "@ARGV" && "@ARGV" ne q{} ? "@ARGV" : 'default');
-print($ENV{ARGS}, "\n");
+$0 = 'parse-brace-close.sh';
+print "1 2 3 4 5\n";
+print "file.txt file.bak\n";
+for my $i (1..3) {
+    print($i, "\n");
+}
