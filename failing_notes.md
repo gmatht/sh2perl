@@ -2,9 +2,9 @@
 
 ## Current status
 
-**420 passed, 97 failed** (up from 417/100; fixed `dqs-nested-awk-sed.sh`,
+**421 passed, 96 failed** (up from 417/100; fixed `dqs-nested-awk-sed.sh`,
 `parse-paren-after-do.sh`, `parse-unexpected-end-of-input.sh`,
-`parse-unexpected-parenclose.sh`)
+`parse-unexpected-parenclose.sh`, `escaped-singlequote-in-doublequote.sh`)
 
 ### Fixed this session:
 - `dqs-nested-awk-sed.sh` — Combined DQS/SQS nesting failure: the
@@ -13,6 +13,15 @@
   (e.g. in `'s|\(.*\)/.*|\1|'`) incorrectly closed the `$()` level.
   Fixed by adding `sq_depth` tracking in `merge_double_quoted_strings`,
   `fix_bare_quotes`, and the `$()` linear scan in `parse_string_interpolation`.
+  (Files: `src/lexer.rs`, `src/parser/words.rs`)
+
+- `escaped-singlequote-in-doublequote.sh` — Escaped single-quote (`\'`) inside
+  double-quoted string within `$(...)` was misinterpreted: the `'` toggled
+  `sq_depth` even when inside an inner double-quoted string, causing the `)`
+  that closes `$()` to not be recognized.  Fixed by adding `dq_depth` tracking
+  in `merge_double_quoted_strings`, `fix_bare_quotes`, and the `$()` linear
+  scan in `parse_string_interpolation`.  Now a `"` inside `$()` toggles
+  `dq_depth`, and `'` only toggles `sq_depth` when `dq_depth == 0`.
   (Files: `src/lexer.rs`, `src/parser/words.rs`)
 
 - `parse-paren-after-do.sh`, `parse-unexpected-end-of-input.sh`,
@@ -85,7 +94,6 @@ bash's output:
 - `dollar-positional-arithmetic.sh` — stdout mismatch
 - `double-bracket-and-chain.sh` — stdout mismatch
 - `escaped-paren-command-subst.sh` — stdout mismatch
-- `escaped-singlequote-in-doublequote.sh` — stdout mismatch
 - `generator-system-echo-checkqx.sh` — stdout mismatch
 - `gunzip_example.sh` — stdout mismatch
 - `heredoc-backtick-quote-span.sh` — stdout mismatch
