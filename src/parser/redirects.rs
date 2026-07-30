@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, HashMap};
 /// `parse_heredoc_body` for heredoc redirects after all redirects on the same
 /// line have been collected.
 pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
-    eprintln!("DEBUG parse_redirect_header: peek={:?}", lexer.peek());
+    if crate::debug::is_debug_enabled() {
+        eprintln!("DEBUG parse_redirect_header: peek={:?}", lexer.peek());
+    }
     let fd = if let Some(Token::Number) = lexer.peek() {
         let fd_str = lexer.get_number_text()?;
         Some(fd_str.parse().unwrap_or(0))
@@ -174,12 +176,58 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
                 } else {
                     s.clone()
                 };
+                // Check for backslash-quoted delimiter: `<<\\EOF` → `EOF`.
                 if truncated.starts_with('\\') {
                     heredoc_quoted = true;
                     if crate::debug::is_debug_enabled() {
                         eprintln!("DEBUG: stripped backslash from heredoc delimiter '{}' -> '{}'", truncated, &truncated[1..]);
                     }
                     Word::Literal(truncated[1..].to_string(), *meta)
+                // Check for single-quoted delimiter: `<<'EOF'` → `EOF`.
+                // The SingleQuotedString token consumed the quotes, so the
+                // truncated text may be `'EOF'` (quotes included, if the token
+                // boundary happened to be at the delimiter's closing quote), or
+                // `EOF'` (trailing quote only, if the inner `'` was consumed as
+                // a regular character of the over-greedy SQ string and the outer
+                // opening quote was already stripped by parse_word).
+                } else if truncated.len() >= 2
+                    && truncated.starts_with('\'')
+                    && truncated.ends_with('\'')
+                {
+                    heredoc_quoted = true;
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!("DEBUG: stripped single quotes from heredoc delimiter '{}' -> '{}'", truncated, &truncated[1..truncated.len()-1]);
+                    }
+                    Word::Literal(truncated[1..truncated.len()-1].to_string(), *meta)
+                // Check for double-quoted delimiter: `<<"EOF"` → `EOF`.
+                } else if truncated.len() >= 2
+                    && truncated.starts_with('"')
+                    && truncated.ends_with('"')
+                {
+                    heredoc_quoted = true;
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!("DEBUG: stripped double quotes from heredoc delimiter '{}' -> '{}'", truncated, &truncated[1..truncated.len()-1]);
+                    }
+                    Word::Literal(truncated[1..truncated.len()-1].to_string(), *meta)
+                // Check for trailing single-quote after delimiter name.
+                // This happens when logos consumed the delimiter's closing `'`
+                // as a regular character of an over-greedy SingleQuotedString
+                // token, and parse_word stripped only the outer quotes leaving
+                // the inner `'` at the end of the truncated text.
+                // Example: `<< 'EOF'` where the SQ token spans
+                // `'EOF'\nThis is a test with an apostrophe: it'`.
+                // After outer-quote stripping and newline truncation we get
+                // `EOF'`.  Strip the trailing `'` and mark as quoted.
+                } else if truncated.ends_with('\'')
+                    || truncated.ends_with('"')
+                {
+                    let quote_char = if truncated.ends_with('\'') { '\'' } else { '"' };
+                    heredoc_quoted = true;
+                    let clean = truncated[..truncated.len()-1].to_string();
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!("DEBUG: stripped trailing quote from heredoc delimiter '{}' -> '{}'", truncated, clean);
+                    }
+                    Word::Literal(clean, *meta)
                 } else {
                     Word::Literal(truncated, *meta)
                 }
@@ -253,7 +301,9 @@ pub fn parse_heredoc_body(lexer: &mut Lexer, target: &Word, strip_tabs: bool) ->
 
 /// Full redirect parsing: header + heredoc body (if applicable).
 pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
-    eprintln!("DEBUG parse_redirect called, lexer.current={}", lexer.current);
+    if crate::debug::is_debug_enabled() {
+        eprintln!("DEBUG parse_redirect called, lexer.current={}", lexer.current);
+    }
     let header = parse_redirect_header(lexer)?;
     if matches!(&header.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs) {
         let strip_tabs = header.operator == RedirectOperator::HeredocTabs;
