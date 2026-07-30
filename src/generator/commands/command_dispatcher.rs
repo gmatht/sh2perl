@@ -495,8 +495,66 @@ pub fn generate_command_impl_with_input(
             if let Command::Simple(cmd) = &base_command {
                 if let Word::Literal(cmd_name, _) = &cmd.name {
                     if cmd_name.is_empty() {
-                        // This is a process substitution command with no base command
-                        // The redirects have already been processed above
+                        // Standalone redirect with no base command.
+                        // For output/append/stderr redirects, generate file creation/truncation.
+                        let has_create = all_redirects.iter().any(|r| {
+                            matches!(
+                                r.operator,
+                                RedirectOperator::Output
+                                    | RedirectOperator::Append
+                                    | RedirectOperator::StderrOutput
+                                    | RedirectOperator::StderrAppend
+                            )
+                        });
+                        if has_create {
+                            for redirect in &all_redirects {
+                                match &redirect.operator {
+                                    RedirectOperator::Output => {
+                                        let target = generator.perl_string_literal(&redirect.target);
+                                        result.push_str(&generator.indent());
+                                        result.push_str(&format!(
+                                            "open my $fh, \'>\', {} or croak \"Cannot write file: $OS_ERROR\\n\";\n",
+                                            target
+                                        ));
+                                        result.push_str(&generator.indent());
+                                        result.push_str("close $fh;\n");
+                                    }
+                                    RedirectOperator::Append => {
+                                        let target = generator.perl_string_literal(&redirect.target);
+                                        result.push_str(&generator.indent());
+                                        result.push_str(&format!(
+                                            "open my $fh, \'>>\', {} or croak \"Cannot append to file: $OS_ERROR\\n\";\n",
+                                            target
+                                        ));
+                                        result.push_str(&generator.indent());
+                                        result.push_str("close $fh;\n");
+                                    }
+                                    RedirectOperator::StderrOutput => {
+                                        let target = generator.perl_string_literal(&redirect.target);
+                                        result.push_str(&generator.indent());
+                                        result.push_str(&format!(
+                                            "open my $fh, \'>\', {} or croak \"Cannot write file: $OS_ERROR\\n\";\n",
+                                            target
+                                        ));
+                                        result.push_str(&generator.indent());
+                                        result.push_str("close $fh;\n");
+                                    }
+                                    RedirectOperator::StderrAppend => {
+                                        let target = generator.perl_string_literal(&redirect.target);
+                                        result.push_str(&generator.indent());
+                                        result.push_str(&format!(
+                                            "open my $fh, \'>>\', {} or croak \"Cannot append to file: $OS_ERROR\\n\";\n",
+                                            target
+                                        ));
+                                        result.push_str(&generator.indent());
+                                        result.push_str("close $fh;\n");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            return result;
+                        }
+                        // No file-creating redirects — return early (redirects already handled).
                         return result;
                     }
 

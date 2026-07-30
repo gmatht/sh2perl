@@ -2,7 +2,7 @@
 
 ## Current status
 
-**394 passed, 123 failed** (fixed 3 more: parse-param-pattern-match, parse-parameter-pattern, parse-substring-double-colon)
+**396 passed, 121 failed** (fixed 2 more: at-in-test, parse-standalone-redirect)
 
 ### Fixed this session:
 - `011_brace_expansion.sh`, `035_brace_expansion_practical.sh` — Fixed
@@ -218,6 +218,31 @@ See notes below for full list of prior fixes.
    generator to avoid undeclared-variable errors inside function bodies.
    Fixed: `arith-base-notation.sh` (the code-gen part).
 
+### Fixed in this session (current):
+
+12. **Standalone redirect `>somefile` silently dropped** —
+    The redirect handler in `command_dispatcher.rs` had an early return for empty
+    command names (`cmd_name.is_empty()`) that assumed the only case was process
+    substitution.  Changed to check for output/append/stderr redirects on the empty
+    command and generate `open my $fh, '>', 'target'; close $fh;` to create/truncate
+    the file.
+    Fixed: `parse-standalone-redirect.sh`.
+
+13. **Extglob `@(pattern)` in `[[ $var = @(pattern) ]]` generated invalid Perl** —
+    The `=` and `!=` operators in test expressions did not detect extglob patterns
+    (`@(`, `*(`, `+(`, `?(`, `!(`) and used `eq`/`ne` instead of `=~`/`!~` regex
+    matching.  Added `has_glob_or_extglob_chars()` check and generated `=~` with
+    `convert_glob_to_regex()` when extglob patterns are present.
+    Fixed: `at-in-test.sh`.
+
+14. **Positional params `$1`, `$2`, … in arithmetic and test expressions** —
+    Added `Phase -1b` in `convert_arithmetic_to_perl_impl()` (`words.rs`) and
+    `convert_pos_params()` in `generate_test_expression_impl()` (`test_expressions.rs`)
+    to replace `$N` with `$_[N-1]` (Perl positional parameters).  Previously `$1`
+    was passed through as-is, where Perl interprets it as the regex capture variable.
+    Partially fixed: `dollar-positional-arithmetic.sh` (still blocked by variable
+    scoping issue inside redirect `do {}` blocks).
+
 ### Fixed in this session (new):
 
 8. **`${var#pattern}` / `${var##pattern}` with brackets in pattern (e.g. `${0##*[/\\]}`)** —
@@ -252,7 +277,7 @@ See notes below for full list of prior fixes.
     emit `substr(...)` instead of the array-slice syntax.
     Fixed: `parse-substring-double-colon.sh`.
 
-## Remaining failures (~123)
+## Remaining failures (~121)
 
 The remaining failures fall into categories that require deeper parser/generator work:
 
@@ -270,6 +295,14 @@ The remaining failures fall into categories that require deeper parser/generator
 3. **Test expression ([[ ... ]] / test / []) translation**:
    Extglob patterns (@(...)), backslash continuations, complex groupings.
    The test expression generator doesn't handle all shell constructs.
+   **Fixed: `at-in-test.sh`** (extglob `@(pattern)` now detected in `=` / `!=`
+   operators and uses `=~` regex matching instead of `eq`).
+   Partially fixed: `dollar-positional-arithmetic.sh` — `$N` positional params
+   in arithmetic (`$_[0]` instead of `$1`) and in test expressions converted;
+   still fails because `my $n` declaration ends up inside a `do {}` block
+   created by the redirect handler's stderr redirect, scoping the variable
+   invisible to later code.  Fix requires hoisting declarations out of
+   redirect scope blocks.
 
 4. **String interpolation edge cases**:
    Variables inside double-quoted strings with special characters,
@@ -295,6 +328,8 @@ The remaining failures fall into categories that require deeper parser/generator
 9. **Redirection handling**:
    Some redirect combinations (clobber, append, same-line heredocs) produce
    different output between Perl and bash.
+   **Fixed: `parse-standalone-redirect.sh`** (standalone `>file` redirect now
+   generates `open`/`close` instead of being silently dropped).
 
 10. **`set -e` and `set -u` interaction**:
     The track-every-exit-code pattern interacts poorly with the generated
