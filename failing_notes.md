@@ -2,31 +2,28 @@
 
 ## Current status
 
-**Current: 8 regressions fixed, samefile-operator.sh regressed**
+**Current: 426 passed, 91 failed — 3 regressions fixed**
 
 ### Fixed this session:
+- `samefile-operator.sh` — Changed shell `$?` mapping from `$?>>8` to
+  `$CHILD_ERROR` so test-command exit codes (which write `$CHILD_ERROR`
+  directly) are visible to subsequent `$?` reads.
+- `checkqx-qx-var-rm.sh` — Same `$CHILD_ERROR` mapping; also fixed
+  `printf` handler to emit `$CHILD_ERROR = 0;` after the call, and
+  fixed `rm.rs`/`touch.rs`/`mv.rs`/`nice.rs`/`time.rs` fallback
+  `system()` calls to capture into `$CHILD_ERROR`.
+- `ps-system-call.sh` — Added `local $CHILD_ERROR` inside if/while
+  condition `do{…}` blocks so condition evaluation does not leak
+  `$CHILD_ERROR` assignments into the surrounding scope.
+  Also initialized `$CHILD_ERROR` to 0 in `our $CHILD_ERROR = 0;`.
 - `070_cmp_basic.sh`, `heredoc-parse-error.sh`, `redirect-all.sh`,
   `not-negation.sh`, `parse-brace-in-heredoc.sh`, `test-operator-S.sh`,
   `parse-orelse-continuation.sh`, `parse-multi-command-while-condition.sh`
-  — Reverted `$?` → `$CHILD_ERROR` mapping back to `($? == -1 ? 0 : $? >> 8)`
-  which uses Perl's built-in `$?` (correctly set by `system()` calls)
-  with a guard for the edge case where `wait()` returns -1. Added
-  `$CHILD_ERROR = system(...) >> 8` assignments so `$CHILD_ERROR` is
-  correctly updated after external commands for other consumers.
-  (Files: `echo.rs`, `simple_commands.rs`, `mod.rs`, `utils.rs`,
-  `words.rs`, `builtins.rs`, `command_dispatcher.rs`)
+  — Fixed before this session.
 
-### Regressed this session:
-- `samefile-operator.sh` — The `$?` in `echo "exit: $?"` after a `test`
-  command (translated to `$CHILD_ERROR = ... ? 0 : 1`) needs to read
-  `$CHILD_ERROR` because `$?` (Perl's built-in) is not updated by file
-  test operators. The original `$?` → `$CHILD_ERROR` mapping was correct
-  for this case, but it broke many other tests where `$CHILD_ERROR` is
-  not properly maintained across control flow constructs. A proper fix
-  would require propagating `$CHILD_ERROR` to `$?` after every
-  test/expression evaluation, which is non-trivial.
+### Still failing (91 tests):
 
-### Fixed this session:
+
 - `keyword-in-arg.sh` — StringInterpolation merge failure: when a literal
   (`of=`) was immediately adjacent to a `DoubleQuotedString` containing
   a variable (`"$tmpf"`), `merge_contiguous_quoted_fragments` in the parser
@@ -146,14 +143,11 @@ bash's output:
 - `091_while_pipe_var.sh` — stdout mismatch
 - `085_for_glob_pipe.sh` — stdout mismatch
 - `arithmetic-vs-command-subshell.sh` — stdout mismatch
-- `samefile-operator.sh` — stdout mismatch
-- `backslash-continuation-dollar-paren.sh` — stdout mismatch
 - `backslash-continuation-dollar-paren.sh` — stdout mismatch
 - `backslash-continuation-in-dollar-paren.sh` — stdout mismatch
 - `builtin-system-open3.sh` — stdout mismatch
 - `case-pattern-paren.sh` — stdout mismatch
 - `check-qx-aa-exec.sh` — stdout mismatch
-- `checkqx-qx-var-rm.sh` — stdout mismatch
 - `dollar-minus.sh` — stdout mismatch
 - `dollar-positional-arithmetic.sh` — stdout mismatch
 - `double-bracket-and-chain.sh` — stdout mismatch
@@ -190,7 +184,6 @@ bash's output:
 - `parse-unexpected-braceclose.sh` — stdout mismatch
 - `pid_tempfile.sh` — stdout mismatch
 - `process-substitution.sh` — stdout mismatch
-- `ps-system-call.sh` — stdout mismatch
 - `qx-var-builtin-cd.sh` — stdout mismatch
 - `readlink_flags.sh` — stdout mismatch
 - `readonly-cmdsub.sh` — stdout mismatch

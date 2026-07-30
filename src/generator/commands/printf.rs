@@ -275,5 +275,9 @@ pub fn generate_printf_command(
         }
     }
 
+    // Set $CHILD_ERROR to 0 for statement context (not expression)
+    if !is_expression {
+        output.push_str("$CHILD_ERROR = 0;\n");
+    }
     output
 }

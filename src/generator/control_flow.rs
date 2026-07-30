@@ -78,7 +78,7 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
                 .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                 .trim_end_matches(';')
                 .to_string();
-            output.push_str(&format!("do {{ {} }}", cond));
+            output.push_str(&format!("do {{ local $CHILD_ERROR; {} }}", cond));
         }
         _ => {
             generator.suppress_set_e_depth += 1;
@@ -107,7 +107,7 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             // where `if func; then` enters when func returns 0.
             // Use `!do { ... }` instead of `!(...)` so multi-statement
             // code (e.g. from redirect commands) is valid in Perl.
-            output.push_str(&format!("!do {{ {} }}", cond));
+            output.push_str(&format!("!do {{ local $CHILD_ERROR; {} }}", cond));
         }
     }
     output.push_str(") {\n");
@@ -1708,7 +1708,7 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
                     .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                     .trim_end_matches(';')
                     .to_string();
-                format!("!({})", c)
+                format!("!do {{ local $CHILD_ERROR; {} }}", c)
             }
         }
     }

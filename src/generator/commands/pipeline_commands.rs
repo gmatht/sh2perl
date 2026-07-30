@@ -749,7 +749,7 @@ pub fn generate_pipeline_for_substitution(
                             let command_str = args.join(" ");
                             // Properly escape quotes in the command string
                             let escaped_command = command_str.replace("\"", "\\\"");
-                            output.push_str(&format!("    system \"{}\";\n", escaped_command));
+                            output.push_str(&format!("    $CHILD_ERROR = system(\"{}\") >> 8;\n", escaped_command));
                         }
 
                         output.push_str("    my $end_time = [gettimeofday];\n");
