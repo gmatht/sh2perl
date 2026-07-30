@@ -3,6 +3,10 @@ use strict;
 use warnings;
 use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use IPC::Open3;
+my $main_exit_code = 0;
+our $CHILD_ERROR;
+$0 = '063_01_deeply_nested_arithmetic.sh';
 my $a;
 my $b;
 my $c;
@@ -18,5 +22,4 @@ my $l;
 my $m;
 my $n;
 my $result = eval { int( ($a + $b) * ($c - $d) / ($e % $f) + ($g ** $h) - ($i << $j) | ($k & $l) ^ ($m | $n) ) } // "";
-print "Deeply nested arithmetic result: $result\n";
-
+print "Deeply nested arithmetic result: ${result}\n";

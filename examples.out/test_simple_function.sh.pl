@@ -3,12 +3,15 @@ use strict;
 use warnings;
 use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use IPC::Open3;
+my $main_exit_code = 0;
+our $CHILD_ERROR;
+$0 = 'test_simple_function.sh';
 
 sub get_file_size {
     my ($file) = @_;
-    my $file = $_[0];
-    my $size = do {
-    my $wc_file = "$file";
+    my $size = do { my $__cs = do {
+    my $wc_file = "${file}";
     my $wc_file_opened = 0;
     my $content = do {
         my $result = q{};
@@ -26,9 +29,8 @@ sub get_file_size {
         my $wc_bytes = length($content);
         $wc_bytes;
     } : q{};
-};
-    print "File $file has $size bytes\n";
+}; chomp $__cs; $__cs; };
+    print "File ${file} has ${size} bytes\n";
     return;
 }
 get_file_size('test_simple_function.sh');
-

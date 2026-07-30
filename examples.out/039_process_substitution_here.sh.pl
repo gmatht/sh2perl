@@ -3,7 +3,11 @@ use strict;
 use warnings;
 use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use IPC::Open3;
+my $main_exit_code = 0;
 my $__set_e = 0;
+our $CHILD_ERROR;
+$0 = '039_process_substitution_here.sh';
 $__set_e = 1;
 # set uo not implemented
 # set pipefail not implemented
@@ -22,5 +26,4 @@ $grep_result_0 = join "\n", @grep_matches_0;
 print $grep_result_0;
 print "\n";
 $CHILD_ERROR = scalar @grep_filtered_0 > 0 ? 0 : 1;
-print "exit: " . ($? >> 8), "\n";
-
+print("exit: " . ($? >> 8), "\n");

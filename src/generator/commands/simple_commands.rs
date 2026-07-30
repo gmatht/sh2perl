@@ -1441,19 +1441,19 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         ));
                     }
                     "cd" => {
-                        // Handle cd command using chdir() instead of system call
+                        // Handle cd command using chdir() instead of system call.
+                        // Set $CHILD_ERROR based on the actual return value of chdir
+                        // so that `||` / `&&` / `$?` work correctly.
                         if cmd.args.is_empty() {
                             // cd with no arguments goes to home directory
                             output.push_str(&generator.indent());
-                            output.push_str("chdir($ENV{HOME} || $ENV{USERPROFILE} || '.');\n");
+                            output.push_str("$CHILD_ERROR = chdir($ENV{HOME} || $ENV{USERPROFILE} || '.') ? 0 : 1;\n");
                         } else {
                             // cd with directory argument
                             let dir = generator.perl_string_literal(&cmd.args[0]);
                             output.push_str(&generator.indent());
-                            output.push_str(&format!("chdir({});\n", dir));
+                            output.push_str(&format!("$CHILD_ERROR = chdir({}) ? 0 : 1;\n", dir));
                         }
-                        output.push_str(&generator.indent());
-                        output.push_str("$CHILD_ERROR = 0;\n");
                     }
                     "let" => {
                         // let is a bash builtin for arithmetic evaluation.

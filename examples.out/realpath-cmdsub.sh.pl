@@ -3,11 +3,12 @@ use strict;
 use warnings;
 use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use IPC::Open3;
 my $main_exit_code = 0;
 my $ls_success = 0;
 my $output = '';
 our $CHILD_ERROR;
-
+$0 = 'realpath-cmdsub.sh';
 # set -o nounset not implemented
 # set nounset not implemented
 
@@ -16,23 +17,23 @@ sub try {
     my $desc = "$_[0]";
 # Builtin command 'shift' not implemented
     my @cmd = (@_);
-    print "==== $desc ====\n";
+    print "==== ${desc} ====\n";
 printf('  $ ');
     for my $arg (@cmd) {
 if ("$arg" =~ /[[:space:]]/) {
-printf('\'%s\' ', "$arg");
+printf('\'%s\' ', "${arg}");
 }
         else {
-printf('%s ', "$arg");
+printf('%s ', "${arg}");
         }
     }
     print "\n";
     my $stdout;
     my $stderr;
     my $rc;
-    $stdout = do { open(my $__fh, '-|', 'bash', '-c', "${cmd}:@ Variable(\"$\", false, None) 2> /tmp/realpath_stderr.") or die "cmd failed: $!\n"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
-    $rc = $?;
-    $stderr = do {
+    $stdout = do { open(my $__fh, '-|', 'bash', '-c', '${cmd}:@ Variable("$", false, None) 2> /tmp/realpath_stderr.') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+    $rc = ($? >> 8);
+    $stderr = do { my $__cs = do {
     my $command = 'cat /tmp/realpath_stderr. Variable("$", false, None) 2> /dev/null || true';
     my ($in, $out, $err);
     my $pid = open3($in, $out, $err, 'bash', '-c', $command);
@@ -42,28 +43,28 @@ printf('%s ', "$arg");
     waitpid $pid, 0;
     $CHILD_ERROR = $? >> 8;
     $result;
-};
+}; chomp $__cs; $__cs; };
     unlink('/tmp/realpath_stderr.');
-    unlink($);
-if ("$stdout" ne q{}) {
+    unlink($$);
+if ($stdout ne q{}) {
 if ("$stdout" =~ /^.*[$]'\x00'.*$/ms) {
 printf("  stdout (NUL\x{2011}terminated): ");
             # Original bash: printf '%s' "$stdout" | od -A n -t x1z
-my $output_4 = do { open(my $__fh, '-|', 'bash', '-c', q{printf %s "$stdout" | od -An -t x1z}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
-print $output_4, "\n";
+my $output_575 = do { open(my $__fh, '-|', 'bash', '-c', 'printf %s "$stdout" | od -An -t x1z') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+print($output_575, "\n");
 printf("\n");
 }
         else {
-printf("  stdout: %s\n", "$stdout");
+printf("  stdout: %s\n", "${stdout}");
         }
 }
     else {
 printf("  stdout: (empty)\n");
     }
-if ("$stderr" ne q{}) {
-printf("  stderr: %s\n", "$stderr");
+if ($stderr ne q{}) {
+printf("  stderr: %s\n", "${stderr}");
     }
-printf("  exit code: %d\n\n", "$rc");
+printf("  exit code: %d\n\n", "${rc}");
     return;
 }
 try('realpath (default, --physical) on a simple file', 'realpath', '/bin');
@@ -74,7 +75,7 @@ try('realpath on a directory with .. component', 'realpath', '/tmp/..');
 try('--canonicalize-existing on an existing path', 'realpath', '--canonicalize-existing', '/usr/bin/sh');
 try('--canonicalize-existing on a path with a missing last component (should fail)', 'realpath', '--canonicalize-existing', '/tmp/no_such_file_xyzzy');
 if ($CHILD_ERROR != 0) {
-    1;
+    0;
 }
 try("--canonicalize-missing on a path with a non\x{2011}existent leaf", 'realpath', '--canonicalize-missing', '/tmp/no_such_file_xyzzy');
 try('--canonicalize-missing on a completely imaginary path', 'realpath', '--canonicalize-missing', '/nonexistent/deeply/missing/file');
@@ -91,27 +92,25 @@ try('--relative-to=/ for /etc/hostname', 'realpath', '--relative-to=/', '/etc/ho
 try("--relative-base=/etc for /etc/hostname (below /etc \x{2192} relative)", 'realpath', '--relative-base=/etc', '/etc/hostname');
 try("--relative-base=/etc for /usr/bin/sh (not below /etc \x{2192} absolute)", 'realpath', '--relative-base=/etc', '/usr/bin/sh');
 try('--relative-base=/ with --relative-to=/tmp  (combined)', 'realpath', '--relative-base=/', '--relative-to=/tmp', '/etc/hostname', '/usr/bin/sh');
-print "==== --zero with two paths ====\
-";
+print "==== --zero with two paths ====\n";
 printf("  \$ realpath --zero /bin /usr/bin/sh\n");
 
 ${} = do { open(my $__fh, '-|', 'realpath', '--zero', '/bin', '/usr/bin/sh') or croak "failed: $ERRNO"; chomp(my $_r = do { local $/; <$__fh> }); close $__fh; $_r; };
-my $rc_zero = $?;
+my $rc_zero = ($? >> 8);
 printf("  (raw output with NULs above; use od to verify):\n");
 printf('  ');
 # Original bash: realpath --zero /bin /usr/bin/sh | od -A n -t x1z | head -3
-my $output_15 = do { open(my $__fh, '-|', 'bash', '-c', q{realpath --zero /bin /usr/bin/sh | od -An -t x1z | head -3}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
-print $output_15, "\n";
-printf("  exit code: %d\n\n", "$rc_zero");
+my $output_586 = do { open(my $__fh, '-|', 'bash', '-c', 'realpath --zero /bin /usr/bin/sh | od -An -t x1z | head -3') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+print($output_586, "\n");
+printf("  exit code: %d\n\n", "${rc_zero}");
 try('--quiet suppresses error message for a truly invalid path', 'realpath', '--quiet', '/nonexistent_dir_xyzzy/foo');
 if ($CHILD_ERROR != 0) {
-    1;
+    0;
 }
 try('without --quiet for comparison (stderr appears)', 'realpath', '/nonexistent_dir_xyzzy/foo');
 if ($CHILD_ERROR != 0) {
-    1;
+    0;
 }
 print "=== All tests completed ===\n";
 
 exit $main_exit_code;
-

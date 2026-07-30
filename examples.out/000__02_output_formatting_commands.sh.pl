@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use Carp;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+use IPC::Open3;
 use Digest::SHA   qw(sha256_hex sha512_hex);
 use File::Path    qw(make_path remove_tree);
 sub capture_stdout {
@@ -17,22 +18,24 @@ sub capture_stdout {
     return $captured;
 }
 
+my $main_exit_code = 0;
 my $ls_success = 0;
 our $CHILD_ERROR;
-
+$0 = '000__02_output_formatting_commands.sh';
 print "=== Output and Formatting Commands ===\n";
-my $echo_result = "Hello from backticks";
-print "Echo result: $echo_result\n";
-my $printf_result = sprintf("Number: %d, String: %s\n", 42, "test");
-print "Printf result: $printf_result\n";
+my $echo_result = do { my $__cs = "Hello from backticks"; chomp $__cs; $__cs; };
+print "Echo result: ${echo_result}\n";
+my $printf_result = do { my $__cs = sprintf("Number: %d, String: %s\n", 42, "test");
+; chomp $__cs; $__cs; };
+print "Printf result: ${printf_result}\n";
 print "=== Compression Commands ===\n";
 print "=== Network Commands ===\n";
 print "=== Process Management Commands ===\n";
 print "=== Checksum Commands ===\n";
 open my $fh, '>', 'test_checksum.txt' or die "test_checksum.txt: $!\n";
-print {*fh} "test content", "\n";
+print {$fh}("test content", "\n");
 close $fh;
-my $sha256_result = do {
+my $sha256_result = do { my $__cs = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha256_hex(
@@ -54,8 +57,9 @@ my $sha256_result = do {
     }
     join("\n", @results) . "\n";
 };
-print "SHA256 result: $sha256_result\n";
-my $sha512_result = do {
+; chomp $__cs; $__cs; };
+print "SHA256 result: ${sha256_result}\n";
+my $sha512_result = do { my $__cs = do {
     my @results;
     if ( -f 'test_checksum.txt' ) {
         my $hash = sha512_hex(
@@ -77,15 +81,16 @@ my $sha512_result = do {
     }
     join("\n", @results) . "\n";
 };
-print "SHA512 result: $sha512_result\n";
-my $strings_result = do { open(my $__fh, '-|', 'bash', '-c', q{strings test_binary.txt | head -3}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
+; chomp $__cs; $__cs; };
+print "SHA512 result: ${sha512_result}\n";
+my $strings_result = do { open(my $__fh, '-|', 'bash', '-c', 'strings test_binary.txt | head -3') or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
 print "Strings result:\n";
-print $strings_result, "\n";
+print($strings_result, "\n");
 print "=== I/O Redirection Commands ===\n";
-my $tee_result = do { open(my $__fh, '-|', 'bash', '-c', q{echo 'test output' | tee test_tee.txt}) or die "cmd failed: $!\n"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; };
-print "Tee result: $tee_result\n";
+my $tee_result = do { open(my $__fh, '-|', 'bash', '-c', q{echo 'test output' | tee test_tee.txt}) or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
+print "Tee result: ${tee_result}\n";
 print "=== Perl Command ===\n";
-my $perl_result = do {
+my $perl_result = do { my $__cs = do {
     my $result;
     my $eval_success = eval {
         $result = capture_stdout( sub { print "Hello from Perl\n" } );
@@ -95,8 +100,7 @@ my $perl_result = do {
         $result = "Error executing Perl code: $EVAL_ERROR";
     }
     $result;
-};
-print "Perl result: $perl_result\n";
+}; chomp $__cs; $__cs; };
+print "Perl result: ${perl_result}\n";
 unlink('test_checksum.txt');
 unlink('test_tee.txt');
-
