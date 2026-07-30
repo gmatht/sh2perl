@@ -2400,7 +2400,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         }
                     },
                     "$" => "$$".to_string(),         // $$ -> $$ (process ID)
-                    "?" => "($? >> 8)".to_string(), // $? -> exit code (>>8 converts wait status)
+                    "?" => "$CHILD_ERROR".to_string(), // $? -> exit code
                     "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
                     "-" => "''".to_string(), // $- -> empty (shell options not tracked)
                     "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
@@ -2829,7 +2829,7 @@ pub fn convert_string_interpolation_to_perl_impl(
                             if !current_string.is_empty() {
                                 push_string_expr(&mut parts, &mut current_string);
                             }
-                            parts.push("($? >> 8)".to_string());
+                            parts.push("$CHILD_ERROR".to_string());
                         } else if generator.declared_locals.contains(var)
                             || generator.function_level_vars.contains(var)
                             || matches!(var.as_str(), "#" | "@" | "*" | "-" | "0" | "$")

@@ -86,7 +86,7 @@ fn convert_shell_var_to_perl(var: &str) -> String {
         "$#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
         "$@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
         "$*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
-        "$?" => "($? >> 8)".to_string(),     // $? -> exit code (>>8 converts wait status)
+        "$?" => "$CHILD_ERROR".to_string(),     // $? -> exit code
         _ if processed.starts_with('$') || processed.starts_with('(') || processed.starts_with('"') || processed.starts_with('\'') => {
             // Already a Perl expression (variable, command capture, or quoted string)
             processed
