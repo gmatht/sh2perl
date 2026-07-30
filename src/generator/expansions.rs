@@ -15,9 +15,18 @@ pub(crate) fn parameter_var_scalar_ref(generator: &Generator, var_name: &str) ->
     }
     if generator.declared_locals.contains(var_name)
         || generator.function_level_vars.contains(var_name)
-        || matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+        || matches!(var_name, "#" | "*" | "-" | "?" | "$" | "!" | "0")
     {
         format!("${{{}}}", var_name)
+    } else if var_name == "@" {
+        // $@ in bash = all script arguments (top level) or function arguments
+        // (inside a function).  In Perl, @ARGV / @_ is the corresponding array.
+        // In scalar context, "@array" gives the space-separated string.
+        if generator.fn_nesting_depth > 0 {
+            format!("\"@_\"")
+        } else {
+            format!("\"@ARGV\"")
+        }
     } else if var_name.contains('[')
         || var_name.contains(']')
         || var_name.contains('{')
@@ -43,9 +52,15 @@ fn parameter_var_bare_assignable_ref(generator: &Generator, var_name: &str) -> S
     }
     if generator.declared_locals.contains(var_name)
         || generator.function_level_vars.contains(var_name)
-        || matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+        || matches!(var_name, "#" | "*" | "-" | "?" | "$" | "!" | "0")
     {
         format!("${}", var_name)
+    } else if var_name == "@" {
+        if generator.fn_nesting_depth > 0 {
+            format!("\"@_\"")
+        } else {
+            format!("\"@ARGV\"")
+        }
     } else {
         format!("$ENV{{{var}}}", var = var_name)
     }
@@ -59,7 +74,7 @@ fn parameter_var_bare_ref(generator: &Generator, var_name: &str) -> String {
     }
     if generator.declared_locals.contains(var_name)
         || generator.function_level_vars.contains(var_name)
-        || matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+        || matches!(var_name, "#" | "*" | "-" | "?" | "$" | "!" | "0")
     {
         format!("${}", var_name)
     } else {
@@ -327,6 +342,16 @@ pub(crate) fn default_value_to_perl(generator: &mut Generator, default: &str) ->
             let perl = generator.word_to_perl(&Word::CommandSubstitution(Box::new(command), None));
             return format!("do {{ my $_result = {}; $_result; }}", perl);
         }
+    }
+    // Handle double-quoted string default: "" → '' (empty string), "text" → 'text'
+    if default.starts_with('"') && default.ends_with('"') && default.len() >= 2 {
+        let inner = &default[1..default.len() - 1];
+        return format!("'{}'", inner.replace('\'', "'\\''"));
+    }
+    // Handle single-quoted string default: '' → '' (empty string), 'text' → 'text'
+    if default.starts_with('\'') && default.ends_with('\'') && default.len() >= 2 {
+        let inner = &default[1..default.len() - 1];
+        return format!("'{}'", inner.replace('\'', "'\\''"));
     }
     // Fall back to string literal
     format!("'{}'", default)
