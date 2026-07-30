@@ -2,9 +2,18 @@
 
 ## Current status
 
-**388 passed, 129 failed** (net +13 from previous 375/142)
+**389 passed, 128 failed** (net +14 from previous 375/142)
 
 ### Fixed this session:
+- `064_02_nested_brace_expansions.sh`, `008_simple_backup.sh` — Fixed
+  brace-expansion Cartesian-product generation in echo commands.  The
+  `expand_brace_items()` function in `simple_commands.rs` was not applying
+  `prefix`/`suffix` from the `BraceExpansion` struct, so connected literal
+  text (`file_`, `_`, `.`) was lost from the expanded items.  Also fixed
+  the Cartesian-product compound-group logic to NOT merge non-BraceExpansion
+  arguments with following BraceExpansions (they are separate echo arguments),
+  and added suffix-token consumption in the parser so that literal text after
+  a brace expansion (e.g. `{a,b}suf`) is stored in the `suffix` field.
 - `test-operator-missing.sh`, `test-operator-S.sh` — Added missing file-test
   unary operators (`-h`, `-p`, `-b`, `-c`, `-g`, `-k`, `-u`, `-O`, `-G`, `-N`, `-S`)
   and binary comparison operators (`-nt`, `-ot`, `-ef`) to the test expression
