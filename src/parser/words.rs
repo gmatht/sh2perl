@@ -2736,10 +2736,23 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 i += 2; // skip $ and (
                 let cmd_start = i;
                 let mut paren_count = 1;
+                // Track single-quote depth inside $(): a ' inside $() starts
+                // a single-quoted string where ( ) and $ are literal.
+                // Also handle backslash escapes.
+                let mut sq_depth = false;
                 while i < content.len() && paren_count > 0 {
+                    // Check for backslash escape first; skip the escaped char.
+                    if content[i..].starts_with('\\') {
+                        i += 2;
+                        continue;
+                    }
                     match content[i..].chars().next() {
-                        Some('(') => paren_count += 1,
-                        Some(')') => paren_count -= 1,
+                        Some('\'') => {
+                            // Toggle single-quote depth.
+                            sq_depth = !sq_depth;
+                        }
+                        Some('(') if !sq_depth => paren_count += 1,
+                        Some(')') if !sq_depth => paren_count -= 1,
                         _ => {}
                     }
                     let ch = content[i..].chars().next().unwrap_or('?');

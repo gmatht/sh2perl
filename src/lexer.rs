@@ -1035,6 +1035,7 @@ impl Lexer {
                 let bytes = input.as_bytes();
                 // Only re-parse if this " is at byte position with "
                 if bytes[start] == b'"' {
+
                     let mut end = start + 1; // skip past opening "
                     let mut p_depth = 0i32;          // $(  ) depth
                     let mut b_depth = 0i32;          // ${  } depth
@@ -1042,6 +1043,10 @@ impl Lexer {
                     // When inside $(), track standalone '(' that are not part of
                     // '$(' so we correctly match ')' to its corresponding '$('.
                     let mut paren_depth = 0i32;
+                    // Track single-quote depth inside $(): a ' inside $() starts
+                    // a single-quoted string where all characters (including ),
+                    // (, \, and $) are literal and must not affect depth tracking.
+                    let mut sq_depth = 0i32;
                     let mut found_close = false;
                     while end < bytes.len() {
                         let ch = bytes[end];
@@ -1054,10 +1059,12 @@ impl Lexer {
                                 found_close = true;
                                 break;
                             }
-                            b'\\' if end + 1 < bytes.len() => {
+                            b'\\' if end + 1 < bytes.len() && sq_depth == 0 => {
                                 // Backslash followed by newline is a line continuation
                                 // inside double-quoted strings.  Skip both the backslash
                                 // and the newline so the string spans multiple lines.
+                                // Inside a single-quoted string within $(), backslash
+                                // is literal and does not skip the next character.
                                 if bytes[end + 1] == b'\n' {
                                     end += 2; // skip backslash AND newline (line continuation)
                                 } else {
@@ -1071,20 +1078,27 @@ impl Lexer {
                                 bt_depth = if bt_depth == 0 { 1 } else { 0 };
                                 end += 1;
                             }
-                            b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'(' => {
+                            b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'(' && sq_depth == 0 => {
                                 p_depth += 1;
                                 end += 2;
                             }
-                            b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'{' => {
+                            b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'{' && sq_depth == 0 => {
                                 b_depth += 1;
                                 end += 2;
                             }
-                            b'(' if p_depth > 0 => {
+                            b'\'' if p_depth > 0 => {
+                                // Toggle single-quote depth inside $().
+                                // A ' inside $() starts/ends a single-quoted string;
+                                // while inside it, all characters are literal.
+                                sq_depth = if sq_depth == 0 { 1 } else { 0 };
+                                end += 1;
+                            }
+                            b'(' if p_depth > 0 && sq_depth == 0 => {
                                 // Standalone '(' inside $() — not part of '$('.
                                 paren_depth += 1;
                                 end += 1;
                             }
-                            b')' => {
+                            b')' if sq_depth == 0 => {
                                 if p_depth > 0 {
                                     if paren_depth > 0 {
                                         // This ')' matches a previous '(' inside $().
@@ -1096,7 +1110,7 @@ impl Lexer {
                                 }
                                 end += 1;
                             }
-                            b'}' => {
+                            b'}' if sq_depth == 0 => {
                                 if b_depth > 0 {
                                     b_depth -= 1;
                                 }
@@ -1555,6 +1569,7 @@ impl Lexer {
                 let mut p_depth = 0i32;
                 let mut b_depth = 0i32;
                 let mut bt_depth = 0i32;
+                let mut sq_depth = 0i32;
                 while pos < input.len() {
                     match bytes[pos] {
                         b'"' if p_depth == 0 && b_depth == 0 && bt_depth == 0 => {
@@ -1565,12 +1580,13 @@ impl Lexer {
                             }
                             break;
                         }
-                        b'\\' if pos + 1 < input.len() => { pos += 2; }
+                        b'\\' if pos + 1 < input.len() && sq_depth == 0 => { pos += 2; }
                         b'`' => { bt_depth = if bt_depth == 0 { 1 } else { 0 }; pos += 1; }
-                        b'$' if pos + 1 < input.len() && bytes[pos + 1] == b'(' => { p_depth += 1; pos += 2; }
-                        b'$' if pos + 1 < input.len() && bytes[pos + 1] == b'{' => { b_depth += 1; pos += 2; }
-                        b')' => { if p_depth > 0 { p_depth -= 1; } pos += 1; }
-                        b'}' => { if b_depth > 0 { b_depth -= 1; } pos += 1; }
+                        b'\'' if p_depth > 0 => { sq_depth = if sq_depth == 0 { 1 } else { 0 }; pos += 1; }
+                        b'$' if pos + 1 < input.len() && bytes[pos + 1] == b'(' && sq_depth == 0 => { p_depth += 1; pos += 2; }
+                        b'$' if pos + 1 < input.len() && bytes[pos + 1] == b'{' && sq_depth == 0 => { b_depth += 1; pos += 2; }
+                        b')' if sq_depth == 0 => { if p_depth > 0 { p_depth -= 1; } pos += 1; }
+                        b'}' if sq_depth == 0 => { if b_depth > 0 { b_depth -= 1; } pos += 1; }
                         _ => { pos += 1; }
                     }
                 }
