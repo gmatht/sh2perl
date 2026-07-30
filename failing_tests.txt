@@ -15,9 +15,10 @@
 050_test_ls_star_dot_sh.sh	stdout mismatch
 057_case.sh	stdout mismatch
 062_09_complex_function.sh	stdout mismatch
+062_10_simple_pipeline.sh	stdout mismatch
+051_primes.sh	stdout mismatch
 062_15_complex_local_variables.sh	stdout mismatch
 062_hard_to_lex.sh	stdout mismatch
-051_primes.sh	stdout mismatch
 063_09_complex_function_parameter_handling.sh	stdout mismatch
 063_14_complex_redirects.sh	stdout mismatch
 064_01_complex_nested_subshells.sh	stdout mismatch
@@ -36,9 +37,9 @@
 091_while_pipe_var.sh	stdout mismatch
 arithmetic-vs-command-subshell.sh	stdout mismatch
 background-chain.sh	stdout mismatch
-085_for_glob_pipe.sh	stdout mismatch
-backslash-continuation-in-dollar-paren.sh	stdout mismatch
 backslash-continuation-dollar-paren.sh	stdout mismatch
+backslash-continuation-in-dollar-paren.sh	stdout mismatch
+085_for_glob_pipe.sh	stdout mismatch
 builtin-system-open3.sh	stdout mismatch
 case-pattern-paren.sh	stdout mismatch
 check-qx-aa-exec.sh	stdout mismatch
@@ -51,19 +52,18 @@ escaped-paren-command-subst.sh	stdout mismatch
 generator-system-echo-checkqx.sh	stdout mismatch
 gunzip_example.sh	stdout mismatch
 heredoc-backtick-quote-span.sh	stdout mismatch
-heredoc-redirects-same-line.sh	stdout mismatch
 heredoc-singlequote-span.sh	stdout mismatch
+heredoc-redirects-same-line.sh	stdout mismatch
 heredoc-with-redirect-same-line.sh	stdout mismatch
-id-cmdsub.sh	stdout mismatch
 keyword-in-arg.sh	stdout mismatch
 lex-dot-in-var.sh	stdout mismatch
 lexer-char-minus.sh	stdout mismatch
-param-expand-hash-sameline.sh	stdout mismatch
+id-cmdsub.sh	stdout mismatch
 param-expand-default-operator.sh	stdout mismatch
+param-expand-hash-sameline.sh	stdout mismatch
 param-expand-hash.sh	stdout mismatch
 param-expand-hashhash.sh	stdout mismatch
 parse-and-or-chain-with-assign.sh	stdout mismatch
-parse-at-slice.sh	stdout mismatch
 parse-brace-close.sh	stdout mismatch
 parse-case-subject-complex.sh	stdout mismatch
 parse-dollar-in-arithmetic.sh	stdout mismatch
@@ -87,7 +87,6 @@ parse-unexpected-end-of-input.sh	debashc failed to generate code
 parse-unexpected-parenclose.sh	debashc failed to generate code
 parse-unexpected-braceclose.sh	stdout mismatch
 pid_tempfile.sh	stdout mismatch
-proc-subst-output.sh	stdout mismatch
 process-substitution.sh	stdout mismatch
 ps-system-call.sh	stdout mismatch
 qx-var-builtin-cd.sh	stdout mismatch
@@ -97,8 +96,8 @@ realpath-cmdsub.sh	stdout mismatch
 samefile-operator.sh	stdout mismatch
 test-expression-backslash-continuation.sh	stdout mismatch
 test_grep.sh	stdout mismatch
-test_system_builtin.sh	stdout mismatch
 typeset-cmdsub.sh	stdout mismatch
+test_system_builtin.sh	stdout mismatch
 utf8-non-utf8-content.sh	stdout mismatch
 tty-cmdsub.sh	stdout mismatch
 zsh-style-eval-redirect.sh	stdout mismatch

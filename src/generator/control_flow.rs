@@ -250,7 +250,12 @@ pub fn generate_case_statement_impl(
                     perl_pattern = perl_pattern.replace("]", "\\]");
                     let clean_pattern = perl_pattern.trim_matches('"').trim_matches('\'');
                     let regex_pattern = format!("^{}$", clean_pattern);
-                    pattern_conditions.push(format!("{} =~ /{}/msx", processed_word, regex_pattern));
+                    // Wrap processed_word in parentheses so that =~ binds to the
+                    // full subject expression, not just the last part of a
+                    // concatenation.  Without parens,  A . B =~ /re/  parses as
+                    // A . (B =~ /re/), which is always truthy (the concat of A
+                    // with the match result 1/"").
+                    pattern_conditions.push(format!("({}) =~ /{}/msx", processed_word, regex_pattern));
                 } else {
                     // Simple literal — use eq for clarity and performance.
                     // Quote the pattern for Perl: wrap in single quotes (escape embedded quotes).
@@ -1797,6 +1802,11 @@ pub fn hoist_my_declarations(generator: &mut Generator, vars: &std::collections:
         if !generator.declared_locals.contains(var)
             && !generator.function_level_vars.contains(var)
         {
+            // Ensure there's a newline before the declaration if the output
+            // doesn't end with one (avoids joining with a previous closing brace).
+            if !output.ends_with('\n') && !output.is_empty() {
+                output.push('\n');
+            }
             output.push_str(&generator.indent());
             output.push_str(&format!("my ${};\n", var));
             generator.declared_locals.insert(var.clone());

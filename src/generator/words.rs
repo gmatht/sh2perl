@@ -2398,15 +2398,16 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                     _ => {
                         // Shell positional parameters ($1, $2, …) map to
-                        // Perl's @_ indexing.  Inside a function $1 is the
-                        // first argument ($_[0]), at the top level @_ is
-                        // empty but $ARGV holds command-line args.  Use
-                        // $_[i-1] which works in both cases (at the top
-                        // level $_[0] is undef, matching an unset $1).
+                        // Perl's $ARGV[N-1] at the top level, or $_[N-1]
+                        // inside a function body.
                         if var.chars().all(|c| c.is_ascii_digit()) {
                             let idx = var.parse::<usize>().unwrap_or(1);
                             if idx >= 1 {
-                                format!("$_[{}]", idx - 1)
+                                if generator.fn_nesting_depth > 0 {
+                                    format!("$_[{}]", idx - 1)
+                                } else {
+                                    format!("$ARGV[{}]", idx - 1)
+                                }
                             } else {
                                 format!("${}", var)
                             }
@@ -2792,8 +2793,12 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 // $0 is the script name; use $0 directly to avoid requiring the English module
                                 current_string.push_str("$0");
                             } else {
-                                // Convert $1 to $_[0], $2 to $_[1], etc.
-                                current_string.push_str(&format!("$_[{}]", index - 1));
+                                // Convert $1 to $ARGV[0] (top level) or $_[0] (function), $2 to $ARGV[1] or $_[1], etc.
+                                if generator.fn_nesting_depth > 0 {
+                                    current_string.push_str(&format!("$_[{}]", index - 1));
+                                } else {
+                                    current_string.push_str(&format!("$ARGV[{}]", index - 1));
+                                }
                             }
                         // Perl arrays are 0-indexed
                         } else if var == "!" {
@@ -3218,12 +3223,18 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
     }
 
     // Phase -1b: replace positional parameters $N (digits only) inside arithmetic
-    // with $_[N-1] so they refer to the script's arguments, not Perl's $1 regex var.
+    // with $ARGV[N-1] (top level) or $_[N-1] (inside a function) so they refer
+    // to the script's arguments, not Perl's $1 regex var.
     {
         let re_pos = regex::Regex::new(r"\$(\d+)").unwrap();
+        let use_argv = generator.fn_nesting_depth == 0;
         result = re_pos.replace_all(&result, |caps: &regex::Captures| {
             let n: usize = caps[1].parse().unwrap_or(1);
-            format!("$_[{}]", n.saturating_sub(1))
+            if use_argv {
+                format!("$ARGV[{}]", n.saturating_sub(1))
+            } else {
+                format!("$_[{}]", n.saturating_sub(1))
+            }
         }).to_string();
     }
 

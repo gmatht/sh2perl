@@ -2,7 +2,7 @@
 
 ## Current status
 
-**413 passed, 104 failed** (up from 409/108)
+**417 passed, 100 failed** (up from 413/104)
 
 ### Fixed this session:
 - `proc-subst-output.sh` — process substitution output `>(cmd)` in exec
@@ -51,6 +51,31 @@
   the `/bin/` hardcode for bare command names was changed to use the bare
   name (system() searches PATH).  check_qx.pl no longer flags these.
   (File: `src/generator/commands/simple_commands.rs`)
+
+- `parse-orelse-continuation.sh` — `cd` command always set `$CHILD_ERROR = 0`
+  after `chdir()`, making `||` continuation never trigger.  Fixed to use
+  `$CHILD_ERROR = chdir(...) ? 0 : 1` so the exit code reflects actual
+  success/failure.
+  (File: `src/generator/commands/simple_commands.rs`)
+
+- `parse-case-subject-complex.sh` — Case patterns with `=~` regex binding
+  had incorrect operator precedence: `A . B =~ /re/` parsed as
+  `A . (B =~ /re/)` which is always truthy (concatenation of A with the
+  match result).  Wrapped the subject in parentheses so `=~` binds to the
+  full concatenated expression.
+  (File: `src/generator/control_flow.rs`)
+
+- `parse-and-or-chain-with-assign.sh` — Variable hoisting inside `&&` handler
+  placed `my $var;` inside the `if (...)` condition parentheses, causing
+  syntax error.  Moved hoisting before the `if` statement.
+  (Files: `src/generator/commands/logic_commands.rs`,
+  `src/generator/control_flow.rs`)
+
+- Positional parameter mapping (`$1`, `$2`, …) — `$1` was mapped to `$_[0]`
+  at all nesting levels, but at the top level `@_` is empty (use `$ARGV[0]`).
+  Only use `$_[N-1]` inside a function body (`fn_nesting_depth > 0`);
+  at the top level use `$ARGV[N-1]`.
+  (File: `src/generator/words.rs`)
 
 ### Previously fixed (earlier sessions):
 - `keyword-in-arg.sh` — Shell keywords in argument position

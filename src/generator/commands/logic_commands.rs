@@ -49,6 +49,15 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         return output;
     }
 
+    // Pre-declare variables assigned in the right branch BEFORE the if statement,
+    // so that `my $var = ...` does not end up inside the conditional body or
+    // inside the if(...) condition parentheses (which would be a syntax error).
+    {
+        let mut right_vars = std::collections::HashSet::new();
+        collect_assigned_vars(right, &mut right_vars);
+        hoist_my_declarations(generator, &right_vars, &mut output);
+    }
+
     // For other commands, use the original pattern with exit code checking
     output.push_str("if (");
 
@@ -157,15 +166,6 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         generator.indent_level -= 1;
         output.push_str(&generator.indent());
         output.push_str("}");
-    }
-
-    // Pre-declare variables assigned in the right branch so that `my $var = ...`
-    // does not end up inside the conditional body (which would make the variable
-    // inaccessible to code after the `&&` expression).
-    {
-        let mut right_vars = std::collections::HashSet::new();
-        collect_assigned_vars(right, &mut right_vars);
-        hoist_my_declarations(generator, &right_vars, &mut output);
     }
 
     output.push_str(") {\n");
