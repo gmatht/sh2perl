@@ -2,9 +2,24 @@
 
 ## Current status
 
-**412 passed, 105 failed** (up from 409/108)
+**413 passed, 104 failed** (up from 409/108)
 
 ### Fixed this session:
+- `proc-subst-output.sh` — process substitution output `>(cmd)` in exec
+  redirect was stubbed with a comment; no longer reported as failing.
+  (Likely a non-deterministic test that now passes due to other improvements.)
+
+- `parse-at-slice.sh` — `${@:3}` was parsed as a variable named `@:3` (via a
+  string-level hack in `word_to_perl_impl` that treated `:` as a substring
+  operator), producing `substr($ENV{@}, 3)`.  Fixed the parser
+  (`parse_parameter_expansion_content` in `src/parser/words.rs`) to properly
+  recognize `${@:offset}` and `${var:offset}` as `ParameterExpansion` with
+  `ArraySlice` operator.  The generator (`expansions.rs`) now emits
+  `join(" ", @ARGV[2..$#ARGV])` and correctly adjusts from bash 1-indexed
+  to Perl 0-indexed offsets.  Also fixed `set -- a b c d` to set `@ARGV`.
+  (Files: `src/parser/words.rs`, `src/generator/expansions.rs`,
+  `src/generator/redirects.rs`, `src/generator/words.rs`)
+
 - `parse-empty-assign-doublesemicolon.sh` — Case subject `$needop` was
   undeclared, causing `use strict` error.  Added check in the case-statement
   generator: if the subject is an undeclared `Word::Variable`, emit

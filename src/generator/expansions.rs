@@ -326,32 +326,67 @@ pub fn generate_parameter_expansion_impl(
                     }
                 }
             } else {
-                // Check if the variable is a scalar (not an array).
-                // If scalar, use substr(); otherwise use array slice.
-                let is_scalar = !generator.indexed_arrays.contains(&pe.variable)
-                    && !generator.associative_arrays.contains(&pe.variable);
-                if is_scalar {
-                    // Scalar substring: ${var:offset} or ${var:offset:length}
-                    let var_ref = if generator.declared_locals.contains(&pe.variable)
-                        || generator.function_level_vars.contains(&pe.variable)
-                    {
-                        format!("${}", pe.variable)
+                // Handle special argument list variables @ and *.
+                // ${@:N} / ${*:N} means arguments starting at position N (1-indexed in bash).
+                // In Perl, @ARGV / @_ is 0-indexed, so offset N-1.
+                if pe.variable == "@" || pe.variable == "*" {
+                    let array_ref = if generator.fn_nesting_depth > 0 {
+                        "@_"
                     } else {
-                        format!("$ENV{{{}}}", pe.variable)
+                        "@ARGV"
+                    };
+                    // Convert bash 1-indexed offset to Perl 0-indexed: N -> N-1
+                    // If offset parses as a number, subtract 1; otherwise pass through.
+                    let perl_offset = if let Ok(n) = offset.parse::<i64>() {
+                        if n > 1 {
+                            format!("{}", n - 1)
+                        } else {
+                            "0".to_string()
+                        }
+                    } else {
+                        format!("({}) - 1", offset)
                     };
                     if let Some(length_str) = length {
-                        format!("substr({}, {}, {})", var_ref, offset, length_str)
+                        format!("join(\" \", {}[{}..{}])", array_ref, perl_offset, length_str)
                     } else {
-                        format!("substr({}, {})", var_ref, offset)
+                        format!("join(\" \", {}[{}..$#{}])", array_ref, perl_offset,
+                            if generator.fn_nesting_depth > 0 { "_" } else { "ARGV" })
+                    }
+                } else if pe.variable == "#" && offset == "@" && length.is_none() {
+                    // ${#@} -> scalar(@ARGV) or scalar(@_)
+                    if generator.fn_nesting_depth > 0 {
+                        "scalar(@_)".to_string()
+                    } else {
+                        "scalar(@ARGV)".to_string()
                     }
                 } else {
-                    // Use @main:: to reference the variable safely under strict mode
-                    let var_ref = format!("@main::{}", pe.variable);
-                    // ${var:offset:length} - array slice
-                    if let Some(length_str) = length {
-                        format!("{}[{}..{}]", var_ref, offset, length_str)
+                    // Check if the variable is a scalar (not an array).
+                    // If scalar, use substr(); otherwise use array slice.
+                    let is_scalar = !generator.indexed_arrays.contains(&pe.variable)
+                        && !generator.associative_arrays.contains(&pe.variable);
+                    if is_scalar {
+                        // Scalar substring: ${var:offset} or ${var:offset:length}
+                        let var_ref = if generator.declared_locals.contains(&pe.variable)
+                            || generator.function_level_vars.contains(&pe.variable)
+                        {
+                            format!("${}", pe.variable)
+                        } else {
+                            format!("$ENV{{{}}}", pe.variable)
+                        };
+                        if let Some(length_str) = length {
+                            format!("substr({}, {}, {})", var_ref, offset, length_str)
+                        } else {
+                            format!("substr({}, {})", var_ref, offset)
+                        }
                     } else {
-                        format!("{}[{}..]", var_ref, offset)
+                        // Use @main:: to reference the variable safely under strict mode
+                        let var_ref = format!("@main::{}", pe.variable);
+                        // ${var:offset:length} - array slice
+                        if let Some(length_str) = length {
+                            format!("join(\" \", {}[{}..{}])", var_ref, offset, length_str)
+                        } else {
+                            format!("join(\" \", {}[{}..])", var_ref, offset)
+                        }
                     }
                 }
             }
