@@ -17,6 +17,10 @@ pub(crate) fn parameter_var_scalar_ref(generator: &Generator, var_name: &str) ->
     if let Ok(n) = var_name.parse::<usize>() {
         return positional_param_ref(n);
     }
+    // If the variable is an indexed array, use element 0 (bash: ${array} = first element)
+    if generator.indexed_arrays.contains(var_name) {
+        return format!("${{{}}}[0]", var_name);
+    }
     if generator.declared_locals.contains(var_name)
         || generator.function_level_vars.contains(var_name)
         || matches!(var_name, "#" | "*" | "-" | "?" | "$" | "!" | "0")
@@ -58,6 +62,10 @@ fn parameter_var_bare_assignable_ref(generator: &Generator, var_name: &str) -> S
     if let Ok(n) = var_name.parse::<usize>() {
         return positional_param_ref(n);
     }
+    // If the variable is an indexed array, use element 0 (bash: ${array} = first element)
+    if generator.indexed_arrays.contains(var_name) {
+        return format!("${{{}}}[0]", var_name);
+    }
     if generator.declared_locals.contains(var_name)
         || generator.function_level_vars.contains(var_name)
         || matches!(var_name, "#" | "*" | "-" | "?" | "$" | "!" | "0")
@@ -83,6 +91,10 @@ fn parameter_var_bare_ref(generator: &Generator, var_name: &str) -> String {
     }
     if let Ok(n) = var_name.parse::<usize>() {
         return positional_param_ref(n);
+    }
+    // If the variable is an indexed array, use element 0 (bash: ${array} = first element)
+    if generator.indexed_arrays.contains(var_name) {
+        return format!("${{{}}}[0]", var_name);
     }
     if generator.declared_locals.contains(var_name)
         || generator.function_level_vars.contains(var_name)

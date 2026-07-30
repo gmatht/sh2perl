@@ -30,17 +30,25 @@ fn convert_arith_subexprs(s: &str, generator: &Generator) -> String {
 
 // Helper function to convert shell variables to Perl equivalents
 fn convert_shell_var_to_perl(var: &str) -> String {
-    let mut s = var.trim().to_string();
-    // Strip surrounding quotes if present
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        s = s[1..s.len()-1].to_string();
-    }
-    // Convert any $(...) command substitutions to qx{...}
-    let s = if s.contains("$(") && !s.contains("$((") {
+    let s = var.trim().to_string();
+    
+    // Remember the original quote style to re-apply it if no conversion happened
+    let was_quoted = (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\''));
+    let quote_char = if was_quoted { s.chars().next().unwrap() } else { ' ' };
+    
+    // Strip surrounding quotes for processing
+    let unquoted = if was_quoted {
+        s[1..s.len()-1].to_string()
+    } else {
+        s.clone()
+    };
+    
+    // Convert any $(...) command substitutions to open()-based capture
+    let processed = if unquoted.contains("$(") && !unquoted.contains("$((") {
         let mut result = String::new();
         let mut depth = 0i32;
         let mut start = None;
-        for ch in s.chars() {
+        for ch in unquoted.chars() {
             if ch == '$' && start.is_none() {
                 start = Some(result.len());
                 result.push(ch);
@@ -51,11 +59,15 @@ fn convert_shell_var_to_perl(var: &str) -> String {
                 depth -= 1;
                 result.push(ch);
                 if depth == 0 {
-                    // Found matching $(...) - extract and replace
+                    // Found matching $(...) - extract and replace with open()-based capture
                     let cmd_start = start.unwrap() + 2;
                     let cmd_end = result.len() - 1;
                     let cmd: String = result[cmd_start..cmd_end].to_string();
-                    let replacement = format!("(do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"cmd failed: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; }})", cmd);
+                    let quoted = crate::ir::safe_perl_q_string(&cmd);
+                    let replacement = format!(
+                        "(do {{ open(my $__fh, '-|', 'bash', '-c', {}) or croak \"cmd failed: $!\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }})",
+                        quoted
+                    );
                     result.truncate(start.unwrap());
                     result.push_str(&replacement);
                     start = None;
@@ -66,20 +78,26 @@ fn convert_shell_var_to_perl(var: &str) -> String {
         }
         result
     } else {
-        s
+        unquoted
     };
-    match s.as_str() {
+    
+    // Determine the final Perl expression
+    match processed.as_str() {
         "$#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
         "$@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
         "$*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
         "$?" => "($? >> 8)".to_string(),     // $? -> exit code (>>8 converts wait status)
-        _ if s.starts_with('$') => {
-            // Regular variable - just return as is for now
-            s
+        _ if processed.starts_with('$') || processed.starts_with('(') || processed.starts_with('"') || processed.starts_with('\'') => {
+            // Already a Perl expression (variable, command capture, or quoted string)
+            processed
         }
         _ => {
-            // Not a variable - return as is
-            s
+            // A plain literal — re-wrap in quotes for Perl
+            if was_quoted && quote_char == '"' {
+                format!("\"{}\"", processed.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@"))
+            } else {
+                format!("'{}'", processed.replace("'", "\\'"))
+            }
         }
     }
 }
@@ -164,6 +182,9 @@ pub fn generate_test_expression_impl(
 ) -> String {
     // Pre-process: convert any $((expr)) arithmetic subexpressions to Perl
     let preprocessed = convert_arith_subexprs(&test_expr.expression, generator);
+    // Pre-process: normalize escaped parentheses \( and \) to ( and ) with spaces
+    // so the grouping logic (") and ") checks work correctly.
+    let preprocessed = preprocessed.replace(r#"\("#, " ( ").replace(r#"\)"#, " ) ");
     // Pre-process: convert ${...} shell parameter expansions to Perl variable refs
     let preprocessed = preprocess_brace_vars_in_test_expr(generator, &preprocessed);
     let expr = &preprocessed;
@@ -387,9 +408,13 @@ pub fn generate_test_expression_impl(
                     s.contains("@(") || s.contains("*(") || s.contains("+(") || s.contains("?(") || s.contains("!(") || s.contains('*') || s.contains('?') || s.contains('[')
                 }
                 if has_glob_or_extglob_chars(value) {
+                    let var = convert_shell_var_to_perl(var);
                     let regex_pattern = generator.convert_glob_to_regex(value);
                     format!("{} =~ {}", var, generator.format_regex_pattern(&format!("^{}$", regex_pattern)))
                 } else {
+                    // Convert any $(...) command substitutions to Perl captures
+                    let var = convert_shell_var_to_perl(var);
+                    let value = convert_shell_var_to_perl(value);
                     // Convert positional parameters $1, $2, … to $_[0], $_[1], …
                     fn convert_pos_params(s: &str) -> String {
                         let re = regex::Regex::new(r"\$(\d+)").unwrap();
@@ -398,7 +423,7 @@ pub fn generate_test_expression_impl(
                             format!("$_[{}]", n.saturating_sub(1))
                         }).to_string()
                     }
-                    format!("{} eq {}", convert_pos_params(var), convert_pos_params(value))
+                    format!("{} eq {}", convert_pos_params(&var), convert_pos_params(&value))
                 }
             }
         } else {
@@ -518,6 +543,31 @@ pub fn generate_test_expression_impl(
         } else {
             "0".to_string()
         }
+    } else if expr.contains(r#"\>"#) {
+        // String greater-than (\\> in single-bracket test): [ "$a" \\> "$b" ]
+        // In the expression, \\> appears as a literal backslash followed by >.
+        let parts: Vec<&str> = expr.split(r#"\>"#).collect();
+        if parts.len() == 2 {
+            let left = parts[0].trim();
+            let right = parts[1].trim();
+            let left_perl = convert_shell_var_to_perl(left);
+            let right_perl = convert_shell_var_to_perl(right);
+            format!("({} gt {})", left_perl, right_perl)
+        } else {
+            "0".to_string()
+        }
+    } else if expr.contains(r#"\<"#) {
+        // String less-than (\\< in single-bracket test): [ "$a" \\< "$b" ]
+        let parts: Vec<&str> = expr.split(r#"\<"#).collect();
+        if parts.len() == 2 {
+            let left = parts[0].trim();
+            let right = parts[1].trim();
+            let left_perl = convert_shell_var_to_perl(left);
+            let right_perl = convert_shell_var_to_perl(right);
+            format!("({} lt {})", left_perl, right_perl)
+        } else {
+            "0".to_string()
+        }
     } else if expr.contains(" -z ") || starts_with_op(expr, "-z") {
         // String is empty: [[ -z $var ]]
         let var = if expr.starts_with("-z ") {
@@ -527,6 +577,7 @@ pub fn generate_test_expression_impl(
         } else {
             expr.replacen("-z ", "", 1).trim().to_string()
         };
+        let var = convert_shell_var_to_perl(&var);
         format!("{} eq q{{}}", var)
     } else if expr.contains(" -n ") || starts_with_op(expr, "-n") {
         // String is not empty: [[ -n $var ]]
@@ -537,6 +588,7 @@ pub fn generate_test_expression_impl(
         } else {
             expr.replacen("-n ", "", 1).trim().to_string()
         };
+        let var = convert_shell_var_to_perl(&var);
         format!("{} ne q{{}}", var)
     } else if expr.contains(" -f ") || starts_with_op(expr, "-f") {
         // File exists and is regular file: [[ -f $var ]]

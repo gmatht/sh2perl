@@ -756,6 +756,7 @@ impl Generator {
                         output.push_str(&self.indent());
                         output.push_str(&format!("my @{} = ({});\n", name, elements_perl.join(", ")));
                         self.declared_locals.insert(name.clone());
+                        self.indexed_arrays.insert(name.clone());
                     } else {
                         output.push_str(&self.indent());
                         output.push_str(&format!("@{} = ({});\n", name, elements_perl.join(", ")));
