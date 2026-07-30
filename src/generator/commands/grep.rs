@@ -590,8 +590,78 @@ pub fn generate_grep_command(
         // Convert \? to ? (shell extended regex to Perl)
         regex_pattern = regex_pattern.replace("\\?", "?");
         // Convert \( and \) to ( and ) (shell extended regex to Perl)
-        regex_pattern = regex_pattern.replace("\\(", "(");
-        regex_pattern = regex_pattern.replace("\\)", ")");
+        // Convert \( and \) to ( and ) only when balanced.
+        // Unbalanced \( is left as \( (literal paren in Perl)
+        // to avoid generating an invalid Perl regex with unclosed (.
+        {
+            let mut new_pat = String::with_capacity(regex_pattern.len());
+            let bytes = regex_pattern.as_bytes();
+            let len = bytes.len();
+            let mut lp_pos: Vec<usize> = Vec::new();
+            let mut rp_pos: Vec<usize> = Vec::new();
+            let mut i = 0;
+            while i < len {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    if bytes[i + 1] == b'(' {
+                        lp_pos.push(i);
+                        i += 2;
+                        continue;
+                    } else if bytes[i + 1] == b')' {
+                        rp_pos.push(i);
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            let mut lp_matched = vec![false; lp_pos.len()];
+            let mut rp_matched = vec![false; rp_pos.len()];
+            {
+                let mut li = 0;
+                let mut ri = 0;
+                while li < lp_pos.len() && ri < rp_pos.len() {
+                    if lp_pos[li] < rp_pos[ri] {
+                        lp_matched[li] = true;
+                        rp_matched[ri] = true;
+                        li += 1;
+                        ri += 1;
+                    } else {
+                        ri += 1;
+                    }
+                }
+            }
+            i = 0;
+            let mut lp_idx = 0;
+            let mut rp_idx = 0;
+            while i < len {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    if bytes[i + 1] == b'(' && lp_idx < lp_pos.len() && lp_pos[lp_idx] == i {
+                        if lp_idx < lp_matched.len() && lp_matched[lp_idx] {
+                            new_pat.push('(');
+                        } else {
+                            new_pat.push('\\');
+                            new_pat.push('(');
+                        }
+                        lp_idx += 1;
+                        i += 2;
+                        continue;
+                    } else if bytes[i + 1] == b')' && rp_idx < rp_pos.len() && rp_pos[rp_idx] == i {
+                        if rp_idx < rp_matched.len() && rp_matched[rp_idx] {
+                            new_pat.push(')');
+                        } else {
+                            new_pat.push('\\');
+                            new_pat.push(')');
+                        }
+                        rp_idx += 1;
+                        i += 2;
+                        continue;
+                    }
+                }
+                new_pat.push(bytes[i] as char);
+                i += 1;
+            }
+            regex_pattern = new_pat;
+        }
         // Convert \{ and \} to { and } (shell extended regex to Perl)
         regex_pattern = regex_pattern.replace("\\{", "{");
         regex_pattern = regex_pattern.replace("\\}", "}");
