@@ -795,7 +795,7 @@ Implementation steps:
 ### Separable Components
 
 Most of the browser-shell vision does not require modifying sh2perl.
-The runtime library (`sh2perl-runtime`), virtual filesystem mounts
+The runtime library (`sh2runtime`), virtual filesystem mounts
 (ramfs, localStorage, HTTP, GitHub), terminal REPL, and device drivers
 (`/dev/webgl`, `/dev/input`) can all be built as standalone JavaScript
 projects. sh2perl's only role is bash→JS transpilation — everything else

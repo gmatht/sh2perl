@@ -492,7 +492,7 @@ Most of this vision does **not** require modifying the shell transpiler.
 The transpiler's job is one thing: **bash syntax → correct JavaScript**.
 Everything else is a runtime library that the generated JS calls into.
 
-### Layer 0: The JavaScript Runtime Library (`sh2perl-runtime`)
+### Layer 0: The JavaScript Runtime Library (`sh2runtime`)
 
 This is a standalone npm package. It implements the virtual filesystem
 abstractions. The generated JS imports it:
@@ -606,8 +606,8 @@ The final product combines all three layers:
 
 | Step | Project | Depends on | Delivers |
 |---|---|---|---|
-| 1 | `sh2perl-runtime` (npm) | Nothing | Virtual FS with ramfs, localStorage, HTTP, GitHub mounts. Usable from plain JS. |
-| 2 | Terminal REPL | sh2perl-runtime | xterm.js + JS read-eval-print loop. Full `/dev/` and `/mount/` access from JavaScript. |
+| 1 | `sh2runtime` (npm) | Nothing | Virtual FS with ramfs, localStorage, HTTP, GitHub mounts. Usable from plain JS. |
+| 2 | Terminal REPL | sh2runtime | xterm.js + JS read-eval-print loop. Full `/dev/` and `/mount/` access from JavaScript. |
 | 3 | `sh2perl-wasm` | sh2perl repo | WASM-compiled bash→JS transpiler. Single function: `bashToJS(code)` |
 | 4 | Browser bash shell | Steps 2 + 3 | Type bash, run in browser. The full vision. |
 
