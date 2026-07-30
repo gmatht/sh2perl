@@ -193,7 +193,23 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
             // This matches how the shell processes unquoted words.
             let s = apply_shell_quote_removal(s);
             
-            if s.contains("system") || s.contains('`') {
+            let has_standalone_system = {
+                let mut found = false;
+                let mut pos = 0;
+                while let Some(idx) = s[pos..].find("system") {
+                    let abs_idx = pos + idx;
+                    let prev_ok = abs_idx == 0 || !s[..abs_idx].chars().last().map_or(false, |c| c.is_alphanumeric() || c == '_');
+                    let after_idx = abs_idx + 6;
+                    let next_ok = after_idx >= s.len() || !s[after_idx..].chars().next().map_or(false, |c| c.is_alphanumeric() || c == '_');
+                    if prev_ok && next_ok {
+                        found = true;
+                        break;
+                    }
+                    pos = abs_idx + 1;
+                }
+                found
+            };
+            if s.contains('`') || has_standalone_system {
                 return crate::generator::commands::utilities::source_safe_perl_string_expr(&s);
             }
 

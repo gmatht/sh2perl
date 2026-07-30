@@ -218,12 +218,28 @@ pub fn generate_case_statement_impl(
                 // the `msx` flags that are unnecessary for plain string equality.
                 let has_glob = pattern_str.contains('*') || pattern_str.contains('?') || pattern_str.contains('[') || pattern_str.contains(']');
 
+                // Convert the case subject to a Perl expression.
+                // If it's an undeclared variable, wrap it in $ENV{var} to
+                // avoid "use strict" errors (bash treats undefined vars as "").
                 let word_str = generator.word_to_perl(&case_stmt.word);
+                let processed_word = match &case_stmt.word {
+                    Word::Variable(var_name, _, _) => {
+                        if generator.declared_locals.contains(var_name)
+                            || generator.function_level_vars.contains(var_name)
+                            || matches!(var_name.as_str(), "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+                            || var_name.chars().all(|c| c.is_ascii_digit())
+                        {
+                            word_str
+                        } else {
+                            format!("($ENV{{{}}} // q{{}})", var_name)
+                        }
+                    }
+                    _ => word_str,
+                };
 
                 // Handle positional parameters in case statements
                 // $1, $2, … are now translated to $_[0], $_[1], … by
                 // word_to_perl, so no string-hack is needed here.
-                let processed_word = word_str;
 
                 if has_glob {
                     // Convert bash glob patterns to Perl regex
