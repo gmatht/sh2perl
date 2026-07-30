@@ -101,9 +101,9 @@ do {
 my $process_result = do { open(my $__fh, '-|', 'bash', '-c', q{bash -c 'comm -23 <(sort file1.txt) <(sort file2.txt)'}) or die "cmd failed: $!\n"; my $_r = do { local $/; <$__fh> }; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; };
 print "Process substitution result:\n";
 print($process_result, "\n");
-my $here_string_result = do { my $__cs = do { my $input_data = "hello world"; my $set1_111 = 'a-z';
-my $set2_111 = 'A-Z';
-my $input_111 = $input_data;;
+my $here_string_result = do { my $__cs = do { my $input_data = "hello world"; my $set1_3 = 'a-z';
+my $set2_3 = 'A-Z';
+my $input_3 = $input_data;;
 print "Here string result: ${here_string_result}\n";
 my $perl_result = do { my $__cs = do {
     my $result;

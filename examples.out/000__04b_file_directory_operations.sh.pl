@@ -10,20 +10,20 @@ our $CHILD_ERROR;
 $0 = '000__04b_file_directory_operations.sh';
 print "=== File and Directory Operations ===\n";
 my $file_list = do { my $__cs = do {
-    my @ls_files_46 = ();
+    my @ls_files_0 = ();
     if ( -f q{.} ) {
-        push @ls_files_46, q{.};
+        push @ls_files_0, q{.};
     }
     elsif ( -d q{.} ) {
         if ( opendir my $dh, q{.} ) {
             while ( my $file = readdir $dh ) {
-                push @ls_files_46, $file;
+                push @ls_files_0, $file;
             }
             closedir $dh;
-            @ls_files_46 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}; $s } ] } @ls_files_46;
+            @ls_files_0 = map { $_->[0] } sort { $a->[1] cmp $b->[1] } map { [ $_, do { (my $s = $_) =~ s{/$}{}; $s } ] } @ls_files_0;
         }
     }
-    (@ls_files_46 ? join("\n", @ls_files_46) . "\n" : q{});
+    (@ls_files_0 ? join("\n", @ls_files_0) . "\n" : q{});
 };
 ; chomp $__cs; $__cs; };
 print "File listing:\n";
