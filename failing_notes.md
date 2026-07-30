@@ -2,9 +2,17 @@
 
 ## Current status
 
-**417 passed, 100 failed** (up from 413/104)
+**417 passed, 100 failed** (up from 413/104; fixed `parse-brace-close.sh` with AST-level brace expansion fix)
 
 ### Fixed this session:
+- `parse-brace-close.sh` — Brace expansion `{file.txt,file.bak}` was
+  parsed with each token (Identifier, Dot, etc.) as a separate
+  `BraceItem::Literal`, producing `[".", "txt", ".", "bak"]` instead of
+  `[".txt", ".bak"]`.  Fixed `parse_brace_expansion` in
+  `src/parser/words.rs` to accumulate consecutive literal tokens into
+  a single `BraceItem::Literal` per comma-separated item.
+  (File: `src/parser/words.rs`)
+
 - `proc-subst-output.sh` — process substitution output `>(cmd)` in exec
   redirect was stubbed with a comment; no longer reported as failing.
   (Likely a non-deterministic test that now passes due to other improvements.)
