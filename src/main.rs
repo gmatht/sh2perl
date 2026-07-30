@@ -787,6 +787,13 @@ exit $main_exit_code;
                         // Generate Perl code
                         let mut gen = Generator::new();
                         gen.use_function_signatures = use_function_signatures;
+                        gen.set_original_script_name(
+                            std::path::Path::new(command)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string(),
+                        );
                         let code = gen.generate(&commands);
 
                         // Handle output file option
@@ -1023,6 +1030,13 @@ exit $main_exit_code;
                             // Generate Perl code
                             let mut gen = Generator::new();
                             gen.use_function_signatures = use_function_signatures;
+                            gen.set_original_script_name(
+                                std::path::Path::new(&actual_command)
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
                             let perl_code = gen.generate(&commands);
 
                             // Write to temporary file and execute

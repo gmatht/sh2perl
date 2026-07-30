@@ -2,13 +2,22 @@
 
 ## Current status
 
-Fixed 9 additional tests this session:
-- `proc-subst-output.sh` (regression)
-- `parse-heredoc-eof-unexpected.sh` (regression)
-- `at-var-default.sh`, `dollar-at-default-quoted.sh`, `dollar-at-with-default.sh`
-- `dq-hashbang-multiline-assign.sh`
-- `func-after-or-assign.sh`, `func-after-test-or.sh`
-- `parse-db-status-fmt.sh`, `parse-dollar-at-default.sh`, `parse-variable-default-with-quotes.sh`
+**363 passed, 154 failed** (net +3 from previous 360/157)
+
+### Fixed this session:
+- `variable-default-with-hash.sh` — `$0` was mapped to `$_[0]` (first function arg)
+  instead of `$0` (script name) in parameter expansion functions
+  (`expansions.rs`).  Added early `"0"` check before numeric parse.
+- `parse-and-or-chain-with-assign.sh` — echo handler and generator now use
+  `$ENV{var}` for undeclared vars instead of bare `$var`, avoiding `use strict`
+  failures when `$var` was not declared (but still block-scoped when inside
+  `&&`/`||` `if` blocks — the `&& { my $x = ... }` scoping is a remaining issue).
+
+### Other improvements:
+- `main.rs` now calls `set_original_script_name()` when running `.sh` files
+  directly, so `$0 = 'script_name';` appears in generated code.
+- Echo handlers in `echo.rs` and `simple_commands.rs` use `$ENV{var}` for
+  undeclared vars (consistent with `convert_string_interpolation_to_perl_impl`).
 
 ### Newly Fixed (this session):
 
