@@ -2516,44 +2516,44 @@ pub fn handle_brace_expansion_impl(
     let prefix = expansion.prefix.as_deref().unwrap_or("");
     let suffix = expansion.suffix.as_deref().unwrap_or("");
 
-    if expansion.items.len() == 1 {
-        let expanded = generator.word_to_perl(&generator.brace_item_to_word(&expansion.items[0]));
-        if !prefix.is_empty() || !suffix.is_empty() {
-            // Split the expanded items and add prefix/suffix to each
-            let items: Vec<String> = expanded
-                .split_whitespace()
-                .map(|item| format!("{}{}{}", prefix, item, suffix))
-                .collect();
-            items.join(" ")
-        } else {
-            expanded
-        }
+    // Expand each item to its raw string value (no Perl quoting)
+    let mut raw_items: Vec<Vec<String>> = expansion
+        .items
+        .iter()
+        .map(|item| {
+            let word = generator.brace_item_to_word(item);
+            match word {
+                Word::Literal(s, _) => vec![s],
+                _ => vec![generator.word_to_perl(&word)],
+            }
+        })
+        .collect();
+
+    // Build the expanded list: either a single range (items.len()==1) or
+    // a cartesian product of multiple item groups.
+    let expanded_items: Vec<String> = if expansion.items.len() == 1 && raw_items.len() == 1 {
+        // Single range: each space-separated token from the expanded item
+        // is a separate result (e.g. "1 2 3 4 5" → ["1","2","3","4","5"]).
+        raw_items
+            .into_iter()
+            .flat_map(|v| v.into_iter().flat_map(|s| {
+                s.split_whitespace().map(|t| t.to_string()).collect::<Vec<_>>()
+            }))
+            .collect()
     } else {
-        // Handle cartesian product for multiple brace items
-        let expanded_items: Vec<Vec<String>> = expansion
-            .items
-            .iter()
-            .map(|item| {
-                let word = generator.brace_item_to_word(item);
-                match word {
-                    Word::Literal(s, _) => vec![s],
-                    _ => vec![generator.word_to_perl(&word)],
-                }
-            })
-            .collect();
+        // Multiple items / cartesian product
+        let cartesian = generate_cartesian_product(&raw_items);
+        cartesian
+    };
 
-        // Generate cartesian product
-        let cartesian = generate_cartesian_product(&expanded_items);
+    // Apply prefix and suffix to each item
+    let items: Vec<String> = expanded_items
+        .iter()
+        .map(|item| format!("{}{}{}", prefix, item, suffix))
+        .collect();
 
-        // Add prefix and suffix to each item
-        let items: Vec<String> = cartesian
-            .iter()
-            .map(|item| format!("{}{}{}", prefix, item, suffix))
-            .collect();
-
-        // Join all combinations with spaces
-        items.join(" ")
-    }
+    // Join all combinations with spaces (raw values, no Perl quoting)
+    items.join(" ")
 }
 
 fn generate_cartesian_product(items: &[Vec<String>]) -> Vec<String> {

@@ -150,6 +150,18 @@ pub fn generate_touch_command(generator: &mut Generator, cmd: &SimpleCommand) ->
                         }
                     }
                 }
+                // Apply prefix (if any) to every expanded item
+                if let Some(prefix) = &expansion.prefix {
+                    for item in expanded_items.iter_mut() {
+                        *item = format!("{}{}", prefix, item);
+                    }
+                }
+                // Apply suffix (if any) to every expanded item
+                if let Some(suffix) = &expansion.suffix {
+                    for item in expanded_items.iter_mut() {
+                        *item = format!("{}{}", item, suffix);
+                    }
+                }
                 // Store as a special marker that can be detected later
                 files.push(format!("BRACE_EXPANSION:{}", expanded_items.join(" ")));
             }

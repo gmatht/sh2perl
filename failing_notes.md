@@ -2,9 +2,25 @@
 
 ## Current status
 
-**389 passed, 128 failed** (net +14 from previous 375/142)
+**391 passed, 126 failed** (fixed 4: 008_simple_backup, 011_brace_expansion, 035_brace_expansion_practical, 064_02_nested_brace_expansions)
 
 ### Fixed this session:
+- `011_brace_expansion.sh`, `035_brace_expansion_practical.sh` — Fixed
+  brace expansion in touch command (`touch file_{001..005}.txt`):
+  1. `parse_word_no_newline_skip()` in `parser/words.rs` was missing the
+     suffix-consumption loop after a prefix+BraceOpen merge (added it,
+     matching the existing logic in `parse_word()`).
+  2. `generate_touch_command()` in `touch.rs` did not apply `expansion.prefix`
+     and `expansion.suffix` to expanded brace items (added prefix/suffix
+     application before storing the BRACE_EXPANSION marker).
+  3. `handle_brace_expansion_impl()` in `generator/words.rs` called
+     `word_to_perl()` on expanded items, producing Perl-quoted strings
+     (e.g. `'1 2 3 4 5'`) that were then double-wrapped in quotes by
+     `word_to_perl_impl()`, emitting `"'1 2 3 4 5'"` (literal quotes in
+     the string).  Changed to extract raw string values directly from
+     `Word::Literal` and split whitespace-separated ranges into individual
+     items before applying prefix/suffix.
+
 - `064_02_nested_brace_expansions.sh`, `008_simple_backup.sh` — Fixed
   brace-expansion Cartesian-product generation in echo commands.  The
   `expand_brace_items()` function in `simple_commands.rs` was not applying
