@@ -472,14 +472,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         // Process substitutions (<(cmd) / >(cmd)) require bash, not /bin/sh.
                         // Run the entire command under `bash -c '...'`, using single-quote
                         // escaping (replace ' with '\'' ) to safely embed the command string.
-                        // Use qx{} with a variable stored in an array element for clean
-                        // shell command generation.
                         let command_str =
                             crate::generator::redirects::generate_bash_command_string(cmd);
                         let escaped = command_str.replace('\'', "'\\''");
                         let bash_cmd = format!("bash -c '{}'", escaped);
-                        let command_lit =
-                            generator.perl_string_literal_force_interp(&Word::literal(bash_cmd));
+                        // Use non-interpolating string so shell $var references are
+                        // preserved for bash (which gets them from $ENV{var} or env).
+                        let command_lit = generator
+                            .perl_string_literal_no_interp(&Word::literal(bash_cmd));
                         crate::ir::expr_to_open_perl(&command_lit, true)
                     } else if redirect_cmd.redirects.iter().any(|r| {
                             matches!(r.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs)
@@ -513,25 +513,29 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             "{} <<'{}'\n{}{}",
                                             inner_cmd_str, delim, body, delim
                                         );
-                                        let command_lit = generator.perl_string_literal_force_interp(
-                                            &Word::literal(heredoc_snippet),
-                                        );
+                                        // Use non-interpolating string because the heredoc
+                                        // body (single-quoted delimiter <<'...') should be
+                                        // treated literally by the shell — no $var expansion.
+                                        let command_lit = generator
+                                            .perl_string_literal_no_interp(&Word::literal(heredoc_snippet));
                                         crate::ir::expr_to_open_perl(&command_lit, true)
                                     }
                                 } else {
                                     // Non-literal command name — fall through
                                     let command_str =
                                         crate::generator::redirects::generate_bash_command_string(cmd);
-                                    let command_lit =
-                                        generator.perl_string_literal_force_interp(&Word::literal(command_str));
+                                    // Use non-interpolating string so shell $var references
+                                    // are preserved for bash.
+                                    let command_lit = generator
+                                        .perl_string_literal_no_interp(&Word::literal(command_str));
                                     crate::ir::expr_to_open_perl(&command_lit, true)
                                 }
                             } else {
                                 // Non-simple inner command — fall through
                                 let command_str =
                                     crate::generator::redirects::generate_bash_command_string(cmd);
-                                let command_lit =
-                                    generator.perl_string_literal_force_interp(&Word::literal(command_str));
+                                let command_lit = generator
+                                    .perl_string_literal_no_interp(&Word::literal(command_str));
                                 crate::ir::expr_to_open_perl(&command_lit, true)
                             }
                         } else {
@@ -662,12 +666,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else {
                             let command_str =
                                 crate::generator::redirects::generate_bash_command_string(cmd);
-                            // Use force_interp so that Perl variables (e.g. $file) in the
-                            // redirect target are interpolated before the command is passed
-                            // to the shell.  This mirrors how bash expands $var in
-                            // `cmd < "$var"`.
-                            let command_lit =
-                                generator.perl_string_literal_force_interp(&Word::literal(command_str));
+                            // Use a non-interpolating Perl string literal so that shell
+                            // variable references (e.g. $LOG_FILE, $HOME) in the command
+                            // string are preserved for bash to expand at runtime (the Perl
+                            // code already sets the corresponding $ENV{var} entries).
+                            // Previously force_interp was used, but after the $ENV{var}
+                            // conversion for undeclared / env-style variables, a bare
+                            // $LOG_FILE in a double-quoted string would be undef.
+                            let command_lit = generator
+                                .perl_string_literal_no_interp(&Word::literal(command_str));
 
                             crate::ir::expr_to_open_perl(&command_lit, true)
                         }
@@ -3386,4 +3393,81 @@ fn convert_param_expansion_in_arith(content: &str, generator: &Generator) -> Str
     }
     // Fall back to original form wrapped in braces (let later phases handle it)
     format!("${{{}}}", content)
+}
+
+/// Preprocess a raw shell string (e.g. heredoc body text) that contains
+/// shell variable references (`${var}` or `$var`) and convert them to proper
+/// Perl variable references (`$var` for declared vars, `$ENV{var}` for
+/// env-style / undeclared vars).
+///
+/// This is needed because heredoc bodies are stored as raw text by the parser
+/// (not parsed into `StringInterpolation` parts), so the variable references
+/// inside them need manual conversion before the string is emitted as Perl.
+pub fn preprocess_shell_vars_in_raw_string(generator: &Generator, raw: &str) -> String {
+    use regex::Regex;
+
+    // Match `${identifier}` — the braced form used in many heredocs
+    let re_braced = Regex::new(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}").unwrap();
+    // Match bare `$identifier` — simple pattern (no look-around since the
+    // regex crate doesn't support it).  We filter out `$ENV` etc. after matching
+    // by checking the next character manually.
+    let re_bare = Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
+
+    let after_braced = re_braced.replace_all(raw, |caps: &regex::Captures| {
+        let var_name = &caps[1];
+        if generator.declared_locals.contains(var_name)
+            || generator.function_level_vars.contains(var_name)
+        {
+            // Declared variable — emit as $var (Perl will interpolate it)
+            format!("${}", var_name)
+        } else {
+            // Undeclared / env-style variable — use $ENV{var}
+            format!("$ENV{{{}}}", var_name)
+        }
+    });
+
+    // Now process bare `$var` references that were not inside braces.
+    // We must skip matches where the `$identifier` is followed by `{` (e.g.
+    // `$ENV{...}`) or another identifier char — those are either already
+    // processed above or are not shell variable references.
+    let mut result = String::new();
+    let mut last_end = 0;
+    for m in re_bare.find_iter(after_braced.as_ref()) {
+        let match_start = m.start();
+        let match_end = m.end();
+        let matched = m.as_str();
+        let var_name = &matched[1..]; // strip the $
+
+        // Check if preceded by another $ (e.g. `$ENV` inside `$ENV{...}`)
+        let preceded_by_dollar = match_start > 0
+            && after_braced.as_bytes()[match_start - 1] == b'$';
+
+        // Check if followed by { (e.g. `$ENV{...}`)
+        let followed_by_brace = match_end < after_braced.len()
+            && after_braced.as_bytes()[match_end] == b'{';
+
+        // Check if followed by another identifier char
+        let followed_by_id_char = match_end < after_braced.len()
+            && after_braced.as_bytes()[match_end].is_ascii_alphanumeric();
+
+        let already_processed = preceded_by_dollar || followed_by_brace || followed_by_id_char;
+
+        if !already_processed
+            && !matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+        {
+            // This is a bare shell variable reference — convert it.
+            let replacement = if generator.declared_locals.contains(var_name)
+                || generator.function_level_vars.contains(var_name)
+            {
+                format!("${}", var_name)
+            } else {
+                format!("$ENV{{{}}}", var_name)
+            };
+            result.push_str(&after_braced[last_end..match_start]);
+            result.push_str(&replacement);
+            last_end = match_end;
+        }
+    }
+    result.push_str(&after_braced[last_end..]);
+    result
 }
