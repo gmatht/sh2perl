@@ -391,8 +391,12 @@ impl Generator {
         // Add infrastructure variables only when actually needed.
         // Many scripts don't use $main_exit_code, $ls_success, etc.
         // Use IR Declare nodes so the backend can optimize them.
+        // Always declare $main_exit_code because simple external commands
+        // (like `dd`, `kill`, etc.) emit `$main_exit_code = system(...) >> 8`
+        // unconditionally.  The declaration is harmless for scripts that
+        // never reference it and avoids strict-var errors for those that do.
         let needs_exit_code = self.needs_exit_code_tracking(ast);
-        if needs_exit_code {
+        if needs_exit_code || true {
             let stmt = IrStmt::Declare {
                 vars: vec![Decl { name: "main_exit_code".to_string(), sigil: Sigil::Scalar }],
                 init: Some(IrExpr::Int(0)),
