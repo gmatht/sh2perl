@@ -2,9 +2,29 @@
 
 ## Current status
 
-**422 passed, 95 failed** (fixed `samefile-operator.sh`,
-`dollar-question.sh`; `004_test_quoted.sh`) by correcting the
-`$?` → `($? >> 8)` double-shift bug)
+**Current: 8 regressions fixed, samefile-operator.sh regressed**
+
+### Fixed this session:
+- `070_cmp_basic.sh`, `heredoc-parse-error.sh`, `redirect-all.sh`,
+  `not-negation.sh`, `parse-brace-in-heredoc.sh`, `test-operator-S.sh`,
+  `parse-orelse-continuation.sh`, `parse-multi-command-while-condition.sh`
+  — Reverted `$?` → `$CHILD_ERROR` mapping back to `($? == -1 ? 0 : $? >> 8)`
+  which uses Perl's built-in `$?` (correctly set by `system()` calls)
+  with a guard for the edge case where `wait()` returns -1. Added
+  `$CHILD_ERROR = system(...) >> 8` assignments so `$CHILD_ERROR` is
+  correctly updated after external commands for other consumers.
+  (Files: `echo.rs`, `simple_commands.rs`, `mod.rs`, `utils.rs`,
+  `words.rs`, `builtins.rs`, `command_dispatcher.rs`)
+
+### Regressed this session:
+- `samefile-operator.sh` — The `$?` in `echo "exit: $?"` after a `test`
+  command (translated to `$CHILD_ERROR = ... ? 0 : 1`) needs to read
+  `$CHILD_ERROR` because `$?` (Perl's built-in) is not updated by file
+  test operators. The original `$?` → `$CHILD_ERROR` mapping was correct
+  for this case, but it broke many other tests where `$CHILD_ERROR` is
+  not properly maintained across control flow constructs. A proper fix
+  would require propagating `$CHILD_ERROR` to `$?` after every
+  test/expression evaluation, which is non-trivial.
 
 ### Fixed this session:
 - `keyword-in-arg.sh` — StringInterpolation merge failure: when a literal
@@ -119,16 +139,15 @@ bash's output:
 - `064_hard_to_generate.sh` — stdout mismatch
 - `063_hard_to_parse.sh` — stdout mismatch
 - `075_eval_complex.sh` — stdout mismatch
-- `072_background_fork.sh` — stdout mismatch
 - `083_process_sub_missing_files.sh` — stdout mismatch
 - `084_while_pipeline.sh` — stdout mismatch
 - `087_function_cmd_sub.sh` — stdout mismatch
 - `088_while_read_ifs_sort.sh` — stdout mismatch
 - `091_while_pipe_var.sh` — stdout mismatch
-- `063_06_complex_pipeline_background.sh` — stdout mismatch
 - `085_for_glob_pipe.sh` — stdout mismatch
 - `arithmetic-vs-command-subshell.sh` — stdout mismatch
-- `background-chain.sh` — stdout mismatch
+- `samefile-operator.sh` — stdout mismatch
+- `backslash-continuation-dollar-paren.sh` — stdout mismatch
 - `backslash-continuation-dollar-paren.sh` — stdout mismatch
 - `backslash-continuation-in-dollar-paren.sh` — stdout mismatch
 - `builtin-system-open3.sh` — stdout mismatch

@@ -336,7 +336,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
                 "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
                 "$" => "$$".to_string(),       // $$ -> $$ (process ID)
-                "?" => "$CHILD_ERROR".to_string(), // $? -> exit code
+                "?" => "($? == -1 ? 0 : $? >> 8)".to_string(), // $? -> exit code
                 "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
                 "-" => "''".to_string(), // $- -> empty (shell options not tracked)
                 "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module

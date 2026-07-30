@@ -856,7 +856,8 @@ pub fn generate_generic_builtin(
                     );
                     if output_var.is_empty() {
                         format!(
-                            "$main_exit_code = system('bash', '-c', {}) >> 8;\n",
+                            "$main_exit_code = $CHILD_ERROR = system('bash', '-c', {}) >> 8;\n",
+
                             cmd_str
                         )
                     } else {
@@ -1162,7 +1163,7 @@ pub fn generate_generic_builtin(
                 "$CHILD_ERROR = 0;\n".to_string()
             } else {
                 let newname = generator.word_to_perl(&cmd.args[0]);
-                format!("$main_exit_code = system('/bin/hostname', {}) >> 8;\n", newname)
+                format!("$main_exit_code = $CHILD_ERROR = system('/bin/hostname', {}) >> 8;\n", newname)
             }
         }
         "chmod" => {
