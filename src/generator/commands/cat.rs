@@ -148,6 +148,9 @@ pub fn generate_cat_command(
         // - Quoted heredocs (<<'EOF'): use SingleQuoted which prevents
         //   Perl interpolation, matching shell semantics.
         let style = if any_unquoted && !any_quoted {
+            // For unquoted heredocs, preprocess shell variable references
+            // (${var} and $var) into proper Perl references.
+            body = crate::generator::words::preprocess_shell_vars_in_raw_string(generator, &body);
             StrStyle::Heredoc
         } else {
             StrStyle::SingleQuoted
