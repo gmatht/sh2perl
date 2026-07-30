@@ -211,6 +211,12 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::SlashAssign)
             | Some(Token::PercentAssign)
             | Some(Token::Assign)
+            // Keywords that can appear in argument position (e.g. `dd if=/dev/zero`)
+            | Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
+            | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
+            | Some(Token::While) | Some(Token::Until) | Some(Token::For)
+            | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
+            | Some(Token::Select) | Some(Token::Function)
         ) {
         let mut combined = String::new();
         loop {
@@ -236,7 +242,14 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::TestBracket)
                 | Some(Token::TestBracketClose)
                 | Some(Token::Assign)
-                | Some(Token::Dollar) => {
+                | Some(Token::Dollar)
+                // Keywords that can appear in argument position
+                | Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
+                | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
+                | Some(Token::While) | Some(Token::Until) | Some(Token::For)
+                | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
+                | Some(Token::Select) | Some(Token::Function)
+                => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
                     // parse_variable_expansion handles the variable reference.
@@ -277,9 +290,14 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 return Ok(Word::BraceExpansion(be, None));
             }
         }
+
+        // Check for immediately adjacent quoted fragments (no whitespace)
+        // before skipping whitespace, so `of="$tmpf"` is merged into one word.
+        let mut word = Word::Literal(combined, None);
+        merge_contiguous_quoted_fragments(lexer, &mut word)?;
         // Skip inline whitespace after consuming the word
         lexer.skip_inline_whitespace_and_comments();
-        return Ok(Word::Literal(combined, None));
+        return Ok(word);
     }
 
     let result = match lexer.peek() {
@@ -764,6 +782,12 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::SlashAssign)
             | Some(Token::PercentAssign)
             | Some(Token::Assign)
+            // Keywords that can appear in argument position (e.g. `dd if=/dev/zero`)
+            | Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
+            | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
+            | Some(Token::While) | Some(Token::Until) | Some(Token::For)
+            | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
+            | Some(Token::Select) | Some(Token::Function)
         ) {
         let mut combined = String::new();
         loop {
@@ -796,7 +820,14 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::SlashAssign)
                 | Some(Token::PercentAssign)
                 | Some(Token::Assign)
-                | Some(Token::Dollar) => {
+                | Some(Token::Dollar)
+                // Keywords that can appear in argument position
+                | Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
+                | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
+                | Some(Token::While) | Some(Token::Until) | Some(Token::For)
+                | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
+                | Some(Token::Select) | Some(Token::Function)
+                => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
                     // parse_variable_expansion handles the variable reference.
@@ -827,9 +858,23 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 _ => break,
             }
         }
+        // If the next token is a BraceOpen, merge the combined literal as
+        // a prefix of the brace expansion so that `file.{txt,md}` becomes
+        // a BraceExpansion with prefix "file." and items ["txt","md"].
+        if matches!(lexer.peek(), Some(Token::BraceOpen)) {
+            let brace_word = parse_brace_expansion(lexer)?;
+            if let Word::BraceExpansion(mut be, _) = brace_word {
+                be.prefix = Some(combined);
+                return Ok(Word::BraceExpansion(be, None));
+            }
+        }
+        // Check for immediately adjacent quoted fragments (no whitespace)
+        // before skipping whitespace, so `of="$tmpf"` is merged into one word.
+        let mut word = Word::Literal(combined, None);
+        merge_contiguous_quoted_fragments(lexer, &mut word)?;
         // Skip inline whitespace after consuming the word, but NOT newlines
         lexer.skip_inline_whitespace_and_comments();
-        return Ok(Word::Literal(combined, None));
+        return Ok(word);
     }
 
     let result = match lexer.peek() {

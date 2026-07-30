@@ -469,6 +469,19 @@ pub fn handle_brace_expansion_for_echo(
         }
     }
 
+    // Apply prefix and suffix to each item
+    if !items.is_empty() {
+        if let Some(prefix) = &expansion.prefix {
+            for item in items.iter_mut() {
+                *item = format!("{}{}", prefix, item);
+            }
+        }
+        if let Some(suffix) = &expansion.suffix {
+            for item in items.iter_mut() {
+                *item = format!("{}{}", item, suffix);
+            }
+        }
+    }
     // Join all items with spaces and return as a quoted string
     let items_str = items.join(" ");
     format!("\"{}\"", items_str.replace("\"", "\\\""))

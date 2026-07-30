@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 /// `parse_heredoc_body` for heredoc redirects after all redirects on the same
 /// line have been collected.
 pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
+    eprintln!("DEBUG parse_redirect_header: peek={:?}", lexer.peek());
     let fd = if let Some(Token::Number) = lexer.peek() {
         let fd_str = lexer.get_number_text()?;
         Some(fd_str.parse().unwrap_or(0))
@@ -158,18 +159,29 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
 
     // For heredocs, strip leading backslash from the delimiter.
     // `<<\EOF` means the delimiter is `EOF` (backslash quotes it).
+    // Also handle the case where logos created a SingleQuotedString that
+    // spans past the heredoc delimiter into the body (e.g. `<< 'EOF'`
+    // where the body contains an apostrophe `it's`). In that case,
+    // truncate at the first newline.
     let mut heredoc_quoted = false;
     let target = match operator {
         RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => {
             if let Word::Literal(s, meta) = &target_raw {
-                if s.starts_with('\\') {
+                // Truncate at first newline if the SingleQuotedString swallowed
+                // part of the heredoc body (logos doesn't understand heredocs).
+                let truncated = if let Some(nl_pos) = s.find('\n') {
+                    s[..nl_pos].to_string()
+                } else {
+                    s.clone()
+                };
+                if truncated.starts_with('\\') {
                     heredoc_quoted = true;
                     if crate::debug::is_debug_enabled() {
-                        eprintln!("DEBUG: stripped backslash from heredoc delimiter '{}' -> '{}'", s, &s[1..]);
+                        eprintln!("DEBUG: stripped backslash from heredoc delimiter '{}' -> '{}'", truncated, &truncated[1..]);
                     }
-                    Word::Literal(s[1..].to_string(), *meta)
+                    Word::Literal(truncated[1..].to_string(), *meta)
                 } else {
-                    target_raw
+                    Word::Literal(truncated, *meta)
                 }
             } else {
                 target_raw
@@ -229,21 +241,23 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
 /// Parse the body of a heredoc (or heredoc-tabs) redirect.
 /// `target` must be the delimiter word.
 /// Returns `(body, quoted)` where `quoted` indicates the delimiter was quoted (`<< 'EOF'`).
-pub fn parse_heredoc_body(lexer: &mut Lexer, target: &Word) -> Result<(Option<String>, bool), ParserError> {
+pub fn parse_heredoc_body(lexer: &mut Lexer, target: &Word, strip_tabs: bool) -> Result<(Option<String>, bool), ParserError> {
     // Determine if the delimiter was quoted by examining the raw input
     // at the delimiter position. The delimiter text is stored without quotes,
     // so we scan backwards from the heredoc body start to find the delimiter
     // in the raw input and check if it was quoted.
     let quoted = detect_heredoc_quoted(lexer, target);
-    let body = parse_heredoc(lexer, target)?;
+    let body = parse_heredoc(lexer, target, strip_tabs)?;
     Ok((body, quoted))
 }
 
 /// Full redirect parsing: header + heredoc body (if applicable).
 pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
+    eprintln!("DEBUG parse_redirect called, lexer.current={}", lexer.current);
     let header = parse_redirect_header(lexer)?;
     if matches!(&header.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs) {
-        let (body, quoted) = parse_heredoc_body(lexer, &header.target)?;
+        let strip_tabs = header.operator == RedirectOperator::HeredocTabs;
+        let (body, quoted) = parse_heredoc_body(lexer, &header.target, strip_tabs)?;
         Ok(Redirect {
             heredoc_body: body,
             heredoc_quoted: quoted,
@@ -255,8 +269,11 @@ pub fn parse_redirect(lexer: &mut Lexer) -> Result<Redirect, ParserError> {
 }
 
 /// Detect whether the heredoc delimiter was quoted (`<< 'EOF'`) by examining
-/// the raw input.  Scans backwards from the first newline after the current
-/// position to find the delimiter and checks for surrounding quote characters.
+/// the raw input.  Scans backwards from the current lexer position to find
+/// the Heredoc token, then examines the token line for quoted delimiters.
+/// This approach works correctly even when logos created a SingleQuotedString
+/// that spanned past the heredoc delimiter (e.g. `<< 'EOF'` where the body
+/// contains an apostrophe).
 fn detect_heredoc_quoted(lexer: &Lexer, target: &Word) -> bool {
     let delim = match heredoc_delim_from_word(target) {
         Some(s) => s,
@@ -265,18 +282,44 @@ fn detect_heredoc_quoted(lexer: &Lexer, target: &Word) -> bool {
     if delim.is_empty() {
         return false;
     }
-    // Find the first newline after the current token position — this marks
-    // the start of the heredoc body.  The delimiter must be before this newline.
-    let start_pos = if let Some((cur_pos, _)) = lexer.get_span() {
-        match lexer.input[cur_pos..].find('\n') {
-            Some(nl_offset) => cur_pos + nl_offset,
-            None => lexer.input.len(),
+    let input = &lexer.input;
+    // Scan backwards from the current lexer position to find the Heredoc token.
+    let current = lexer.current;
+    let mut heredoc_end = None;
+    let mut scan_idx = current.saturating_sub(1);
+    loop {
+        if let Some(tok) = lexer.tokens.get(scan_idx) {
+            if matches!(tok.0, Token::Heredoc | Token::HeredocTabs) {
+                heredoc_end = Some(tok.2);
+                break;
+            }
+            if scan_idx == 0 {
+                break;
+            }
+            scan_idx -= 1;
+        } else {
+            break;
         }
-    } else {
-        return false;
+    }
+    // Find the first newline after the heredoc token
+    let start_pos = match heredoc_end {
+        Some(end) => match input[end..].find('\n') {
+            Some(nl_offset) => end + nl_offset,
+            None => input.len(),
+        },
+        None => {
+            // Fallback: use current token position
+            if let Some((cur_pos, _)) = lexer.get_span() {
+                match input[cur_pos..].find('\n') {
+                    Some(nl_offset) => cur_pos + nl_offset,
+                    None => input.len(),
+                }
+            } else {
+                return false;
+            }
+        }
     };
     // Search the entire line before start_pos for a quoted delimiter.
-    let input = &lexer.input;
     // Find the beginning of the line containing the delimiter (search backwards from start_pos)
     let line_start = input[..start_pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
     let line = &input[line_start..start_pos];
@@ -304,7 +347,7 @@ fn heredoc_delim_from_word(word: &Word) -> Option<String> {
     }
 }
 
-fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, ParserError> {
+fn parse_heredoc(lexer: &mut Lexer, target: &Word, strip_tabs: bool) -> Result<Option<String>, ParserError> {
     let delim = match heredoc_delim_from_word(target) {
         Some(s) => s,
         None => {
@@ -318,19 +361,51 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
     }
 
     // Find the start of the heredoc body in the raw input.
-    let start_pos = if let Some((cur_pos, _)) = lexer.get_span() {
-        if crate::debug::is_debug_enabled() {
-            eprintln!("DEBUG parse_heredoc: cur_pos={}, input[..]={:?}", cur_pos, &lexer.input[cur_pos..cur_pos+40.min(lexer.input.len()-cur_pos)]);
-        }
-        match lexer.input[cur_pos..].find('\n') {
-            Some(nl_offset) => cur_pos + nl_offset + 1,
-            None => lexer.input.len(),
-        }
-    } else {
-        return Ok(Some(String::new()));
-    };
-
+    // We scan backwards from the current lexer position to find the
+    // Heredoc token, then find the first newline after its end.
+    // This approach works even when logos created a SingleQuotedString
+    // that spanned past the heredoc delimiter (e.g. `<< 'EOF'` where
+    // the body contains an apostrophe).
     let saved_lexer_current = lexer.current;
+    let start_pos = {
+        let mut body_start = None;
+        // Scan backwards through tokens to find the Heredoc/HeredocTabs token
+        let mut scan_idx = saved_lexer_current.saturating_sub(1);
+        loop {
+            if let Some(tok) = lexer.tokens.get(scan_idx) {
+                if matches!(tok.0, Token::Heredoc | Token::HeredocTabs) {
+                    // Found the heredoc operator. The body starts after the
+                    // first newline following this token.
+                    if let Some(nl_offset) = lexer.input[tok.2..].find('\n') {
+                        body_start = Some(tok.2 + nl_offset + 1);
+                    } else {
+                        body_start = Some(lexer.input.len());
+                    }
+                    break;
+                }
+                if scan_idx == 0 {
+                    break;
+                }
+                scan_idx -= 1;
+            } else {
+                break;
+            }
+        }
+        // Fallback: use the current token position
+        body_start.unwrap_or_else(|| {
+            if let Some((cur_pos, _)) = lexer.get_span() {
+                match lexer.input[cur_pos..].find('\n') {
+                    Some(nl_offset) => cur_pos + nl_offset + 1,
+                    None => lexer.input.len(),
+                }
+            } else {
+                lexer.input.len()
+            }
+        })
+    };
+    if crate::debug::is_debug_enabled() {
+        eprintln!("DEBUG parse_heredoc: start_pos={}, input[..]={:?}", start_pos, &lexer.input[start_pos..start_pos+40.min(lexer.input.len()-start_pos)]);
+    }
 
     // Read the raw input line by line until we find the delimiter
     let mut body = String::new();
@@ -346,7 +421,13 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         if line.trim() == delim {
             break;
         }
-        body.push_str(line);
+        // For <<- heredocs, strip leading tab characters from each line
+        if strip_tabs {
+            let stripped = line.trim_start_matches('\t');
+            body.push_str(stripped);
+        } else {
+            body.push_str(line);
+        }
         if line_end < input.len() && input.as_bytes()[line_end] == b'\n' {
             body.push('\n');
             current_pos = line_end + 1;
@@ -456,6 +537,10 @@ fn parse_heredoc(lexer: &mut Lexer, target: &Word) -> Result<Option<String>, Par
         // the same line are still in the token list before body_start_idx.
         if lexer.current >= body_start_idx {
             lexer.current = saved_lexer_current;
+        }
+        // After drain, ensure lexer.current is not past the end
+        if lexer.current >= lexer.tokens.len() && !lexer.tokens.is_empty() {
+            lexer.current = lexer.tokens.len() - 1;
         }
     }
 
