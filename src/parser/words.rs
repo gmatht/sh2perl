@@ -1816,6 +1816,33 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     },
                     None,
                 ));
+            } else if braced_content.contains(':') && !braced_content.contains("::") && !braced_content.contains(":-") && !braced_content.contains(":=") && !braced_content.contains(":+") && !braced_content.contains(":?") {
+                // ${var:offset} or ${var:offset:length} - substring/array-slice
+                // The first colon must not be part of any two-char operator.
+                let colon_pos = braced_content.find(':').unwrap();
+                let var_name = &braced_content[..colon_pos];
+                let rest = &braced_content[colon_pos + 1..];
+                if let Some(second_colon) = rest.find(':') {
+                    let offset = &rest[..second_colon];
+                    let length = &rest[second_colon + 1..];
+                    return Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                            is_mutable: true,
+                        },
+                        None,
+                    ));
+                } else {
+                    return Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
+                            is_mutable: true,
+                        },
+                        None,
+                    ));
+                }
             } else if braced_content.contains('[') && braced_content.contains(']') {
                 // This might be a map/array access like ${map[foo]} or ${arr[1]} or ${map[$k]}
                 // OR it might be a parameter expansion with brackets in the pattern
@@ -2153,13 +2180,149 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
             lexer.next();
             if matches!(lexer.peek(), Some(Token::BraceClose)) {
                 lexer.next();
+                Ok(Word::Variable("*".to_string(), true, None))
+            } else {
+                // ${*...} with additional operators — build content and analyze
+                let mut content = String::from("*");
+                let rest = parse_braced_variable_name(lexer)?;
+                if matches!(lexer.peek(), Some(Token::BraceClose)) {
+                    lexer.next();
+                }
+                content.push_str(&rest);
+                // Reuse the same analysis as DollarBraceAt (inline below)
+                if content.contains(":-") {
+                    let colon_pos = content.find(":-").unwrap();
+                    let var_name = &content[..colon_pos];
+                    let default_val = &content[colon_pos + 2..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else if content.contains(":=") {
+                    let colon_pos = content.find(":=").unwrap();
+                    let var_name = &content[..colon_pos];
+                    let default_val = &content[colon_pos + 2..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else if content.contains(":+") {
+                    let colon_pos = content.find(":+").unwrap();
+                    let var_name = &content[..colon_pos];
+                    let alt_val = &content[colon_pos + 2..];
+                    Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: var_name.to_string(),
+                            operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                            is_mutable: true,
+                        },
+                        None,
+                    ))
+                } else if let Some(minus_pos) = content.find('-') {
+                    if minus_pos > 0 {
+                        let var_name = &content[..minus_pos];
+                        let default_val = &content[minus_pos + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::Variable(content, true, None))
+                    }
+                } else if let Some(plus_pos) = content.find('+') {
+                    if plus_pos > 0 {
+                        let var_name = &content[..plus_pos];
+                        let alt_val = &content[plus_pos + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::Variable(content, true, None))
+                    }
+                } else if let Some(quest_pos) = content.find('?') {
+                    if quest_pos > 0 {
+                        let var_name = &content[..quest_pos];
+                        let error_msg = &content[quest_pos + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::Variable(content, true, None))
+                    }
+                } else if let Some(eq_pos) = content.find('=') {
+                    if eq_pos > 0 {
+                        let var_name = &content[..eq_pos];
+                        let default_val = &content[eq_pos + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::Variable(content, true, None))
+                    }
+                } else if content.contains(':') && !content.contains("::") && !content.contains(":-") && !content.contains(":=") && !content.contains(":+") && !content.contains(":?") {
+                    // ${*:offset} or ${*:offset:length} - array slice
+                    let colon_pos = content.find(':').unwrap();
+                    let var_name = &content[..colon_pos];
+                    let rest = &content[colon_pos + 1..];
+                    if let Some(second_colon) = rest.find(':') {
+                        let offset = &rest[..second_colon];
+                        let length = &rest[second_colon + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    }
+                } else {
+                    Ok(Word::Variable(content, true, None))
+                }
             }
-            Ok(Word::Variable("*".to_string(), true, None))
         }
         Some(Token::DollarBraceAt) => {
             lexer.next();
+            eprintln!("DEBUG DollarBraceAt: peek={:?}", lexer.peek());
             if matches!(lexer.peek(), Some(Token::BraceClose)) {
                 lexer.next();
+                eprintln!("DEBUG DollarBraceAt: just @");
                 Ok(Word::Variable("@".to_string(), true, None))
             } else {
                 // ${@...} with additional operators — build content and analyze
@@ -2270,6 +2433,32 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         ))
                     } else {
                         Ok(Word::Variable(content, true, None))
+                    }
+                } else if content.contains(':') && !content.contains("::") && !content.contains(":-") && !content.contains(":=") && !content.contains(":+") && !content.contains(":?") {
+                    // ${@:offset} or ${@:offset:length} - array slice
+                    let colon_pos = content.find(':').unwrap();
+                    let var_name = &content[..colon_pos];
+                    let rest = &content[colon_pos + 1..];
+                    if let Some(second_colon) = rest.find(':') {
+                        let offset = &rest[..second_colon];
+                        let length = &rest[second_colon + 1..];
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
+                    } else {
+                        Ok(Word::ParameterExpansion(
+                            ParameterExpansion {
+                                variable: var_name.to_string(),
+                                operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
+                                is_mutable: true,
+                            },
+                            None,
+                        ))
                     }
                 } else {
                     Ok(Word::Variable(content, true, None))
@@ -3055,6 +3244,12 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         }
     }
 
+    // Check for ${var:offset} or ${var:offset:length} - substring/array-slice
+    // Single colon NOT followed by - = + ? : (those are handled above).
+    // Must come AFTER the [...] check because patterns like ${arr[@]:offset} have
+    // brackets and should be handled by the array-access branch first.
+    // We only reach here for simple variable names (no brackets) like ${@:3} or ${var:offset}.
+
     // Check for operators that use `//` and `/` BEFORE checking for array access,
     // because patterns like ${var//[^a-z]/_} contain brackets that look like array access.
     // Must check these before the array-access branch.
@@ -3184,6 +3379,43 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 return Ok(ParameterExpansion {
                     variable: format!("{}[{}]", var_name, key),
                     operator: ParameterExpansionOperator::None,
+                    is_mutable: true,
+                });
+            }
+        }
+    }
+
+    // Check for ${var:offset} or ${var:offset:length} - substring/array-slice
+    // Single colon NOT followed by - = + ? : (those are handled above).
+    // Must come AFTER the [...] check because patterns like ${arr[@]:offset} have
+    // brackets and should be handled by the array-access branch first.
+    // We only reach here for simple variable names (no brackets) like ${@:3} or ${var:offset}.
+    // Also guard against operator patterns like ${var%%pattern} where the pattern
+    // contains ':' by checking that no operator characters precede the colon.
+    if content.contains(':') && !content.contains('[') && !content.contains(']') 
+        && !content.contains("::") && !content.contains(":-") && !content.contains(":=") 
+        && !content.contains(":+") && !content.contains(":?") 
+        && !content.contains('%') && !content.contains('#') 
+        && !content.contains('/') && !content.contains('^') && !content.contains(',')
+    {
+        let colon_pos = content.find(':').unwrap();
+        // Only treat as ArraySlice if the colon is at a position that could be
+        // after a variable name (not after an operator).
+        if colon_pos > 0 {
+            let var_name = &content[..colon_pos];
+            let rest = &content[colon_pos + 1..];
+            if let Some(second_colon) = rest.find(':') {
+                let offset = &rest[..second_colon];
+                let length = &rest[second_colon + 1..];
+                return Ok(ParameterExpansion {
+                    variable: var_name.to_string(),
+                    operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                    is_mutable: true,
+                });
+            } else {
+                return Ok(ParameterExpansion {
+                    variable: var_name.to_string(),
+                    operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
                     is_mutable: true,
                 });
             }

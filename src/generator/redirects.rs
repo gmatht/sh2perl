@@ -926,34 +926,52 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
     match cmd.name.as_str() {
         "set" => {
             // Convert shell set options to Perl equivalents
-            for arg in &cmd.args {
-                if let Word::Literal(opt, _) = arg {
-                    match opt.as_str() {
-                        "-e" => {
-                            output.push_str("$__set_e = 1;\n");
-                            generator.set_e_active = true;
-                        }
-                        "-u" => output.push_str("use strict;\n"),
-                        "-o" => {
-                            // Handle pipefail and other options
-                            if let Some(next_arg) = cmd
-                                .args
-                                .get(cmd.args.iter().position(|a| a == arg).unwrap() + 1)
-                            {
-                                if let Word::Literal(opt_name, _) = next_arg {
-                                    match opt_name.as_str() {
-                                        "pipefail" => output.push_str(
-                                            "# set -o pipefail not implemented in Perl\n",
-                                        ),
-                                        _ => output.push_str(&format!(
-                                            "# set -o {} not implemented\n",
-                                            opt_name
-                                        )),
+            // Check for "set -- arg1 arg2 ..." which sets positional parameters
+            if let Some(dashdash_pos) = cmd.args.iter().position(|a| {
+                matches!(a, Word::Literal(s, _) if s == "--")
+            }) {
+                // Collect all args after -- into @ARGV (or @_ inside a function)
+                let perl_args: Vec<String> = cmd.args[dashdash_pos + 1..]
+                    .iter()
+                    .map(|a| generator.word_to_perl(a))
+                    .collect();
+                if !perl_args.is_empty() {
+                    if generator.fn_nesting_depth > 0 {
+                        output.push_str(&format!("@_ = ({});\n", perl_args.join(", ")));
+                    } else {
+                        output.push_str(&format!("@ARGV = ({});\n", perl_args.join(", ")));
+                    }
+                }
+            } else {
+                for arg in &cmd.args {
+                    if let Word::Literal(opt, _) = arg {
+                        match opt.as_str() {
+                            "-e" => {
+                                output.push_str("$__set_e = 1;\n");
+                                generator.set_e_active = true;
+                            }
+                            "-u" => output.push_str("use strict;\n"),
+                            "-o" => {
+                                // Handle pipefail and other options
+                                if let Some(next_arg) = cmd
+                                    .args
+                                    .get(cmd.args.iter().position(|a| a == arg).unwrap() + 1)
+                                {
+                                    if let Word::Literal(opt_name, _) = next_arg {
+                                        match opt_name.as_str() {
+                                            "pipefail" => output.push_str(
+                                                "# set -o pipefail not implemented in Perl\n",
+                                            ),
+                                            _ => output.push_str(&format!(
+                                                "# set -o {} not implemented\n",
+                                                opt_name
+                                            )),
+                                        }
                                     }
                                 }
                             }
+                            _ => output.push_str(&format!("# set {} not implemented\n", opt)),
                         }
-                        _ => output.push_str(&format!("# set {} not implemented\n", opt)),
                     }
                 }
             }

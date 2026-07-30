@@ -1727,7 +1727,7 @@ fn flatten_conditions(cmd: &Command, conds: &mut Vec<Command>) {
 /// in a command tree. This is used to hoist `my` declarations before conditional
 /// statements (if/elsif/while/for) to satisfy Perl::Critic's
 /// `ProhibitConditionalDeclarations` policy.
-fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet<String>) {
+pub fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet<String>) {
     match cmd {
         Command::Assignment(assignment) => {
             vars.insert(assignment.variable.clone());
@@ -1792,7 +1792,7 @@ fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet<Str
 /// been declared in the generator.  This is used before conditional statements
 /// so that the `my` declaration sits outside the conditional body, satisfying
 /// Perl::Critic's `ProhibitConditionalDeclarations` policy.
-fn hoist_my_declarations(generator: &mut Generator, vars: &std::collections::HashSet<String>, output: &mut String) {
+pub fn hoist_my_declarations(generator: &mut Generator, vars: &std::collections::HashSet<String>, output: &mut String) {
     for var in vars {
         if !generator.declared_locals.contains(var)
             && !generator.function_level_vars.contains(var)
