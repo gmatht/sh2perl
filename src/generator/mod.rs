@@ -437,7 +437,7 @@ impl Generator {
         // use $CHILD_ERROR internally even when there is no explicit command
         // substitution or system call in the shell source.
         // CHILD_ERROR must be `our`, not `my`, so emit raw text.
-        output.push_str("our $CHILD_ERROR = 0;\n");
+        output.push_str("our $CHILD_ERROR;\n");
         if !self.function_level_vars.is_empty() {
             output.push_str("\n");
         }

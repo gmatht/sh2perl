@@ -992,7 +992,7 @@ pub fn generate_command_impl_with_input(
                             let args_str = args.join(", ");
 
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("$main_exit_code = system('cmp', {}) >> 8;\n", args_str));
+                            result.push_str(&format!("$main_exit_code = $CHILD_ERROR = system('cmp', {}) >> 8;\n", args_str));
 
                             return result;
                         }
