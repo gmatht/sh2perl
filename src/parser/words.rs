@@ -1817,43 +1817,53 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     None,
                 ));
             } else if braced_content.contains('[') && braced_content.contains(']') {
-                // This is a map/array access like ${map[foo]} or ${arr[1]} or ${map[$k]}
+                // This might be a map/array access like ${map[foo]} or ${arr[1]} or ${map[$k]}
+                // OR it might be a parameter expansion with brackets in the pattern
+                // (e.g. ${0##*[/\]}).  Check if the part before `[` contains pattern
+                // operators: if so, fall through to the pattern-operator checks below.
                 if let Some(bracket_start) = braced_content.find('[') {
                     if let Some(bracket_end) = braced_content.rfind(']') {
                         let map_name = &braced_content[..bracket_start];
                         let key = &braced_content[bracket_start + 1..bracket_end];
 
-                        // Special case: if key is "@", this is array iteration
-                        if key == "@" {
-                            // Check if there's array slicing in braced_content after ']'
-                            let after_bracket = &braced_content[bracket_end + 1..];
-                            if after_bracket.starts_with(':') {
-                                // This is array slicing like ${arr[@]:start:length}
-                                let slice_part = &after_bracket[1..]; // skip leading ':'
-                                if let Some(second_colon) = slice_part.find(':') {
-                                    let offset = &slice_part[..second_colon];
-                                    let length = &slice_part[second_colon + 1..];
-                                    return Ok(Word::array_slice(
-                                        map_name.to_string(),
-                                        offset.to_string(),
-                                        Some(length.to_string()),
-                                    ));
-                                } else {
-                                    return Ok(Word::array_slice(
-                                        map_name.to_string(),
-                                        slice_part.to_string(),
-                                        None,
-                                    ));
+                        // Guard: if the variable-name portion before `[` contains
+                        // pattern-removal or substitution operators, this is a
+                        // parameter expansion with brackets in the pattern, not
+                        // an array/map access.
+                        if !(map_name.contains('#') || map_name.contains('%') || map_name.contains('/')) {
+                            // Special case: if key is "@", this is array iteration
+                            if key == "@" {
+                                // Check if there's array slicing in braced_content after ']'
+                                let after_bracket = &braced_content[bracket_end + 1..];
+                                if after_bracket.starts_with(':') {
+                                    // This is array slicing like ${arr[@]:start:length}
+                                    let slice_part = &after_bracket[1..]; // skip leading ':'
+                                    if let Some(second_colon) = slice_part.find(':') {
+                                        let offset = &slice_part[..second_colon];
+                                        let length = &slice_part[second_colon + 1..];
+                                        return Ok(Word::array_slice(
+                                            map_name.to_string(),
+                                            offset.to_string(),
+                                            Some(length.to_string()),
+                                        ));
+                                    } else {
+                                        return Ok(Word::array_slice(
+                                            map_name.to_string(),
+                                            slice_part.to_string(),
+                                            None,
+                                        ));
+                                    }
                                 }
+                                return Ok(Word::MapAccess(
+                                    map_name.to_string(),
+                                    "@".to_string(),
+                                    None,
+                                ));
                             }
-                            return Ok(Word::MapAccess(
-                                map_name.to_string(),
-                                "@".to_string(),
-                                None,
-                            ));
-                        }
 
-                        return Ok(Word::MapAccess(map_name.to_string(), key.to_string(), None));
+                            return Ok(Word::MapAccess(map_name.to_string(), key.to_string(), None));
+                        }
+                        // else: fall through to parameter expansion checks below
                     }
                 }
             }
@@ -1894,7 +1904,11 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     },
                     None,
                 ))
-            } else if braced_content.ends_with("##*/") {
+            } else if braced_content.ends_with("##*/")
+                // Also guard: the `#` of `#*/` must not be preceded by `#`
+                // (otherwise this is actually `${var##pattern}` not `${var##*/}`).
+                && !braced_content.ends_with("###*/")
+            {
                 let base_var = braced_content.trim_end_matches("##*/");
                 Ok(Word::ParameterExpansion(
                     ParameterExpansion {
@@ -1904,7 +1918,11 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     },
                     None,
                 ))
-            } else if braced_content.ends_with("%/*") {
+            } else if braced_content.ends_with("%/*")
+                // Guard: the `%` of `%/*` must not be preceded by `%`
+                // (otherwise this is actually `${var%%pattern}` not `${var%/*}`).
+                && !braced_content.ends_with("%%/*")
+            {
                 let base_var = braced_content.trim_end_matches("%/*");
                 Ok(Word::ParameterExpansion(
                     ParameterExpansion {
@@ -1930,7 +1948,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 } else {
                     Ok(Word::Variable(braced_content, true, None))
                 }
-            } else if braced_content.contains("%%") && !braced_content.ends_with("%/*") {
+            } else if braced_content.contains("%%") && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*")) {
                 let parts: Vec<&str> = braced_content.split("%%").collect();
                 if parts.len() == 2 {
                     Ok(Word::ParameterExpansion(
@@ -1962,7 +1980,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 } else {
                     Ok(Word::Variable(braced_content, true, None))
                 }
-            } else if braced_content.contains("%") && !braced_content.contains("%%") && !braced_content.ends_with("%/*") {
+            } else if braced_content.contains("%") && !braced_content.contains("%%") && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*")) {
                 let parts: Vec<&str> = braced_content.splitn(2, "%").collect();
                 if parts.len() == 2 {
                     Ok(Word::ParameterExpansion(
@@ -3202,7 +3220,7 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
             operator: ParameterExpansionOperator::Basename,
             is_mutable: true,
         })
-    } else if content.ends_with("%/*") {
+    } else if content.ends_with("%/*") && !content.ends_with("%%/*") {
         let base_var = content.trim_end_matches("%/*");
         Ok(ParameterExpansion {
             variable: base_var.to_string(),
@@ -3224,7 +3242,7 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 is_mutable: true,
             })
         }
-    } else if content.contains("%%") && !content.ends_with("%/*") {
+    } else if content.contains("%%") && !(content.ends_with("%/*") && !content.ends_with("%%/*")) {
         let parts: Vec<&str> = content.split("%%").collect();
         if parts.len() == 2 {
             Ok(ParameterExpansion {
@@ -3254,7 +3272,7 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 is_mutable: true,
             })
         }
-    } else if content.contains("%") && !content.contains("%%") && !content.ends_with("%/*") {
+    } else if content.contains("%") && !content.contains("%%") && !(content.ends_with("%/*") && !content.ends_with("%%/*")) {
         let parts: Vec<&str> = content.split("%").collect();
         if parts.len() == 2 {
             Ok(ParameterExpansion {

@@ -2,7 +2,7 @@
 
 ## Current status
 
-**391 passed, 126 failed** (fixed 4: 008_simple_backup, 011_brace_expansion, 035_brace_expansion_practical, 064_02_nested_brace_expansions)
+**394 passed, 123 failed** (fixed 3 more: parse-param-pattern-match, parse-parameter-pattern, parse-substring-double-colon)
 
 ### Fixed this session:
 - `011_brace_expansion.sh`, `035_brace_expansion_practical.sh` — Fixed
@@ -218,7 +218,41 @@ See notes below for full list of prior fixes.
    generator to avoid undeclared-variable errors inside function bodies.
    Fixed: `arith-base-notation.sh` (the code-gen part).
 
-## Remaining failures (~145)
+### Fixed in this session (new):
+
+8. **`${var#pattern}` / `${var##pattern}` with brackets in pattern (e.g. `${0##*[/\\]}`)** —
+   The array-access check (`[...]`) in `parse_variable_expansion()` (`src/parser/words.rs`)
+   was checked BEFORE parameter-expansion pattern operators (`##`, `%%`, `#`, `%`, `//`, `/`).
+   When a pattern contained `[` and `]` (like `##*[/\\]`), the braced content was
+   incorrectly treated as array access (`map[key]`) instead of parameter expansion.
+   Added a guard: if the text before `[` contains pattern operators (`#`, `%`, `/`),
+   the brackets are part of the pattern, not array access.
+   Fixed: `parse-param-pattern-match.sh`.
+
+9. **`${var%%/*}` misparsed as `%/*` Dirname instead of `%%` RemoveLongestSuffix** —
+   The `%/*` Dirname check (`braced_content.ends_with("%/*")`) was too greedy:
+   `path%%/*` ends with `%/*` (the second `%` + `/*`), triggering Dirname instead
+   of `%% RemoveLongestSuffix`.  Added a guard so `%/*` only matches when the
+   preceding character is NOT `%`.  Same fix for `##*/` Basename.
+   Fixed: `parse-parameter-pattern.sh`.
+
+10. **`/` inside character classes not escaped for `s///` delimiter** —
+    The `glob_to_perl_regex_*()` functions in `expansions.rs` escaped `/` as `\/`
+    only OUTSIDE character classes (`[...]`).  Inside a class, `/` was passed
+    through unescaped, breaking the `s///` substitution syntax (the unescaped `/`
+    acted as an extra delimiter).  Now `/` is escaped inside character classes too.
+    Fixed: `parse-param-pattern-match.sh` (the code-gen part).
+
+11. **`${x::-2}` (substring with `::`) generated array slice instead of `substr()`** —
+    The `ArraySlice` operator generated for scalar substring expansion was emitted
+    as `@main::x[0..-2]` (array slice) instead of `substr($x, 0, -2)`.  Both in
+    `convert_string_interpolation_to_perl_impl()` (`words.rs`) and in
+    `generate_parameter_expansion_impl()` (`expansions.rs`), added a check: if
+    the variable is a scalar (not in indexed_arrays or associative_arrays),
+    emit `substr(...)` instead of the array-slice syntax.
+    Fixed: `parse-substring-double-colon.sh`.
+
+## Remaining failures (~123)
 
 The remaining failures fall into categories that require deeper parser/generator work:
 

@@ -2849,29 +2849,56 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 }
                             }
                         } else {
-                            // Regular array slice - use join for string context
-                            let trimmed_offset = offset.trim();
-                            if let Some(length_str) = length {
-                                let trimmed_len = length_str.trim();
-                                let start = trimmed_offset.parse::<i32>().unwrap_or(0);
-                                let len = trimmed_len.parse::<i32>().unwrap_or(0);
-                                let end = if len > 0 { start + len - 1 } else { start };
-                                parts.push(format!(
-                                    "join(\" \", @{}[{}..{}])",
-                                    pe.variable, trimmed_offset, end
-                                ));
-                            } else {
-                                // For negative offsets like ${arr[@]: -10}, use -1 as end
-                                // For positive offsets, use $#arr as end
-                                let end_idx = if trimmed_offset.starts_with('-') {
-                                    "-1".to_string()
+                            // Check if the variable is a scalar (not an array).
+                            let is_scalar = !generator.indexed_arrays.contains(&pe.variable)
+                                && !generator.associative_arrays.contains(&pe.variable);
+                            if is_scalar {
+                                // Scalar substring: ${var:offset} or ${var:offset:length}
+                                let var_ref = if generator.declared_locals.contains(&pe.variable)
+                                    || generator.function_level_vars.contains(&pe.variable)
+                                {
+                                    format!("${}", pe.variable)
                                 } else {
-                                    format!("$#{}", pe.variable)
+                                    format!("$ENV{{{}}}", pe.variable)
                                 };
-                                parts.push(format!(
-                                    "join(\" \", @{}[{}..{}])",
-                                    pe.variable, trimmed_offset, end_idx
-                                ));
+                                let trimmed_offset = offset.trim();
+                                if let Some(length_str) = length {
+                                    let trimmed_len = length_str.trim();
+                                    parts.push(format!(
+                                        "substr({}, {}, {})",
+                                        var_ref, trimmed_offset, trimmed_len
+                                    ));
+                                } else {
+                                    parts.push(format!(
+                                        "substr({}, {})",
+                                        var_ref, trimmed_offset
+                                    ));
+                                }
+                            } else {
+                                // Regular array slice - use join for string context
+                                let trimmed_offset = offset.trim();
+                                if let Some(length_str) = length {
+                                    let trimmed_len = length_str.trim();
+                                    let start = trimmed_offset.parse::<i32>().unwrap_or(0);
+                                    let len = trimmed_len.parse::<i32>().unwrap_or(0);
+                                    let end = if len > 0 { start + len - 1 } else { start };
+                                    parts.push(format!(
+                                        "join(\" \", @{}[{}..{}])",
+                                        pe.variable, trimmed_offset, end
+                                    ));
+                                } else {
+                                    // For negative offsets like ${arr[@]: -10}, use -1 as end
+                                    // For positive offsets, use $#arr as end
+                                    let end_idx = if trimmed_offset.starts_with('-') {
+                                        "-1".to_string()
+                                    } else {
+                                        format!("$#{}", pe.variable)
+                                    };
+                                    parts.push(format!(
+                                        "join(\" \", @{}[{}..{}])",
+                                        pe.variable, trimmed_offset, end_idx
+                                    ));
+                                }
                             }
                         }
                     }
