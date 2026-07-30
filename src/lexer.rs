@@ -1297,7 +1297,7 @@ impl Lexer {
             // multi-line quoted strings passed to awk, sed, perl, etc.
             let keywords = [
                 "done", "then", "fi", "esac", "elif",
-                "do",
+                "do", ")",
             ];
             let mut split_pos = None;
 

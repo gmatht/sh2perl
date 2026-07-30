@@ -2,7 +2,7 @@
 
 ## Current status
 
-**396 passed, 121 failed** (fixed 2 more: at-in-test, parse-standalone-redirect)
+**402 passed, 115 failed** (fixed 6 more: heredoc-apostrophe, heredoc-apostrophe-in-unquoted, heredoc-apostrophe-span, parse-heredoc-apostrophe, and 2 related heredoc tests)
 
 ### Fixed this session:
 - `011_brace_expansion.sh`, `035_brace_expansion_practical.sh` — Fixed
@@ -243,6 +243,24 @@ See notes below for full list of prior fixes.
     Partially fixed: `dollar-positional-arithmetic.sh` (still blocked by variable
     scoping issue inside redirect `do {}` blocks).
 
+15. **Heredoc with apostrophe in body (single-quoted delimiter) fails to parse** —
+    Two issues were fixed:
+    a. In `lexer.rs`, the `split_overgreedy_sq()` function only split over-greedy
+       SingleQuotedString tokens on newlines followed by shell keywords (`done`,
+       `then`, `fi`, `esac`, `elif`, `do`).  When the SQ token consumed the closing
+       `)` of `$(...)`, the `)` was never seen as a separate token, causing
+       `capture_parenthetical_text()` to run past EOF.  Added `)` to the keyword
+       list so over-greedy SQ tokens are split at `)` after a newline.
+    b. In `parser/redirects.rs`, the heredoc delimiter truncation code only handled
+       backslash-quoted delimiters (`<<\EOF`).  When logos correctly matched a short
+       `'EOF'` token but `parse_word` stripped the outer quotes, the trailing `'`
+       from the delimiter's closing quote was left in the truncated delimiter text,
+       causing `parse_heredoc_body` to look for `EOF'` instead of `EOF`.  Added
+       checks for trailing single-quote and double-quote characters, stripping them
+       and setting `heredoc_quoted = true`.
+    Fixed: `heredoc-apostrophe.sh`, `heredoc-apostrophe-in-unquoted.sh`,
+           `heredoc-apostrophe-span.sh`, `parse-heredoc-apostrophe.sh`.
+
 ### Fixed in this session (new):
 
 8. **`${var#pattern}` / `${var##pattern}` with brackets in pattern (e.g. `${0##*[/\\]}`)** —
@@ -277,13 +295,12 @@ See notes below for full list of prior fixes.
     emit `substr(...)` instead of the array-slice syntax.
     Fixed: `parse-substring-double-colon.sh`.
 
-## Remaining failures (~121)
+## Remaining failures (~115)
 
 The remaining failures fall into categories that require deeper parser/generator work:
 
-1. **Parser failures on edge cases** (~11 tests):
+1. **Parser failures on edge cases** (~7 tests):
    - `arith-base-notation.sh`: `10#x` in arithmetic — `#` lexed as comment
-   - Heredoc/apostrophe issues: apostrophe-delimited heredocs misparsed
    - Backslash continuation in `$(...)` or `[ ... ]` causing parser errors
    - These need parser-level fixes (lexer context awareness for `#`, heredoc delimiter parsing)
 
