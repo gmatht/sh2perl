@@ -291,22 +291,52 @@ pub fn generate_test_expression_impl(
             "0".to_string()
         }
     } else if expr.contains(" != ") {
-        // String inequality: [[ $var != value ]]
+        // String inequality (pattern matching in [[ ]]): [[ $var != pattern ]]
         let parts: Vec<&str> = expr.split(" != ").collect();
         if parts.len() == 2 {
             let var = parts[0].trim();
             let value = parts[1].trim();
-            format!("{} ne {}", var, value)
+            fn has_glob_or_extglob_chars(s: &str) -> bool {
+                s.contains("@(") || s.contains("*(") || s.contains("+(") || s.contains("?(") || s.contains("!(") || s.contains('*') || s.contains('?') || s.contains('[')
+            }
+            fn convert_pos_params(s: &str) -> String {
+                let re = regex::Regex::new(r"\$(\d+)").unwrap();
+                re.replace_all(s, |caps: &regex::Captures| {
+                    let n: usize = caps[1].parse().unwrap_or(1);
+                    format!("$_[{}]", n.saturating_sub(1))
+                }).to_string()
+            }
+            if has_glob_or_extglob_chars(value) {
+                let regex_pattern = generator.convert_glob_to_regex(value);
+                format!("{} !~ {}", convert_pos_params(var), generator.format_regex_pattern(&format!("^{}$", regex_pattern)))
+            } else {
+                format!("{} ne {}", convert_pos_params(var), convert_pos_params(value))
+            }
         } else {
             "0".to_string()
         }
     } else if expr.contains("!=") {
-        // String inequality without spaces: [[ $var!=value ]]
+        // String inequality without spaces: [[ $var!=pattern ]]
         let parts: Vec<&str> = expr.split("!=").collect();
         if parts.len() == 2 {
             let var = parts[0].trim();
             let value = parts[1].trim();
-            format!("{} ne {}", var, value)
+            fn has_glob_or_extglob_chars(s: &str) -> bool {
+                s.contains("@(") || s.contains("*(") || s.contains("+(") || s.contains("?(") || s.contains("!(") || s.contains('*') || s.contains('?') || s.contains('[')
+            }
+            fn convert_pos_params(s: &str) -> String {
+                let re = regex::Regex::new(r"\$(\d+)").unwrap();
+                re.replace_all(s, |caps: &regex::Captures| {
+                    let n: usize = caps[1].parse().unwrap_or(1);
+                    format!("$_[{}]", n.saturating_sub(1))
+                }).to_string()
+            }
+            if has_glob_or_extglob_chars(value) {
+                let regex_pattern = generator.convert_glob_to_regex(value);
+                format!("{} !~ {}", convert_pos_params(var), generator.format_regex_pattern(&format!("^{}$", regex_pattern)))
+            } else {
+                format!("{} ne {}", convert_pos_params(var), convert_pos_params(value))
+            }
         } else {
             "0".to_string()
         }
@@ -349,7 +379,27 @@ pub fn generate_test_expression_impl(
                     format!("($ENV{{'HOME'}} . '/{}') eq {}", path, clean_value)
                 }
             } else {
-                format!("{} eq {}", var, value)
+                // In [[ ]], `=` is pattern matching (same as `==`), not strict
+                // string equality.  If the value contains extglob constructs
+                // (@(...), *(...), +(...), ?(...), !(...)) or glob metacharacters
+                // (*, ?, [), use regex matching.  Otherwise `eq` is safe.
+                fn has_glob_or_extglob_chars(s: &str) -> bool {
+                    s.contains("@(") || s.contains("*(") || s.contains("+(") || s.contains("?(") || s.contains("!(") || s.contains('*') || s.contains('?') || s.contains('[')
+                }
+                if has_glob_or_extglob_chars(value) {
+                    let regex_pattern = generator.convert_glob_to_regex(value);
+                    format!("{} =~ {}", var, generator.format_regex_pattern(&format!("^{}$", regex_pattern)))
+                } else {
+                    // Convert positional parameters $1, $2, … to $_[0], $_[1], …
+                    fn convert_pos_params(s: &str) -> String {
+                        let re = regex::Regex::new(r"\$(\d+)").unwrap();
+                        re.replace_all(s, |caps: &regex::Captures| {
+                            let n: usize = caps[1].parse().unwrap_or(1);
+                            format!("$_[{}]", n.saturating_sub(1))
+                        }).to_string()
+                    }
+                    format!("{} eq {}", convert_pos_params(var), convert_pos_params(value))
+                }
             }
         } else {
             "0".to_string()

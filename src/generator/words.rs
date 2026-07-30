@@ -3122,6 +3122,16 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
         result = re_idx.replace_all(&result, "0").to_string();
     }
 
+    // Phase -1b: replace positional parameters $N (digits only) inside arithmetic
+    // with $_[N-1] so they refer to the script's arguments, not Perl's $1 regex var.
+    {
+        let re_pos = regex::Regex::new(r"\$(\d+)").unwrap();
+        result = re_pos.replace_all(&result, |caps: &regex::Captures| {
+            let n: usize = caps[1].parse().unwrap_or(1);
+            format!("$_[{}]", n.saturating_sub(1))
+        }).to_string();
+    }
+
     // Phase 0a: replace bash array-length syntax ${#var[@]} with scalar(@var)
     // Use placeholders to protect against later variable conversion.
     let mut arr_len_replacements: Vec<(String, String)> = Vec::new();
