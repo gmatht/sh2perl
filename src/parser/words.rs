@@ -2740,6 +2740,10 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 // a single-quoted string where ( ) and $ are literal.
                 // Also handle backslash escapes.
                 let mut sq_depth = false;
+                // Track double-quote depth inside $(): a " inside $() is a
+                // double-quoted string where ' is literal and must NOT toggle
+                // sq_depth.
+                let mut dq_depth = 0i32;
                 while i < content.len() && paren_count > 0 {
                     // Check for backslash escape first; skip the escaped char.
                     if content[i..].starts_with('\\') {
@@ -2747,8 +2751,16 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         continue;
                     }
                     match content[i..].chars().next() {
-                        Some('\'') => {
-                            // Toggle single-quote depth.
+                        Some('"') if dq_depth == 0 => {
+                            // Toggle double-quote depth.
+                            dq_depth = 1;
+                        }
+                        Some('"') => {
+                            dq_depth = 0;
+                        }
+                        Some('\'') if dq_depth == 0 => {
+                            // Toggle single-quote depth, but only when NOT
+                            // inside a double-quoted string within $().
                             sq_depth = !sq_depth;
                         }
                         Some('(') if !sq_depth => paren_count += 1,
