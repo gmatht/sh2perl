@@ -101,7 +101,39 @@ fn merge_contiguous_quoted_fragments(
                 let fragment_word = parse_string_interpolation(lexer)?;
                 match plain_text_of_word(&fragment_word) {
                     Some(text) => text,
-                    None => break,
+                    None => {
+                        // The DoubleQuotedString contains variables or
+                        // other non-plain-text parts.  Merge the parsed
+                        // parts into the current word.
+                        let word_literal = match word {
+                            Word::Literal(s, _) => Some(s.clone()),
+                            Word::StringInterpolation(interp, _) => {
+                                let mut s = String::new();
+                                for p in &interp.parts {
+                                    if let StringPart::Literal(t) = p {
+                                        s.push_str(t);
+                                    }
+                                }
+                                if s.is_empty() { None } else { Some(s) }
+                            }
+                            _ => None,
+                        };
+                        if let Word::StringInterpolation(frag_interp, _) = fragment_word {
+                            let mut new_parts = Vec::new();
+                            if let Some(lit) = word_literal {
+                                new_parts.push(StringPart::Literal(lit));
+                            }
+                            new_parts.extend(frag_interp.parts);
+                            *word = Word::StringInterpolation(
+                                StringInterpolation { parts: new_parts },
+                                None,
+                            );
+                        }
+                        // We consumed the fragment but cannot represent it
+                        // as a plain string.  Break out so the merged word
+                        // (now a StringInterpolation) is returned as-is.
+                        break;
+                    }
                 }
             }
             Some(Token::DollarSingleQuotedString) => match parse_ansic_quoted_string(lexer)? {

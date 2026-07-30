@@ -4,8 +4,8 @@
 003_pipeline.sh	stdout mismatch
 009_arrays.sh	stdout mismatch
 012_process_substitution.sh	stdout mismatch
-015_grep_advanced.sh	stdout mismatch
 016_grep_basic.sh	stdout mismatch
+015_grep_advanced.sh	stdout mismatch
 019_grep_regex.sh	stdout mismatch
 017_grep_context.sh	stdout mismatch
 018_grep_params.sh	stdout mismatch
@@ -14,9 +14,8 @@
 045_shell_calling_perl.sh	stdout mismatch
 050_test_ls_star_dot_sh.sh	stdout mismatch
 057_case.sh	stdout mismatch
-051_primes.sh	stdout mismatch
 062_09_complex_function.sh	stdout mismatch
-062_10_simple_pipeline.sh	stdout mismatch
+051_primes.sh	stdout mismatch
 062_15_complex_local_variables.sh	stdout mismatch
 062_hard_to_lex.sh	stdout mismatch
 063_09_complex_function_parameter_handling.sh	stdout mismatch
@@ -48,7 +47,6 @@ dollar-minus.sh	stdout mismatch
 dollar-positional-arithmetic.sh	stdout mismatch
 double-bracket-and-chain.sh	stdout mismatch
 escaped-paren-command-subst.sh	stdout mismatch
-escaped-singlequote-in-doublequote.sh	stdout mismatch
 generator-system-echo-checkqx.sh	stdout mismatch
 gunzip_example.sh	stdout mismatch
 heredoc-backtick-quote-span.sh	stdout mismatch
@@ -64,8 +62,8 @@ param-expand-hash-sameline.sh	stdout mismatch
 param-expand-hash.sh	stdout mismatch
 param-expand-hashhash.sh	stdout mismatch
 parse-dollar-in-arithmetic.sh	stdout mismatch
-parse-dollar-paren-pipe.sh	stdout mismatch
 parse-dollar-single-quote.sh	stdout mismatch
+parse-dollar-paren-pipe.sh	stdout mismatch
 parse-dot-after-var.sh	stdout mismatch
 parse-double-semicolon.sh	stdout mismatch
 parse-error-block-in-pipeline.sh	stdout mismatch

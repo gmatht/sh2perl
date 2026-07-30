@@ -2,11 +2,43 @@
 
 ## Current status
 
-**421 passed, 96 failed** (up from 417/100; fixed `dqs-nested-awk-sed.sh`,
-`parse-paren-after-do.sh`, `parse-unexpected-end-of-input.sh`,
-`parse-unexpected-parenclose.sh`, `escaped-singlequote-in-doublequote.sh`)
+**424 passed, 94 failed** (up from 421/96; fixed `keyword-in-arg.sh`,
+`escaped-paren-command-subst.sh`)
 
 ### Fixed this session:
+- `keyword-in-arg.sh` — StringInterpolation merge failure: when a literal
+  (`of=`) was immediately adjacent to a `DoubleQuotedString` containing
+  a variable (`"$tmpf"`), `merge_contiguous_quoted_fragments` in the parser
+  consumed the `DoubleQuotedString` token via `parse_string_interpolation`
+  but then discarded it when `plain_text_of_word` returned `None` (because
+  the interpolation contains a Variable). Fixed by merging the interpolation
+  parts into the current word when the fragment cannot be represented as
+  plain text, creating a `StringInterpolation` word that preserves both
+  the literal prefix and the variable reference.
+  (Files: `src/parser/words.rs`)
+
+- `escaped-paren-command-subst.sh` — The grep pattern `foo\(bar` (BRE
+  with an unclosed group `\(` without matching `\)`) was being blindly
+  converted to `foo(bar` (Perl regex open group) via
+  `regex_pattern.replace("\\(", "(")`, producing an invalid Perl
+  regex that crashed at compile time. Fixed by checking for balanced
+  `\(` / `\)` pairs: only convert when matched, leaving unmatched
+  `\(` as `\(` (literal paren match in Perl) to avoid generating
+  invalid regex syntax.
+  (Files: `src/generator/commands/grep.rs`)
+
+- `qx-var-builtin-cd.sh` (partial) — The `cd -- "$(dirname "$0")"`
+  pattern had two `cd` handlers (one in `simple_commands.rs` for
+  standalone `cd`, one in `words.rs` for `cd` inside command
+  substitution) that both ignored `--` and used `args[0]` directly,
+  causing the second argument (the command substitution) to be
+  lost. Fixed both handlers to skip leading `--` and use `args[1]`
+  when present. The test still fails because `$0` is set to the
+  basename only, so `dirname` returns `.` instead of the actual
+  script directory.
+  (Files: `src/generator/commands/simple_commands.rs`,
+  `src/generator/words.rs`)
+
 - `dqs-nested-awk-sed.sh` — Combined DQS/SQS nesting failure: the
   `merge_double_quoted_strings` byte scanner in the lexer did not track
   single-quote depth inside `$(...)`, so a literal `)` inside single quotes
