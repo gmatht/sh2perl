@@ -442,6 +442,198 @@ But even the `bc` version works — it's just slower. For a Pong game
 running at 60 FPS with a transpiler eliminating the subprocess overhead,
 the `bc` calls become inline JS arithmetic anyway.
 
+## Two Kinds of Internet Access: Fetch vs. Navigate
+
+The initial vision focused on `cat /http/...` which uses `fetch()` and is
+subject to CORS. But the browser has a second channel: **navigation**.
+
+| Mechanism | CORS required? | Returns | Shell command |
+|---|---|---|---|
+| `fetch()` | ✅ Required | Response body (text, JSON, binary) | `curl`, `cat /http/...` |
+| `window.open()` / `<a href>` | ❌ Not needed | Browser navigates to the URL | `open <url>` |
+
+`open` is the browser's native escape hatch:
+
+```bash
+# These fail — target site has no CORS:
+curl https://en.wikipedia.org/wiki/Bash        # ❌
+cat /http/en.wikipedia.org/wiki/Bash           # ❌
+
+# This always works — it's a native navigation:
+open https://en.wikipedia.org/wiki/Bash         # ✅
+```
+
+The semantic difference:
+
+- `curl` / `cat /http/...` — "give me this data to process in my script"
+- `open` — "show this to the user in a tab"
+
+They compose naturally in a script:
+
+```bash
+# It handles arbitrary URLs with no CORS concerns.
+# "Open the GitHub page for every repo with >1000 stars"
+for repo in /mount/github:trending/*/; do
+  stars=$(cat "$repo/stargazers_count")
+  if [ "$stars" -gt 1000 ]; then
+    open "$(cat "$repo/html_url")"
+  fi
+done
+
+# "Search for a topic, open the most relevant Wikipedia pages"
+for page in /wiki/search?q=bash+scripting/*/; do
+  open "https://en.wikipedia.org/wiki/$(basename $page)"
+done
+```
+
+## What Can Be Developed Separately from sh2perl
+
+Most of this vision does **not** require modifying the shell transpiler.
+The transpiler's job is one thing: **bash syntax → correct JavaScript**.
+Everything else is a runtime library that the generated JS calls into.
+
+### Layer 0: The JavaScript Runtime Library (`sh2perl-runtime`)
+
+This is a standalone npm package. It implements the virtual filesystem
+abstractions. The generated JS imports it:
+
+```javascript
+import { fs, term, sh } from "sh2perl-runtime";
+
+// Generated code calls these:
+let content = await fs.read("/http/example.com/data.json");
+await fs.write("/pc/report.csv", data);
+let keys = await fs.read("/dev/input/keyboard");
+```
+
+This library can be developed independently. It doesn't need the
+transpiler at all — you can use it from plain JavaScript right now.
+
+**What's in it:**
+
+| Module | Independent? | Depends on sh2perl? |
+|---|---|---|
+| `ramfs` — in-memory filesystem | ✅ Yes | ❌ No |
+| `localStorageFS` — persistent scratch | ✅ Yes | ❌ No |
+| `downloadFS` — `/pc/` write triggers download | ✅ Yes | ❌ No |
+| `clipboardFS` — `/clip/` read/write | ✅ Yes | ❌ No |
+| `httpFS` — `/http/...` via fetch | ✅ Yes | ❌ No |
+| `githubFS` — `/mount/github:...` | ✅ Yes | ❌ No |
+| `npmFS` — `/mount/npm:...` | ✅ Yes | ❌ No |
+| `inputFS` — `/dev/input/keyboard` | ✅ Yes | ❌ No |
+| `webglFS` — `/dev/webgl/*` | ✅ Yes | ❌ No |
+| `procFS` — `/proc/cpu`, `/proc/mem` | ✅ Yes | ❌ No |
+
+Each mount handler is a standalone class implementing a small interface:
+
+```typescript
+interface VirtualFS {
+  read(path: string): Promise<Uint8Array | null>;
+  write(path: string, data: Uint8Array): Promise<void>;
+  list(path: string): Promise<string[]>;
+  remove(path: string): Promise<void>;
+  exists(path: string): Promise<boolean>;
+}
+```
+
+You could publish `sh2perl-runtime` on npm today without writing a
+single line of transpiler code. It's a browser filesystem library that
+happens to pair well with the transpiler.
+
+### Layer 1: The REPL Shell (Terminal UI)
+
+A standalone web app that combines:
+
+- **xterm.js** — terminal emulator UI
+- **sh2perl-runtime** — the virtual filesystem
+- A **read-eval-print loop** that evaluates commands
+
+Initially this could use a **JavaScript REPL** (no bash syntax):
+
+```javascript
+// Type this in the terminal:
+> fs.read("https://api.github.com/repos/user/repo/readme")
+  .then(console.log)
+
+> await fs.write("/pc/report.csv", "a,b,c\n1,2,3")
+  // Your browser downloads report.csv
+
+> fs.list("/mount/npm:lodash")
+  .then(files => files.forEach(f => console.log(f)))
+```
+
+This works **without sh2perl**. The bash transpilation only becomes
+relevant when you want to type bash syntax instead of JavaScript.
+
+### Layer 2: The Transpiler (sh2perl compiled to WASM)
+
+This is the one piece that requires the Rust codebase. Compile
+sh2perl to WASM, expose a `bashToJS(code: string) => string` function.
+
+```javascript
+import init, { bashToJS } from "sh2perl-wasm";
+
+await init();
+let js = bashToJS(`echo "hello world" | grep hello`);
+// js = `
+//   import { sh } from "sh2perl-runtime";
+//   let output = await sh.pipeline([
+//     () => sh.exec("echo", ["hello world"]),
+//     (input) => sh.exec("grep", ["hello"], { input })
+//   ]);
+// `
+```
+
+### Layer 3: Integration — The Browser Shell
+
+The final product combines all three layers:
+
+```
+┌──────────────────────────────────────────┐
+│  xterm.js (terminal UI)                  │
+│    │                                     │
+│    ├ User types bash ──→ sh2perl-wasm    │
+│    │                     → generated JS  │
+│    │                                     │
+│    └ Generated JS calls sh2perl-runtime  │
+│        → reads/writes virtual filesystem │
+│        → routes to correct mount handler │
+│        → displays output in terminal     │
+└──────────────────────────────────────────┘
+```
+
+### Build Order (Independent Projects)
+
+| Step | Project | Depends on | Delivers |
+|---|---|---|---|
+| 1 | `sh2perl-runtime` (npm) | Nothing | Virtual FS with ramfs, localStorage, HTTP, GitHub mounts. Usable from plain JS. |
+| 2 | Terminal REPL | sh2perl-runtime | xterm.js + JS read-eval-print loop. Full `/dev/` and `/mount/` access from JavaScript. |
+| 3 | `sh2perl-wasm` | sh2perl repo | WASM-compiled bash→JS transpiler. Single function: `bashToJS(code)` |
+| 4 | Browser bash shell | Steps 2 + 3 | Type bash, run in browser. The full vision. |
+
+**Step 1 is the critical enabler.** It's the foundation everything else
+builds on, and it can ship today as a standalone library regardless of
+the transpiler's status.
+
+### What Requires the Transpiller
+
+Very little, in terms of features:
+
+| Feature | Needs sh2perl? | Alternative |
+|---|---|---|
+| Virtual filesystem mounts | ❌ No | JavaScript API: `fs.read()`, `fs.write()` |
+| `/dev/webgl` rendering | ❌ No | JS API: `fs.write("/dev/webgl/call", ...)` |
+| GitHub repo browsing | ❌ No | JS API: `fs.list("/mount/github:user/repo")` |
+| Pipes between commands | ❌ No | JS: `sh.pipeline(...)` runtime function |
+| Control flow (if/for/while) | ❌ No | JS already has these |
+| `ls`, `cat`, `grep` commands | ❌ No | JS wrappers: `await ls("/tmp")` |
+| **Bash syntax instead of JS** | ✅ Yes | Type `if [ -f x ]` instead of `if (await fs.exists("x"))` |
+
+Everything except the last row is a **runtime library concern**, not a
+transpiler concern. The transpiler's sole value-add is letting users
+write bash syntax. The filesystem, the mounts, the devices, the terminal
+— those are all independent.
+
 ## Summary
 
 This is a **serious joke**. The syntax is absurd — writing a real-time 3D

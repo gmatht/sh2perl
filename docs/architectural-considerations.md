@@ -792,6 +792,15 @@ Implementation steps:
    eliminating ~2000 lines of formatting code. The risk is over-investing in
    ESTree infrastructure before the core IR is validated by a non-JS backend.
 
+### Separable Components
+
+Most of the browser-shell vision does not require modifying sh2perl.
+The runtime library (`sh2perl-runtime`), virtual filesystem mounts
+(ramfs, localStorage, HTTP, GitHub), terminal REPL, and device drivers
+(`/dev/webgl`, `/dev/input`) can all be built as standalone JavaScript
+projects. sh2perl's only role is bash→JS transpilation — everything else
+is a runtime concern.
+
 ---
 
 *See also: [bash-game-vision.md](bash-game-vision.md) for a speculative
