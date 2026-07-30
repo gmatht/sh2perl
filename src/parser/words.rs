@@ -1252,7 +1252,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
     };
 
     let mut result = result?;
-    if lexer.current_position() == start_pos {
+    if lexer.current_position() != start_pos {
         merge_contiguous_quoted_fragments(lexer, &mut result)?;
     }
 
@@ -2141,6 +2141,11 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
     let content = content.replace("\\\"", "\"");
     let content = content.replace("\\\\", "\\");
+    // Remove backslash-newline line continuations (\<newline>)
+    // that were not handled by the lexer's regex (logos captures
+    // them inside the DoubleQuotedString token).
+    let content = content.replace("\\\n", "");
+    let content = content.replace("\\\r\n", "");
 
     if crate::debug::is_debug_enabled() {
         eprintln!("DEBUG parse_string_interpolation: content len={}, content={:?}", content.len(), &content[..content.len().min(80)]);

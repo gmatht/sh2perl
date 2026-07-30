@@ -37,6 +37,17 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
         while i < bytes.len() {
             match bytes[i] {
                 b'"' => { result.push_str("\\\""); }
+                b'\\' => {
+                    // Check if this is a line continuation (backslash followed by newline).
+                    // In that case, preserve both as-is — Perl also treats \<newline> as
+                    // line continuation, matching shell semantics.
+                    let is_line_continuation = i + 1 < bytes.len() && bytes[i + 1] == b'\n';
+                    if is_line_continuation {
+                        result.push_str("\\\\");  // Keep \\ in Perl source so \n is a line continuation
+                    } else {
+                        result.push_str("\\\\");  // Escape: \\ → \\
+                    }
+                }
                 b'@' => { result.push_str("\\@"); }
                 b'$' => {
                     let next = if i + 1 < bytes.len() { Some(bytes[i + 1]) } else { None };
@@ -2752,7 +2763,8 @@ pub fn convert_string_interpolation_to_perl_impl(
                             || matches!(var.as_str(), "#" | "@" | "*" | "-" | "0" | "$")
                         {
                             // Regular declared variable - add directly for interpolation
-                            current_string.push_str(&format!("${}", var));
+                            // Use ${var} syntax to prevent merging with adjacent literal text
+                            current_string.push_str(&format!("${{{}}}", var));
                         } else {
                             // Undeclared variable - use $ENV{}
                             current_string.push_str(&format!("$ENV{{{}}}", var));
