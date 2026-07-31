@@ -1644,6 +1644,28 @@ pub fn perl_expr_to_ir(perl_expr: &str) -> IrExpr {
     // Double-quoted string literal: "..."
     if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
         let inner = &trimmed[1..trimmed.len()-1];
+        // If the inner content contains a double quote that is NOT preceded
+        // by a backslash, this is NOT a simple double-quoted string literal
+        // but rather a concatenation expression like "a" . $x . "b" that
+        // happens to start and end with ".
+        let has_bare_quote = {
+            let bytes = inner.as_bytes();
+            let mut i = 0;
+            let mut found = false;
+            while i < bytes.len() {
+                if bytes[i] == b'\"' {
+                    if i == 0 || bytes[i-1] != b'\\' {
+                        found = true;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            found
+        };
+        if has_bare_quote {
+            return IrExpr::RawExpr(trimmed.to_string());
+        }
         // If the inner content has no $, @, or \ (escapes), it's safe as Str.
         let has_interp = inner.contains('$') || inner.contains('@');
         let has_escapes = inner.contains('\\');
