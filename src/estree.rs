@@ -829,14 +829,14 @@ fn assignment_expr(a: &Assignment) -> Expr {
             let array = Expr::ArrayExpression {
                 elements: elements.iter().map(|e| Some(str_lit(e))).collect(),
             };
-            let callee = if matches!(a.operator, AssignmentOperator::PlusAssign) {
+            let callee = if matches!(&a.operator, AssignmentOperator::PlusAssign) {
                 "setArrayAppend"
             } else {
                 "setArray"
             };
             sh2_call(callee, vec![str_lit(name), array])
         }
-        _ => match a.operator {
+        _ => match &a.operator {
             AssignmentOperator::Assign => sh2_call(
                 "setVar",
                 vec![str_lit(&a.variable), word_to_expr_quoted(&a.value)],
@@ -853,7 +853,7 @@ fn assignment_expr(a: &Assignment) -> Expr {
     }
 }
 
-fn assign_op_str(op: AssignmentOperator) -> &'static str {
+fn assign_op_str(op: &AssignmentOperator) -> &'static str {
     match op {
         AssignmentOperator::Assign => "=",
         AssignmentOperator::PlusAssign => "+=",
