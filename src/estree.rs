@@ -216,7 +216,7 @@ fn stmt_for_command(cmd: &Command) -> Option<Stmt> {
         Command::Assignment(a) => Stmt::ExpressionStatement {
             expression: sh2_call(
                 "setVar",
-                vec![str_lit(&a.variable), word_to_expr(&a.value)],
+                vec![str_lit(&a.variable), word_to_expr_quoted(&a.value)],
             ),
         },
         Command::If(if_stmt) => Stmt::IfStatement {
@@ -473,6 +473,7 @@ fn command_to_expr(cmd: &Command) -> Expr {
             &bc.redirects,
         ),
         Command::Redirect(rc) => apply_redirects(command_to_expr(&rc.command), &rc.redirects),
+        Command::Pipeline(p) => pipeline_expr(p),
         Command::Subshell(c) => async_sh2_call("subshell", vec![arrow(vec![], command_arrow_body(c))]),
         Command::Block(b) => async_sh2_call(
             "block",
@@ -489,7 +490,7 @@ fn command_to_expr(cmd: &Command) -> Expr {
         ),
         Command::Assignment(a) => sh2_call(
             "setVar",
-            vec![str_lit(&a.variable), word_to_expr(&a.value)],
+            vec![str_lit(&a.variable), word_to_expr_quoted(&a.value)],
         ),
         Command::ShoptCommand(s) => sh2_call(
             "shopt",
@@ -646,7 +647,10 @@ fn exec_call_with_env(name: &Word, args: &[Word], env: &BTreeMap<String, Word>, 
     let mut call_args = vec![word_to_expr(name), args_array(args)];
     if !env.is_empty() {
         call_args.push(Expr::ObjectExpression {
-            properties: env.iter().map(|(k, v)| prop(k, word_to_expr(v))).collect(),
+            properties: env
+                .iter()
+                .map(|(k, v)| prop(k, word_to_expr_quoted(v)))
+                .collect(),
         });
     }
     apply_redirects(async_sh2_call("exec", call_args), redirects)
@@ -751,6 +755,20 @@ fn args_array(args: &[Word]) -> Expr {
     }
 }
 
+/// Like `word_to_expr` but command substitutions do NOT word-split
+/// (assignment values, env values — bash keeps internal spaces there).
+fn word_to_expr_quoted(word: &Word) -> Expr {
+    match word {
+        Word::CommandSubstitution(cmd, _) => Expr::AwaitExpression {
+            argument: Box::new(sh2_call(
+                "capture",
+                vec![arrow(vec![], command_arrow_body(cmd))],
+            )),
+        },
+        _ => word_to_expr(word),
+    }
+}
+
 fn word_to_expr(word: &Word) -> Expr {
     match word {
         Word::Literal(s, _) => Expr::Literal {
@@ -759,9 +777,10 @@ fn word_to_expr(word: &Word) -> Expr {
         },
         Word::Variable(name, _, _) => sh2_call("getVar", vec![str_lit(name)]),
         Word::CommandSubstitution(cmd, _) => Expr::AwaitExpression {
-            // Closure so the runtime can redirect fd 1 BEFORE the command runs.
+            // Unquoted $(...) / `...`: bash word-splits the captured output, so
+            // the runtime returns an ARRAY of words (exec flattens arrays).
             argument: Box::new(sh2_call(
-                "capture",
+                "captureWords",
                 vec![arrow(vec![], command_arrow_body(cmd))],
             )),
         },
@@ -898,10 +917,15 @@ mod tests {
 
     #[test]
     fn command_substitution_uses_await_capture() {
+        // Unquoted $(...) word-splits: captureWords returns an arg array.
         let json = to_json("echo $(date)");
         assert!(json.contains("\"type\":\"AwaitExpression\""));
-        assert!(json.contains("\"name\":\"capture\""));
+        assert!(json.contains("\"name\":\"captureWords\""));
         assert!(!json.contains("unsupported"));
+        // Quoted "$(...)" stays a plain template capture (no word splitting).
+        let json2 = to_json("echo \"$(date)\"");
+        assert!(json2.contains("\"name\":\"capture\""));
+        assert!(!json2.contains("captureWords"));
     }
 
     #[test]
