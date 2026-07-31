@@ -214,10 +214,7 @@ fn stmt_for_command(cmd: &Command) -> Option<Stmt> {
         // v0: operator (e.g. +=) not yet represented; structural gate flags
         // non-Assign operators when they matter.
         Command::Assignment(a) => Stmt::ExpressionStatement {
-            expression: sh2_call(
-                "setVar",
-                vec![str_lit(&a.variable), word_to_expr_quoted(&a.value)],
-            ),
+            expression: assignment_expr(a),
         },
         Command::If(if_stmt) => Stmt::IfStatement {
             test: command_to_expr(&if_stmt.condition),
@@ -401,9 +398,14 @@ fn for_item_expr(w: &Word) -> Expr {
         Word::Variable(name, _, _) if name == "@" || name == "*" => {
             sh2_call("listVar", vec![str_lit(name)])
         }
-        Word::StringInterpolation(interp, _) => match pure_at_parts(interp) {
-            Some(name) => sh2_call("listVar", vec![str_lit(name)]),
-            None => word_to_expr(w),
+        Word::StringInterpolation(interp, _) => {
+            if let Some(arr_expr) = pure_array_template_parts(interp) {
+                return arr_expr;
+            }
+            match pure_at_parts(interp) {
+                Some(name) => sh2_call("listVar", vec![str_lit(name)]),
+                None => word_to_expr(w),
+            }
         },
         _ => word_to_expr(w),
     }
@@ -488,10 +490,7 @@ fn command_to_expr(cmd: &Command) -> Expr {
                 arrow(vec![], ArrowBody::Block(Box::new(block_stmt(&w.body.commands)))),
             ],
         ),
-        Command::Assignment(a) => sh2_call(
-            "setVar",
-            vec![str_lit(&a.variable), word_to_expr_quoted(&a.value)],
-        ),
+        Command::Assignment(a) => assignment_expr(a),
         Command::ShoptCommand(s) => sh2_call(
             "shopt",
             vec![
@@ -787,12 +786,110 @@ fn word_to_expr(word: &Word) -> Expr {
                 vec![arrow(vec![], command_arrow_body(cmd))],
             )),
         },
-        Word::StringInterpolation(interp, _) => template_from_parts(&interp.parts),
+        Word::StringInterpolation(interp, _) => match pure_template_part(interp) {
+            Some(expr) => expr,
+            None => template_from_parts(&interp.parts),
+        },
         Word::ParameterExpansion(pe, _) => param_expansion_to_expr(pe),
         Word::Arithmetic(ae, _) => sh2_call("arith", vec![str_lit(&ae.expression)]),
         Word::BraceExpansion(be, _) => brace_expansion_to_expr(be),
+        // Arrays: `arr=(a b c)` assignment, `arr[i]`, `${arr[@]}`, `${#arr[@]}`
+        Word::Array(name, elements, _) => sh2_call(
+            "setArray",
+            vec![
+                str_lit(name),
+                Expr::ArrayExpression {
+                    elements: elements.iter().map(|e| Some(str_lit(e))).collect(),
+                },
+            ],
+        ),
+        Word::MapAccess(name, key, _) => sh2_call("arrayIndex", vec![str_lit(name), str_lit(key)]),
+        Word::MapKeys(name, _) => sh2_call("arrayItems", vec![str_lit(name)]),
+        Word::MapLength(name, _) => sh2_call("arrayLen", vec![str_lit(name)]),
+        Word::ArraySlice(name, offset, length, _) => sh2_call(
+            "param",
+            vec![
+                str_lit("slice"),
+                str_lit(name),
+                str_lit(offset),
+                str_lit(length.as_deref().unwrap_or("")),
+            ],
+        ),
         other => sh2_call("unsupported", vec![str_lit(&other.to_string())]),
     }
+}
+
+/// Assignment lowering: `arr=(a b c)` sets an array directly (sh2.setArray);
+/// everything else sets a scalar (sh2.setVar).
+fn assignment_expr(a: &Assignment) -> Expr {
+    match &a.value {
+        Word::Array(name, elements, _) => sh2_call(
+            "setArray",
+            vec![
+                str_lit(name),
+                Expr::ArrayExpression {
+                    elements: elements.iter().map(|e| Some(str_lit(e))).collect(),
+                },
+            ],
+        ),
+        _ => sh2_call(
+            "setVar",
+            vec![str_lit(&a.variable), word_to_expr_quoted(&a.value)],
+        ),
+    }
+}
+
+/// A `"${arr[@]}"`-style interpolation (empty surrounding literals, a single
+/// array-returning part) → the raw array expression, so exec/forLoop flatten
+/// it into separate args/items like bash. None otherwise.
+fn pure_array_template_parts(interp: &StringInterpolation) -> Option<Expr> {
+    let non_literal: Vec<&StringPart> = interp
+        .parts
+        .iter()
+        .filter(|p| !matches!(p, StringPart::Literal(s) if s.is_empty()))
+        .collect();
+    if non_literal.len() != 1 {
+        return None;
+    }
+    match non_literal[0] {
+        StringPart::MapKeys(name) => Some(sh2_call("arrayItems", vec![str_lit(name)])),
+        StringPart::MapAccess(name, key) if key == "@" || key == "*" => {
+            Some(sh2_call("arrayIndex", vec![str_lit(name), str_lit(key)]))
+        }
+        StringPart::ArraySlice(name, offset, length) if offset == "@" || offset == "*" => {
+            Some(sh2_call(
+                "param",
+                vec![
+                    str_lit("slice"),
+                    str_lit(name),
+                    str_lit(offset),
+                    str_lit(length.as_deref().unwrap_or("")),
+                ],
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// A pure interpolation (empty surrounding literals, ONE non-literal part)
+/// lowers to the raw part expression instead of a template literal — the
+/// runtime decides string vs array, and exec/forLoop flatten arrays into
+/// separate args/items exactly like bash ("${arr[@]}" → per-element args).
+fn pure_template_part(interp: &StringInterpolation) -> Option<Expr> {
+    let mut non_literal: Option<&StringPart> = None;
+    for p in &interp.parts {
+        match p {
+            StringPart::Literal(s) if s.is_empty() => {}
+            StringPart::Literal(_) => return None, // any non-empty literal → template
+            other => {
+                if non_literal.is_some() {
+                    return None;
+                }
+                non_literal = Some(other);
+            }
+        }
+    }
+    non_literal.map(part_to_expr)
 }
 
 /// `${var...}` parameter expansion → `sh2.param(op, name, args...)`. The
@@ -900,6 +997,18 @@ fn part_to_expr(part: &StringPart) -> Expr {
         StringPart::Variable(name) => sh2_call("getVar", vec![str_lit(name)]),
         StringPart::ParameterExpansion(pe) => param_expansion_to_expr(pe),
         StringPart::Arithmetic(ae) => sh2_call("arith", vec![str_lit(&ae.expression)]),
+        StringPart::MapAccess(name, key) => sh2_call("arrayIndex", vec![str_lit(name), str_lit(key)]),
+        StringPart::MapKeys(name) => sh2_call("arrayItems", vec![str_lit(name)]),
+        StringPart::MapLength(name) => sh2_call("arrayLen", vec![str_lit(name)]),
+        StringPart::ArraySlice(name, offset, length) => sh2_call(
+            "param",
+            vec![
+                str_lit("slice"),
+                str_lit(name),
+                str_lit(offset),
+                str_lit(length.as_deref().unwrap_or("")),
+            ],
+        ),
         StringPart::CommandSubstitution(cmd) => Expr::AwaitExpression {
             argument: Box::new(sh2_call(
                 "capture",
@@ -1008,9 +1117,12 @@ mod tests {
 
     #[test]
     fn unsupported_constructs_are_marked() {
-        // Array/map access is not yet lowered → must be flagged.
-        let json = to_json("echo ${arr[1]}");
-        assert!(json.contains("\"name\":\"unsupported\""));
+        // Regression guard: complex array/param/arith input must contain NO
+        // sh2.unsupported (every construct the parser emits is lowered).
+        let json = to_json(
+            "numbers=(1 2 3)\necho ${#numbers[@]} ${numbers[1]} ${numbers[@]:1:2}\necho $((2+3)) ${x:-d}",
+        );
+        assert!(!json.contains("\"name\":\"unsupported\""));
     }
 
     #[test]
