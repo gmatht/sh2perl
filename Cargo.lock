@@ -74,6 +74,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "debashcl"
+version = "0.1.0"
+dependencies = [
+ "debashl",
+ "lazy_static",
+ "md5",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "debashl"
 version = "0.1.0"
 dependencies = [

@@ -469,13 +469,13 @@ Before submitting, test your examples:
 
 ```bash
 # Test a specific example
-cargo run -- test examples/your_example.sh
+cargo run --bin debashc -- test examples/your_example.sh
 
 # Run all tests
-cargo run -- test-all
+cargo run --bin debashc -- test-all
 
 # Test with Perl::Critic enabled
-cargo run -- test-all --perl-critic
+cargo run --bin debashc -- test-all --perl-critic
 ```
 
 ### 10. **Example Structure Template**

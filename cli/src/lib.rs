@@ -1,10 +1,10 @@
-mod cache;
-mod cli_commands;
-mod execution;
-mod help;
-mod testing;
-mod timeout_manager;
-mod utils;
+pub mod cache;
+pub mod cli_commands;
+pub mod execution;
+pub mod help;
+pub mod testing;
+pub mod timeout_manager;
+pub mod utils;
 
 use std::env;
 use std::fs;
@@ -38,12 +38,7 @@ fn fix_command_substitution_placeholders(mut code: String) -> String {
     code
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    main_with_args(args);
-}
-
-fn main_with_args(args: Vec<String>) {
+pub fn main_with_args(args: Vec<String>) {
     let program_name = &args[0];
 
     if args.len() < 2 {

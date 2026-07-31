@@ -36,12 +36,13 @@ if ! rustup target list --installed | grep -qx "${TARGET}"; then
 fi
 
 # 2. Command module (exports _start; clean WASI command)
+#    debashc bin lives in the debashcl crate (workspace member `cli/`)
 echo "==> Building ${OUT}/debashc.wasm (WASI command)"
-cargo build --release --target "${TARGET}" --bin debashc
+cargo build --release --target "${TARGET}" -p debashcl --bin debashc
 
 # 3. Library module (exports _initialize + debashc_* C-ABI functions)
 echo "==> Building ${OUT}/debashl.wasm (WASM library)"
-cargo build --release --target "${TARGET}" --features wasi-lib --lib
+cargo build --release --target "${TARGET}" -p debashl --features wasi-lib --lib
 
 echo
 echo "Built:"

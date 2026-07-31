@@ -104,7 +104,7 @@ perl -MPerl::Critic -e "print Perl::Critic->VERSION"
 cargo build
 
 # Test with Perl::Critic
-cargo run fail 000 --perl-critic
+cargo run --bin debashc -- fail 000 --perl-critic
 ```
 
 ## Requirements
