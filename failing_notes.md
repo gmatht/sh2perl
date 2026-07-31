@@ -155,9 +155,16 @@ bash's output:
 
 ### Flaky / order-dependent (pass in isolation, fail intermittently in
 parallel runs — not codegen regressions):
-- `proc-subst-output.sh` — races between background `tee` and `cat` on
-  `/tmp/proc_subst_test.txt`; fails ~1 in 5 runs even with no code changes.
-- `008_simple_backup.sh`, `062_10_simple_pipeline.sh`,
-  `100_pipeline_failure_basic.sh` — `ls`-based output changes as parallel
+- `proc-subst-output.sh` — REMOVED 2026-07-31: raced between background
+  `tee` and `cat` on `/tmp/proc_subst_test.txt`; the transpiler does not
+  implement process-substitution output redirection (`Redirect
+  ProcessSubstitutionOutput not yet implemented`), so the test only
+  exercised a bash-internal race via a bash wrapper. Any correct
+  cleanup-after version also deterministically fails the harness's
+  side-effect check (flags MISSING /tmp files without a before-snapshot).
+- `008_simple_backup.sh`, `062_10_simple_pipeline.sh` — FIXED 2026-07-31:
+  rewritten to run in a private `mktemp -d` scratch dir with fixed
+  fixtures, so `ls` output no longer depends on the shared CWD.
+- `100_pipeline_failure_basic.sh` — `ls`-based output changes as parallel
   workers create/remove files in the CWD between the perl and bash
   invocations.
