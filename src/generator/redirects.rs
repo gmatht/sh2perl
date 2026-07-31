@@ -1015,8 +1015,21 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             var_name, array_name, key
                         ));
                     } else {
-                        // Export variable without assignment
-                        output.push_str(&format!("$ENV{{{}}} = ${};\n", var_name, var_name));
+                        // Export variable without assignment.  If the variable was
+                        // declared as a Perl local, copy its value into the
+                        // environment.  Otherwise it is an undeclared env-style
+                        // variable that is already tracked in %ENV (assignments to
+                        // such names emit `$ENV{var} = ...` directly), so `export`
+                        // is a no-op — re-reading it as `$var` would be a bare
+                        // undeclared reference and a `use strict` compile error.
+                        if generator.declared_locals.contains(var_name)
+                            || generator.function_level_vars.contains(var_name)
+                        {
+                            output.push_str(&format!(
+                                "$ENV{{{}}} = ${};\n",
+                                var_name, var_name
+                            ));
+                        }
                     }
                 }
             }
