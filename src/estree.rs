@@ -820,22 +820,47 @@ fn word_to_expr(word: &Word) -> Expr {
 }
 
 /// Assignment lowering: `arr=(a b c)` sets an array directly (sh2.setArray);
-/// everything else sets a scalar (sh2.setVar).
+/// `arr+=(...)` appends (sh2.setArrayAppend); compound scalar operators
+/// (`x+=v`, `x-=v`, ...) go through sh2.assign; everything else sets a
+/// scalar (sh2.setVar).
 fn assignment_expr(a: &Assignment) -> Expr {
     match &a.value {
-        Word::Array(name, elements, _) => sh2_call(
-            "setArray",
-            vec![
-                str_lit(name),
-                Expr::ArrayExpression {
-                    elements: elements.iter().map(|e| Some(str_lit(e))).collect(),
-                },
-            ],
-        ),
-        _ => sh2_call(
-            "setVar",
-            vec![str_lit(&a.variable), word_to_expr_quoted(&a.value)],
-        ),
+        Word::Array(name, elements, _) => {
+            let array = Expr::ArrayExpression {
+                elements: elements.iter().map(|e| Some(str_lit(e))).collect(),
+            };
+            let callee = if matches!(a.operator, AssignmentOperator::PlusAssign) {
+                "setArrayAppend"
+            } else {
+                "setArray"
+            };
+            sh2_call(callee, vec![str_lit(name), array])
+        }
+        _ => match a.operator {
+            AssignmentOperator::Assign => sh2_call(
+                "setVar",
+                vec![str_lit(&a.variable), word_to_expr_quoted(&a.value)],
+            ),
+            op => sh2_call(
+                "assign",
+                vec![
+                    str_lit(&a.variable),
+                    str_lit(assign_op_str(op)),
+                    word_to_expr_quoted(&a.value),
+                ],
+            ),
+        },
+    }
+}
+
+fn assign_op_str(op: AssignmentOperator) -> &'static str {
+    match op {
+        AssignmentOperator::Assign => "=",
+        AssignmentOperator::PlusAssign => "+=",
+        AssignmentOperator::MinusAssign => "-=",
+        AssignmentOperator::StarAssign => "*=",
+        AssignmentOperator::SlashAssign => "/=",
+        AssignmentOperator::PercentAssign => "%=",
     }
 }
 
