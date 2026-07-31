@@ -320,53 +320,55 @@ impl Generator {
 
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
-        output.push_str("use strict;\n");
-        output.push_str("use warnings;\n");
-        // Only emit imports that are actually needed by the generated code.
-        // Carp, English, locale are part of the original boilerplate but
-        // many scripts don't use them — skip when not needed.
-        // Carp and English are used by almost every generated script
-        // (redirects, error handling, command generators) so always import
-        // them rather than trying to detect which commands emit croak() or
-        // reference $OS_ERROR / $ERRNO.
-        output.push_str("use Carp;\n");
-        output.push_str("use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);\n");
+        // Unified import registry (M6): every `use` statement needed by the
+        // generated code is collected here and emitted in one pass below, in
+        // a fixed order, so the needs_*() AST-scans above are the only place
+        // that decides imports. Output is identical to the previous inline
+        // emissions (including the Digest::SHA column-alignment spacing).
+        let mut use_lines: Vec<String> = vec![
+            "use strict;".to_string(),
+            "use warnings;".to_string(),
+            // Carp/English are used by almost every generated script
+            // (redirects, error handling, command generators), so they are
+            // always imported rather than detected.
+            "use Carp;".to_string(),
+            "use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);".to_string(),
+        ];
         let needs_locale = self.needs_locale_import(ast);
         if needs_locale {
-            output.push_str("use locale;\n");
+            use_lines.push("use locale;".to_string());
         }
-
         if needs_basename {
-            output.push_str("use File::Basename;\n");
+            use_lines.push("use File::Basename;".to_string());
         }
-        // IPC::Open3 is used by command-substitution fallbacks and a few command generators.
-        // Many code paths in the generator use open3 for command substitutions that cannot
-        // be translated to native Perl.  Include it unconditionally (it's harmless when unused).
-        output.push_str("use IPC::Open3;\n");
-        if needs_file_find {
-            // No additional imports needed for glob-based approach
-        }
+        // IPC::Open3 backs command-substitution fallbacks; harmless when unused.
+        use_lines.push("use IPC::Open3;".to_string());
+        // needs_file_find needs no import (glob-based approach).
         if needs_digest_sha {
-            output.push_str("use Digest::SHA   qw(sha256_hex sha512_hex);\n");
+            use_lines.push("use Digest::SHA   qw(sha256_hex sha512_hex);".to_string());
         }
         if needs_file_path {
-            // Align with other use statements - 2 spaces when Digest::SHA is present, 1 space otherwise
+            // Align with other use statements — 2 spaces when Digest::SHA is
+            // present, 1 space otherwise.
             if needs_digest_sha {
-                output.push_str("use File::Path    qw(make_path remove_tree);\n");
+                use_lines.push("use File::Path    qw(make_path remove_tree);".to_string());
             } else {
-                output.push_str("use File::Path qw(make_path remove_tree);\n");
+                use_lines.push("use File::Path qw(make_path remove_tree);".to_string());
             }
         }
         if needs_file_copy {
-            // Use 2 spaces when Digest::SHA is present for column alignment, 1 space otherwise
             if needs_digest_sha {
-                output.push_str("use File::Copy  qw(copy move);\n");
+                use_lines.push("use File::Copy  qw(copy move);".to_string());
             } else {
-                output.push_str("use File::Copy qw(copy move);\n");
+                use_lines.push("use File::Copy qw(copy move);".to_string());
             }
         }
         if needs_posix {
-            output.push_str("use POSIX qw(time);\n");
+            use_lines.push("use POSIX qw(time);".to_string());
+        }
+        for line in &use_lines {
+            output.push_str(line);
+            output.push('\n');
         }
         if needs_date_snapshot {
             output.push_str("my $DATE_SNAPSHOT = time;\n");
