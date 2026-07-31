@@ -20,7 +20,7 @@ static NO_MAGIC_NUMBERS: AtomicBool = AtomicBool::new(false);
 // Import from our new modules
 use crate::cli_commands::{
     export_mir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
-    parse_file_to_perl, parse_input, parse_system_to_perl, parse_to_perl,
+    parse_file_to_estree, parse_file_to_perl, parse_input, parse_system_to_perl, parse_to_perl,
     parse_to_perl_inline, parse_to_perl_with_opts,
     run_generated,
 };
@@ -569,6 +569,13 @@ exit $main_exit_code;
                     println!("Error: Only 'perl' language is supported");
                     return;
                 }
+            } else if args.len() >= 3 && args[2] == "--estree" {
+                if args.len() < 4 {
+                    println!("Error: file --estree requires filename");
+                    return;
+                }
+                let filename = &args[3];
+                parse_file_to_estree(filename);
             } else if args.len() >= 3 && args[2] == "--perl-critic-only" {
                 if args.len() < 4 {
                     println!("Error: file --perl-critic-only requires filename");

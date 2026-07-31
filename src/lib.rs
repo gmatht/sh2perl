@@ -5,6 +5,7 @@ pub mod parser;
 // pub mod mir; // TODO: Fix MIR implementation
 pub mod ir;
 pub mod debug;
+pub mod estree;
 pub mod generator;
 pub mod mir_simple;
 pub mod shared_utils;

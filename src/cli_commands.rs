@@ -413,6 +413,29 @@ pub fn parse_file_to_perl(filename: &str) {
     }
 }
 
+/// Parse a shell file and emit **standard ESTree JSON** (v0 backend,
+/// `sh2.*` runtime namespace — see src/estree.rs / PLAN.md §1.2).
+pub fn parse_file_to_estree(filename: &str) {
+    match fs::read_to_string(filename) {
+        Ok(content) => {
+            let commands = match Parser::new(&content).parse() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Parse error: {}", e);
+                    return;
+                }
+            };
+            match debashl::estree::ast_to_estree_json(&commands) {
+                Ok(json) => println!("{}", json),
+                Err(e) => eprintln!("ESTree serialization error: {}", e),
+            }
+        }
+        Err(e) => {
+            eprintln!("Error reading file {}: {}", filename, e);
+        }
+    }
+}
+
 pub fn interactive_mode() {
     println!("Interactive mode - type 'quit' to exit");
     println!("{}", "=".repeat(50));
