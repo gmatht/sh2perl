@@ -1,7 +1,10 @@
 #!/bin/bash
 # Variable capture from pipeline
-files=$(ls /tmp 2>/dev/null | wc -l)
-echo "Files in /tmp: $files"
+d=$(mktemp -d)
+files=$(ls "$d" 2>/dev/null | wc -l)
+echo "Files: $files"
 count=$(echo "a b c" | wc -w)
 echo "Words: $count"
+cd /
+rm -rf "$d"
 echo "done"
