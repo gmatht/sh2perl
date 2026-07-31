@@ -57,6 +57,14 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         collect_assigned_vars(right, &mut right_vars);
         hoist_my_declarations(generator, &right_vars, &mut output);
     }
+    // Pre-declare variables assigned in the LEFT branch as well: bash has no
+    // block scoping, so `n=$(...) && test "$n" = ...` leaves $n visible after
+    // the statement even though the condition body is emitted inside a do {}.
+    {
+        let mut left_vars = std::collections::HashSet::new();
+        collect_assigned_vars(left, &mut left_vars);
+        hoist_my_declarations(generator, &left_vars, &mut output);
+    }
 
     // For other commands, use the original pattern with exit code checking
     output.push_str("if (");

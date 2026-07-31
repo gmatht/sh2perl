@@ -1056,12 +1056,14 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 }
             }
         }
-        "declare" => {
-            // Handle declare command
+        "declare" | "typeset" => {
+            // Handle declare command (typeset is a synonym)
             let mut is_assoc = false;
             let mut is_array = false;
             let mut is_print = false;
-            for arg in &cmd.args {
+            let mut i = 0;
+            while i < cmd.args.len() {
+                let arg = &cmd.args[i];
                 match arg {
                     Word::Literal(opt, _) => {
                         // Track flags like -a (indexed) and -A (associative)
@@ -1099,7 +1101,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             } else if generator.declared_locals.contains(var) {
                                 // Print scalar variable
                                 output.push_str(&generator.indent());
-                                output.push_str(&format!("print \"declare -- {}=${{}}\\\n\", ${};\n", var, var));
+                                output.push_str(&format!("print \"declare -- {}=${{{}}}\\n\", ${};\n", var, var, var));
                             } else {
                                 // Variable not declared, just print empty
                                 output.push_str(&generator.indent());
@@ -1113,7 +1115,56 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                     let var = parts[0];
                                     let value = parts[1];
                                     if !generator.function_level_vars.contains(var) {
-                                        let perl_value = shell_value_to_perl(value);
+                                        // The parser may split `var="quoted value"` into
+                                        // `Literal("var=")` + a following word (e.g.
+                                        // StringInterpolation/CommandSubstitution).  When
+                                        // the value after `=` is empty, look at the next
+                                        // argument for the actual value.
+                                        let mut perl_value = shell_value_to_perl(value);
+                                        if value.is_empty() && i + 1 < cmd.args.len() {
+                                            match &cmd.args[i + 1] {
+                                                Word::StringInterpolation(si, _) => {
+                                                    perl_value = generator.word_to_perl(
+                                                        &Word::StringInterpolation(
+                                                            si.clone(),
+                                                            None,
+                                                        ),
+                                                    );
+                                                    i += 1;
+                                                }
+                                                Word::CommandSubstitution(cs, _) => {
+                                                    perl_value = generator.word_to_perl(
+                                                        &Word::CommandSubstitution(
+                                                            cs.clone(),
+                                                            None,
+                                                        ),
+                                                    );
+                                                    i += 1;
+                                                }
+                                                Word::ParameterExpansion(pe, _) => {
+                                                    perl_value = generator.word_to_perl(
+                                                        &Word::ParameterExpansion(
+                                                            pe.clone(),
+                                                            None,
+                                                        ),
+                                                    );
+                                                    i += 1;
+                                                }
+                                                Word::Variable(v, _, _) => {
+                                                    perl_value = generator.word_to_perl(
+                                                        &Word::Variable(v.clone(), true, None),
+                                                    );
+                                                    i += 1;
+                                                }
+                                                Word::Arithmetic(arith, _) => {
+                                                    perl_value = generator.word_to_perl(
+                                                        &Word::Arithmetic(arith.clone(), None),
+                                                    );
+                                                    i += 1;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
                                         output.push_str(&generator.indent());
                                         if is_assoc {
                                             output.push_str(&format!("my %{} = ({});\n", var, perl_value));
@@ -1140,6 +1191,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                     generator.declared_locals.insert(opt.clone());
                                 }
                             }
+                            i += 1;
                         }
                     }
                     Word::Array(name, elements, _) => {
@@ -1166,8 +1218,11 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             }
                             generator.declared_locals.insert(name.clone());
                         }
+                        i += 1;
                     }
-                    _ => {}
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
         }

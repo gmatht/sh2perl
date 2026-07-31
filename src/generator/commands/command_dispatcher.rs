@@ -479,6 +479,22 @@ pub fn generate_command_impl_with_input(
                 )
             });
             if has_stderr_redirect && !has_output_redirect {
+                // Bash has no block scoping: an assignment inside a redirected
+                // command (e.g. `n=$(...) 2>/dev/null`) persists after it, but
+                // a `my $n;` declaration inside the do {} block would not.
+                // Hoist declarations for variables assigned by the base
+                // command out of the scope block so later references see the
+                // assigned value.
+                let mut assigned_vars: Vec<String> = Vec::new();
+                generator.collect_assigned_vars_in_command(&base_command, &mut assigned_vars);
+                for var in &assigned_vars {
+                    if !generator.declared_locals.contains(var)
+                        && !generator.function_level_vars.contains(var)
+                    {
+                        result.insert_str(0, &format!("my ${};\n", var));
+                        generator.declared_locals.insert(var.clone());
+                    }
+                }
                 result.insert_str(0, &format!("{}do {{\n", generator.indent()));
                 generator.indent_level += 1;
                 stderr_scope_opened = true;

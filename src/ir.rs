@@ -616,18 +616,32 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
 
         IrStmt::System { cmd, args, capture } => {
             let cmd_str = ir_expr_to_perl(cmd);
+            // Quote a string VALUE as a bash single-quoted shell word.
+            // (Perl-style `\'` escaping is NOT understood by bash inside
+            // single quotes, so embedded quotes must use the `'\''` idiom.)
+            let bash_quote = |s: &str| -> String {
+                format!("'{}'", s.replace('\'', "'\\''"))
+            };
             if let Some(var) = capture {
                 // Build a shell command string from the command and its arguments.
                 // Run it through bash -c to capture stdout.
                 let mut arg_parts: Vec<String> = Vec::new();
                 arg_parts.push(cmd_str.clone());
                 for a in args {
-                    let a_str = ir_expr_to_perl(a);
-                    // If the argument is already a Perl string literal, use it.
-                    if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
-                        arg_parts.push(a_str);
-                    } else {
-                        arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                    match a {
+                        IrExpr::Str(s, _) => {
+                            // Literal string: quote its value for bash.
+                            arg_parts.push(bash_quote(s));
+                        }
+                        _ => {
+                            let a_str = ir_expr_to_perl(a);
+                            // If the argument is already a Perl string literal, use it.
+                            if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
+                                arg_parts.push(a_str);
+                            } else {
+                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                            }
+                        }
                     }
                 }
                 let full_cmd = arg_parts.join(" ");
@@ -643,11 +657,19 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 let mut arg_parts: Vec<String> = Vec::new();
                 arg_parts.push(cmd_str.clone());
                 for a in args {
-                    let a_str = ir_expr_to_perl(a);
-                    if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
-                        arg_parts.push(a_str);
-                    } else {
-                        arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                    match a {
+                        IrExpr::Str(s, _) => {
+                            // Literal string: quote its value for bash.
+                            arg_parts.push(bash_quote(s));
+                        }
+                        _ => {
+                            let a_str = ir_expr_to_perl(a);
+                            if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
+                                arg_parts.push(a_str);
+                            } else {
+                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                            }
+                        }
                     }
                 }
                 let full_cmd = arg_parts.join(" ");
@@ -1719,7 +1741,15 @@ pub fn perl_expr_to_ir(perl_expr: &str) -> IrExpr {
         };
         // Ensure it's a valid identifier
         if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return IrExpr::Var(name.to_string(), Sigil::Scalar);
+            // All-uppercase names: the generator only emits a bare `$NAME`
+            // for variables it has declared as locals (undeclared variables
+            // render as `($ENV{NAME} // q{})`), so converting to IrExpr::Var
+            // would let ir_expr_to_perl's env-style heuristic wrongly remap
+            // them to $ENV{NAME}.  Keep them as RawExpr to preserve the
+            // generator's declared/local resolution.
+            if !name.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+                return IrExpr::Var(name.to_string(), Sigil::Scalar);
+            }
         }
     }
 
