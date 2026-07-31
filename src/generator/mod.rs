@@ -931,11 +931,25 @@ impl Generator {
                         && !self.function_level_vars.contains(&assignment.variable);
 
                     if is_env_style_var {
-                        // Use $ENV{var} = value (env-var style, no my declaration)
+                        // Bash semantics: a plain assignment creates a shell
+                        // variable; it does NOT export it to the environment.
+                        // Only variables that were already exported (inherited
+                        // from the environment, e.g. PATH/HOME) are kept in
+                        // sync automatically.  An explicit `export VAR` later
+                        // copies the local value into %ENV.
+                        self.declared_locals.insert(assignment.variable.clone());
                         if value_perl.starts_with('{') && value_perl.ends_with('}') {
-                            output.push_str(&format!("$ENV{{{}}} = do {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!("my ${} = do {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!(
+                                "$ENV{{{}}} = ${} if exists $ENV{{{}}};\n",
+                                assignment.variable, assignment.variable, assignment.variable
+                            ));
                         } else {
-                            output.push_str(&format!("$ENV{{{}}} = {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!("my ${} = {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!(
+                                "$ENV{{{}}} = ${} if exists $ENV{{{}}};\n",
+                                assignment.variable, assignment.variable, assignment.variable
+                            ));
                         }
                     } else if needs_decl_for_assign {
                         // Variable was not yet declared — combine declaration + assignment
@@ -1282,7 +1296,7 @@ impl Generator {
         }
     }
 
-    fn collect_assigned_vars_in_command(&self, cmd: &Command, vars: &mut Vec<String>) {
+    pub(crate) fn collect_assigned_vars_in_command(&self, cmd: &Command, vars: &mut Vec<String>) {
         match cmd {
             Command::Assignment(assign) => {
                 vars.push(assign.variable.clone());
