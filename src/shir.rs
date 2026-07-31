@@ -82,7 +82,7 @@ fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
         }
         Command::For(f) => IrStmt::For {
             var: f.variable.clone(),
-            iter: IrExpr::Array(f.items.iter().map(for_item_ir).collect()),
+            iter: IrExpr::Array(for_items_ir(&f.items)),
             body: body_stmts(&Command::Block(f.body.clone())),
         },
         Command::Block(b) => IrStmt::Block(
@@ -194,7 +194,11 @@ fn exec_call_ir(
     args: &[Word],
     env: &std::collections::BTreeMap<String, Word>,
 ) -> IrExpr {
-    let mut call_args = vec![word_ir(name), IrExpr::Array(args.iter().map(word_ir).collect())];
+    // `declare -A map=(...)` / `local -A options=()` — the array-literal arg
+    // is lowered to a side-effecting setArray call; tell it the map is
+    // associative so it registers the assoc store.
+    let assoc = args.iter().any(|a| matches!(a, Word::Literal(s, _) if s.starts_with("-A")));
+    let mut call_args = vec![word_ir(name), IrExpr::Array(exec_args_ir(args, assoc))];
     if !env.is_empty() {
         call_args.push(IrExpr::Object(
             env.iter()
@@ -205,21 +209,208 @@ fn exec_call_ir(
     call("exec", call_args)
 }
 
-fn assignment_value_ir(a: &Assignment) -> IrExpr {
-    match &a.value {
+/// Marker prefix the runtime recognizes on exec args / for-loop items (see
+/// sh2-namespace.mjs: `exec` glob-expands the suffix against the filesystem).
+/// Only UNQUOTED words may glob; the parser keeps double-quoted words as
+/// StringInterpolation (never tagged here), and single-quoted words are
+/// indistinguishable from bare ones in the AST — the corpus has no
+/// single-quoted globs in exec-arg position, so tagging all Literals with
+/// glob chars matches bash for every example.
+const GLOB_MAGIC: &str = "\u{1}SH2GLOB\u{1}";
+
+fn has_glob_chars(s: &str) -> bool {
+    // Skip `${...}` regions: `[`/`*`/`?` inside an expansion (`${#x[@]}`, `${x:-*}`)
+    // are parameter syntax, not glob patterns.
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < bytes.len() && depth > 0 {
+                if bytes[j] == b'{' {
+                    depth += 1;
+                } else if bytes[j] == b'}' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        if bytes[i] == b'*' || bytes[i] == b'?' || bytes[i] == b'[' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Exec-argument lowering: merges consecutive brace expansions into a single
+/// cross-product `sh2.brace` call (`{a,b}{1,2}` is ONE bash word — the
+/// parser splits it into two words, so the emitter re-joins them, exactly
+/// like the perl backend's cartesian-product pass), and tags unquoted glob
+/// words for the runtime to expand.
+fn exec_args_ir(args: &[Word], assoc: bool) -> Vec<IrExpr> {
+    merged_words_ir(args, &|w| arg_word_ir(w, assoc))
+}
+
+/// Same brace merge for for-loop item lists (`for x in {a,b}{1,2}`); the
+/// single-word fallback keeps the `$@`/`$*` listVar special case.
+fn for_items_ir(items: &[Word]) -> Vec<IrExpr> {
+    merged_words_ir(items, &for_item_ir)
+}
+
+fn merged_words_ir(words: &[Word], single: &dyn Fn(&Word) -> IrExpr) -> Vec<IrExpr> {
+    let mut out: Vec<IrExpr> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        if let Word::BraceExpansion(be, _) = &words[i] {
+            let mut groups = vec![brace_items_json(&be.items)];
+            let mut middles: Vec<serde_json::Value> = Vec::new();
+            let mut suffix = be.suffix.clone().unwrap_or_default();
+            let prefix = be.prefix.clone().unwrap_or_default();
+            i += 1;
+            while i < words.len() {
+                if let Word::BraceExpansion(be2, _) = &words[i] {
+                    middles.push(serde_json::Value::String(format!(
+                        "{}{}",
+                        suffix,
+                        be2.prefix.as_deref().unwrap_or("")
+                    )));
+                    groups.push(brace_items_json(&be2.items));
+                    suffix = be2.suffix.clone().unwrap_or_default();
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            // A brace expansion whose prefix/suffix/items contain glob chars
+            // must glob EACH result (`*.{txt,log}` → `*.txt` → files): the
+            // runtime globs any result string that starts with GLOB_MAGIC.
+            let magic_prefix = if has_glob_chars(&prefix)
+                || has_glob_chars(&suffix)
+                || be_items_contain_glob(&groups)
+            {
+                format!("{GLOB_MAGIC}{prefix}")
+            } else {
+                prefix.clone()
+            };
+            out.push(call(
+                "brace",
+                vec![
+                    st(&magic_prefix),
+                    IrExpr::Json(serde_json::Value::Array(groups)),
+                    IrExpr::Json(serde_json::Value::Array(middles)),
+                    st(&suffix),
+                ],
+            ));
+        } else {
+            out.push(single(&words[i]));
+            i += 1;
+        }
+    }
+    out
+}
+
+fn be_items_contain_glob(groups: &[serde_json::Value]) -> bool {
+    fn collect(v: &serde_json::Value, found: &mut bool) {
+        match v {
+            serde_json::Value::String(s) => {
+                if has_glob_chars(s) {
+                    *found = true;
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| collect(x, found)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| collect(x, found)),
+            _ => {}
+        }
+    }
+    let mut found = false;
+    for g in groups {
+        collect(g, &mut found);
+    }
+    found
+}
+
+/// A single exec-argument word (non-brace). Unquoted glob words get the
+/// GLOB_MAGIC tag so the runtime expands them against the filesystem. An
+/// array literal (`declare -a arr=(a b)`) lowers to a side-effecting
+/// setArray call whose (magic) return value is dropped by the runtime's exec
+/// arg flattener; `assoc` marks `declare -A` literals.
+fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
+    match w {
+        Word::Literal(s, _) if has_glob_chars(s) => st(&format!("{GLOB_MAGIC}{s}")),
         Word::Array(name, elements, _) => call(
             "setArray",
             vec![
                 st(name),
-                IrExpr::Array(
-                    elements
-                        .iter()
-                        .map(|e| st(e))
-                        .collect(),
-                ),
+                IrExpr::Array(elements.iter().map(|e| st(e)).collect()),
+                IrExpr::Bool(assoc),
             ],
         ),
-        _ => word_ir_quoted(&a.value),
+        _ => word_ir(w),
+    }
+}
+
+/// `name op value` — the RHS expression for a statement-level assignment
+/// (`IrStmt::Assign` wraps it in `sh2.setVar`). Compound operators lower to
+/// `sh2.assign` (which sets the variable itself), array `+=` to
+/// `sh2.setArrayAppend`.
+fn assignment_value_ir(a: &Assignment) -> IrExpr {
+    match &a.value {
+        Word::Array(name, elements, _) if a.operator == AssignmentOperator::PlusAssign => call(
+            "setArrayAppend",
+            vec![st(name), IrExpr::Array(elements.iter().map(|e| st(e)).collect())],
+        ),
+        Word::Array(name, elements, _) => call(
+            "setArray",
+            vec![st(name), IrExpr::Array(elements.iter().map(|e| st(e)).collect())],
+        ),
+        _ if a.operator == AssignmentOperator::Assign => word_ir_quoted(&a.value),
+        _ => call(
+            "assign",
+            vec![
+                st(&a.variable),
+                st(assign_op_str(&a.operator)),
+                word_ir_quoted(&a.value),
+            ],
+        ),
+    }
+}
+
+/// `name op value` in EXPRESSION context (`&&`/`||` operands, `if`/`while`
+/// conditions): the assignment must still happen AND the expression must be
+/// truthy. All three helpers return true.
+fn assignment_expr_ir(a: &Assignment) -> IrExpr {
+    match &a.value {
+        Word::Array(name, elements, _) if a.operator == AssignmentOperator::PlusAssign => call(
+            "setArrayAppend",
+            vec![st(name), IrExpr::Array(elements.iter().map(|e| st(e)).collect())],
+        ),
+        Word::Array(name, elements, _) => call(
+            "setArray",
+            vec![st(name), IrExpr::Array(elements.iter().map(|e| st(e)).collect())],
+        ),
+        _ => call(
+            "assign",
+            vec![
+                st(&a.variable),
+                st(assign_op_str(&a.operator)),
+                word_ir_quoted(&a.value),
+            ],
+        ),
+    }
+}
+
+fn assign_op_str(op: &AssignmentOperator) -> &'static str {
+    match op {
+        AssignmentOperator::Assign => "=",
+        AssignmentOperator::PlusAssign => "+=",
+        AssignmentOperator::MinusAssign => "-=",
+        AssignmentOperator::StarAssign => "*=",
+        AssignmentOperator::SlashAssign => "/=",
+        AssignmentOperator::PercentAssign => "%=",
     }
 }
 
@@ -309,7 +500,7 @@ fn command_to_ir(cmd: &Command) -> IrExpr {
                 IrExpr::Arrow(body_stmts(&Command::Block(w.body.clone()))),
             ],
         ),
-        Command::Assignment(a) => assignment_value_ir(a),
+        Command::Assignment(a) => assignment_expr_ir(a),
         Command::ShoptCommand(s) => call("shopt", vec![st(&s.option), IrExpr::Bool(s.enable)]),
         Command::And(l, r) => IrExpr::BinOp {
             op: BinOpKind::And,
@@ -417,6 +608,10 @@ fn word_ir(w: &Word) -> IrExpr {
 
 fn param_ir(pe: &ParameterExpansion) -> IrExpr {
     let (op, extra): (String, Vec<IrExpr>) = match &pe.operator {
+        ParameterExpansionOperator::None if pe.variable.len() > 1 && pe.variable.starts_with('#') => {
+            // ${#name} — string length (the parser keeps the `#` in the name)
+            return call("param", vec![st("len"), st(&pe.variable[1..])]);
+        }
         ParameterExpansionOperator::None => (String::new(), vec![]),
         ParameterExpansionOperator::UppercaseAll => ("^^".into(), vec![]),
         ParameterExpansionOperator::LowercaseAll => (",,".into(), vec![]),
@@ -473,6 +668,11 @@ fn brace_items_json(items: &[BraceItem]) -> serde_json::Value {
 }
 
 fn pure_template_part(interp: &StringInterpolation) -> Option<IrExpr> {
+    pure_part(interp).map(part_ir)
+}
+
+/// The single non-literal part of a one-part interpolation (if any).
+fn pure_part(interp: &StringInterpolation) -> Option<&StringPart> {
     let mut non_literal: Option<&StringPart> = None;
     for p in &interp.parts {
         match p {
@@ -486,7 +686,36 @@ fn pure_template_part(interp: &StringInterpolation) -> Option<IrExpr> {
             }
         }
     }
-    non_literal.map(part_ir)
+    non_literal
+}
+
+/// Like `part_ir` but WITHOUT the sh2.join wrapper for array-valued parts:
+/// `for x in "${!map[@]}"` must iterate each key, so the array is passed
+/// through (the runtime's forLoop flattens it).
+fn part_ir_flat(part: &StringPart) -> IrExpr {
+    match part {
+        StringPart::MapAccess(name, key) if key == "@" || key == "*" => {
+            call("arrayIndex", vec![st(name), st(key)])
+        }
+        StringPart::MapKeys(name) => call("arrayItems", vec![st(name)]),
+        StringPart::ArraySlice(name, offset, length) => call(
+            "param",
+            vec![
+                st("slice"),
+                st(name),
+                st(offset),
+                st(length.as_deref().unwrap_or("")),
+            ],
+        ),
+        // `${!map[@]}` — the parser tags it as a slice of `!map`; for-loop
+        // items must see the ARRAY (each key iterated), not the join.
+        StringPart::ParameterExpansion(pe)
+            if matches!(pe.operator, ParameterExpansionOperator::ArraySlice(..)) =>
+        {
+            param_ir(pe)
+        }
+        other => part_ir(other),
+    }
 }
 
 fn interpolate_ir(parts: &[StringPart]) -> IrExpr {
@@ -505,19 +734,39 @@ fn part_ir(part: &StringPart) -> IrExpr {
     match part {
         StringPart::Literal(_) => unreachable!("Literal parts handled in interpolate_ir"),
         StringPart::Variable(name) => call("getVar", vec![st(name)]),
-        StringPart::ParameterExpansion(pe) => param_ir(pe),
+        StringPart::ParameterExpansion(pe) => {
+            // `${arr[@]:off:len}` (ArraySlice) can return an ARRAY; inside a
+            // template literal that would render with JS comma joins — wrap
+            // in sh2.join (idempotent for plain string slices).
+            if matches!(pe.operator, ParameterExpansionOperator::ArraySlice(..)) {
+                call("join", vec![param_ir(pe)])
+            } else {
+                param_ir(pe)
+            }
+        }
         StringPart::Arithmetic(ae) => call("arith", vec![st(&ae.expression)]),
+        // Array-valued expansions inside a template literal would render with
+        // JS's comma join; bash joins them with spaces, so wrap in sh2.join.
+        // (In direct exec-arg position the array is flattened instead — see
+        // word_ir / the runtime's exec.)
+        StringPart::MapAccess(name, key) if key == "@" || key == "*" => call(
+            "join",
+            vec![call("arrayIndex", vec![st(name), st(key)])],
+        ),
         StringPart::MapAccess(name, key) => call("arrayIndex", vec![st(name), st(key)]),
-        StringPart::MapKeys(name) => call("arrayItems", vec![st(name)]),
+        StringPart::MapKeys(name) => call("join", vec![call("arrayItems", vec![st(name)])]),
         StringPart::MapLength(name) => call("arrayLen", vec![st(name)]),
         StringPart::ArraySlice(name, offset, length) => call(
-            "param",
-            vec![
-                st("slice"),
-                st(name),
-                st(offset),
-                st(length.as_deref().unwrap_or("")),
-            ],
+            "join",
+            vec![call(
+                "param",
+                vec![
+                    st("slice"),
+                    st(name),
+                    st(offset),
+                    st(length.as_deref().unwrap_or("")),
+                ],
+            )],
         ),
         StringPart::CommandSubstitution(cmd) => call(
             "capture",
@@ -531,12 +780,13 @@ fn for_item_ir(w: &Word) -> IrExpr {
     match w {
         Word::Variable(name, _, _) if name == "@" || name == "*" => call("listVar", vec![st(name)]),
         Word::StringInterpolation(interp, _) => {
-            if let Some(part) = pure_template_part(interp) {
-                return part;
+            if let Some(part) = pure_part(interp) {
+                // Un-joined: `for x in "${!map[@]}"` iterates each element.
+                return part_ir_flat(part);
             }
             word_ir(w)
         }
-        _ => word_ir(w),
+        _ => arg_word_ir(w, false),
     }
 }
 
@@ -581,10 +831,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::Assign { targets, expr } => {
             let target = &targets[0];
             match expr {
-                // arr=(...) → sh2.setArray already sets the array
-                IrExpr::Call { func, .. } if func == "setArray" => Stmt::ExpressionStatement {
-                    expression: expr_to_estree(expr),
-                },
+                // arr=(...) / arr+=(...) / x op= v → the helper already sets
+                // the variable itself; emit the call bare.
+                IrExpr::Call { func, .. }
+                    if func == "setArray" || func == "setArrayAppend" || func == "assign" =>
+                {
+                    Stmt::ExpressionStatement {
+                        expression: expr_to_estree(expr),
+                    }
+                }
                 _ => Stmt::ExpressionStatement {
                     expression: sh2_call("setVar", vec![str_lit(&target.var), expr_to_estree(expr)]),
                 },
