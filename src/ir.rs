@@ -153,6 +153,21 @@ pub struct Decl {
 
 // ── Statements ───────────────────────────────────────────────────────
 
+/// One `case` clause: shell-glob patterns + body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrCaseClause {
+    pub patterns: Vec<String>,
+    pub body: Vec<IrStmt>,
+}
+
+/// One redirection spec (fd, mode, target expression).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrRedirect {
+    pub fd: Option<i32>,
+    pub mode: String, // "r" | "w" | "a" | "r+" | "heredoc" | "herestring" | "unsupported"
+    pub target: IrExpr,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrStmt {
     /// Output: print/say with optional trailing newline
@@ -264,6 +279,29 @@ pub enum IrStmt {
     Require(String),
     /// Raw Perl text (migration bridge)
     RawText(String),
+    /// ── Neutral nodes (ESTree-path AST→IR builder only) ─────────────
+    /// The Perl generator never emits these; the Perl renderer's arms are
+    /// unreachable. They make the IR capable of expressing the full shell so
+    /// shir_to_estree can consume it (PLAN.md §3).
+    /// case … esac — dispatch on a value against shell-glob patterns.
+    Case {
+        discriminant: IrExpr,
+        clauses: Vec<IrCaseClause>,
+    },
+    /// Redirection wrapper: run `inner` with fd redirects applied.
+    Redirect {
+        inner: Vec<IrStmt>,
+        redirects: Vec<IrRedirect>,
+    },
+    /// Shell function definition (positional args via the runtime).
+    Function {
+        name: String,
+        body: Vec<IrStmt>,
+    },
+    /// Subshell — copy semantics (env/fd snapshot, run, discard).
+    Subshell(Vec<IrStmt>),
+    /// Background — run asynchronously.
+    Background(Vec<IrStmt>),
 }
 
 // ── Subroutine ───────────────────────────────────────────────────────
@@ -413,6 +451,15 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::RawText(text) => {
             // Splice verbatim — no transformation
             out.push_str(text);
+        }
+
+        // Neutral ESTree-path-only nodes — the Perl generator never emits them.
+        IrStmt::Case { .. }
+        | IrStmt::Redirect { .. }
+        | IrStmt::Function { .. }
+        | IrStmt::Subshell(_)
+        | IrStmt::Background(_) => {
+            unreachable!("ESTree-path-only IR node reached the Perl renderer")
         }
 
         IrStmt::Output { value, newline, target } => {
@@ -1369,6 +1416,11 @@ fn try_embed_newline_in_string_literal(expr: &str) -> Option<String> {
 fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
     match stmt {
         IrStmt::RawText(t) => t.contains("$main_exit_code") || t.contains("main_exit_code"),
+        IrStmt::Case { .. }
+        | IrStmt::Redirect { .. }
+        | IrStmt::Function { .. }
+        | IrStmt::Subshell(_)
+        | IrStmt::Background(_) => false,
         IrStmt::Assign { targets, expr: _ } => {
             targets.iter().any(|t| t.var == "main_exit_code")
         }
@@ -1465,6 +1517,12 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
                 vars.insert(cap);
             }
         }
+        // Neutral ESTree-path-only nodes carry no Perl variables.
+        IrStmt::Case { .. }
+        | IrStmt::Redirect { .. }
+        | IrStmt::Function { .. }
+        | IrStmt::Subshell(_)
+        | IrStmt::Background(_) => {}
         IrStmt::Output { value, .. } => collect_vars_in_expr(value, vars),
         IrStmt::WriteFile { path, content, .. } => {
             collect_vars_in_expr(path, vars);
