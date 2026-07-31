@@ -2608,6 +2608,11 @@ impl Generator {
                 self.command_uses_ls(&loop_.condition)
                     || loop_.body.commands.iter().any(|c| self.command_uses_ls(c))
             }
+            Command::Case(case_stmt) => {
+                case_stmt.cases.iter().any(|clause| {
+                    clause.body.iter().any(|c| self.command_uses_ls(c))
+                })
+            }
             Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_ls(c)),
             Command::Subshell(c) | Command::Background(c) => self.command_uses_ls(c),
             Command::Block(b) => b.commands.iter().any(|c| self.command_uses_ls(c)),
