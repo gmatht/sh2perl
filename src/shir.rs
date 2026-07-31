@@ -25,10 +25,14 @@ fn st(s: &str) -> IrExpr {
 // ── AST → IR ─────────────────────────────────────────────────────────
 
 pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
+    // Shared optimization passes (M6): the same optimize_stmts the Perl
+    // backend runs now also runs here, so future passes (constant folding,
+    // dead-assignment elimination) benefit both consumers of the IR.
+    let stmts = crate::ir::optimize_stmts(&commands.iter().filter_map(stmt_for_command).collect::<Vec<_>>());
     IrProgram {
         imports: vec![],
         requires: vec![],
-        stmts: commands.iter().filter_map(stmt_for_command).collect(),
+        stmts,
         subs: vec![],
     }
 }
