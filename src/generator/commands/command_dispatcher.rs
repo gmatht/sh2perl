@@ -88,20 +88,24 @@ pub fn generate_command_impl_with_input(
             generator.generate_assignment(assignment)
         }
         Command::Not(cmd) => {
-            // Negation: ! cmd  ->  ! do { perl_code };
-            // Use !do { ... } instead of !(...) because the inner code may
-            // contain multiple statements (variable declarations, etc.) which
-            // are not valid inside parentheses in Perl.
+            // Negation: ! cmd  ->  do { perl_code }; $CHILD_ERROR = $CHILD_ERROR ? 0 : 1;
+            // Use `do { ... }` (instead of `!do { ... }`) because we need the
+            // side effect (updating $CHILD_ERROR) and the return value of the
+            // command (expression context) in case this is nested inside another
+            // expression.  The `do { ... }; $CHILD_ERROR = ...;` pattern
+            // properly updates $CHILD_ERROR to the negated exit code.
+            // After negation, $CHILD_ERROR must be updated to reflect the
+            // negated exit code: $? = !$?  =>  $CHILD_ERROR = $CHILD_ERROR ? 0 : 1
             let inner = generator.generate_command(cmd);
             // Strip trailing whitespace/semicolons so the do block is clean.
             let inner_clean = inner.trim().trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t');
             if inner_clean.is_empty() {
                 String::new()
             } else if inner_clean.starts_with("!") {
-                // Double negation: !! cmd
-                format!("!(!do {{ {} }});\n", inner_clean)
+                // Double negation: !! cmd — negation happens twice, cancels out
+                format!("do {{ {}; }}; $CHILD_ERROR = $CHILD_ERROR ? 0 : 1;\n", inner_clean)
             } else {
-                format!("!do {{ {} }};\n", inner_clean)
+                format!("do {{ {}; }}; $CHILD_ERROR = $CHILD_ERROR ? 0 : 1;\n", inner_clean)
             }
         }
         Command::BlankLine => "\n".to_string(),

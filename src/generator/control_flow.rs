@@ -400,6 +400,12 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
     // with explicit condition checks via last unless/last if.
     match &*while_loop.condition {
         Command::And(_, _) | Command::Or(_, _) => {
+            let status_id = generator.get_unique_id();
+            // Track the loop's exit status: bash returns the last body
+            // command's status, or 0 if the body was never entered
+            // (condition failed on first evaluation) or the loop was
+            // left via break/continue (which reset the status to 0).
+            output.push_str(&format!("my $__while_status_{} = 0;\n", status_id));
             output.push_str(&format!("{} (1) {{\n", loop_keyword));
             generator.indent_level += 1;
             // Flatten the And/Or tree and generate each condition as a last check
@@ -450,9 +456,14 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             }
             // Generate body
             output.push_str(&generator.generate_block_commands(&while_loop.body));
+            // Capture the body's exit status (skipped by break/continue,
+            // which leave the status at 0, matching bash).
+            output.push_str(&generator.indent());
+            output.push_str(&format!("$__while_status_{} = $CHILD_ERROR;\n", status_id));
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");
+            output.push_str(&format!("$CHILD_ERROR = $__while_status_{};\n", status_id));
         }
         Command::Block(block) => {
             // Block conditions arise when env vars are assigned before a command
@@ -460,6 +471,11 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             // as a step in a while (1) loop, checking exit code after each.
             // NOTE: Always use `while (1)` — using `until (1)` would never execute
             // the body because `until` runs while the condition is false.
+            let status_id = generator.get_unique_id();
+            // Track the loop's exit status: bash returns the last body
+            // command's status, or 0 if the body was never entered or the
+            // loop was left via break/continue.
+            output.push_str(&format!("my $__while_status_{} = 0;\n", status_id));
             output.push_str("while (1) {\n");
             generator.indent_level += 1;
             // Generate all commands except the last one as plain statements
@@ -585,9 +601,14 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             }
             // Generate body
             output.push_str(&generator.generate_block_commands(&while_loop.body));
+            // Capture the body's exit status (skipped by break/continue,
+            // which leave the status at 0, matching bash).
+            output.push_str(&generator.indent());
+            output.push_str(&format!("$__while_status_{} = $CHILD_ERROR;\n", status_id));
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");
+            output.push_str(&format!("$CHILD_ERROR = $__while_status_{};\n", status_id));
         }
         Command::Simple(cmd) if cmd.name == "[" || cmd.name == "test" => {
             output.push_str(&format!("{} (", loop_keyword));
