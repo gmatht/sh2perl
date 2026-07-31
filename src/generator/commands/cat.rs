@@ -191,7 +191,7 @@ pub fn generate_cat_command(
                 let ir_stmt = IrStmt::Assign {
                     targets: vec![AssignTarget {
                         var: target_var.to_string(),
-                        sigil: Sigil::Scalar,
+                        sigil: Some(Sigil::Scalar),
                         indices: vec![],
                     }],
                     expr: IrExpr::Str(body, style),

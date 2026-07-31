@@ -398,7 +398,7 @@ impl Generator {
         let needs_exit_code = self.needs_exit_code_tracking(ast);
         if needs_exit_code || true {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "main_exit_code".to_string(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: "main_exit_code".to_string(), sigil: Some(Sigil::Scalar) }],
                 init: Some(IrExpr::Int(0)),
                 local: false,
             };
@@ -407,7 +407,7 @@ impl Generator {
         // $ls_success is only needed for ls command output parsing
         if self.needs_ls_success(ast) {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "ls_success".to_string(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: "ls_success".to_string(), sigil: Some(Sigil::Scalar) }],
                 init: Some(IrExpr::Int(0)),
                 local: false,
             };
@@ -416,7 +416,7 @@ impl Generator {
         // $__set_e is only needed when `set -e` (errexit) is active
         if self.set_e_active {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "__set_e".to_string(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: "__set_e".to_string(), sigil: Some(Sigil::Scalar) }],
                 init: Some(IrExpr::Int(0)),
                 local: false,
             };
@@ -425,7 +425,7 @@ impl Generator {
         // $output is only needed when there are top-level output statements
         if needs_exit_code || self.needs_output_var(ast) {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "output".to_string(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: "output".to_string(), sigil: Some(Sigil::Scalar) }],
                 init: Some(IrExpr::Str("".to_string(), crate::ir::StrStyle::SingleQuoted)),
                 local: false,
             };
@@ -464,7 +464,7 @@ impl Generator {
         // Use IR Declare nodes so the backend can optimize dead declarations.
         for var in &self.function_level_vars {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: var.clone(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: var.clone(), sigil: Some(Sigil::Scalar) }],
                 init: None,
                 local: false,
             };
@@ -473,14 +473,14 @@ impl Generator {
             // as an array or hash in some context.
             if self.associative_arrays.contains(var) {
                 let stmt = IrStmt::Declare {
-                    vars: vec![Decl { name: var.clone(), sigil: Sigil::Hash }],
+                    vars: vec![Decl { name: var.clone(), sigil: Some(Sigil::Hash) }],
                     init: None,
                     local: false,
                 };
                 output.push_str(&stmt_to_perl(&stmt, 0));
             } else if self.indexed_arrays.contains(var) {
                 let stmt = IrStmt::Declare {
-                    vars: vec![Decl { name: var.clone(), sigil: Sigil::Array }],
+                    vars: vec![Decl { name: var.clone(), sigil: Some(Sigil::Array) }],
                     init: None,
                     local: false,
                 };
@@ -495,7 +495,7 @@ impl Generator {
         if !self.no_magic_numbers && !self.constants.is_empty() {
             for (name, value) in &self.constants {
                 let stmt = IrStmt::Declare {
-                    vars: vec![Decl { name: name.clone(), sigil: Sigil::Scalar }],
+                    vars: vec![Decl { name: name.clone(), sigil: Some(Sigil::Scalar) }],
                     init: Some(IrExpr::Int(*value)),
                     local: false,
                 };
@@ -520,7 +520,7 @@ impl Generator {
 
         // Add final exit statement — only if $main_exit_code is tracked.
         if needs_exit_code {
-            let stmt = IrStmt::Exit(Some(IrExpr::Var("main_exit_code".to_string(), Sigil::Scalar)));
+            let stmt = IrStmt::Exit(Some(IrExpr::Var("main_exit_code".to_string(), Some(Sigil::Scalar))));
             output.push('\n');
             output.push_str(&stmt_to_perl(&stmt, 0));
         }

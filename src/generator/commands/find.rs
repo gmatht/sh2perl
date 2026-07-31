@@ -258,7 +258,7 @@ pub fn generate_find_command(
         // Declare array: my @input_var;
         stmts.push(IrStmt::DeclareArray {
             var: input_var.to_string(),
-            sigil: Sigil::Array,
+            sigil: Some(Sigil::Array),
             elements: vec![],
         });
 
@@ -282,14 +282,14 @@ pub fn generate_find_command(
         stmts.push(IrStmt::Assign {
             targets: vec![ir::AssignTarget {
                 var: input_var.to_string(),
-                sigil: Sigil::Scalar,
+                sigil: Some(Sigil::Scalar),
                 indices: vec![],
             }],
             expr: IrExpr::Call {
                 func: "join".to_string(),
                 args: vec![
                     IrExpr::Str("\n".to_string(), StrStyle::DoubleQuoted),
-                    IrExpr::Var(input_var.to_string(), Sigil::Array),
+                    IrExpr::Var(input_var.to_string(), Some(Sigil::Array)),
                 ],
             },
         });
@@ -388,7 +388,7 @@ pub fn generate_find_for_substitution(
     // my @find_results;
     stmts.push(IrStmt::DeclareArray {
         var: "find_results".to_string(),
-        sigil: Sigil::Array,
+        sigil: Some(Sigil::Array),
         elements: vec![],
     });
 
@@ -406,13 +406,13 @@ pub fn generate_find_for_substitution(
     stmts.push(IrStmt::Declare {
         vars: vec![ir::Decl {
             name: "result".to_string(),
-            sigil: Sigil::Scalar,
+            sigil: Some(Sigil::Scalar),
         }],
         init: Some(IrExpr::Call {
             func: "join".to_string(),
             args: vec![
                 IrExpr::Str("\n".to_string(), StrStyle::DoubleQuoted),
-                IrExpr::Var("find_results".to_string(), Sigil::Array),
+                IrExpr::Var("find_results".to_string(), Some(Sigil::Array)),
             ],
         }),
         local: false,
@@ -421,18 +421,18 @@ pub fn generate_find_for_substitution(
     // if ($result ne "") { $result .= "\n"; }
     stmts.push(IrStmt::If {
         cond: IrExpr::BinOp {
-            lhs: Box::new(IrExpr::Var("result".to_string(), Sigil::Scalar)),
+            lhs: Box::new(IrExpr::Var("result".to_string(), Some(Sigil::Scalar))),
             op: ir::BinOpKind::Ne,
             rhs: Box::new(IrExpr::Str("".to_string(), StrStyle::SingleQuoted)),
         },
         then: vec![IrStmt::Assign {
             targets: vec![ir::AssignTarget {
                 var: "result".to_string(),
-                sigil: Sigil::Scalar,
+                sigil: Some(Sigil::Scalar),
                 indices: vec![],
             }],
             expr: IrExpr::BinOp {
-                lhs: Box::new(IrExpr::Var("result".to_string(), Sigil::Scalar)),
+                lhs: Box::new(IrExpr::Var("result".to_string(), Some(Sigil::Scalar))),
                 op: ir::BinOpKind::Concat,
                 rhs: Box::new(IrExpr::Str("\n".to_string(), StrStyle::DoubleQuoted)),
             },

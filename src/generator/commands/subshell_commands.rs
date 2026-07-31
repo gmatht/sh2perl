@@ -16,8 +16,8 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
     // Use IR Declare { local: true } so the backend can optimize this.
     {
         let stmt = IrStmt::Declare {
-            vars: vec![Decl { name: "ENV".to_string(), sigil: Sigil::Hash }],
-            init: Some(IrExpr::Var("ENV".to_string(), Sigil::Hash)),
+            vars: vec![Decl { name: "ENV".to_string(), sigil: Some(Sigil::Hash) }],
+            init: Some(IrExpr::Var("ENV".to_string(), Some(Sigil::Hash))),
             local: true,
         };
         output.push_str(&generator.indent());
@@ -47,9 +47,9 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
         }
         // Associative arrays need % sigil instead of $
         let sigil = if generator.associative_arrays.contains(var_name) {
-            Sigil::Hash
+            Some(Sigil::Hash)
         } else {
-            Sigil::Scalar
+            Some(Sigil::Scalar)
         };
         // Use `my` instead of `local` because the outer variable may be a
         // lexical (my) variable, and Perl's `local` only works on package

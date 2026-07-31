@@ -180,7 +180,7 @@ pub fn generate_sort_command_with_output(
         func: "join".to_string(),
         args: vec![
             IrExpr::Str("\n".to_string(), StrStyle::DoubleQuoted),
-            IrExpr::Var(format!("sort_sorted_{}", command_index), Sigil::Array),
+            IrExpr::Var(format!("sort_sorted_{}", command_index), Some(Sigil::Array)),
         ],
     };
 
@@ -189,7 +189,7 @@ pub fn generate_sort_command_with_output(
         let stmt = IrStmt::Assign {
             targets: vec![AssignTarget {
                 var: output_name.to_string(),
-                sigil: Sigil::Scalar,
+                sigil: Some(Sigil::Scalar),
                 indices: vec![],
             }],
             expr: join_expr,
@@ -199,7 +199,7 @@ pub fn generate_sort_command_with_output(
         let stmt = IrStmt::Declare {
             vars: vec![Decl {
                 name: output_name.to_string(),
-                sigil: Sigil::Scalar,
+                sigil: Some(Sigil::Scalar),
             }],
             init: Some(join_expr),
             local: false,

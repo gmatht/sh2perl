@@ -2344,7 +2344,7 @@ fn generate_buffered_pipeline(
                 // Use `print $var, "\n";` which is idiomatic Perl and avoids the
                 // verbose `if (... ne q{} && !defined ...) { print ...; if (!... =~ m{\n\z})` dance.
                 let print_stmt = IrStmt::Output {
-                    value: IrExpr::Var(output_var.clone(), Sigil::Scalar),
+                    value: IrExpr::Var(output_var.clone(), Some(Sigil::Scalar)),
                     newline: true,
                     target: None,
                 };

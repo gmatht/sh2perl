@@ -160,20 +160,20 @@ pub fn generate_wc_command_with_output(
 
     if count_lines {
         fmt_parts.push(pad.to_string());
-        sprintf_args.push(IrExpr::Var("_wc_lines".to_string(), Sigil::Scalar));
+        sprintf_args.push(IrExpr::Var("_wc_lines".to_string(), Some(Sigil::Scalar)));
     }
     if count_words {
         fmt_parts.push(pad.to_string());
-        sprintf_args.push(IrExpr::Var("_wc_words".to_string(), Sigil::Scalar));
+        sprintf_args.push(IrExpr::Var("_wc_words".to_string(), Some(Sigil::Scalar)));
     }
     if count_chars || count_bytes {
         fmt_parts.push(pad.to_string());
         let var_name = if count_chars { "_wc_chars" } else { "_wc_bytes" };
-        sprintf_args.push(IrExpr::Var(var_name.to_string(), Sigil::Scalar));
+        sprintf_args.push(IrExpr::Var(var_name.to_string(), Some(Sigil::Scalar)));
     }
     if longest_line {
         fmt_parts.push(pad.to_string());
-        sprintf_args.push(IrExpr::Var("_wc_longest".to_string(), Sigil::Scalar));
+        sprintf_args.push(IrExpr::Var("_wc_longest".to_string(), Some(Sigil::Scalar)));
     }
 
     // Append filename if provided
@@ -200,7 +200,7 @@ pub fn generate_wc_command_with_output(
     let decl = IrStmt::Declare {
         vars: vec![Decl {
             name: "_wc_result".to_string(),
-            sigil: Sigil::Scalar,
+            sigil: Some(Sigil::Scalar),
         }],
         init: Some(sprintf_expr),
         local: false,

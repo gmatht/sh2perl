@@ -193,7 +193,7 @@ pub fn generate_sha512sum_command(
                     &IrStmt::Declare {
                         vars: vec![Decl {
                             name: "/".to_string(),
-                            sigil: Sigil::Scalar,
+                            sigil: Some(Sigil::Scalar),
                         }],
                         init: Some(IrExpr::RawExpr("undef".to_string())),
                         local: true,
@@ -234,7 +234,7 @@ pub fn generate_sha512sum_command(
                     &IrStmt::Declare {
                         vars: vec![Decl {
                             name: "/".to_string(),
-                            sigil: Sigil::Scalar,
+                            sigil: Some(Sigil::Scalar),
                         }],
                         init: Some(IrExpr::RawExpr("undef".to_string())),
                         local: true,
