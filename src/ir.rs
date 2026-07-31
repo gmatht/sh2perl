@@ -130,6 +130,20 @@ pub enum IrExpr {
     },
     /// Raw Perl expression text (migration bridge)
     RawExpr(String),
+    /// Delayed statement block (closure) — used by the ESTree path for
+    /// pipeline stages, subshell/background/redirect/function bodies and
+    /// loop conditions. The Perl generator never emits it.
+    Arrow(Vec<IrStmt>),
+    /// Array literal (ESTree-path only — e.g. for-items, brace groups).
+    Array(Vec<IrExpr>),
+    /// Boolean literal (ESTree-path only — e.g. shopt enable flags).
+    Bool(bool),
+    /// Raw JSON literal (ESTree-path only — e.g. brace-expansion groups).
+    Json(serde_json::Value),
+    /// Bare identifier (ESTree-path only — e.g. the for-loop variable name).
+    Ident(String),
+    /// Object literal (ESTree-path only — e.g. redirect specs, env maps).
+    Object(Vec<(String, IrExpr)>),
 }
 
 // ── Assignment target ────────────────────────────────────────────────
@@ -166,6 +180,8 @@ pub struct IrRedirect {
     pub fd: Option<i32>,
     pub mode: String, // "r" | "w" | "a" | "r+" | "heredoc" | "herestring" | "unsupported"
     pub target: IrExpr,
+    /// Whether an unquoted heredoc body should be interpolated (ESTree path).
+    pub interpolate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -252,6 +268,8 @@ pub enum IrStmt {
         args: Vec<IrExpr>,
         capture: Option<String>,
         redirects: Vec<IrExpr>,
+        /// Command-scoped environment variables (`VAR=x cmd`) — ESTree path.
+        env: Vec<(String, IrExpr)>,
     },
     /// Pipeline — a sequence of commands connected by pipes.
     /// When `capture` is `Some(var)`, the entire pipeline's stdout is captured
@@ -302,6 +320,11 @@ pub enum IrStmt {
     Subshell(Vec<IrStmt>),
     /// Background — run asynchronously.
     Background(Vec<IrStmt>),
+    /// Plain block group `{ a; b; }` (no copy semantics — unlike Subshell).
+    Block(Vec<IrStmt>),
+    /// Evaluate an expression as a statement (ESTree-path pipelines,
+    /// and/or/not, bare sh2.* calls). Perl generator never emits it.
+    Expr(IrExpr),
 }
 
 // ── Subroutine ───────────────────────────────────────────────────────
@@ -458,7 +481,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         | IrStmt::Redirect { .. }
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
-        | IrStmt::Background(_) => {
+        | IrStmt::Background(_)
+        | IrStmt::Block(_)
+        | IrStmt::Expr(_) => {
             unreachable!("ESTree-path-only IR node reached the Perl renderer")
         }
 
@@ -960,6 +985,12 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
 
         IrExpr::RawExpr(text) => text.clone(),
+        IrExpr::Arrow(_) => unreachable!("ESTree-path-only Arrow reached the Perl renderer"),
+        IrExpr::Array(_) => unreachable!("ESTree-path-only Array reached the Perl renderer"),
+        IrExpr::Bool(_) => unreachable!("ESTree-path-only Bool reached the Perl renderer"),
+        IrExpr::Json(_) => unreachable!("ESTree-path-only Json reached the Perl renderer"),
+        IrExpr::Ident(_) => unreachable!("ESTree-path-only Ident reached the Perl renderer"),
+        IrExpr::Object(_) => unreachable!("ESTree-path-only Object reached the Perl renderer"),
 
         IrExpr::Int(n) => {
             if n.abs() < 1000 {
@@ -1421,6 +1452,8 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
         | IrStmt::Background(_) => false,
+        IrStmt::Block(stmts) => stmts.iter().any(stmt_refers_to_main_exit),
+        IrStmt::Expr(e) => expr_refers_to_main_exit(e),
         IrStmt::Assign { targets, expr: _ } => {
             targets.iter().any(|t| t.var == "main_exit_code")
         }
@@ -1469,6 +1502,12 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
     match expr {
         IrExpr::Var(name, _) => name == "main_exit_code",
         IrExpr::RawExpr(t) => t.contains("main_exit_code"),
+        IrExpr::Arrow(_) => false,
+        IrExpr::Array(elems) => elems.iter().any(expr_refers_to_main_exit),
+        IrExpr::Bool(_) => false,
+        IrExpr::Json(_) => false,
+        IrExpr::Ident(_) => false,
+        IrExpr::Object(props) => props.iter().any(|(_, v)| expr_refers_to_main_exit(v)),
         IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
             InterpPart::Lit(_) => false,
             InterpPart::Expr(e) => expr_refers_to_main_exit(e),
@@ -1523,6 +1562,12 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
         | IrStmt::Background(_) => {}
+        IrStmt::Block(stmts) => {
+            for st in stmts {
+                collect_vars_in_stmt(st, vars);
+            }
+        }
+        IrStmt::Expr(e) => collect_vars_in_expr(e, vars),
         IrStmt::Output { value, .. } => collect_vars_in_expr(value, vars),
         IrStmt::WriteFile { path, content, .. } => {
             collect_vars_in_expr(path, vars);
@@ -1591,6 +1636,24 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
         IrExpr::RawExpr(t) => {
             for cap in regex_lite_find_all(r"\$([a-zA-Z_][a-zA-Z0-9_]*)", t) {
                 vars.insert(cap);
+            }
+        }
+        IrExpr::Arrow(body) => {
+            for stmt in body {
+                collect_vars_in_stmt(stmt, vars);
+            }
+        }
+        IrExpr::Array(elems) => {
+            for e in elems {
+                collect_vars_in_expr(e, vars);
+            }
+        }
+        IrExpr::Bool(_) => {}
+        IrExpr::Json(_) => {}
+        IrExpr::Ident(_) => {}
+        IrExpr::Object(props) => {
+            for (_, v) in props {
+                collect_vars_in_expr(v, vars);
             }
         }
         IrExpr::Interpolate(parts) => {
