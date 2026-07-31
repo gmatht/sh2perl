@@ -12,7 +12,15 @@ pub mod mir_simple;
 pub mod shared_utils;
 pub mod timeout_manager;
 pub mod variable_analysis;
+// Browser (JS/wasm-bindgen) API — wasm32-unknown-unknown only.
+#[cfg(not(target_os = "wasi"))]
 pub mod wasm;
+// WASI (wasm32-wasip1) library ABI — plain C exports, see wasi_api.rs.
+// Feature-gated so the `debashc` command build stays a clean WASI command
+// (a module exporting both `_start` and `_initialize` is neither a valid
+// command nor a valid reactor in strict runtimes like Node's node:wasi).
+#[cfg(all(target_os = "wasi", feature = "wasi-lib"))]
+pub mod wasi_api;
 
 // Only export the main types to avoid conflicts
 pub use ast::*;
