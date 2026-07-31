@@ -229,7 +229,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         } else {
             // -e path: run perl directly with the code and any remaining
             // arguments as separate argv elements (no shell re-quoting).
-            // The IrStmt::System emitter quotes each literal arg for bash.
+            // The IrStmt::Exec emitter quotes each literal arg for bash.
             let output_var = format!("perl_output_{}", generator.get_unique_id());
             let mut sys_args = vec![
                 IrExpr::Str("-e".to_string(), StrStyle::SingleQuoted),
@@ -243,10 +243,11 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                     sys_args.push(IrExpr::RawExpr(bash_str));
                 }
             }
-            let sys_stmt = IrStmt::System {
+            let sys_stmt = IrStmt::Exec {
                 cmd: IrExpr::Str("perl".to_string(), StrStyle::SingleQuoted),
                 args: sys_args,
                 capture: Some(output_var.clone()),
+                redirects: vec![],
             };
             output.push_str(&stmt_to_perl(&sys_stmt, 0));
             output.push_str(&format!("chomp ${};\n", output_var));

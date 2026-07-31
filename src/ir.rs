@@ -228,11 +228,14 @@ pub enum IrStmt {
         /// If true, emit `carp` instead of `warn` (requires `use Carp`).
         carp: bool,
     },
-    /// System call
-    System {
+    /// Run a command (neutral — the language-agnostic "exec"). The Perl
+    /// backend renders it as `system(...)`/`qx{}`; the ESTree consumer uses
+    /// cmd/args/redirects. `redirects` is empty until generators populate it.
+    Exec {
         cmd: IrExpr,
         args: Vec<IrExpr>,
         capture: Option<String>,
+        redirects: Vec<IrExpr>,
     },
     /// Pipeline — a sequence of commands connected by pipes.
     /// When `capture` is `Some(var)`, the entire pipeline's stdout is captured
@@ -632,7 +635,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str(&format!("{} {};\n", kw, e));
         }
 
-        IrStmt::System { cmd, args, capture } => {
+        IrStmt::Exec { cmd, args, capture, .. } => {
             let cmd_str = ir_expr_to_perl(cmd);
             // Quote a string VALUE as a bash single-quoted shell word.
             // (Perl-style `\'` escaping is NOT understood by bash inside
@@ -1393,7 +1396,7 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
             expr_refers_to_main_exit(cond)
                 || body.iter().any(|s| stmt_refers_to_main_exit(s))
         }
-        IrStmt::System { capture, .. } => {
+        IrStmt::Exec { capture, .. } => {
             matches!(capture, Some(v) if v == "main_exit_code")
         }
         IrStmt::Pipeline { stages, .. } => {
@@ -1507,7 +1510,7 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
             collect_vars_in_expr(cond, vars);
             for s in body { collect_vars_in_stmt(s, vars); }
         }
-        IrStmt::System { cmd, args, .. } => {
+        IrStmt::Exec { cmd, args, .. } => {
             collect_vars_in_expr(cmd, vars);
             for a in args { collect_vars_in_expr(a, vars); }
         }
