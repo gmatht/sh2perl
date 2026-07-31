@@ -10,7 +10,6 @@ pub mod shir;
 pub mod generator;
 pub mod mir_simple;
 pub mod shared_utils;
-pub mod timeout_manager;
 pub mod variable_analysis;
 // Browser (JS/wasm-bindgen) API — wasm32-unknown-unknown only.
 #[cfg(not(target_os = "wasi"))]
