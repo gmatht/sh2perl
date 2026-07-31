@@ -61,6 +61,21 @@ pub enum InterpPart {
     Expr(Box<IrExpr>),
 }
 
+// ── Arithmetic AST (neutral) ─────────────────────────────────────────
+/// Parsed `$((...))` arithmetic — rendered as NATIVE JS arithmetic by the
+/// ESTree backend (faster/cleaner than a runtime string-eval). Assignments
+/// (`x=`, `x+=`, `x++`) are NOT representable here (they need setVar
+/// semantics) and fall back to the runtime `sh2.arith` evaluator.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArithAst {
+    Num(i64),
+    Var(String),
+    Index { var: String, key: Box<ArithAst> },
+    Bin { op: &'static str, lhs: Box<ArithAst>, rhs: Box<ArithAst> },
+    Un { op: &'static str, arg: Box<ArithAst> },
+    Cond { test: Box<ArithAst>, then: Box<ArithAst>, else_: Box<ArithAst> },
+}
+
 // ── Expressions ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,6 +151,8 @@ pub enum IrExpr {
     Arrow(Vec<IrStmt>),
     /// Array literal (ESTree-path only — e.g. for-items, brace groups).
     Array(Vec<IrExpr>),
+    /// Parsed arithmetic (neutral AST) — ESTree path renders native JS.
+    Arith(Box<ArithAst>),
     /// Boolean literal (ESTree-path only — e.g. shopt enable flags).
     Bool(bool),
     /// Raw JSON literal (ESTree-path only — e.g. brace-expansion groups).
@@ -987,6 +1004,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         IrExpr::RawExpr(text) => text.clone(),
         IrExpr::Arrow(_) => unreachable!("ESTree-path-only Arrow reached the Perl renderer"),
         IrExpr::Array(_) => unreachable!("ESTree-path-only Array reached the Perl renderer"),
+        IrExpr::Arith(_) => unreachable!("ESTree-path-only Arith reached the Perl renderer"),
         IrExpr::Bool(_) => unreachable!("ESTree-path-only Bool reached the Perl renderer"),
         IrExpr::Json(_) => unreachable!("ESTree-path-only Json reached the Perl renderer"),
         IrExpr::Ident(_) => unreachable!("ESTree-path-only Ident reached the Perl renderer"),
@@ -1504,6 +1522,7 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         IrExpr::RawExpr(t) => t.contains("main_exit_code"),
         IrExpr::Arrow(_) => false,
         IrExpr::Array(elems) => elems.iter().any(expr_refers_to_main_exit),
+        IrExpr::Arith(_) => false,
         IrExpr::Bool(_) => false,
         IrExpr::Json(_) => false,
         IrExpr::Ident(_) => false,
@@ -1648,6 +1667,7 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
                 collect_vars_in_expr(e, vars);
             }
         }
+        IrExpr::Arith(_) => {}
         IrExpr::Bool(_) => {}
         IrExpr::Json(_) => {}
         IrExpr::Ident(_) => {}

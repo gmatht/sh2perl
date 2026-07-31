@@ -136,6 +136,16 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    BinaryExpression {
+        operator: &'static str,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    ConditionalExpression {
+        test: Box<Expr>,
+        consequent: Box<Expr>,
+        alternate: Box<Expr>,
+    },
     UnaryExpression {
         operator: &'static str,
         argument: Box<Expr>,
