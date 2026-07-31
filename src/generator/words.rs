@@ -2268,7 +2268,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             cond: crate::ir::IrExpr::BinOp {
                                 lhs: Box::new(crate::ir::IrExpr::Var(
                                     "CHILD_ERROR".to_string(),
-                                    crate::ir::Sigil::Scalar,
+                                    Some(crate::ir::Sigil::Scalar),
                                 )),
                                 op: crate::ir::BinOpKind::Eq,
                                 rhs: Box::new(crate::ir::IrExpr::Int(0)),
