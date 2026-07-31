@@ -34,7 +34,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libppi-perl libperl-critic-perl
 
       - name: Build debashc
-        run: cargo build
+        run: cargo build -p debashcl --bin debashc
 
       - name: Run main (cargo) tests
         run: |
