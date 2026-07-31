@@ -121,6 +121,9 @@ pub enum Expr {
         params: Vec<Expr>,
         body: ArrowBody,
         expression: bool,
+        // Always async: closure bodies may contain `await` (nested execs),
+        // and the runtime awaits every closure it invokes.
+        r#async: bool,
     },
     ObjectExpression {
         properties: Vec<Property>,
@@ -222,37 +225,51 @@ fn stmt_for_command(cmd: &Command) -> Option<Stmt> {
             alternate: if_stmt.else_branch.as_ref().map(|b| Box::new(body_stmt(b))),
         },
         Command::Case(c) => case_to_switch(c),
-        Command::While(w) => Stmt::WhileStatement {
-            test: {
-                let t = command_to_expr(&w.condition);
-                if w.is_until {
-                    Expr::UnaryExpression {
-                        operator: "!",
-                        argument: Box::new(t),
-                        prefix: true,
-                    }
-                } else {
-                    t
+        Command::While(w) => {
+            let t = command_to_expr(&w.condition);
+            let test = if w.is_until {
+                Expr::UnaryExpression {
+                    operator: "!",
+                    argument: Box::new(t),
+                    prefix: true,
                 }
-            },
-            body: Box::new(block_stmt(&w.body.commands)),
+            } else {
+                t
+            };
+            Stmt::ExpressionStatement {
+                expression: async_sh2_call(
+                    "whileLoop",
+                    vec![
+                        // Condition must be a closure — a bare expression would
+                        // be evaluated once when building the arguments.
+                        arrow(vec![], ArrowBody::Expr(Box::new(test))),
+                        arrow(
+                            vec![],
+                            ArrowBody::Block(Box::new(block_stmt(&w.body.commands))),
+                        ),
+                    ],
+                ),
+            }
         },
-        Command::For(f) => Stmt::ForOfStatement {
-            left: Box::new(Stmt::VariableDeclaration {
-                declarations: vec![VariableDeclarator {
-                    type_: "VariableDeclarator",
-                    id: Expr::Identifier {
-                        name: f.variable.clone(),
-                    },
-                    init: None,
-                }],
-                kind: "let",
-            }),
-            right: Expr::ArrayExpression {
-                elements: f.items.iter().map(|w| Some(word_to_expr(w))).collect(),
-            },
-            body: Box::new(block_stmt(&f.body.commands)),
-        },
+        Command::For(f) => {
+            let js_var = safe_ident(&f.variable);
+            Stmt::ExpressionStatement {
+                expression: async_sh2_call(
+                    "forLoop",
+                    vec![
+                        for_items_expr(&f.items),
+                        arrow(
+                            vec![Expr::Identifier { name: js_var.clone() }],
+                            ArrowBody::Block(Box::new(for_loop_body(
+                                &f.variable,
+                                &js_var,
+                                &f.body.commands,
+                            ))),
+                        ),
+                    ],
+                ),
+            }
+        }
         Command::Block(b) => Stmt::BlockStatement {
             body: b.commands.iter().filter_map(stmt_for_command).collect(),
         },
@@ -272,7 +289,7 @@ fn stmt_for_command(cmd: &Command) -> Option<Stmt> {
             ),
         },
         Command::CStyleFor(cf) => Stmt::ExpressionStatement {
-            expression: sh2_call(
+            expression: async_sh2_call(
                 "cstyleFor",
                 vec![
                     str_lit(&cf.arith_content),
@@ -290,7 +307,7 @@ fn stmt_for_command(cmd: &Command) -> Option<Stmt> {
             ),
         },
         Command::Subshell(c) => Stmt::ExpressionStatement {
-            expression: sh2_call("subshell", vec![arrow(vec![], command_arrow_body(c))]),
+            expression: async_sh2_call("subshell", vec![arrow(vec![], command_arrow_body(c))]),
         },
         Command::Background(c) => Stmt::ExpressionStatement {
             expression: sh2_call("background", vec![arrow(vec![], command_arrow_body(c))]),
@@ -319,8 +336,12 @@ fn stmt_for_command(cmd: &Command) -> Option<Stmt> {
                 prefix: true,
             },
         },
-        Command::Break(lvl) => Stmt::BreakStatement { label: lvl.clone() },
-        Command::Continue(lvl) => Stmt::ContinueStatement { label: lvl.clone() },
+        Command::Break(_) => Stmt::ExpressionStatement {
+            expression: sh2_call("break", vec![]),
+        },
+        Command::Continue(_) => Stmt::ExpressionStatement {
+            expression: sh2_call("continue", vec![]),
+        },
         Command::Return(w) => Stmt::ReturnStatement {
             argument: w.as_ref().map(word_to_expr),
         },
@@ -328,6 +349,80 @@ fn stmt_for_command(cmd: &Command) -> Option<Stmt> {
             expression: unsupported(other),
         },
     })
+}
+
+/// Shell variables used as JS identifiers may collide with reserved words
+/// (`for var in ...` → `async (var) => ...` is a SyntaxError). Suffix with `_`.
+fn safe_ident(name: &str) -> String {
+    const RESERVED: &[&str] = &[
+        "var", "let", "const", "function", "class", "if", "else", "for", "while",
+        "do", "switch", "case", "break", "continue", "return", "new", "delete",
+        "typeof", "instanceof", "in", "of", "try", "catch", "finally", "throw",
+        "this", "super", "import", "export", "default", "extends", "static",
+        "yield", "await", "null", "true", "false", "void", "debugger", "arguments",
+    ];
+    if RESERVED.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
+}
+
+/// `for i in ...` — the JS loop variable must be mirrored into the shell var
+/// store each iteration (`sh2.setVar("i", i)`) so `$i` inside the body works.
+/// `js_name` may differ from `shell_name` (reserved-word avoidance).
+fn for_loop_body(shell_name: &str, js_name: &str, commands: &[Command]) -> Stmt {
+    let mut stmts = vec![Stmt::ExpressionStatement {
+        expression: sh2_call(
+            "setVar",
+            vec![
+                str_lit(shell_name),
+                Expr::Identifier {
+                    name: js_name.to_string(),
+                },
+            ],
+        ),
+    }];
+    stmts.extend(commands.iter().filter_map(stmt_for_command));
+    Stmt::BlockStatement { body: stmts }
+}
+
+/// Items of a `for i in ...` list. `$@`/`$*` (and `"$@"`) lower to
+/// `sh2.listVar(name)` so an empty positional list yields ZERO iterations
+/// (plain `sh2.getVar("@")` would yield one empty-string item).
+fn for_items_expr(items: &[Word]) -> Expr {
+    Expr::ArrayExpression {
+        elements: items.iter().map(|w| Some(for_item_expr(w))).collect(),
+    }
+}
+
+fn for_item_expr(w: &Word) -> Expr {
+    match w {
+        Word::Variable(name, _, _) if name == "@" || name == "*" => {
+            sh2_call("listVar", vec![str_lit(name)])
+        }
+        Word::StringInterpolation(interp, _) => match pure_at_parts(interp) {
+            Some(name) => sh2_call("listVar", vec![str_lit(name)]),
+            None => word_to_expr(w),
+        },
+        _ => word_to_expr(w),
+    }
+}
+
+/// A `"$@"`-style interpolation (a single `@`/`*` variable part, all literal
+/// parts empty) → the variable name; otherwise None.
+fn pure_at_parts(interp: &StringInterpolation) -> Option<&str> {
+    let mut var: Option<&str> = None;
+    for part in &interp.parts {
+        match part {
+            StringPart::Literal(s) if s.is_empty() => {}
+            StringPart::Variable(name) if (name == "@" || name == "*") && var.is_none() => {
+                var = Some(name);
+            }
+            _ => return None,
+        }
+    }
+    var
 }
 
 /// Body of an `if`/`while`/`for`: unwrap `Block` into its statements.
@@ -344,8 +439,17 @@ fn block_stmt(commands: &[Command]) -> Stmt {
     }
 }
 
+/// Async sh2.* call — wrapped in `await` so the runtime's async work
+/// completes before the next statement (statement order must be preserved).
+/// `background` is intentionally NOT awaited (fire-and-forget).
+fn async_sh2_call(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::AwaitExpression {
+        argument: Box::new(sh2_call(name, args)),
+    }
+}
+
 fn pipeline_expr(p: &Pipeline) -> Expr {
-    sh2_call(
+    async_sh2_call(
         "pipeline",
         vec![Expr::ArrayExpression {
             elements: p
@@ -369,16 +473,17 @@ fn command_to_expr(cmd: &Command) -> Expr {
             &bc.redirects,
         ),
         Command::Redirect(rc) => apply_redirects(command_to_expr(&rc.command), &rc.redirects),
-        Command::Pipeline(p) => pipeline_expr(p),
-        Command::Subshell(c) => sh2_call("subshell", vec![arrow(vec![], command_arrow_body(c))]),
-        Command::Block(b) => sh2_call(
+        Command::Subshell(c) => async_sh2_call("subshell", vec![arrow(vec![], command_arrow_body(c))]),
+        Command::Block(b) => async_sh2_call(
             "block",
             vec![arrow(vec![], ArrowBody::Block(Box::new(block_stmt(&b.commands))))],
         ),
-        Command::While(w) => sh2_call(
+        Command::While(w) => async_sh2_call(
             "whileLoop",
             vec![
-                command_to_expr(&w.condition),
+                // Condition must be a closure — a bare expression would be
+                // evaluated once when building the arguments.
+                arrow(vec![], ArrowBody::Expr(Box::new(command_to_expr(&w.condition)))),
                 arrow(vec![], ArrowBody::Block(Box::new(block_stmt(&w.body.commands)))),
             ],
         ),
@@ -475,7 +580,7 @@ fn apply_redirects(inner: Expr, redirects: &[Redirect]) -> Expr {
     if redirects.is_empty() {
         return inner;
     }
-    sh2_call(
+    async_sh2_call(
         "redirect",
         vec![
             arrow(vec![], ArrowBody::Expr(Box::new(inner))),
@@ -544,16 +649,19 @@ fn exec_call_with_env(name: &Word, args: &[Word], env: &BTreeMap<String, Word>, 
             properties: env.iter().map(|(k, v)| prop(k, word_to_expr(v))).collect(),
         });
     }
-    apply_redirects(sh2_call("exec", call_args), redirects)
+    apply_redirects(async_sh2_call("exec", call_args), redirects)
 }
 
 /// Arrow helper: sets `expression` correctly for block vs expression bodies.
+/// All arrows are async (closure bodies may await nested calls; the runtime
+/// awaits every closure it invokes).
 fn arrow(params: Vec<Expr>, body: ArrowBody) -> Expr {
     let expression = matches!(body, ArrowBody::Expr(_));
     Expr::ArrowFunctionExpression {
         params,
         body,
         expression,
+        r#async: true,
     }
 }
 
@@ -575,9 +683,10 @@ fn command_arrow_body(c: &Command) -> ArrowBody {
         | Command::Not(_)
         | Command::Assignment(_)
         | Command::ShoptCommand(_) => ArrowBody::Expr(Box::new(command_to_expr(c))),
-        other => ArrowBody::Block(Box::new(
-            stmt_for_command(other).unwrap_or_else(|| Stmt::BlockStatement { body: vec![] }),
-        )),
+        other => ArrowBody::Block(Box::new(Stmt::BlockStatement {
+            body: vec![stmt_for_command(other)
+                .unwrap_or_else(|| Stmt::BlockStatement { body: vec![] })],
+        })),
     }
 }
 
@@ -650,7 +759,11 @@ fn word_to_expr(word: &Word) -> Expr {
         },
         Word::Variable(name, _, _) => sh2_call("getVar", vec![str_lit(name)]),
         Word::CommandSubstitution(cmd, _) => Expr::AwaitExpression {
-            argument: Box::new(sh2_call("capture", vec![command_to_expr(cmd)])),
+            // Closure so the runtime can redirect fd 1 BEFORE the command runs.
+            argument: Box::new(sh2_call(
+                "capture",
+                vec![arrow(vec![], command_arrow_body(cmd))],
+            )),
         },
         Word::StringInterpolation(interp, _) => template_from_parts(&interp.parts),
         other => sh2_call("unsupported", vec![str_lit(&other.to_string())]),
@@ -691,7 +804,10 @@ fn part_to_expr(part: &StringPart) -> Expr {
         StringPart::Literal(_) => unreachable!("Literal parts are handled in template_from_parts"),
         StringPart::Variable(name) => sh2_call("getVar", vec![str_lit(name)]),
         StringPart::CommandSubstitution(cmd) => Expr::AwaitExpression {
-            argument: Box::new(sh2_call("capture", vec![command_to_expr(cmd)])),
+            argument: Box::new(sh2_call(
+                "capture",
+                vec![arrow(vec![], command_arrow_body(cmd))],
+            )),
         },
         other => sh2_call("unsupported", vec![str_lit(&format!("{other:?}"))]),
     }
