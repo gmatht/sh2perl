@@ -1315,6 +1315,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     }
                 }
             }
+        // Set $CHILD_ERROR to 0 for echo commands in statement context (not in pipeline)
+        if generator.current_pipeline_output_id().is_none() {
+            output.push_str(&generator.indent());
+            output.push_str("$CHILD_ERROR = 0;\n");
+        }
         } else if name == "true" && !cmd.env_vars.is_empty() && cmd.args.is_empty() {
             // This is a standalone assignment (e.g., i=$((i + 1)))
             for (var, value) in &cmd.env_vars {
