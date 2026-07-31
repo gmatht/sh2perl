@@ -39,7 +39,7 @@ pub fn generate_diff_command(
         if _is_final_command {
             // Standalone diff: print the captured output.
             let print_stmt = IrStmt::Output {
-                value: IrExpr::Var("diff_output".to_string(), Sigil::Scalar),
+                value: IrExpr::Var("diff_output".to_string(), Some(Sigil::Scalar)),
                 newline: true,
                 target: None,
             };

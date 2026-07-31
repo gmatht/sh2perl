@@ -1,14 +1,26 @@
-/// Perl IR — Intermediate Representation for code generation.
+/// Intermediate Representation for code generation.
 ///
-/// The generator produces an `IrProgram` from the shell AST.  A single
+/// The generator produces an `IrProgram` from the shell AST.  The Perl
 /// backend `ir_to_perl()` converts it to Perl text.  `RawText`/`RawExpr`
 /// hold unimigrated code so conversion can happen function by function.
+///
+/// ShIR direction (PLAN.md §3/§8): this module is being generalized from a
+/// Perl-only IR into a language-neutral ShIR that both the Perl backend and
+/// the ESTree emitter consume. The first step is done: `Sigil` is now an
+/// OPTIONAL backend annotation on `Var`/`AssignTarget`/`Decl`/`DeclareArray`
+/// (the core no longer requires a Perl `$`/`@`/`%`; `None` renders as scalar
+/// for Perl, and a non-Perl backend ignores it). Remaining Perl-specific
+/// surface to neutralize: `StrStyle` (Command/Heredoc → extensions),
+/// `Backtick`, `Regex`, `System`/`Pipeline` (→ `Exec`), `Require`,
+/// `SetChildError`. `RawText`/`RawExpr` stay as the migration bridge. The
+/// estree emitter (src/estree.rs) currently lowers from the raw AST and will
+/// reroute through this IR once two backends consume it.
 ///
 /// See docs/ir-design.md for full documentation.
 
 // ── Sigils ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Sigil {
     Scalar,
     Array,
@@ -57,8 +69,11 @@ pub enum IrExpr {
     Int(i64),
     /// String literal
     Str(String, StrStyle),
-    /// Variable: $name, @name, %name
-    Var(String, Sigil),
+    /// Variable: $name, @name, %name. The sigil is an OPTIONAL
+    /// backend annotation: the core IR is language-neutral and does not
+    /// require a Perl sigil (None renders as scalar for the Perl backend;
+    /// a non-Perl backend ignores it).
+    Var(String, Option<Sigil>),
     /// Array/hash element: $arr[idx], $map{key}
     Index {
         var: String,
@@ -121,7 +136,8 @@ pub enum IrExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssignTarget {
     pub var: String,
-    pub sigil: Sigil,
+    /// Optional backend sigil annotation (see Var).
+    pub sigil: Option<Sigil>,
     pub indices: Vec<IrExpr>,
 }
 
@@ -130,7 +146,8 @@ pub struct AssignTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decl {
     pub name: String,
-    pub sigil: Sigil,
+    /// Optional backend sigil annotation (see Var).
+    pub sigil: Option<Sigil>,
 }
 
 // ── Statements ───────────────────────────────────────────────────────
@@ -171,7 +188,8 @@ pub enum IrStmt {
     /// Array/hash assignment
     DeclareArray {
         var: String,
-        sigil: Sigil,
+        /// Optional backend sigil annotation (see Var).
+        sigil: Option<Sigil>,
         elements: Vec<IrExpr>,
     },
     /// if/elsif/else
@@ -510,7 +528,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             let kw = if *local { "local" } else { "my" };
             let decls = vars
                 .iter()
-                .map(|d| match d.sigil {
+                .map(|d| match d.sigil.unwrap_or(Sigil::Scalar) {
                     Sigil::Scalar => format!("${}", d.name),
                     Sigil::Array => format!("@{}", d.name),
                     Sigil::Hash => format!("%{}", d.name),
@@ -522,7 +540,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 emit_indent(out, indent);
                 // `local` always uses the `local $var = expr;` form.
                 // `my`: single scalar can omit parentheses: "my $x = expr;"
-                if *local || (vars.len() == 1 && vars[0].sigil == Sigil::Scalar) {
+                if *local || (vars.len() == 1 && vars[0].sigil.unwrap_or(Sigil::Scalar) == Sigil::Scalar) {
                     out.push_str(&format!("{} {} = {};\n", kw, decls, rhs));
                 } else {
                     out.push_str(&format!("{} ({}) = ({});\n", kw, decls, rhs));
@@ -539,7 +557,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 .map(|e| ir_expr_to_perl(e))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sigil_char = match sigil {
+            let sigil_char = match sigil.unwrap_or(Sigil::Scalar) {
                 Sigil::Array => '@',
                 Sigil::Hash => '%',
                 _ => '$',
@@ -994,7 +1012,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             }
         },
 
-        IrExpr::Var(name, sigil) => match sigil {
+        IrExpr::Var(name, sigil) => match sigil.unwrap_or(Sigil::Scalar) {
             Sigil::Scalar => {
                 if is_env_style_var_name(name) {
                     format!("$ENV{{{}}}", name)
@@ -1081,7 +1099,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             // of the `${\(...)}` trick (which is unidiomatic transliteration-style).
             let all_simple = parts.iter().all(|part| match part {
                 InterpPart::Lit(_) => true,
-                InterpPart::Expr(e) => matches!(e.as_ref(), IrExpr::Var(_, Sigil::Scalar)),
+                InterpPart::Expr(e) => matches!(e.as_ref(), IrExpr::Var(_, None | Some(Sigil::Scalar))),
             });
 
             if all_simple {
@@ -1105,8 +1123,10 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                             }
                         },
                         InterpPart::Expr(e) => {
-                            if let IrExpr::Var(name, Sigil::Scalar) = e.as_ref() {
-                                if is_env_style_var_name(name) {
+                            if let IrExpr::Var(name, sigil) = e.as_ref() {
+                                if sigil.unwrap_or(Sigil::Scalar) == Sigil::Scalar
+                                    && is_env_style_var_name(name)
+                                {
                                     s.push_str(&format!("$ENV{{{}}}", name));
                                 } else {
                                     s.push_str(&format!("${}", name));
@@ -1748,7 +1768,7 @@ pub fn perl_expr_to_ir(perl_expr: &str) -> IrExpr {
             // them to $ENV{NAME}.  Keep them as RawExpr to preserve the
             // generator's declared/local resolution.
             if !name.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
-                return IrExpr::Var(name.to_string(), Sigil::Scalar);
+                return IrExpr::Var(name.to_string(), Some(Sigil::Scalar));
             }
         }
     }
@@ -1757,7 +1777,7 @@ pub fn perl_expr_to_ir(perl_expr: &str) -> IrExpr {
     if trimmed.starts_with('@') && trimmed.len() > 1 {
         let name = &trimmed[1..];
         if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return IrExpr::Var(name.to_string(), Sigil::Array);
+            return IrExpr::Var(name.to_string(), Some(Sigil::Array));
         }
     }
 

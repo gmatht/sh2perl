@@ -321,7 +321,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                         &IrStmt::Assign {
                             targets: vec![AssignTarget {
                                 var: "main_exit_code".to_string(),
-                                sigil: Sigil::Scalar,
+                                sigil: Some(Sigil::Scalar),
                                 indices: vec![],
                             }],
                             expr: IrExpr::Int(0),
@@ -356,7 +356,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                             &IrStmt::Assign {
                                 targets: vec![AssignTarget {
                                     var: "main_exit_code".to_string(),
-                                    sigil: Sigil::Scalar,
+                                    sigil: Some(Sigil::Scalar),
                                     indices: vec![],
                                 }],
                                 expr: IrExpr::Int(0),
