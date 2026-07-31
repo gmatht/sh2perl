@@ -3,6 +3,7 @@ pub mod assignments;
 pub mod commands;
 pub mod control_flow;
 pub mod errors;
+pub mod normalize;
 pub mod redirects;
 pub mod utilities;
 pub mod words;

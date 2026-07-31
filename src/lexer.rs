@@ -206,6 +206,19 @@ pub enum Token {
     Let,
 
     // Conditionals
+    // Conditionals — test operators for `[ -f x ]` / `[[ $x -eq 5 ]]`.
+    //
+    // WARNING (breakage history): these tokens lex ANYWHERE, so `-rf` in a
+    // normal command was split into `-r` + `f` (longest-match takes the `-r`
+    // token, `f` becomes a bare identifier). That made `rm -rf x` parse
+    // identically to `rm -r f x` and forced generator workarounds that
+    // conflated the two (rm.rs treated a bare `f` after `-r` as the force
+    // flag, silently eating a real file named `f`). parse_word() now re-joins
+    // these tokens with adjacent bare words (see parser/words.rs), so the
+    // whitespace in the source is the discriminator: `-rf` (no space)
+    // combines, `-r f` (space) stays two args — matching bash. Test-
+    // expression parsers consume these tokens directly and are unaffected.
+    // Keep them out of any non-test token consumer so the combine rule holds.
     #[token("-eq", priority = 1)]
     Eq,
     #[token("-ne", priority = 1)]

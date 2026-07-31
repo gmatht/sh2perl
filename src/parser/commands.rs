@@ -556,6 +556,22 @@ impl Parser {
             }
         }
 
+        // Canonicalize combined short flags (`-rf` → `-r -f`) for known
+        // flag-taking commands (see parser/normalize.rs). This runs after all
+        // arguments — including post-redirect ones — have been collected, and
+        // is the single choke point every simple command passes through.
+        match &mut command {
+            Command::Simple(sc) => {
+                if let Word::Literal(name, _) = &sc.name {
+                    crate::parser::normalize::normalize_combined_flags(name, &mut sc.args);
+                }
+            }
+            Command::BuiltinCommand(bc) => {
+                crate::parser::normalize::normalize_combined_flags(&bc.name, &mut bc.args);
+            }
+            _ => {}
+        }
+
         if redirects.is_empty() {
             Ok(command)
         } else {
