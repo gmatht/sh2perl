@@ -218,14 +218,18 @@ fn fix_control_flow(prog: Program) -> Program {
         body: prog
             .body
             .into_iter()
-            .filter_map(|s| fix_stmt(s, false, false))
+            .filter_map(|s| fix_stmt(s, false, false, false))
             .collect(),
     }
 }
 
-/// `in_arrow` — inside an ArrowFunctionExpression body; `in_switch` —
-/// directly inside a switch-case consequent (native break is legal there).
-fn fix_stmt(stmt: Stmt, in_arrow: bool, in_switch: bool) -> Option<Stmt> {
+/// `in_arrow` — inside an ArrowFunctionExpression body; `in_func` — inside
+/// the sh2.define function arrow (only there is a native `return` legal:
+/// bash `return` inside a loop body / pipeline stage / subshell exits the
+/// enclosing FUNCTION, which in generated JS is a loop-body arrow the
+/// runtime must unwind via the RETURN signal); `in_switch` — directly
+/// inside a switch-case consequent (native break is legal there).
+fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Option<Stmt> {
     Some(match stmt {
         Stmt::BreakStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("break", vec![]),
@@ -235,7 +239,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_switch: bool) -> Option<Stmt> {
                 expression: sh2_call("continue", vec![]),
             }
         }
-        Stmt::ReturnStatement { argument } if !in_arrow => {
+        Stmt::ReturnStatement { argument } if !in_arrow || !in_func => {
             let mut args = vec![];
             if let Some(a) = argument {
                 args.push(a);
@@ -245,12 +249,12 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_switch: bool) -> Option<Stmt> {
             }
         }
         Stmt::ExpressionStatement { expression } => Stmt::ExpressionStatement {
-            expression: fix_expr(expression, in_arrow),
+            expression: fix_expr(expression, in_arrow, in_func),
         },
         Stmt::BlockStatement { body } => Stmt::BlockStatement {
             body: body
                 .into_iter()
-                .filter_map(|s| fix_stmt(s, in_arrow, false))
+                .filter_map(|s| fix_stmt(s, in_arrow, in_func, false))
                 .collect(),
         },
         Stmt::IfStatement {
@@ -258,40 +262,42 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_switch: bool) -> Option<Stmt> {
             consequent,
             alternate,
         } => Stmt::IfStatement {
-            test: fix_expr(test, in_arrow),
+            test: fix_expr(test, in_arrow, in_func),
             consequent: Box::new(
-                fix_stmt(*consequent, in_arrow, false).unwrap_or(Stmt::BlockStatement {
+                fix_stmt(*consequent, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
                     body: vec![],
                 }),
             ),
             alternate: alternate.map(|a| {
-                Box::new(fix_stmt(*a, in_arrow, false).unwrap_or(Stmt::BlockStatement {
-                    body: vec![],
-                }))
+                Box::new(
+                    fix_stmt(*a, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
+                        body: vec![],
+                    }),
+                )
             }),
         },
         Stmt::SwitchStatement {
             discriminant,
             cases,
         } => Stmt::SwitchStatement {
-            discriminant: fix_expr(discriminant, in_arrow),
+            discriminant: fix_expr(discriminant, in_arrow, in_func),
             cases: cases
                 .into_iter()
                 .map(|c| SwitchCase {
                     type_: c.type_,
-                    test: c.test.map(|t| fix_expr(t, in_arrow)),
+                    test: c.test.map(|t| fix_expr(t, in_arrow, in_func)),
                     consequent: c
                         .consequent
                         .into_iter()
-                        .filter_map(|s| fix_stmt(s, in_arrow, true))
+                        .filter_map(|s| fix_stmt(s, in_arrow, in_func, true))
                         .collect(),
                 })
                 .collect(),
         },
         Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
-            test: fix_expr(test, in_arrow),
+            test: fix_expr(test, in_arrow, in_func),
             body: Box::new(
-                fix_stmt(*body, in_arrow, false).unwrap_or(Stmt::BlockStatement {
+                fix_stmt(*body, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
                     body: vec![],
                 }),
             ),
@@ -302,9 +308,9 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_switch: bool) -> Option<Stmt> {
             body,
         } => Stmt::ForOfStatement {
             left,
-            right: fix_expr(right, in_arrow),
+            right: fix_expr(right, in_arrow, in_func),
             body: Box::new(
-                fix_stmt(*body, in_arrow, false).unwrap_or(Stmt::BlockStatement {
+                fix_stmt(*body, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
                     body: vec![],
                 }),
             ),
@@ -318,7 +324,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_switch: bool) -> Option<Stmt> {
                 .map(|d| VariableDeclarator {
                     type_: d.type_,
                     id: d.id,
-                    init: d.init.map(|i| fix_expr(i, in_arrow)),
+                    init: d.init.map(|i| fix_expr(i, in_arrow, in_func)),
                 })
                 .collect(),
             kind,
@@ -327,33 +333,44 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_switch: bool) -> Option<Stmt> {
     })
 }
 
-fn fix_expr(e: Expr, in_arrow: bool) -> Expr {
+fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
     match e {
         Expr::CallExpression {
             callee,
             arguments,
             optional,
-        } => Expr::CallExpression {
-            callee: Box::new(fix_expr(*callee, in_arrow)),
-            arguments: arguments
-                .into_iter()
-                .map(|a| fix_expr(a, in_arrow))
-                .collect(),
-            optional,
-        },
+        } => {
+            // Arrows are bash-return contexts (loop bodies, pipeline stages,
+            // subshells) EXCEPT the sh2.define function arrow, where a
+            // native `return` is legal (and keeps the function's value).
+            let is_define = matches!(
+                callee.as_ref(),
+                Expr::MemberExpression { object, property, .. }
+                    if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
+                        && matches!(property.as_ref(), Expr::Identifier { name } if name == "define")
+            );
+            Expr::CallExpression {
+                callee: Box::new(fix_expr(*callee, in_arrow, in_func)),
+                arguments: arguments
+                    .into_iter()
+                    .map(|a| fix_expr(a, in_arrow, if is_define { true } else { false }))
+                    .collect(),
+                optional,
+            }
+        }
         Expr::MemberExpression {
             object,
             property,
             computed,
             optional,
         } => Expr::MemberExpression {
-            object: Box::new(fix_expr(*object, in_arrow)),
-            property: Box::new(fix_expr(*property, in_arrow)),
+            object: Box::new(fix_expr(*object, in_arrow, in_func)),
+            property: Box::new(fix_expr(*property, in_arrow, in_func)),
             computed,
             optional,
         },
         Expr::AwaitExpression { argument } => Expr::AwaitExpression {
-            argument: Box::new(fix_expr(*argument, in_arrow)),
+            argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
         },
         Expr::ArrowFunctionExpression {
             params,
@@ -363,9 +380,11 @@ fn fix_expr(e: Expr, in_arrow: bool) -> Expr {
         } => Expr::ArrowFunctionExpression {
             params,
             body: match body {
-                ArrowBody::Expr(inner) => ArrowBody::Expr(Box::new(fix_expr(*inner, true))),
+                ArrowBody::Expr(inner) => ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func))),
                 ArrowBody::Block(b) => ArrowBody::Block(Box::new(
-                    fix_stmt(*b, true, false).unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                    fix_stmt(*b, true, in_func, false).unwrap_or(Stmt::BlockStatement {
+                        body: vec![],
+                    }),
                 )),
             },
             expression,
@@ -377,7 +396,7 @@ fn fix_expr(e: Expr, in_arrow: bool) -> Expr {
                 .map(|p| Property {
                     type_: p.type_,
                     key: p.key,
-                    value: fix_expr(p.value, in_arrow),
+                    value: fix_expr(p.value, in_arrow, in_func),
                     kind: p.kind,
                     computed: p.computed,
                     shorthand: p.shorthand,
@@ -387,14 +406,14 @@ fn fix_expr(e: Expr, in_arrow: bool) -> Expr {
         Expr::ArrayExpression { elements } => Expr::ArrayExpression {
             elements: elements
                 .into_iter()
-                .map(|el| el.map(|e| fix_expr(e, in_arrow)))
+                .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func)))
                 .collect(),
         },
         Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
             quasis,
             expressions: expressions
                 .into_iter()
-                .map(|e| fix_expr(e, in_arrow))
+                .map(|e| fix_expr(e, in_arrow, in_func))
                 .collect(),
         },
         Expr::LogicalExpression {
@@ -403,8 +422,8 @@ fn fix_expr(e: Expr, in_arrow: bool) -> Expr {
             right,
         } => Expr::LogicalExpression {
             operator,
-            left: Box::new(fix_expr(*left, in_arrow)),
-            right: Box::new(fix_expr(*right, in_arrow)),
+            left: Box::new(fix_expr(*left, in_arrow, in_func)),
+            right: Box::new(fix_expr(*right, in_arrow, in_func)),
         },
         Expr::UnaryExpression {
             operator,
@@ -412,7 +431,7 @@ fn fix_expr(e: Expr, in_arrow: bool) -> Expr {
             prefix,
         } => Expr::UnaryExpression {
             operator,
-            argument: Box::new(fix_expr(*argument, in_arrow)),
+            argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
             prefix,
         },
         other => other,
@@ -585,10 +604,12 @@ fn transform_redirects(redirects: &mut Vec<Redirect>) -> Vec<Command> {
     for r in redirects.iter_mut() {
         match std::mem::replace(&mut r.operator, RedirectOperator::Input) {
             RedirectOperator::ProcessSubstitutionInput(inner) => {
-                producers.push(*inner);
+                // Recursively transform the producer (it may itself contain
+                // `<(sort <(grep ...))` — nested process substitution).
+                let inner = transform_cmd(&inner);
+                producers.push(inner.clone());
                 // here-string: content = captured stdout of the producer
                 r.operator = RedirectOperator::HereString;
-                let inner = producers.last().unwrap().clone();
                 r.target = Word::StringInterpolation(
                     StringInterpolation {
                         parts: vec![StringPart::CommandSubstitution(Box::new(inner))],
