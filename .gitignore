@@ -48,3 +48,24 @@ examples/comparison.txt
 examples/config.txt
 examples/-
 __tmp_run_*.pl
+
+# Scratch files from ad-hoc test commands (root-level artifacts)
+out.txt
+comparison.txt
+config.txt
+final_result.txt
+users.txt
+file_00[0-9]
+001
+002
+003
+004
+005
+[0-9][0-9]
+--version
+&1
+1
+?*$ENV{*
+?*${*
+test.py
+x.py
