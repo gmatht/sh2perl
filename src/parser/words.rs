@@ -229,6 +229,63 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
             | Some(Token::Colon)
             | Some(Token::Star)
+            | Some(Token::Colon)
+// Test-operator tokens are intentionally included so combined
+
+            | Some(Token::Colon)
+// short flags (`rm -rf`, `echo -rf`) re-join into ONE literal
+
+            | Some(Token::Colon)
+// instead of lexing as `-r` + `f`. The lexer emits them as
+
+            | Some(Token::Colon)
+// distinct tokens for the test-expression parsers (`[ -f x ]`),
+
+            | Some(Token::Colon)
+// which consume them directly; here in argument position the
+
+            | Some(Token::Colon)
+// whitespace in the source is the discriminator — `-rf` combines,
+
+            | Some(Token::Colon)
+// `-r f` stays two args, exactly like bash. (History: before this,
+
+            | Some(Token::Colon)
+// `rm -rf x` and `rm -r f x` parsed identically and rm.rs had a
+
+            | Some(Token::Colon)
+// workaround that conflated them, eating a real file named `f`.)
+
+            | Some(Token::Colon)
+| Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le)
+
+            | Some(Token::Colon)
+| Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) | Some(Token::NonZero)
+
+            | Some(Token::Colon)
+| Some(Token::File) | Some(Token::Directory) | Some(Token::Exists)
+
+            | Some(Token::Colon)
+| Some(Token::Readable) | Some(Token::Writable) | Some(Token::Executable)
+
+            | Some(Token::Colon)
+| Some(Token::Size) | Some(Token::Symlink) | Some(Token::SymlinkH)
+
+            | Some(Token::Colon)
+| Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block)
+
+            | Some(Token::Colon)
+| Some(Token::Character) | Some(Token::SetGid) | Some(Token::Sticky)
+
+            | Some(Token::Colon)
+| Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned)
+
+            | Some(Token::Colon)
+| Some(Token::Modified) | Some(Token::NewerThan) | Some(Token::OlderThan)
+
+            | Some(Token::Colon)
+| Some(Token::SameFile)
+
             | Some(Token::Percent)
             | Some(Token::Comma)
             | Some(Token::Question)
@@ -267,6 +324,63 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
                 | Some(Token::Colon)
                 | Some(Token::Star)
+                | Some(Token::Colon)
+// Test-operator tokens are intentionally included so combined
+
+                | Some(Token::Colon)
+// short flags (`rm -rf`, `echo -rf`) re-join into ONE literal
+
+                | Some(Token::Colon)
+// instead of lexing as `-r` + `f`. The lexer emits them as
+
+                | Some(Token::Colon)
+// distinct tokens for the test-expression parsers (`[ -f x ]`),
+
+                | Some(Token::Colon)
+// which consume them directly; here in argument position the
+
+                | Some(Token::Colon)
+// whitespace in the source is the discriminator — `-rf` combines,
+
+                | Some(Token::Colon)
+// `-r f` stays two args, exactly like bash. (History: before this,
+
+                | Some(Token::Colon)
+// `rm -rf x` and `rm -r f x` parsed identically and rm.rs had a
+
+                | Some(Token::Colon)
+// workaround that conflated them, eating a real file named `f`.)
+
+                | Some(Token::Colon)
+| Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le)
+
+                | Some(Token::Colon)
+| Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) | Some(Token::NonZero)
+
+                | Some(Token::Colon)
+| Some(Token::File) | Some(Token::Directory) | Some(Token::Exists)
+
+                | Some(Token::Colon)
+| Some(Token::Readable) | Some(Token::Writable) | Some(Token::Executable)
+
+                | Some(Token::Colon)
+| Some(Token::Size) | Some(Token::Symlink) | Some(Token::SymlinkH)
+
+                | Some(Token::Colon)
+| Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block)
+
+                | Some(Token::Colon)
+| Some(Token::Character) | Some(Token::SetGid) | Some(Token::Sticky)
+
+                | Some(Token::Colon)
+| Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned)
+
+                | Some(Token::Colon)
+| Some(Token::Modified) | Some(Token::NewerThan) | Some(Token::OlderThan)
+
+                | Some(Token::Colon)
+| Some(Token::SameFile)
+
                 | Some(Token::Percent)
                 | Some(Token::Comma)
                 | Some(Token::Question)
@@ -886,6 +1000,63 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
             | Some(Token::Colon)
             | Some(Token::Star)
+            | Some(Token::Colon)
+// Test-operator tokens are intentionally included so combined
+
+            | Some(Token::Colon)
+// short flags (`rm -rf`, `echo -rf`) re-join into ONE literal
+
+            | Some(Token::Colon)
+// instead of lexing as `-r` + `f`. The lexer emits them as
+
+            | Some(Token::Colon)
+// distinct tokens for the test-expression parsers (`[ -f x ]`),
+
+            | Some(Token::Colon)
+// which consume them directly; here in argument position the
+
+            | Some(Token::Colon)
+// whitespace in the source is the discriminator — `-rf` combines,
+
+            | Some(Token::Colon)
+// `-r f` stays two args, exactly like bash. (History: before this,
+
+            | Some(Token::Colon)
+// `rm -rf x` and `rm -r f x` parsed identically and rm.rs had a
+
+            | Some(Token::Colon)
+// workaround that conflated them, eating a real file named `f`.)
+
+            | Some(Token::Colon)
+| Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le)
+
+            | Some(Token::Colon)
+| Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) | Some(Token::NonZero)
+
+            | Some(Token::Colon)
+| Some(Token::File) | Some(Token::Directory) | Some(Token::Exists)
+
+            | Some(Token::Colon)
+| Some(Token::Readable) | Some(Token::Writable) | Some(Token::Executable)
+
+            | Some(Token::Colon)
+| Some(Token::Size) | Some(Token::Symlink) | Some(Token::SymlinkH)
+
+            | Some(Token::Colon)
+| Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block)
+
+            | Some(Token::Colon)
+| Some(Token::Character) | Some(Token::SetGid) | Some(Token::Sticky)
+
+            | Some(Token::Colon)
+| Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned)
+
+            | Some(Token::Colon)
+| Some(Token::Modified) | Some(Token::NewerThan) | Some(Token::OlderThan)
+
+            | Some(Token::Colon)
+| Some(Token::SameFile)
+
             | Some(Token::Percent)
             | Some(Token::Comma)
             | Some(Token::Question)
@@ -924,6 +1095,63 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
                 | Some(Token::Colon)
                 | Some(Token::Star)
+                | Some(Token::Colon)
+// Test-operator tokens are intentionally included so combined
+
+                | Some(Token::Colon)
+// short flags (`rm -rf`, `echo -rf`) re-join into ONE literal
+
+                | Some(Token::Colon)
+// instead of lexing as `-r` + `f`. The lexer emits them as
+
+                | Some(Token::Colon)
+// distinct tokens for the test-expression parsers (`[ -f x ]`),
+
+                | Some(Token::Colon)
+// which consume them directly; here in argument position the
+
+                | Some(Token::Colon)
+// whitespace in the source is the discriminator — `-rf` combines,
+
+                | Some(Token::Colon)
+// `-r f` stays two args, exactly like bash. (History: before this,
+
+                | Some(Token::Colon)
+// `rm -rf x` and `rm -r f x` parsed identically and rm.rs had a
+
+                | Some(Token::Colon)
+// workaround that conflated them, eating a real file named `f`.)
+
+                | Some(Token::Colon)
+| Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le)
+
+                | Some(Token::Colon)
+| Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) | Some(Token::NonZero)
+
+                | Some(Token::Colon)
+| Some(Token::File) | Some(Token::Directory) | Some(Token::Exists)
+
+                | Some(Token::Colon)
+| Some(Token::Readable) | Some(Token::Writable) | Some(Token::Executable)
+
+                | Some(Token::Colon)
+| Some(Token::Size) | Some(Token::Symlink) | Some(Token::SymlinkH)
+
+                | Some(Token::Colon)
+| Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block)
+
+                | Some(Token::Colon)
+| Some(Token::Character) | Some(Token::SetGid) | Some(Token::Sticky)
+
+                | Some(Token::Colon)
+| Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned)
+
+                | Some(Token::Colon)
+| Some(Token::Modified) | Some(Token::NewerThan) | Some(Token::OlderThan)
+
+                | Some(Token::Colon)
+| Some(Token::SameFile)
+
                 | Some(Token::Percent)
                 | Some(Token::Comma)
                 | Some(Token::Question)
