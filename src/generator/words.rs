@@ -748,19 +748,19 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // For backtick commands, we need to return the value, not print it
                             perl_code
                         } else if name == "head" {
-                            // Use IrExpr::Backtick for a clean qx{} expression.
+                            // Use IrExpr::Capture for a clean qx{} expression.
                             // This avoids the `do { my @_qx_cmd = (...); ... }` boilerplate
                             // (Pattern A fix).
                             let head_cmd = generator.generate_command_string_for_system(cmd);
-                            let backtick = crate::ir::IrExpr::Backtick {
+                            let backtick = crate::ir::IrExpr::Capture {
                                 expr: Box::new(crate::ir::IrExpr::RawExpr(head_cmd)),
                                 native: false,
                             };
                             crate::ir::expr_to_perl(&backtick)
                         } else if name == "tail" {
-                            // Use IrExpr::Backtick for a clean qx{} expression.
+                            // Use IrExpr::Capture for a clean qx{} expression.
                             let tail_cmd = generator.generate_command_string_for_system(cmd);
-                            let backtick = crate::ir::IrExpr::Backtick {
+                            let backtick = crate::ir::IrExpr::Capture {
                                 expr: Box::new(crate::ir::IrExpr::RawExpr(tail_cmd)),
                                 native: false,
                             };

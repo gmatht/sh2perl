@@ -109,11 +109,12 @@ pub enum IrExpr {
     },
     /// String interpolation: "hello $name"
     Interpolate(Vec<InterpPart>),
-    /// Backtick command-substitution result.
-    /// If `native` is true, the expression already produces the exact
-    /// value (no trailing newline). If false, trailing newlines are
-    /// stripped (shell command-substitution semantics).
-    Backtick {
+    /// Command output capture (shell command substitution / backticks) —
+    /// neutral. The Perl backend renders it as qx{}/backticks; a non-Perl
+    /// consumer uses the wrapped command expression. If `native` is true the
+    /// expression already produces the exact value (no trailing newline); if
+    /// false, trailing newlines are stripped (shell semantics).
+    Capture {
         expr: Box<IrExpr>,
         native: bool,
     },
@@ -461,7 +462,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
 
         IrStmt::Assign { targets, expr } => {
             let rhs = ir_expr_to_perl(expr);
-            // Detect Backtick { native: false } on the RHS — emit the
+            // Detect Capture { native: false } on the RHS — emit the
             // two-statement clean form instead of embedding a do-block.
             if targets.len() == 1 && targets[0].indices.is_empty() {
                 let var = &targets[0].var;
@@ -470,9 +471,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 } else {
                     format!("${}", var)
                 };
-                if let IrExpr::Backtick { native: false, .. } = expr {
+                if let IrExpr::Capture { native: false, .. } = expr {
                     // Extract the inner expression string for qx{...}
-                    if let IrExpr::Backtick { expr: inner_expr, .. } = expr {
+                    if let IrExpr::Capture { expr: inner_expr, .. } = expr {
                         let mut inner_str = ir_expr_to_perl(inner_expr);
                         // Strip surrounding backticks from StrStyle::Command rendering
                         if inner_str.starts_with('`') && inner_str.ends_with('`') && inner_str.len() >= 2 {
@@ -798,7 +799,7 @@ pub(crate) fn emit_sub(out: &mut String, sub: &IrSub) {
 
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     match expr {
-        IrExpr::Backtick { expr, native } => {
+        IrExpr::Capture { expr, native } => {
             let mut inner = ir_expr_to_perl(expr);
             // Strip surrounding backticks from StrStyle::Command rendering
             if inner.starts_with('`') && inner.ends_with('`') && inner.len() >= 2 {
@@ -1421,7 +1422,7 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
             InterpPart::Expr(e) => expr_refers_to_main_exit(e),
         }),
         IrExpr::BinOp { lhs, rhs, .. } => expr_refers_to_main_exit(lhs) || expr_refers_to_main_exit(rhs),
-        IrExpr::Backtick { expr, .. } => expr_refers_to_main_exit(expr),
+        IrExpr::Capture { expr, .. } => expr_refers_to_main_exit(expr),
         IrExpr::Call { args, .. } => args.iter().any(|a| expr_refers_to_main_exit(a)),
         IrExpr::MethodCall { obj, args, .. } => expr_refers_to_main_exit(obj) || args.iter().any(|a| expr_refers_to_main_exit(a)),
         IrExpr::Index { key, .. } => expr_refers_to_main_exit(key),
@@ -1545,7 +1546,7 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
             collect_vars_in_expr(lhs, vars);
             collect_vars_in_expr(rhs, vars);
         }
-        IrExpr::Backtick { expr, .. } => collect_vars_in_expr(expr, vars),
+        IrExpr::Capture { expr, .. } => collect_vars_in_expr(expr, vars),
         IrExpr::Call { args, .. } => {
             for a in args { collect_vars_in_expr(a, vars); }
         }

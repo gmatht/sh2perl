@@ -701,7 +701,7 @@ pub fn generate_pipeline_for_substitution(
                     }
                     _ => {
                         // Generic fallback for non-special-cased single commands:
-                        // Use IrExpr::Backtick to emit a clean qx{bash -c '...'}
+                        // Use IrExpr::Capture to emit a clean qx{bash -c '...'}
                         // expression instead of the full pipeline scaffold.
                         // This addresses Pattern A (pipeline boilerplate) and
                         // Pattern B (contradictory newline handling).
@@ -713,7 +713,7 @@ pub fn generate_pipeline_for_substitution(
                         // Use the command string directly inside qx{...} instead
                         // of wrapping in bash -c.  Perl's qx{} executes through
                         // /bin/sh by default.
-                        let backtick = IrExpr::Backtick {
+                        let backtick = IrExpr::Capture {
                             expr: Box::new(IrExpr::RawExpr(final_cmd_str)),
                             native: false,
                         };
@@ -821,10 +821,10 @@ pub fn generate_pipeline_for_substitution(
     // it through bash -c.  Perl's qx{} already runs through /bin/sh by
     // default, so the bash -c wrapper is unnecessary for simple pipelines.
     //
-    // Use IrExpr::Backtick to produce a clean `do { chomp(my $_r = qx{...}); $_r; }`
+    // Use IrExpr::Capture to produce a clean `do { chomp(my $_r = qx{...}); $_r; }`
     // expression. This replaces the raw format!() with an IR node that the
     // backend formats consistently, addressing Patterns A and G.
-    let backtick_expr = IrExpr::Backtick {
+    let backtick_expr = IrExpr::Capture {
         expr: Box::new(IrExpr::RawExpr(final_cmd)),
         native: false,
     };
