@@ -1981,14 +1981,24 @@ fn generate_linebyline_command(
             // For echo, just output the line
             let mut output = String::new();
             if let Some(arg) = cmd.args.first() {
-                let value = generator.word_to_perl(arg);
-                // Check if the value is the same as the input variable to avoid redundant assignment
-                let line_var_with_dollar = format!("${}", line_var);
-                if value != line_var_with_dollar {
-                    // Echo command sets the input variable to the value
+                // Detect when the echoed value is the input line variable
+                // itself (echo $L or echo "$L") — no assignment needed.
+                // Compare at the AST level instead of string-comparing
+                // generated Perl, since word_to_perl may render undeclared
+                // variables as ($ENV{var} // q{}) rather than bare $var.
+                let is_self = match arg {
+                    Word::Variable(var, _, _) => var == line_var,
+                    Word::StringInterpolation(interp, _) => {
+                        interp.parts.len() == 1
+                            && matches!(&interp.parts[0], StringPart::Variable(var) if var == line_var)
+                    }
+                    _ => false,
+                };
+                if !is_self {
+                    let value = generator.word_to_perl(arg);
                     output.push_str(&format!("${} = {};\n", line_var, value));
                 }
-                // If value == input_var_with_dollar, skip the assignment as it's redundant
+                // If value == input_var, skip the assignment as it's redundant
             }
             output
         }

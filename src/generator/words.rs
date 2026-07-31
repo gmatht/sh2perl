@@ -2420,7 +2420,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 format!("${}", var)
                             }
                         } else {
-                            format!("${}", var)           // Regular variable
+                            // Regular variable — use the centralized helper so
+                            // undeclared vars map to $ENV{var} (avoiding `use strict`
+                            // compile errors) and declared vars keep their $var form.
+                            crate::generator::expansions::parameter_var_scalar_ref(generator, var)
                         }
                     }
                 }
