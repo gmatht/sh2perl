@@ -750,11 +750,14 @@ fn exec_call(name: &Word, args: &[Word]) -> Expr {
 }
 
 fn args_array(args: &[Word]) -> Expr {
+    // Each word lowers independently. The parser loses the whitespace between
+    // adjacent literal/brace words (`{a,b}-suf` vs `{a,b} -suf` are
+    // indistinguishable), so cross-product coalescing would be wrong for the
+    // space-separated form; per-word lowering matches the Perl backend.
     Expr::ArrayExpression {
         elements: args.iter().map(|w| Some(word_to_expr(w))).collect(),
     }
 }
-
 /// Like `word_to_expr` but command substitutions do NOT word-split
 /// (assignment values, env values — bash keeps internal spaces there).
 fn word_to_expr_quoted(word: &Word) -> Expr {
@@ -785,8 +788,81 @@ fn word_to_expr(word: &Word) -> Expr {
             )),
         },
         Word::StringInterpolation(interp, _) => template_from_parts(&interp.parts),
+        Word::ParameterExpansion(pe, _) => param_expansion_to_expr(pe),
+        Word::Arithmetic(ae, _) => sh2_call("arith", vec![str_lit(&ae.expression)]),
+        Word::BraceExpansion(be, _) => brace_expansion_to_expr(be),
         other => sh2_call("unsupported", vec![str_lit(&other.to_string())]),
     }
+}
+
+/// `${var...}` parameter expansion → `sh2.param(op, name, args...)`. The
+/// runtime implements the operator set (defaults, case mods, prefix/suffix
+/// removal, substitution, basename/dirname, slicing).
+fn param_expansion_to_expr(pe: &ParameterExpansion) -> Expr {
+    let (op, extra): (&str, Vec<Expr>) = match &pe.operator {
+        ParameterExpansionOperator::None => ("", vec![]),
+        ParameterExpansionOperator::UppercaseAll => ("^^", vec![]),
+        ParameterExpansionOperator::LowercaseAll => (",,", vec![]),
+        ParameterExpansionOperator::UppercaseFirst => ("^", vec![]),
+        ParameterExpansionOperator::RemoveLongestPrefix(p) => ("##", vec![str_lit(p)]),
+        ParameterExpansionOperator::RemoveShortestPrefix(p) => ("#", vec![str_lit(p)]),
+        ParameterExpansionOperator::RemoveLongestSuffix(p) => ("%%", vec![str_lit(p)]),
+        ParameterExpansionOperator::RemoveShortestSuffix(p) => ("%", vec![str_lit(p)]),
+        ParameterExpansionOperator::SubstituteAll(p, r) => ("//", vec![str_lit(p), str_lit(r)]),
+        ParameterExpansionOperator::DefaultValue(d) => (":-", vec![str_lit(d)]),
+        ParameterExpansionOperator::AssignDefault(d) => (":=", vec![str_lit(d)]),
+        ParameterExpansionOperator::ErrorIfUnset(e) => (":?", vec![str_lit(e)]),
+        ParameterExpansionOperator::Basename => ("basename", vec![]),
+        ParameterExpansionOperator::Dirname => ("dirname", vec![]),
+        ParameterExpansionOperator::ArraySlice(off, len) => (
+            "slice",
+            vec![str_lit(off), str_lit(len.as_deref().unwrap_or(""))],
+        ),
+    };
+    let mut args = vec![str_lit(op), str_lit(&pe.variable)];
+    args.extend(extra);
+    sh2_call("param", args)
+}
+
+/// `{a,b}` / `{1..5}` brace expansion → `sh2.brace(prefix, items, suffix)`
+/// returning an ARRAY of words (exec flattens array args into separate
+/// arguments, matching bash's word-splitting of brace expansion).
+fn brace_expansion_to_expr(be: &BraceExpansion) -> Expr {
+    let groups = Expr::Literal {
+        value: serde_json::Value::Array(vec![brace_items_json(&be.items)]),
+        raw: None,
+    };
+    sh2_call(
+        "brace",
+        vec![
+            str_lit(be.prefix.as_deref().unwrap_or("")),
+            groups,
+            Expr::Literal {
+                value: serde_json::Value::Array(vec![]),
+                raw: None,
+            },
+            str_lit(be.suffix.as_deref().unwrap_or("")),
+        ],
+    )
+}
+
+fn brace_items_json(items: &[BraceItem]) -> serde_json::Value {
+    serde_json::Value::Array(
+        items
+            .iter()
+            .map(|it| match it {
+                BraceItem::Literal(s) => serde_json::Value::String(s.clone()),
+                BraceItem::Range(r) => serde_json::json!({
+                    "range": [r.start, r.end, r.step, r.format]
+                }),
+                BraceItem::Sequence(seq) => serde_json::Value::Array(
+                    seq.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+                ),
+                BraceItem::Nested(n) => serde_json::json!({ "nested": brace_items_json(&n.items) }),
+                BraceItem::Compound(c) => serde_json::json!({ "nested": brace_items_json(c) }),
+            })
+            .collect(),
+    )
 }
 
 fn template_from_parts(parts: &[StringPart]) -> Expr {
@@ -822,6 +898,8 @@ fn part_to_expr(part: &StringPart) -> Expr {
     match part {
         StringPart::Literal(_) => unreachable!("Literal parts are handled in template_from_parts"),
         StringPart::Variable(name) => sh2_call("getVar", vec![str_lit(name)]),
+        StringPart::ParameterExpansion(pe) => param_expansion_to_expr(pe),
+        StringPart::Arithmetic(ae) => sh2_call("arith", vec![str_lit(&ae.expression)]),
         StringPart::CommandSubstitution(cmd) => Expr::AwaitExpression {
             argument: Box::new(sh2_call(
                 "capture",
@@ -930,8 +1008,8 @@ mod tests {
 
     #[test]
     fn unsupported_constructs_are_marked() {
-        // Arithmetic words are not yet lowered → must be flagged.
-        let json = to_json("echo $((1+2))");
+        // Array/map access is not yet lowered → must be flagged.
+        let json = to_json("echo ${arr[1]}");
         assert!(json.contains("\"name\":\"unsupported\""));
     }
 
