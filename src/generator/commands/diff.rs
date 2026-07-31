@@ -34,6 +34,7 @@ pub fn generate_diff_command(
             args: args_ir,
             capture: Some("diff_output".to_string()),
             redirects: vec![],
+            env: vec![],
         };
         output.push_str(&stmt_to_perl(&sys_stmt, generator.indent_level));
 
