@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 default-run = "debashc"
 
+[features]
+default = []
+# Library (reactor) build for wasm32-wasip1: adds the plain C-ABI exports
+# (src/wasi_api.rs). Use:  cargo build --target wasm32-wasip1 --features wasi-lib --lib
+wasi-lib = []
+
 [[bin]]
 name = "debashc"
 path = "src/main.rs"

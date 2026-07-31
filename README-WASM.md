@@ -116,3 +116,29 @@ To modify the script:
 1. Edit `build-and-run-wasm.ps1`
 2. Test changes by running the script
 3. The script includes detailed comments for easy modification
+
+## WASI (server-side) build
+
+`build-wasi.sh` produces two artifacts for the `wasm32-wasip1` target, sharing
+the same parsing/transpiling code:
+
+| Artifact | Role | Entry | Use |
+|---|---|---|---|
+| `target/wasm32-wasip1/release/debashc.wasm` | WASI **command** | `_start` | `wasmtime run --dir . debashc.wasm file --perl script.sh` (also `file --estree`, `parse`, `lex`, ...) |
+| `target/wasm32-wasip1/release/debashl.wasm` | WASM **library** | `_initialize` | instantiate and call `debashc_to_perl` / `debashc_to_estree` / `debashc_lex` / `debashc_version` (plain C ABI, no JS glue) |
+
+Build with:
+
+```bash
+./build-wasi.sh
+```
+
+A single module *can* carry both `_start` and library exports, but strict
+runtimes (e.g. Node `node:wasi`) reject a module exporting both `_start` and
+`_initialize`, so the command and library builds stay separate
+(`wasi-lib` cargo feature, see `src/wasi_api.rs` for the memory contract and
+JSON result envelope). The library is callable from wasmtime/wasmer embedding
+APIs, Node `node:wasi`, Python `wasmtime`, C/C++, etc. — no wasm-bindgen, no
+browser glue. `debashc file --estree` / `debashc_to_estree` emit the standard
+ESTree JSON contract (PLAN.md §1.2), so sh2runtime can consume this WASI
+binary as a transpiler tool.
