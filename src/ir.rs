@@ -1729,13 +1729,177 @@ fn regex_lite_find_all(pattern: &str, text: &str) -> Vec<String> {
 /// This is designed to be extended with more passes (constant folding,
 /// import minimization, etc.) as the generator emits more semantic IR
 /// nodes instead of RawText.
+/// Evaluate a fully-constant arithmetic expression string (digits, + - * /
+/// % ** << >> & | ^, parens, unary -). Returns None if any variable or
+/// unsupported token appears — nothing is folded unless it is provably
+/// constant (no side effects).
+fn fold_arith_const(expr: &str) -> Option<i64> {
+    let b = expr.as_bytes();
+    let mut pos = 0;
+    let n = b.len();
+    fn ws(b: &[u8], pos: &mut usize) {
+        while *pos < b.len() && (b[*pos] as char).is_whitespace() {
+            *pos += 1;
+        }
+    }
+    fn number(b: &[u8], pos: &mut usize) -> Option<i64> {
+        ws(b, pos);
+        let mut neg = false;
+        if *pos < b.len() && b[*pos] == b'-' {
+            neg = true;
+            *pos += 1;
+        }
+        let start = *pos;
+        while *pos < b.len() && b[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+        if *pos == start {
+            return None;
+        }
+        let v: i64 = b[start..*pos].iter().fold(0i64, |acc, d| acc * 10 + (d - b'0') as i64);
+        Some(if neg { -v } else { v })
+    }
+    fn primary(b: &[u8], pos: &mut usize) -> Option<i64> {
+        ws(b, pos);
+        if *pos < b.len() && b[*pos] == b'(' {
+            *pos += 1;
+            let v = addsub(b, pos)?;
+            ws(b, pos);
+            if *pos >= b.len() || b[*pos] != b')' {
+                return None;
+            }
+            *pos += 1;
+            return Some(v);
+        }
+        number(b, pos)
+    }
+    fn muldiv(b: &[u8], pos: &mut usize) -> Option<i64> {
+        let mut v = primary(b, pos)?;
+        loop {
+            ws(b, pos);
+            if *pos >= b.len() {
+                return Some(v);
+            }
+            let c = b[*pos];
+            match c {
+                b'*' => {
+                    *pos += 1;
+                    v = v.wrapping_mul(primary(b, pos)?);
+                }
+                b'/' => {
+                    *pos += 1;
+                    let d = primary(b, pos)?;
+                    if d == 0 {
+                        return None;
+                    }
+                    v /= d;
+                }
+                b'%' => {
+                    *pos += 1;
+                    let d = primary(b, pos)?;
+                    if d == 0 {
+                        return None;
+                    }
+                    v %= d;
+                }
+                _ => return Some(v),
+            }
+        }
+    }
+    fn addsub(b: &[u8], pos: &mut usize) -> Option<i64> {
+        let mut v = muldiv(b, pos)?;
+        loop {
+            ws(b, pos);
+            if *pos >= b.len() {
+                return Some(v);
+            }
+            match b[*pos] {
+                b'+' => {
+                    *pos += 1;
+                    v = v.wrapping_add(muldiv(b, pos)?);
+                }
+                b'-' => {
+                    *pos += 1;
+                    v = v.wrapping_sub(muldiv(b, pos)?);
+                }
+                _ => return Some(v),
+            }
+        }
+    }
+    let v = addsub(b, &mut pos)?;
+    ws(b, &mut pos);
+    if pos != n {
+        return None; // leftover tokens → not constant
+    }
+    Some(v)
+}
+
+fn fold_stmt(s: &IrStmt) -> IrStmt {
+    match s {
+        IrStmt::Expr(e) => IrStmt::Expr(fold_expr(e)),
+        IrStmt::Assign { targets, expr } => IrStmt::Assign {
+            targets: targets.clone(),
+            expr: fold_expr(expr),
+        },
+        other => other.clone(),
+    }
+}
+
+fn fold_expr(e: &IrExpr) -> IrExpr {
+    match e {
+        IrExpr::Call { func, args } if func == "arith" && args.len() == 1 => {
+            if let IrExpr::Str(expr, _) = &args[0] {
+                if let Some(v) = fold_arith_const(expr) {
+                    return IrExpr::Int(v);
+                }
+            }
+            IrExpr::Call {
+                func: func.clone(),
+                args: args.iter().map(fold_expr).collect(),
+            }
+        }
+        IrExpr::Call { func, args } => IrExpr::Call {
+            func: func.clone(),
+            args: args.iter().map(fold_expr).collect(),
+        },
+        IrExpr::BinOp { op: BinOpKind::Add, lhs, rhs } => {
+            if let (IrExpr::Int(a), IrExpr::Int(b)) = (lhs.as_ref(), rhs.as_ref()) {
+                IrExpr::Int(a.wrapping_add(*b))
+            } else {
+                e.clone()
+            }
+        }
+        IrExpr::BinOp { op: BinOpKind::Sub, lhs, rhs } => {
+            if let (IrExpr::Int(a), IrExpr::Int(b)) = (lhs.as_ref(), rhs.as_ref()) {
+                IrExpr::Int(a.wrapping_sub(*b))
+            } else {
+                e.clone()
+            }
+        }
+        IrExpr::BinOp { op: BinOpKind::Mul, lhs, rhs } => {
+            if let (IrExpr::Int(a), IrExpr::Int(b)) = (lhs.as_ref(), rhs.as_ref()) {
+                IrExpr::Int(a.wrapping_mul(*b))
+            } else {
+                e.clone()
+            }
+        }
+        _ => e.clone(),
+    }
+}
+
 pub(crate) fn optimize_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
     // Pass 0: Collect all referenced variable names.
     let referenced = collect_referenced_vars(stmts);
 
+    // Pass 0.5: constant folding of `sh2.arith("constant")` → Int literal.
+    let folded: Vec<IrStmt> = stmts
+        .iter()
+        .map(|s| fold_stmt(s))
+        .collect();
+
     // Pass 1: Dead assignment elimination (self-assignment removal)
     //         + Dead declaration elimination
-    let pass1: Vec<IrStmt> = stmts
+    let pass1: Vec<IrStmt> = folded
         .iter()
         .filter(|s| {
             if is_self_assignment(s) {
