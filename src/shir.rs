@@ -580,7 +580,10 @@ fn word_ir(w: &Word) -> IrExpr {
             vec![IrExpr::Arrow(command_arrow_stmts(cmd))],
         ),
         Word::ParameterExpansion(pe, _) => param_ir(pe),
-        Word::Arithmetic(ae, _) => call("arith", vec![st(&ae.expression)]),
+        Word::Arithmetic(ae, _) => match parse_arith(&ae.expression) {
+            Some(a) => IrExpr::Arith(Box::new(a)),
+            None => call("arith", vec![st(&ae.expression)]),
+        },
         Word::BraceExpansion(be, _) => brace_ir(be),
         Word::Array(name, _, _) => call("getVar", vec![st(name)]),
         Word::MapAccess(name, key, _) => call("arrayIndex", vec![st(name), st(key)]),
@@ -744,7 +747,10 @@ fn part_ir(part: &StringPart) -> IrExpr {
                 param_ir(pe)
             }
         }
-        StringPart::Arithmetic(ae) => call("arith", vec![st(&ae.expression)]),
+        StringPart::Arithmetic(ae) => match parse_arith(&ae.expression) {
+            Some(a) => IrExpr::Arith(Box::new(a)),
+            None => call("arith", vec![st(&ae.expression)]),
+        },
         // Array-valued expansions inside a template literal would render with
         // JS's comma join; bash joins them with spaces, so wrap in sh2.join.
         // (In direct exec-arg position the array is flattened instead — see
@@ -787,6 +793,500 @@ fn for_item_ir(w: &Word) -> IrExpr {
             word_ir(w)
         }
         _ => arg_word_ir(w, false),
+    }
+}
+
+// ── arithmetic string → neutral AST ──────────────────────────────────
+/// Recursive-descent parser for `$((...))` content. Returns None when the
+/// expression contains assignments / ++ / -- / anything needing setVar
+/// semantics — those fall back to the runtime `sh2.arith` evaluator.
+fn parse_arith(src: &str) -> Option<ArithAst> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut pos = 0usize;
+    let n = chars.len();
+
+    fn skip(chars: &[char], pos: &mut usize) {
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
+        }
+    }
+    fn eat2(chars: &[char], pos: &mut usize, s: &str) -> bool {
+        if *pos + s.len() <= chars.len() {
+            let got: String = chars[*pos..*pos + s.len()].iter().collect();
+            if got == s {
+                *pos += s.len();
+                return true;
+            }
+        }
+        false
+    }
+    fn primary(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        skip(chars, pos);
+        if *pos >= chars.len() {
+            return None;
+        }
+        let c = chars[*pos];
+        if c == '(' {
+            *pos += 1;
+            let e = ternary(chars, pos)?;
+            skip(chars, pos);
+            if *pos >= chars.len() || chars[*pos] != ')' {
+                return None;
+            }
+            *pos += 1;
+            return Some(e);
+        }
+        if c.is_ascii_digit() {
+            let mut s = String::new();
+            while *pos < chars.len()
+                && (chars[*pos].is_ascii_alphanumeric() || chars[*pos] == 'x' || chars[*pos] == 'X')
+            {
+                s.push(chars[*pos]);
+                *pos += 1;
+            }
+            let v = if s.starts_with("0x") || s.starts_with("0X") {
+                i64::from_str_radix(&s[2..], 16).ok()?
+            } else {
+                s.parse::<i64>().ok()?
+            };
+            return Some(ArithAst::Num(v));
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let mut name = String::new();
+            while *pos < chars.len()
+                && (chars[*pos].is_ascii_alphanumeric() || chars[*pos] == '_')
+            {
+                name.push(chars[*pos]);
+                *pos += 1;
+            }
+            skip(chars, pos);
+            if *pos < chars.len() && chars[*pos] == '[' {
+                *pos += 1;
+                let key = ternary(chars, pos)?;
+                skip(chars, pos);
+                if *pos >= chars.len() || chars[*pos] != ']' {
+                    return None;
+                }
+                *pos += 1;
+                return Some(ArithAst::Index {
+                    var: name,
+                    key: Box::new(key),
+                });
+            }
+            // postfix ++ / -- need setVar semantics → fall back to runtime
+            if eat2(chars, pos, "++") || eat2(chars, pos, "--") {
+                return None;
+            }
+            return Some(ArithAst::Var(name));
+        }
+        None
+    }
+    fn unary(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        skip(chars, pos);
+        if *pos < chars.len() {
+            let c = chars[*pos];
+            if c == '-' || c == '+' || c == '!' || c == '~' {
+                *pos += 1;
+                let op = match c {
+                    '-' => "-",
+                    '+' => "+",
+                    '!' => "!",
+                    _ => "~",
+                };
+                return Some(ArithAst::Un {
+                    op,
+                    arg: Box::new(unary(chars, pos)?),
+                });
+            }
+        }
+        primary(chars, pos)
+    }
+    // ** power: RIGHT-associative (2**3**2 = 2**(3**2) = 512), binds tighter
+    // than * / % (a**b * c = (a**b) * c), matching bash/evalArith.
+    fn pow(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let base = unary(chars, pos)?;
+        skip(chars, pos);
+        if *pos + 1 < chars.len() && chars[*pos] == '*' && chars[*pos + 1] == '*' {
+            *pos += 2;
+            let exp = pow(chars, pos)?;
+            return Some(ArithAst::Bin {
+                op: "**",
+                lhs: Box::new(base),
+                rhs: Box::new(exp),
+            });
+        }
+        Some(base)
+    }
+    fn mul(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = pow(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            let c = *chars.get(*pos).unwrap_or(&'\0');
+            if c == '*' {
+                *pos += 1;
+                let rhs = pow(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "*",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else if c == '/' {
+                *pos += 1;
+                let rhs = pow(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "/",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else if c == '%' {
+                *pos += 1;
+                let rhs = pow(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "%",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn add(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = mul(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            let c = *chars.get(*pos).unwrap_or(&'\0');
+            if c == '+' {
+                *pos += 1;
+                let rhs = mul(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "+",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else if c == '-' {
+                *pos += 1;
+                let rhs = mul(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "-",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn shift(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = add(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            if eat2(chars, pos, "<<") {
+                let rhs = add(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "<<",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else if eat2(chars, pos, ">>") {
+                let rhs = add(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: ">>",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn rel(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = shift(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            let c = *chars.get(*pos).unwrap_or(&'\0');
+            if c == '<' || c == '>' {
+                let mut two = false;
+                let op = if c == '<' {
+                    two = *pos + 1 < chars.len() && chars[*pos + 1] == '=';
+                    if two {
+                        "<="
+                    } else {
+                        "<"
+                    }
+                } else {
+                    two = *pos + 1 < chars.len() && chars[*pos + 1] == '=';
+                    if two {
+                        ">="
+                    } else {
+                        ">"
+                    }
+                };
+                *pos += if two { 2 } else { 1 };
+                let rhs = shift(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn eq(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = rel(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            if eat2(chars, pos, "==") {
+                let rhs = rel(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "==",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else if eat2(chars, pos, "!=") {
+                let rhs = rel(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "!=",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn band(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = eq(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            if *pos < chars.len() && chars[*pos] == '&' && chars.get(*pos + 1) != Some(&'&') {
+                *pos += 1;
+                let rhs = eq(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "&",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn bxor(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = band(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            if *pos < chars.len() && chars[*pos] == '^' {
+                *pos += 1;
+                let rhs = band(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "^",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn bor(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = bxor(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            if *pos < chars.len() && chars[*pos] == '|' && chars.get(*pos + 1) != Some(&'|') {
+                *pos += 1;
+                let rhs = bxor(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "|",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn land(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = bor(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            if eat2(chars, pos, "&&") {
+                let rhs = bor(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "&&",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn lor(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let mut lhs = land(chars, pos)?;
+        loop {
+            skip(chars, pos);
+            if eat2(chars, pos, "||") {
+                let rhs = land(chars, pos)?;
+                lhs = ArithAst::Bin {
+                    op: "||",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+    fn ternary(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        let test = lor(chars, pos)?;
+        skip(chars, pos);
+        if *pos < chars.len() && chars[*pos] == '?' {
+            *pos += 1;
+            let then = ternary(chars, pos)?;
+            skip(chars, pos);
+            if *pos >= chars.len() || chars[*pos] != ':' {
+                return None;
+            }
+            *pos += 1;
+            let else_ = ternary(chars, pos)?;
+            return Some(ArithAst::Cond {
+                test: Box::new(test),
+                then: Box::new(then),
+                else_: Box::new(else_),
+            });
+        }
+        Some(test)
+    }
+
+    let ast = ternary(&chars, &mut pos)?;
+    skip(&chars, &mut pos);
+    if pos != n {
+        return None;
+    }
+    Some(ast)
+}
+
+/// Render the neutral arithmetic AST as native JS expressions.
+fn arith_to_estree(a: &ArithAst) -> Expr {
+    match a {
+        ArithAst::Num(v) => Expr::Literal {
+            value: serde_json::Value::from(*v),
+            raw: None,
+        },
+        ArithAst::Var(name) => Expr::LogicalExpression {
+            operator: "||",
+            left: Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                arguments: vec![sh2_call("getVar", vec![str_lit(name)])],
+                optional: false,
+            }),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+            }),
+        },
+        ArithAst::Index { var, key } => Expr::LogicalExpression {
+            operator: "||",
+            left: Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                arguments: vec![sh2_call("arrayIndex", vec![str_lit(var), arith_to_estree(key)])],
+                optional: false,
+            }),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+            }),
+        },
+        ArithAst::Bin { op, lhs, rhs } => {
+            if *op == "&&" || *op == "||" {
+                // bash yields 0/1; JS logicals yield one of the operands
+                Expr::ConditionalExpression {
+                    test: Box::new(Expr::LogicalExpression {
+                        operator: op,
+                        left: Box::new(arith_to_estree(lhs)),
+                        right: Box::new(arith_to_estree(rhs)),
+                    }),
+                    consequent: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(1),
+                        raw: None,
+                    }),
+                    alternate: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                    }),
+                }
+            } else if *op == "/" {
+                // bash arithmetic is INTEGER division (truncating toward
+                // zero); zero divisor must abort the whole expansion, and
+                // JS bitwise ops would silently absorb a NaN — so throw
+                // from the runtime helper (caught by arithEval).
+                sh2_call("idiv", vec![arith_to_estree(lhs), arith_to_estree(rhs)])
+            } else if *op == "%" {
+                // modulo by zero aborts the expansion too (bash "division by 0")
+                sh2_call("imod", vec![arith_to_estree(lhs), arith_to_estree(rhs)])
+            } else if matches!(*op, "<" | "<=" | ">" | ">=" | "==" | "!=") {
+                // bash comparisons yield 0/1; JS yields booleans
+                Expr::ConditionalExpression {
+                    test: Box::new(Expr::BinaryExpression {
+                        operator: op,
+                        left: Box::new(arith_to_estree(lhs)),
+                        right: Box::new(arith_to_estree(rhs)),
+                    }),
+                    consequent: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(1),
+                        raw: None,
+                    }),
+                    alternate: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                    }),
+                }
+            } else {
+                Expr::BinaryExpression {
+                    operator: op,
+                    left: Box::new(arith_to_estree(lhs)),
+                    right: Box::new(arith_to_estree(rhs)),
+                }
+            }
+        }
+        ArithAst::Un { op, arg } => {
+            if *op == "!" {
+                // bash ! yields 0/1; JS ! yields a boolean
+                Expr::ConditionalExpression {
+                    test: Box::new(Expr::UnaryExpression {
+                        operator: "!",
+                        argument: Box::new(arith_to_estree(arg)),
+                        prefix: true,
+                    }),
+                    consequent: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(1),
+                        raw: None,
+                    }),
+                    alternate: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                    }),
+                }
+            } else {
+                Expr::UnaryExpression {
+                    operator: op,
+                    argument: Box::new(arith_to_estree(arg)),
+                    prefix: true,
+                }
+            }
+        }
+        ArithAst::Cond { test, then, else_ } => Expr::ConditionalExpression {
+            test: Box::new(arith_to_estree(test)),
+            consequent: Box::new(arith_to_estree(then)),
+            alternate: Box::new(arith_to_estree(else_)),
+        },
     }
 }
 
@@ -1061,6 +1561,18 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             prefix: true,
         },
         IrExpr::Arrow(stmts) => arrow(vec![], IrExpr::Arrow(stmts.clone())),
+        IrExpr::Arith(a) => {
+            let inner = arith_to_estree(a);
+            sh2_call(
+                "arithEval",
+                vec![Expr::ArrowFunctionExpression {
+                    params: vec![],
+                    body: ArrowBody::Expr(Box::new(inner)),
+                    expression: true,
+                    r#async: false,
+                }],
+            )
+        }
         other => unreachable!("Perl-only IR expression reached the ESTree renderer: {other:?}"),
     }
 }
