@@ -1,3 +1,0 @@
-User: $USER
-Host: ${HOSTNAME:-localhost}
-Path: $PWD
