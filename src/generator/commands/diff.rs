@@ -22,17 +22,18 @@ pub fn generate_diff_command(
     }
 
     if !args_ir.is_empty() {
-        // Use IrStmt::System with capture to emit clean `qx{...}` instead of
+        // Use IrStmt::Exec with capture to emit clean `qx{...}` instead of
         // the verbose pipe-open boilerplate (Pattern E fix).
         //
         // The variable declared by System (e.g. `$diff_output`) is scoped to
         // the surrounding block.  When called from command_substitution
         // (is_final_command = false), the caller wraps us in `do { ... }` so
         // we emit `$diff_output;` as the final expression.
-        let sys_stmt = IrStmt::System {
+        let sys_stmt = IrStmt::Exec {
             cmd: IrExpr::Str("diff".to_string(), StrStyle::SingleQuoted),
             args: args_ir,
             capture: Some("diff_output".to_string()),
+            redirects: vec![],
         };
         output.push_str(&stmt_to_perl(&sys_stmt, generator.indent_level));
 
