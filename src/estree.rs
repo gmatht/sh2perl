@@ -183,15 +183,467 @@ pub struct TemplateElementValue {
 // this module only owns the ESTree node model + the sh2.* helpers.
 
 /// Lower a parsed shell program to an ESTree `Program` (via the ShIR).
+///
+/// Runs a pre-pass that rewrites process substitution (`<(...)`) into
+/// constructs the ShIR can lower (here-string stdin + a materialized-path
+/// argument); see `transform_process_substitution`.
 pub fn ast_to_estree(commands: &[Command]) -> Program {
-    let ir = crate::shir::ast_to_ir(commands);
-    crate::shir::shir_to_estree(&ir)
+    let transformed: Vec<Command> = commands.iter().map(transform_cmd).collect();
+    let ir = crate::shir::ast_to_ir(&transformed);
+    fix_control_flow(crate::shir::shir_to_estree(&ir))
 }
 
 /// Convenience: lower + serialize (deterministic, compact JSON).
 pub fn ast_to_estree_json(commands: &[Command]) -> Result<String, serde_json::Error> {
-    let ir = crate::shir::ast_to_ir(commands);
-    crate::shir::shir_to_estree_json(&ir)
+    let transformed: Vec<Command> = commands.iter().map(transform_cmd).collect();
+    let ir = crate::shir::ast_to_ir(&transformed);
+    serde_json::to_string(&fix_control_flow(crate::shir::shir_to_estree(&ir)))
+}
+
+// ── control-flow legality pass ───────────────────────────────────────
+//
+// The ShIR emits native `break`/`continue`/`return` statements, but in the
+// generated JS all loops are `sh2.*Loop` calls whose bodies are ARROW
+// functions, so a native `break`/`continue` inside a loop body (or a
+// top-level `return`) is a SyntaxError. This pass rewrites those illegal
+// statements back to `sh2.break()`/`sh2.continue()`/`sh2.return()` calls,
+// which throw control Signals the runtime loop functions catch. Native
+// `break` inside a `switch` (case clauses) and `return` inside a function
+// arrow stay native (both legal).
+
+fn fix_control_flow(prog: Program) -> Program {
+    Program {
+        type_: prog.type_,
+        source_type: prog.source_type,
+        body: prog
+            .body
+            .into_iter()
+            .filter_map(|s| fix_stmt(s, false, false))
+            .collect(),
+    }
+}
+
+/// `in_arrow` — inside an ArrowFunctionExpression body; `in_switch` —
+/// directly inside a switch-case consequent (native break is legal there).
+fn fix_stmt(stmt: Stmt, in_arrow: bool, in_switch: bool) -> Option<Stmt> {
+    Some(match stmt {
+        Stmt::BreakStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
+            expression: sh2_call("break", vec![]),
+        },
+        Stmt::ContinueStatement { label } if in_arrow && !in_switch => {
+            Stmt::ExpressionStatement {
+                expression: sh2_call("continue", vec![]),
+            }
+        }
+        Stmt::ReturnStatement { argument } if !in_arrow => {
+            let mut args = vec![];
+            if let Some(a) = argument {
+                args.push(a);
+            }
+            Stmt::ExpressionStatement {
+                expression: sh2_call("return", args),
+            }
+        }
+        Stmt::ExpressionStatement { expression } => Stmt::ExpressionStatement {
+            expression: fix_expr(expression, in_arrow),
+        },
+        Stmt::BlockStatement { body } => Stmt::BlockStatement {
+            body: body
+                .into_iter()
+                .filter_map(|s| fix_stmt(s, in_arrow, false))
+                .collect(),
+        },
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => Stmt::IfStatement {
+            test: fix_expr(test, in_arrow),
+            consequent: Box::new(
+                fix_stmt(*consequent, in_arrow, false).unwrap_or(Stmt::BlockStatement {
+                    body: vec![],
+                }),
+            ),
+            alternate: alternate.map(|a| {
+                Box::new(fix_stmt(*a, in_arrow, false).unwrap_or(Stmt::BlockStatement {
+                    body: vec![],
+                }))
+            }),
+        },
+        Stmt::SwitchStatement {
+            discriminant,
+            cases,
+        } => Stmt::SwitchStatement {
+            discriminant: fix_expr(discriminant, in_arrow),
+            cases: cases
+                .into_iter()
+                .map(|c| SwitchCase {
+                    type_: c.type_,
+                    test: c.test.map(|t| fix_expr(t, in_arrow)),
+                    consequent: c
+                        .consequent
+                        .into_iter()
+                        .filter_map(|s| fix_stmt(s, in_arrow, true))
+                        .collect(),
+                })
+                .collect(),
+        },
+        Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
+            test: fix_expr(test, in_arrow),
+            body: Box::new(
+                fix_stmt(*body, in_arrow, false).unwrap_or(Stmt::BlockStatement {
+                    body: vec![],
+                }),
+            ),
+        },
+        Stmt::ForOfStatement {
+            left,
+            right,
+            body,
+        } => Stmt::ForOfStatement {
+            left,
+            right: fix_expr(right, in_arrow),
+            body: Box::new(
+                fix_stmt(*body, in_arrow, false).unwrap_or(Stmt::BlockStatement {
+                    body: vec![],
+                }),
+            ),
+        },
+        Stmt::VariableDeclaration {
+            declarations,
+            kind,
+        } => Stmt::VariableDeclaration {
+            declarations: declarations
+                .into_iter()
+                .map(|d| VariableDeclarator {
+                    type_: d.type_,
+                    id: d.id,
+                    init: d.init.map(|i| fix_expr(i, in_arrow)),
+                })
+                .collect(),
+            kind,
+        },
+        other => other,
+    })
+}
+
+fn fix_expr(e: Expr, in_arrow: bool) -> Expr {
+    match e {
+        Expr::CallExpression {
+            callee,
+            arguments,
+            optional,
+        } => Expr::CallExpression {
+            callee: Box::new(fix_expr(*callee, in_arrow)),
+            arguments: arguments
+                .into_iter()
+                .map(|a| fix_expr(a, in_arrow))
+                .collect(),
+            optional,
+        },
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            optional,
+        } => Expr::MemberExpression {
+            object: Box::new(fix_expr(*object, in_arrow)),
+            property: Box::new(fix_expr(*property, in_arrow)),
+            computed,
+            optional,
+        },
+        Expr::AwaitExpression { argument } => Expr::AwaitExpression {
+            argument: Box::new(fix_expr(*argument, in_arrow)),
+        },
+        Expr::ArrowFunctionExpression {
+            params,
+            body,
+            expression,
+            r#async,
+        } => Expr::ArrowFunctionExpression {
+            params,
+            body: match body {
+                ArrowBody::Expr(inner) => ArrowBody::Expr(Box::new(fix_expr(*inner, true))),
+                ArrowBody::Block(b) => ArrowBody::Block(Box::new(
+                    fix_stmt(*b, true, false).unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                )),
+            },
+            expression,
+            r#async,
+        },
+        Expr::ObjectExpression { properties } => Expr::ObjectExpression {
+            properties: properties
+                .into_iter()
+                .map(|p| Property {
+                    type_: p.type_,
+                    key: p.key,
+                    value: fix_expr(p.value, in_arrow),
+                    kind: p.kind,
+                    computed: p.computed,
+                    shorthand: p.shorthand,
+                })
+                .collect(),
+        },
+        Expr::ArrayExpression { elements } => Expr::ArrayExpression {
+            elements: elements
+                .into_iter()
+                .map(|el| el.map(|e| fix_expr(e, in_arrow)))
+                .collect(),
+        },
+        Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
+            quasis,
+            expressions: expressions
+                .into_iter()
+                .map(|e| fix_expr(e, in_arrow))
+                .collect(),
+        },
+        Expr::LogicalExpression {
+            operator,
+            left,
+            right,
+        } => Expr::LogicalExpression {
+            operator,
+            left: Box::new(fix_expr(*left, in_arrow)),
+            right: Box::new(fix_expr(*right, in_arrow)),
+        },
+        Expr::UnaryExpression {
+            operator,
+            argument,
+            prefix,
+        } => Expr::UnaryExpression {
+            operator,
+            argument: Box::new(fix_expr(*argument, in_arrow)),
+            prefix,
+        },
+        other => other,
+    }
+}
+
+// ── process-substitution pre-pass ───────────────────────────────────
+//
+// The parser stores `<(cmd)` both as an argument position (the argument
+// itself is dropped, the redirect carries the inner command) and as an
+// explicit stdin redirect (`cmd < <(cmd)`). Both arrive as
+// `RedirectOperator::ProcessSubstitutionInput`. We rewrite:
+//
+//   1. the redirect → a here-string whose content is the inner command's
+//      captured stdout (`sh2.capture`), so stdin-based consumers
+//      (`mapfile`, `while ...; done < <(...)`) see the produced stream;
+//   2. for ordinary commands, additionally append a magic-prefixed
+//      argument carrying the same capture; the runtime (`sh2.exec`)
+//      recognizes the prefix and materializes it to a temp file path,
+//      emulating bash's `/dev/fd/N` argument passing (`diff <(a) <(b)`).
+//
+// `mapfile`/`readarray` are stdin-based only: appending a path argument
+// would be an error, so they get the here-string rewrite alone.
+
+/// Marker prefix the runtime recognizes on exec arguments (see
+/// sh2-namespace.mjs: `exec` materializes the suffix to a temp file).
+const PS_MAGIC: &str = "\u{1}SH2PS\u{1}";
+
+fn transform_cmd(cmd: &Command) -> Command {
+    match cmd {
+        Command::Simple(sc) => {
+            let mut sc = sc.clone();
+            let ps = transform_redirects(&mut sc.redirects);
+            if !ps.is_empty() {
+                let stdin_only = matches!(
+                    sc.name.as_literal(),
+                    Some("mapfile") | Some("readarray")
+                );
+                if !stdin_only {
+                    // Re-add the dropped argument positions as materialized
+                    // paths (the parser kept only the redirects).
+                    for inner in ps {
+                        sc.args.push(ps_arg_word(inner));
+                    }
+                }
+            }
+            Command::Simple(sc)
+        }
+        Command::BuiltinCommand(bc) => {
+            let mut bc = bc.clone();
+            let ps = transform_redirects(&mut bc.redirects);
+            if !ps.is_empty() {
+                let stdin_only = bc.name == "mapfile" || bc.name == "readarray";
+                if !stdin_only {
+                    for inner in ps {
+                        bc.args.push(ps_arg_word(inner));
+                    }
+                }
+            }
+            Command::BuiltinCommand(bc)
+        }
+        Command::Redirect(rc) => {
+            let mut rc = rc.clone();
+            let producers = transform_redirects(&mut rc.redirects);
+            rc.command = Box::new(transform_cmd(&rc.command));
+            // Re-add dropped argument positions (`diff <(a) <(b)`): the
+            // parser lifts `<(...)` args onto the redirect list, so the
+            // inner simple command must get the materialized paths back.
+            if !producers.is_empty() {
+                append_ps_args(&mut rc.command, producers);
+            }
+            Command::Redirect(rc)
+        }
+        Command::Pipeline(p) => {
+            let mut p = p.clone();
+            p.commands = p.commands.iter().map(transform_cmd).collect();
+            Command::Pipeline(p)
+        }
+        Command::And(l, r) => Command::And(
+            Box::new(transform_cmd(l)),
+            Box::new(transform_cmd(r)),
+        ),
+        Command::Or(l, r) => Command::Or(
+            Box::new(transform_cmd(l)),
+            Box::new(transform_cmd(r)),
+        ),
+        Command::Not(c) => Command::Not(Box::new(transform_cmd(c))),
+        Command::Background(c) => Command::Background(Box::new(transform_cmd(c))),
+        Command::Subshell(c) => Command::Subshell(Box::new(transform_cmd(c))),
+        Command::If(i) => {
+            let mut i = i.clone();
+            i.condition = Box::new(transform_cmd(&i.condition));
+            i.then_branch = Box::new(transform_cmd(&i.then_branch));
+            i.else_branch = i
+                .else_branch
+                .map(|b| Box::new(transform_cmd(&b)));
+            Command::If(i)
+        }
+        Command::Case(c) => {
+            let mut c = c.clone();
+            c.word = transform_word(c.word);
+            for cl in &mut c.cases {
+                cl.patterns = cl.patterns.iter().cloned().map(transform_word).collect();
+                cl.body = cl.body.iter().map(transform_cmd).collect();
+            }
+            Command::Case(c)
+        }
+        Command::While(w) => {
+            let mut w = w.clone();
+            w.condition = Box::new(transform_cmd(&w.condition));
+            w.body = Block {
+                commands: w.body.commands.iter().map(transform_cmd).collect(),
+            };
+            Command::While(w)
+        }
+        Command::For(f) => {
+            let mut f = f.clone();
+            f.items = f.items.iter().cloned().map(transform_word).collect();
+            f.body = Block {
+                commands: f.body.commands.iter().map(transform_cmd).collect(),
+            };
+            Command::For(f)
+        }
+        Command::Function(f) => {
+            let mut f = f.clone();
+            f.body = Block {
+                commands: f.body.commands.iter().map(transform_cmd).collect(),
+            };
+            Command::Function(f)
+        }
+        Command::Block(b) => Command::Block(Block {
+            commands: b.commands.iter().map(transform_cmd).collect(),
+        }),
+        Command::Assignment(a) => {
+            let mut a = a.clone();
+            a.value = transform_word(a.value);
+            Command::Assignment(a)
+        }
+        Command::Return(w) => Command::Return(w.as_ref().map(|w| transform_word(w.clone()))),
+        other => other.clone(),
+    }
+}
+
+fn transform_word(w: Word) -> Word {
+    match w {
+        Word::CommandSubstitution(inner, ann) => {
+            Word::CommandSubstitution(Box::new(transform_cmd(&inner)), ann)
+        }
+        Word::StringInterpolation(mut interp, ann) => {
+            let mut parts = Vec::with_capacity(interp.parts.len());
+            for p in interp.parts {
+                match p {
+                    StringPart::CommandSubstitution(inner) => parts.push(
+                        StringPart::CommandSubstitution(Box::new(transform_cmd(&inner))),
+                    ),
+                    other => parts.push(other),
+                }
+            }
+            interp.parts = parts;
+            Word::StringInterpolation(interp, ann)
+        }
+        other => other,
+    }
+}
+
+/// Rewrite process-substitution redirects in place; returns the inner
+/// commands (in order) so the caller can rebuild argument positions.
+fn transform_redirects(redirects: &mut Vec<Redirect>) -> Vec<Command> {
+    let mut producers = Vec::new();
+    for r in redirects.iter_mut() {
+        match std::mem::replace(&mut r.operator, RedirectOperator::Input) {
+            RedirectOperator::ProcessSubstitutionInput(inner) => {
+                producers.push(*inner);
+                // here-string: content = captured stdout of the producer
+                r.operator = RedirectOperator::HereString;
+                let inner = producers.last().unwrap().clone();
+                r.target = Word::StringInterpolation(
+                    StringInterpolation {
+                        parts: vec![StringPart::CommandSubstitution(Box::new(inner))],
+                    },
+                    None,
+                );
+                r.heredoc_body = None;
+                r.heredoc_quoted = true;
+            }
+            other => r.operator = other,
+        }
+    }
+    producers
+}
+
+/// Append one materialized-path argument per producer to a simple/builtin
+/// command (skipping stdin-only readers like mapfile). Recurses through
+/// nested Redirect wrappers; other command kinds take no arguments.
+fn append_ps_args(cmd: &mut Command, producers: Vec<Command>) {
+    match cmd {
+        Command::Simple(sc) => {
+            let stdin_only = matches!(
+                sc.name.as_literal(),
+                Some("mapfile") | Some("readarray")
+            );
+            if !stdin_only {
+                for inner in producers {
+                    sc.args.push(ps_arg_word(inner));
+                }
+            }
+        }
+        Command::BuiltinCommand(bc) => {
+            if bc.name != "mapfile" && bc.name != "readarray" {
+                for inner in producers {
+                    bc.args.push(ps_arg_word(inner));
+                }
+            }
+        }
+        Command::Redirect(rc) => append_ps_args(&mut rc.command, producers),
+        _ => {}
+    }
+}
+
+/// Argument word that carries the producer; the runtime materializes the
+/// `PS_MAGIC`-prefixed string into a temp file path at exec time.
+fn ps_arg_word(inner: Command) -> Word {
+    Word::StringInterpolation(
+        StringInterpolation {
+            parts: vec![
+                StringPart::Literal(PS_MAGIC.to_string()),
+                StringPart::CommandSubstitution(Box::new(inner)),
+            ],
+        },
+        None,
+    )
 }
 
 // ── sh2.* namespace helpers ─────────────────────────────────────────
@@ -429,5 +881,52 @@ mod tests {
         let a = serde_json::to_string(&ast_to_estree(&commands)).unwrap();
         let b = serde_json::to_string(&ast_to_estree(&commands)).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn break_inside_loop_lowers_to_sh2_call() {
+        // `break`/`continue` inside a loop body is emitted INSIDE an arrow
+        // function, so it must become a sh2.break() call, never a native
+        // `break;` statement (illegal JS in an arrow body).
+        let json = to_json("while true; do echo x; break; done");
+        assert!(json.contains("\"name\":\"break\""));
+        assert!(!json.contains("\"type\":\"BreakStatement\""));
+        assert!(!json.contains("unsupported"));
+        let json2 = to_json("for i in a b; do continue; done");
+        assert!(json2.contains("\"name\":\"continue\""));
+        assert!(!json2.contains("\"type\":\"ContinueStatement\""));
+    }
+
+    #[test]
+    fn case_breaks_stay_native() {
+        // Native break inside a switch-case is legal and prevents fallthrough.
+        let json = to_json("case $x in a) echo a;; *) echo b;; esac");
+        assert!(json.contains("\"type\":\"BreakStatement\""));
+    }
+
+    #[test]
+    fn top_level_return_lowers_to_sh2_call() {
+        // A top-level `return` is illegal in ESM; it becomes sh2.return().
+        let json = to_json("case $1 in foo) return 0;; esac");
+        assert!(json.contains("\"name\":\"return\""));
+        assert!(!json.contains("\"type\":\"ReturnStatement\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn process_substitution_lowers_without_unsupported() {
+        // <(cmd) as an argument position: the redirect becomes a here-string
+        // (captured producer stdout) and a materialized-path argument is
+        // appended for the runtime to turn into a temp file.
+        let json = to_json("diff <(echo a) <(echo b)");
+        assert!(!json.contains("\"name\":\"unsupported\""));
+        assert!(!json.contains("\"value\":\"unsupported\""));
+        assert!(json.contains("\"name\":\"capture\""));
+        assert!(json.contains("\"name\":\"exec\""));
+        // mapfile is stdin-only: no appended path argument, still no gate leak
+        let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");
+        assert!(!json2.contains("\"name\":\"unsupported\""));
+        assert!(!json2.contains("\"value\":\"unsupported\""));
+        assert!(json2.contains("\"name\":\"capture\""));
     }
 }

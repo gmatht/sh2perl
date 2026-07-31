@@ -248,6 +248,7 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
                 args: sys_args,
                 capture: Some(output_var.clone()),
                 redirects: vec![],
+                env: vec![],
             };
             output.push_str(&stmt_to_perl(&sys_stmt, 0));
             output.push_str(&format!("chomp ${};\n", output_var));
