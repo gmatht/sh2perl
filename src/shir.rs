@@ -34,6 +34,19 @@ static CASE_NOCASE: Mutex<Option<bool>> = Mutex::new(None);
 /// value-consuming positions (if/while/until conds, `!`, ternary) get the
 /// native lowering.
 static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
+/// Whether the program may enable `set -e` (errexit) anywhere (set per
+/// compilation by `shir_to_estree`; see `ir_may_enable_errexit`). The
+/// runtime's `sh2.guard` wrapper is an identity function when the errexit
+/// flag never turns on, so guard emission is skipped entirely for programs
+/// that provably never enable it.
+static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
+/// Serializes whole-program compilations: the lift/scan statics above are
+/// per-compilation state, and the determinism unit test compiles in
+/// parallel threads — without a lock, one thread's emission can read
+/// another thread's half-installed statics (torn output). Compilations are
+/// short and each process compiles one file, so the lock is uncontended in
+/// practice; it is never re-entered (`shir_to_estree` does not recurse).
+static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 /// Either lift — reads / test-injection / array-element injection consult
 /// both sets.
 fn is_lifted(name: &str) -> bool {
@@ -2838,14 +2851,22 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
 
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
+    let _compile_guard = COMPILE_LOCK.lock().unwrap();
     let (num, str) = drop_externally_referenced_loop_vars(
         prog,
         &numeric_lift_vars(prog),
         &string_lift_vars(prog, &numeric_lift_vars(prog)),
     );
+    // Run ALL analysis passes before touching any static: the lift/scan
+    // statics are shared global state, and the determinism unit test
+    // compiles concurrently in other threads — a computation between the
+    // static writes and the body emission widens the torn-read window.
+    let nocase = ir_may_enable_nocasematch(prog);
+    let errexit = ir_may_enable_errexit(prog);
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
-    *CASE_NOCASE.lock().unwrap() = Some(ir_may_enable_nocasematch(prog));
+    *CASE_NOCASE.lock().unwrap() = Some(nocase);
+    *MAY_ERREXIT.lock().unwrap() = Some(errexit);
     let mut body: Vec<Stmt> = Vec::new();
     // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
     // reads an unset var as 0 in arithmetic and "" as a string.
@@ -2891,6 +2912,13 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
 /// exempts non-final commands in those lists from errexit).
 fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     let s = stmt_to_estree(stmt)?;
+    // No `set -e` anywhere → the runtime's errexit flag can never turn on,
+    // so `sh2.guard(v)` would be an identity call on every statement.
+    // Skip the wrapper entirely (provably identical semantics, ~1600 fewer
+    // runtime calls across the corpus).
+    if !MAY_ERREXIT.lock().unwrap().unwrap_or(true) {
+        return Some(s);
+    }
     let guardable = match stmt {
         IrStmt::Expr(IrExpr::Call { func, .. }) => {
             // `&&` / `||` / `!` lists: bash exempts non-final commands from
@@ -3159,6 +3187,175 @@ fn try_native_case(
             *alt.expect("at least one clause"),
         ],
     })
+}
+
+/// True when the program may enable `set -e` (errexit) anywhere (top level
+/// or nested in any function/loop/case/arrow body). The runtime's
+/// `sh2.guard` wrapper is the identity function when the errexit flag never
+/// turns on (it starts false and only the `set` builtin's `-e` / `-o
+/// errexit` toggles it — `eval`/`source` run real bash subprocesses whose
+/// errexit is their own), so the emitter skips guard emission entirely for
+/// programs that provably never enable it. Conservative: a dynamic command
+/// name (`$cmd ...` may be `set`), a non-literal set argument (may be
+/// `-e`), or `-e` in any flag cluster all keep the guards.
+fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
+    /// A literal `exec("set", [...])` call — the runtime's set builtin
+    /// parses (see sh2-namespace.mjs): `--` first or a first arg without a
+    /// `-`/`+` prefix means positional assignment (no flags); otherwise
+    /// each flag cluster is scanned — `e` enables errexit with a `-`
+    /// prefix (and disables with `+`), `o` makes the NEXT argument a long
+    /// option name (`errexit` enables).
+    fn set_call_enables(args: &[IrExpr]) -> bool {
+        let mut lits: Vec<&str> = Vec::with_capacity(args.len());
+        for a in args {
+            match a {
+                IrExpr::Str(s, _) => lits.push(s.as_str()),
+                _ => return true, // dynamic flag word: may be `-e` at runtime
+            }
+        }
+        match lits.first() {
+            None | Some(&"--") => return false,
+            Some(a) if !a.starts_with('-') && !a.starts_with('+') => {
+                return false; // positional assignment
+            }
+            _ => {}
+        }
+        let mut pending_o = false; // `-o`/`+o` seen: next arg is a long option name
+        let mut o_enable = false;
+        for a in lits {
+            if pending_o {
+                if a == "errexit" && o_enable {
+                    return true;
+                }
+                pending_o = false;
+                continue;
+            }
+            let enable = a.starts_with('-');
+            if !a.starts_with('-') && !a.starts_with('+') {
+                continue;
+            }
+            for c in a[1..].chars() {
+                if c == 'e' && enable {
+                    return true;
+                }
+                if c == 'o' {
+                    pending_o = true;
+                    o_enable = enable;
+                }
+            }
+        }
+        false
+    }
+
+    fn scan_expr(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "exec" {
+                    match args.as_slice() {
+                        [IrExpr::Str(name, _), IrExpr::Array(elems), ..] if name == "set" => {
+                            if set_call_enables(elems) {
+                                return true;
+                            }
+                        }
+                        [IrExpr::Str(_name, _), ..] => { /* other literal command */ }
+                        _ => return true, // dynamic command name: may be `set`
+                    }
+                }
+                args.iter().any(scan_expr)
+            }
+            IrExpr::Arrow(stmts) => scan_stmts(stmts),
+            IrExpr::Array(elems) => elems.iter().any(scan_expr),
+            IrExpr::Object(props) => props.iter().any(|(_, v)| scan_expr(v)),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Expr(e) => scan_expr(e),
+                InterpPart::Lit(_) => false,
+            }),
+            IrExpr::Capture { expr, .. } => scan_expr(expr),
+            IrExpr::Index { key, .. } => scan_expr(key),
+            IrExpr::BinOp { lhs, rhs, .. } => scan_expr(lhs) || scan_expr(rhs),
+            IrExpr::MethodCall { obj, args, .. } => {
+                scan_expr(obj) || args.iter().any(scan_expr)
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                scan_expr(cond) || scan_expr(then) || scan_expr(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => scan_expr(expr) || scan_expr(default),
+            IrExpr::Arith(a) => scan_arith(a),
+            _ => false,
+        }
+    }
+    fn scan_arith(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Bin { lhs, rhs, .. } => scan_arith(lhs) || scan_arith(rhs),
+            ArithAst::Un { arg, .. } => scan_arith(arg),
+            ArithAst::Cond { test, then, else_ } => {
+                scan_arith(test) || scan_arith(then) || scan_arith(else_)
+            }
+            ArithAst::Index { key, .. } => scan_arith(key),
+            _ => false,
+        }
+    }
+    fn scan_stmts(stmts: &[IrStmt]) -> bool {
+        stmts.iter().any(scan_stmt)
+    }
+    fn scan_stmt(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Expr(e) => scan_expr(e),
+            IrStmt::Output { value, .. } => scan_expr(value),
+            IrStmt::WriteFile { path, content, .. } => {
+                scan_expr(path) || scan_expr(content)
+            }
+            IrStmt::Assign { targets, expr } => {
+                scan_expr(expr) || targets.iter().any(|t| t.indices.iter().any(scan_expr))
+            }
+            IrStmt::Declare { init, .. } => init.as_ref().is_some_and(scan_expr),
+            IrStmt::DeclareArray { elements, .. } => elements.iter().any(scan_expr),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                scan_expr(cond)
+                    || scan_stmts(then)
+                    || scan_stmts(else_)
+                    || elsifs.iter().any(|(c, b)| scan_expr(c) || scan_stmts(b))
+            }
+            IrStmt::For { iter, body, .. } => scan_expr(iter) || scan_stmts(body),
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                scan_expr(cond) || scan_stmts(body)
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr(expr),
+            IrStmt::Exec { cmd, args, env, .. } => {
+                match cmd {
+                    IrExpr::Str(name, _) if name == "set" => {
+                        if set_call_enables(args) {
+                            return true;
+                        }
+                    }
+                    IrExpr::Str(_name, _) => { /* other literal command */ }
+                    _ => return true, // dynamic command name: may be `set`
+                }
+                scan_expr(cmd)
+                    || args.iter().any(scan_expr)
+                    || env.iter().any(|(_, v)| scan_expr(v))
+            }
+            IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| scan_stmts(s)),
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => scan_expr(e),
+            IrStmt::SetChildError(e) => scan_expr(e),
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => scan_expr(discriminant) || clauses.iter().any(|c| scan_stmts(&c.body)),
+            IrStmt::Redirect { inner, redirects } => {
+                scan_stmts(inner) || redirects.iter().any(|r| scan_expr(&r.target))
+            }
+            IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => scan_stmts(body),
+            IrStmt::Require(_)
+            | IrStmt::RawText(_)
+            | IrStmt::Return(None)
+            | IrStmt::Exit(None) => false,
+        }
+    }
+    scan_stmts(&prog.stmts)
 }
 
 /// True when the program contains `shopt -s nocasematch` anywhere (top
