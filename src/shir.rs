@@ -2224,15 +2224,36 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 alternate,
             }
         }
-        IrStmt::While { cond, body } => Stmt::ExpressionStatement {
-            expression: await_call(
-                "whileLoop",
-                vec![
-                    arrow(vec![], IrExpr::Arrow(vec![IrStmt::Expr(cond.clone())])),
-                    arrow(vec![], IrExpr::Arrow(body.clone())),
-                ],
-            ),
-        },
+        IrStmt::While { cond, body } => {
+            // Fast path: a provably-sync loop (neither cond nor body needs
+            // `await`) lowers to the synchronous runtime loop, which has
+            // IDENTICAL semantics (lastExit, BREAK/CONTINUE/RETURN signals,
+            // capture bound) minus the per-iteration promise/microtask
+            // machinery — ~100x faster busy loops. The closures are plain
+            // (r#async: false); eligibility is checked on the already-lowered
+            // ESTree: any AwaitExpression inside disqualifies (the runtime
+            // call is pure CPU, so no *Sync blocking-I/O concern — the gate
+            // whitelists whileLoopSync explicitly).
+            let cond_e = expr_to_estree(cond);
+            let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
+            if !expr_has_await(&cond_e) && !stmts_have_await(&body_stmts) {
+                return Some(Stmt::ExpressionStatement {
+                    expression: sh2_call(
+                        "whileLoopSync",
+                        vec![sync_arrow_expr(cond_e), sync_arrow_block(body_stmts)],
+                    ),
+                });
+            }
+            Stmt::ExpressionStatement {
+                expression: await_call(
+                    "whileLoop",
+                    vec![
+                        arrow(vec![], IrExpr::Arrow(vec![IrStmt::Expr(cond.clone())])),
+                        arrow(vec![], IrExpr::Arrow(body.clone())),
+                    ],
+                ),
+            }
+        }
         IrStmt::For { var, iter, body } => {
             let js_var = safe_ident(var);
             let mut body_stmts = vec![IrStmt::Assign {
@@ -3270,6 +3291,43 @@ fn arrow_with_param(param: String, body: IrExpr) -> Expr {
 
 fn await_call(name: &str, args: Vec<Expr>) -> Expr {
     await_expr(sh2_call(name, args))
+}
+
+/// Plain (non-async) zero-arg arrow `() => expr` for the sync-loop fast path.
+fn sync_arrow_expr(expr: Expr) -> Expr {
+    Expr::ArrowFunctionExpression {
+        params: vec![],
+        body: ArrowBody::Expr(Box::new(expr)),
+        expression: true,
+        r#async: false,
+    }
+}
+
+/// Plain (non-async) block arrow `() => { stmts }` for the sync-loop fast path.
+fn sync_arrow_block(stmts: Vec<Stmt>) -> Expr {
+    Expr::ArrowFunctionExpression {
+        params: vec![],
+        body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body: stmts })),
+        expression: false,
+        r#async: false,
+    }
+}
+
+/// True if the lowered ESTree contains an `AwaitExpression` (i.e. needs an
+/// async context). Serialization-based: `type_` is the only "type" field, so
+/// the substring `"type":"AwaitExpression"` appears iff such a node is
+/// present. A false positive only costs the fast path (falls back to the
+/// async loop) — never correctness.
+fn expr_has_await(e: &Expr) -> bool {
+    serde_json::to_string(e)
+        .map(|s| s.contains("\"type\":\"AwaitExpression\""))
+        .unwrap_or(true)
+}
+
+fn stmts_have_await(stmts: &[Stmt]) -> bool {
+    serde_json::to_string(stmts)
+        .map(|s| s.contains("\"type\":\"AwaitExpression\""))
+        .unwrap_or(true)
 }
 
 fn await_expr(inner: Expr) -> Expr {
