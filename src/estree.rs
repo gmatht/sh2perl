@@ -951,6 +951,42 @@ mod tests {
     }
 
     #[test]
+    fn grep_null_test_lifts_to_contains() {
+        // `if echo $x | grep P >/dev/null 2>/dev/null` (discarded-output grep
+        // as a test) is a substring test — no echo/grep spawns, no pipeline;
+        // the emitter inlines the ShIR `contains` call to a NATIVE
+        // `String(h).includes(n)` (src/shir.rs expr_to_estree).
+        let json = to_json(
+            "if echo hi | grep hi > /dev/null 2> /dev/null; then echo yes; fi",
+        );
+        assert!(json.contains("\"name\":\"includes\""));
+        assert!(json.contains("\"name\":\"String\""));
+        assert!(!json.contains("pipeline"));
+        assert!(!json.contains("\"name\":\"grep\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn grep_with_regex_pattern_not_lifted() {
+        // BRE metacharacters disqualify the lift: `grep 'a.c'` is a regex,
+        // not a substring test — the pipeline must stay.
+        let json = to_json(
+            "if echo hi | grep a.c > /dev/null 2> /dev/null; then echo yes; fi",
+        );
+        assert!(!json.contains("contains"));
+        assert!(json.contains("pipeline"));
+    }
+
+    #[test]
+    fn statement_pipeline_grep_not_lifted() {
+        // Statement-position `echo x | grep y >/dev/null` keeps its $? status
+        // (read back by the next command) — only test-position conds lift.
+        let json = to_json("echo hi | grep hi > /dev/null 2> /dev/null; echo $?");
+        assert!(!json.contains("contains"));
+        assert!(json.contains("pipeline"));
+    }
+
+    #[test]
     fn assignment_lowers_to_setvar() {
         // provably-numeric/string variables are LIFTED to native JS writes
         // (`x = 42` / `x = \"hello\"`), no runtime store round-trip
