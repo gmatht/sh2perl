@@ -484,6 +484,17 @@ fn stdin_only_command(name: Option<&str>) -> bool {
 
 fn transform_cmd(cmd: &Command) -> Command {
     match cmd {
+        // Unterminated-parameter-expansion artifact: the lexer reads
+        // `echo "${var:?unset"` (missing closing `}`) as a bare
+        // StringInterpolation whose literal parts re-join to text starting
+        // with `${`. bash rejects the construct at parse time and aborts the
+        // whole script there, so the word can never execute: drop the
+        // command (BlankLine lowers to nothing) instead of printing the raw
+        // artifact text.
+        Command::Simple(_) if command_is_unterminated_param_artifact(cmd) => Command::BlankLine,
+        Command::BuiltinCommand(_) if command_is_unterminated_param_artifact(cmd) => {
+            Command::BlankLine
+        }
         Command::Simple(sc) => {
             let mut sc = sc.clone();
             let ps = transform_redirects(&mut sc.redirects);
@@ -591,6 +602,44 @@ fn transform_cmd(cmd: &Command) -> Command {
         }
         Command::Return(w) => Command::Return(w.as_ref().map(|w| transform_word(w.clone()))),
         other => other.clone(),
+    }
+}
+
+/// True when `w` is the lexer's artifact for an unterminated parameter
+/// expansion inside a double-quoted string: a pure-literal interpolation
+/// (or bare literal) that starts with `${`, has content beyond the `${`,
+/// and never closes the brace. Legit single-quoted `'${x}'` text closes the
+/// brace; a bare `'${'` (escaped-dollar artifact, `\${`) is only the
+/// two-char opener — both excluded.
+fn is_unterminated_param_literal(w: &Word) -> bool {
+    let joined = match w {
+        Word::StringInterpolation(interp, _)
+            if interp.parts.iter().all(|p| matches!(p, StringPart::Literal(_))) =>
+        {
+            interp
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    StringPart::Literal(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        }
+        Word::Literal(s, _) => s.clone(),
+        _ => return false,
+    };
+    joined.starts_with("${") && joined.len() > 2 && !joined.contains('}')
+}
+
+/// A simple/builtin command whose NAME or any ARG is such an artifact word.
+fn command_is_unterminated_param_artifact(cmd: &Command) -> bool {
+    match cmd {
+        Command::Simple(sc) => {
+            is_unterminated_param_literal(&sc.name)
+                || sc.args.iter().any(is_unterminated_param_literal)
+        }
+        Command::BuiltinCommand(bc) => bc.args.iter().any(is_unterminated_param_literal),
+        _ => false,
     }
 }
 
@@ -948,6 +997,26 @@ mod tests {
         assert!(json.contains("\"name\":\"return\""));
         assert!(!json.contains("\"type\":\"ReturnStatement\""));
         assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn unterminated_param_expansion_drops_command() {
+        // `echo "${var:?unset"` (missing closing `}`) is a bash parse error:
+        // the lexer artifact word must never print. The command lowers to
+        // nothing (BlankLine) — an empty program, matching bash's abort.
+        let json = to_json("echo \"${var:?unset\"");
+        assert!(!json.contains("unset"));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("\"name\":\"unsupported\""));
+        // Legit single-quoted `${x}` text (closing brace present) survives.
+        let json2 = to_json("echo '${x}'");
+        assert!(json2.contains("${x}"));
+        assert!(!json2.contains("\"name\":\"unsupported\""));
+        // Bare `${` (escaped-dollar artifact, `\\${`) is only the opener:
+        // not an unterminated expansion, keep the command.
+        let json3 = to_json("echo '${'");
+        assert!(json3.contains("${"));
+        assert!(!json3.contains("\"name\":\"unsupported\""));
     }
 
     #[test]
