@@ -2,8 +2,26 @@ use debashl::ast::Word;
 use debashl::mir_simple::MirCommand;
 use debashl::{Generator, Lexer, Parser};
 use std::fs;
+use std::io::Read;
 use std::io::Write;
 use std::process::Command;
+
+/// Read a `file`-style input: `-` means stdin (virtual stdin first — the
+/// wasm embedders set it — then real fd 0); anything else is fs::read.
+/// Byte-preserving so the ESTree path keeps its raw-byte handling.
+pub(crate) fn read_cli_input(filename: &str) -> std::io::Result<Vec<u8>> {
+    if filename != "-" {
+        return fs::read(filename);
+    }
+    crate::with_virtual_stdin(|opt| match opt {
+        Some(bytes) => Ok(bytes.to_vec()),
+        None => {
+            let mut buf = Vec::new();
+            std::io::stdin().read_to_end(&mut buf)?;
+            Ok(buf)
+        }
+    })
+}
 
 pub fn run_generated(lang: &str, input: &str) {
     let source = if input.ends_with(".sh") || std::path::Path::new(input).exists() {
@@ -73,9 +91,9 @@ pub fn parse_input(input: &str) {
 }
 
 pub fn parse_file(filename: &str) {
-    match fs::read_to_string(filename) {
-        Ok(content) => {
-            parse_input(&content);
+    match read_cli_input(filename) {
+        Ok(bytes) => {
+            parse_input(&String::from_utf8_lossy(&bytes));
         }
         Err(e) => {
             println!("Error reading file {}: {}", filename, e);
@@ -403,9 +421,9 @@ fn extract_backticks_perl_logic(perl_code: &str) -> String {
 }
 
 pub fn parse_file_to_perl(filename: &str) {
-    match fs::read_to_string(filename) {
-        Ok(content) => {
-            parse_to_perl(&content);
+    match read_cli_input(filename) {
+        Ok(bytes) => {
+            parse_to_perl(&String::from_utf8_lossy(&bytes));
         }
         Err(e) => {
             println!("Error reading file {}: {}", filename, e);
@@ -416,7 +434,7 @@ pub fn parse_file_to_perl(filename: &str) {
 /// Parse a shell file and emit **standard ESTree JSON** (v0 backend,
 /// `sh2.*` runtime namespace — see src/estree.rs / PLAN.md §1.2).
 pub fn parse_file_to_estree(filename: &str) {
-    match fs::read(filename) {
+    match read_cli_input(filename) {
         Ok(bytes) => {
             // bash reads the source as raw bytes and passes non-UTF-8 bytes
             // through unchanged (utf8-non-utf8-content.sh: a lone Latin-1
