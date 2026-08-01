@@ -942,10 +942,13 @@ mod tests {
     }
 
     #[test]
-    fn echo_lowers_to_exec_call() {
+    fn echo_lowers_to_builtin_call() {
+        // `echo` is a runtime SYNC builtin → the async exec dispatch is
+        // skipped entirely (`sh2.builtin("echo", ...)`, no await).
         let json = to_json("echo hello world");
         assert!(json.contains("\"type\":\"Program\""));
-        assert!(json.contains("\"name\":\"exec\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"exec\""));
         assert!(json.contains("hello"));
         assert!(!json.contains("unsupported"));
     }
@@ -1151,8 +1154,11 @@ mod tests {
         let json = to_json("shopt -s extglob");
         assert!(json.contains("\"name\":\"shopt\""));
         assert!(!json.contains("unsupported"));
+        // the body is `echo $i` — a sync builtin call (no await) → the
+        // c-style loop lowers to the SYNC runtime twin.
         let json2 = to_json("for ((i=0; i<3; i++)); do echo $i; done");
-        assert!(json2.contains("\"name\":\"cstyleFor\""));
+        assert!(json2.contains("\"name\":\"cstyleForSync\""));
+        assert!(!json2.contains("\"name\":\"cstyleFor\""));
         assert!(!json2.contains("unsupported"));
     }
 
@@ -1169,10 +1175,12 @@ mod tests {
     fn longoption_dollar_brace_expands() {
         // `--x="${X}"`: the LongOption lexer path merges the quoted string
         // as raw text, arriving as the bare literal `--x=${X}`. The transform
-        // splits it so the parameter expansion is evaluated (sh2.param).
+        // splits it so the parameter expansion is evaluated — natively now
+        // (X is a lifted string binding: `${X}` → bare `X`).
         let json = to_json("X=test; echo --x=\"${X}\"");
         assert!(json.contains("--x="));
-        assert!(json.contains("\"name\":\"param\""));
+        assert!(json.contains("\"type\":\"Identifier\",\"name\":\"X\""));
+        assert!(!json.contains("\"name\":\"param\""));
         assert!(!json.contains("\"name\":\"unsupported\""));
         // Single-quoted `${x}` (no `=`) stays literal; `\\${x}` (escaped
         // dollar) keeps its backslash — both must NOT be expanded.

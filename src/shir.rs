@@ -40,6 +40,104 @@ static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
 /// flag never turns on, so guard emission is skipped entirely for programs
 /// that provably never enable it.
 static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
+/// Builtins the runtime implements as SYNC functions (harness
+/// sh2-namespace.mjs `builtins.*` — every non-async entry of builtins.json;
+/// `wait`/`exec`/`sleep`/`command` are async and stay on the async exec
+/// path). `sh2.exec("echo", args)` lowers to a sync `sh2.builtin("echo",
+/// args)` dispatch: identical arg flattening/glob expansion, identical
+/// builtin function, minus the async exec machinery (the whileLoopSync
+/// pattern — same semantics, no per-call promises).
+const SYNC_BUILTINS: &[&str] = &[
+    ".", ":", "basename", "break", "cd", "cmp", "comm", "continue", "declare",
+    "dirname", "echo", "eval", "exit", "export", "false", "head", "let", "local",
+    "mapfile", "printf", "pwd", "read", "readarray", "readonly", "return", "seq",
+    "set", "shift", "sort", "source", "stat", "tail", "touch", "trap", "true",
+    "type", "typeset", "uniq", "unset", "wc",
+];
+/// Names of every function the program defines (IrStmt::Function), set per
+/// compilation by `shir_to_estree` under COMPILE_LOCK. A script-defined
+/// function SHADOWS a same-named builtin in bash, so exec calls to a
+/// shadowed name must keep the async exec dispatch (the runtime's function
+/// map) — never the sync builtin path.
+static PROGRAM_FUNCTIONS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+fn program_defines_function(name: &str) -> bool {
+    PROGRAM_FUNCTIONS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(true) // unset → conservative: keep the async exec path
+}
+
+/// Recursive IrStmt walk collecting every `IrStmt::Function` name — a
+/// same-named script function shadows a builtin anywhere in the program
+/// (definitions inside bodies/arrows count).
+fn collect_program_functions(stmts: &[IrStmt], out: &mut HashSet<String>) {
+    fn walk_stmts(stmts: &[IrStmt], out: &mut HashSet<String>) {
+        for st in stmts {
+            match st {
+                IrStmt::Function { name, body } => {
+                    out.insert(name.clone());
+                    walk_stmts(body, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk_stmts(body, out),
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk_stmts(then, out);
+                    walk_stmts(else_, out);
+                    for (_, b) in elsifs {
+                        walk_stmts(b, out);
+                    }
+                }
+                IrStmt::For { body, .. } => walk_stmts(body, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for stage in stages {
+                        walk_stmts(stage, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk_stmts(inner, out),
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk_stmts(&c.body, out);
+                    }
+                }
+                IrStmt::Expr(e) => walk_expr(e, out),
+                _ => {}
+            }
+        }
+    }
+    fn walk_expr(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Arrow(stmts) => walk_stmts(stmts, out),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, out);
+                walk_expr(rhs, out);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(inner) = p {
+                        walk_expr(inner, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk_stmts(stmts, out);
+}
 /// Serializes whole-program compilations: the lift/scan statics above are
 /// per-compilation state, and the determinism unit test compiles in
 /// parallel threads — without a lock, one thread's emission can read
@@ -1935,6 +2033,26 @@ fn is_async_call(name: &str) -> bool {
     )
 }
 
+/// `sh2.exec("name", args)` → sync `sh2.builtin("name", args)` when the
+/// runtime implements `name` as a SYNC builtin (harness builtins.json minus
+/// the async wait/exec/sleep/command) AND no script-defined function
+/// shadows it (bash: a function named like a builtin wins — the runtime's
+/// exec dispatch consults its function map first, so a shadowed name must
+/// keep the async exec path). Env-carrying exec calls stay async (the
+/// builtin twin takes no env). The sync twin skips the async exec
+/// machinery (arg flattening/glob expansion happen identically inside it),
+/// the whileLoopSync pattern: same semantics, no per-call promises.
+fn exec_or_builtin<'a>(func: &'a str, args: &[IrExpr]) -> &'a str {
+    if func == "exec" {
+        if let [IrExpr::Str(name, _), IrExpr::Array(_)] = args {
+            if SYNC_BUILTINS.contains(&name.as_str()) && !program_defines_function(name) {
+                return "builtin";
+            }
+        }
+    }
+    func
+}
+
 /// bash special / environment variables the RUNTIME reads from its own
 /// store or process.env (IFS drives field-splitting and joins; PATH feeds
 /// spawned commands; exported vars sync to process.env). Lifting any of
@@ -2863,10 +2981,13 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // static writes and the body emission widens the torn-read window.
     let nocase = ir_may_enable_nocasematch(prog);
     let errexit = ir_may_enable_errexit(prog);
+    let mut functions = HashSet::new();
+    collect_program_functions(&prog.stmts, &mut functions);
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
     *CASE_NOCASE.lock().unwrap() = Some(nocase);
     *MAY_ERREXIT.lock().unwrap() = Some(errexit);
+    *PROGRAM_FUNCTIONS.lock().unwrap() = Some(functions);
     let mut body: Vec<Stmt> = Vec::new();
     // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
     // reads an unset var as 0 in arithmetic and "" as a string.
@@ -3781,8 +3902,28 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         .collect(),
                 });
             }
+            // sync-builtin dispatch (the expr_to_estree rewrite, for the
+            // statement-form Exec): env-carrying calls stay async.
+            let callee = if env.is_empty() {
+                if let IrExpr::Str(name, _) = cmd {
+                    if SYNC_BUILTINS.contains(&name.as_str()) && !program_defines_function(name) {
+                        "builtin"
+                    } else {
+                        "exec"
+                    }
+                } else {
+                    "exec"
+                }
+            } else {
+                "exec"
+            };
+            let call = sh2_call(callee, call_args);
             Stmt::ExpressionStatement {
-                expression: await_expr(sh2_call("exec", call_args)),
+                expression: if is_async_call(callee) {
+                    await_expr(call)
+                } else {
+                    call
+                },
             }
         }
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),
@@ -4173,6 +4314,263 @@ fn test_str_to_estree(s: &str) -> Option<Expr> {
     })
 }
 
+/// Like `test_str_to_estree` but STRICTER: returns `Some` only when the
+/// string is `$`-free (plain literal) or EVERY `$`-expansion in it is a
+/// lifted variable (all inlined into a template literal). A `$` referring
+/// to a store-bound variable would have to be expanded by the runtime from
+/// the STORE at runtime — a native expression cannot do that, so the caller
+/// falls back to the runtime call (or the value-override param form, where
+/// the runtime still expandWord's the arg). Mirrors expandWord's quote
+/// handling: a pair of surrounding quotes (the parser keeps them in
+/// defaults) is stripped first.
+fn fully_lifted_template(s: &str) -> Option<Expr> {
+    // expandWord strips one pair of surrounding quotes after expansion.
+    let bare = if s.len() >= 2 {
+        let q = s.chars().next().unwrap();
+        if (q == '"' || q == '\'') && s.ends_with(q) {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        }
+    } else {
+        s
+    };
+    if !bare.contains('$') {
+        return Some(str_lit(bare));
+    }
+    let bytes = bare.as_bytes();
+    let mut i = 0;
+    let n = bytes.len();
+    while i < n {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        if i + 1 < n && bytes[i + 1] == b'{' {
+            if let Some(close) = bare[i + 2..].find('}') {
+                let name = &bare[i + 2..i + 2 + close];
+                if is_lifted(name) {
+                    i = i + 2 + close + 1;
+                    continue;
+                }
+            }
+            return None; // ${...} with a non-lifted / complex body
+        }
+        let rest = &bare[i + 1..];
+        let name_len = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if name_len > 0 {
+            let name = &rest[..name_len];
+            if is_lifted(name) {
+                i += 1 + name_len;
+                continue;
+            }
+        }
+        return None; // $$ / $? / $1 / $(...) — not a lifted plain ref
+    }
+    test_str_to_estree(bare)
+}
+
+/// `sh2.param` lowering for LIFTED variable names. The runtime reads the
+/// value from the STORE by string name — a lifted binding is not there — so
+/// the value is inlined as a JS expression and the pure string ops the
+/// runtime would run are emitted natively (mirrors harness
+/// sh2-namespace.mjs param/substGlob/stripGlobPrefix/stripGlobSuffix
+/// exactly; the corpus is the oracle). Ops whose extras cannot go native
+/// (glob patterns, store-reading defaults/offsets, `:?` exit, basename/
+/// dirname) fall through to the caller's value-override form
+/// (`sh2.param(op, name, extras..., value)`), never a store read.
+fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args else {
+        return None;
+    };
+    if !is_lifted(name) {
+        return None;
+    }
+    // positional / array / ${#x} / ${!map} forms have special runtime
+    // semantics and their names are never liftable identifiers anyway.
+    if name.contains('@')
+        || name.contains('*')
+        || name.contains('[')
+        || name.starts_with('#')
+        || name.starts_with('!')
+    {
+        return None;
+    }
+    let id = || Expr::Identifier {
+        name: name.clone(),
+    };
+    let val = || Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        arguments: vec![id()],
+        optional: false,
+    };
+    let member = |obj: Expr, prop: &str| Expr::MemberExpression {
+        object: Box::new(obj),
+        property: Box::new(Expr::Identifier {
+            name: prop.to_string(),
+        }),
+        computed: false,
+        optional: false,
+    };
+    let method = |obj: Expr, prop: &str, args: Vec<Expr>| Expr::CallExpression {
+        callee: Box::new(member(obj, prop)),
+        arguments: args,
+        optional: false,
+    };
+    let bin = |l: Expr, op: &'static str, r: Expr| Expr::BinaryExpression {
+        operator: op,
+        left: Box::new(l),
+        right: Box::new(r),
+    };
+    let cond = |t: Expr, c: Expr, a: Expr| Expr::ConditionalExpression {
+        test: Box::new(t),
+        consequent: Box::new(c),
+        alternate: Box::new(a),
+    };
+    let int_lit = |i: i64| Expr::Literal {
+        value: serde_json::Value::from(i),
+        raw: None,
+    };
+    // A glob-strip/substitute pattern that the runtime's literal fast path
+    // handles (no glob metachars) and that embeds cleanly in a JS string
+    // literal (ASCII; `$` is literal there, exactly like the runtime — it
+    // never expands patterns).
+    let literal_pattern = |p: &str| {
+        !p.is_empty() && p.is_ascii() && !p.chars().any(|c| matches!(c, '*' | '?' | '['))
+    };
+    match op.as_str() {
+        // ${x} — a plain read of the binding (like the getVar lift)
+        "" => Some(id()),
+        // ${#x} — string length
+        "len" => Some(member(val(), "length")),
+        // ${x^^} / ${x,,} — case conversion
+        "^^" => Some(method(val(), "toUpperCase", vec![])),
+        ",," => Some(method(val(), "toLowerCase", vec![])),
+        // ${x^} / ${x,} — first character only (empty → "", like the
+        // runtime's `v.length ? ... : v` since charAt(0) is "" and
+        // slice(1) is "" for the empty string)
+        "^" | "," => {
+            let up = op == "^";
+            Some(bin(
+                method(
+                    method(val(), "charAt", vec![int_lit(0)]),
+                    if up { "toUpperCase" } else { "toLowerCase" },
+                    vec![],
+                ),
+                "+",
+                method(val(), "slice", vec![int_lit(1)]),
+            ))
+        }
+        // ${x#p} / ${x##p} / ${x%p} / ${x%%p} — literal prefix/suffix
+        // removal (shortest == longest for literal patterns, exactly like
+        // the runtime's literal fast paths)
+        "#" | "##" | "%" | "%%" => {
+            let [_, _, IrExpr::Str(p, _)] = args else {
+                return None;
+            };
+            if !literal_pattern(p) {
+                return None;
+            }
+            let len = p.chars().count() as i64;
+            if op.starts_with('#') {
+                Some(cond(
+                    method(val(), "startsWith", vec![str_lit(p)]),
+                    method(val(), "slice", vec![int_lit(len)]),
+                    val(),
+                ))
+            } else {
+                Some(cond(
+                    method(val(), "endsWith", vec![str_lit(p)]),
+                    method(val(), "slice", vec![int_lit(0), int_lit(-len)]),
+                    val(),
+                ))
+            }
+        }
+        // ${x//p/r} — replace ALL occurrences (split/join; the runtime's
+        // literal fast path is exactly this). Empty pattern must stay on
+        // the runtime (split("") splits chars; bash treats it as a
+        // no-op).
+        "//" => {
+            let [_, _, IrExpr::Str(p, _), IrExpr::Str(r, _)] = args else {
+                return None;
+            };
+            if !literal_pattern(p) {
+                return None;
+            }
+            let rep = fully_lifted_template(r)?;
+            Some(method(
+                method(val(), "split", vec![str_lit(p)]),
+                "join",
+                vec![rep],
+            ))
+        }
+        // ${x:-d} / ${x:=d} — default when empty. `:=` also WRITES the
+        // binding (a JS assignment expression — the runtime's setVar
+        // cannot see the lifted binding, so this op must go native; the
+        // lift analysis marks `:=` names whose default cannot be fully
+        // inlined, keeping them store-bound instead).
+        ":-" | ":=" => {
+            let [_, _, IrExpr::Str(d, _)] = args else {
+                return None;
+            };
+            let dflt = fully_lifted_template(d)?;
+            let test = bin(val(), "!==", str_lit(""));
+            if op == ":-" {
+                Some(cond(test, val(), dflt))
+            } else {
+                Some(cond(
+                    test,
+                    val(),
+                    Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(id()),
+                        right: Box::new(dflt),
+                    },
+                ))
+            }
+        }
+        // ${x:off:len} — substring slice with LITERAL integer offsets
+        // (negative offsets count from the end, like the runtime's
+        // v.slice(off, off + len)). Non-integer offsets (arith exprs) fall
+        // through to the value-override form.
+        "slice" => {
+            let [_, _, IrExpr::Str(off, _), IrExpr::Str(len, _)] = args else {
+                return None;
+            };
+            let int_of = |t: &str| {
+                let t = t.trim();
+                if t.is_empty() {
+                    Some(0i64)
+                } else if t.starts_with('-') {
+                    t[1..].parse::<i64>().ok().map(|v| -v)
+                } else {
+                    t.parse::<i64>().ok()
+                }
+            };
+            let o = int_of(off)?;
+            if len.trim().is_empty() {
+                Some(method(val(), "slice", vec![int_lit(o)]))
+            } else {
+                let l = int_of(len)?;
+                Some(method(
+                    val(),
+                    "slice",
+                    vec![int_lit(o), int_lit(o + l)],
+                ))
+            }
+        }
+        // basename/dirname/:? and everything else: the value-override form
+        // (runtime keeps the string-op logic; only the value source
+        // changes).
+        _ => None,
+    }
+}
+
 /// Conservative "always a string" analysis (slice 4). A variable lifts to a
 /// native JS string binding (`let x = ""`) iff every assignment source is a
 /// plain string (a literal, an interpolation, or a copy of another
@@ -4262,8 +4660,51 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
             IrExpr::Call { func, args } => {
                 if func != "getVar" && func != "test" && func != "setArray" && func != "setArrayAppend"
                 {
-                    for a in args {
+                    for (i, a) in args.iter().enumerate() {
+                        // `sh2.param`'s NAME arg (index 1) is a direct store
+                        // lookup, never a $ref scan — and for a lifted name
+                        // the emitter inlines the value (native string ops
+                        // or the trailing value-override arg), so it must
+                        // NOT be marked store-bound. The extras keep their
+                        // marks (the runtime still expandWord's/evalArith's
+                        // them against the store). Names that are NOT plain
+                        // identifiers (`map[$k]` — the runtime expands the
+                        // subscript via normAssocKey/expandWord; `@`/`*`/
+                        // `#x`/`!x` forms) keep their marks.
+                        if func == "param" && i == 1 {
+                            if let IrExpr::Str(n, _) = a {
+                                let plain = !n.contains('$')
+                                    && !n.contains('[')
+                                    && !n.contains('@')
+                                    && !n.contains('*')
+                                    && !n.starts_with('#')
+                                    && !n.starts_with('!');
+                                if plain {
+                                    continue;
+                                }
+                            }
+                        }
                         mark_str_args(a, string_ctx);
+                    }
+                }
+                // `${x:=d}` WRITES the variable. The native lowering updates
+                // the JS binding via an assignment expression — but a
+                // default that cannot be fully inlined (a `$` ref to a
+                // store-bound var) or a subshell/background write (copy
+                // semantics: bash writes a COPY; a module binding would be
+                // clobbered) must keep the name store-bound so the runtime
+                // setVar path stays consistent.
+                if func == "param" {
+                    if let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args.as_slice() {
+                        if op == ":=" {
+                            let store_default = matches!(
+                                args.get(2),
+                                Some(IrExpr::Str(d, _)) if d.contains('$')
+                            );
+                            if store_default || in_copy {
+                                string_ctx.insert(name.clone());
+                            }
+                        }
                     }
                 }
                 if func == "exec" {
@@ -4744,6 +5185,50 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
+            // `sh2.param` on a LIFTED variable: the runtime reads the value
+            // from the STORE by string name — a lifted binding is not
+            // there — so the pure string ops lower NATIVE (the `${x//p/r}`
+            // → split/join family) and the rest inject the value as a
+            // trailing override argument (the runtime uses `String(value)`
+            // instead of a store read; its expandWord/evalArith still
+            // process the extras, so `$ref` semantics are unchanged).
+            if func == "param" {
+                if let Some(native) = try_native_param(args) {
+                    return native;
+                }
+                if let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args.as_slice() {
+                    if is_lifted(name) && op != ":=" {
+                        let mut cargs: Vec<Expr> = vec![str_lit(op), str_lit(name)];
+                        for (i, a) in args.iter().enumerate().skip(2) {
+                            match a {
+                                // patterns are NEVER expanded by the
+                                // runtime (substGlob/stripGlob* use them
+                                // raw) — keep them raw; defaults /
+                                // replacements / offsets ARE expanded
+                                // (expandWord/evalArith), so inject lifted
+                                // refs there.
+                                IrExpr::Str(s, _) if matches!(op.as_str(), "#" | "##" | "%" | "%%" | "//") && i == 2 => {
+                                    cargs.push(str_lit(s));
+                                }
+                                IrExpr::Str(s, _) => {
+                                    cargs.push(test_str_to_estree(s).unwrap_or_else(|| str_lit(s)));
+                                }
+                                _ => cargs.push(expr_to_estree(a)),
+                            }
+                        }
+                        // the runtime signature is param(op, name, a, b,
+                        // value) — pad missing extra slots so the value
+                        // lands in the trailing `value` slot.
+                        while cargs.len() < 4 {
+                            cargs.push(str_lit(""));
+                        }
+                        cargs.push(Expr::Identifier {
+                            name: name.clone(),
+                        });
+                        return sh2_call("param", cargs);
+                    }
+                }
+            }
             // `for ((...))` whose body needs no await lowers to the sync
             // runtime twin (the whileLoopSync precedent): identical
             // semantics minus the per-iteration promise machinery. The
@@ -4761,8 +5246,9 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
-            let call = sh2_call(func, mapped_args);
-            if is_async_call(func) {
+            let callee_name = exec_or_builtin(func, args);
+            let call = sh2_call(callee_name, mapped_args);
+            if is_async_call(callee_name) {
                 await_expr(call)
             } else {
                 call
