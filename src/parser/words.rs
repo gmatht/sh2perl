@@ -81,6 +81,7 @@ fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
 fn expansion_into_parts(expansion: Word) -> Option<Vec<StringPart>> {
     match expansion {
         Word::Variable(name, _, _) => Some(vec![StringPart::Variable(name)]),
+        Word::Arithmetic(a, _) => Some(vec![StringPart::Arithmetic(a)]),
         Word::ParameterExpansion(pe, _) => Some(vec![StringPart::ParameterExpansion(pe)]),
         Word::MapAccess(name, key, _) => Some(vec![StringPart::MapAccess(name, key)]),
         Word::MapKeys(name, _) => Some(vec![StringPart::MapKeys(name)]),
@@ -258,6 +259,18 @@ fn merge_contiguous_quoted_fragments(
                     break;
                 }
                 continue;
+            }
+            // `$(( ... ))` glued to the word (`x=$((1+2))` — one bash word):
+            // the lexer emits a distinct Arithmetic token the combine loop
+            // stops at, so merge the parsed arithmetic as a part here.
+            Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                if let Ok(arith) = parse_arithmetic_expression(lexer) {
+                    if !merge_expansion_into_word(word, arith) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
             }
             // Escape fragments (`\'`, `\"`, `\x`) glued after a word:
             // keep the raw text — the renderers unescape it (like `echo a\'b`).
@@ -3141,6 +3154,31 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 current_literal.clear();
             }
 
+            if i + 2 < content.len() && content[i..].starts_with("$((") {
+                // `$(( ... ))` arithmetic expansion — find the matching
+                // `))` (paren-balanced) and emit an Arithmetic part; before
+                // the `$(` branch, or `(1+2)` would parse as a subshell
+                // command (`echo "x=$((1+2))"` → running `1+2` as a command).
+                let mut j = i + 3;
+                let mut depth = 2usize;
+                while j < content.len() && depth > 0 {
+                    if content.as_bytes()[j] == b'(' {
+                        depth += 1;
+                    } else if content.as_bytes()[j] == b')' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    parts.push(StringPart::Arithmetic(ArithmeticExpression {
+                        expression: content[i + 3..j - 2].trim().to_string(),
+                        tokens: vec![],
+                    }));
+                    i = j;
+                    continue;
+                }
+                // unbalanced — fall through to the literal `$` handling
+            }
             if i + 1 < content.len() && content[i + 1..].starts_with('(') {
                 // Command substitution $(...)
                 i += 2; // skip $ and (
@@ -3303,6 +3341,31 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 current_literal.clear();
             }
 
+            if i + 2 < content.len() && content[i..].starts_with("$((") {
+                // `$(( ... ))` arithmetic expansion — find the matching
+                // `))` (paren-balanced) and emit an Arithmetic part; before
+                // the `$(` branch, or `(1+2)` would parse as a subshell
+                // command (`echo "x=$((1+2))"` → running `1+2` as a command).
+                let mut j = i + 3;
+                let mut depth = 2usize;
+                while j < content.len() && depth > 0 {
+                    if content.as_bytes()[j] == b'(' {
+                        depth += 1;
+                    } else if content.as_bytes()[j] == b')' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    parts.push(StringPart::Arithmetic(ArithmeticExpression {
+                        expression: content[i + 3..j - 2].trim().to_string(),
+                        tokens: vec![],
+                    }));
+                    i = j;
+                    continue;
+                }
+                // unbalanced — fall through to the literal `$` handling
+            }
             if i + 1 < content.len() && content[i + 1..].starts_with('(') {
                 // Command substitution $(...)
                 i += 2; // skip $ and (
