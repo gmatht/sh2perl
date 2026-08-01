@@ -678,7 +678,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             } else {
                 quoted_text
             };
-            Ok(Word::Literal(content, None))
+            Ok(Word::Literal(content, Some(())))
         }
         Some(Token::SingleQuote) => {
             // Handle a bare single-quote token that wasn't paired into
@@ -716,7 +716,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 lexer.current = lexer.tokens.len();
                 lexer.input[start + 1..].to_string()
             };
-            Ok(Word::Literal(content, None))
+            Ok(Word::Literal(content, Some(())))
         }
         Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
@@ -1455,7 +1455,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             } else {
                 quoted_text
             };
-            Ok(Word::Literal(content, None))
+            Ok(Word::Literal(content, Some(())))
         }
         Some(Token::SingleQuote) => {
             // Handle a bare single-quote token that wasn't paired into
@@ -1493,7 +1493,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 lexer.current = lexer.tokens.len();
                 lexer.input[start + 1..].to_string()
             };
-            Ok(Word::Literal(content, None))
+            Ok(Word::Literal(content, Some(())))
         }
         Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),

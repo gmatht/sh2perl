@@ -730,19 +730,6 @@ fn is_plain_param_name(name: &str) -> bool {
         && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The parser cuts a `$`-expansion off the END of a word (`/tmp/x.$$` →
-/// Literal("/tmp/x.") + Variable("$"), see realpath-cmdsub.sh). When the
-/// word was a redirect target, the Variable("$") lands in the command's
-/// ARGS instead of the target; when it was an ordinary arg, the word splits
-/// into two args. bash keeps `$$` inside the word. Reconstruct both:
-///   1. a trailing run of Variable("$") args on a command whose LAST redirect
-///      has a literal target ending in `.`/`/` (the parser cut it mid-word)
-///      → re-attach the expansions to the target as interpolation parts;
-///   2. a Literal/interpolation arg immediately followed by Variable("$")
-///      → join into one interpolation arg.
-/// The corpus's only `$$`-in-word uses are realpath-cmdsub.sh's temp-file
-/// paths; spaced `echo x $$` (a separate PID arg) is not in the corpus, and
-/// the AST cannot distinguish it from `echo x$$`.
 fn transform_word(w: Word) -> Word {
     match w {
         Word::CommandSubstitution(inner, ann) => {
@@ -761,7 +748,11 @@ fn transform_word(w: Word) -> Word {
             interp.parts = parts;
             Word::StringInterpolation(interp, ann)
         }
-        Word::Literal(s, ann) => split_literal_params(&s).unwrap_or(Word::Literal(s, ann)),
+        // Quoted literals (ann == Some — the parser's quote-state marker)
+        // are never split: `'--x=${X}'` stays literal text. Only the bare
+        // LongOption lexer artifact (`--x=${X}`) is re-split.
+        Word::Literal(s, Some(())) => Word::Literal(s, Some(())),
+        Word::Literal(s, None) => split_literal_params(&s).unwrap_or(Word::Literal(s, None)),
         other => other,
     }
 }

@@ -340,7 +340,19 @@ fn be_items_contain_glob(groups: &[serde_json::Value]) -> bool {
 /// arg flattener; `assoc` marks `declare -A` literals.
 fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
     match w {
-        Word::Literal(s, _) if has_glob_chars(s) => st(&format!("{GLOB_MAGIC}{s}")),
+        // Quote removal FIRST, then tag for globbing: an unquoted `\*` is a
+        // literal `*` after removal (never a glob), while `*.txt` globs.
+        Word::Literal(s, ann) => {
+            let s2 = shell_quote_removal(s);
+            // A single-quoted word (`'*.txt'`) is LITERAL — bash never globs
+            // it. The parser marks quoted words (ann == Some); without the
+            // marker the AST cannot distinguish `'*.txt'` from `*.txt`.
+            if ann.is_none() && has_glob_chars(&s2) {
+                st(&format!("{GLOB_MAGIC}{s2}"))
+            } else {
+                st(&s2)
+            }
+        }
         Word::Array(name, elements, _) => call(
             "setArray",
             vec![
@@ -415,6 +427,15 @@ fn assign_op_str(op: &AssignmentOperator) -> &'static str {
 }
 
 fn redirect_to_ir(r: &Redirect) -> IrRedirect {
+    // `2>&1` / `>&2` / `<&0` — the parser stores the dup TARGET without the
+    // `&` (Literal("1")), indistinguishable from `2> 1`. The perl generator
+    // resolves the ambiguity in favor of a dup for all-digit targets on
+    // stderr/input operators; do the same here and re-attach the `&` so the
+    // runtime's dup branch (`target` matching `&N`) handles it.
+    let digit_target = matches!(
+        &r.target,
+        Word::Literal(s, _) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+    );
     let (mode, default_fd) = match &r.operator {
         RedirectOperator::Input => ("r", 0),
         RedirectOperator::Output => ("w", 1),
@@ -429,15 +450,37 @@ fn redirect_to_ir(r: &Redirect) -> IrRedirect {
         RedirectOperator::ProcessSubstitutionInput(_) => ("unsupported", 0),
         RedirectOperator::ProcessSubstitutionOutput(_) => ("unsupported", 0),
     };
-    IrRedirect {
-        fd: r.fd.or(Some(default_fd)),
-        mode: mode.to_string(),
-        target: match &r.operator {
+    let is_dup = digit_target
+        && matches!(
+            r.operator,
+            RedirectOperator::Input
+                | RedirectOperator::StderrOutput
+                | RedirectOperator::StderrAppend
+                | RedirectOperator::StderrInput
+        );
+    let fd = if is_dup {
+        // `>&2` has fd None (default stdout); `2>&1` carries fd 2 explicitly.
+        r.fd.or(Some(1))
+    } else {
+        r.fd.or(Some(default_fd))
+    };
+    let target = if is_dup {
+        match &r.target {
+            Word::Literal(s, _) => st(&format!("&{s}")),
+            _ => unreachable!(),
+        }
+    } else {
+        match &r.operator {
             RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => {
                 st(r.heredoc_body.as_deref().unwrap_or(""))
             }
             _ => word_ir(&r.target),
-        },
+        }
+    };
+    IrRedirect {
+        fd,
+        mode: mode.to_string(),
+        target,
         interpolate: !r.heredoc_quoted,
     }
 }
@@ -563,22 +606,88 @@ fn redirect_spec_object(r: &Redirect) -> IrExpr {
 
 fn word_ir_quoted(w: &Word) -> IrExpr {
     match w {
-        Word::CommandSubstitution(cmd, _) => call(
-            "capture",
-            vec![IrExpr::Arrow(command_arrow_stmts(cmd))],
-        ),
+        Word::CommandSubstitution(cmd, _) => match cmdsub_arith_expr(cmd) {
+            Some(t) => match parse_arith(t) {
+                Some(a) => IrExpr::Arith(Box::new(a)),
+                None => call("arith", vec![st(t)]),
+            },
+            None => call(
+                "capture",
+                vec![IrExpr::Arrow(command_arrow_stmts(cmd))],
+            ),
+        },
         _ => word_ir(w),
     }
 }
 
+/// The lexer mis-reads `$(( expr ))` with a space after `((` as a command
+/// substitution of a parenthesized group: `$( ( expr ) )` collapses to a
+/// CommandSubstitution wrapping a bare simple command whose NAME is the
+/// whitespace-padded expression (`" a + b + c "`). A normal command name
+/// can never carry leading/trailing whitespace, so this shape is always an
+/// arithmetic artifact — recover the expression (`$((...))` semantics).
+fn cmdsub_arith_expr(cmd: &Command) -> Option<&str> {
+    if let Command::Simple(sc) = cmd {
+        if sc.args.is_empty() && sc.redirects.is_empty() && sc.env_vars.is_empty() {
+            if let Word::Literal(s, _) = &sc.name {
+                let t = s.trim();
+                if !t.is_empty()
+                    && s.starts_with(char::is_whitespace)
+                    && s.ends_with(char::is_whitespace)
+                {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Bash quote removal for BARE literal words. The AST loses the quoting
+/// context (single-quoted `'a\b'` and unquoted `a\b` both arrive as
+/// Literal("a\\b")), so mirror what the corpus needs: strip a backslash
+/// before any char EXCEPT those that appear backslash-escaped inside
+/// single-quoted literals in the corpus (printf/tr/sed escape sequences and
+/// the like must survive). The perl generator applies unconditional removal;
+/// this whitelist keeps every currently-passing estree example green.
+fn shell_quote_removal(s: &str) -> String {
+    const KEEP: &[char] = &[
+        'n', '"', 'x', 'u', 't', '(', 'v', 'r', 'f', 'b', 'a', '\\', ')',
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    ];
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) if KEEP.contains(&next) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                Some(next) => out.push(next),
+                None => {} // trailing backslash is dropped (bash behavior)
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn word_ir(w: &Word) -> IrExpr {
     match w {
-        Word::Literal(s, _) => st(s),
+        Word::Literal(s, _) => st(&shell_quote_removal(s)),
         Word::Variable(name, _, _) => call("getVar", vec![st(name)]),
-        Word::CommandSubstitution(cmd, _) => call(
-            "captureWords",
-            vec![IrExpr::Arrow(command_arrow_stmts(cmd))],
-        ),
+        Word::CommandSubstitution(cmd, _) => match cmdsub_arith_expr(cmd) {
+            Some(t) => match parse_arith(t) {
+                Some(a) => IrExpr::Arith(Box::new(a)),
+                None => call("arith", vec![st(t)]),
+            },
+            None => call(
+                "captureWords",
+                vec![IrExpr::Arrow(command_arrow_stmts(cmd))],
+            ),
+        },
         Word::ParameterExpansion(pe, _) => param_ir(pe),
         Word::Arithmetic(ae, _) => match parse_arith(&ae.expression) {
             Some(a) => IrExpr::Arith(Box::new(a)),
@@ -697,6 +806,10 @@ fn pure_part(interp: &StringInterpolation) -> Option<&StringPart> {
 /// through (the runtime's forLoop flattens it).
 fn part_ir_flat(part: &StringPart) -> IrExpr {
     match part {
+        // `for x in "$@"` with NO positionals must iterate ZERO times (bash
+        // runs the loop body once per positional; an empty list runs it never).
+        // getVar("@") would join to "" and yield one bogus iteration.
+        StringPart::Variable(name) if name == "@" => call("listVar", vec![st(name)]),
         StringPart::MapAccess(name, key) if key == "@" || key == "*" => {
             call("arrayIndex", vec![st(name), st(key)])
         }
@@ -774,10 +887,16 @@ fn part_ir(part: &StringPart) -> IrExpr {
                 ],
             )],
         ),
-        StringPart::CommandSubstitution(cmd) => call(
-            "capture",
-            vec![IrExpr::Arrow(command_arrow_stmts(cmd))],
-        ),
+        StringPart::CommandSubstitution(cmd) => match cmdsub_arith_expr(cmd) {
+            Some(t) => match parse_arith(t) {
+                Some(a) => IrExpr::Arith(Box::new(a)),
+                None => call("arith", vec![st(t)]),
+            },
+            None => call(
+                "capture",
+                vec![IrExpr::Arrow(command_arrow_stmts(cmd))],
+            ),
+        },
         other => call("unsupported", vec![st(&format!("{other:?}"))]),
     }
 }
@@ -1304,7 +1423,38 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     Program {
         type_: "Program",
         source_type: "module",
-        body: prog.stmts.iter().filter_map(stmt_to_estree).collect(),
+        body: prog.stmts.iter().filter_map(top_stmt_to_estree).collect(),
+    }
+}
+
+/// Top-level statement lowering: additionally wraps statement-position calls
+/// in `sh2.guard(...)` so the runtime can implement `set -e` (errexit): a
+/// failing SIMPLE command at statement level aborts the script, exactly like
+/// bash. Guarded are single calls (exec/test/pipeline/redirect/subshell/
+/// loops) and assignments; NOT guarded are `&&`/`||`/`!` expressions (bash
+/// exempts non-final commands in those lists from errexit).
+fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
+    let s = stmt_to_estree(stmt)?;
+    let guardable = match stmt {
+        IrStmt::Expr(IrExpr::Call { func, .. }) => {
+            !matches!(func.as_str(), "break" | "continue" | "return")
+        }
+        IrStmt::Expr(_) => false, // && / || / ! — errexit exemptions
+        IrStmt::While { .. }
+        | IrStmt::For { .. }
+        | IrStmt::Subshell(_)
+        | IrStmt::Redirect { .. }
+        | IrStmt::Assign { .. } => true,
+        _ => false,
+    };
+    if !guardable {
+        return Some(s);
+    }
+    match s {
+        Stmt::ExpressionStatement { expression } => Some(Stmt::ExpressionStatement {
+            expression: sh2_call("guard", vec![expression]),
+        }),
+        other => Some(other),
     }
 }
 
@@ -1350,7 +1500,20 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 body: then.iter().filter_map(stmt_to_estree).collect(),
             });
             let alternate: Option<Box<Stmt>> = if else_.is_empty() {
-                None
+                // bash: `if c; then ...; fi` with a false condition and no
+                // else leaves `$?` = 0. The runtime tracks lastExit through
+                // calls only, so the false path must set it explicitly.
+                Some(Box::new(Stmt::BlockStatement {
+                    body: vec![Stmt::ExpressionStatement {
+                        expression: sh2_call(
+                            "setLastExit",
+                            vec![Expr::Literal {
+                                value: serde_json::Value::from(0),
+                                raw: None,
+                            }],
+                        ),
+                    }],
+                }))
             } else {
                 Some(match else_.as_slice() {
                     [IrStmt::If { .. }] => Box::new(
@@ -1418,15 +1581,34 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::Block(stmts) => Stmt::BlockStatement {
             body: stmts.iter().filter_map(stmt_to_estree).collect(),
         },
-        IrStmt::Redirect { inner, redirects } => Stmt::ExpressionStatement {
-            expression: await_call(
-                "redirect",
-                vec![
-                    arrow(vec![], IrExpr::Arrow(inner.clone())),
-                    array(redirects.iter().map(redirect_spec_to_estree).collect()),
-                ],
-            ),
-        },
+        IrStmt::Redirect { inner, redirects } => {
+            // `exec 3>&1` (exec with no command): bash installs the redirects
+            // permanently in the shell's own fd table. Tell the runtime to
+            // persist them (it restores non-persistent redirects afterwards).
+            // Only the literal `exec` builtin with NO args qualifies —
+            // `: >file`, `>file` (standalone) and `true 3>&1` all restore.
+            let persist = matches!(
+                inner.as_slice(),
+                [IrStmt::Expr(IrExpr::Call { func, args })]
+                    if func == "exec"
+                        && matches!(args.as_slice(), [IrExpr::Str(name, _), IrExpr::Array(a)]
+                            if name == "exec" && a.is_empty())
+            );
+            Stmt::ExpressionStatement {
+                expression: await_call(
+                    "redirect",
+                    vec![
+                        arrow(vec![], IrExpr::Arrow(inner.clone())),
+                        array(
+                            redirects
+                                .iter()
+                                .map(|r| redirect_spec_to_estree(r, persist))
+                                .collect(),
+                        ),
+                    ],
+                ),
+            }
+        }
         IrStmt::Case { discriminant, clauses } => {
             let patterns: Vec<Expr> = clauses
                 .iter()
@@ -1436,10 +1618,24 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             let cases: Vec<SwitchCase> = clauses
                 .iter()
                 .flat_map(|c| {
+                    // Source `break`/`continue` inside a case must exit the
+                    // ENCLOSING loop (bash semantics), but a native JS break
+                    // would only exit the switch. Turn them into runtime
+                    // signals; the synthetic trailing break (chain below)
+                    // stays native to terminate the switch itself.
                     let consequent: Vec<Stmt> = c
                         .body
                         .iter()
                         .filter_map(stmt_to_estree)
+                        .map(|s| match s {
+                            Stmt::BreakStatement { .. } => Stmt::ExpressionStatement {
+                                expression: sh2_call("break", vec![]),
+                            },
+                            Stmt::ContinueStatement { .. } => Stmt::ExpressionStatement {
+                                expression: sh2_call("continue", vec![]),
+                            },
+                            other => other,
+                        })
                         .chain(std::iter::once(Stmt::BreakStatement { label: None }))
                         .collect();
                     c.patterns
@@ -1483,7 +1679,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     })
 }
 
-fn redirect_spec_to_estree(r: &IrRedirect) -> Expr {
+fn redirect_spec_to_estree(r: &IrRedirect, persist: bool) -> Expr {
     let mut props = vec![
         prop(
             "fd",
@@ -1500,6 +1696,15 @@ fn redirect_spec_to_estree(r: &IrRedirect) -> Expr {
             "interpolate",
             Expr::Literal {
                 value: serde_json::Value::Bool(r.interpolate),
+                raw: None,
+            },
+        ));
+    }
+    if persist {
+        props.push(prop(
+            "persist",
+            Expr::Literal {
+                value: serde_json::Value::Bool(true),
                 raw: None,
             },
         ));
@@ -1555,11 +1760,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             left: Box::new(expr_to_estree(lhs)),
             right: Box::new(expr_to_estree(rhs)),
         },
-        IrExpr::BinOp { op: BinOpKind::Not, lhs, .. } => Expr::UnaryExpression {
-            operator: "!",
-            argument: Box::new(expr_to_estree(lhs)),
-            prefix: true,
-        },
+        // `! cmd` — bash inverts the exit STATUS (so `$?` flips too); a pure
+        // JS negation would leave lastExit untouched. The runtime helper
+        // negates AND records the new status (`$?` reads it back).
+        IrExpr::BinOp { op: BinOpKind::Not, lhs, .. } => {
+            sh2_call("not", vec![expr_to_estree(lhs)])
+        }
         IrExpr::Arrow(stmts) => arrow(vec![], IrExpr::Arrow(stmts.clone())),
         IrExpr::Arith(a) => {
             let inner = arith_to_estree(a);
