@@ -464,7 +464,18 @@ pub fn parse_file_to_estree(filename: &str) {
                 }
             };
             match debashl::estree::ast_to_estree_json(&commands) {
-                Ok(json) => println!("{}", json),
+                Ok(json) => {
+                    // Opt-in bc → native Math.* lowering (cli/src/bc_native.rs):
+                    // `x=$(echo 'expr' | bc -l)` becomes String(Math.*) with
+                    // zero spawns. Env-gated so the corpus output stays
+                    // byte-identical by default (SH2_BC_NATIVE=1 to enable).
+                    let json = if std::env::var("SH2_BC_NATIVE").is_ok() {
+                        crate::bc_native::lower_bc_native(&json)
+                    } else {
+                        json
+                    };
+                    println!("{}", json);
+                }
                 Err(e) => eprintln!("ESTree serialization error: {}", e),
             }
         }
