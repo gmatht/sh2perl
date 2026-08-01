@@ -1,3 +1,4 @@
+pub mod bc_native;
 pub mod cache;
 pub mod cli_commands;
 pub mod execution;
