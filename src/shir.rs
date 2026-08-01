@@ -509,13 +509,24 @@ fn command_to_ir(cmd: &Command) -> IrExpr {
             &bc.env_vars,
             &bc.redirects,
         ),
-        Command::Redirect(rc) => call(
-            "redirect",
-            vec![
-                IrExpr::Arrow(vec![IrStmt::Expr(command_to_ir(&rc.command))]),
-                IrExpr::Array(rc.redirects.iter().map(redirect_spec_object).collect()),
-            ],
-        ),
+        Command::Redirect(rc) => {
+            // `exec 4>&1` in expression context: bash installs the redirects
+            // permanently in the shell's fd table (see stmt_to_estree's
+            // IrStmt::Redirect persist rule — same qualification here).
+            let persist = is_bare_exec(&rc.command);
+            call(
+                "redirect",
+                vec![
+                    IrExpr::Arrow(vec![IrStmt::Expr(command_to_ir(&rc.command))]),
+                    IrExpr::Array(
+                        rc.redirects
+                            .iter()
+                            .map(|r| redirect_spec_object_persist(r, persist))
+                            .collect(),
+                    ),
+                ],
+            )
+        }
         Command::Pipeline(p) => call(
             "pipeline",
             vec![IrExpr::Array(
@@ -569,6 +580,18 @@ fn command_to_ir(cmd: &Command) -> IrExpr {
     }
 }
 
+/// The literal `exec` builtin with NO args (a redirect-only `exec N>&M`):
+/// bash installs those redirects permanently in the shell's own fd table.
+fn is_bare_exec(cmd: &Command) -> bool {
+    match cmd {
+        Command::BuiltinCommand(bc) => bc.name == "exec" && bc.args.is_empty(),
+        Command::Simple(sc) => {
+            sc.name.as_literal().map_or(false, |n| n == "exec") && sc.args.is_empty()
+        }
+        _ => false,
+    }
+}
+
 fn exec_expr(
     name: &Word,
     args: &[Word],
@@ -579,17 +602,32 @@ fn exec_expr(
     if redirects.is_empty() {
         exec_call
     } else {
+        // `exec 4>&1` in EXPRESSION context (command substitution bodies,
+        // if/while conditions, pipeline stages): bash installs the redirects
+        // permanently in the shell's own fd table, so the runtime must keep
+        // them after the redirect call (same rule as the statement path in
+        // stmt_to_estree — only the literal `exec` builtin with no args).
+        let persist = matches!(name, Word::Literal(s, _) if s == "exec") && args.is_empty();
         call(
             "redirect",
             vec![
                 IrExpr::Arrow(vec![IrStmt::Expr(exec_call)]),
-                IrExpr::Array(redirects.iter().map(redirect_spec_object).collect()),
+                IrExpr::Array(
+                    redirects
+                        .iter()
+                        .map(|r| redirect_spec_object_persist(r, persist))
+                        .collect(),
+                ),
             ],
         )
     }
 }
 
 fn redirect_spec_object(r: &Redirect) -> IrExpr {
+    redirect_spec_object_persist(r, false)
+}
+
+fn redirect_spec_object_persist(r: &Redirect, persist: bool) -> IrExpr {
     let ir = redirect_to_ir(r);
     let mut props = vec![
         ("fd".to_string(), IrExpr::Int(ir.fd.unwrap_or(0) as i64)),
@@ -598,6 +636,9 @@ fn redirect_spec_object(r: &Redirect) -> IrExpr {
     ];
     if ir.mode == "heredoc" || ir.mode == "heredoc-tabs" {
         props.push(("interpolate".to_string(), IrExpr::Bool(ir.interpolate)));
+    }
+    if persist {
+        props.push(("persist".to_string(), IrExpr::Bool(true)));
     }
     IrExpr::Object(props)
 }
@@ -1415,7 +1456,7 @@ fn is_async_call(name: &str) -> bool {
     matches!(
         name,
         "exec" | "redirect" | "pipeline" | "subshell" | "block" | "whileLoop" | "cstyleFor"
-            | "capture" | "captureWords" | "forLoop"
+            | "capture" | "captureWords" | "forLoop" | "and" | "or"
     )
 }
 
@@ -1437,7 +1478,13 @@ fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     let s = stmt_to_estree(stmt)?;
     let guardable = match stmt {
         IrStmt::Expr(IrExpr::Call { func, .. }) => {
-            !matches!(func.as_str(), "break" | "continue" | "return")
+            // `&&` / `||` / `!` lists: bash exempts non-final commands from
+            // errexit; `and`/`or` are the lowered &&/|| (same exemption),
+            // `not` is `!`.
+            !matches!(
+                func.as_str(),
+                "break" | "continue" | "return" | "and" | "or" | "not"
+            )
         }
         IrStmt::Expr(_) => false, // && / || / ! — errexit exemptions
         IrStmt::While { .. }
@@ -1750,16 +1797,22 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 call
             }
         }
-        IrExpr::BinOp { op: BinOpKind::And, lhs, rhs } => Expr::LogicalExpression {
-            operator: "&&",
-            left: Box::new(expr_to_estree(lhs)),
-            right: Box::new(expr_to_estree(rhs)),
-        },
-        IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs } => Expr::LogicalExpression {
-            operator: "||",
-            left: Box::new(expr_to_estree(lhs)),
-            right: Box::new(expr_to_estree(rhs)),
-        },
+        IrExpr::BinOp { op: BinOpKind::And, lhs, rhs } => {
+            // bash `a && b`: run a, then run b only if a's EXIT STATUS is 0.
+            // A native JS `&&` would consult the return VALUE of the left
+            // operand instead — capture() returns the captured STRING and
+            // assign() returns true, so `r=$(cmd) || ...` (and friends) would
+            // branch on the wrong thing. The runtime helper sequences both
+            // sides and checks lastExit.
+            await_call(
+                "and",
+                vec![arrow(vec![], (**lhs).clone()), arrow(vec![], (**rhs).clone())],
+            )
+        }
+        IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs } => await_call(
+            "or",
+            vec![arrow(vec![], (**lhs).clone()), arrow(vec![], (**rhs).clone())],
+        ),
         // `! cmd` — bash inverts the exit STATUS (so `$?` flips too); a pure
         // JS negation would leave lastExit untouched. The runtime helper
         // negates AND records the new status (`$?` reads it back).
