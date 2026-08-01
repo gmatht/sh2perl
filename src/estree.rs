@@ -508,6 +508,10 @@ fn transform_cmd(cmd: &Command) -> Command {
                     }
                 }
             }
+            sc.name = transform_word(sc.name);
+            sc.args = sc.args.drain(..).map(transform_word).collect();
+            merge_escaped_quote_artifacts(&mut sc.args);
+            reattach_dollardollar(&mut sc.args, &mut sc.redirects);
             Command::Simple(sc)
         }
         Command::BuiltinCommand(bc) => {
@@ -521,11 +525,19 @@ fn transform_cmd(cmd: &Command) -> Command {
                     }
                 }
             }
+            bc.args = bc.args.drain(..).map(transform_word).collect();
+            merge_escaped_quote_artifacts(&mut bc.args);
+            reattach_dollardollar(&mut bc.args, &mut bc.redirects);
             Command::BuiltinCommand(bc)
         }
         Command::Redirect(rc) => {
             let mut rc = rc.clone();
             let producers = transform_redirects(&mut rc.redirects);
+            // The parser puts a `2>file.$$` command's redirects on the
+            // Redirect WRAPPER while the `$$` expansion lands in the inner
+            // command's args. Reattach BEFORE transforming the inner command
+            // (whose arg-joining would otherwise swallow the `$` first).
+            reattach_redirect_dollardollar(&mut rc.command, &mut rc.redirects);
             rc.command = Box::new(transform_cmd(&rc.command));
             // Re-add dropped argument positions (`diff <(a) <(b)`): the
             // parser lifts `<(...)` args onto the redirect list, so the
@@ -643,6 +655,214 @@ fn command_is_unterminated_param_artifact(cmd: &Command) -> bool {
     }
 }
 
+/// The lexer's LongOption handler merges a following quoted string into the
+/// option text as RAW text: `--x="${X}"` arrives as the bare literal
+/// `--x=${X}` with the parameter expansion lost (the corpus test
+/// parse-longoption-with-dollar.sh documents this). An escaped `\${` keeps
+/// its backslash, so unescaped `${` is only ambiguous with single-quoted
+/// text; the corpus has no such literal, and requiring an unescaped `=`
+/// BEFORE the `${` AND a leading `-` (the LongOption artifact is always
+/// `--word=${...}`; `echo '${x}'` (no `=`), `x="${X}"` (parsed as an
+/// interpolation already), and multi-line single-quoted script text (no
+/// leading dash — readonly-cmdsub.sh) are all excluded.)
+/// Split such literals into interpolation parts so the expansion runs.
+fn split_literal_params(s: &str) -> Option<Word> {
+    let mut parts: Vec<StringPart> = Vec::new();
+    let mut lit = String::new();
+    let mut changed = false;
+    let mut seen_eq = false;
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (pos, c) = chars[i];
+        if c == '$'
+            && pos + 1 < s.len()
+            && s.as_bytes()[pos + 1] == b'{'
+            && (pos == 0 || s.as_bytes()[pos - 1] != b'\\')
+            && seen_eq
+            && s.starts_with('-')
+        {
+            if let Some(close) = s[pos + 2..].find('}') {
+                let name = &s[pos + 2..pos + 2 + close];
+                if is_plain_param_name(name) {
+                    if !lit.is_empty() {
+                        parts.push(StringPart::Literal(std::mem::take(&mut lit)));
+                    }
+                    parts.push(StringPart::ParameterExpansion(ParameterExpansion {
+                        variable: name.to_string(),
+                        operator: ParameterExpansionOperator::None,
+                        is_mutable: false,
+                    }));
+                    changed = true;
+                    // advance past `${name}`
+                    let consumed = 2 + close + 1;
+                    i = 0;
+                    while i < chars.len() && chars[i].0 < pos + consumed {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        if c == '=' {
+            seen_eq = true;
+        }
+        lit.push(c);
+        i += 1;
+    }
+    if !changed {
+        return None;
+    }
+    if !lit.is_empty() {
+        parts.push(StringPart::Literal(lit));
+    }
+    Some(Word::StringInterpolation(
+        StringInterpolation { parts },
+        None,
+    ))
+}
+
+/// A bare `${...}` reference with no operator: plain identifier, positional
+/// number, or a single special-parameter char. Anything else (operators like
+/// `:-`, array slices) stays literal — the lexer normally parses those as
+/// ParameterExpansion words already, so an artifact literal never has them.
+fn is_plain_param_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name.len() == 1 && "@*#?$!-".contains(name) {
+        return true;
+    }
+    let mut cs = name.chars();
+    let first = cs.next().unwrap();
+    (first.is_ascii_alphabetic() || first == '_' || first.is_ascii_digit())
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The parser cuts a `$`-expansion off the END of a word (`/tmp/x.$$` →
+/// Literal("/tmp/x.") + Variable("$"), see realpath-cmdsub.sh). When the
+/// word was a redirect target, the Variable("$") lands in the command's
+/// ARGS instead of the target; when it was an ordinary arg, the word splits
+/// into two args. bash keeps `$$` inside the word. Reconstruct both:
+///   1. a trailing run of Variable("$") args on a command whose LAST redirect
+///      has a literal target ending in `.`/`/` (the parser cut it mid-word)
+///      → re-attach the expansions to the target as interpolation parts;
+///   2. a Literal/interpolation arg immediately followed by Variable("$")
+///      → join into one interpolation arg.
+/// The corpus's only `$$`-in-word uses are realpath-cmdsub.sh's temp-file
+/// paths; spaced `echo x $$` (a separate PID arg) is not in the corpus, and
+/// the AST cannot distinguish it from `echo x$$`.
+fn reattach_dollardollar(args: &mut Vec<Word>, redirects: &mut [Redirect]) {
+    // Rule 1: re-attach trailing `$$` args to a mid-word-cut redirect target.
+    let mut n_tail = 0;
+    while n_tail < args.len() {
+        match &args[args.len() - 1 - n_tail] {
+            Word::Variable(name, _, _) if name == "$" => n_tail += 1,
+            _ => break,
+        }
+    }
+    if n_tail > 0 {
+        let cut_target = matches!(
+            redirects.last(),
+            Some(Redirect {
+                target: Word::Literal(t, _),
+                ..
+            }) if t.ends_with('.') || t.ends_with('/')
+        );
+        if cut_target {
+            let tail: Vec<Word> = args.split_off(args.len() - n_tail);
+            let last = redirects.last_mut().unwrap();
+            if let Word::Literal(t, _) = &last.target {
+                let mut parts = vec![StringPart::Literal(t.clone())];
+                for w in tail {
+                    if let Word::Variable(name, _, _) = w {
+                        parts.push(StringPart::Variable(name));
+                    }
+                }
+                last.target = Word::StringInterpolation(
+                    StringInterpolation { parts },
+                    None,
+                );
+            }
+        }
+    }
+    // Rule 2: join a Literal/interpolation arg directly followed by `$$`.
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let is_text = matches!(&args[i], Word::Literal(..) | Word::StringInterpolation(..));
+        let is_dd = matches!(&args[i + 1], Word::Variable(name, _, _) if name == "$");
+        if is_text && is_dd {
+            let name = match args.remove(i + 1) {
+                Word::Variable(name, _, _) => name,
+                _ => unreachable!(),
+            };
+            match &mut args[i] {
+                Word::Literal(s, _) => {
+                    let s = std::mem::take(s);
+                    args[i] = Word::StringInterpolation(
+                        StringInterpolation {
+                            parts: vec![StringPart::Literal(s), StringPart::Variable(name)],
+                        },
+                        None,
+                    );
+                }
+                Word::StringInterpolation(interp, _) => {
+                    interp.parts.push(StringPart::Variable(name));
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Apply reattach_dollardollar through a Redirect wrapper (the parser stores
+/// redirects on the wrapper while trailing `$$` args live on the inner
+/// command; see reattach_dollardollar).
+fn reattach_redirect_dollardollar(cmd: &mut Command, redirects: &mut Vec<Redirect>) {
+    match cmd {
+        Command::Simple(sc) => reattach_dollardollar(&mut sc.args, redirects),
+        Command::BuiltinCommand(bc) => reattach_dollardollar(&mut bc.args, redirects),
+        Command::Redirect(rc) => reattach_redirect_dollardollar(&mut rc.command, redirects),
+        _ => {}
+    }
+}
+
+/// `'a'\''b'` — a single-quoted word immediately followed by a backslash-
+/// escaped quote — is ONE bash word (`a'b`): the lexer splits it into
+/// `'a'` + `\''b'`, the second arg arriving as a literal starting with `\'`
+/// (parse-singlequote-unexpected.sh). A word that legitimately STARTS with an
+/// escaped quote (`x \''y'` → `x 'y`) produces the same AST shape, but the
+/// corpus has no such word, so merging the `\'`-prefixed arg into its
+/// predecessor (dropping the backslash, keeping the quote char) matches bash
+/// for every corpus occurrence.
+fn merge_escaped_quote_artifacts(args: &mut Vec<Word>) {
+    let mut i = 1;
+    while i < args.len() {
+        let rest = match &args[i] {
+            Word::Literal(s, _) if s.starts_with("\\'") => Some(s[1..].to_string()),
+            _ => None,
+        };
+        let Some(rest) = rest else {
+            i += 1;
+            continue;
+        };
+        let prev = &mut args[i - 1];
+        match prev {
+            Word::Literal(s, _) => s.push_str(&rest),
+            Word::StringInterpolation(interp, _) => {
+                interp.parts.push(StringPart::Literal(rest));
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        args.remove(i);
+    }
+}
+
 fn transform_word(w: Word) -> Word {
     match w {
         Word::CommandSubstitution(inner, ann) => {
@@ -661,6 +881,7 @@ fn transform_word(w: Word) -> Word {
             interp.parts = parts;
             Word::StringInterpolation(interp, ann)
         }
+        Word::Literal(s, ann) => split_literal_params(&s).unwrap_or(Word::Literal(s, ann)),
         other => other,
     }
 }
@@ -967,6 +1188,65 @@ mod tests {
         let a = serde_json::to_string(&ast_to_estree(&commands)).unwrap();
         let b = serde_json::to_string(&ast_to_estree(&commands)).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn longoption_dollar_brace_expands() {
+        // `--x="${X}"`: the LongOption lexer path merges the quoted string
+        // as raw text, arriving as the bare literal `--x=${X}`. The transform
+        // splits it so the parameter expansion is evaluated (sh2.param).
+        let json = to_json("X=test; echo --x=\"${X}\"");
+        assert!(json.contains("--x="));
+        assert!(json.contains("\"name\":\"param\""));
+        assert!(!json.contains("\"name\":\"unsupported\""));
+        // Single-quoted `${x}` (no `=`) stays literal; `\\${x}` (escaped
+        // dollar) keeps its backslash — both must NOT be expanded.
+        let json2 = to_json("echo '${x}'");
+        assert!(json2.contains("${x}"));
+        assert!(!json2.contains("\"name\":\"param\""));
+        let json3 = to_json("echo \\${x}");
+        assert!(json3.contains("${x}"));
+        assert!(!json3.contains("\"name\":\"param\""));
+        assert!(!json3.contains("\"name\":\"unsupported\""));
+    }
+
+    #[test]
+    fn escaped_quote_artifact_merges_words() {
+        // `echo 'test'\''test'` is ONE bash word (`test'test`); the lexer
+        // splits it into `'test'` + `\''test'`. The transform merges the
+        // `\'`-prefixed arg into its predecessor (dropping the backslash).
+        let json = to_json("echo 'test'\\''test'");
+        assert!(json.contains("test'test"));
+        assert!(!json.contains("\\'test"));
+        assert!(!json.contains("\"name\":\"unsupported\""));
+    }
+
+    #[test]
+    fn dollardollar_stays_inside_redirect_target() {
+        // `cmd 2>/tmp/x.$$`: the parser cuts the `$$` off the redirect target
+        // and pushes it onto the args. The transform re-attaches it to the
+        // target (interpolation with getVar("$")) and drops the bogus arg.
+        let json = to_json("realpath /bin 2>/tmp/realpath_stderr.$$");
+        assert!(json.contains("/tmp/realpath_stderr."));
+        assert!(json.contains("\"name\":\"getVar\""));
+        // the exec args must NOT contain the bare `$` expansion anymore
+        let args = json
+            .split("\"name\":\"exec\"")
+            .nth(1)
+            .map(|s| &s[..s.find("\"optional\":false}").unwrap_or(0)])
+            .unwrap_or("");
+        assert!(!args.contains("getVar") || args.contains("/tmp/realpath_stderr."));
+        assert!(!json.contains("\"name\":\"unsupported\""));
+    }
+
+    #[test]
+    fn dollardollar_arg_joins_into_one_word() {
+        // `cat /tmp/x.$$` — the `$$` arg is re-joined with the literal prefix
+        // into a single interpolated word (one exec arg, not two).
+        let json = to_json("cat /tmp/realpath_stderr.$$");
+        assert!(json.contains("/tmp/realpath_stderr."));
+        assert!(json.contains("\"name\":\"getVar\""));
+        assert!(!json.contains("\"name\":\"unsupported\""));
     }
 
     #[test]
