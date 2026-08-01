@@ -1011,6 +1011,43 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
             };
             return Some(ArithAst::Num(v));
         }
+        if c == '$' {
+            // bash allows `$var` / `${var}` / `$1` INSIDE $(( )) — the
+            // runtime evalArith accepts them; treat as a bare variable read.
+            *pos += 1;
+            if *pos < chars.len() && chars[*pos] == '{' {
+                *pos += 1;
+                let mut name = String::new();
+                while *pos < chars.len() && chars[*pos] != '}' {
+                    name.push(chars[*pos]);
+                    *pos += 1;
+                }
+                if *pos >= chars.len() {
+                    return None;
+                }
+                *pos += 1;
+                return if name.is_empty() {
+                    None
+                } else {
+                    Some(ArithAst::Var(name))
+                };
+            }
+            if *pos < chars.len()
+                && (chars[*pos].is_ascii_alphabetic()
+                    || chars[*pos] == '_'
+                    || chars[*pos].is_ascii_digit())
+            {
+                let mut name = String::new();
+                while *pos < chars.len()
+                    && (chars[*pos].is_ascii_alphanumeric() || chars[*pos] == '_')
+                {
+                    name.push(chars[*pos]);
+                    *pos += 1;
+                }
+                return Some(ArithAst::Var(name));
+            }
+            return None; // bare `$` — fall back to the runtime evaluator
+        }
         if c.is_ascii_alphabetic() || c == '_' {
             let mut name = String::new();
             while *pos < chars.len()
