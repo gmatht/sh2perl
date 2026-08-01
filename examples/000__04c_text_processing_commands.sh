@@ -86,6 +86,8 @@ echo "$diff_result"
 
 # tr command with backticks
 #PERL_MUST_NOT_CONTAIN `tr
+d=$(mktemp -d)
+cd "$d" || exit 1
 tr_result=`echo "HELLO WORLD" | tr 'A-Z' 'a-z'`
 echo "Lowercase: $tr_result"
 
@@ -97,5 +99,7 @@ echo "$xargs_result"
 
 # Cleanup
 rm -f file1.txt file2.txt
+cd /
+rm -rf "$d"
 
 echo "=== Text Processing Commands Complete ==="

@@ -2,11 +2,17 @@
 
 # Simple shell script example
 echo "Hello, World!"
+# Run in a private scratch dir so `ls` output is deterministic
+d=$(mktemp -d)
+mkdir -p "$d/sub1" "$d/sub2"
+touch "$d/a.txt" "$d/b.txt"
+cd "$d"
 #TODO: Support multi-column output
-ls -1 | grep -v __tmp_test_output.pl
 #This should be a single token, not two.
 #AST_MUST_CONTAIN: [Literal("-1")]
-echo `ls | grep -v __tmp_test_output.pl`
+ls -1 | grep -v a.txt
+echo `ls | grep -v a.txt`
 #Lets not consider ls -la at the moment as permissions are OS dependent
 #ls -la
-#grep "pattern" file.txt echo "backup_exit: $?"
+cd /
+rm -rf "$d"

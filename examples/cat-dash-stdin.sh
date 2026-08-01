@@ -4,3 +4,4 @@
 cat - > /tmp/out.txt
 
 echo "exit: $?"
+rm -f /tmp/out.txt

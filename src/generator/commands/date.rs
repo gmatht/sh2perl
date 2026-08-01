@@ -112,7 +112,7 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
                     "my $date_now = time(); my $date_format = {}; $date_format =~ s/^\\+//; require POSIX; {}",
                     format_expr,
                     expr_to_perl(&strftime_var_ir(
-                        IrExpr::Var("date_format".to_string(), crate::ir::Sigil::Scalar),
+                        IrExpr::Var("date_format".to_string(), Some(crate::ir::Sigil::Scalar)),
                         true
                     ))
                 )
@@ -147,7 +147,7 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
                     "my $date_now = time(); my $date_format = {}; $date_format =~ s/^\\+//; require POSIX; {}",
                     format_expr,
                     expr_to_perl(&strftime_var_ir(
-                        IrExpr::Var("date_format".to_string(), crate::ir::Sigil::Scalar),
+                        IrExpr::Var("date_format".to_string(), Some(crate::ir::Sigil::Scalar)),
                         false
                     ))
                 )

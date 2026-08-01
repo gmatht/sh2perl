@@ -53,6 +53,8 @@ echo "=== Process Management Commands ==="
 # echo "Nohup result: $nohup_result"
 
 # nice command with backticks
+d=$(mktemp -d)
+cd "$d" || exit 1
 #PERL_MUST_NOT_CONTAIN `nice
 #nice_result=`nice echo "low priority process"`
 #echo "Nice result: $nice_result"
@@ -92,4 +94,6 @@ echo "Perl result: $perl_result"
 
 # Cleanup
 rm -f test_checksum.txt test_tee.txt
+cd /
+rm -rf "$d"
 

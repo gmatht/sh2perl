@@ -29,7 +29,7 @@ fn convert_arith_subexprs(s: &str, generator: &Generator) -> String {
 }
 
 // Helper function to convert shell variables to Perl equivalents
-fn convert_shell_var_to_perl(var: &str) -> String {
+fn convert_shell_var_to_perl(generator: &Generator, var: &str) -> String {
     let s = var.trim().to_string();
     
     // Remember the original quote style to re-apply it if no conversion happened
@@ -87,8 +87,24 @@ fn convert_shell_var_to_perl(var: &str) -> String {
         "$@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
         "$*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
         "$?" => "$CHILD_ERROR".to_string(),     // $? -> exit code
-        _ if processed.starts_with('$') || processed.starts_with('(') || processed.starts_with('"') || processed.starts_with('\'') => {
-            // Already a Perl expression (variable, command capture, or quoted string)
+        _ if processed.starts_with('$') && processed.len() > 1 => {
+            // A bare `$name` reference.  Map undeclared variables to
+            // $ENV{name} (avoiding `use strict` compile errors), keep
+            // declared variables and existing special forms ($ENV{...},
+            // ${...}, $CHILD_ERROR, $ARGV[...], $_[...]) as-is.
+            let rest = &processed[1..];
+            if !rest.is_empty()
+                && rest.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                test_expr_var_ref(generator, rest)
+            } else {
+                processed
+            }
+        }
+        _ if processed.starts_with('(')
+            || processed.starts_with('"')
+            || processed.starts_with('\'') => {
+            // Already a Perl expression (command capture or quoted string)
             processed
         }
         _ => {
@@ -408,13 +424,13 @@ pub fn generate_test_expression_impl(
                     s.contains("@(") || s.contains("*(") || s.contains("+(") || s.contains("?(") || s.contains("!(") || s.contains('*') || s.contains('?') || s.contains('[')
                 }
                 if has_glob_or_extglob_chars(value) {
-                    let var = convert_shell_var_to_perl(var);
+                    let var = convert_shell_var_to_perl(generator, var);
                     let regex_pattern = generator.convert_glob_to_regex(value);
                     format!("{} =~ {}", var, generator.format_regex_pattern(&format!("^{}$", regex_pattern)))
                 } else {
                     // Convert any $(...) command substitutions to Perl captures
-                    let var = convert_shell_var_to_perl(var);
-                    let value = convert_shell_var_to_perl(value);
+                    let var = convert_shell_var_to_perl(generator, var);
+                    let value = convert_shell_var_to_perl(generator, value);
                     // Convert positional parameters $1, $2, … to $_[0], $_[1], …
                     fn convert_pos_params(s: &str) -> String {
                         let re = regex::Regex::new(r"\$(\d+)").unwrap();
@@ -435,8 +451,8 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let left = parts[0].trim();
             let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(left);
-            let mut right_perl = convert_shell_var_to_perl(right);
+            let left_perl = convert_shell_var_to_perl(generator, left);
+            let mut right_perl = convert_shell_var_to_perl(generator, right);
 
             // Replace magic numbers with constants
             for (const_name, value) in &generator.constants {
@@ -454,8 +470,8 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let left = parts[0].trim();
             let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(left);
-            let mut right_perl = convert_shell_var_to_perl(right);
+            let left_perl = convert_shell_var_to_perl(generator, left);
+            let mut right_perl = convert_shell_var_to_perl(generator, right);
 
             // Replace magic numbers with constants
             for (const_name, value) in &generator.constants {
@@ -473,8 +489,8 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let left = parts[0].trim();
             let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(left);
-            let mut right_perl = convert_shell_var_to_perl(right);
+            let left_perl = convert_shell_var_to_perl(generator, left);
+            let mut right_perl = convert_shell_var_to_perl(generator, right);
 
             // Replace magic numbers with constants
             for (const_name, value) in &generator.constants {
@@ -492,8 +508,8 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let left = parts[0].trim();
             let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(left);
-            let mut right_perl = convert_shell_var_to_perl(right);
+            let left_perl = convert_shell_var_to_perl(generator, left);
+            let mut right_perl = convert_shell_var_to_perl(generator, right);
 
             // Replace magic numbers with constants
             for (const_name, value) in &generator.constants {
@@ -511,8 +527,8 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let left = parts[0].trim();
             let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(left);
-            let mut right_perl = convert_shell_var_to_perl(right);
+            let left_perl = convert_shell_var_to_perl(generator, left);
+            let mut right_perl = convert_shell_var_to_perl(generator, right);
 
             // Replace magic numbers with constants
             for (const_name, value) in &generator.constants {
@@ -530,8 +546,8 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let left = parts[0].trim();
             let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(left);
-            let mut right_perl = convert_shell_var_to_perl(right);
+            let left_perl = convert_shell_var_to_perl(generator, left);
+            let mut right_perl = convert_shell_var_to_perl(generator, right);
 
             // Replace magic numbers with constants
             for (const_name, value) in &generator.constants {
@@ -550,8 +566,8 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let left = parts[0].trim();
             let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(left);
-            let right_perl = convert_shell_var_to_perl(right);
+            let left_perl = convert_shell_var_to_perl(generator, left);
+            let right_perl = convert_shell_var_to_perl(generator, right);
             format!("({} gt {})", left_perl, right_perl)
         } else {
             "0".to_string()
@@ -562,8 +578,8 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let left = parts[0].trim();
             let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(left);
-            let right_perl = convert_shell_var_to_perl(right);
+            let left_perl = convert_shell_var_to_perl(generator, left);
+            let right_perl = convert_shell_var_to_perl(generator, right);
             format!("({} lt {})", left_perl, right_perl)
         } else {
             "0".to_string()
@@ -577,7 +593,7 @@ pub fn generate_test_expression_impl(
         } else {
             expr.replacen("-z ", "", 1).trim().to_string()
         };
-        let var = convert_shell_var_to_perl(&var);
+        let var = convert_shell_var_to_perl(generator, &var);
         format!("{} eq q{{}}", var)
     } else if expr.contains(" -n ") || starts_with_op(expr, "-n") {
         // String is not empty: [[ -n $var ]]
@@ -588,7 +604,7 @@ pub fn generate_test_expression_impl(
         } else {
             expr.replacen("-n ", "", 1).trim().to_string()
         };
-        let var = convert_shell_var_to_perl(&var);
+        let var = convert_shell_var_to_perl(generator, &var);
         format!("{} ne q{{}}", var)
     } else if expr.contains(" -f ") || starts_with_op(expr, "-f") {
         // File exists and is regular file: [[ -f $var ]]

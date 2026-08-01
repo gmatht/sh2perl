@@ -63,6 +63,12 @@ impl Parser {
             }
         }
 
+        // Index of the first command parsed on the CURRENT source line. bash
+        // parses/executes one line (list) at a time; a syntax error (`;;` or a
+        // stray `)` outside case/subshell) discards the whole line and aborts
+        // the rest of the script, so the parser truncates back to this index.
+        let mut line_start = 0usize;
+
         while !self.lexer.is_eof() {
 
             let _current_token = self.lexer.peek();
@@ -74,6 +80,7 @@ impl Parser {
             // Check if we're at a newline before parsing the command
             if let Some(Token::Newline) | Some(Token::CarriageReturn) = self.lexer.peek() {
                 // Consume the token and continue to next iteration
+                line_start = commands.len();
                 self.lexer.next();
                 continue;
             }
@@ -88,8 +95,23 @@ impl Parser {
             }
 
             // After parsing a command, look ahead for pipeline operators
-            // Skip whitespace and comments
-            self.lexer.skip_whitespace_and_comments();
+            // Skip whitespace and comments (tracking line boundaries: a
+            // newline here starts a new source line, so `;;`-truncation must
+            // keep the commands before it)
+            loop {
+                match self.lexer.peek() {
+                    Some(Token::Space) | Some(Token::Tab) | Some(Token::Comment) => {
+                        self.lexer.next();
+                    }
+                    Some(Token::Newline) | Some(Token::CarriageReturn) => {
+                        // The command parsed above is pushed AFTER this loop,
+                        // so it starts the new line too.
+                        line_start = commands.len() + 1;
+                        self.lexer.next();
+                    }
+                    _ => break,
+                }
+            }
 
             // Check if the next token is a pipeline operator
             if let Some(token) = self.lexer.peek() {
@@ -115,11 +137,17 @@ impl Parser {
                     }
                     Some(Token::Newline) | Some(Token::CarriageReturn) => {
                         newline_count += 1;
+                        line_start = commands.len();
                         self.lexer.next();
                     }
                     Some(Token::Semicolon) => {
                         self.lexer.next();
                         break;
+                    }
+                    Some(Token::DoubleSemicolon) | Some(Token::ParenClose) => {
+                        commands.truncate(line_start);
+                        self.lexer.next();
+                        return Ok(commands);
                     }
                     Some(Token::Background) => {
                         // Convert last command to background
@@ -554,6 +582,22 @@ impl Parser {
                     }
                 }
             }
+        }
+
+        // Canonicalize combined short flags (`-rf` → `-r -f`) for known
+        // flag-taking commands (see parser/normalize.rs). This runs after all
+        // arguments — including post-redirect ones — have been collected, and
+        // is the single choke point every simple command passes through.
+        match &mut command {
+            Command::Simple(sc) => {
+                if let Word::Literal(name, _) = &sc.name {
+                    crate::parser::normalize::normalize_combined_flags(name, &mut sc.args);
+                }
+            }
+            Command::BuiltinCommand(bc) => {
+                crate::parser::normalize::normalize_combined_flags(&bc.name, &mut bc.args);
+            }
+            _ => {}
         }
 
         if redirects.is_empty() {
@@ -3258,6 +3302,32 @@ fn parse_arithmetic_assignment<'a>(expr: &'a str) -> Option<(&'a str, &'a str)> 
         i += 1;
     }
     None
+}
+
+/// Parse text as a pipeline, reporting whether the ENTIRE text was consumed.
+/// The plain pipeline parser stops at the first command separator and
+/// silently drops any trailing commands; command-substitution bodies with
+/// multiple commands (`$(cmd1\ncmd2)`) must detect that and reparse with
+/// the full parser instead.
+pub fn parse_pipeline_from_text_with_rest(
+    text: &str,
+) -> Result<(Command, bool), ParserError> {
+    use crate::lexer::{Lexer, Token};
+
+    let mut lexer = Lexer::new(text);
+    let mut parser = Parser::new_with_lexer(lexer);
+    let cmd = parser.parse_pipeline()?;
+    // Skip trailing separators/whitespace, then report what remains.
+    while let Some(tok) = parser.lexer.peek() {
+        match tok {
+            Token::Space | Token::Tab | Token::Newline | Token::CarriageReturn
+            | Token::Semicolon | Token::Comment => {
+                parser.lexer.next();
+            }
+            _ => break,
+        }
+    }
+    Ok((cmd, parser.lexer.is_eof()))
 }
 
 pub fn parse_pipeline_from_text(text: &str) -> Result<Command, ParserError> {

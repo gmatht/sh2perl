@@ -1,12 +1,18 @@
 #!/bin/bash
 
-# This script should generate system calls with builtin commands
 echo "Testing system calls with builtin commands"
+d=$(mktemp -d)
+cd "$d" || exit 1
+printf 'a\n' > a.txt
+printf 'b\n' > b.txt
+mkdir sub
+printf 'c\n' > sub/c.txt
 
-# These should generate system 'ls' and system 'find' calls
-result1=`ls -la`
+result1=`ls -A`
 result2=`find . -name "*.txt"`
 
 echo "Results:"
 echo "$result1"
 echo "$result2"
+cd /
+rm -rf "$d"

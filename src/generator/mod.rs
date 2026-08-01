@@ -320,53 +320,55 @@ impl Generator {
 
         // Add Perl shebang and pragmas
         output.push_str("#!/usr/bin/env perl\n");
-        output.push_str("use strict;\n");
-        output.push_str("use warnings;\n");
-        // Only emit imports that are actually needed by the generated code.
-        // Carp, English, locale are part of the original boilerplate but
-        // many scripts don't use them — skip when not needed.
-        // Carp and English are used by almost every generated script
-        // (redirects, error handling, command generators) so always import
-        // them rather than trying to detect which commands emit croak() or
-        // reference $OS_ERROR / $ERRNO.
-        output.push_str("use Carp;\n");
-        output.push_str("use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);\n");
+        // Unified import registry (M6): every `use` statement needed by the
+        // generated code is collected here and emitted in one pass below, in
+        // a fixed order, so the needs_*() AST-scans above are the only place
+        // that decides imports. Output is identical to the previous inline
+        // emissions (including the Digest::SHA column-alignment spacing).
+        let mut use_lines: Vec<String> = vec![
+            "use strict;".to_string(),
+            "use warnings;".to_string(),
+            // Carp/English are used by almost every generated script
+            // (redirects, error handling, command generators), so they are
+            // always imported rather than detected.
+            "use Carp;".to_string(),
+            "use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);".to_string(),
+        ];
         let needs_locale = self.needs_locale_import(ast);
         if needs_locale {
-            output.push_str("use locale;\n");
+            use_lines.push("use locale;".to_string());
         }
-
         if needs_basename {
-            output.push_str("use File::Basename;\n");
+            use_lines.push("use File::Basename;".to_string());
         }
-        // IPC::Open3 is used by command-substitution fallbacks and a few command generators.
-        // Many code paths in the generator use open3 for command substitutions that cannot
-        // be translated to native Perl.  Include it unconditionally (it's harmless when unused).
-        output.push_str("use IPC::Open3;\n");
-        if needs_file_find {
-            // No additional imports needed for glob-based approach
-        }
+        // IPC::Open3 backs command-substitution fallbacks; harmless when unused.
+        use_lines.push("use IPC::Open3;".to_string());
+        // needs_file_find needs no import (glob-based approach).
         if needs_digest_sha {
-            output.push_str("use Digest::SHA   qw(sha256_hex sha512_hex);\n");
+            use_lines.push("use Digest::SHA   qw(sha256_hex sha512_hex);".to_string());
         }
         if needs_file_path {
-            // Align with other use statements - 2 spaces when Digest::SHA is present, 1 space otherwise
+            // Align with other use statements — 2 spaces when Digest::SHA is
+            // present, 1 space otherwise.
             if needs_digest_sha {
-                output.push_str("use File::Path    qw(make_path remove_tree);\n");
+                use_lines.push("use File::Path    qw(make_path remove_tree);".to_string());
             } else {
-                output.push_str("use File::Path qw(make_path remove_tree);\n");
+                use_lines.push("use File::Path qw(make_path remove_tree);".to_string());
             }
         }
         if needs_file_copy {
-            // Use 2 spaces when Digest::SHA is present for column alignment, 1 space otherwise
             if needs_digest_sha {
-                output.push_str("use File::Copy  qw(copy move);\n");
+                use_lines.push("use File::Copy  qw(copy move);".to_string());
             } else {
-                output.push_str("use File::Copy qw(copy move);\n");
+                use_lines.push("use File::Copy qw(copy move);".to_string());
             }
         }
         if needs_posix {
-            output.push_str("use POSIX qw(time);\n");
+            use_lines.push("use POSIX qw(time);".to_string());
+        }
+        for line in &use_lines {
+            output.push_str(line);
+            output.push('\n');
         }
         if needs_date_snapshot {
             output.push_str("my $DATE_SNAPSHOT = time;\n");
@@ -398,7 +400,7 @@ impl Generator {
         let needs_exit_code = self.needs_exit_code_tracking(ast);
         if needs_exit_code || true {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "main_exit_code".to_string(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: "main_exit_code".to_string(), sigil: Some(Sigil::Scalar) }],
                 init: Some(IrExpr::Int(0)),
                 local: false,
             };
@@ -407,7 +409,7 @@ impl Generator {
         // $ls_success is only needed for ls command output parsing
         if self.needs_ls_success(ast) {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "ls_success".to_string(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: "ls_success".to_string(), sigil: Some(Sigil::Scalar) }],
                 init: Some(IrExpr::Int(0)),
                 local: false,
             };
@@ -416,7 +418,7 @@ impl Generator {
         // $__set_e is only needed when `set -e` (errexit) is active
         if self.set_e_active {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "__set_e".to_string(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: "__set_e".to_string(), sigil: Some(Sigil::Scalar) }],
                 init: Some(IrExpr::Int(0)),
                 local: false,
             };
@@ -425,7 +427,7 @@ impl Generator {
         // $output is only needed when there are top-level output statements
         if needs_exit_code || self.needs_output_var(ast) {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "output".to_string(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: "output".to_string(), sigil: Some(Sigil::Scalar) }],
                 init: Some(IrExpr::Str("".to_string(), crate::ir::StrStyle::SingleQuoted)),
                 local: false,
             };
@@ -464,7 +466,7 @@ impl Generator {
         // Use IR Declare nodes so the backend can optimize dead declarations.
         for var in &self.function_level_vars {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: var.clone(), sigil: Sigil::Scalar }],
+                vars: vec![Decl { name: var.clone(), sigil: Some(Sigil::Scalar) }],
                 init: None,
                 local: false,
             };
@@ -473,14 +475,14 @@ impl Generator {
             // as an array or hash in some context.
             if self.associative_arrays.contains(var) {
                 let stmt = IrStmt::Declare {
-                    vars: vec![Decl { name: var.clone(), sigil: Sigil::Hash }],
+                    vars: vec![Decl { name: var.clone(), sigil: Some(Sigil::Hash) }],
                     init: None,
                     local: false,
                 };
                 output.push_str(&stmt_to_perl(&stmt, 0));
             } else if self.indexed_arrays.contains(var) {
                 let stmt = IrStmt::Declare {
-                    vars: vec![Decl { name: var.clone(), sigil: Sigil::Array }],
+                    vars: vec![Decl { name: var.clone(), sigil: Some(Sigil::Array) }],
                     init: None,
                     local: false,
                 };
@@ -495,7 +497,7 @@ impl Generator {
         if !self.no_magic_numbers && !self.constants.is_empty() {
             for (name, value) in &self.constants {
                 let stmt = IrStmt::Declare {
-                    vars: vec![Decl { name: name.clone(), sigil: Sigil::Scalar }],
+                    vars: vec![Decl { name: name.clone(), sigil: Some(Sigil::Scalar) }],
                     init: Some(IrExpr::Int(*value)),
                     local: false,
                 };
@@ -520,7 +522,7 @@ impl Generator {
 
         // Add final exit statement — only if $main_exit_code is tracked.
         if needs_exit_code {
-            let stmt = IrStmt::Exit(Some(IrExpr::Var("main_exit_code".to_string(), Sigil::Scalar)));
+            let stmt = IrStmt::Exit(Some(IrExpr::Var("main_exit_code".to_string(), Some(Sigil::Scalar))));
             output.push('\n');
             output.push_str(&stmt_to_perl(&stmt, 0));
         }
@@ -931,11 +933,25 @@ impl Generator {
                         && !self.function_level_vars.contains(&assignment.variable);
 
                     if is_env_style_var {
-                        // Use $ENV{var} = value (env-var style, no my declaration)
+                        // Bash semantics: a plain assignment creates a shell
+                        // variable; it does NOT export it to the environment.
+                        // Only variables that were already exported (inherited
+                        // from the environment, e.g. PATH/HOME) are kept in
+                        // sync automatically.  An explicit `export VAR` later
+                        // copies the local value into %ENV.
+                        self.declared_locals.insert(assignment.variable.clone());
                         if value_perl.starts_with('{') && value_perl.ends_with('}') {
-                            output.push_str(&format!("$ENV{{{}}} = do {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!("my ${} = do {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!(
+                                "$ENV{{{}}} = ${} if exists $ENV{{{}}};\n",
+                                assignment.variable, assignment.variable, assignment.variable
+                            ));
                         } else {
-                            output.push_str(&format!("$ENV{{{}}} = {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!("my ${} = {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!(
+                                "$ENV{{{}}} = ${} if exists $ENV{{{}}};\n",
+                                assignment.variable, assignment.variable, assignment.variable
+                            ));
                         }
                     } else if needs_decl_for_assign {
                         // Variable was not yet declared — combine declaration + assignment
@@ -1282,7 +1298,7 @@ impl Generator {
         }
     }
 
-    fn collect_assigned_vars_in_command(&self, cmd: &Command, vars: &mut Vec<String>) {
+    pub(crate) fn collect_assigned_vars_in_command(&self, cmd: &Command, vars: &mut Vec<String>) {
         match cmd {
             Command::Assignment(assign) => {
                 vars.push(assign.variable.clone());
@@ -2607,6 +2623,11 @@ impl Generator {
             Command::While(loop_) => {
                 self.command_uses_ls(&loop_.condition)
                     || loop_.body.commands.iter().any(|c| self.command_uses_ls(c))
+            }
+            Command::Case(case_stmt) => {
+                case_stmt.cases.iter().any(|clause| {
+                    clause.body.iter().any(|c| self.command_uses_ls(c))
+                })
             }
             Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_ls(c)),
             Command::Subshell(c) | Command::Background(c) => self.command_uses_ls(c),

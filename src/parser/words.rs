@@ -74,6 +74,83 @@ fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
     }
 }
 
+/// Convert a parsed `$`-expansion word into interpolation parts. Every shape
+/// parse_variable_expansion can return maps to a StringPart — a missed shape
+/// would silently DISCARD the consumed expansion (a value-losing bug), so the
+/// match must be exhaustive over Word.
+fn expansion_into_parts(expansion: Word) -> Option<Vec<StringPart>> {
+    match expansion {
+        Word::Variable(name, _, _) => Some(vec![StringPart::Variable(name)]),
+        Word::Arithmetic(a, _) => Some(vec![StringPart::Arithmetic(a)]),
+        Word::ParameterExpansion(pe, _) => Some(vec![StringPart::ParameterExpansion(pe)]),
+        Word::MapAccess(name, key, _) => Some(vec![StringPart::MapAccess(name, key)]),
+        Word::MapKeys(name, _) => Some(vec![StringPart::MapKeys(name)]),
+        Word::MapLength(name, _) => Some(vec![StringPart::MapLength(name)]),
+        Word::ArraySlice(name, offset, len, _) => Some(vec![StringPart::ArraySlice(name, offset, len)]),
+        Word::Arithmetic(a, _) => Some(vec![StringPart::Arithmetic(a)]),
+        Word::CommandSubstitution(c, _) => Some(vec![StringPart::CommandSubstitution(c)]),
+        Word::StringInterpolation(interp, _) => Some(interp.parts),
+        _ => None,
+    }
+}
+
+/// Merge a parsed `$`-expansion word into the current word as interpolation
+/// parts: `x` + `$var` -> StringInterpolation[Literal("x"), Variable("var")].
+/// Returns false when the shapes can't be merged (caller breaks the loop).
+fn merge_expansion_into_word(word: &mut Word, expansion: Word) -> bool {
+    let Some(parts) = expansion_into_parts(expansion) else {
+        return false;
+    };
+    match word {
+        Word::Literal(s, _) => {
+            let lit = std::mem::take(s);
+            let mut new_parts = vec![StringPart::Literal(lit)];
+            new_parts.extend(parts);
+            *word = Word::StringInterpolation(StringInterpolation { parts: new_parts }, None);
+            true
+        }
+        Word::Variable(name, _, _) => {
+            let mut new_parts = vec![StringPart::Variable(name.clone())];
+            new_parts.extend(parts);
+            *word = Word::StringInterpolation(StringInterpolation { parts: new_parts }, None);
+            true
+        }
+        Word::StringInterpolation(interp, _) => {
+            // Coalesce adjacent Literal parts (e.g. SI[Lit("x")] + SI[Lit("y"), Var]).
+            if let Some(StringPart::Literal(last)) = interp.parts.last_mut() {
+                if let Some(StringPart::Literal(first)) = parts.first() {
+                    last.push_str(first);
+                    interp.parts.extend(parts.into_iter().skip(1));
+                    return true;
+                }
+            }
+            interp.parts.extend(parts);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Append a raw token's text to the word (used for glued literal fragments
+/// that follow a single-token word like `$$/x` or `'a'-suffix`).
+fn append_raw_token_text(lexer: &mut Lexer, word: &mut Word) -> Result<bool, ParserError> {
+    if let Some(text) = lexer.get_current_text() {
+        let ok = append_plain_text(word, &text);
+        lexer.next();
+        // Token::Escape: also consume+append the escaped character
+        // (mirrors the combine loop's `\x` handling).
+        if text == "\\" {
+            if let Some(escaped_text) = lexer.get_current_text() {
+                let ok2 = append_plain_text(word, &escaped_text);
+                lexer.next();
+                return Ok(ok && ok2);
+            }
+        }
+        return Ok(ok);
+    }
+    Ok(false)
+}
+
 fn merge_contiguous_quoted_fragments(
     lexer: &mut Lexer,
     word: &mut Word,
@@ -140,6 +217,92 @@ fn merge_contiguous_quoted_fragments(
                 Word::Literal(text, _) => text,
                 _ => break,
             },
+            // `$`-expansions glued to the word (no whitespace): `x$$`, `x$var`,
+            // `x${y}`, `x$?`, ... — merge as interpolation parts.
+            Some(Token::Dollar) => {
+                let is_var_ref = lexer
+                    .peek_n(1)
+                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                    .unwrap_or(false);
+                if !is_var_ref {
+                    // literal `$` (e.g. `'a'$/x`) — append the raw char
+                    if !append_raw_token_text(lexer, word)? {
+                        break;
+                    }
+                    continue;
+                }
+                let expansion = parse_variable_expansion(lexer)?;
+                if !merge_expansion_into_word(word, expansion) {
+                    break;
+                }
+                continue;
+            }
+            Some(Token::DollarBrace)
+            | Some(Token::DollarParen)
+            | Some(Token::DollarHashSimple)
+            | Some(Token::DollarAtSimple)
+            | Some(Token::DollarStarSimple)
+            | Some(Token::DollarQuestion)
+            | Some(Token::DollarDollar)
+            | Some(Token::DollarBang)
+            | Some(Token::DollarMinus)
+            | Some(Token::DollarBraceHash)
+            | Some(Token::DollarBraceBang)
+            | Some(Token::DollarBraceStar)
+            | Some(Token::DollarBraceAt)
+            | Some(Token::DollarBraceHashStar)
+            | Some(Token::DollarBraceHashAt)
+            | Some(Token::DollarBraceBangStar)
+            | Some(Token::DollarBraceBangAt) => {
+                let expansion = parse_variable_expansion(lexer)?;
+                if !merge_expansion_into_word(word, expansion) {
+                    break;
+                }
+                continue;
+            }
+            // `$(( ... ))` glued to the word (`x=$((1+2))` — one bash word):
+            // the lexer emits a distinct Arithmetic token the combine loop
+            // stops at, so merge the parsed arithmetic as a part here.
+            Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
+                if let Ok(arith) = parse_arithmetic_expression(lexer) {
+                    if !merge_expansion_into_word(word, arith) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            // Escape fragments (`\'`, `\"`, `\x`) glued after a word:
+            // keep the raw text — the renderers unescape it (like `echo a\'b`).
+            Some(Token::Escape)
+            | Some(Token::EscapedDoubleQuote)
+            | Some(Token::EscapedSingleQuote)
+            | Some(Token::EscapedBacktick) => {
+                if !append_raw_token_text(lexer, word)? {
+                    break;
+                }
+                continue;
+            }
+            // Literal continuation after a single-token word: `$$/x`, `$var/x`,
+            // `'a'-suffix`. Same token set the combine loop treats as
+            // word-continuation characters (dead in branch A — the loop already
+            // consumed them; live for branch B results).
+            Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float)
+            | Some(Token::PaddedNumber) | Some(Token::HexNumber)
+            | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range)
+            | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Colon)
+            | Some(Token::Star) | Some(Token::Percent) | Some(Token::Comma)
+            | Some(Token::Question) | Some(Token::BraceClose)
+            | Some(Token::TestBracket) | Some(Token::TestBracketClose)
+            | Some(Token::Equality) | Some(Token::Caret)
+            | Some(Token::PlusAssign) | Some(Token::MinusAssign)
+            | Some(Token::StarAssign) | Some(Token::SlashAssign)
+            | Some(Token::PercentAssign) | Some(Token::Assign) => {
+                if !append_raw_token_text(lexer, word)? {
+                    break;
+                }
+                continue;
+            }
             _ => break,
         };
 
@@ -229,6 +392,63 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
             | Some(Token::Colon)
             | Some(Token::Star)
+            | Some(Token::Colon)
+// Test-operator tokens are intentionally included so combined
+
+            | Some(Token::Colon)
+// short flags (`rm -rf`, `echo -rf`) re-join into ONE literal
+
+            | Some(Token::Colon)
+// instead of lexing as `-r` + `f`. The lexer emits them as
+
+            | Some(Token::Colon)
+// distinct tokens for the test-expression parsers (`[ -f x ]`),
+
+            | Some(Token::Colon)
+// which consume them directly; here in argument position the
+
+            | Some(Token::Colon)
+// whitespace in the source is the discriminator — `-rf` combines,
+
+            | Some(Token::Colon)
+// `-r f` stays two args, exactly like bash. (History: before this,
+
+            | Some(Token::Colon)
+// `rm -rf x` and `rm -r f x` parsed identically and rm.rs had a
+
+            | Some(Token::Colon)
+// workaround that conflated them, eating a real file named `f`.)
+
+            | Some(Token::Colon)
+| Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le)
+
+            | Some(Token::Colon)
+| Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) | Some(Token::NonZero)
+
+            | Some(Token::Colon)
+| Some(Token::File) | Some(Token::Directory) | Some(Token::Exists)
+
+            | Some(Token::Colon)
+| Some(Token::Readable) | Some(Token::Writable) | Some(Token::Executable)
+
+            | Some(Token::Colon)
+| Some(Token::Size) | Some(Token::Symlink) | Some(Token::SymlinkH)
+
+            | Some(Token::Colon)
+| Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block)
+
+            | Some(Token::Colon)
+| Some(Token::Character) | Some(Token::SetGid) | Some(Token::Sticky)
+
+            | Some(Token::Colon)
+| Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned)
+
+            | Some(Token::Colon)
+| Some(Token::Modified) | Some(Token::NewerThan) | Some(Token::OlderThan)
+
+            | Some(Token::Colon)
+| Some(Token::SameFile)
+
             | Some(Token::Percent)
             | Some(Token::Comma)
             | Some(Token::Question)
@@ -267,6 +487,63 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
                 | Some(Token::Colon)
                 | Some(Token::Star)
+                | Some(Token::Colon)
+// Test-operator tokens are intentionally included so combined
+
+                | Some(Token::Colon)
+// short flags (`rm -rf`, `echo -rf`) re-join into ONE literal
+
+                | Some(Token::Colon)
+// instead of lexing as `-r` + `f`. The lexer emits them as
+
+                | Some(Token::Colon)
+// distinct tokens for the test-expression parsers (`[ -f x ]`),
+
+                | Some(Token::Colon)
+// which consume them directly; here in argument position the
+
+                | Some(Token::Colon)
+// whitespace in the source is the discriminator — `-rf` combines,
+
+                | Some(Token::Colon)
+// `-r f` stays two args, exactly like bash. (History: before this,
+
+                | Some(Token::Colon)
+// `rm -rf x` and `rm -r f x` parsed identically and rm.rs had a
+
+                | Some(Token::Colon)
+// workaround that conflated them, eating a real file named `f`.)
+
+                | Some(Token::Colon)
+| Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le)
+
+                | Some(Token::Colon)
+| Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) | Some(Token::NonZero)
+
+                | Some(Token::Colon)
+| Some(Token::File) | Some(Token::Directory) | Some(Token::Exists)
+
+                | Some(Token::Colon)
+| Some(Token::Readable) | Some(Token::Writable) | Some(Token::Executable)
+
+                | Some(Token::Colon)
+| Some(Token::Size) | Some(Token::Symlink) | Some(Token::SymlinkH)
+
+                | Some(Token::Colon)
+| Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block)
+
+                | Some(Token::Colon)
+| Some(Token::Character) | Some(Token::SetGid) | Some(Token::Sticky)
+
+                | Some(Token::Colon)
+| Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned)
+
+                | Some(Token::Colon)
+| Some(Token::Modified) | Some(Token::NewerThan) | Some(Token::OlderThan)
+
+                | Some(Token::Colon)
+| Some(Token::SameFile)
+
                 | Some(Token::Percent)
                 | Some(Token::Comma)
                 | Some(Token::Question)
@@ -414,7 +691,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             } else {
                 quoted_text
             };
-            Ok(Word::Literal(content, None))
+            Ok(Word::Literal(content, Some(())))
         }
         Some(Token::SingleQuote) => {
             // Handle a bare single-quote token that wasn't paired into
@@ -452,7 +729,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 lexer.current = lexer.tokens.len();
                 lexer.input[start + 1..].to_string()
             };
-            Ok(Word::Literal(content, None))
+            Ok(Word::Literal(content, Some(())))
         }
         Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
@@ -886,6 +1163,63 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
             | Some(Token::Colon)
             | Some(Token::Star)
+            | Some(Token::Colon)
+// Test-operator tokens are intentionally included so combined
+
+            | Some(Token::Colon)
+// short flags (`rm -rf`, `echo -rf`) re-join into ONE literal
+
+            | Some(Token::Colon)
+// instead of lexing as `-r` + `f`. The lexer emits them as
+
+            | Some(Token::Colon)
+// distinct tokens for the test-expression parsers (`[ -f x ]`),
+
+            | Some(Token::Colon)
+// which consume them directly; here in argument position the
+
+            | Some(Token::Colon)
+// whitespace in the source is the discriminator — `-rf` combines,
+
+            | Some(Token::Colon)
+// `-r f` stays two args, exactly like bash. (History: before this,
+
+            | Some(Token::Colon)
+// `rm -rf x` and `rm -r f x` parsed identically and rm.rs had a
+
+            | Some(Token::Colon)
+// workaround that conflated them, eating a real file named `f`.)
+
+            | Some(Token::Colon)
+| Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le)
+
+            | Some(Token::Colon)
+| Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) | Some(Token::NonZero)
+
+            | Some(Token::Colon)
+| Some(Token::File) | Some(Token::Directory) | Some(Token::Exists)
+
+            | Some(Token::Colon)
+| Some(Token::Readable) | Some(Token::Writable) | Some(Token::Executable)
+
+            | Some(Token::Colon)
+| Some(Token::Size) | Some(Token::Symlink) | Some(Token::SymlinkH)
+
+            | Some(Token::Colon)
+| Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block)
+
+            | Some(Token::Colon)
+| Some(Token::Character) | Some(Token::SetGid) | Some(Token::Sticky)
+
+            | Some(Token::Colon)
+| Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned)
+
+            | Some(Token::Colon)
+| Some(Token::Modified) | Some(Token::NewerThan) | Some(Token::OlderThan)
+
+            | Some(Token::Colon)
+| Some(Token::SameFile)
+
             | Some(Token::Percent)
             | Some(Token::Comma)
             | Some(Token::Question)
@@ -924,6 +1258,63 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick)
                 | Some(Token::Colon)
                 | Some(Token::Star)
+                | Some(Token::Colon)
+// Test-operator tokens are intentionally included so combined
+
+                | Some(Token::Colon)
+// short flags (`rm -rf`, `echo -rf`) re-join into ONE literal
+
+                | Some(Token::Colon)
+// instead of lexing as `-r` + `f`. The lexer emits them as
+
+                | Some(Token::Colon)
+// distinct tokens for the test-expression parsers (`[ -f x ]`),
+
+                | Some(Token::Colon)
+// which consume them directly; here in argument position the
+
+                | Some(Token::Colon)
+// whitespace in the source is the discriminator — `-rf` combines,
+
+                | Some(Token::Colon)
+// `-r f` stays two args, exactly like bash. (History: before this,
+
+                | Some(Token::Colon)
+// `rm -rf x` and `rm -r f x` parsed identically and rm.rs had a
+
+                | Some(Token::Colon)
+// workaround that conflated them, eating a real file named `f`.)
+
+                | Some(Token::Colon)
+| Some(Token::Eq) | Some(Token::Ne) | Some(Token::Lt) | Some(Token::Le)
+
+                | Some(Token::Colon)
+| Some(Token::Gt) | Some(Token::Ge) | Some(Token::Zero) | Some(Token::NonZero)
+
+                | Some(Token::Colon)
+| Some(Token::File) | Some(Token::Directory) | Some(Token::Exists)
+
+                | Some(Token::Colon)
+| Some(Token::Readable) | Some(Token::Writable) | Some(Token::Executable)
+
+                | Some(Token::Colon)
+| Some(Token::Size) | Some(Token::Symlink) | Some(Token::SymlinkH)
+
+                | Some(Token::Colon)
+| Some(Token::PipeFile) | Some(Token::Socket) | Some(Token::Block)
+
+                | Some(Token::Colon)
+| Some(Token::Character) | Some(Token::SetGid) | Some(Token::Sticky)
+
+                | Some(Token::Colon)
+| Some(Token::SetUid) | Some(Token::Owned) | Some(Token::GroupOwned)
+
+                | Some(Token::Colon)
+| Some(Token::Modified) | Some(Token::NewerThan) | Some(Token::OlderThan)
+
+                | Some(Token::Colon)
+| Some(Token::SameFile)
+
                 | Some(Token::Percent)
                 | Some(Token::Comma)
                 | Some(Token::Question)
@@ -1077,7 +1468,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             } else {
                 quoted_text
             };
-            Ok(Word::Literal(content, None))
+            Ok(Word::Literal(content, Some(())))
         }
         Some(Token::SingleQuote) => {
             // Handle a bare single-quote token that wasn't paired into
@@ -1115,7 +1506,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 lexer.current = lexer.tokens.len();
                 lexer.input[start + 1..].to_string()
             };
-            Ok(Word::Literal(content, None))
+            Ok(Word::Literal(content, Some(())))
         }
         Some(Token::BacktickString) => parse_backtick_command_substitution(lexer),
         Some(Token::DollarSingleQuotedString) => Ok(parse_ansic_quoted_string(lexer)?),
@@ -2550,11 +2941,11 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                             None,
                         ))
                     } else {
-                        // If multiple commands, wrap in a pipeline or use the first one
-                        Ok(Word::CommandSubstitution(
-                            Box::new(commands[0].clone()),
-                            None,
-                        ))
+                        // Multiple commands: wrap in a Block so the whole
+                        // body runs (a `$(cmd1\ncmd2)` substitution captures
+                        // both — parse-dollar-paren-pipe.sh).
+                        let block = crate::ast::Block { commands };
+                        Ok(Word::CommandSubstitution(Box::new(crate::ast::Command::Block(block)), None))
                     }
                 }
                 Err(_) => {
@@ -2763,6 +3154,31 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 current_literal.clear();
             }
 
+            if i + 2 < content.len() && content[i..].starts_with("$((") {
+                // `$(( ... ))` arithmetic expansion — find the matching
+                // `))` (paren-balanced) and emit an Arithmetic part; before
+                // the `$(` branch, or `(1+2)` would parse as a subshell
+                // command (`echo "x=$((1+2))"` → running `1+2` as a command).
+                let mut j = i + 3;
+                let mut depth = 2usize;
+                while j < content.len() && depth > 0 {
+                    if content.as_bytes()[j] == b'(' {
+                        depth += 1;
+                    } else if content.as_bytes()[j] == b')' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    parts.push(StringPart::Arithmetic(ArithmeticExpression {
+                        expression: content[i + 3..j - 2].trim().to_string(),
+                        tokens: vec![],
+                    }));
+                    i = j;
+                    continue;
+                }
+                // unbalanced — fall through to the literal `$` handling
+            }
             if i + 1 < content.len() && content[i + 1..].starts_with('(') {
                 // Command substitution $(...)
                 i += 2; // skip $ and (
@@ -2804,11 +3220,38 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
                 if paren_count == 0 {
                     let cmd_content = &content[cmd_start..i - 1];
-                    if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content)
-                    {
-                        parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
-                    } else {
-                        parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                    // Multi-command `$(cmd1\ncmd2)` bodies: the pipeline
+                    // parser silently drops everything after the first
+                    // pipeline (parse-dollar-paren-pipe.sh). Try the full
+                    // parser FIRST only when the pipeline parse did not
+                    // consume the whole text — a `$(( expr ))` mis-read
+                    // (`$( ( expr ) )`) must keep the pipeline-parsed padded
+                    // command shape the lowering recovers as arithmetic
+                    // (parse-paren-close.sh).
+                    match crate::parser::commands::parse_pipeline_from_text_with_rest(cmd_content) {
+                        Ok((cmd, true)) => {
+                            parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                        }
+                        Ok((_, false)) | Err(_) => {
+                            if let Ok(cmds) =
+                                crate::parser::commands::parse_commands_from_text(cmd_content)
+                            {
+                                if cmds.is_empty() {
+                                    parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                                } else if cmds.len() == 1 {
+                                    parts.push(StringPart::CommandSubstitution(Box::new(
+                                        cmds.into_iter().next().unwrap(),
+                                    )));
+                                } else {
+                                    let block = crate::ast::Block { commands: cmds };
+                                    parts.push(StringPart::CommandSubstitution(Box::new(
+                                        crate::ast::Command::Block(block),
+                                    )));
+                                }
+                            } else {
+                                parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                            }
+                        }
                     }
                 } else {
                     current_literal.push_str("$(");
@@ -2898,6 +3341,31 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 current_literal.clear();
             }
 
+            if i + 2 < content.len() && content[i..].starts_with("$((") {
+                // `$(( ... ))` arithmetic expansion — find the matching
+                // `))` (paren-balanced) and emit an Arithmetic part; before
+                // the `$(` branch, or `(1+2)` would parse as a subshell
+                // command (`echo "x=$((1+2))"` → running `1+2` as a command).
+                let mut j = i + 3;
+                let mut depth = 2usize;
+                while j < content.len() && depth > 0 {
+                    if content.as_bytes()[j] == b'(' {
+                        depth += 1;
+                    } else if content.as_bytes()[j] == b')' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    parts.push(StringPart::Arithmetic(ArithmeticExpression {
+                        expression: content[i + 3..j - 2].trim().to_string(),
+                        tokens: vec![],
+                    }));
+                    i = j;
+                    continue;
+                }
+                // unbalanced — fall through to the literal `$` handling
+            }
             if i + 1 < content.len() && content[i + 1..].starts_with('(') {
                 // Command substitution $(...)
                 i += 2; // skip $ and (

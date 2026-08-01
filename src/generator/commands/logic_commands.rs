@@ -57,6 +57,14 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         collect_assigned_vars(right, &mut right_vars);
         hoist_my_declarations(generator, &right_vars, &mut output);
     }
+    // Pre-declare variables assigned in the LEFT branch as well: bash has no
+    // block scoping, so `n=$(...) && test "$n" = ...` leaves $n visible after
+    // the statement even though the condition body is emitted inside a do {}.
+    {
+        let mut left_vars = std::collections::HashSet::new();
+        collect_assigned_vars(left, &mut left_vars);
+        hoist_my_declarations(generator, &left_vars, &mut output);
+    }
 
     // For other commands, use the original pattern with exit code checking
     output.push_str("if (");
@@ -313,7 +321,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                         &IrStmt::Assign {
                             targets: vec![AssignTarget {
                                 var: "main_exit_code".to_string(),
-                                sigil: Sigil::Scalar,
+                                sigil: Some(Sigil::Scalar),
                                 indices: vec![],
                             }],
                             expr: IrExpr::Int(0),
@@ -348,7 +356,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                             &IrStmt::Assign {
                                 targets: vec![AssignTarget {
                                     var: "main_exit_code".to_string(),
-                                    sigil: Sigil::Scalar,
+                                    sigil: Some(Sigil::Scalar),
                                     indices: vec![],
                                 }],
                                 expr: IrExpr::Int(0),

@@ -748,19 +748,19 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // For backtick commands, we need to return the value, not print it
                             perl_code
                         } else if name == "head" {
-                            // Use IrExpr::Backtick for a clean qx{} expression.
+                            // Use IrExpr::Capture for a clean qx{} expression.
                             // This avoids the `do { my @_qx_cmd = (...); ... }` boilerplate
                             // (Pattern A fix).
                             let head_cmd = generator.generate_command_string_for_system(cmd);
-                            let backtick = crate::ir::IrExpr::Backtick {
+                            let backtick = crate::ir::IrExpr::Capture {
                                 expr: Box::new(crate::ir::IrExpr::RawExpr(head_cmd)),
                                 native: false,
                             };
                             crate::ir::expr_to_perl(&backtick)
                         } else if name == "tail" {
-                            // Use IrExpr::Backtick for a clean qx{} expression.
+                            // Use IrExpr::Capture for a clean qx{} expression.
                             let tail_cmd = generator.generate_command_string_for_system(cmd);
-                            let backtick = crate::ir::IrExpr::Backtick {
+                            let backtick = crate::ir::IrExpr::Capture {
                                 expr: Box::new(crate::ir::IrExpr::RawExpr(tail_cmd)),
                                 native: false,
                             };
@@ -2268,7 +2268,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             cond: crate::ir::IrExpr::BinOp {
                                 lhs: Box::new(crate::ir::IrExpr::Var(
                                     "CHILD_ERROR".to_string(),
-                                    crate::ir::Sigil::Scalar,
+                                    Some(crate::ir::Sigil::Scalar),
                                 )),
                                 op: crate::ir::BinOpKind::Eq,
                                 rhs: Box::new(crate::ir::IrExpr::Int(0)),
@@ -2420,7 +2420,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 format!("${}", var)
                             }
                         } else {
-                            format!("${}", var)           // Regular variable
+                            // Regular variable — use the centralized helper so
+                            // undeclared vars map to $ENV{var} (avoiding `use strict`
+                            // compile errors) and declared vars keep their $var form.
+                            crate::generator::expansions::parameter_var_scalar_ref(generator, var)
                         }
                     }
                 }

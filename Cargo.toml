@@ -1,17 +1,17 @@
+[workspace]
+members = [".", "cli"]
+default-members = [".", "cli"]
+
 [package]
 name = "debashl"
 version = "0.1.0"
 edition = "2021"
-default-run = "debashc"
 
-[[bin]]
-name = "debashc"
-path = "src/main.rs"
-
-
-
-
-
+[features]
+default = []
+# Library (reactor) build for wasm32-wasip1: adds the plain C-ABI exports
+# (src/wasi_api.rs). Use:  cargo build --target wasm32-wasip1 --features wasi-lib --lib -p debashl
+wasi-lib = []
 
 [[bin]]
 name = "convert_examples"

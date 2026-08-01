@@ -227,22 +227,35 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
             output.push_str("}\n");
             return output;
         } else {
-            // -e path: build a shell-safe command string
-            let escaped_code = clean_code.replace("'", "'\\''");
-            let cmd_str = format!("perl -e '{}'", escaped_code);
-
+            // -e path: run perl directly with the code and any remaining
+            // arguments as separate argv elements (no shell re-quoting).
+            // The IrStmt::Exec emitter quotes each literal arg for bash.
             let output_var = format!("perl_output_{}", generator.get_unique_id());
-            let sys_stmt = IrStmt::System {
-                cmd: IrExpr::Str("bash".to_string(), StrStyle::SingleQuoted),
-                args: vec![
-                    IrExpr::Str("-c".to_string(), StrStyle::SingleQuoted),
-                    IrExpr::Str(cmd_str, StrStyle::SingleQuoted),
-                ],
+            let mut sys_args = vec![
+                IrExpr::Str("-e".to_string(), StrStyle::SingleQuoted),
+                IrExpr::Str(clean_code.clone(), StrStyle::SingleQuoted),
+            ];
+            // Append remaining args (after the -e/-ne code argument) so
+            // `perl -e 'code' "first" "second"` passes them to @ARGV.
+            if let Some(code_idx) = code_arg_index {
+                for arg in cmd.args.iter().skip(code_idx + 2) {
+                    let bash_str = word_to_bash_string_for_system(generator, arg);
+                    sys_args.push(IrExpr::RawExpr(bash_str));
+                }
+            }
+            let sys_stmt = IrStmt::Exec {
+                cmd: IrExpr::Str("perl".to_string(), StrStyle::SingleQuoted),
+                args: sys_args,
                 capture: Some(output_var.clone()),
+                redirects: vec![],
+                env: vec![],
             };
             output.push_str(&stmt_to_perl(&sys_stmt, 0));
             output.push_str(&format!("chomp ${};\n", output_var));
-            output.push_str(&format!("print ${};\n", output_var));
+            // Restore the newline that chomp removed: bash prints the perl
+            // output with its trailing newline, so the following print must
+            // add one back or blank lines between commands are lost.
+            output.push_str(&format!("print ${}, \"\\n\";\n", output_var));
             return output;
         }
     }
@@ -270,7 +283,9 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         "my ${} = qx{{perl {}}};\nchomp ${};\n",
         output_var, formatted_args, output_var
     ));
-    output.push_str(&format!("print ${};\n", output_var));
+    // Restore the newline that chomp removed (bash keeps the perl
+    // output's trailing newline).
+    output.push_str(&format!("print ${}, \"\\n\";\n", output_var));
 
     output
 }
@@ -404,7 +419,9 @@ pub fn generate_perl_pipeline_command(
             "my ${} = qx{{perl {}}};\nchomp ${};\n",
             output_var, formatted_args, output_var
         ));
-        output.push_str(&format!("print ${};\n", output_var));
+        // Restore the newline that chomp removed (bash keeps the perl
+        // output's trailing newline).
+        output.push_str(&format!("print ${}, \"\\n\";\n", output_var));
     }
 
     output

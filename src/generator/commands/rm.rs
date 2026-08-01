@@ -12,28 +12,28 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
     let mut files = Vec::new();
     let mut use_shell_fallback = false;
 
-    // Parse rm options
+    // Parse rm options. Args arrive canonicalized (parser/normalize.rs splits
+    // combined short flags, so `-rf` is `-r -f` here); only single-char flags
+    // need handling.
     for arg in &cmd.args {
         if let Word::Literal(arg_str, _) = arg {
             match arg_str.as_str() {
                 "-r" | "-R" | "--recursive" => recursive = true,
                 "-f" | "--force" => force = true,
                 "-v" | "--verbose" => verbose = true,
-                "-rf" | "-fr" => {
-                    recursive = true;
-                    force = true;
-                }
                 _ if arg_str.starts_with('-') => {
                     use_shell_fallback = true;
                 }
-                "f" => {
-                    // Handle case where -rf is parsed as -r and f separately
-                    if recursive {
-                        force = true;
-                    } else if !arg_str.starts_with('-') {
-                        files.push(format!("\"{}\"", arg_str));
-                    }
-                }
+                // NOTE: there is deliberately NO special case for a bare `f`
+                // argument here. Historically the lexer split `-rf` into the
+                // `-r` token + a bare `f` identifier, and this generator had a
+                // workaround that reassembled them (treating `f` after `-r` as
+                // the force flag). That conflated `rm -rf x` with `rm -r f x` —
+                // a REAL file named `f` was silently dropped and the rest was
+                // force-flagged. The lexer now keeps `-rf` as one word and
+                // parser/normalize.rs canonicalizes it to `-r -f`, so a literal
+                // `f` argument here is simply a file to remove. Do NOT
+                // reintroduce an `f`-means-force rule.
                 _ => {
                     if !arg_str.starts_with('-') {
                         files.push(format!("\"{}\"", arg_str));

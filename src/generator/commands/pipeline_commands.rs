@@ -701,7 +701,7 @@ pub fn generate_pipeline_for_substitution(
                     }
                     _ => {
                         // Generic fallback for non-special-cased single commands:
-                        // Use IrExpr::Backtick to emit a clean qx{bash -c '...'}
+                        // Use IrExpr::Capture to emit a clean qx{bash -c '...'}
                         // expression instead of the full pipeline scaffold.
                         // This addresses Pattern A (pipeline boilerplate) and
                         // Pattern B (contradictory newline handling).
@@ -713,7 +713,7 @@ pub fn generate_pipeline_for_substitution(
                         // Use the command string directly inside qx{...} instead
                         // of wrapping in bash -c.  Perl's qx{} executes through
                         // /bin/sh by default.
-                        let backtick = IrExpr::Backtick {
+                        let backtick = IrExpr::Capture {
                             expr: Box::new(IrExpr::RawExpr(final_cmd_str)),
                             native: false,
                         };
@@ -821,10 +821,10 @@ pub fn generate_pipeline_for_substitution(
     // it through bash -c.  Perl's qx{} already runs through /bin/sh by
     // default, so the bash -c wrapper is unnecessary for simple pipelines.
     //
-    // Use IrExpr::Backtick to produce a clean `do { chomp(my $_r = qx{...}); $_r; }`
+    // Use IrExpr::Capture to produce a clean `do { chomp(my $_r = qx{...}); $_r; }`
     // expression. This replaces the raw format!() with an IR node that the
     // backend formats consistently, addressing Patterns A and G.
-    let backtick_expr = IrExpr::Backtick {
+    let backtick_expr = IrExpr::Capture {
         expr: Box::new(IrExpr::RawExpr(final_cmd)),
         native: false,
     };
@@ -1981,14 +1981,24 @@ fn generate_linebyline_command(
             // For echo, just output the line
             let mut output = String::new();
             if let Some(arg) = cmd.args.first() {
-                let value = generator.word_to_perl(arg);
-                // Check if the value is the same as the input variable to avoid redundant assignment
-                let line_var_with_dollar = format!("${}", line_var);
-                if value != line_var_with_dollar {
-                    // Echo command sets the input variable to the value
+                // Detect when the echoed value is the input line variable
+                // itself (echo $L or echo "$L") — no assignment needed.
+                // Compare at the AST level instead of string-comparing
+                // generated Perl, since word_to_perl may render undeclared
+                // variables as ($ENV{var} // q{}) rather than bare $var.
+                let is_self = match arg {
+                    Word::Variable(var, _, _) => var == line_var,
+                    Word::StringInterpolation(interp, _) => {
+                        interp.parts.len() == 1
+                            && matches!(&interp.parts[0], StringPart::Variable(var) if var == line_var)
+                    }
+                    _ => false,
+                };
+                if !is_self {
+                    let value = generator.word_to_perl(arg);
                     output.push_str(&format!("${} = {};\n", line_var, value));
                 }
-                // If value == input_var_with_dollar, skip the assignment as it's redundant
+                // If value == input_var, skip the assignment as it's redundant
             }
             output
         }
@@ -2334,7 +2344,7 @@ fn generate_buffered_pipeline(
                 // Use `print $var, "\n";` which is idiomatic Perl and avoids the
                 // verbose `if (... ne q{} && !defined ...) { print ...; if (!... =~ m{\n\z})` dance.
                 let print_stmt = IrStmt::Output {
-                    value: IrExpr::Var(output_var.clone(), Sigil::Scalar),
+                    value: IrExpr::Var(output_var.clone(), Some(Sigil::Scalar)),
                     newline: true,
                     target: None,
                 };
