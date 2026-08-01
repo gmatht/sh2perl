@@ -470,16 +470,25 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
 /// sh2-namespace.mjs: `exec` materializes the suffix to a temp file).
 const PS_MAGIC: &str = "\u{1}SH2PS\u{1}";
 
+/// Commands that read stdin when given no file arguments. For these the
+/// process-substitution rewrite adds ONLY the here-string (captured producer
+/// stdout on stdin); appending a materialized-path argument would duplicate
+/// the capture (`head <(while true; do echo .; sleep 1; done)` would run the
+/// producer twice — 2× the capture time bound — and time out the gate).
+fn stdin_only_command(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some("mapfile") | Some("readarray") | Some("head") | Some("tail") | Some("cat") | Some("wc")
+    )
+}
+
 fn transform_cmd(cmd: &Command) -> Command {
     match cmd {
         Command::Simple(sc) => {
             let mut sc = sc.clone();
             let ps = transform_redirects(&mut sc.redirects);
             if !ps.is_empty() {
-                let stdin_only = matches!(
-                    sc.name.as_literal(),
-                    Some("mapfile") | Some("readarray")
-                );
+                let stdin_only = stdin_only_command(sc.name.as_literal());
                 if !stdin_only {
                     // Re-add the dropped argument positions as materialized
                     // paths (the parser kept only the redirects).
@@ -494,7 +503,7 @@ fn transform_cmd(cmd: &Command) -> Command {
             let mut bc = bc.clone();
             let ps = transform_redirects(&mut bc.redirects);
             if !ps.is_empty() {
-                let stdin_only = bc.name == "mapfile" || bc.name == "readarray";
+                let stdin_only = stdin_only_command(Some(&bc.name));
                 if !stdin_only {
                     for inner in ps {
                         bc.args.push(ps_arg_word(inner));
@@ -641,10 +650,7 @@ fn transform_redirects(redirects: &mut Vec<Redirect>) -> Vec<Command> {
 fn append_ps_args(cmd: &mut Command, producers: Vec<Command>) {
     match cmd {
         Command::Simple(sc) => {
-            let stdin_only = matches!(
-                sc.name.as_literal(),
-                Some("mapfile") | Some("readarray")
-            );
+            let stdin_only = stdin_only_command(sc.name.as_literal());
             if !stdin_only {
                 for inner in producers {
                     sc.args.push(ps_arg_word(inner));
@@ -652,7 +658,7 @@ fn append_ps_args(cmd: &mut Command, producers: Vec<Command>) {
             }
         }
         Command::BuiltinCommand(bc) => {
-            if bc.name != "mapfile" && bc.name != "readarray" {
+            if !stdin_only_command(Some(&bc.name)) {
                 for inner in producers {
                     bc.args.push(ps_arg_word(inner));
                 }
