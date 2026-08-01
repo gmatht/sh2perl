@@ -22,6 +22,18 @@ static LIFTED_NUMERIC: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// Provably-string variables lifted to native JS string bindings
 /// (`let x = ""`; reads are bare `x`; writes `x = <string expr>`).
 static LIFTED_STRING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Whether `shopt -s nocasematch` may be enabled anywhere in the current
+/// program (set per compilation by `shir_to_estree`; see
+/// `ir_may_enable_nocasematch`). Native case/test substring lifts must
+/// lowercase to stay exact when it is.
+static CASE_NOCASE: Mutex<Option<bool>> = Mutex::new(None);
+/// Nesting depth of `sh2.and`/`sh2.or` arrow lowering (see the BinOp And/Or
+/// arms). The runtime helpers branch on `lastExit`, which a NATIVE test
+/// expression never sets — so inside `&&`/`||` arrows a test must stay a
+/// runtime `sh2.test` call (which records the status) and only the
+/// value-consuming positions (if/while/until conds, `!`, ternary) get the
+/// native lowering.
+static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
 /// Either lift — reads / test-injection / array-element injection consult
 /// both sets.
 fn is_lifted(name: &str) -> bool {
@@ -2558,6 +2570,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     );
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
+    *CASE_NOCASE.lock().unwrap() = Some(ir_may_enable_nocasematch(prog));
     let mut body: Vec<Stmt> = Vec::new();
     // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
     // reads an unset var as 0 in arithmetic and "" as a string.
@@ -2639,6 +2652,345 @@ fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
 pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error> {
     serde_json::to_string(&shir_to_estree(prog))
 }
+
+/// Classification of a case-pattern string for the native lowering.
+/// `globMatch` on any of these shapes is a plain JS string op:
+/// - `*` / `**` → matches every value (`CasePat::Any`);
+/// - `*lit*` → substring (`CasePat::Substr`);
+/// - `lit*` → prefix (`CasePat::Prefix`);
+/// - `*lit` → suffix (`CasePat::Suffix`);
+/// - `lit` (optionally quoted) → exact equality (`CasePat::Exact`).
+/// Conservative: rejects `$` (expansion), `(`, `)`, quotes, backslash,
+/// `!`, and any glob metacharacter inside the literal.
+#[derive(Debug, Clone, PartialEq)]
+enum CasePat {
+    Any,
+    Substr(String),
+    Prefix(String),
+    Suffix(String),
+    Exact(String),
+}
+
+fn classify_case_pat(pat: &str) -> Option<CasePat> {
+    // A quoted pattern (`"start"`, `''`) arrives with its quote chars; the
+    // runtime's expandWord strips them (making a quoted `*a*` an ACTIVE
+    // glob there too), so unwrap one pair of quotes before classifying.
+    let bare = pat
+        .strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .or_else(|| {
+            pat.strip_prefix('\'')
+                .and_then(|x| x.strip_suffix('\''))
+        })
+        .unwrap_or(pat);
+    let has_meta = |s: &str| {
+        s.chars().any(|c| {
+            matches!(
+                c,
+                '*' | '?' | '[' | ']' | '\\' | '$' | '(' | ')' | '\'' | '"' | '!'
+            )
+        })
+    };
+    // `*` / `**` / ... — consecutive stars collapse to one `*`.
+    if !bare.is_empty() && bare.chars().all(|c| c == '*') {
+        return Some(CasePat::Any);
+    }
+    // `*lit*`, `lit*`, `*lit` — exactly one star on either side.
+    if let Some(inner) = bare.strip_prefix('*') {
+        if let Some(inner) = inner.strip_suffix('*') {
+            if inner.is_empty() || has_meta(inner) {
+                return None;
+            }
+            return Some(CasePat::Substr(inner.to_string()));
+        }
+        if inner.is_empty() || has_meta(inner) {
+            return None;
+        }
+        return Some(CasePat::Suffix(inner.to_string()));
+    }
+    if let Some(inner) = bare.strip_suffix('*') {
+        if inner.is_empty() || has_meta(inner) {
+            return None;
+        }
+        return Some(CasePat::Prefix(inner.to_string()));
+    }
+    if has_meta(bare) {
+        return None;
+    }
+    Some(CasePat::Exact(bare.to_string()))
+}
+
+/// Lower a `case` whose EVERY pattern is one of the [`CasePat`] shapes to a
+/// native if/else-if chain: `String(disc).includes(lit)` for substring
+/// globs, `String(disc) === lit` for exact literals, `true` for `*` — no
+/// `sh2.caseMatch` dispatch, no glob engine, no per-pattern string parsing.
+/// bash `case` is first-match-wins, which is exactly an if/else-if chain;
+/// the discriminant is bound once to a temp const (the switch form
+/// evaluates it once too). Under a possible `shopt -s nocasematch` the
+/// runtime's caseMatch lowercases the VALUE side only (not the pattern) —
+/// mirrored exactly. Conservative: any unclassifiable pattern (or no
+/// clauses at all) keeps the runtime switch form.
+fn try_native_case(
+    discriminant: &IrExpr,
+    clauses: &[IrCaseClause],
+    nocase: bool,
+) -> Option<Stmt> {
+    if clauses.is_empty() {
+        return None;
+    }
+    let pats: Vec<Vec<CasePat>> = clauses
+        .iter()
+        .map(|c| {
+            c.patterns
+                .iter()
+                .map(|p| classify_case_pat(p))
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // `String($sh_case ?? '')` — the runtime's caseMatch coercion.
+    let value_expr = |id: &str| {
+        let base = Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "String".to_string(),
+            }),
+            arguments: vec![Expr::LogicalExpression {
+                operator: "??",
+                left: Box::new(Expr::Identifier {
+                    name: id.to_string(),
+                }),
+                right: Box::new(str_lit("")),
+            }],
+            optional: false,
+        };
+        if nocase {
+            Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(base),
+                    property: Box::new(Expr::Identifier {
+                        name: "toLowerCase".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![],
+                optional: false,
+            }
+        } else {
+            base
+        }
+    };
+    let pat_test = |pat: &CasePat| -> Expr {
+        let value = value_expr(CASE_TMP);
+        match pat {
+            CasePat::Any => Expr::Literal {
+                value: serde_json::Value::Bool(true),
+                raw: None,
+            },
+            CasePat::Substr(lit) => Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(value),
+                    property: Box::new(Expr::Identifier {
+                        name: "includes".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![str_lit(lit)],
+                optional: false,
+            },
+            CasePat::Prefix(lit) => Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(value),
+                    property: Box::new(Expr::Identifier {
+                        name: "startsWith".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![str_lit(lit)],
+                optional: false,
+            },
+            CasePat::Suffix(lit) => Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(value),
+                    property: Box::new(Expr::Identifier {
+                        name: "endsWith".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![str_lit(lit)],
+                optional: false,
+            },
+            CasePat::Exact(lit) => Expr::BinaryExpression {
+                operator: "===",
+                left: Box::new(value),
+                right: Box::new(str_lit(lit)),
+            },
+        }
+    };
+    // Clause body: same break/continue → sh2.* signal mapping as the switch
+    // form (a native break inside the if would only be legal inside a JS
+    // loop, but bash's break must exit the ENCLOSING loop).
+    let body_of = |stmts: &[IrStmt]| Stmt::BlockStatement {
+        body: stmts
+            .iter()
+            .filter_map(stmt_to_estree)
+            .map(|s| match s {
+                Stmt::BreakStatement { .. } => Stmt::ExpressionStatement {
+                    expression: sh2_call("break", vec![]),
+                },
+                Stmt::ContinueStatement { .. } => Stmt::ExpressionStatement {
+                    expression: sh2_call("continue", vec![]),
+                },
+                other => other,
+            })
+            .collect(),
+    };
+    // Build the chain from the LAST clause backwards (alternate nesting).
+    let mut alt: Option<Box<Stmt>> = None;
+    for (clause, pats) in clauses.iter().zip(pats.iter()).rev() {
+        let mut test: Option<Expr> = None;
+        for pat in pats {
+            let t = pat_test(pat);
+            test = Some(match test {
+                None => t,
+                Some(prev) => Expr::LogicalExpression {
+                    operator: "||",
+                    left: Box::new(prev),
+                    right: Box::new(t),
+                },
+            });
+        }
+        let stmt = Stmt::IfStatement {
+            test: test.expect("case clause has at least one pattern"),
+            consequent: Box::new(body_of(&clause.body)),
+            alternate: alt.take(),
+        };
+        alt = Some(Box::new(stmt));
+    }
+    Some(Stmt::BlockStatement {
+        body: vec![
+            Stmt::VariableDeclaration {
+                kind: "const",
+                declarations: vec![VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: Expr::Identifier {
+                        name: CASE_TMP.to_string(),
+                    },
+                    init: Some(expr_to_estree(discriminant)),
+                }],
+            },
+            *alt.expect("at least one clause"),
+        ],
+    })
+}
+
+/// True when the program contains `shopt -s nocasematch` anywhere (top
+/// level or nested in any function/loop/case/arrow body). Conservative: the
+/// runtime's case/test matching is case-insensitive once enabled, so a
+/// native substring lift must lowercase to stay exact. `shopt -u` after a
+/// `-s` still counts (a static scan cannot prove the runtime state).
+fn ir_may_enable_nocasematch(prog: &IrProgram) -> bool {
+    fn scan_expr(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "shopt"
+                    && matches!(args.as_slice(), [IrExpr::Str(opt, _), IrExpr::Bool(en)]
+                        if opt == "nocasematch" && *en)
+                {
+                    return true;
+                }
+                args.iter().any(scan_expr)
+            }
+            IrExpr::Arrow(stmts) => scan_stmts(stmts),
+            IrExpr::Array(elems) => elems.iter().any(scan_expr),
+            IrExpr::Object(props) => props.iter().any(|(_, v)| scan_expr(v)),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Expr(e) => scan_expr(e),
+                InterpPart::Lit(_) => false,
+            }),
+            IrExpr::Capture { expr, .. } => scan_expr(expr),
+            IrExpr::Index { key, .. } => scan_expr(key),
+            IrExpr::BinOp { lhs, rhs, .. } => scan_expr(lhs) || scan_expr(rhs),
+            IrExpr::MethodCall { obj, args, .. } => {
+                scan_expr(obj) || args.iter().any(scan_expr)
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                scan_expr(cond) || scan_expr(then) || scan_expr(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => scan_expr(expr) || scan_expr(default),
+            IrExpr::Arith(a) => scan_arith(a),
+            _ => false,
+        }
+    }
+    fn scan_arith(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Bin { lhs, rhs, .. } => scan_arith(lhs) || scan_arith(rhs),
+            ArithAst::Un { arg, .. } => scan_arith(arg),
+            ArithAst::Cond { test, then, else_ } => {
+                scan_arith(test) || scan_arith(then) || scan_arith(else_)
+            }
+            ArithAst::Index { key, .. } => scan_arith(key),
+            _ => false,
+        }
+    }
+    fn scan_stmts(stmts: &[IrStmt]) -> bool {
+        stmts.iter().any(scan_stmt)
+    }
+    fn scan_stmt(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Expr(e) => scan_expr(e),
+            IrStmt::Output { value, .. } => scan_expr(value),
+            IrStmt::WriteFile { path, content, .. } => {
+                scan_expr(path) || scan_expr(content)
+            }
+            IrStmt::Assign { targets, expr } => {
+                scan_expr(expr) || targets.iter().any(|t| t.indices.iter().any(scan_expr))
+            }
+            IrStmt::Declare { init, .. } => init.as_ref().is_some_and(scan_expr),
+            IrStmt::DeclareArray { elements, .. } => elements.iter().any(scan_expr),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                scan_expr(cond)
+                    || scan_stmts(then)
+                    || scan_stmts(else_)
+                    || elsifs.iter().any(|(c, b)| scan_expr(c) || scan_stmts(b))
+            }
+            IrStmt::For { iter, body, .. } => scan_expr(iter) || scan_stmts(body),
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                scan_expr(cond) || scan_stmts(body)
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr(expr),
+            IrStmt::Exec { cmd, args, env, .. } => {
+                scan_expr(cmd) || args.iter().any(scan_expr) || env.iter().any(|(_, v)| scan_expr(v))
+            }
+            IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| scan_stmts(s)),
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => scan_expr(e),
+            IrStmt::SetChildError(e) => scan_expr(e),
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => scan_expr(discriminant) || clauses.iter().any(|c| scan_stmts(&c.body)),
+            IrStmt::Redirect { inner, redirects } => {
+                scan_stmts(inner) || redirects.iter().any(|r| scan_expr(&r.target))
+            }
+            IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => scan_stmts(body),
+            IrStmt::Require(_)
+            | IrStmt::RawText(_)
+            | IrStmt::Return(None)
+            | IrStmt::Exit(None) => false,
+        }
+    }
+    scan_stmts(&prog.stmts)
+}
+
+/// The temp binding name for a lifted case discriminant. `$` cannot appear
+/// in a shell variable name, so `$sh_case` can never collide with a lifted
+/// variable's native JS binding.
+const CASE_TMP: &str = "$sh_case";
 
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     Some(match stmt {
@@ -2875,6 +3227,10 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             }
         }
         IrStmt::Case { discriminant, clauses } => {
+            let nocase = CASE_NOCASE.lock().unwrap().unwrap_or(false);
+            if let Some(native) = try_native_case(discriminant, clauses, nocase) {
+                return Some(native);
+            }
             let patterns: Vec<Expr> = clauses
                 .iter()
                 .flat_map(|c| c.patterns.iter())
@@ -2977,6 +3333,137 @@ fn redirect_spec_to_estree(r: &IrRedirect, persist: bool) -> Expr {
     Expr::ObjectExpression { properties: props }
 }
 
+fn str_operand(e: &str) -> Option<Expr> {
+    let e = e.trim();
+    if let Some(inner) = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        let bare = inner.strip_prefix('$').unwrap_or(inner);
+        if is_lifted_str(bare) {
+            return Some(Expr::Identifier { name: bare.to_string() });
+        }
+        if inner.contains('$')
+            || inner.contains('*')
+            || inner.contains('?')
+            || inner.contains('[')
+        {
+            return None;
+        }
+        return Some(Expr::Literal {
+            value: serde_json::Value::String(inner.to_string()),
+            raw: None,
+        });
+    }
+    // A bare `$name` needs the runtime value — only a lifted var can be
+    // read natively; never treat it as the literal text (`$y` ≠ "y").
+    if let Some(rest) = e.strip_prefix('$') {
+        if is_lifted_str(rest) {
+            return Some(Expr::Identifier {
+                name: rest.to_string(),
+            });
+        }
+        return None;
+    }
+    if !e.is_empty()
+        && !e.contains(['*', '?', '[', '$'])
+        && e.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Some(Expr::Literal {
+            value: serde_json::Value::String(e.to_string()),
+            raw: None,
+        });
+    }
+    None
+}
+
+/// `[ "$x" = *P* ]` family: the RIGHT side is a [`CasePat`] glob (the
+/// runtime glob-matches a `=`/`==`/`!=` operand containing glob
+/// metachars — and only the right side; a glob on the left is compared
+/// literally), the left is a normal operand (lifted var or literal) —
+/// lower to native `String(x).includes(P)` / `startsWith` / `endsWith`
+/// (negated for `!=`). Under a possible `nocasematch` the runtime's
+/// evalTest lowercases BOTH sides: the literal is pre-lowercased at emit
+/// time and the value side gets `toLowerCase()`.
+fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
+    let nocase = CASE_NOCASE.lock().unwrap().unwrap_or(false);
+    let build = |operand: Expr, pat: &CasePat| {
+        let mut value = Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "String".to_string(),
+            }),
+            arguments: vec![operand],
+            optional: false,
+        };
+        if nocase {
+            value = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(value),
+                    property: Box::new(Expr::Identifier {
+                        name: "toLowerCase".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![],
+                optional: false,
+            };
+        }
+        let lit_str = |lit: &str| {
+            if nocase {
+                lit.to_lowercase()
+            } else {
+                lit.to_string()
+            }
+        };
+        let str_op = |name: &str, arg: Expr| Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(value.clone()),
+                property: Box::new(Expr::Identifier {
+                    name: name.to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![arg],
+            optional: false,
+        };
+        let inc = match pat {
+            CasePat::Any => Expr::Literal {
+                value: serde_json::Value::Bool(true),
+                raw: None,
+            },
+            CasePat::Substr(lit) => str_op("includes", str_lit(&lit_str(lit))),
+            CasePat::Prefix(lit) => str_op("startsWith", str_lit(&lit_str(lit))),
+            CasePat::Suffix(lit) => str_op("endsWith", str_lit(&lit_str(lit))),
+            CasePat::Exact(lit) => Expr::BinaryExpression {
+                operator: "===",
+                left: Box::new(value.clone()),
+                right: Box::new(str_lit(&lit_str(lit))),
+            },
+        };
+        if negate {
+            Expr::UnaryExpression {
+                operator: "!",
+                argument: Box::new(inc),
+                prefix: true,
+            }
+        } else {
+            inc
+        }
+    };
+    if let Some(pat) = classify_case_pat(rhs.trim()) {
+        // only the GLOB shapes lift natively here: a bare operand
+        // containing `=`/`<`/`>` would tokenize into separate test tokens
+        // (the runtime splits on them), so Exact/Any stay on the runtime
+        // (the plain-equality path already covers exact literals).
+        if matches!(&pat, CasePat::Substr(_) | CasePat::Prefix(_) | CasePat::Suffix(_)) {
+            if let Some(l) = str_operand(lhs) {
+                return Some(build(l, &pat));
+            }
+        }
+    }
+    None
+}
+
 /// Native lowering for a SIMPLE test expression whose operands are all
 /// lifted numeric variables (or integer literals): `"$count" -lt 100`
 /// becomes `count < 100` — no runtime test-string round-trip. Returns None
@@ -3019,42 +3506,6 @@ fn try_native_test(s: &str) -> Option<Expr> {
             });
         }
     }
-    fn str_operand(e: &str) -> Option<Expr> {
-        let e = e.trim();
-        if let Some(inner) = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-            let bare = inner.strip_prefix('$').unwrap_or(inner);
-            if is_lifted_str(bare) {
-                return Some(Expr::Identifier { name: bare.to_string() });
-            }
-            if inner.contains('$')
-                || inner.contains('*')
-                || inner.contains('?')
-                || inner.contains('[')
-            {
-                return None;
-            }
-            return Some(Expr::Literal {
-                value: serde_json::Value::String(inner.to_string()),
-                raw: None,
-            });
-        }
-        let bare = e.strip_prefix('$').unwrap_or(e);
-        if is_lifted_str(bare) {
-            return Some(Expr::Identifier { name: bare.to_string() });
-        }
-        if !bare.is_empty()
-            && !bare.contains(['*', '?', '[', '$'])
-            && bare
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        {
-            return Some(Expr::Literal {
-                value: serde_json::Value::String(bare.to_string()),
-                raw: None,
-            });
-        }
-        None
-    }
     for (op, js) in string_ops {
         // the parser strips the SPACES around `=`/`==`/`!=` (`"$x"=hello`),
         // so match the bare operator token outside quoted regions
@@ -3076,11 +3527,28 @@ fn try_native_test(s: &str) -> Option<Expr> {
                 }
                 // the operator must not sit inside a quoted region or a
                 // word (`"$x"=a=b` — the first `=` is the operator, the
-                // second sits mid-word)
+                // second sits mid-word). Like the runtime tokenizer (which
+                // splits on `=` even adjacent to word chars), a word may
+                // end right before the operator (`$s==*.txt`); false
+                // operators are weeded out by the operand checks below.
                 let before = if idx > 0 { b[idx - 1] } else { 0 };
-                let is_op = before == 0 || before == b'"' || before == b' ' || before == b'\'';
+                let is_op = before == 0
+                    || before == b'"'
+                    || before == b' '
+                    || before == b'\''
+                    || before == b'$'
+                    || before == b'_'
+                    || before.is_ascii_alphanumeric();
                 if is_op {
                     let (lhs, rhs) = (&s[..idx], &s[idx + op.len()..]);
+                    // glob-to-substring family: `[ "$x" = *P* ]` →
+                    // `String(x).includes(P)`. The runtime glob-matches a
+                    // `=`/`==`/`!=` operand containing glob metacharacters;
+                    // a pure `*P*` operand is exactly a substring test, so
+                    // the whole comparison lowers native (no sh2.test).
+                    if let Some(native) = try_native_glob_test(lhs, rhs, op == "!=") {
+                        return Some(native);
+                    }
                     let l = str_operand(lhs)?;
                     let r = str_operand(rhs)?;
                     return Some(Expr::BinaryExpression {
@@ -3751,11 +4219,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 }
             }
             // test expressions: native comparison when both operands are
-            // lifted; otherwise inject lifted values as a template literal
+            // lifted; otherwise inject lifted values as a template literal.
+            // Inside `&&`/`||` arrows the runtime `and`/`or` branch on
+            // lastExit, which a native expression never sets — keep the
+            // runtime call there (the injected template still inlines
+            // lifted values).
             if func == "test" {
                 if let [IrExpr::Str(sv, _)] = args.as_slice() {
-                    if let Some(native) = try_native_test(sv) {
-                        return native;
+                    if *AND_OR_DEPTH.lock().unwrap() == 0 {
+                        if let Some(native) = try_native_test(sv) {
+                            return native;
+                        }
                     }
                     if let Some(tpl) = test_str_to_estree(sv) {
                         // the injected template is the ARGUMENT to the
@@ -3778,15 +4252,23 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // assign() returns true, so `r=$(cmd) || ...` (and friends) would
             // branch on the wrong thing. The runtime helper sequences both
             // sides and checks lastExit.
-            await_call(
+            *AND_OR_DEPTH.lock().unwrap() += 1;
+            let e = await_call(
                 "and",
                 vec![arrow(vec![], (**lhs).clone()), arrow(vec![], (**rhs).clone())],
-            )
+            );
+            *AND_OR_DEPTH.lock().unwrap() -= 1;
+            e
         }
-        IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs } => await_call(
-            "or",
-            vec![arrow(vec![], (**lhs).clone()), arrow(vec![], (**rhs).clone())],
-        ),
+        IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs } => {
+            *AND_OR_DEPTH.lock().unwrap() += 1;
+            let e = await_call(
+                "or",
+                vec![arrow(vec![], (**lhs).clone()), arrow(vec![], (**rhs).clone())],
+            );
+            *AND_OR_DEPTH.lock().unwrap() -= 1;
+            e
+        }
         // `! cmd` — bash inverts the exit STATUS (so `$?` flips too); a pure
         // JS negation would leave lastExit untouched. The runtime helper
         // negates AND records the new status (`$?` reads it back).
