@@ -6,6 +6,11 @@ pub mod testing;
 pub mod timeout_manager;
 pub mod utils;
 
+// WASI (wasm32-wasip1) CLI-layer ABI — the full command-line processing
+// (main_with_args) as a library call for embedders; see wasi_api.rs.
+#[cfg(all(target_os = "wasi", feature = "wasi-cli"))]
+pub mod wasi_api;
+
 use std::env;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
