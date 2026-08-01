@@ -7,6 +7,8 @@ echo "=== Checksum Commands ==="
 
 # sha256sum command with backticks
 #PERL_MUST_NOT_CONTAIN `sha256sum
+d=$(mktemp -d)
+cd "$d" || exit 1
 echo "test content" > test_checksum.txt
 sha256_result=`sha256sum test_checksum.txt`
 echo "SHA256 result: $sha256_result"
@@ -26,4 +28,6 @@ echo "$strings_result"
 rm -f test_checksum.txt
 
 echo "=== Checksum Commands Complete ==="
+cd /
+rm -rf "$d"
 

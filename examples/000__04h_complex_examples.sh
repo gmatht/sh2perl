@@ -1,6 +1,8 @@
 #!/bin/bash
 
 # Complex backtick examples
+d=$(mktemp -d)
+cd "$d" || exit 1
 # This file demonstrates complex usage patterns with backticks
 
 echo "=== Complex Backtick Examples ==="
@@ -71,4 +73,6 @@ echo "Perl result: $perl_result"
 rm -f file1.txt file2.txt
 
 echo "=== Complex Backtick Examples Complete ==="
+cd /
+rm -rf "$d"
 
