@@ -975,6 +975,281 @@ fn brace_items_json(items: &[BraceItem]) -> serde_json::Value {
     )
 }
 
+/// Emit-time evaluation of `sh2.brace(prefix, groups, middles, suffix)` —
+/// the runtime's brace expansion is PURE string work over the literal JSON
+/// args the parser always emits (see `brace_ir`), so the whole call lowers
+/// to a native array literal. Mirrors harness/sh2-namespace.mjs exactly:
+/// `braceRange` / `alphaRange` / `expandBraceNested` / `expandBraceGroup`
+/// plus the cartesian product with inter-group `middles` and the
+/// prefix/suffix wrap. The runtime never adds GLOB_MAGIC to brace results,
+/// so the literal strings are bit-identical to what the runtime returns and
+/// downstream flattening (forLoop/exec) treats them identically.
+fn brace_expand(
+    prefix: &str,
+    groups: &serde_json::Value,
+    middles: &serde_json::Value,
+    suffix: &str,
+) -> Vec<String> {
+    fn jstr(v: &serde_json::Value) -> String {
+        v.as_str().unwrap_or("").to_string()
+    }
+    fn is_int_str(s: &str) -> bool {
+        let b = s.as_bytes();
+        let digits = if b.first() == Some(&b'-') { &b[1..] } else { b };
+        !digits.is_empty() && digits.iter().all(|c| c.is_ascii_digit())
+    }
+    fn alpha_range(a: &str, b: &str, step: i64) -> Vec<String> {
+        let mut out = Vec::new();
+        let ca = a.chars().next().unwrap_or('a') as i64;
+        let cb = b.chars().next().unwrap_or('a') as i64;
+        let mut i = ca;
+        if ca <= cb {
+            while i <= cb {
+                out.push(char::from_u32(i as u32).unwrap().to_string());
+                match i.checked_add(step) {
+                    Some(n) => i = n,
+                    None => break,
+                }
+            }
+        } else {
+            while i >= cb {
+                out.push(char::from_u32(i as u32).unwrap().to_string());
+                match i.checked_sub(step) {
+                    Some(n) => i = n,
+                    None => break,
+                }
+            }
+        }
+        out
+    }
+    fn step_of(step: &serde_json::Value) -> i64 {
+        match step {
+            serde_json::Value::String(s) => s
+                .parse::<i64>()
+                .ok()
+                .map(|v| v.abs())
+                .filter(|v| *v != 0)
+                .unwrap_or(1),
+            serde_json::Value::Number(n) => n
+                .as_i64()
+                .map(|v| v.abs())
+                .filter(|v| *v != 0)
+                .unwrap_or(1),
+            _ => 1,
+        }
+    }
+    /// The runtime's `braceRange([start, end, step, format])` — zero-padded
+    /// numeric ranges, letter ranges, mixed `{a1..c3}` runs, and the
+    /// literal `start..end` fallback.
+    fn brace_range_value(range: &serde_json::Value) -> Vec<String> {
+        let arr = match range.as_array() {
+            Some(a) if a.len() >= 2 => a,
+            _ => return vec![],
+        };
+        let start = jstr(&arr[0]);
+        let end = jstr(&arr[1]);
+        let st = step_of(arr.get(2).unwrap_or(&serde_json::Value::Null));
+        let is_num = is_int_str(&start) && is_int_str(&end);
+        // mixed `{a1..c3}` → alpha part × numeric part
+        if !is_num {
+            let alpha_num = |s: &str| -> Option<(String, String)> {
+                let bytes = s.as_bytes();
+                let alen = bytes
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .count();
+                if alen == 0 || alen == bytes.len() {
+                    return None;
+                }
+                let (a, n) = s.split_at(alen);
+                if n.is_empty() || !n.bytes().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                Some((a.to_string(), n.to_string()))
+            };
+            if let (Some((al1, an1)), Some((al2, an2))) = (alpha_num(&start), alpha_num(&end)) {
+                let alphas = alpha_range(&al1, &al2, 1);
+                let lo: i64 = an1.parse().unwrap_or(0);
+                let hi: i64 = an2.parse().unwrap_or(0);
+                let width = an1.len().max(an2.len());
+                let mut out = Vec::new();
+                for ch in &alphas {
+                    let mut n = lo;
+                    if lo <= hi {
+                        while n <= hi {
+                            out.push(format!("{ch}{n:0width$}", width = width));
+                            match n.checked_add(1) {
+                                Some(x) => n = x,
+                                None => break,
+                            }
+                        }
+                    } else {
+                        while n >= hi {
+                            out.push(format!("{ch}{n:0width$}", width = width));
+                            match n.checked_sub(1) {
+                                Some(x) => n = x,
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                return out;
+            }
+        }
+        if is_num {
+            let a = start.parse::<i64>().unwrap_or(0);
+            let b = end.parse::<i64>().unwrap_or(0);
+            let width = if start.starts_with('0') || end.starts_with('0') {
+                start.len().max(end.len())
+            } else {
+                0
+            };
+            let fmt = |n: i64| -> String {
+                let s = n.abs().to_string();
+                let padded = if width > 0 {
+                    format!("{s:0>width$}", width = width)
+                } else {
+                    s
+                };
+                if n < 0 {
+                    format!("-{padded}")
+                } else {
+                    padded
+                }
+            };
+            let mut out = Vec::new();
+            let mut i = a;
+            if a <= b {
+                while i <= b {
+                    out.push(fmt(i));
+                    match i.checked_add(st) {
+                        Some(n) => i = n,
+                        None => break,
+                    }
+                }
+            } else {
+                while i >= b {
+                    out.push(fmt(i));
+                    match i.checked_sub(st) {
+                        Some(n) => i = n,
+                        None => break,
+                    }
+                }
+            }
+            return out;
+        }
+        let single_letter = |s: &str| s.len() == 1 && s.chars().next().unwrap().is_ascii_alphabetic();
+        if single_letter(&start) && single_letter(&end) {
+            return alpha_range(&start, &end, st);
+        }
+        let all_alpha = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphabetic());
+        if all_alpha(&start) && all_alpha(&end) {
+            // longer alpha runs (`{ab..az}`) — step applies to the last
+            // letter; the prefix stays the START's prefix (runtime quirk,
+            // mirrored exactly)
+            let mut out = Vec::new();
+            let ca = start.chars().next().unwrap() as i64;
+            let cb = end.chars().next().unwrap() as i64;
+            let prefix = &start[..start.len() - 1];
+            let mut i = ca;
+            if ca <= cb {
+                while i <= cb {
+                    out.push(format!("{prefix}{}", char::from_u32(i as u32).unwrap()));
+                    match i.checked_add(st) {
+                        Some(n) => i = n,
+                        None => break,
+                    }
+                }
+            } else {
+                while i >= cb {
+                    out.push(format!("{prefix}{}", char::from_u32(i as u32).unwrap()));
+                    match i.checked_sub(st) {
+                        Some(n) => i = n,
+                        None => break,
+                    }
+                }
+            }
+            return out;
+        }
+        vec![format!("{start}..{end}")]
+    }
+    /// `expandBraceNested(items)` — nested groups expand recursively.
+    fn brace_nested(items: &serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(arr) = items.as_array() {
+            for it in arr {
+                if let Some(s) = it.as_str() {
+                    out.push(s.to_string());
+                } else if let Some(r) = it.get("range") {
+                    out.extend(brace_range_value(r));
+                } else if let Some(n) = it.get("nested") {
+                    out.extend(brace_nested(n));
+                } else if it.is_array() {
+                    out.extend(brace_nested(it));
+                }
+            }
+        }
+        out
+    }
+    /// `expandBraceGroup(g)` — a range inside a comma-separated group stays
+    /// LITERAL (`{1..3,7..9}`); only a lone range expands.
+    fn brace_group(g: &serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(items) = g.as_array() {
+            for it in items {
+                if let Some(s) = it.as_str() {
+                    out.push(s.to_string());
+                } else if let Some(r) = it.get("range") {
+                    if items.len() == 1 {
+                        out.extend(brace_range_value(r));
+                    } else if let Some(rarr) = r.as_array() {
+                        out.push(format!("{}..{}", jstr(&rarr[0]), jstr(&rarr[1])));
+                    }
+                } else if let Some(n) = it.get("nested") {
+                    out.extend(brace_nested(n));
+                } else if it.is_array() {
+                    out.extend(brace_nested(it));
+                }
+            }
+        }
+        out
+    }
+    // cartesian product of the group expansions, middles spliced between
+    let expansions: Vec<Vec<String>> = groups
+        .as_array()
+        .map(|gs| gs.iter().map(brace_group).collect())
+        .unwrap_or_default();
+    let mut combos: Vec<Vec<String>> = vec![vec![]];
+    for g in &expansions {
+        let mut next = Vec::new();
+        for c in &combos {
+            for it in g {
+                let mut cc = c.clone();
+                cc.push(it.clone());
+                next.push(cc);
+            }
+        }
+        combos = next;
+    }
+    let ms: Vec<String> = middles
+        .as_array()
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+        .unwrap_or_default();
+    combos
+        .iter()
+        .map(|c| {
+            let mut body = String::new();
+            for (i, x) in c.iter().enumerate() {
+                body.push_str(x);
+                if let Some(m) = ms.get(i) {
+                    body.push_str(m);
+                }
+            }
+            format!("{prefix}{body}{suffix}")
+        })
+        .collect()
+}
+
 fn pure_template_part(interp: &StringInterpolation) -> Option<IrExpr> {
     pure_part(interp).map(part_ir)
 }
@@ -3079,16 +3354,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             let alternate: Option<Box<Stmt>> = if else_.is_empty() {
                 // bash: `if c; then ...; fi` with a false condition and no
                 // else leaves `$?` = 0. The runtime tracks lastExit through
-                // calls only, so the false path must set it explicitly.
+                // calls only, so the false path must set it explicitly — a
+                // native field write (`sh2.lastExit = 0`), no dispatch.
                 Some(Box::new(Stmt::BlockStatement {
                     body: vec![Stmt::ExpressionStatement {
-                        expression: sh2_call(
-                            "setLastExit",
-                            vec![Expr::Literal {
+                        expression: Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(sh2_member("lastExit")),
+                            right: Box::new(Expr::Literal {
                                 value: serde_json::Value::from(0),
                                 raw: None,
-                            }],
-                        ),
+                            }),
+                        },
                     }],
                 }))
             } else {
@@ -3167,11 +3444,26 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 });
             }
             body_stmts.extend(body.clone());
+            let iter_e = expr_to_estree(iter);
+            let body_e: Vec<Stmt> = body_stmts.iter().filter_map(stmt_to_estree).collect();
+            // Fast path: a provably-sync loop (neither the iterable nor the
+            // body needs `await`) lowers to the synchronous runtime loop —
+            // identical semantics (flattening, GLOB_MAGIC items, BREAK/
+            // CONTINUE/RETURN signals, capture bound) minus the per-iteration
+            // promise machinery (the whileLoopSync precedent).
+            if !expr_has_await(&iter_e) && !stmts_have_await(&body_e) {
+                return Some(Stmt::ExpressionStatement {
+                    expression: sh2_call(
+                        "forLoopSync",
+                        vec![iter_e, sync_arrow_with_param(js_var, body_e)],
+                    ),
+                });
+            }
             Stmt::ExpressionStatement {
                 expression: await_call(
                     "forLoop",
                     vec![
-                        expr_to_estree(iter),
+                        iter_e,
                         arrow_with_param(js_var, IrExpr::Arrow(body_stmts)),
                     ],
                 ),
@@ -4177,6 +4469,23 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         },
         IrExpr::Interpolate(parts) => interpolate_to_estree(parts),
         IrExpr::Call { func, args } => {
+            // `sh2.brace(prefix, groups, middles, suffix)` — the args are
+            // ALWAYS literal (brace_ir emits Str/Json), the expansion is
+            // pure string work, and the runtime never glob-marks the
+            // results — so the whole call lowers to a native array literal
+            // (computed once at emit time, not per loop/iteration).
+            if func == "brace" {
+                if let [IrExpr::Str(prefix, _), IrExpr::Json(groups), IrExpr::Json(middles), IrExpr::Str(suffix, _)] =
+                    args.as_slice()
+                {
+                    return Expr::ArrayExpression {
+                        elements: brace_expand(prefix, groups, middles, suffix)
+                            .iter()
+                            .map(|s| Some(str_lit(s)))
+                            .collect(),
+                    };
+                }
+            }
             // setArray/setArrayAppend ELEMENT strings are expandWord'd by
             // the runtime from the STORE — inject lifted values as template
             // literals (the parser keeps elements as raw text, so
@@ -4235,6 +4544,23 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         // the injected template is the ARGUMENT to the
                         // runtime test (a bare template is always truthy)
                         return sh2_call("test", vec![tpl]);
+                    }
+                }
+            }
+            // `for ((...))` whose body needs no await lowers to the sync
+            // runtime twin (the whileLoopSync precedent): identical
+            // semantics minus the per-iteration promise machinery. The
+            // header string is evaluated by the runtime's evalArith
+            // (store-based), so only the BODY needs the await scan.
+            if func == "cstyleFor" {
+                if let [IrExpr::Str(header, _), IrExpr::Arrow(body_stmts)] = args.as_slice() {
+                    let body_e: Vec<Stmt> =
+                        body_stmts.iter().filter_map(stmt_to_estree).collect();
+                    if !stmts_have_await(&body_e) {
+                        return sh2_call(
+                            "cstyleForSync",
+                            vec![str_lit(header), sync_arrow_block(body_e)],
+                        );
                     }
                 }
             }
@@ -4368,6 +4694,18 @@ fn sync_arrow_expr(expr: Expr) -> Expr {
 fn sync_arrow_block(stmts: Vec<Stmt>) -> Expr {
     Expr::ArrowFunctionExpression {
         params: vec![],
+        body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body: stmts })),
+        expression: false,
+        r#async: false,
+    }
+}
+
+/// Plain (non-async) one-param block arrow `(param) => { stmts }` for the
+/// forLoopSync fast path (the loop variable shadows the module binding, so
+/// the lifted `i = Number(i)` coercion self-assignment works unchanged).
+fn sync_arrow_with_param(param: String, stmts: Vec<Stmt>) -> Expr {
+    Expr::ArrowFunctionExpression {
+        params: vec![Expr::Identifier { name: param }],
         body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body: stmts })),
         expression: false,
         r#async: false,
