@@ -12,6 +12,8 @@ echo "Echo result: $echo_result"
 
 # printf command with backticks
 #PERL_MUST_NOT_CONTAIN `printf
+d=$(mktemp -d)
+cd "$d" || exit 1
 printf_result=`printf "Number: %d, String: %s\n" 42 "test"`
 echo "Printf result: $printf_result"
 
@@ -24,4 +26,6 @@ echo "Tee result: $tee_result"
 rm -f test_tee.txt
 
 echo "=== Output and Formatting Commands Complete ==="
+cd /
+rm -rf "$d"
 
