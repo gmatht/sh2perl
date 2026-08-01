@@ -141,6 +141,11 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    AssignmentExpression {
+        operator: String,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     ConditionalExpression {
         test: Box<Expr>,
         consequent: Box<Expr>,
@@ -947,10 +952,16 @@ mod tests {
 
     #[test]
     fn assignment_lowers_to_setvar() {
+        // a provably-numeric variable is LIFTED to a native JS number write
+        // (`x = 42`), no runtime store round-trip
         let json = to_json("x=42");
-        assert!(json.contains("\"name\":\"setVar\""));
-        assert!(json.contains("x"));
+        assert!(json.contains("\"type\":\"AssignmentExpression\""));
+        assert!(!json.contains("\"name\":\"setVar\""));
         assert!(!json.contains("unsupported"));
+        // a non-numeric source stays in the runtime store
+        let json2 = to_json("x=hello");
+        assert!(json2.contains("\"name\":\"setVar\""));
+        assert!(!json2.contains("unsupported"));
     }
 
     #[test]

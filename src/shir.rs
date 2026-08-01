@@ -10,6 +10,23 @@
 use crate::ast::*;
 use crate::estree::*;
 use crate::ir::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+/// Variables proven (conservatively) to hold ONLY numbers — lifted to
+/// native JS number bindings: `let x = 0` declared at program top, reads
+/// become bare `x` (no `sh2.getVar` + `Number(...)||0`), writes become
+/// `x = <native expr>` (no `sh2.setVar` + `arithEval`). Reset by
+/// `shir_to_estree` per compilation (the Perl generator never runs this).
+static LIFTED_NUMERIC: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+fn is_lifted(name: &str) -> bool {
+    LIFTED_NUMERIC
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
 
 fn call(func: &str, args: Vec<IrExpr>) -> IrExpr {
     IrExpr::Call {
@@ -1012,41 +1029,13 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
             return Some(ArithAst::Num(v));
         }
         if c == '$' {
-            // bash allows `$var` / `${var}` / `$1` INSIDE $(( )) — the
-            // runtime evalArith accepts them; treat as a bare variable read.
-            *pos += 1;
-            if *pos < chars.len() && chars[*pos] == '{' {
-                *pos += 1;
-                let mut name = String::new();
-                while *pos < chars.len() && chars[*pos] != '}' {
-                    name.push(chars[*pos]);
-                    *pos += 1;
-                }
-                if *pos >= chars.len() {
-                    return None;
-                }
-                *pos += 1;
-                return if name.is_empty() {
-                    None
-                } else {
-                    Some(ArithAst::Var(name))
-                };
-            }
-            if *pos < chars.len()
-                && (chars[*pos].is_ascii_alphabetic()
-                    || chars[*pos] == '_'
-                    || chars[*pos].is_ascii_digit())
-            {
-                let mut name = String::new();
-                while *pos < chars.len()
-                    && (chars[*pos].is_ascii_alphanumeric() || chars[*pos] == '_')
-                {
-                    name.push(chars[*pos]);
-                    *pos += 1;
-                }
-                return Some(ArithAst::Var(name));
-            }
-            return None; // bare `$` — fall back to the runtime evaluator
+            // bash expands `$var` inside $(( )) as a STRING INSERTION before
+            // parsing: `$(( $j * 2 ))` with j unset becomes `$(( * 2 ))` (a
+            // syntax error → whole expansion empty), `$(( $j + 1 ))` becomes
+            // `$(( + 1 ))` (unary plus → 1). A native number read (0 for
+            // unset) cannot express that, so dollar-prefixed operands fall
+            // back to the runtime evaluator (sh2.arith) which reproduces it.
+            return None;
         }
         if c.is_ascii_alphabetic() || c == '_' {
             let mut name = String::new();
@@ -1373,19 +1362,26 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             value: serde_json::Value::from(*v),
             raw: None,
         },
-        ArithAst::Var(name) => Expr::LogicalExpression {
-            operator: "||",
-            left: Box::new(Expr::CallExpression {
-                callee: Box::new(Expr::Identifier {
-                    name: "Number".to_string(),
-                }),
-                arguments: vec![sh2_call("getVar", vec![str_lit(name)])],
-                optional: false,
-            }),
-            right: Box::new(Expr::Literal {
-                value: serde_json::Value::from(0),
-                raw: None,
-            }),
+        ArithAst::Var(name) => {
+            if is_lifted(name) {
+                // already a JS number — no Number()/||0 coercion needed
+                Expr::Identifier { name: name.clone() }
+            } else {
+                Expr::LogicalExpression {
+                    operator: "||",
+                    left: Box::new(Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "Number".to_string(),
+                        }),
+                        arguments: vec![sh2_call("getVar", vec![str_lit(name)])],
+                        optional: false,
+                    }),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                    }),
+                }
+            }
         },
         ArithAst::Index { var, key } => Expr::LogicalExpression {
             operator: "||",
@@ -1497,11 +1493,495 @@ fn is_async_call(name: &str) -> bool {
     )
 }
 
+/// Conservative "always a number" analysis for the ESTree backend.
+///
+/// bash variables are strings; JS has real numbers. A variable whose every
+/// assignment is provably numeric (a `$((...))` expression without `/`/`%`
+/// — the only error sources — a numeric literal, or a copy of another
+/// lifted variable) and that never appears in a string-parsed context
+/// (`sh2.test`/`sh2.param`/array calls read the runtime STORE by string) can
+/// be lifted to a native JS number binding: reads are bare `x`, writes are
+/// `x = <expr>`, `let x = 0` at program top. Everything else keeps the
+/// runtime store (exact current behavior).
+fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
+    let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    let mut excluded: HashSet<String> = HashSet::new();
+    let mut string_ctx: HashSet<String> = HashSet::new();
+
+    fn is_ident(s: &str) -> bool {
+        let mut cs = s.chars();
+        match cs.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+            _ => false,
+        }
+    }
+    fn mark_string_refs(s: &str, out: &mut HashSet<String>) {
+        // A var is read from the STORE whenever its name appears inside a
+        // string-parsed context (test/param/brace/caseMatch strings). Mark
+        // any identifier-like word, bare or $-prefixed (conservative: over-
+        // marking is safe — the var just stays in the store).
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let mut c = bytes[i] as char;
+            // a `$` prefix starts a variable reference: skip it, then treat
+            // the following identifier as a STORE read (`$count` inside a
+            // test string resolves via the runtime store)
+            if c == '$' {
+                i += 1;
+                if i >= bytes.len() {
+                    break;
+                }
+                c = bytes[i] as char;
+            }
+            let prev_alnum = i > 0 && bytes[i - 1].is_ascii_alphanumeric();
+            if (c.is_ascii_alphabetic() || c == '_') && !prev_alnum {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let w = &s[start..i];
+                if is_ident(w) {
+                    out.insert(w.to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    fn mark_write_builtin_vars(e: &IrExpr, excluded: &mut HashSet<String>) {
+        match e {
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    mark_write_builtin_vars(el, excluded);
+                }
+            }
+            IrExpr::Str(sv, _) => {
+                let v = sv.split('=').next().unwrap_or("");
+                if is_ident(v) {
+                    excluded.insert(v.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    fn mark_str_args(e: &IrExpr, string_ctx: &mut HashSet<String>) {
+        match e {
+            IrExpr::Str(ss, _) => mark_string_refs(ss, string_ctx),
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    mark_str_args(el, string_ctx);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    mark_str_args(v, string_ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_expr(
+        e: &IrExpr,
+        excluded: &mut HashSet<String>,
+        string_ctx: &mut HashSet<String>,
+        in_copy: bool,
+    ) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func != "getVar" {
+                    // ANY runtime call's string args (recursing into the
+                    // Array/[] wrappers exec and setArrayAppend use) may
+                    // contain `$var` references the runtime resolves from
+                    // the STORE — setArrayAppend(["$candidate"]),
+                    // local("n=$1"), test("$count -lt 100") — so mark every
+                    // identifier found there as store-read (not liftable).
+                    for a in args {
+                        mark_str_args(a, string_ctx);
+                    }
+                }
+                if matches!(
+                    func.as_str(),
+                    "arrayIndex" | "arrayLen" | "arrayItems" | "arraySlice" | "setArray"
+                        | "setArrayAppend"
+                ) {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        excluded.insert(name.clone());
+                    }
+                }
+                for a in args {
+                    walk_expr(a, excluded, string_ctx, in_copy);
+                }
+            }
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    walk_stmt(st, excluded, string_ctx, in_copy);
+                }
+            }
+            IrExpr::Index { key, .. } => walk_expr(key, excluded, string_ctx, in_copy),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, excluded, string_ctx, in_copy);
+                walk_expr(rhs, excluded, string_ctx, in_copy);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, excluded, string_ctx, in_copy);
+                for a in args {
+                    walk_expr(a, excluded, string_ctx, in_copy);
+                }
+            }
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                walk_expr(cond, excluded, string_ctx, in_copy);
+                walk_expr(then, excluded, string_ctx, in_copy);
+                walk_expr(else_, excluded, string_ctx, in_copy);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, excluded, string_ctx, in_copy);
+                walk_expr(default, excluded, string_ctx, in_copy);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(inner) = p {
+                        walk_expr(inner, excluded, string_ctx, in_copy);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, excluded, string_ctx, in_copy),
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, excluded, string_ctx, in_copy);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, excluded, string_ctx, in_copy);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(
+        st: &IrStmt,
+        excluded: &mut HashSet<String>,
+        string_ctx: &mut HashSet<String>,
+        in_copy: bool,
+    ) {
+        match st {
+            IrStmt::Assign { targets, expr } => {
+                for t in targets {
+                    if t.indices.is_empty() {
+                        if in_copy {
+                            // a subshell/background write is COPY-local in
+                            // bash — a lifted module var would be clobbered
+                            excluded.insert(t.var.clone());
+                        }
+                    } else {
+                        excluded.insert(t.var.clone());
+                    }
+                }
+                walk_expr(expr, excluded, string_ctx, in_copy);
+            }
+            IrStmt::Declare { vars, .. } => {
+                for v in vars {
+                    excluded.insert(v.name.clone());
+                }
+            }
+            IrStmt::DeclareArray { var, .. } => {
+                excluded.insert(var.clone());
+            }
+            IrStmt::For { var, iter, body } => {
+                excluded.insert(var.clone());
+                walk_expr(iter, excluded, string_ctx, in_copy);
+                for b in body {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, excluded, string_ctx, in_copy);
+                for b in body {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                walk_expr(cond, excluded, string_ctx, in_copy);
+                for b in then.iter().chain(else_) {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        walk_stmt(stm, excluded, string_ctx, in_copy);
+                    }
+                }
+            }
+            IrStmt::Exec {
+                cmd,
+                args,
+                capture,
+                env,
+                ..
+            } => {
+                if let Some(c) = capture {
+                    excluded.insert(c.clone());
+                }
+                for (v, _) in env {
+                    excluded.insert(v.clone());
+                }
+                if let IrExpr::Str(cname, _) = cmd {
+                    if matches!(
+                        cname.as_str(),
+                        "read" | "declare" | "typeset" | "local" | "export" | "readonly"
+                            | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source" | "."
+                    ) {
+                        for a in args {
+                            mark_write_builtin_vars(a, excluded);
+                        }
+                    }
+                }
+                walk_expr(cmd, excluded, string_ctx, in_copy);
+                for a in args {
+                    walk_expr(a, excluded, string_ctx, in_copy);
+                }
+            }
+            IrStmt::Pipeline { stages, capture, .. } => {
+                if let Some(c) = capture {
+                    excluded.insert(c.clone());
+                }
+                for stage in stages {
+                    for b in stage {
+                        walk_stmt(b, excluded, string_ctx, in_copy);
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } | IrStmt::Block(body) => {
+                for b in body {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+            }
+            // subshell/background: COPY semantics — writes inside are local
+            IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                for b in body {
+                    walk_stmt(b, excluded, string_ctx, true);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for b in inner {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+                for r in redirects {
+                    walk_expr(&r.target, excluded, string_ctx, in_copy);
+                }
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                walk_expr(discriminant, excluded, string_ctx, in_copy);
+                for c in clauses {
+                    for p in &c.patterns {
+                        mark_string_refs(p, string_ctx);
+                    }
+                    for b in &c.body {
+                        walk_stmt(b, excluded, string_ctx, in_copy);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, excluded, string_ctx, in_copy),
+            IrStmt::Output { value, .. } => walk_expr(value, excluded, string_ctx, in_copy),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, excluded, string_ctx, in_copy);
+                walk_expr(content, excluded, string_ctx, in_copy);
+            }
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => {
+                walk_expr(e, excluded, string_ctx, in_copy)
+            }
+            IrStmt::SetChildError(e) => walk_expr(e, excluded, string_ctx, in_copy),
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                walk_expr(expr, excluded, string_ctx, in_copy)
+            }
+            _ => {}
+        }
+    }
+
+    for st in &prog.stmts {
+        walk_stmt(st, &mut excluded, &mut string_ctx, false);
+    }
+
+    // collect assignment sources (top-level + function bodies — a function
+    // WRITING a global is a global write in bash, so it counts)
+    fn collect_assigns(st: &IrStmt, assigns: &mut HashMap<String, Vec<IrExpr>>) {
+        match st {
+            IrStmt::Assign { targets, expr } => {
+                for t in targets {
+                    if t.indices.is_empty() {
+                        assigns
+                            .entry(t.var.clone())
+                            .or_default()
+                            .push(expr.clone());
+                    }
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    collect_assigns(b, assigns);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        collect_assigns(stm, assigns);
+                    }
+                }
+            }
+            IrStmt::For { body, .. } => {
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+            }
+            IrStmt::Exec { args, .. } => {
+                for a in args {
+                    collect_expr_assigns(a, assigns);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        collect_assigns(b, assigns);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    collect_assigns(b, assigns);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        collect_assigns(b, assigns);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => collect_expr_assigns(e, assigns),
+            IrStmt::Output { value, .. } => collect_expr_assigns(value, assigns),
+            _ => {}
+        }
+    }
+    fn collect_expr_assigns(e: &IrExpr, assigns: &mut HashMap<String, Vec<IrExpr>>) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    collect_assigns(st, assigns);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_expr_assigns(a, assigns);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    collect_expr_assigns(el, assigns);
+                }
+            }
+            _ => {}
+        }
+    }
+    for st in &prog.stmts {
+        collect_assigns(st, &mut assigns);
+    }
+
+    fn arith_has_div_mod(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Bin { op, lhs, rhs } => {
+                *op == "/" || *op == "%" || arith_has_div_mod(lhs) || arith_has_div_mod(rhs)
+            }
+            ArithAst::Un { arg, .. } => arith_has_div_mod(arg),
+            ArithAst::Cond { test, then, else_, .. } => {
+                arith_has_div_mod(test) || arith_has_div_mod(then) || arith_has_div_mod(else_)
+            }
+            ArithAst::Index { key, .. } => arith_has_div_mod(key),
+            _ => false,
+        }
+    }
+
+    // fixpoint: a var is liftable when ALL its assignment sources are
+    // numeric (arith without / %, numeric literal, or another lifted var).
+    let mut lifted: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (name, exprs) in &assigns {
+            if lifted.contains(name)
+                || excluded.contains(name)
+                || string_ctx.contains(name)
+                || name.contains('[')
+                || name.contains(']')
+            {
+                // names with a subscript (`map[answer]` — the parser keeps
+                // the whole bracket string as the var name) are array
+                // writes: never liftable (a `let map[answer]` is invalid JS)
+                continue;
+            }
+            let all_numeric = exprs.iter().all(|e| match e {
+                IrExpr::Arith(a) => !arith_has_div_mod(a),
+                IrExpr::Int(_) => true,
+                IrExpr::Str(sv, _) => sv.trim().parse::<i64>().is_ok(),
+                IrExpr::Var(n, _) => lifted.contains(n.as_str()),
+                IrExpr::Call { func, args } if func == "getVar" => {
+                    matches!(args.as_slice(), [IrExpr::Str(n, _)] if lifted.contains(n.as_str()))
+                }
+                _ => false,
+            });
+            if all_numeric {
+                lifted.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    lifted
+}
+
+
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
+    let lifted = numeric_lift_vars(prog);
+    *LIFTED_NUMERIC.lock().unwrap() = Some(lifted);
+    let mut body: Vec<Stmt> = Vec::new();
+    // `let x = 0` for each lifted numeric variable, at program top. bash
+    // reads an unset var as 0 in arithmetic, so 0 is the right init.
+    for name in LIFTED_NUMERIC.lock().unwrap().as_ref().unwrap().iter() {
+        body.push(Stmt::VariableDeclaration {
+            kind: "let",
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: Expr::Identifier { name: name.clone() },
+                init: Some(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                }),
+            }],
+        });
+    }
+    body.extend(prog.stmts.iter().filter_map(top_stmt_to_estree));
     Program {
         type_: "Program",
         source_type: "module",
-        body: prog.stmts.iter().filter_map(top_stmt_to_estree).collect(),
+        body,
     }
 }
 
@@ -1527,8 +2007,12 @@ fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::While { .. }
         | IrStmt::For { .. }
         | IrStmt::Subshell(_)
-        | IrStmt::Redirect { .. }
-        | IrStmt::Assign { .. } => true,
+        | IrStmt::Redirect { .. } => true,
+        IrStmt::Assign { targets, .. } => {
+            // a native lifted write always succeeds → guard would be wrong
+            // (guard(0) exits under errexit)
+            !targets.iter().any(|t| is_lifted(&t.var) && t.indices.is_empty())
+        }
         _ => false,
     };
     if !guardable {
@@ -1564,6 +2048,36 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         },
         IrStmt::Assign { targets, expr } => {
             let target = &targets[0];
+            if is_lifted(&target.var) && target.indices.is_empty() {
+                // native JS number write — the analysis guarantees a
+                // numeric source with no / or % (no arithEval error path)
+                let right = match expr {
+                    IrExpr::Arith(a) => arith_to_estree(a),
+                    IrExpr::Str(sv, _) => Expr::Literal {
+                        value: serde_json::Value::from(sv.trim().parse::<i64>().unwrap_or(0)),
+                        raw: None,
+                    },
+                    IrExpr::Int(i) => Expr::Literal {
+                        value: serde_json::Value::from(*i),
+                        raw: None,
+                    },
+                    IrExpr::Var(n, _) => Expr::Identifier { name: n.clone() },
+                    IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
+                        [IrExpr::Str(n, _)] => Expr::Identifier { name: n.clone() },
+                        _ => unreachable!("lifted getVar source"),
+                    },
+                    _ => unreachable!("lifted var assigned a non-numeric source"),
+                };
+                return Some(Stmt::ExpressionStatement {
+                    expression: Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(Expr::Identifier {
+                            name: target.var.clone(),
+                        }),
+                        right: Box::new(right),
+                    },
+                });
+            }
             match expr {
                 // arr=(...) / arr+=(...) / x op= v → the helper already sets
                 // the variable itself; emit the call bare.
@@ -1814,7 +2328,13 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             value: v.clone(),
             raw: None,
         },
-        IrExpr::Var(name, _) => sh2_call("getVar", vec![str_lit(name)]),
+        IrExpr::Var(name, _) => {
+            if is_lifted(name) {
+                Expr::Identifier { name: name.clone() }
+            } else {
+                sh2_call("getVar", vec![str_lit(name)])
+            }
+        }
         IrExpr::Ident(name) => Expr::Identifier { name: name.clone() },
         IrExpr::Array(elems) => Expr::ArrayExpression {
             elements: elems.iter().map(|e| Some(expr_to_estree(e))).collect(),
@@ -1827,6 +2347,14 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         },
         IrExpr::Interpolate(parts) => interpolate_to_estree(parts),
         IrExpr::Call { func, args } => {
+            // a read of a lifted numeric variable is a bare JS identifier
+            if func == "getVar" {
+                if let [IrExpr::Str(name, _)] = args.as_slice() {
+                    if is_lifted(name) {
+                        return Expr::Identifier { name: name.clone() };
+                    }
+                }
+            }
             let call = sh2_call(func, args.iter().map(expr_to_estree).collect());
             if is_async_call(func) {
                 await_expr(call)
