@@ -1591,7 +1591,10 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
     ) {
         match e {
             IrExpr::Call { func, args } => {
-                if func != "getVar" {
+                // `test` strings are excluded: the renderer injects lifted
+                // values into them (slice 3), so a lifted var may appear
+                // inside a test expression.
+                if func != "getVar" && func != "test" {
                     // ANY runtime call's string args (recursing into the
                     // Array/[] wrappers exec and setArrayAppend use) may
                     // contain `$var` references the runtime resolves from
@@ -2310,6 +2313,174 @@ fn redirect_spec_to_estree(r: &IrRedirect, persist: bool) -> Expr {
     Expr::ObjectExpression { properties: props }
 }
 
+/// Native lowering for a SIMPLE test expression whose operands are all
+/// lifted numeric variables (or integer literals): `"$count" -lt 100`
+/// becomes `count < 100` — no runtime test-string round-trip. Returns None
+/// for anything else (falls back to the injected template / runtime).
+fn try_native_test(s: &str) -> Option<Expr> {
+    let s = s.trim();
+    let ops: [(&str, &str); 6] = [
+        ("-eq", "==="),
+        ("-ne", "!=="),
+        ("-lt", "<"),
+        ("-le", "<="),
+        ("-gt", ">"),
+        ("-ge", ">="),
+    ];
+    let mut op_pos = None;
+    let mut op_js = "";
+    for (op, js) in ops {
+        // the operator must be a standalone token
+        let pat = format!(" {op} ");
+        if let Some(p) = s.find(&pat) {
+            op_pos = Some(p);
+            op_js = js;
+            break;
+        }
+    }
+    let p = op_pos?;
+    let (lhs, rhs) = (&s[..p], &s[p + 2 + 3..]);
+    fn operand(e: &str) -> Option<Expr> {
+        let e = e.trim();
+        let e = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(e);
+        let e = e.strip_prefix('$').unwrap_or(e);
+        if is_lifted(e) {
+            return Some(Expr::Identifier { name: e.to_string() });
+        }
+        if let Ok(v) = e.parse::<i64>() {
+            return Some(Expr::Literal { value: serde_json::Value::from(v), raw: None });
+        }
+        None
+    }
+    let l = operand(lhs)?;
+    let r = operand(rhs)?;
+    Some(Expr::BinaryExpression {
+        operator: op_js,
+        left: Box::new(l),
+        right: Box::new(r),
+    })
+}
+
+/// Inject lifted-variable VALUES into a test-expression string as a
+/// template literal: `"$count" -lt 100` becomes
+/// `` `"${count}" -lt 100` `` (the runtime still parses the expression, but
+/// the lifted var's value is inlined instead of read from the store, which
+/// it is no longer in). Handles `$name`, `${name}`, and bare names inside
+/// `$(( ... ))` arith regions. Returns None when nothing is injected.
+fn test_str_to_estree(s: &str) -> Option<Expr> {
+    let bytes = s.as_bytes();
+    let mut quasis: Vec<String> = Vec::new();
+    let mut exprs: Vec<Expr> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0usize;
+    let n = bytes.len();
+    let mut changed = false;
+    while i < n {
+        if s[i..].starts_with("$((") {
+            // `$(( ... ))` arith region — inject bare lifted identifiers
+            let mut j = i + 3;
+            let mut depth = 2usize;
+            while j < n && depth > 0 {
+                if bytes[j] == b'(' {
+                    depth += 1;
+                } else if bytes[j] == b')' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                break; // unbalanced — keep the rest literal
+            }
+            let region = &s[i + 3..j - 2];
+            lit.push_str("$((");
+            let rb = region.as_bytes();
+            let mut k = 0usize;
+            while k < rb.len() {
+                let c = rb[k] as char;
+                if (c.is_ascii_alphabetic() || c == '_')
+                    && (k == 0 || !rb[k - 1].is_ascii_alphanumeric())
+                {
+                    let start = k;
+                    while k < rb.len() && (rb[k].is_ascii_alphanumeric() || rb[k] == b'_') {
+                        k += 1;
+                    }
+                    let w = &region[start..k];
+                    if is_lifted(w) {
+                        quasis.push(std::mem::take(&mut lit));
+                        exprs.push(Expr::Identifier { name: w.to_string() });
+                        changed = true;
+                        continue;
+                    }
+                    lit.push_str(w);
+                    continue;
+                }
+                let ch = region[k..].chars().next().unwrap();
+                lit.push(ch);
+                k += ch.len_utf8();
+            }
+            lit.push_str("))");
+            i = j;
+            continue;
+        }
+        if bytes[i] == b'$' && i + 1 < n && bytes[i + 1] == b'{' {
+            if let Some(close) = s[i + 2..].find('}') {
+                let name = &s[i + 2..i + 2 + close];
+                let end = i + 2 + close + 1;
+                if is_lifted(name) {
+                    quasis.push(std::mem::take(&mut lit));
+                    exprs.push(Expr::Identifier { name: name.to_string() });
+                    changed = true;
+                } else {
+                    lit.push_str(&s[i..end]);
+                }
+                i = end;
+                continue;
+            }
+        } else if bytes[i] == b'$' && i + 1 < n {
+            let rest = &s[i + 1..];
+            let name_len = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            if name_len > 0 {
+                let name = &rest[..name_len];
+                if is_lifted(name) {
+                    quasis.push(std::mem::take(&mut lit));
+                    exprs.push(Expr::Identifier { name: name.to_string() });
+                    changed = true;
+                    i += 1 + name_len;
+                    continue;
+                }
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        lit.push(ch);
+        i += ch.len_utf8();
+    }
+    if !changed {
+        return None;
+    }
+    quasis.push(lit);
+    let mut elems: Vec<TemplateElement> = quasis
+        .into_iter()
+        .map(|raw| TemplateElement {
+            type_: "TemplateElement",
+            value: TemplateElementValue {
+                raw,
+                cooked: None,
+            },
+            tail: false,
+        })
+        .collect();
+    if let Some(last) = elems.last_mut() {
+        last.tail = true;
+    }
+    Some(Expr::TemplateLiteral {
+        quasis: elems,
+        expressions: exprs,
+    })
+}
+
 fn expr_to_estree(e: &IrExpr) -> Expr {
     match e {
         IrExpr::Int(i) => Expr::Literal {
@@ -2352,6 +2523,20 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if let [IrExpr::Str(name, _)] = args.as_slice() {
                     if is_lifted(name) {
                         return Expr::Identifier { name: name.clone() };
+                    }
+                }
+            }
+            // test expressions: native comparison when both operands are
+            // lifted; otherwise inject lifted values as a template literal
+            if func == "test" {
+                if let [IrExpr::Str(sv, _)] = args.as_slice() {
+                    if let Some(native) = try_native_test(sv) {
+                        return native;
+                    }
+                    if let Some(tpl) = test_str_to_estree(sv) {
+                        // the injected template is the ARGUMENT to the
+                        // runtime test (a bare template is always truthy)
+                        return sh2_call("test", vec![tpl]);
                     }
                 }
             }
