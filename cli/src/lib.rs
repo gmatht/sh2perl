@@ -13,6 +13,7 @@ pub mod wasi_api;
 
 use std::env;
 use std::fs;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // Use the debug module for controlling DEBUG output
@@ -21,6 +22,28 @@ use debashl::{shared_utils::SharedUtils, Generator, Parser};
 
 // Global flag for --no-magic-numbers
 static NO_MAGIC_NUMBERS: AtomicBool = AtomicBool::new(false);
+
+// Virtual stdin: wasm/JS embedders (node:wasi has no filesystem preopens)
+// feed file content through `debashc_cli_run_with_input`; the CLI's `-`
+// filename convention (file --estree -, file --perl -, file -) reads this
+// when set, else real fd 0. The native CLI never sets it.
+static VIRTUAL_STDIN: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// Set the content `-` resolves to (wasm input injection).
+pub fn set_virtual_stdin(bytes: Vec<u8>) {
+    *VIRTUAL_STDIN.lock().unwrap() = Some(bytes);
+}
+
+/// Clear the virtual stdin override.
+pub fn clear_virtual_stdin() {
+    *VIRTUAL_STDIN.lock().unwrap() = None;
+}
+
+/// Run `f` with the current virtual stdin (if any).
+pub(crate) fn with_virtual_stdin<T>(f: impl FnOnce(Option<&[u8]>) -> T) -> T {
+    let g = VIRTUAL_STDIN.lock().unwrap();
+    f(g.as_deref())
+}
 
 // Import from our new modules
 use crate::cli_commands::{
