@@ -19,8 +19,24 @@ use std::sync::Mutex;
 /// `x = <native expr>` (no `sh2.setVar` + `arithEval`). Reset by
 /// `shir_to_estree` per compilation (the Perl generator never runs this).
 static LIFTED_NUMERIC: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Provably-string variables lifted to native JS string bindings
+/// (`let x = ""`; reads are bare `x`; writes `x = <string expr>`).
+static LIFTED_STRING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Either lift — reads / test-injection / array-element injection consult
+/// both sets.
 fn is_lifted(name: &str) -> bool {
+    is_lifted_num(name) || is_lifted_str(name)
+}
+fn is_lifted_num(name: &str) -> bool {
     LIFTED_NUMERIC
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+fn is_lifted_str(name: &str) -> bool {
+    LIFTED_STRING
         .lock()
         .unwrap()
         .as_ref()
@@ -1363,9 +1379,25 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             raw: None,
         },
         ArithAst::Var(name) => {
-            if is_lifted(name) {
+            if is_lifted_num(name) {
                 // already a JS number — no Number()/||0 coercion needed
                 Expr::Identifier { name: name.clone() }
+            } else if is_lifted_str(name) {
+                // a JS string — bash coerces it in arithmetic (Number(x)||0)
+                Expr::LogicalExpression {
+                    operator: "||",
+                    left: Box::new(Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "Number".to_string(),
+                        }),
+                        arguments: vec![Expr::Identifier { name: name.clone() }],
+                        optional: false,
+                    }),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                    }),
+                }
             } else {
                 Expr::LogicalExpression {
                     operator: "||",
@@ -1493,6 +1525,36 @@ fn is_async_call(name: &str) -> bool {
     )
 }
 
+/// bash special / environment variables the RUNTIME reads from its own
+/// store or process.env (IFS drives field-splitting and joins; PATH feeds
+/// spawned commands; exported vars sync to process.env). Lifting any of
+/// these to a native binding would desync the runtime.
+fn is_reserved_var(name: &str) -> bool {
+    matches!(
+        name,
+        "IFS" | "PATH" | "HOME" | "PWD" | "OLDPWD" | "SHELL" | "USER" | "TERM" | "LANG"
+            | "LC_ALL" | "LC_CTYPE" | "PS1" | "PS2" | "PS3" | "PS4" | "ENV" | "BASH"
+            | "BASH_VERSION" | "RANDOM" | "SECONDS" | "LINENO" | "PPID" | "SHLVL"
+            | "HOSTNAME" | "TMPDIR" | "CDPATH" | "COLUMNS" | "LINES" | "UID" | "EUID"
+            | "GROUPS" | "OPTIND" | "OPTARG" | "REPLY" | "PIPESTATUS" | "FUNCNAME"
+            | "BASH_SOURCE" | "BASH_LINENO" | "BASH_ARGV" | "BASH_ARGC"
+    )
+}
+
+/// JS reserved words — a lifted variable becomes a native binding, and
+/// `let var = 0` (etc.) is a SyntaxError.
+fn is_js_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "var" | "let" | "const" | "function" | "return" | "if" | "else" | "for" | "while"
+            | "do" | "switch" | "case" | "break" | "continue" | "new" | "delete" | "typeof"
+            | "instanceof" | "in" | "of" | "class" | "extends" | "super" | "this" | "null"
+            | "true" | "false" | "undefined" | "NaN" | "Infinity" | "async" | "await"
+            | "yield" | "static" | "import" | "export" | "default" | "try" | "catch"
+            | "finally" | "throw" | "void" | "with" | "debugger" | "enum"
+    )
+}
+
 /// Conservative "always a number" analysis for the ESTree backend.
 ///
 /// bash variables are strings; JS has real numbers. A variable whose every
@@ -1591,10 +1653,11 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
     ) {
         match e {
             IrExpr::Call { func, args } => {
-                // `test` strings are excluded: the renderer injects lifted
-                // values into them (slice 3), so a lifted var may appear
-                // inside a test expression.
-                if func != "getVar" && func != "test" {
+                // `test` / `setArray` / `setArrayAppend` strings are
+                // excluded: the renderer injects lifted values into them,
+                // so a lifted var may appear inside them.
+                if func != "getVar" && func != "test" && func != "setArray" && func != "setArrayAppend"
+                {
                     // ANY runtime call's string args (recursing into the
                     // Array/[] wrappers exec and setArrayAppend use) may
                     // contain `$var` references the runtime resolves from
@@ -1778,6 +1841,13 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 }
                 for r in redirects {
                     walk_expr(&r.target, excluded, string_ctx, in_copy);
+                    if r.interpolate {
+                        // the runtime expandWord's interpolated heredoc
+                        // bodies from the STORE
+                        if let IrExpr::Str(body, _) = &r.target {
+                            mark_string_refs(body, string_ctx);
+                        }
+                    }
                 }
             }
             IrStmt::Case {
@@ -1930,6 +2000,8 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
             if lifted.contains(name)
                 || excluded.contains(name)
                 || string_ctx.contains(name)
+                || is_reserved_var(name)
+                || is_js_keyword(name)
                 || name.contains('[')
                 || name.contains(']')
             {
@@ -1962,11 +2034,13 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
 
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
-    let lifted = numeric_lift_vars(prog);
-    *LIFTED_NUMERIC.lock().unwrap() = Some(lifted);
+    let num = numeric_lift_vars(prog);
+    let str = string_lift_vars(prog, &num);
+    *LIFTED_NUMERIC.lock().unwrap() = Some(num);
+    *LIFTED_STRING.lock().unwrap() = Some(str);
     let mut body: Vec<Stmt> = Vec::new();
-    // `let x = 0` for each lifted numeric variable, at program top. bash
-    // reads an unset var as 0 in arithmetic, so 0 is the right init.
+    // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
+    // reads an unset var as 0 in arithmetic and "" as a string.
     for name in LIFTED_NUMERIC.lock().unwrap().as_ref().unwrap().iter() {
         body.push(Stmt::VariableDeclaration {
             kind: "let",
@@ -1975,6 +2049,19 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
                 id: Expr::Identifier { name: name.clone() },
                 init: Some(Expr::Literal {
                     value: serde_json::Value::from(0),
+                    raw: None,
+                }),
+            }],
+        });
+    }
+    for name in LIFTED_STRING.lock().unwrap().as_ref().unwrap().iter() {
+        body.push(Stmt::VariableDeclaration {
+            kind: "let",
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: Expr::Identifier { name: name.clone() },
+                init: Some(Expr::Literal {
+                    value: serde_json::Value::String(String::new()),
                     raw: None,
                 }),
             }],
@@ -2052,24 +2139,30 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::Assign { targets, expr } => {
             let target = &targets[0];
             if is_lifted(&target.var) && target.indices.is_empty() {
-                // native JS number write — the analysis guarantees a
-                // numeric source with no / or % (no arithEval error path)
+                // native JS write — the analysis guarantees the source kind
                 let right = match expr {
+                    // numeric-lifted source
                     IrExpr::Arith(a) => arith_to_estree(a),
-                    IrExpr::Str(sv, _) => Expr::Literal {
-                        value: serde_json::Value::from(sv.trim().parse::<i64>().unwrap_or(0)),
-                        raw: None,
-                    },
                     IrExpr::Int(i) => Expr::Literal {
                         value: serde_json::Value::from(*i),
                         raw: None,
                     },
+                    IrExpr::Str(sv, _) if is_lifted_num(&target.var) => Expr::Literal {
+                        value: serde_json::Value::from(sv.trim().parse::<i64>().unwrap_or(0)),
+                        raw: None,
+                    },
+                    // string-lifted source
+                    IrExpr::Str(sv, _) => Expr::Literal {
+                        value: serde_json::Value::String(sv.clone()),
+                        raw: None,
+                    },
+                    IrExpr::Interpolate(parts) => interpolate_to_estree(parts),
                     IrExpr::Var(n, _) => Expr::Identifier { name: n.clone() },
                     IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
                         [IrExpr::Str(n, _)] => Expr::Identifier { name: n.clone() },
                         _ => unreachable!("lifted getVar source"),
                     },
-                    _ => unreachable!("lifted var assigned a non-numeric source"),
+                    _ => unreachable!("lifted var assigned an unanalysed source"),
                 };
                 return Some(Stmt::ExpressionStatement {
                     expression: Expr::AssignmentExpression {
@@ -2319,7 +2412,8 @@ fn redirect_spec_to_estree(r: &IrRedirect, persist: bool) -> Expr {
 /// for anything else (falls back to the injected template / runtime).
 fn try_native_test(s: &str) -> Option<Expr> {
     let s = s.trim();
-    let ops: [(&str, &str); 6] = [
+    // numeric ops first (their standalone tokens are unambiguous)
+    let numeric_ops: [(&str, &str); 6] = [
         ("-eq", "==="),
         ("-ne", "!=="),
         ("-lt", "<"),
@@ -2327,38 +2421,108 @@ fn try_native_test(s: &str) -> Option<Expr> {
         ("-gt", ">"),
         ("-ge", ">="),
     ];
-    let mut op_pos = None;
-    let mut op_js = "";
-    for (op, js) in ops {
-        // the operator must be a standalone token
+    let string_ops: [(&str, &str); 3] = [("==", "==="), ("!=", "!=="), ("=", "===")];
+    for (op, js) in numeric_ops {
         let pat = format!(" {op} ");
         if let Some(p) = s.find(&pat) {
-            op_pos = Some(p);
-            op_js = js;
-            break;
+            let (lhs, rhs) = (&s[..p], &s[p + 2 + op.len()..]);
+            // numeric comparison: operands must be numeric-lifted or ints
+            fn num_operand(e: &str) -> Option<Expr> {
+                let e = e.trim();
+                let e = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(e);
+                let e = e.strip_prefix('$').unwrap_or(e);
+                if is_lifted_num(e) {
+                    return Some(Expr::Identifier { name: e.to_string() });
+                }
+                if let Ok(v) = e.parse::<i64>() {
+                    return Some(Expr::Literal { value: serde_json::Value::from(v), raw: None });
+                }
+                None
+            }
+            let l = num_operand(lhs)?;
+            let r = num_operand(rhs)?;
+            return Some(Expr::BinaryExpression {
+                operator: js,
+                left: Box::new(l),
+                right: Box::new(r),
+            });
         }
     }
-    let p = op_pos?;
-    let (lhs, rhs) = (&s[..p], &s[p + 2 + 3..]);
-    fn operand(e: &str) -> Option<Expr> {
+    fn str_operand(e: &str) -> Option<Expr> {
         let e = e.trim();
-        let e = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(e);
-        let e = e.strip_prefix('$').unwrap_or(e);
-        if is_lifted(e) {
-            return Some(Expr::Identifier { name: e.to_string() });
+        if let Some(inner) = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+            let bare = inner.strip_prefix('$').unwrap_or(inner);
+            if is_lifted_str(bare) {
+                return Some(Expr::Identifier { name: bare.to_string() });
+            }
+            if inner.contains('$')
+                || inner.contains('*')
+                || inner.contains('?')
+                || inner.contains('[')
+            {
+                return None;
+            }
+            return Some(Expr::Literal {
+                value: serde_json::Value::String(inner.to_string()),
+                raw: None,
+            });
         }
-        if let Ok(v) = e.parse::<i64>() {
-            return Some(Expr::Literal { value: serde_json::Value::from(v), raw: None });
+        let bare = e.strip_prefix('$').unwrap_or(e);
+        if is_lifted_str(bare) {
+            return Some(Expr::Identifier { name: bare.to_string() });
+        }
+        if !bare.is_empty()
+            && !bare.contains(['*', '?', '[', '$'])
+            && bare
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            return Some(Expr::Literal {
+                value: serde_json::Value::String(bare.to_string()),
+                raw: None,
+            });
         }
         None
     }
-    let l = operand(lhs)?;
-    let r = operand(rhs)?;
-    Some(Expr::BinaryExpression {
-        operator: op_js,
-        left: Box::new(l),
-        right: Box::new(r),
-    })
+    for (op, js) in string_ops {
+        // the parser strips the SPACES around `=`/`==`/`!=` (`"$x"=hello`),
+        // so match the bare operator token outside quoted regions
+        let mut in_q = false;
+        let mut idx = 0usize;
+        let b = s.as_bytes();
+        while idx < b.len() {
+            if b[idx] == b'"' {
+                in_q = !in_q;
+                idx += 1;
+                continue;
+            }
+            if !in_q && s[idx..].starts_with(op) {
+                // `==` must not be consumed as `=`; `=` must not be the
+                // first char of `==`
+                if op == "=" && s[idx..].starts_with("==") {
+                    idx += 1;
+                    continue;
+                }
+                // the operator must not sit inside a quoted region or a
+                // word (`"$x"=a=b` — the first `=` is the operator, the
+                // second sits mid-word)
+                let before = if idx > 0 { b[idx - 1] } else { 0 };
+                let is_op = before == 0 || before == b'"' || before == b' ' || before == b'\'';
+                if is_op {
+                    let (lhs, rhs) = (&s[..idx], &s[idx + op.len()..]);
+                    let l = str_operand(lhs)?;
+                    let r = str_operand(rhs)?;
+                    return Some(Expr::BinaryExpression {
+                        operator: js,
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    });
+                }
+            }
+            idx += 1;
+        }
+    }
+    None
 }
 
 /// Inject lifted-variable VALUES into a test-expression string as a
@@ -2481,6 +2645,457 @@ fn test_str_to_estree(s: &str) -> Option<Expr> {
     })
 }
 
+/// Conservative "always a string" analysis (slice 4). A variable lifts to a
+/// native JS string binding (`let x = ""`) iff every assignment source is a
+/// plain string (a literal, an interpolation, or a copy of another
+/// string-lifted var) — never arithmetic, capture, or a write-builtin — and
+/// it is not already numeric-lifted. String reads inside arithmetic still
+/// work via `(Number(x) || 0)` on the native binding.
+fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<String> {
+    let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    let mut excluded: HashSet<String> = HashSet::new();
+    let mut string_ctx: HashSet<String> = HashSet::new();
+
+    fn is_ident(s: &str) -> bool {
+        let mut cs = s.chars();
+        match cs.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+            _ => false,
+        }
+    }
+    fn mark_string_refs(s: &str, out: &mut HashSet<String>) {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let mut c = bytes[i] as char;
+            if c == '$' {
+                i += 1;
+                if i >= bytes.len() {
+                    break;
+                }
+                c = bytes[i] as char;
+            }
+            let prev_alnum = i > 0 && bytes[i - 1].is_ascii_alphanumeric();
+            if (c.is_ascii_alphabetic() || c == '_') && !prev_alnum {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let w = &s[start..i];
+                if is_ident(w) {
+                    out.insert(w.to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    fn mark_str_args(e: &IrExpr, string_ctx: &mut HashSet<String>) {
+        match e {
+            IrExpr::Str(ss, _) => mark_string_refs(ss, string_ctx),
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    mark_str_args(el, string_ctx);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    mark_str_args(v, string_ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn mark_write_builtin_vars(e: &IrExpr, excluded: &mut HashSet<String>) {
+        match e {
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    mark_write_builtin_vars(el, excluded);
+                }
+            }
+            IrExpr::Str(sv, _) => {
+                let v = sv.split('=').next().unwrap_or("");
+                if is_ident(v) {
+                    excluded.insert(v.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_expr(
+        e: &IrExpr,
+        excluded: &mut HashSet<String>,
+        string_ctx: &mut HashSet<String>,
+        in_copy: bool,
+    ) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func != "getVar" && func != "test" && func != "setArray" && func != "setArrayAppend"
+                {
+                    for a in args {
+                        mark_str_args(a, string_ctx);
+                    }
+                }
+                if func == "exec" {
+                    if let Some(IrExpr::Str(cname, _)) = args.first() {
+                        if matches!(
+                            cname.as_str(),
+                            "read" | "declare" | "typeset" | "local" | "export" | "readonly"
+                                | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source"
+                                | "."
+                        ) {
+                            for a in &args[1..] {
+                                mark_write_builtin_vars(a, excluded);
+                            }
+                        }
+                    }
+                }
+                if matches!(
+                    func.as_str(),
+                    "arrayIndex" | "arrayLen" | "arrayItems" | "arraySlice" | "setArray"
+                        | "setArrayAppend"
+                ) {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        excluded.insert(name.clone());
+                    }
+                }
+                for a in args {
+                    walk_expr(a, excluded, string_ctx, in_copy);
+                }
+            }
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    walk_stmt(st, excluded, string_ctx, in_copy);
+                }
+            }
+            IrExpr::Index { key, .. } => walk_expr(key, excluded, string_ctx, in_copy),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, excluded, string_ctx, in_copy);
+                walk_expr(rhs, excluded, string_ctx, in_copy);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, excluded, string_ctx, in_copy);
+                for a in args {
+                    walk_expr(a, excluded, string_ctx, in_copy);
+                }
+            }
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                walk_expr(cond, excluded, string_ctx, in_copy);
+                walk_expr(then, excluded, string_ctx, in_copy);
+                walk_expr(else_, excluded, string_ctx, in_copy);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, excluded, string_ctx, in_copy);
+                walk_expr(default, excluded, string_ctx, in_copy);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(inner) = p {
+                        walk_expr(inner, excluded, string_ctx, in_copy);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, excluded, string_ctx, in_copy),
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, excluded, string_ctx, in_copy);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, excluded, string_ctx, in_copy);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(
+        st: &IrStmt,
+        excluded: &mut HashSet<String>,
+        string_ctx: &mut HashSet<String>,
+        in_copy: bool,
+    ) {
+        match st {
+            IrStmt::Assign { targets, expr } => {
+                for t in targets {
+                    if t.indices.is_empty() {
+                        if in_copy {
+                            excluded.insert(t.var.clone());
+                        }
+                    } else {
+                        excluded.insert(t.var.clone());
+                    }
+                }
+                walk_expr(expr, excluded, string_ctx, in_copy);
+            }
+            IrStmt::Declare { vars, .. } => {
+                for v in vars {
+                    excluded.insert(v.name.clone());
+                }
+            }
+            IrStmt::DeclareArray { var, .. } => {
+                excluded.insert(var.clone());
+            }
+            IrStmt::For { var, iter, body } => {
+                excluded.insert(var.clone());
+                walk_expr(iter, excluded, string_ctx, in_copy);
+                for b in body {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, excluded, string_ctx, in_copy);
+                for b in body {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_expr(cond, excluded, string_ctx, in_copy);
+                for b in then.iter().chain(else_) {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        walk_stmt(stm, excluded, string_ctx, in_copy);
+                    }
+                }
+            }
+            IrStmt::Exec { cmd, args, capture, env, .. } => {
+                if let Some(c) = capture {
+                    excluded.insert(c.clone());
+                }
+                for (v, _) in env {
+                    excluded.insert(v.clone());
+                }
+                if let IrExpr::Str(cname, _) = cmd {
+                    if matches!(
+                        cname.as_str(),
+                        "read" | "declare" | "typeset" | "local" | "export" | "readonly"
+                            | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source" | "."
+                    ) {
+                        for a in args {
+                            mark_write_builtin_vars(a, excluded);
+                        }
+                    }
+                }
+                walk_expr(cmd, excluded, string_ctx, in_copy);
+                for a in args {
+                    walk_expr(a, excluded, string_ctx, in_copy);
+                }
+            }
+            IrStmt::Pipeline { stages, capture, .. } => {
+                if let Some(c) = capture {
+                    excluded.insert(c.clone());
+                }
+                for stage in stages {
+                    for b in stage {
+                        walk_stmt(b, excluded, string_ctx, in_copy);
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } | IrStmt::Block(body) => {
+                for b in body {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+            }
+            IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                for b in body {
+                    walk_stmt(b, excluded, string_ctx, true);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for b in inner {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+                for r in redirects {
+                    walk_expr(&r.target, excluded, string_ctx, in_copy);
+                    if r.interpolate {
+                        if let IrExpr::Str(body, _) = &r.target {
+                            mark_string_refs(body, string_ctx);
+                        }
+                    }
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                walk_expr(discriminant, excluded, string_ctx, in_copy);
+                for c in clauses {
+                    for p in &c.patterns {
+                        mark_string_refs(p, string_ctx);
+                    }
+                    for b in &c.body {
+                        walk_stmt(b, excluded, string_ctx, in_copy);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, excluded, string_ctx, in_copy),
+            IrStmt::Output { value, .. } => walk_expr(value, excluded, string_ctx, in_copy),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, excluded, string_ctx, in_copy);
+                walk_expr(content, excluded, string_ctx, in_copy);
+            }
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => {
+                walk_expr(e, excluded, string_ctx, in_copy)
+            }
+            IrStmt::SetChildError(e) => walk_expr(e, excluded, string_ctx, in_copy),
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                walk_expr(expr, excluded, string_ctx, in_copy)
+            }
+            _ => {}
+        }
+    }
+    for st in &prog.stmts {
+        walk_stmt(st, &mut excluded, &mut string_ctx, false);
+    }
+
+    fn collect_assigns(st: &IrStmt, assigns: &mut HashMap<String, Vec<IrExpr>>) {
+        match st {
+            IrStmt::Assign { targets, expr } => {
+                for t in targets {
+                    if t.indices.is_empty() {
+                        assigns
+                            .entry(t.var.clone())
+                            .or_default()
+                            .push(expr.clone());
+                    }
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    collect_assigns(b, assigns);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        collect_assigns(stm, assigns);
+                    }
+                }
+            }
+            IrStmt::For { body, .. } => {
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+            }
+            IrStmt::Exec { args, .. } => {
+                for a in args {
+                    collect_expr_assigns(a, assigns);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        collect_assigns(b, assigns);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    collect_assigns(b, assigns);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        collect_assigns(b, assigns);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => collect_expr_assigns(e, assigns),
+            IrStmt::Output { value, .. } => collect_expr_assigns(value, assigns),
+            _ => {}
+        }
+    }
+    fn collect_expr_assigns(e: &IrExpr, assigns: &mut HashMap<String, Vec<IrExpr>>) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    collect_assigns(st, assigns);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_expr_assigns(a, assigns);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    collect_expr_assigns(el, assigns);
+                }
+            }
+            _ => {}
+        }
+    }
+    for st in &prog.stmts {
+        collect_assigns(st, &mut assigns);
+    }
+
+    let mut lifted: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (name, exprs) in &assigns {
+            if lifted.contains(name)
+                || numeric.contains(name)
+                || excluded.contains(name)
+                || string_ctx.contains(name)
+                || is_reserved_var(name)
+                || is_js_keyword(name)
+                || name.contains('[')
+                || name.contains(']')
+            {
+                continue;
+            }
+            let all_string = exprs.iter().all(|e| match e {
+                IrExpr::Str(_, _) => true,
+                IrExpr::Interpolate(_) => true,
+                IrExpr::Var(n, _) => lifted.contains(n.as_str()),
+                IrExpr::Call { func, args } if func == "getVar" => {
+                    matches!(args.as_slice(), [IrExpr::Str(n, _)] if lifted.contains(n.as_str()))
+                }
+                _ => false,
+            });
+            if all_string {
+                lifted.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    lifted
+}
+
+
+/// Render a setArray/setArrayAppend argument: Str elements with lifted
+/// `$var` references become template literals with the values inlined (the
+/// runtime would otherwise read them from the STORE, which lifted vars are
+/// no longer in). Arrays recurse; everything else lowers normally.
+fn array_elt_to_estree(e: &IrExpr) -> Expr {
+    match e {
+        IrExpr::Str(sv, _) => {
+            if let Some(tpl) = test_str_to_estree(sv) {
+                tpl
+            } else {
+                expr_to_estree(e)
+            }
+        }
+        IrExpr::Array(elems) => Expr::ArrayExpression {
+            elements: elems.iter().map(|el| Some(array_elt_to_estree(el))).collect(),
+        },
+        _ => expr_to_estree(e),
+    }
+}
+
 fn expr_to_estree(e: &IrExpr) -> Expr {
     match e {
         IrExpr::Int(i) => Expr::Literal {
@@ -2518,6 +3133,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         },
         IrExpr::Interpolate(parts) => interpolate_to_estree(parts),
         IrExpr::Call { func, args } => {
+            // setArray/setArrayAppend ELEMENT strings are expandWord'd by
+            // the runtime from the STORE — inject lifted values as template
+            // literals (the parser keeps elements as raw text, so
+            // `["$candidate"]` must inline candidate's value).
+            let mapped_args: Vec<Expr> = if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                args.iter().map(array_elt_to_estree).collect()
+            } else {
+                args.iter().map(expr_to_estree).collect()
+            };
             // a read of a lifted numeric variable is a bare JS identifier
             if func == "getVar" {
                 if let [IrExpr::Str(name, _)] = args.as_slice() {
@@ -2540,7 +3164,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
-            let call = sh2_call(func, args.iter().map(expr_to_estree).collect());
+            let call = sh2_call(func, mapped_args);
             if is_async_call(func) {
                 await_expr(call)
             } else {
