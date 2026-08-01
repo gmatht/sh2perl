@@ -92,7 +92,7 @@ fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
             expr: assignment_value_ir(a),
         },
         Command::If(if_stmt) => IrStmt::If {
-            cond: command_to_ir(&if_stmt.condition),
+            cond: command_to_test_ir(&if_stmt.condition),
             then: body_stmts(&if_stmt.then_branch),
             elsifs: vec![],
             else_: if_stmt
@@ -103,7 +103,7 @@ fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
         },
         Command::Case(c) => case_to_ir(c),
         Command::While(w) => {
-            let cond = command_to_ir(&w.condition);
+            let cond = command_to_test_ir(&w.condition);
             IrStmt::While {
                 cond: if w.is_until {
                     not_ir(cond)
@@ -530,6 +530,116 @@ fn case_to_ir(c: &CaseStatement) -> IrStmt {
             })
             .collect(),
     }
+}
+
+/// Test-position command lowering (if/while/until conds): lifts the
+/// `echo X | grep P >/dev/null 2>/dev/null` idiom — a substring test that
+/// currently spawns echo+grep per evaluation — into a plain substring
+/// compare (`Call "contains"`). Non-matching commands lower exactly as
+/// `command_to_ir` would. Only fired in TEST position because that is the
+/// one context where the pipeline's exit status is consumed by control
+/// flow rather than read back through `$?` (`&&`/`||` operands and
+/// statement-position pipelines keep their status semantics).
+fn command_to_test_ir(cmd: &Command) -> IrExpr {
+    let ir = command_to_ir(cmd);
+    try_lift_grep_contains(&ir).unwrap_or(ir)
+}
+
+/// `echo <arg> | grep <literal> >/dev/null 2>/dev/null` → `contains(arg,
+/// literal)`. grep's exit status with both streams discarded is exactly
+/// "does the line contain the literal pattern"; `echo <arg>` emits one
+/// line, so the lift is a plain substring test. Conservative: only plain
+/// literal patterns free of BRE metacharacters (`^ $ . [ ] * \`), no grep
+/// flags, echo with exactly one argument, both fds redirected to
+/// /dev/null, exactly two pipeline stages.
+fn try_lift_grep_contains(cond: &IrExpr) -> Option<IrExpr> {
+    let IrExpr::Call { func, args } = cond else { return None };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else { return None };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    // stage 1: exec("echo", [arg])
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if f1 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
+        return None;
+    };
+    if name1 != "echo" || echo_args.len() != 1 {
+        return None;
+    }
+    let arg = echo_args[0].clone();
+    // stage 2: Expr(Call("redirect", [Arrow([exec grep]), Array([spec...])]))
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "redirect" {
+        return None;
+    }
+    let [IrExpr::Arrow(inner), IrExpr::Array(redirect_specs)] = a2.as_slice() else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func: f3, args: a3 })] = inner.as_slice() else {
+        return None;
+    };
+    if f3 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name2, _), IrExpr::Array(grep_args)] = a3.as_slice() else {
+        return None;
+    };
+    if name2 != "grep" {
+        return None;
+    }
+    let [IrExpr::Str(pat, _)] = grep_args.as_slice() else { return None };
+    if !is_safe_grep_literal(pat) {
+        return None;
+    }
+    // both fds discarded to /dev/null (redirect-spec objects)
+    let (mut out, mut err) = (false, false);
+    for spec in redirect_specs {
+        let IrExpr::Object(entries) = spec else { continue };
+        let (mut fd, mut mode, mut target) = (None, None, None);
+        for (k, v) in entries {
+            match (k.as_str(), v) {
+                ("fd", IrExpr::Int(f)) => fd = Some(*f),
+                ("mode", IrExpr::Str(m, _)) => mode = Some(m.as_str()),
+                ("target", IrExpr::Str(t, _)) => target = Some(t.as_str()),
+                _ => {}
+            }
+        }
+        if mode == Some("w") && target == Some("/dev/null") {
+            match fd {
+                Some(1) => out = true,
+                Some(2) => err = true,
+                _ => {}
+            }
+        }
+    }
+    if !(out && err) {
+        return None;
+    }
+    Some(call(
+        "contains",
+        vec![arg, IrExpr::Str(pat.clone(), StrStyle::SingleQuoted)],
+    ))
+}
+
+/// A grep pattern is liftable to a JS substring check only when grep would
+/// treat it as a literal: no BRE metacharacters (`^ $ . [ ] * \`), no
+/// leading `-` (would parse as an option). BRE treats `+ ? ( ) { } |` as
+/// literals, so they are safe.
+fn is_safe_grep_literal(pat: &str) -> bool {
+    !pat.starts_with('-') && !pat.chars().any(|c| matches!(c, '^' | '$' | '.' | '[' | ']' | '*' | '\\'))
 }
 
 fn command_to_ir(cmd: &Command) -> IrExpr {
@@ -3169,6 +3279,30 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if is_lifted(name) {
                         return Expr::Identifier { name: name.clone() };
                     }
+                }
+            }
+            // `echo X | grep PAT` lowers to a `contains` call — the runtime
+            // impl is String(h).includes(n), so emit it NATIVE (no dispatch)
+            if func == "contains" {
+                if let [h, n] = args.as_slice() {
+                    return Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::CallExpression {
+                                callee: Box::new(Expr::Identifier {
+                                    name: "String".to_string(),
+                                }),
+                                arguments: vec![expr_to_estree(h)],
+                                optional: false,
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "includes".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![expr_to_estree(n)],
+                        optional: false,
+                    };
                 }
             }
             // test expressions: native comparison when both operands are
