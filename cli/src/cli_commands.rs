@@ -416,8 +416,28 @@ pub fn parse_file_to_perl(filename: &str) {
 /// Parse a shell file and emit **standard ESTree JSON** (v0 backend,
 /// `sh2.*` runtime namespace — see src/estree.rs / PLAN.md §1.2).
 pub fn parse_file_to_estree(filename: &str) {
-    match fs::read_to_string(filename) {
-        Ok(content) => {
+    match fs::read(filename) {
+        Ok(bytes) => {
+            // bash reads the source as raw bytes and passes non-UTF-8 bytes
+            // through unchanged (utf8-non-utf8-content.sh: a lone Latin-1
+            // byte). fs::read_to_string would reject such files, so decode
+            // byte-preservingly: valid UTF-8 as-is; otherwise map bytes
+            // >= 0x80 to U+F800+byte private-use chars, which the emitter
+            // (src/estree.rs map_raw_bytes) turns into raw-byte markers the
+            // runtime writes back byte-for-byte.
+            let content = match String::from_utf8(bytes.clone()) {
+                Ok(s) => s,
+                Err(_) => bytes
+                    .iter()
+                    .map(|&b| {
+                        if b < 0x80 {
+                            b as char
+                        } else {
+                            char::from_u32(0xF800 + b as u32).unwrap_or('\u{FFFD}')
+                        }
+                    })
+                    .collect(),
+            };
             let commands = match Parser::new(&content).parse() {
                 Ok(c) => c,
                 Err(e) => {

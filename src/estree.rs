@@ -239,6 +239,34 @@ fn fix_control_flow(prog: Program) -> Program {
 /// enclosing FUNCTION, which in generated JS is a loop-body arrow the
 /// runtime must unwind via the RETURN signal); `in_switch` — directly
 /// inside a switch-case consequent (native break is legal there).
+// ── raw-byte preservation (non-UTF-8 sources) ───────────────────────
+//
+// The CLI decodes non-UTF-8 source bytes (>= 0x80) to U+F800+byte private-
+// use chars before parsing (see cli/src/cli_commands.rs parse_file_to_estree).
+// bash passes those bytes through unchanged, so the emitted strings map them
+// to a `\x01SH2BYTE\x01<HEX>\x01` marker; the runtime's emit()/writeFileSync
+// decode the marker back into the raw byte, so stdout matches bash
+// byte-for-byte.
+const RAW_BYTE_MAGIC: &str = "\u{1}SH2BYTE\u{1}";
+
+fn map_raw_bytes(s: &str) -> String {
+    if !s.chars().any(|c| (0xF800..=0xF8FF).contains(&(c as u32))) {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for c in s.chars() {
+        let u = c as u32;
+        if (0xF800..=0xF8FF).contains(&u) {
+            out.push_str(RAW_BYTE_MAGIC);
+            out.push_str(&format!("{:02X}", (u - 0xF800) as u8));
+            out.push('\u{1}');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Option<Stmt> {
     Some(match stmt {
         Stmt::BreakStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
@@ -419,8 +447,25 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func)))
                 .collect(),
         },
+        Expr::Literal { value, raw } => Expr::Literal {
+            value: match value {
+                serde_json::Value::String(s) => serde_json::Value::String(map_raw_bytes(&s)),
+                other => other,
+            },
+            raw,
+        },
         Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
-            quasis,
+            quasis: quasis
+                .into_iter()
+                .map(|q| TemplateElement {
+                    type_: q.type_,
+                    value: TemplateElementValue {
+                        raw: map_raw_bytes(&q.value.raw),
+                        cooked: q.value.cooked.map(|c| map_raw_bytes(&c)),
+                    },
+                    tail: q.tail,
+                })
+                .collect(),
             expressions: expressions
                 .into_iter()
                 .map(|e| fix_expr(e, in_arrow, in_func))
