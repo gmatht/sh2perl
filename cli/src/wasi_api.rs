@@ -154,6 +154,42 @@ pub extern "C" fn debashc_cli_run_json(input: *const u8, input_len: usize) -> *m
     }
 }
 
+/// `debashc_cli_run_with_input(argc, argv, input, input_len) -> *mut u8` —
+/// like `debashc_cli_run`, but the file commands read the script content
+/// from `input` instead of the filesystem. Pass `-` as the filename
+/// (`["debashc","file","--estree","-"]`): the CLI's `-` convention
+/// resolves to this buffer (virtual stdin). This is how JS drives
+/// `file --estree`/`file --perl` under `node:wasi`, which has no
+/// filesystem preopens — the embedder reads the .sh with its own fs and
+/// passes the bytes alongside the argv.
+#[no_mangle]
+pub extern "C" fn debashc_cli_run_with_input(
+    argc: usize,
+    argv: *const *const u8,
+    input: *const u8,
+    input_len: usize,
+) -> *mut u8 {
+    if argc == 0 || argv.is_null() {
+        return alloc_string(&err_json(&"debashc_cli_run_with_input: no argv provided"));
+    }
+    if input.is_null() || input_len == 0 {
+        return alloc_string(&err_json(&"debashc_cli_run_with_input: no input"));
+    }
+    let mut args = Vec::with_capacity(argc);
+    for i in 0..argc {
+        // Safety: embedder contract — argv[i] is a valid pointer to a
+        // NUL-terminated string for 0 <= i < argc.
+        let s = unsafe { CStr::from_ptr(*argv.add(i) as *const i8) };
+        args.push(s.to_string_lossy().into_owned());
+    }
+    // Safety: embedder contract — input points at input_len valid bytes.
+    let input = unsafe { slice::from_raw_parts(input, input_len) };
+    crate::set_virtual_stdin(input.to_vec());
+    main_with_args(args);
+    crate::clear_virtual_stdin();
+    alloc_string(&ok_json(0))
+}
+
 /// `debashc_str_len(ptr) -> u32` — payload length in bytes (excludes NUL).
 #[no_mangle]
 pub extern "C" fn debashc_str_len(ptr: *const u8) -> u32 {

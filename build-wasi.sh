@@ -73,6 +73,8 @@ Usage:
 
   # as a WASM library with FULL CLI processing: instantiate debashcl.wasm and call
   #   debashc_cli_run(argc, argv) / debashc_cli_run_json(json_args, len)
+  #   debashc_cli_run_with_input(argc, argv, input, len)  # file cmds via stdin `-`
   # (JSON envelope {"ok":true,"exit":0}; CLI output on the wasi stdout stream)
-  # demo: node cli/example-wasi.mjs parse 'echo hi'
+  # demos: node cli/example-wasi.mjs parse 'echo hi'
+  #        node cli/example-wasi-file.mjs examples/001_simple.sh --estree
 EOF
