@@ -74,14 +74,31 @@ fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
     }
 }
 
+/// Convert a parsed `$`-expansion word into interpolation parts. Every shape
+/// parse_variable_expansion can return maps to a StringPart — a missed shape
+/// would silently DISCARD the consumed expansion (a value-losing bug), so the
+/// match must be exhaustive over Word.
+fn expansion_into_parts(expansion: Word) -> Option<Vec<StringPart>> {
+    match expansion {
+        Word::Variable(name, _, _) => Some(vec![StringPart::Variable(name)]),
+        Word::ParameterExpansion(pe, _) => Some(vec![StringPart::ParameterExpansion(pe)]),
+        Word::MapAccess(name, key, _) => Some(vec![StringPart::MapAccess(name, key)]),
+        Word::MapKeys(name, _) => Some(vec![StringPart::MapKeys(name)]),
+        Word::MapLength(name, _) => Some(vec![StringPart::MapLength(name)]),
+        Word::ArraySlice(name, offset, len, _) => Some(vec![StringPart::ArraySlice(name, offset, len)]),
+        Word::Arithmetic(a, _) => Some(vec![StringPart::Arithmetic(a)]),
+        Word::CommandSubstitution(c, _) => Some(vec![StringPart::CommandSubstitution(c)]),
+        Word::StringInterpolation(interp, _) => Some(interp.parts),
+        _ => None,
+    }
+}
+
 /// Merge a parsed `$`-expansion word into the current word as interpolation
 /// parts: `x` + `$var` -> StringInterpolation[Literal("x"), Variable("var")].
 /// Returns false when the shapes can't be merged (caller breaks the loop).
 fn merge_expansion_into_word(word: &mut Word, expansion: Word) -> bool {
-    let parts: Vec<StringPart> = match expansion {
-        Word::Variable(name, _, _) => vec![StringPart::Variable(name)],
-        Word::StringInterpolation(interp, _) => interp.parts,
-        _ => return false,
+    let Some(parts) = expansion_into_parts(expansion) else {
+        return false;
     };
     match word {
         Word::Literal(s, _) => {
