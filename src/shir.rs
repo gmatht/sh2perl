@@ -1665,6 +1665,407 @@ fn is_js_keyword(name: &str) -> bool {
     )
 }
 
+/// Is a for-loop ITERATION provably numeric? Some(true) = all items are
+/// numeric (brace ranges, numeric arrays, Range); Some(false) = known
+/// strings; None = unknown (command substitution, $@, ...).
+fn iter_numeric(e: &IrExpr) -> Option<bool> {
+    /// the brace items arrive as a Json value: nested arrays of range
+    /// objects (`{1..5}`) or literal strings (`{a,b}`)
+    fn json_items_numeric(v: &serde_json::Value, found: &mut bool) {
+        match v {
+            serde_json::Value::Array(a) => {
+                for x in a {
+                    json_items_numeric(x, found);
+                }
+            }
+            serde_json::Value::Object(o) => {
+                if !o.contains_key("range") {
+                    *found = false;
+                }
+            }
+            serde_json::Value::String(sv) => {
+                if sv.trim().parse::<i64>().is_err() {
+                    *found = false;
+                }
+            }
+            _ => *found = false,
+        }
+    }
+    fn brace_numeric(args: &[IrExpr]) -> Option<bool> {
+        for a in args {
+            if let IrExpr::Json(v) = a {
+                let mut numeric = true;
+                json_items_numeric(v, &mut numeric);
+                return Some(numeric);
+            }
+        }
+        None
+    }
+    match e {
+        IrExpr::Range { .. } => Some(true),
+        // the merged for-items shape: `Array([brace(...)])` for `{1..3}`,
+        // or `Array([Str("1"), Str("2"), ...])` for `1 2 3`
+        IrExpr::Array(elems) => {
+            let mut numeric = true;
+            let mut known = true;
+            for el in elems {
+                match el {
+                    IrExpr::Str(sv, _) => {
+                        if sv.trim().parse::<i64>().is_err() {
+                            numeric = false;
+                        }
+                    }
+                    IrExpr::Call { func, args } if func == "brace" => match brace_numeric(args) {
+                        Some(true) => {}
+                        Some(false) => numeric = false,
+                        None => known = false,
+                    },
+                    _ => known = false,
+                }
+            }
+            if known {
+                Some(numeric)
+            } else {
+                None
+            }
+        }
+        IrExpr::Call { func, args } if func == "brace" => brace_numeric(args),
+        _ => None,
+    }
+}
+
+/// All for-loop statements' (var, iter) pairs, recursively.
+fn collect_for_iters(prog: &IrProgram) -> HashMap<String, IrExpr> {
+    fn walk_stmt(st: &IrStmt, out: &mut HashMap<String, IrExpr>) {
+        match st {
+            IrStmt::For { var, iter, body } => {
+                out.insert(var.clone(), iter.clone());
+                for b in body {
+                    walk_stmt(b, out);
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                for b in body {
+                    walk_stmt(b, out);
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    walk_stmt(b, out);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        walk_stmt(stm, out);
+                    }
+                }
+            }
+            IrStmt::Exec { args, .. } => {
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        walk_stmt(b, out);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    walk_stmt(b, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        walk_stmt(b, out);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, out),
+            IrStmt::Output { value, .. } => walk_expr(value, out),
+            _ => {}
+        }
+    }
+    fn walk_expr(e: &IrExpr, out: &mut HashMap<String, IrExpr>) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    walk_stmt(st, out);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashMap::new();
+    for st in &prog.stmts {
+        walk_stmt(st, &mut out);
+    }
+    out
+}
+
+/// A lifted FOR-loop variable must be referenced ONLY inside its own loop
+/// body: the closure param shadows the module `let` and the store sync is
+/// dropped, so any read/write after the loop sees the stale initial value.
+/// Remove from both lift sets any loop var referenced outside its loop.
+fn drop_externally_referenced_loop_vars(
+    prog: &IrProgram,
+    num: &HashSet<String>,
+    str: &HashSet<String>,
+) -> (HashSet<String>, HashSet<String>) {
+    let mut for_vars: HashSet<String> = HashSet::new();
+    fn collect_for_vars(st: &IrStmt, out: &mut HashSet<String>) {
+        match st {
+            IrStmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                for b in body {
+                    collect_for_vars(b, out);
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                for b in body {
+                    collect_for_vars(b, out);
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    collect_for_vars(b, out);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        collect_for_vars(stm, out);
+                    }
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        collect_for_vars(b, out);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    collect_for_vars(b, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        collect_for_vars(b, out);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => collect_for_vars_expr(e, out),
+            _ => {}
+        }
+    }
+    fn collect_for_vars_expr(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    collect_for_vars(st, out);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_for_vars_expr(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for st in &prog.stmts {
+        collect_for_vars(st, &mut for_vars);
+    }
+
+    // every reference to a var, tagged with the enclosing For-var stack
+    let mut external: HashSet<String> = HashSet::new();
+    fn ref_expr(e: &IrExpr, stack: &[String], external: &mut HashSet<String>) {
+        match e {
+            IrExpr::Var(n, _) => {
+                if !stack.contains(&n.clone()) {
+                    external.insert(n.clone());
+                }
+            }
+            IrExpr::Call { func, args } => {
+                if func == "getVar" {
+                    if let [IrExpr::Str(n, _)] = args.as_slice() {
+                        if !stack.contains(n) {
+                            external.insert(n.clone());
+                        }
+                    }
+                }
+                if func == "setVar" {
+                    if let [IrExpr::Str(n, _), ..] = args.as_slice() {
+                        if !stack.contains(n) {
+                            external.insert(n.clone());
+                        }
+                    }
+                }
+                for a in args {
+                    ref_expr(a, stack, external);
+                }
+            }
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    ref_stmt(st, stack, external);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                ref_expr(lhs, stack, external);
+                ref_expr(rhs, stack, external);
+            }
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                ref_expr(cond, stack, external);
+                ref_expr(then, stack, external);
+                ref_expr(else_, stack, external);
+            }
+            IrExpr::Capture { expr, .. } => ref_expr(expr, stack, external),
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    ref_expr(el, stack, external);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(inner) = p {
+                        ref_expr(inner, stack, external);
+                    }
+                }
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                ref_expr(expr, stack, external);
+                ref_expr(default, stack, external);
+            }
+            IrExpr::Index { key, .. } => ref_expr(key, stack, external),
+            IrExpr::MethodCall { obj, args, .. } => {
+                ref_expr(obj, stack, external);
+                for a in args {
+                    ref_expr(a, stack, external);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    ref_expr(v, stack, external);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn ref_stmt(st: &IrStmt, stack: &[String], external: &mut HashSet<String>) {
+        match st {
+            IrStmt::For { var, iter, body } => {
+                let mut s2 = stack.to_vec();
+                s2.push(var.clone());
+                ref_expr(iter, &s2, external);
+                for b in body {
+                    ref_stmt(b, &s2, external);
+                }
+            }
+            IrStmt::Assign { targets, expr } => {
+                for t in targets {
+                    if !stack.contains(&t.var) {
+                        external.insert(t.var.clone());
+                    }
+                }
+                ref_expr(expr, stack, external);
+            }
+            IrStmt::Declare { vars, .. } => {
+                for v in vars {
+                    if !stack.contains(&v.name) {
+                        external.insert(v.name.clone());
+                    }
+                }
+            }
+            IrStmt::While { cond, body, .. }
+            | IrStmt::DoWhile { cond, body, .. } => {
+                ref_expr(cond, stack, external);
+                for b in body {
+                    ref_stmt(b, stack, external);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                ref_expr(cond, stack, external);
+                for b in then.iter().chain(else_) {
+                    ref_stmt(b, stack, external);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        ref_stmt(stm, stack, external);
+                    }
+                }
+            }
+            IrStmt::Exec { cmd, args, .. } => {
+                ref_expr(cmd, stack, external);
+                for a in args {
+                    ref_expr(a, stack, external);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        ref_stmt(b, stack, external);
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } | IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                for b in body {
+                    ref_stmt(b, stack, external);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for b in inner {
+                    ref_stmt(b, stack, external);
+                }
+                for r in redirects {
+                    ref_expr(&r.target, stack, external);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                ref_expr(discriminant, stack, external);
+                for c in clauses {
+                    for b in &c.body {
+                        ref_stmt(b, stack, external);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => ref_expr(e, stack, external),
+            IrStmt::Output { value, .. } => ref_expr(value, stack, external),
+            _ => {}
+        }
+    }
+    for st in &prog.stmts {
+        ref_stmt(st, &[], &mut external);
+    }
+
+    let mut num2 = num.clone();
+    let mut str2 = str.clone();
+    for v in &for_vars {
+        if external.contains(v) {
+            num2.remove(v);
+            str2.remove(v);
+        }
+    }
+    (num2, str2)
+}
+
 /// Conservative "always a number" analysis for the ESTree backend.
 ///
 /// bash variables are strings; JS has real numbers. A variable whose every
@@ -1867,7 +2268,10 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 excluded.insert(var.clone());
             }
             IrStmt::For { var, iter, body } => {
-                excluded.insert(var.clone());
+                // NOTE: the loop var is NOT excluded here — the loop
+                // iteration is its assignment source (see collect_for_iters
+                // + the fixpoint); external references are removed by
+                // drop_externally_referenced_loop_vars afterwards.
                 walk_expr(iter, excluded, string_ctx, in_copy);
                 for b in body {
                     walk_stmt(b, excluded, string_ctx, in_copy);
@@ -2029,7 +2433,9 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                     }
                 }
             }
-            IrStmt::For { body, .. } => {
+            IrStmt::For { var, body, .. } => {
+                // the loop iteration is a source even with no body writes
+                assigns.entry(var.clone()).or_default();
                 for b in body {
                     collect_assigns(b, assigns);
                 }
@@ -2103,6 +2509,7 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
 
     // fixpoint: a var is liftable when ALL its assignment sources are
     // numeric (arith without / %, numeric literal, or another lifted var).
+    let for_iters = collect_for_iters(prog);
     let mut lifted: HashSet<String> = HashSet::new();
     loop {
         let mut changed = false;
@@ -2129,7 +2536,7 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                     matches!(args.as_slice(), [IrExpr::Str(n, _)] if lifted.contains(n.as_str()))
                 }
                 _ => false,
-            });
+            }) && for_iters.get(name).map_or(true, |it| iter_numeric(it) == Some(true));
             if all_numeric {
                 lifted.insert(name.clone());
                 changed = true;
@@ -2144,8 +2551,11 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
 
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
-    let num = numeric_lift_vars(prog);
-    let str = string_lift_vars(prog, &num);
+    let (num, str) = drop_externally_referenced_loop_vars(
+        prog,
+        &numeric_lift_vars(prog),
+        &string_lift_vars(prog, &numeric_lift_vars(prog)),
+    );
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
     let mut body: Vec<Stmt> = Vec::new();
@@ -2272,6 +2682,17 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         [IrExpr::Str(n, _)] => Expr::Identifier { name: n.clone() },
                         _ => unreachable!("lifted getVar source"),
                     },
+                    // the for-loop numeric coercion (`i = Number(i)`)
+                    IrExpr::Call { func, args } if func == "Number" => match args.as_slice() {
+                        [IrExpr::Ident(n)] => Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "Number".to_string(),
+                            }),
+                            arguments: vec![Expr::Identifier { name: n.clone() }],
+                            optional: false,
+                        },
+                        _ => unreachable!("lifted Number source"),
+                    },
                     _ => unreachable!("lifted var assigned an unanalysed source"),
                 };
                 return Some(Stmt::ExpressionStatement {
@@ -2366,14 +2787,33 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::For { var, iter, body } => {
             let js_var = safe_ident(var);
-            let mut body_stmts = vec![IrStmt::Assign {
-                targets: vec![AssignTarget {
-                    var: var.clone(),
-                    sigil: None,
-                    indices: vec![],
-                }],
-                expr: IrExpr::Ident(js_var.clone()),
-            }];
+            let mut body_stmts = vec![];
+            if is_lifted_num(var) {
+                // the forLoop items arrive as strings; coerce the param to
+                // a number in place (the closure param shadows the module
+                // let — a self-assign is exactly the coercion we want)
+                body_stmts.push(IrStmt::Assign {
+                    targets: vec![AssignTarget {
+                        var: var.clone(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Call {
+                        func: "Number".to_string(),
+                        args: vec![IrExpr::Ident(js_var.clone())],
+                    },
+                });
+            } else if !is_lifted(var) {
+                // store sync (non-lifted loop var)
+                body_stmts.push(IrStmt::Assign {
+                    targets: vec![AssignTarget {
+                        var: var.clone(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Ident(js_var.clone()),
+                });
+            }
             body_stmts.extend(body.clone());
             Stmt::ExpressionStatement {
                 expression: await_call(
@@ -2970,7 +3410,10 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                 excluded.insert(var.clone());
             }
             IrStmt::For { var, iter, body } => {
-                excluded.insert(var.clone());
+                // NOTE: the loop var is NOT excluded here — the loop
+                // iteration is its assignment source (see collect_for_iters
+                // + the fixpoint); external references are removed by
+                // drop_externally_referenced_loop_vars afterwards.
                 walk_expr(iter, excluded, string_ctx, in_copy);
                 for b in body {
                     walk_stmt(b, excluded, string_ctx, in_copy);
@@ -3112,7 +3555,9 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                     }
                 }
             }
-            IrStmt::For { body, .. } => {
+            IrStmt::For { var, body, .. } => {
+                // the loop iteration is a source even with no body writes
+                assigns.entry(var.clone()).or_default();
                 for b in body {
                     collect_assigns(b, assigns);
                 }
