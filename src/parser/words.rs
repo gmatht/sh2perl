@@ -2928,11 +2928,11 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                             None,
                         ))
                     } else {
-                        // If multiple commands, wrap in a pipeline or use the first one
-                        Ok(Word::CommandSubstitution(
-                            Box::new(commands[0].clone()),
-                            None,
-                        ))
+                        // Multiple commands: wrap in a Block so the whole
+                        // body runs (a `$(cmd1\ncmd2)` substitution captures
+                        // both — parse-dollar-paren-pipe.sh).
+                        let block = crate::ast::Block { commands };
+                        Ok(Word::CommandSubstitution(Box::new(crate::ast::Command::Block(block)), None))
                     }
                 }
                 Err(_) => {
@@ -3182,11 +3182,38 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
                 if paren_count == 0 {
                     let cmd_content = &content[cmd_start..i - 1];
-                    if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content)
-                    {
-                        parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
-                    } else {
-                        parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                    // Multi-command `$(cmd1\ncmd2)` bodies: the pipeline
+                    // parser silently drops everything after the first
+                    // pipeline (parse-dollar-paren-pipe.sh). Try the full
+                    // parser FIRST only when the pipeline parse did not
+                    // consume the whole text — a `$(( expr ))` mis-read
+                    // (`$( ( expr ) )`) must keep the pipeline-parsed padded
+                    // command shape the lowering recovers as arithmetic
+                    // (parse-paren-close.sh).
+                    match crate::parser::commands::parse_pipeline_from_text_with_rest(cmd_content) {
+                        Ok((cmd, true)) => {
+                            parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
+                        }
+                        Ok((_, false)) | Err(_) => {
+                            if let Ok(cmds) =
+                                crate::parser::commands::parse_commands_from_text(cmd_content)
+                            {
+                                if cmds.is_empty() {
+                                    parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                                } else if cmds.len() == 1 {
+                                    parts.push(StringPart::CommandSubstitution(Box::new(
+                                        cmds.into_iter().next().unwrap(),
+                                    )));
+                                } else {
+                                    let block = crate::ast::Block { commands: cmds };
+                                    parts.push(StringPart::CommandSubstitution(Box::new(
+                                        crate::ast::Command::Block(block),
+                                    )));
+                                }
+                            } else {
+                                parts.push(StringPart::Literal(format!("$({})", cmd_content)));
+                            }
+                        }
                     }
                 } else {
                     current_literal.push_str("$(");
