@@ -1058,11 +1058,14 @@ mod tests {
 
     #[test]
     fn case_lowers_to_switch_statement() {
+        // `case` with simple patterns lifts to a native if/else-if chain
+        // (no runtime dispatch) — see try_native_case in shir.rs.
         let json = to_json("case $x in a) echo a;; *) echo other;; esac");
-        assert!(json.contains("\"type\":\"SwitchStatement\""));
-        assert!(json.contains("\"type\":\"SwitchCase\""));
-        assert!(json.contains("\"name\":\"caseMatch\""));
-        assert!(json.contains("\"type\":\"BreakStatement\""));
+        assert!(!json.contains("\"type\":\"SwitchStatement\""));
+        assert!(!json.contains("\"name\":\"caseMatch\""));
+        assert!(json.contains("\"type\":\"IfStatement\""));
+        assert!(json.contains("\"name\":\"includes\"")
+            || json.contains("\"operator\":\"===\""));
         assert!(!json.contains("unsupported"));
     }
 
@@ -1237,9 +1240,11 @@ mod tests {
 
     #[test]
     fn case_breaks_stay_native() {
-        // Native break inside a switch-case is legal and prevents fallthrough.
+        // Source break/continue inside a case must exit the ENCLOSING loop
+        // (bash semantics) — the lifted if-chain turns them into runtime
+        // signals, so no native BreakStatement appears in a case body.
         let json = to_json("case $x in a) echo a;; *) echo b;; esac");
-        assert!(json.contains("\"type\":\"BreakStatement\""));
+        assert!(!json.contains("\"type\":\"BreakStatement\""));
     }
 
     #[test]
