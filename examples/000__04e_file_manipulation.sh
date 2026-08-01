@@ -7,6 +7,8 @@ echo "=== File Manipulation Commands ==="
 
 # cp command with backticks (though it doesn't produce output)
 #PERL_MUST_NOT_CONTAIN `cp
+d=$(mktemp -d)
+cd "$d" || exit 1
 echo "test content" > test_file.txt
 cp_result=`cp test_file.txt test_file_copy.txt && echo "Copy successful"`
 echo "Copy result: $cp_result"
@@ -41,4 +43,6 @@ rm -f test_file.txt test_file_copy.txt test_file_moved.txt
 rm -rf test_dir 2>/dev/null || true
 
 echo "=== File Manipulation Commands Complete ==="
+cd /
+rm -rf "$d"
 
