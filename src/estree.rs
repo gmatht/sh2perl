@@ -510,8 +510,6 @@ fn transform_cmd(cmd: &Command) -> Command {
             }
             sc.name = transform_word(sc.name);
             sc.args = sc.args.drain(..).map(transform_word).collect();
-            merge_escaped_quote_artifacts(&mut sc.args);
-            reattach_dollardollar(&mut sc.args, &mut sc.redirects);
             Command::Simple(sc)
         }
         Command::BuiltinCommand(bc) => {
@@ -526,18 +524,11 @@ fn transform_cmd(cmd: &Command) -> Command {
                 }
             }
             bc.args = bc.args.drain(..).map(transform_word).collect();
-            merge_escaped_quote_artifacts(&mut bc.args);
-            reattach_dollardollar(&mut bc.args, &mut bc.redirects);
             Command::BuiltinCommand(bc)
         }
         Command::Redirect(rc) => {
             let mut rc = rc.clone();
             let producers = transform_redirects(&mut rc.redirects);
-            // The parser puts a `2>file.$$` command's redirects on the
-            // Redirect WRAPPER while the `$$` expansion lands in the inner
-            // command's args. Reattach BEFORE transforming the inner command
-            // (whose arg-joining would otherwise swallow the `$` first).
-            reattach_redirect_dollardollar(&mut rc.command, &mut rc.redirects);
             rc.command = Box::new(transform_cmd(&rc.command));
             // Re-add dropped argument positions (`diff <(a) <(b)`): the
             // parser lifts `<(...)` args onto the redirect list, so the
@@ -752,117 +743,6 @@ fn is_plain_param_name(name: &str) -> bool {
 /// The corpus's only `$$`-in-word uses are realpath-cmdsub.sh's temp-file
 /// paths; spaced `echo x $$` (a separate PID arg) is not in the corpus, and
 /// the AST cannot distinguish it from `echo x$$`.
-fn reattach_dollardollar(args: &mut Vec<Word>, redirects: &mut [Redirect]) {
-    // Rule 1: re-attach trailing `$$` args to a mid-word-cut redirect target.
-    let mut n_tail = 0;
-    while n_tail < args.len() {
-        match &args[args.len() - 1 - n_tail] {
-            Word::Variable(name, _, _) if name == "$" => n_tail += 1,
-            _ => break,
-        }
-    }
-    if n_tail > 0 {
-        let cut_target = matches!(
-            redirects.last(),
-            Some(Redirect {
-                target: Word::Literal(t, _),
-                ..
-            }) if t.ends_with('.') || t.ends_with('/')
-        );
-        if cut_target {
-            let tail: Vec<Word> = args.split_off(args.len() - n_tail);
-            let last = redirects.last_mut().unwrap();
-            if let Word::Literal(t, _) = &last.target {
-                let mut parts = vec![StringPart::Literal(t.clone())];
-                for w in tail {
-                    if let Word::Variable(name, _, _) = w {
-                        parts.push(StringPart::Variable(name));
-                    }
-                }
-                last.target = Word::StringInterpolation(
-                    StringInterpolation { parts },
-                    None,
-                );
-            }
-        }
-    }
-    // Rule 2: join a Literal/interpolation arg directly followed by `$$`.
-    let mut i = 0;
-    while i + 1 < args.len() {
-        let is_text = matches!(&args[i], Word::Literal(..) | Word::StringInterpolation(..));
-        let is_dd = matches!(&args[i + 1], Word::Variable(name, _, _) if name == "$");
-        if is_text && is_dd {
-            let name = match args.remove(i + 1) {
-                Word::Variable(name, _, _) => name,
-                _ => unreachable!(),
-            };
-            match &mut args[i] {
-                Word::Literal(s, _) => {
-                    let s = std::mem::take(s);
-                    args[i] = Word::StringInterpolation(
-                        StringInterpolation {
-                            parts: vec![StringPart::Literal(s), StringPart::Variable(name)],
-                        },
-                        None,
-                    );
-                }
-                Word::StringInterpolation(interp, _) => {
-                    interp.parts.push(StringPart::Variable(name));
-                }
-                _ => unreachable!(),
-            }
-        } else {
-            i += 1;
-        }
-    }
-}
-
-/// Apply reattach_dollardollar through a Redirect wrapper (the parser stores
-/// redirects on the wrapper while trailing `$$` args live on the inner
-/// command; see reattach_dollardollar).
-fn reattach_redirect_dollardollar(cmd: &mut Command, redirects: &mut Vec<Redirect>) {
-    match cmd {
-        Command::Simple(sc) => reattach_dollardollar(&mut sc.args, redirects),
-        Command::BuiltinCommand(bc) => reattach_dollardollar(&mut bc.args, redirects),
-        Command::Redirect(rc) => reattach_redirect_dollardollar(&mut rc.command, redirects),
-        _ => {}
-    }
-}
-
-/// `'a'\''b'` — a single-quoted word immediately followed by a backslash-
-/// escaped quote — is ONE bash word (`a'b`): the lexer splits it into
-/// `'a'` + `\''b'`, the second arg arriving as a literal starting with `\'`
-/// (parse-singlequote-unexpected.sh). A word that legitimately STARTS with an
-/// escaped quote (`x \''y'` → `x 'y`) produces the same AST shape, but the
-/// corpus has no such word, so merging the `\'`-prefixed arg into its
-/// predecessor (dropping the backslash, keeping the quote char) matches bash
-/// for every corpus occurrence.
-fn merge_escaped_quote_artifacts(args: &mut Vec<Word>) {
-    let mut i = 1;
-    while i < args.len() {
-        let rest = match &args[i] {
-            Word::Literal(s, _) if s.starts_with("\\'") => Some(s[1..].to_string()),
-            _ => None,
-        };
-        let Some(rest) = rest else {
-            i += 1;
-            continue;
-        };
-        let prev = &mut args[i - 1];
-        match prev {
-            Word::Literal(s, _) => s.push_str(&rest),
-            Word::StringInterpolation(interp, _) => {
-                interp.parts.push(StringPart::Literal(rest));
-            }
-            _ => {
-                i += 1;
-                continue;
-            }
-        }
-        args.remove(i);
-    }
-}
-
 fn transform_word(w: Word) -> Word {
     match w {
         Word::CommandSubstitution(inner, ann) => {

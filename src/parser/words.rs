@@ -74,6 +74,65 @@ fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
     }
 }
 
+/// Merge a parsed `$`-expansion word into the current word as interpolation
+/// parts: `x` + `$var` -> StringInterpolation[Literal("x"), Variable("var")].
+/// Returns false when the shapes can't be merged (caller breaks the loop).
+fn merge_expansion_into_word(word: &mut Word, expansion: Word) -> bool {
+    let parts: Vec<StringPart> = match expansion {
+        Word::Variable(name, _, _) => vec![StringPart::Variable(name)],
+        Word::StringInterpolation(interp, _) => interp.parts,
+        _ => return false,
+    };
+    match word {
+        Word::Literal(s, _) => {
+            let lit = std::mem::take(s);
+            let mut new_parts = vec![StringPart::Literal(lit)];
+            new_parts.extend(parts);
+            *word = Word::StringInterpolation(StringInterpolation { parts: new_parts }, None);
+            true
+        }
+        Word::Variable(name, _, _) => {
+            let mut new_parts = vec![StringPart::Variable(name.clone())];
+            new_parts.extend(parts);
+            *word = Word::StringInterpolation(StringInterpolation { parts: new_parts }, None);
+            true
+        }
+        Word::StringInterpolation(interp, _) => {
+            // Coalesce adjacent Literal parts (e.g. SI[Lit("x")] + SI[Lit("y"), Var]).
+            if let Some(StringPart::Literal(last)) = interp.parts.last_mut() {
+                if let Some(StringPart::Literal(first)) = parts.first() {
+                    last.push_str(first);
+                    interp.parts.extend(parts.into_iter().skip(1));
+                    return true;
+                }
+            }
+            interp.parts.extend(parts);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Append a raw token's text to the word (used for glued literal fragments
+/// that follow a single-token word like `$$/x` or `'a'-suffix`).
+fn append_raw_token_text(lexer: &mut Lexer, word: &mut Word) -> Result<bool, ParserError> {
+    if let Some(text) = lexer.get_current_text() {
+        let ok = append_plain_text(word, &text);
+        lexer.next();
+        // Token::Escape: also consume+append the escaped character
+        // (mirrors the combine loop's `\x` handling).
+        if text == "\\" {
+            if let Some(escaped_text) = lexer.get_current_text() {
+                let ok2 = append_plain_text(word, &escaped_text);
+                lexer.next();
+                return Ok(ok && ok2);
+            }
+        }
+        return Ok(ok);
+    }
+    Ok(false)
+}
+
 fn merge_contiguous_quoted_fragments(
     lexer: &mut Lexer,
     word: &mut Word,
@@ -140,6 +199,80 @@ fn merge_contiguous_quoted_fragments(
                 Word::Literal(text, _) => text,
                 _ => break,
             },
+            // `$`-expansions glued to the word (no whitespace): `x$$`, `x$var`,
+            // `x${y}`, `x$?`, ... — merge as interpolation parts.
+            Some(Token::Dollar) => {
+                let is_var_ref = lexer
+                    .peek_n(1)
+                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                    .unwrap_or(false);
+                if !is_var_ref {
+                    // literal `$` (e.g. `'a'$/x`) — append the raw char
+                    if !append_raw_token_text(lexer, word)? {
+                        break;
+                    }
+                    continue;
+                }
+                let expansion = parse_variable_expansion(lexer)?;
+                if !merge_expansion_into_word(word, expansion) {
+                    break;
+                }
+                continue;
+            }
+            Some(Token::DollarBrace)
+            | Some(Token::DollarParen)
+            | Some(Token::DollarHashSimple)
+            | Some(Token::DollarAtSimple)
+            | Some(Token::DollarStarSimple)
+            | Some(Token::DollarQuestion)
+            | Some(Token::DollarDollar)
+            | Some(Token::DollarBang)
+            | Some(Token::DollarMinus)
+            | Some(Token::DollarBraceHash)
+            | Some(Token::DollarBraceBang)
+            | Some(Token::DollarBraceStar)
+            | Some(Token::DollarBraceAt)
+            | Some(Token::DollarBraceHashStar)
+            | Some(Token::DollarBraceHashAt)
+            | Some(Token::DollarBraceBangStar)
+            | Some(Token::DollarBraceBangAt) => {
+                let expansion = parse_variable_expansion(lexer)?;
+                if !merge_expansion_into_word(word, expansion) {
+                    break;
+                }
+                continue;
+            }
+            // Escape fragments (`\'`, `\"`, `\x`) glued after a word:
+            // keep the raw text — the renderers unescape it (like `echo a\'b`).
+            Some(Token::Escape)
+            | Some(Token::EscapedDoubleQuote)
+            | Some(Token::EscapedSingleQuote)
+            | Some(Token::EscapedBacktick) => {
+                if !append_raw_token_text(lexer, word)? {
+                    break;
+                }
+                continue;
+            }
+            // Literal continuation after a single-token word: `$$/x`, `$var/x`,
+            // `'a'-suffix`. Same token set the combine loop treats as
+            // word-continuation characters (dead in branch A — the loop already
+            // consumed them; live for branch B results).
+            Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float)
+            | Some(Token::PaddedNumber) | Some(Token::HexNumber)
+            | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range)
+            | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Colon)
+            | Some(Token::Star) | Some(Token::Percent) | Some(Token::Comma)
+            | Some(Token::Question) | Some(Token::BraceClose)
+            | Some(Token::TestBracket) | Some(Token::TestBracketClose)
+            | Some(Token::Equality) | Some(Token::Caret)
+            | Some(Token::PlusAssign) | Some(Token::MinusAssign)
+            | Some(Token::StarAssign) | Some(Token::SlashAssign)
+            | Some(Token::PercentAssign) | Some(Token::Assign) => {
+                if !append_raw_token_text(lexer, word)? {
+                    break;
+                }
+                continue;
+            }
             _ => break,
         };
 
