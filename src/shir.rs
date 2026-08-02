@@ -34,6 +34,15 @@ static CASE_NOCASE: Mutex<Option<bool>> = Mutex::new(None);
 /// value-consuming positions (if/while/until conds, `!`, ternary) get the
 /// native lowering.
 static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
+/// Per-function `local`-variable native lift: function name → the set of
+/// local vars whose declarations (and every later reference) lower to
+/// native `let` bindings inside the function body (see
+/// `local_lift_analysis`). Set per compilation by `shir_to_estree`.
+static LOCAL_LIFT: Mutex<Option<HashMap<String, HashSet<String>>>> = Mutex::new(None);
+/// Function-definition scope stack during emission: each frame is
+/// (function name, the local-decl names already emitted in this body —
+/// first decl is a `let`, later ones are assignments).
+static FUNCTION_STACK: Mutex<Vec<(String, HashSet<String>)>> = Mutex::new(Vec::new());
 /// Whether the program may enable `set -e` (errexit) anywhere (set per
 /// compilation by `shir_to_estree`; see `ir_may_enable_errexit`). The
 /// runtime's `sh2.guard` wrapper is an identity function when the errexit
@@ -147,9 +156,40 @@ fn collect_program_functions(stmts: &[IrStmt], out: &mut HashSet<String>) {
 /// practice; it is never re-entered (`shir_to_estree` does not recurse).
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 /// Either lift — reads / test-injection / array-element injection consult
-/// both sets.
+/// both sets. Local-function lifts (per-function `local` bindings, see
+/// [`local_lift_analysis`]) count too: the function-scope stack is only
+/// populated during emission inside the current function body, so top-level
+/// and cross-function reads never see a local lift.
 fn is_lifted(name: &str) -> bool {
-    is_lifted_num(name) || is_lifted_str(name)
+    is_lifted_num(name) || is_lifted_str(name) || is_local_lifted(name)
+}
+/// Is `name` a natively-lifted `local` of the function currently being
+/// emitted? (The function-scope stack, see [`LOCAL_LIFT`] /
+/// [`FUNCTION_STACK`].)
+fn is_local_lifted(name: &str) -> bool {
+    let stack = FUNCTION_STACK.lock().unwrap();
+    let Some((fname, _)) = stack.last() else {
+        return false;
+    };
+    let map = LOCAL_LIFT.lock().unwrap();
+    map.as_ref()
+        .and_then(|m| m.get(fname))
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+/// Run `f` with the current function's lifted-local set and its
+/// already-emitted decl-name set (mutated by the caller: first decl →
+/// `let`, later → assignment). Returns None when not inside a function or
+/// the function has no lifted locals.
+fn with_func_lift<R>(f: impl FnOnce(&HashSet<String>, &mut HashSet<String>) -> R) -> Option<R> {
+    let mut stack = FUNCTION_STACK.lock().unwrap();
+    let (fname, seen) = stack.last_mut()?;
+    let map = LOCAL_LIFT.lock().unwrap();
+    let set = map.as_ref()?.get(fname)?;
+    if set.is_empty() {
+        return None;
+    }
+    Some(f(set, seen))
 }
 fn is_lifted_num(name: &str) -> bool {
     LIFTED_NUMERIC
