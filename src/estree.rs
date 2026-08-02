@@ -89,6 +89,13 @@ pub struct VariableDeclarator {
     pub init: Option<Expr>,
 }
 
+/// The `regex` property of a JS regex Literal (pattern + flags).
+#[derive(Debug, Clone, Serialize)]
+pub struct RegexLiteral {
+    pub pattern: String,
+    pub flags: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum Expr {
@@ -98,6 +105,11 @@ pub enum Expr {
     Literal {
         value: serde_json::Value,
         raw: Option<String>,
+        // A JS regex literal (`/\s+/`) — standard ESTree carries it as a
+        // `regex` property on the Literal node (value: {}). Emitted only
+        // by the native wc -w lowering (the runtime's word-count split).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        regex: Option<RegexLiteral>,
     },
     TemplateLiteral {
         quasis: Vec<TemplateElement>,
@@ -455,12 +467,13 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func)))
                 .collect(),
         },
-        Expr::Literal { value, raw } => Expr::Literal {
+        Expr::Literal { value, raw, regex } => Expr::Literal {
             value: match value {
                 serde_json::Value::String(s) => serde_json::Value::String(map_raw_bytes(&s)),
                 other => other,
             },
             raw,
+            regex,
         },
         Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
             quasis: quasis
@@ -910,6 +923,21 @@ pub(crate) fn str_lit(s: &str) -> Expr {
     Expr::Literal {
         value: serde_json::Value::String(s.to_string()),
         raw: None,
+        regex: None,
+    }
+}
+
+/// A JS regex literal (`/\s+/`) — the ESTree `Literal`-with-`regex` shape
+/// (value: {} like the spec's RegExp literal). Printed by estree-gen.mjs
+/// as `/pattern/flags`.
+pub(crate) fn regex_lit(pattern: &str) -> Expr {
+    Expr::Literal {
+        value: serde_json::Value::Object(serde_json::Map::new()),
+        raw: None,
+        regex: Some(RegexLiteral {
+            pattern: pattern.to_string(),
+            flags: String::new(),
+        }),
     }
 }
 
