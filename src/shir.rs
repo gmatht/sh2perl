@@ -2812,6 +2812,24 @@ fn mark_store_refs(s: &str, out: &mut HashSet<String>) {
 
 /// Conservative "always a number" analysis for the ESTree backend.
 ///
+/// Does an arithmetic AST contain `/` or `%` anywhere? Only those two
+/// operators can abort a `$((...))` expansion (zero divisor) — a native
+/// JS arith without them cannot throw, so its arithEval wrapper is dead
+/// weight (see the IrExpr::Arith arm of expr_to_estree).
+fn arith_has_div_mod(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } => {
+            *op == "/" || *op == "%" || arith_has_div_mod(lhs) || arith_has_div_mod(rhs)
+        }
+        ArithAst::Un { arg, .. } => arith_has_div_mod(arg),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_has_div_mod(test) || arith_has_div_mod(then) || arith_has_div_mod(else_)
+        }
+        ArithAst::Index { key, .. } => arith_has_div_mod(key),
+        _ => false,
+    }
+}
+
 /// bash variables are strings; JS has real numbers. A variable whose every
 /// assignment is provably numeric (a `$((...))` expression without `/`/`%`
 /// — the only error sources — a numeric literal, or a copy of another
@@ -3250,20 +3268,6 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
     for st in &prog.stmts {
         collect_assigns(st, &mut assigns);
     }
-
-fn arith_has_div_mod(a: &ArithAst) -> bool {
-    match a {
-        ArithAst::Bin { op, lhs, rhs } => {
-            *op == "/" || *op == "%" || arith_has_div_mod(lhs) || arith_has_div_mod(rhs)
-        }
-        ArithAst::Un { arg, .. } => arith_has_div_mod(arg),
-        ArithAst::Cond { test, then, else_, .. } => {
-            arith_has_div_mod(test) || arith_has_div_mod(then) || arith_has_div_mod(else_)
-        }
-        ArithAst::Index { key, .. } => arith_has_div_mod(key),
-        _ => false,
-    }
-}
 
     // fixpoint: a var is liftable when ALL its assignment sources are
     // numeric (arith without / %, numeric literal, or another lifted var).
@@ -4524,19 +4528,19 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::Function { name, body } => Stmt::ExpressionStatement {
             expression: sh2_call(
                 "define",
-                vec![str_lit(name), arrow(vec![], IrExpr::Arrow(body.clone()))],
+                vec![str_lit(name), arrow_sink(vec![], IrExpr::Arrow(body.clone()))],
             ),
         },
         IrStmt::Subshell(stmts) => Stmt::ExpressionStatement {
             expression: await_call(
                 "subshell",
-                vec![arrow(vec![], IrExpr::Arrow(stmts.clone()))],
+                vec![arrow_sink(vec![], IrExpr::Arrow(stmts.clone()))],
             ),
         },
         IrStmt::Background(stmts) => Stmt::ExpressionStatement {
             expression: sh2_call(
                 "background",
-                vec![arrow(vec![], IrExpr::Arrow(stmts.clone()))],
+                vec![arrow_sink(vec![], IrExpr::Arrow(stmts.clone()))],
             ),
         },
         IrStmt::Block(stmts) => Stmt::BlockStatement {
@@ -4579,7 +4583,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 expression: await_call(
                     "redirect",
                     vec![
-                        arrow(vec![], IrExpr::Arrow(inner.clone())),
+                        arrow_sink(vec![], IrExpr::Arrow(inner.clone())),
                         array(
                             redirects
                                 .iter()
@@ -5429,16 +5433,12 @@ fn native_capture_wc(cmd_args: &[IrExpr], stdin_file: &IrExpr) -> Option<Expr> {
             };
             Expr::BinaryExpression {
                 operator: "-",
-                left: Box::new(Expr::CallExpression {
-                    callee: Box::new(Expr::MemberExpression {
-                        object: Box::new(split),
-                        property: Box::new(Expr::Identifier {
-                            name: "length".to_string(),
-                        }),
-                        computed: false,
-                        optional: false,
+                left: Box::new(Expr::MemberExpression {
+                    object: Box::new(split),
+                    property: Box::new(Expr::Identifier {
+                        name: "length".to_string(),
                     }),
-                    arguments: vec![],
+                    computed: false,
                     optional: false,
                 }),
                 right: Box::new(Expr::Literal {
@@ -7568,6 +7568,65 @@ fn fully_lifted_template(s: &str) -> Option<Expr> {
     test_str_to_estree(bare)
 }
 
+/// The native ESTree expression for a positional-parameter read — the
+/// exact value the runtime's `getVar(name)` yields for `$0` / `$1..$9` /
+/// `$@` / `$*` / `$#` (direct reads of its positional state, which the
+/// function-call machinery saves/restores — sound inside function bodies
+/// too). Non-positional names → None.
+fn positional_read(name: &str) -> Option<Expr> {
+    let positional = || sh2_member("positional");
+    match name {
+        "0" => Some(sh2_member("argv0")),
+        "@" | "*" => Some(Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(positional()),
+                property: Box::new(Expr::Identifier {
+                    name: "join".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![str_lit(" ")],
+            optional: false,
+        }),
+        "#" => Some(Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "String".to_string(),
+            }),
+            arguments: vec![Expr::MemberExpression {
+                object: Box::new(positional()),
+                property: Box::new(Expr::Identifier {
+                    name: "length".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }],
+            optional: false,
+        }),
+        _ => {
+            let d = name.parse::<u32>().ok()?;
+            if (1..=9).contains(&d) {
+                Some(Expr::LogicalExpression {
+                    operator: "??",
+                    left: Box::new(Expr::MemberExpression {
+                        object: Box::new(positional()),
+                        property: Box::new(Expr::Literal {
+                            value: serde_json::Value::from(d - 1),
+                            raw: None,
+                        regex: None,
+                        }),
+                        computed: true,
+                        optional: false,
+                    }),
+                    right: Box::new(str_lit("")),
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// `sh2.param` lowering for LIFTED variable names. The runtime reads the
 /// value from the STORE by string name — a lifted binding is not there — so
 /// the value is inlined as a JS expression and the pure string ops the
@@ -7581,22 +7640,23 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args else {
         return None;
     };
-    if !is_lifted(name) {
-        return None;
-    }
-    // positional / array / ${#x} / ${!map} forms have special runtime
-    // semantics and their names are never liftable identifiers anyway.
-    if name.contains('@')
-        || name.contains('*')
-        || name.contains('[')
-        || name.starts_with('#')
-        || name.starts_with('!')
-    {
-        return None;
-    }
-    let id = || Expr::Identifier {
-        name: name.clone(),
+    // Value source: a LIFTED binding (bare identifier — the runtime cannot
+    // read it from the store), a POSITIONAL ($0/$1..$9/$@/$*/$# — a direct
+    // read of the runtime's positional state, the exact value its getVar
+    // would yield; sound inside function bodies too because the runtime's
+    // call machinery saves/restores `positional` around script-function
+    // calls), or nothing (a store var → keep the runtime call).
+    let value: Option<Expr> = if is_lifted(name) {
+        Some(Expr::Identifier {
+            name: name.clone(),
+        })
+    } else {
+        positional_read(name)
     };
+    let value = value?;
+    // positional writes (`${1:=d}`) and `:?` exits stay on the runtime.
+    let is_positional = positional_read(name).is_some() && !is_lifted(name);
+    let id = || value.clone();
     let val = || Expr::CallExpression {
         callee: Box::new(Expr::Identifier {
             name: "String".to_string(),
@@ -7705,12 +7765,17 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 vec![rep],
             ))
         }
-        // ${x:-d} / ${x:=d} — default when empty. `:=` also WRITES the
+        // ${x:-d} — default when empty. `${x:=d}` also WRITES the
         // binding (a JS assignment expression — the runtime's setVar
         // cannot see the lifted binding, so this op must go native; the
         // lift analysis marks `:=` names whose default cannot be fully
-        // inlined, keeping them store-bound instead).
+        // inlined, keeping them store-bound instead). A POSITIONAL
+        // `:=` write stays on the runtime (its setVar path is the
+        // store/positional authority).
         ":-" | ":=" => {
+            if op == ":=" && is_positional {
+                return None;
+            }
             let [_, _, IrExpr::Str(d, _)] = args else {
                 return None;
             };
@@ -7733,8 +7798,50 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         // ${x:off:len} — substring slice with LITERAL integer offsets
         // (negative offsets count from the end, like the runtime's
         // v.slice(off, off + len)). Non-integer offsets (arith exprs) fall
-        // through to the value-override form.
+        // through to the value-override form. `${@:off:len}` / `${*:off:len}`
+        // are the positional-LIST slice: bash offsets are 1-BASED
+        // (${@:1} = all params; ${@:0} includes $0), negative offsets count
+        // from the end, and the result is the list joined with spaces
+        // (exactly the runtime's `sl.join(' ')`).
         "slice" => {
+            if name == "@" || name == "*" {
+                let [_, _, IrExpr::Str(off, _), IrExpr::Str(len, _)] = args else {
+                    return None;
+                };
+                let int_of = |t: &str| {
+                    let t = t.trim();
+                    if t.is_empty() {
+                        Some(0i64)
+                    } else if t.starts_with('-') {
+                        t[1..].parse::<i64>().ok().map(|v| -v)
+                    } else {
+                        t.parse::<i64>().ok()
+                    }
+                };
+                let o = int_of(off)?;
+                let l = int_of(len).unwrap_or(0);
+                let list: Expr = if o == 0 {
+                    // [argv0, ...positional] — concat (no spread node)
+                    method(
+                        array(vec![sh2_member("argv0")]),
+                        "concat",
+                        vec![sh2_member("positional")],
+                    )
+                } else {
+                    sh2_member("positional")
+                };
+                let start: i64 = if o == 0 { 0 } else if o > 0 { o - 1 } else { o };
+                let sl = if len.trim().is_empty() {
+                    method(list, "slice", vec![int_lit(start)])
+                } else {
+                    method(
+                        list,
+                        "slice",
+                        vec![int_lit(start), int_lit(start + l)],
+                    )
+                };
+                return Some(method(sl, "join", vec![str_lit(" ")]));
+            }
             let [_, _, IrExpr::Str(off, _), IrExpr::Str(len, _)] = args else {
                 return None;
             };
@@ -7760,9 +7867,31 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 ))
             }
         }
-        // basename/dirname/:? and everything else: the value-override form
-        // (runtime keeps the string-op logic; only the value source
-        // changes).
+        // ${x##*/} — the parser's basename/dirname ops: pure string work
+        // (trailing-slash strip + last-component split — mirror the
+        // runtime's param impl exactly; a missing slash yields the whole
+        // path / ".").
+        "basename" | "dirname" => {
+            // mirror the runtime's `p = v.replace(/\/+$/, '')` — one
+            // trailing-slash strip, no flags
+            let strip = method(val(), "replace", vec![regex_lit("\\/+$"), str_lit("")]);
+            let last = method(strip.clone(), "lastIndexOf", vec![str_lit("/")]);
+            if op == "basename" {
+                Some(cond(
+                    bin(last.clone(), ">=", int_lit(0)),
+                    method(strip.clone(), "slice", vec![bin(last.clone(), "+", int_lit(1))]),
+                    strip,
+                ))
+            } else {
+                Some(cond(
+                    bin(last.clone(), ">=", int_lit(0)),
+                    method(strip.clone(), "slice", vec![int_lit(0), last]),
+                    str_lit("."),
+                ))
+            }
+        }
+        // :? and everything else: the value-override form (runtime keeps
+        // the string-op logic; only the value source changes).
         _ => None,
     }
 }
@@ -8607,10 +8736,32 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // the runtime from the STORE — inject lifted values as template
             // literals (the parser keeps elements as raw text, so
             // `["$candidate"]` must inline candidate's value).
-            let mapped_args: Vec<Expr> = if matches!(func.as_str(), "setArray" | "setArrayAppend") {
-                args.iter().map(array_elt_to_estree).collect()
-            } else {
-                args.iter().map(expr_to_estree).collect()
+            //
+            // Arrows lowered inside `capture`/`captureWords`/`pipeline`/
+            // `subshell`/`background`/`redirect`/`define` args run under a
+            // runtime-swapped stdout sink or may later be called under any
+            // sink (see `arrow_sink`) — native echo/printf must stay
+            // suppressed there, so raise ECHO_SINK_DEPTH for the whole arg
+            // lowering. Loop/`and`/`or`/`block` arrows run in the CURRENT
+            // sink and are NOT raised here (nor in `arrow`).
+            let mapped_args: Vec<Expr> = {
+                let sink_args = matches!(
+                    func.as_str(),
+                    "capture" | "captureWords" | "pipeline" | "subshell" | "background"
+                        | "redirect" | "define"
+                );
+                if sink_args {
+                    *ECHO_SINK_DEPTH.lock().unwrap() += 1;
+                }
+                let out = if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                    args.iter().map(array_elt_to_estree).collect()
+                } else {
+                    args.iter().map(expr_to_estree).collect()
+                };
+                if sink_args {
+                    *ECHO_SINK_DEPTH.lock().unwrap() -= 1;
+                }
+                out
             };
             // a read of a lifted numeric variable is a bare JS identifier;
             // bash special vars ($? / $# / $0 / $1..$9 / $@ / $$ / $- /
@@ -8647,6 +8798,64 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         arguments: vec![expr_to_estree(n)],
                         optional: false,
                     };
+                }
+            }
+            // `sh2.join(v)` — the runtime impl is exactly
+            // `Array.isArray(v) ? v.join(" ") : String(v)` (array-valued
+            // expansions — `${arr[@]}`, `${!map[@]}`, `${arr[@]:off:len}` —
+            // must space-join inside template literals, scalars pass
+            // through). The arg's runtime value type is decidable from its
+            // IR SHAPE, so the ternary (which would evaluate the arg up to
+            // 3x — and triple-count its sh2 calls in the metric) is never
+            // needed: provably-string args (plain `${x:o:l}` slices,
+            // `${#arr[@]}` lengths, `${@:o:l}` joins) drop the join as
+            // identity; provably-array args (the runtime's `[...slice]`
+            // `[@]`-suffix form, arrayItems/listVar — always arrays even
+            // for missing names) join directly. Ambiguous args (plain-name
+            // slices — the runtime checks `arrays.get(name)` — and
+            // `arrayIndex` @/*, which returns '' for a missing array)
+            // keep the runtime join (exact, no duplication).
+            if func == "join" {
+                if let [v] = args.as_slice() {
+                    let ve = expr_to_estree(v);
+                    if expr_has_await(&ve) {
+                        return sh2_call("join", vec![ve]);
+                    }
+                    let always_array = matches!(v, IrExpr::Call { func: f, .. }
+                        if matches!(f.as_str(), "arrayItems" | "listVar"));
+                    let always_array = always_array
+                        || matches!(v, IrExpr::Call { func: f, args: a }
+                            if f == "param"
+                                && matches!(a.as_slice(),
+                                    [IrExpr::Str(op, _), IrExpr::Str(name, _), ..]
+                                    if op == "slice"
+                                        && (name.ends_with("[@]") || name.ends_with("[*]")
+                                            || (name.starts_with('!')
+                                                && !name.contains('*')))));
+                    let always_string = matches!(v, IrExpr::Call { func: f, args: a }
+                        if f == "param"
+                            && matches!(a.as_slice(),
+                                [IrExpr::Str(op, _), IrExpr::Str(name, _), ..]
+                                if op == "slice"
+                                    && (name.starts_with('#') || name == "@" || name == "*")));
+                    if always_array {
+                        return Expr::CallExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(ve.clone()),
+                                property: Box::new(Expr::Identifier {
+                                    name: "join".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: vec![str_lit(" ")],
+                            optional: false,
+                        };
+                    }
+                    if always_string {
+                        return ve; // join of a scalar is String(v) — identity
+                    }
+                    return sh2_call("join", vec![ve]);
                 }
             }
             // test expressions: native comparison when both operands are
@@ -9154,6 +9363,19 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         IrExpr::Arrow(stmts) => arrow(vec![], IrExpr::Arrow(stmts.clone())),
         IrExpr::Arith(a) => {
             let inner = arith_to_estree(a);
+            // `$(( ... ))` whose expression contains NO `/` or `%` cannot
+            // throw (the only runtime abort a native arith can express is
+            // the idiv/imod zero-divisor throw — everything else is a
+            // plain JS number op), so the arithEval try/catch wrapper is
+            // dead weight: emit the native value bare (template literals
+            // and runtime args String() it exactly like the helper's
+            // `String(f())`; a store var inside still reads via getVar,
+            // the runtime's exact coercion). Div/mod expressions keep the
+            // wrapper — bash aborts the WHOLE expansion on a zero divisor
+            // (empty result), which only the catch can express.
+            if !arith_has_div_mod(a) {
+                return inner;
+            }
             sh2_call(
                 "arithEval",
                 vec![Expr::ArrowFunctionExpression {
@@ -9192,12 +9414,27 @@ fn array(elements: Vec<Expr>) -> Expr {
 }
 
 fn arrow(params: Vec<Expr>, body: IrExpr) -> Expr {
-    // Every runtime-call arrow (capture/pipeline/redirect/subshell/define/
-    // and/or/while/for/background) is a context where the runtime may have
-    // swapped stdout sinks (fdTargets) or where the body may later be
-    // CALLED under any sink (function bodies). `process.stdout.write` is
-    // only byte-identical to the runtime's `emit` while fd 1 is the
-    // default stdout, so native echo lowering is suppressed inside.
+    arrow_body(params, body)
+}
+
+/// Arrow whose body runs under a runtime-swapped stdout sink or may later
+/// be CALLED under any sink: `capture`/`captureWords`/`pipeline` (the
+/// runtime swaps fdTargets[1] to a capture buffer), `redirect` (fdTargets
+/// change for the body), `subshell`/`background` (the body can run while
+/// the enclosing sink context differs — the background body is deferred to
+/// a microtask, the subshell clones fdTargets), and `define` (a function
+/// body may be called under ANY sink at runtime). Native echo/printf
+/// (`process.stdout.write`) is only byte-identical to the runtime's `emit`
+/// while fd 1 is the default stdout, so ECHO_SINK_DEPTH is raised while
+/// such bodies lower.
+///
+/// Loops (`whileLoop`/`forLoop`/`cstyleFor` and their *Sync twins) and
+/// `and`/`or`/`block` run their arrows in the CURRENT sink — they never
+/// swap fdTargets (verified against sh2-namespace.mjs) — so plain `arrow`
+/// keeps the depth at the enclosing level: a loop nested inside a
+/// capture/redirect/function is still covered by THAT construct's
+/// arrow_sink bump.
+fn arrow_sink(params: Vec<Expr>, body: IrExpr) -> Expr {
     *ECHO_SINK_DEPTH.lock().unwrap() += 1;
     let out = arrow_body(params, body);
     *ECHO_SINK_DEPTH.lock().unwrap() -= 1;
