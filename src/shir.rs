@@ -825,10 +825,11 @@ fn try_lift_grep_contains(cond: &IrExpr) -> Option<IrExpr> {
 
 /// A grep pattern is liftable to a JS substring check only when grep would
 /// treat it as a literal: no BRE metacharacters (`^ $ . [ ] * \`), no
-/// leading `-` (would parse as an option). BRE treats `+ ? ( ) { } |` as
-/// literals, so they are safe.
+/// leading `-` (would parse as an option), no real newline (grep matches
+/// within a single line; a substring test would cross line boundaries).
+/// BRE treats `+ ? ( ) { } |` as literals, so they are safe.
 fn is_safe_grep_literal(pat: &str) -> bool {
-    !pat.starts_with('-') && !pat.chars().any(|c| matches!(c, '^' | '$' | '.' | '[' | ']' | '*' | '\\'))
+    !pat.starts_with('-') && !pat.chars().any(|c| matches!(c, '^' | '$' | '.' | '[' | ']' | '*' | '\\' | '\n'))
 }
 
 fn command_to_ir(cmd: &Command) -> IrExpr {
@@ -1951,6 +1952,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
         ArithAst::Num(v) => Expr::Literal {
             value: serde_json::Value::from(*v),
             raw: None,
+        regex: None,
         },
         ArithAst::Var(name) => {
             if is_lifted_num(name) {
@@ -1970,6 +1972,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     right: Box::new(Expr::Literal {
                         value: serde_json::Value::from(0),
                         raw: None,
+                    regex: None,
                     }),
                 }
             } else {
@@ -1991,6 +1994,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     right: Box::new(Expr::Literal {
                         value: serde_json::Value::from(0),
                         raw: None,
+                    regex: None,
                     }),
                 }
             }
@@ -2007,6 +2011,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             right: Box::new(Expr::Literal {
                 value: serde_json::Value::from(0),
                 raw: None,
+            regex: None,
             }),
         },
         ArithAst::Bin { op, lhs, rhs } => {
@@ -2073,10 +2078,12 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     consequent: Box::new(Expr::Literal {
                         value: serde_json::Value::from(1),
                         raw: None,
+                    regex: None,
                     }),
                     alternate: Box::new(Expr::Literal {
                         value: serde_json::Value::from(0),
                         raw: None,
+                    regex: None,
                     }),
                 }
             } else if matches!(*op, "<" | "<=" | ">" | ">=" | "==" | "!=") {
@@ -2090,10 +2097,12 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     consequent: Box::new(Expr::Literal {
                         value: serde_json::Value::from(1),
                         raw: None,
+                    regex: None,
                     }),
                     alternate: Box::new(Expr::Literal {
                         value: serde_json::Value::from(0),
                         raw: None,
+                    regex: None,
                     }),
                 }
             } else {
@@ -2116,10 +2125,12 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     consequent: Box::new(Expr::Literal {
                         value: serde_json::Value::from(1),
                         raw: None,
+                    regex: None,
                     }),
                     alternate: Box::new(Expr::Literal {
                         value: serde_json::Value::from(0),
                         raw: None,
+                    regex: None,
                     }),
                 }
             } else {
@@ -3339,6 +3350,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
                 init: Some(Expr::Literal {
                     value: serde_json::Value::from(0),
                     raw: None,
+                regex: None,
                 }),
             }],
         });
@@ -3352,6 +3364,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
                 init: Some(Expr::Literal {
                     value: serde_json::Value::String(String::new()),
                     raw: None,
+                regex: None,
                 }),
             }],
         });
@@ -3629,6 +3642,7 @@ fn try_native_case(
             CasePat::Any => Expr::Literal {
                 value: serde_json::Value::Bool(true),
                 raw: None,
+            regex: None,
             },
             CasePat::Substr(lit) => Expr::CallExpression {
                 callee: Box::new(Expr::MemberExpression {
@@ -4186,6 +4200,7 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
             right: Box::new(Expr::Literal {
                 value: serde_json::Value::from(0),
                 raw: None,
+            regex: None,
             }),
         },
         bool_lit(true),
@@ -4233,6 +4248,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         right: Box::new(Expr::Literal {
                             value: serde_json::Value::from(0),
                             raw: None,
+                        regex: None,
                         }),
                     }
                 };
@@ -4281,10 +4297,12 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                                     consequent: Box::new(Expr::Literal {
                                         value: serde_json::Value::from(1),
                                         raw: None,
+                                    regex: None,
                                     }),
                                     alternate: Box::new(Expr::Literal {
                                         value: serde_json::Value::from(0),
                                         raw: None,
+                                    regex: None,
                                     }),
                                 }),
                             },
@@ -4309,15 +4327,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     IrExpr::Int(i) => Expr::Literal {
                         value: serde_json::Value::from(*i),
                         raw: None,
+                    regex: None,
                     },
                     IrExpr::Str(sv, _) if is_lifted_num(&target.var) => Expr::Literal {
                         value: serde_json::Value::from(sv.trim().parse::<i64>().unwrap_or(0)),
                         raw: None,
+                    regex: None,
                     },
                     // string-lifted source
                     IrExpr::Str(sv, _) => Expr::Literal {
                         value: serde_json::Value::String(sv.clone()),
                         raw: None,
+                    regex: None,
                     },
                     IrExpr::Interpolate(parts) => interpolate_to_estree(parts),
                     IrExpr::Var(n, _) => Expr::Identifier { name: n.clone() },
@@ -4391,6 +4412,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             right: Box::new(Expr::Literal {
                                 value: serde_json::Value::from(0),
                                 raw: None,
+                            regex: None,
                             }),
                         },
                     }],
@@ -4524,19 +4546,19 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // `echo args > file` / `echo args >> file`: a native
             // fs.writeFile replaces the redirect+builtin pair (see
             // try_native_echo_redirect).
-            if let Some(native) = try_native_echo_redirect(
-                inner,
-                &redirects
-                    .iter()
-                    .map(|r| {
-                        (
-                            r.fd.unwrap_or(0) as i64,
-                            r.mode.as_str(),
-                            &r.target,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            ) {
+            let redirect_specs = redirects
+                .iter()
+                .map(|r| (r.fd.unwrap_or(0) as i64, r.mode.as_str(), &r.target))
+                .collect::<Vec<_>>();
+            if let Some(native) = try_native_echo_redirect(inner, &redirect_specs) {
+                return Some(Stmt::ExpressionStatement {
+                    expression: native,
+                });
+            }
+            // `grep -q PAT <<< TEXT` (statement position): the fd-0
+            // herestring redirect form of the substring test — no spawn,
+            // no fd plumbing (see `try_native_grep_q_redirect`).
+            if let Some(native) = try_native_grep_q_redirect(inner, &redirect_specs) {
                 return Some(Stmt::ExpressionStatement {
                     expression: native,
                 });
@@ -4669,6 +4691,7 @@ fn redirect_spec_to_estree(r: &IrRedirect, persist: bool) -> Expr {
             Expr::Literal {
                 value: serde_json::Value::from(r.fd.unwrap_or(0)),
                 raw: None,
+            regex: None,
             },
         ),
         prop("mode", str_lit(&r.mode)),
@@ -4680,6 +4703,7 @@ fn redirect_spec_to_estree(r: &IrRedirect, persist: bool) -> Expr {
             Expr::Literal {
                 value: serde_json::Value::Bool(r.interpolate),
                 raw: None,
+            regex: None,
             },
         ));
     }
@@ -4689,6 +4713,7 @@ fn redirect_spec_to_estree(r: &IrRedirect, persist: bool) -> Expr {
             Expr::Literal {
                 value: serde_json::Value::Bool(true),
                 raw: None,
+            regex: None,
             },
         ));
     }
@@ -4712,6 +4737,7 @@ fn str_operand(e: &str) -> Option<Expr> {
         return Some(Expr::Literal {
             value: serde_json::Value::String(inner.to_string()),
             raw: None,
+        regex: None,
         });
     }
     // A bare `$name` needs the runtime value — only a lifted var can be
@@ -4732,6 +4758,7 @@ fn str_operand(e: &str) -> Option<Expr> {
         return Some(Expr::Literal {
             value: serde_json::Value::String(e.to_string()),
             raw: None,
+        regex: None,
         });
     }
     None
@@ -4792,6 +4819,7 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
             CasePat::Any => Expr::Literal {
                 value: serde_json::Value::Bool(true),
                 raw: None,
+            regex: None,
             },
             CasePat::Substr(lit) => str_op("includes", str_lit(&lit_str(lit))),
             CasePat::Prefix(lit) => str_op("startsWith", str_lit(&lit_str(lit))),
@@ -5176,6 +5204,7 @@ fn read_file_value(path: Expr, encoding: Option<&'static str>, ok: i64, err: i64
         right: Box::new(Expr::Literal {
             value: serde_json::Value::from(exit),
             raw: None,
+        regex: None,
         }),
     };
     let then = Expr::CallExpression {
@@ -5320,12 +5349,14 @@ fn native_capture_sort(cmd_args: &[IrExpr], stdin_file: Option<&IrExpr>) -> Opti
                 Expr::Literal {
                     value: serde_json::Value::from(0),
                     raw: None,
+                regex: None,
                 },
                 Expr::UnaryExpression {
                     operator: "-",
                     argument: Box::new(Expr::Literal {
                         value: serde_json::Value::from(1),
                         raw: None,
+                    regex: None,
                     }),
                     prefix: true,
                 },
@@ -5413,6 +5444,7 @@ fn native_capture_wc(cmd_args: &[IrExpr], stdin_file: &IrExpr) -> Option<Expr> {
                 right: Box::new(Expr::Literal {
                     value: serde_json::Value::from(1),
                     raw: None,
+                regex: None,
                 }),
             }
         }
@@ -5467,6 +5499,7 @@ fn native_capture_path(cmd: &str, cmd_args: &[IrExpr]) -> Option<Expr> {
             right: Box::new(Expr::Literal {
                 value: serde_json::Value::from(0),
                 raw: None,
+            regex: None,
             }),
         },
         value,
@@ -5579,6 +5612,189 @@ fn ir_expr_needs_runtime(e: &IrExpr) -> bool {
         }
         _ => false,
     }
+}
+
+/// `grep -q PAT FILE` — a pure substring test over a file's contents: the
+/// spawned grep collapses to an `await sh2.fs.readFile(FILE, "utf8")`
+/// promise chain that returns grep's exact truthiness (match) and records
+/// grep's exact exit statuses — 0 match, 1 no match, 2 unreadable/missing
+/// file (the runtime's spawn yields the real grep code; `$?` reads it
+/// back). No spawn, no stderr noise, no regex engine: the pattern must be
+/// a plain literal (is_safe_grep_literal) in the single-file `-q` form
+/// (`grep -q PAT FILE`); the stdin/`-e`/multi-file forms keep the runtime.
+fn native_exec_grep_q(file: &IrExpr, pat: &str) -> Option<Expr> {
+    if !is_safe_grep_literal(pat) {
+        return None;
+    }
+    let read = sh2_fs_call("readFile", vec![expr_to_estree(file), str_lit("utf8")]);
+    let hit = |s: Expr| Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![s],
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "includes".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![str_lit(pat)],
+        optional: false,
+    };
+    let h = hit(Expr::Identifier {
+        name: "s".to_string(),
+    });
+    let status = |v: Expr| Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(Expr::ConditionalExpression {
+            test: Box::new(v),
+            consequent: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+            alternate: Box::new(Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+                regex: None,
+            }),
+        }),
+    };
+    let then = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(read),
+            property: Box::new(Expr::Identifier {
+                name: "then".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![Expr::ArrowFunctionExpression {
+            params: vec![Expr::Identifier {
+                name: "s".to_string(),
+            }],
+            body: ArrowBody::Expr(Box::new(seq(vec![status(h.clone()), h]))),
+            expression: true,
+            r#async: false,
+        }],
+        optional: false,
+    };
+    let catch = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(then),
+            property: Box::new(Expr::Identifier {
+                name: "catch".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![Expr::ArrowFunctionExpression {
+            params: vec![Expr::Identifier {
+                name: "e".to_string(),
+            }],
+            body: ArrowBody::Expr(Box::new(seq(vec![
+                Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(sh2_member("lastExit")),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(2),
+                        raw: None,
+                        regex: None,
+                    }),
+                },
+                bool_lit(false),
+            ]))),
+            expression: true,
+            r#async: false,
+        }],
+        optional: false,
+    };
+    Some(await_expr(catch))
+}
+
+/// `grep -q PAT <<< TEXT` — the fd-0 herestring redirect form of the
+/// substring test: the spawned grep collapses to a native `includes` over
+/// the herestring text with grep's exact status (0 match, 1 no match)
+/// recorded to lastExit. The herestring's appended newline cannot affect
+/// a literal pattern (real newlines are rejected by is_safe_grep_literal).
+/// Only a single fd-0 herestring spec qualifies — any other redirect
+/// shape (files, extra fds, `2>&1` that would surface grep's stderr)
+/// keeps the runtime redirect.
+fn try_native_grep_q_redirect(
+    inner: &[IrStmt],
+    specs: &[(i64, &str, &IrExpr)],
+) -> Option<Expr> {
+    if specs.len() != 1 || specs[0].0 != 0 || specs[0].1 != "herestring" {
+        return None;
+    }
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
+        return None;
+    };
+    if func != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(gargs)] = args.as_slice() else {
+        return None;
+    };
+    if name != "grep" {
+        return None;
+    }
+    let [IrExpr::Str(q, _), IrExpr::Str(pat, _)] = gargs.as_slice() else {
+        return None;
+    };
+    if q != "-q" {
+        return None;
+    }
+    native_grep_q_herestring(&specs[0].2, pat)
+}
+fn native_grep_q_herestring(target: &IrExpr, pat: &str) -> Option<Expr> {
+    if !is_safe_grep_literal(pat) {
+        return None;
+    }
+    let hit = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![expr_to_estree(target)],
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "includes".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![str_lit(pat)],
+        optional: false,
+    };
+    // ((sh2.lastExit = hit ? 0 : 1), hit)
+    Some(seq(vec![
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::ConditionalExpression {
+                test: Box::new(hit.clone()),
+                consequent: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                    regex: None,
+                }),
+                alternate: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(1),
+                    raw: None,
+                    regex: None,
+                }),
+            }),
+        },
+        hit,
+    ]))
 }
 
 /// `echo args...` at the module's default stdout sink (see ECHO_SINK_DEPTH
@@ -5991,12 +6207,14 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
                                     arguments: vec![arg, Expr::Literal {
                                         value: serde_json::Value::from(10),
                                         raw: None,
+                                    regex: None,
                                     }],
                                     optional: false,
                                 }),
                                 right: Box::new(Expr::Literal {
                                     value: serde_json::Value::from(0),
                                     raw: None,
+                                regex: None,
                                 }),
                             },
                             _ => unreachable!("printf_parse gates the conversions"),
@@ -6028,6 +6246,7 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
             right: Box::new(Expr::Literal {
                 value: serde_json::Value::from(0),
                 raw: None,
+            regex: None,
             }),
         },
         bool_lit(true),
@@ -6090,6 +6309,7 @@ fn try_native_echo(args: &[IrExpr]) -> Option<Expr> {
             right: Box::new(Expr::Literal {
                 value: serde_json::Value::from(0),
                 raw: None,
+            regex: None,
             }),
         },
         bool_lit(true),
@@ -6236,6 +6456,163 @@ fn try_native_tr_pipeline(pipe: &IrExpr) -> Option<Expr> {
 }
 
 
+/// `$(echo args... | wc -l/-w/-c)` — the capture's pipeline is the sync
+/// echo builtin feeding the sync wc builtin: the captured value is a pure
+/// count over the echoed text, so the whole capture+pipeline+spawn
+/// machinery collapses to a native count expression — no spawn, no async
+/// pipeline, no fd swapping. The runtime's echo emits the args joined
+/// with single spaces (with `-e`/`-n` handling) plus a trailing newline;
+/// the runtime's wc counts newline chars (`-l`), bytes (`-c`), or
+/// whitespace-separated words (`-w`) — the exact formulas mirrored here
+/// as native JS. Conservative: any echo arg the runtime would transform
+/// beyond joining (GLOB_MAGIC globs, PS_MAGIC process-substitution paths,
+/// raw-byte markers) or a script-defined echo/wc function keeps the
+/// runtime pipeline.
+fn native_capture_echo_wc(pipe: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    // stage 1: exec("echo", args)
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if f1 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(n1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
+        return None;
+    };
+    if n1 != "echo" {
+        return None;
+    }
+    if echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    // stage 2: exec("wc", [flag])
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(n2, _), IrExpr::Array(wc_args)] = a2.as_slice() else {
+        return None;
+    };
+    if n2 != "wc" {
+        return None;
+    }
+    let [IrExpr::Str(flag, _)] = wc_args.as_slice() else {
+        return None;
+    };
+    if !matches!(flag.as_str(), "-l" | "-w" | "-c") {
+        return None;
+    }
+    let (joined, no_newline, _) = echo_join_args(echo_args)?;
+    // the byte stream wc counts: the joined text plus echo's trailing
+    // newline (skipped for `-n`)
+    let text: Expr = if no_newline {
+        joined
+    } else {
+        Expr::BinaryExpression {
+            operator: "+",
+            left: Box::new(joined),
+            right: Box::new(str_lit("\n")),
+        }
+    };
+    let method = |obj: Expr, name: &str, margs: Vec<Expr>| Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: margs,
+        optional: false,
+    };
+    let len = |obj: Expr| Expr::MemberExpression {
+        object: Box::new(obj),
+        property: Box::new(Expr::Identifier {
+            name: "length".to_string(),
+        }),
+        computed: false,
+        optional: false,
+    };
+    let count: Expr = match flag.as_str() {
+        // newline count: text.split("\n").length - 1 (the runtime's
+        // `(text.match(/\n/g) || []).length`)
+        "-l" => Expr::BinaryExpression {
+            operator: "-",
+            left: Box::new(len(method(
+                text,
+                "split",
+                vec![str_lit("\n")],
+            ))),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+                regex: None,
+            }),
+        },
+        // byte count: Buffer.byteLength(text, "utf8") (the runtime's
+        // exact formula)
+        "-c" => Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "Buffer".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "byteLength".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![text, str_lit("utf8")],
+            optional: false,
+        },
+        // word count: text.trim() ? text.trim().split(/\s+/).length : 0
+        // (the runtime's exact formula)
+        "-w" => {
+            let trimmed = method(text, "trim", vec![]);
+            Expr::ConditionalExpression {
+                test: Box::new(trimmed.clone()),
+                consequent: Box::new(len(method(
+                    trimmed,
+                    "split",
+                    vec![regex_lit("\\s+")],
+                ))),
+                alternate: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                    regex: None,
+                }),
+            }
+        }
+        _ => return None,
+    };
+    // the wc builtin prints the count (the capture strips the newline)
+    Some(Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        arguments: vec![count],
+        optional: false,
+    })
+}
+
 /// Native lowering for a SIMPLE test expression whose operands are all
 /// lifted numeric variables (or integer literals): `"$count" -lt 100`
 /// becomes `count < 100` — no runtime test-string round-trip. Returns None
@@ -6349,6 +6726,7 @@ fn try_native_test(s: &str) -> Option<Expr> {
                         Expr::Literal {
                             value: serde_json::Value::from(v),
                             raw: None,
+                        regex: None,
                         },
                         false,
                     ));
@@ -6766,6 +7144,7 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let int_lit = |i: i64| Expr::Literal {
         value: serde_json::Value::from(i),
         raw: None,
+    regex: None,
     };
     // A glob-strip/substitute pattern that the runtime's literal fast path
     // handles (no glob metachars) and that embeds cleanly in a JS string
@@ -7412,18 +7791,22 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         IrExpr::Int(i) => Expr::Literal {
             value: serde_json::Value::from(*i),
             raw: None,
+        regex: None,
         },
         IrExpr::Str(s, _) => Expr::Literal {
             value: serde_json::Value::String(s.clone()),
             raw: None,
+        regex: None,
         },
         IrExpr::Bool(b) => Expr::Literal {
             value: serde_json::Value::Bool(*b),
             raw: None,
+        regex: None,
         },
         IrExpr::Json(v) => Expr::Literal {
             value: v.clone(),
             raw: None,
+        regex: None,
         },
         IrExpr::Var(name, _) => {
             if is_lifted(name) {
@@ -7602,10 +7985,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                         consequent: Box::new(Expr::Literal {
                                             value: serde_json::Value::from(0),
                                             raw: None,
+                                        regex: None,
                                         }),
                                         alternate: Box::new(Expr::Literal {
                                             value: serde_json::Value::from(1),
                                             raw: None,
+                                        regex: None,
                                         }),
                                     }),
                                 },
@@ -7772,6 +8157,13 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         if let Some(native) = try_native_echo_redirect(stmts, &specs) {
                             return native;
                         }
+                        // `grep -q PAT <<< TEXT` — the fd-0 herestring
+                        // redirect form of the substring test (see
+                        // `try_native_grep_q_redirect`): no spawn, no fd
+                        // plumbing.
+                        if let Some(native) = try_native_grep_q_redirect(stmts, &specs) {
+                            return native;
+                        }
                     }
                 }
             }
@@ -7800,6 +8192,19 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         if let [IrStmt::Expr(inner)] = stmts.as_slice() {
                             if let Some(value) = try_native_echo_capture(inner) {
                                 return value;
+                            }
+                        }
+                    }
+                }
+                // `$(echo args... | wc -l/-w/-c)` — the capture's pipeline
+                // is the sync echo builtin feeding the sync wc builtin: the
+                // value is a pure count over the echoed text (see
+                // `native_capture_echo_wc`) — no spawn, no async pipeline.
+                if !program_defines_function("echo") && !program_defines_function("wc") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                            if let Some(count) = native_capture_echo_wc(pipe) {
+                                return count;
                             }
                         }
                     }
@@ -7881,6 +8286,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 right: Box::new(Expr::Literal {
                                     value: serde_json::Value::from(0),
                                     raw: None,
+                                regex: None,
                                 }),
                             };
                             return seq(vec![
@@ -7892,15 +8298,34 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                         consequent: Box::new(Expr::Literal {
                                             value: serde_json::Value::from(0),
                                             raw: None,
+                                        regex: None,
                                         }),
                                         alternate: Box::new(Expr::Literal {
                                             value: serde_json::Value::from(1),
                                             raw: None,
+                                        regex: None,
                                         }),
                                     }),
                                 },
                                 nonzero,
                             ]);
+                        }
+                    }
+                }
+            }
+            // `grep -q PAT FILE` — a pure substring test over a file's
+            // contents (see `native_exec_grep_q`): the spawn collapses to
+            // a readFile + includes promise chain. The single-file `-q`
+            // form only — stdin/`-e`/multi-file greps keep the runtime.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
+                    if name == "grep" {
+                        if let [IrExpr::Str(q, _), IrExpr::Str(pat, _), file] = a.as_slice() {
+                            if q == "-q" {
+                                if let Some(native) = native_exec_grep_q(file, pat) {
+                                    return native;
+                                }
+                            }
                         }
                     }
                 }
@@ -7921,6 +8346,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 right: Box::new(Expr::Literal {
                                     value: serde_json::Value::from(if ok { 0 } else { 1 }),
                                     raw: None,
+                                regex: None,
                                 }),
                             },
                             bool_lit(ok),
@@ -8151,6 +8577,7 @@ fn last_exit_eq_zero() -> Expr {
         right: Box::new(Expr::Literal {
             value: serde_json::Value::from(0),
             raw: None,
+        regex: None,
         }),
     }
 }
@@ -8163,6 +8590,7 @@ fn bool_lit(b: bool) -> Expr {
     Expr::Literal {
         value: serde_json::Value::Bool(b),
         raw: None,
+    regex: None,
     }
 }
 
@@ -8228,6 +8656,7 @@ fn native_special_var(name: &str) -> Option<Expr> {
                         property: Box::new(Expr::Literal {
                             value: serde_json::Value::from(d - 1),
                             raw: None,
+                        regex: None,
                         }),
                         computed: true,
                         optional: false,
