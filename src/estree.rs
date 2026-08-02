@@ -1310,11 +1310,13 @@ mod tests {
     fn process_substitution_lowers_without_unsupported() {
         // <(cmd) as an argument position: the redirect becomes a here-string
         // (captured producer stdout) and a materialized-path argument is
-        // appended for the runtime to turn into a temp file.
+        // appended for the runtime to turn into a temp file. `<(echo a)`
+        // is a pure echo capture — lowered natively (trimCapture), no
+        // async capture machinery.
         let json = to_json("diff <(echo a) <(echo b)");
         assert!(!json.contains("\"name\":\"unsupported\""));
         assert!(!json.contains("\"value\":\"unsupported\""));
-        assert!(json.contains("\"name\":\"capture\""));
+        assert!(json.contains("\"name\":\"trimCapture\""));
         assert!(json.contains("\"name\":\"exec\""));
         // mapfile is stdin-only: no appended path argument, still no gate leak
         let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");
