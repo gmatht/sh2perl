@@ -2666,7 +2666,25 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // `test` / `setArray` / `setArrayAppend` strings are
                 // excluded: the renderer injects lifted values into them,
                 // so a lifted var may appear inside them.
+                let let_args_native = if func == "exec" {
+                    // `let "a < b" "c == d"` whose EVERY arith string
+                    // parses natively (parse_arith) lowers to a native
+                    // expression in the emitter — the runtime never sees
+                    // the strings, so their `$var` refs are NOT store
+                    // reads and must not mark the vars. Any unparseable
+                    // arg (assignments / `++` / `$` refs / `10#` bases)
+                    // keeps the whole call on the runtime → mark all.
+                    matches!(args.as_slice(), [IrExpr::Str(cname, _), IrExpr::Array(cargs)]
+                        if cname == "let"
+                            && !cargs.is_empty()
+                            && cargs.iter().all(|a| {
+                                matches!(a, IrExpr::Str(s, _) if parse_arith(s).is_some())
+                            }))
+                } else {
+                    false
+                };
                 if func != "getVar" && func != "test" && func != "setArray" && func != "setArrayAppend"
+                    && !let_args_native
                 {
                     // ANY runtime call's string args (recursing into the
                     // Array/[] wrappers exec and setArrayAppend use) may
@@ -2992,19 +3010,19 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
         collect_assigns(st, &mut assigns);
     }
 
-    fn arith_has_div_mod(a: &ArithAst) -> bool {
-        match a {
-            ArithAst::Bin { op, lhs, rhs } => {
-                *op == "/" || *op == "%" || arith_has_div_mod(lhs) || arith_has_div_mod(rhs)
-            }
-            ArithAst::Un { arg, .. } => arith_has_div_mod(arg),
-            ArithAst::Cond { test, then, else_, .. } => {
-                arith_has_div_mod(test) || arith_has_div_mod(then) || arith_has_div_mod(else_)
-            }
-            ArithAst::Index { key, .. } => arith_has_div_mod(key),
-            _ => false,
+fn arith_has_div_mod(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } => {
+            *op == "/" || *op == "%" || arith_has_div_mod(lhs) || arith_has_div_mod(rhs)
         }
+        ArithAst::Un { arg, .. } => arith_has_div_mod(arg),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_has_div_mod(test) || arith_has_div_mod(then) || arith_has_div_mod(else_)
+        }
+        ArithAst::Index { key, .. } => arith_has_div_mod(key),
+        _ => false,
     }
+}
 
     // fixpoint: a var is liftable when ALL its assignment sources are
     // numeric (arith without / %, numeric literal, or another lifted var).
@@ -3027,6 +3045,14 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 continue;
             }
             let all_numeric = exprs.iter().all(|e| match e {
+                // `/` and `%` assignments stay blocked: bash ABORTS the
+                // whole expansion on a zero divisor (x stays unchanged),
+                // which a native/lifted number binding cannot express
+                // (a lifted `x = Math.trunc(1/0)` would store Infinity,
+                // and `$((0 % 0))` with unset operands is exercised by
+                // 063_01_deeply_nested_arithmetic — a native % yields NaN
+                // where bash yields ""). The runtime idiv/imod throw and
+                // the setVar path's arithEval catches → "".
                 IrExpr::Arith(a) => !arith_has_div_mod(a),
                 IrExpr::Int(_) => true,
                 IrExpr::Str(sv, _) => sv.trim().parse::<i64>().is_ok(),
@@ -4757,6 +4783,420 @@ fn try_native_echo_capture(e: &IrExpr) -> Option<Expr> {
     }
 }
 
+// ── native command-substitution lowerings (pure-capture family) ────────
+// `$(cmd ...)` whose value is a pure function of file contents / path
+// strings: the whole capture+spawn/arrow machinery collapses to a native
+// expression. `sh2.trimCapture` applies the capture's exact NUL + trailing-
+// newline strips; the promise chains record the exit status the spawned
+// binary would (success → lastExit 0, failure → 1).
+
+/// `sh2.fs.<name>(...)` — the runtime's node:fs/promises namespace
+/// (harness sh2-namespace.mjs, whitelisted in estree_gate.pl).
+fn sh2_fs_call(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "sh2".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "fs".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: args,
+        optional: false,
+    }
+}
+
+/// `await sh2.fs.readFile(path, enc?).then(r => (sh2.lastExit = ok, r))
+/// .catch(e => (sh2.lastExit = err, ""))` — the value the runtime's exec
+/// path would capture for a pure file-reading command, INCLUDING its exit
+/// status (`$?` reads lastExit after the cmdsub: bash yields the spawned
+/// binary's code — 0 on success, 1 on a missing/unreadable file).
+fn read_file_value(path: Expr, encoding: Option<&'static str>, ok: i64, err: i64) -> Expr {
+    let mut args = vec![path];
+    if let Some(enc) = encoding {
+        args.push(str_lit(enc));
+    }
+    let base = sh2_fs_call("readFile", args);
+    let status = |exit: i64| Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(exit),
+            raw: None,
+        }),
+    };
+    let then = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(base),
+            property: Box::new(Expr::Identifier {
+                name: "then".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![Expr::ArrowFunctionExpression {
+            params: vec![Expr::Identifier {
+                name: "r".to_string(),
+            }],
+            body: ArrowBody::Expr(Box::new(seq(vec![status(ok), Expr::Identifier {
+                name: "r".to_string(),
+            }]))),
+            expression: true,
+            r#async: false,
+        }],
+        optional: false,
+    };
+    let catch = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(then),
+            property: Box::new(Expr::Identifier {
+                name: "catch".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![Expr::ArrowFunctionExpression {
+            params: vec![Expr::Identifier {
+                name: "e".to_string(),
+            }],
+            body: ArrowBody::Expr(Box::new(seq(vec![status(err), str_lit("")]))),
+            expression: true,
+            r#async: false,
+        }],
+        optional: false,
+    };
+    await_expr(catch)
+}
+
+/// A plain literal path arg the native readers accept: non-empty, no
+/// GLOB_MAGIC / PS_MAGIC markers, not a flag (`-` or leading `-`).
+fn is_plain_path_arg(e: &IrExpr) -> Option<String> {
+    let IrExpr::Str(sv, _) = e else {
+        return None;
+    };
+    if sv.is_empty()
+        || sv.starts_with(GLOB_MAGIC)
+        || sv.starts_with(PS_MAGIC)
+        || sv.starts_with('-')
+    {
+        return None;
+    }
+    Some(sv.clone())
+}
+
+/// `$(cat f...)` / `$(cat < f)` — the capture's value is the files'
+/// contents concatenated (missing file → empty + exit 1, like the spawn),
+/// minus the capture strips.
+fn native_capture_cat(cmd_args: &[IrExpr], stdin_file: Option<&IrExpr>) -> Option<Expr> {
+    let mut reads: Vec<Expr> = if let Some(t) = stdin_file {
+        if !cmd_args.is_empty() {
+            return None;
+        }
+        vec![read_file_value(expr_to_estree(t), Some("utf8"), 0, 1)]
+    } else {
+        let mut out = Vec::new();
+        for a in cmd_args {
+            let _ = is_plain_path_arg(a)?;
+            out.push(read_file_value(expr_to_estree(a), Some("utf8"), 0, 1));
+        }
+        if out.is_empty() {
+            return None; // `$(cat)` reads stdin — not a pure file read
+        }
+        out
+    };
+    let mut joined = reads.pop().expect("cat has at least one read");
+    for r in reads.into_iter().rev() {
+        joined = Expr::BinaryExpression {
+            operator: "+",
+            left: Box::new(r),
+            right: Box::new(joined),
+        };
+    }
+    Some(sh2_call("trimCapture", vec![joined]))
+}
+
+/// `$(sort f)` / `$(sort < f)` — read, drop the trailing empty line,
+/// sort (C-locale byte order on ASCII == JS default string order — the
+/// C_LOCALE assumption), re-join with newlines. GNU sort always ends its
+/// output with a newline and the capture strips trailing newlines, so the
+/// joined lines are the exact captured value (empty file → ""). The
+/// runtime's own sort builtin leaves lastExit 0 even on a missing file
+/// (readFileSafe swallows the error), so the chain records 0/0 — identical
+/// to today's passing behavior.
+fn native_capture_sort(cmd_args: &[IrExpr], stdin_file: Option<&IrExpr>) -> Option<Expr> {
+    let path: &IrExpr = if let Some(t) = stdin_file {
+        if !cmd_args.is_empty() {
+            return None;
+        }
+        t
+    } else {
+        match cmd_args {
+            [single] => single,
+            _ => return None,
+        }
+    };
+    if is_plain_path_arg(path).is_none() {
+        return None;
+    }
+    let s = read_file_value(expr_to_estree(path), Some("utf8"), 0, 0);
+    // `(s.endsWith('\n') ? s.slice(0, -1) : s).split('\n').sort().join('\n')`
+    let ends_nl = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(s.clone()),
+            property: Box::new(Expr::Identifier {
+                name: "endsWith".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![str_lit("\n")],
+        optional: false,
+    };
+    let sliced = Expr::ConditionalExpression {
+        test: Box::new(ends_nl),
+        consequent: Box::new(Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(s.clone()),
+                property: Box::new(Expr::Identifier {
+                    name: "slice".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![
+                Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                },
+                Expr::UnaryExpression {
+                    operator: "-",
+                    argument: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(1),
+                        raw: None,
+                    }),
+                    prefix: true,
+                },
+            ],
+            optional: false,
+        }),
+        alternate: Box::new(s),
+    };
+    let lines = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(sliced),
+            property: Box::new(Expr::Identifier {
+                name: "split".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![str_lit("\n")],
+        optional: false,
+    };
+    let sorted = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(lines),
+            property: Box::new(Expr::Identifier {
+                name: "sort".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![],
+        optional: false,
+    };
+    Some(Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(sorted),
+            property: Box::new(Expr::Identifier {
+                name: "join".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![str_lit("\n")],
+        optional: false,
+    })
+}
+
+/// `$(wc -l < f)` / `$(wc -c < f)` — newline count / byte count of the
+/// redirected file (the runtime builtin's exact formulas; the fd-0
+/// redirect form is the one the corpus uses — the `wc -l f` filename-arg
+/// form appends the filename to the output and is left on the runtime).
+fn native_capture_wc(cmd_args: &[IrExpr], stdin_file: &IrExpr) -> Option<Expr> {
+    let [IrExpr::Str(flag, _)] = cmd_args else {
+        return None;
+    };
+    let count: Expr = match flag.as_str() {
+        "-l" => {
+            // `(await ...).split('\n').length - 1` — exact newline count
+            let s = read_file_value(expr_to_estree(stdin_file), Some("utf8"), 0, 1);
+            let split = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(s),
+                    property: Box::new(Expr::Identifier {
+                        name: "split".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![str_lit("\n")],
+                optional: false,
+            };
+            Expr::BinaryExpression {
+                operator: "-",
+                left: Box::new(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(split),
+                        property: Box::new(Expr::Identifier {
+                            name: "length".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![],
+                    optional: false,
+                }),
+                right: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(1),
+                    raw: None,
+                }),
+            }
+        }
+        "-c" => {
+            // no encoding → Buffer; `.length` = byte count (bash wc -c
+            // counts bytes, the runtime's Buffer.byteLength formula)
+            let buf = read_file_value(expr_to_estree(stdin_file), None, 0, 1);
+            Expr::MemberExpression {
+                object: Box::new(buf),
+                property: Box::new(Expr::Identifier {
+                    name: "length".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }
+        }
+        _ => return None,
+    };
+    Some(Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        arguments: vec![count],
+        optional: false,
+    })
+}
+
+/// `$(dirname X)` / `$(basename X)` / `$(pwd)` — the sync runtime helpers
+/// return the exact string the builtin would emit (minus the trailing
+/// newline the capture strips); `pwd` is a plain field read. All three
+/// record lastExit = 0 like the builtins.
+fn native_capture_path(cmd: &str, cmd_args: &[IrExpr]) -> Option<Expr> {
+    let value = match cmd {
+        "dirname" | "basename" => {
+            let [arg] = cmd_args else {
+                return None; // no args → builtin errors (empty capture)
+            };
+            sh2_call(cmd, vec![expr_to_estree(arg)])
+        }
+        "pwd" => {
+            if !cmd_args.is_empty() {
+                return None;
+            }
+            sh2_member("cwd")
+        }
+        _ => return None,
+    };
+    Some(seq(vec![
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+            }),
+        },
+        value,
+    ]))
+}
+
+/// `$(cat ...)` / `$(sort ...)` / `$(wc ...)` / `$(dirname ...)` /
+/// `$(basename ...)` / `$(pwd ...)` — a capture whose single statement is
+/// one of the pure sync builtins (or a single `< file` input redirect
+/// feeding one) collapses to a native value expression. Conservative:
+/// any other command / redirect shape / shadowing function keeps the
+/// runtime capture machinery.
+fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
+    match stmts {
+        [IrStmt::Expr(inner)] => {
+            let IrExpr::Call { func, args } = inner else {
+                return None;
+            };
+            if func != "exec" {
+                return None;
+            }
+            let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice() else {
+                return None;
+            };
+            if program_defines_function(name) {
+                return None; // a script function shadows the builtin
+            }
+            match name.as_str() {
+                "cat" => native_capture_cat(cmd_args, None),
+                "sort" => native_capture_sort(cmd_args, None),
+                "dirname" | "basename" | "pwd" => {
+                    native_capture_path(name, cmd_args)
+                }
+                _ => None,
+            }
+        }
+        // `$(wc -l < f)` — an input redirect wrapping the builtin: the
+        // redirect only supplies stdin (fd 0, mode "r"), which the native
+        // readFile replaces wholesale.
+        [IrStmt::Redirect { inner, redirects }] => {
+            if redirects.len() != 1 {
+                return None;
+            }
+            let r = &redirects[0];
+            if r.mode != "r" || r.fd != Some(0) || r.interpolate {
+                return None;
+            }
+            let [IrStmt::Expr(inner_e)] = inner.as_slice() else {
+                return None;
+            };
+            let IrExpr::Call { func, args } = inner_e else {
+                return None;
+            };
+            if func != "exec" {
+                return None;
+            }
+            let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice() else {
+                return None;
+            };
+            if program_defines_function(name) {
+                return None;
+            }
+            match name.as_str() {
+                "cat" => native_capture_cat(cmd_args, Some(&r.target)),
+                "sort" => native_capture_sort(cmd_args, Some(&r.target)),
+                "wc" => native_capture_wc(cmd_args, &r.target),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Args the runtime's echo would transform beyond plain string joining:
 /// GLOB_MAGIC (glob expansion), PS_MAGIC (process-substitution paths — the
 /// runtime materializes them into /dev/fd paths), and raw-byte markers
@@ -6170,7 +6610,24 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
     ) {
         match e {
             IrExpr::Call { func, args } => {
+                // `test` / `setArray` / `setArrayAppend` strings are
+                // excluded: the renderer injects lifted values into them,
+                // so a lifted var may appear inside them.
+                let let_args_native = if func == "exec" {
+                    // Parseable `let` args lower natively (see the
+                    // numeric-lift twin of this walker) — their `$var`
+                    // refs are never store reads.
+                    matches!(args.as_slice(), [IrExpr::Str(cname, _), IrExpr::Array(cargs)]
+                        if cname == "let"
+                            && !cargs.is_empty()
+                            && cargs.iter().all(|a| {
+                                matches!(a, IrExpr::Str(s, _) if parse_arith(s).is_some())
+                            }))
+                } else {
+                    false
+                };
                 if func != "getVar" && func != "test" && func != "setArray" && func != "setArrayAppend"
+                    && !let_args_native
                 {
                     for (i, a) in args.iter().enumerate() {
                         // `sh2.param`'s NAME arg (index 1) is a direct store
@@ -6897,6 +7354,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         }
                     }
                 }
+                // `$(cat f)` / `$(sort f)` / `$(wc -l < f)` /
+                // `$(dirname x)` / `$(basename x)` / `$(pwd)` — the
+                // pure-capture family: the value is a native expression
+                // over file contents / path strings (see
+                // `try_native_capture_value`) — no spawn, no async
+                // capture arrow, no fd swapping.
+                if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                    if let Some(value) = try_native_capture_value(stmts) {
+                        return value;
+                    }
+                }
             }
             // `printf FORMAT ARGS...` with a static format at the module's
             // default stdout sink: a native `process.stdout.write`, no
@@ -6923,6 +7391,67 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 {
                     if let Some(native) = try_native_echo(args) {
                         return native;
+                    }
+                }
+            }
+            // `let ARITH...` / `(( ARITH ))` — a statement/condition whose
+            // EVERY arith arg parses natively (parse_arith rejects
+            // assignments / `++` / `--` / `$` refs / `10#` bases): the
+            // value is a native expression (lifted vars read bare,
+            // store vars as `Number(getVar)||0` — the runtime's exact
+            // coercion), with the runtime builtin's status recorded
+            // (`let` returns true iff the LAST evaluated value != 0 and
+            // sets lastExit to match — `(v !== 0 ? 0 : 1)`). No dispatch,
+            // no string re-parse per evaluation.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
+                    if name == "let" && !a.is_empty() {
+                        let mut vals: Vec<Expr> = Vec::new();
+                        let mut parseable = true;
+                        for arg in a {
+                            match arg {
+                                IrExpr::Str(sv, _) => match parse_arith(sv) {
+                                    Some(ast) => vals.push(arith_to_estree(&ast)),
+                                    None => {
+                                        parseable = false;
+                                        break;
+                                    }
+                                },
+                                _ => {
+                                    parseable = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if parseable {
+                            let v = vals.pop().expect("non-empty let");
+                            let nonzero = Expr::BinaryExpression {
+                                operator: "!==",
+                                left: Box::new(v),
+                                right: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                }),
+                            };
+                            return seq(vec![
+                                Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(sh2_member("lastExit")),
+                                    right: Box::new(Expr::ConditionalExpression {
+                                        test: Box::new(nonzero.clone()),
+                                        consequent: Box::new(Expr::Literal {
+                                            value: serde_json::Value::from(0),
+                                            raw: None,
+                                        }),
+                                        alternate: Box::new(Expr::Literal {
+                                            value: serde_json::Value::from(1),
+                                            raw: None,
+                                        }),
+                                    }),
+                                },
+                                nonzero,
+                            ]);
+                        }
                     }
                 }
             }
