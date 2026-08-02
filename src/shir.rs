@@ -1908,13 +1908,19 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     }),
                 }
             } else {
+                // non-lifted store var: `Number(getVar(x)) || 0` — except
+                // the bash special vars, which read the runtime's state
+                // fields directly (`$?` → Number(sh2.lastExit) || 0).
+                let read = native_special_var(name).unwrap_or_else(|| {
+                    sh2_call("getVar", vec![str_lit(name)])
+                });
                 Expr::LogicalExpression {
                     operator: "||",
                     left: Box::new(Expr::CallExpression {
                         callee: Box::new(Expr::Identifier {
                             name: "Number".to_string(),
                         }),
-                        arguments: vec![sh2_call("getVar", vec![str_lit(name)])],
+                        arguments: vec![read],
                         optional: false,
                     }),
                     right: Box::new(Expr::Literal {
@@ -5192,6 +5198,8 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         IrExpr::Var(name, _) => {
             if is_lifted(name) {
                 Expr::Identifier { name: name.clone() }
+            } else if let Some(native) = native_special_var(name) {
+                native
             } else {
                 sh2_call("getVar", vec![str_lit(name)])
             }
@@ -5289,11 +5297,16 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             } else {
                 args.iter().map(expr_to_estree).collect()
             };
-            // a read of a lifted numeric variable is a bare JS identifier
+            // a read of a lifted numeric variable is a bare JS identifier;
+            // bash special vars ($? / $# / $0 / $1..$9 / $@ / $$ / $- /
+            // $PWD) are direct reads of the runtime's state fields
             if func == "getVar" {
                 if let [IrExpr::Str(name, _)] = args.as_slice() {
                     if is_lifted(name) {
                         return Expr::Identifier { name: name.clone() };
+                    }
+                    if let Some(native) = native_special_var(name) {
+                        return native;
                     }
                 }
             }
@@ -5611,6 +5624,81 @@ fn bool_lit(b: bool) -> Expr {
     Expr::Literal {
         value: serde_json::Value::Bool(b),
         raw: None,
+    }
+}
+
+/// bash special vars the runtime reads from its own STATE FIELDS (never
+/// the store — the runtime getVar special-cases them ahead of the store
+/// too): a direct member read instead of a getVar dispatch. `$?` reads
+/// `sh2.lastExit`; `$#` `sh2.positional.length`; `$0` `sh2.argv0`;
+/// `$@`/`$*` the positional join; `$1`..`$9` a positional element
+/// (`?? ''` — the runtime returns '' when out of range, JS undefined would
+/// render "undefined"); `$$` the pid; `$-` the constant 'hB'; `$PWD` the
+/// tracked cwd. The value is identical to the runtime's getVar for every
+/// corpus-observable state (the corpus is the oracle).
+fn native_special_var(name: &str) -> Option<Expr> {
+    let positional = || sh2_member("positional");
+    match name {
+        "?" => Some(sh2_member("lastExit")),
+        "#" => Some(Expr::MemberExpression {
+            object: Box::new(positional()),
+            property: Box::new(Expr::Identifier {
+                name: "length".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        "0" => Some(sh2_member("argv0")),
+        "@" | "*" => Some(Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(positional()),
+                property: Box::new(Expr::Identifier {
+                    name: "join".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![str_lit(" ")],
+            optional: false,
+        }),
+        "$" => Some(Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "String".to_string(),
+            }),
+            arguments: vec![Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "process".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "pid".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }],
+            optional: false,
+        }),
+        "-" => Some(str_lit("hB")),
+        "PWD" => Some(sh2_member("cwd")),
+        _ => {
+            let d = name.parse::<u32>().ok()?;
+            if (1..=9).contains(&d) {
+                Some(Expr::LogicalExpression {
+                    operator: "??",
+                    left: Box::new(Expr::MemberExpression {
+                        object: Box::new(positional()),
+                        property: Box::new(Expr::Literal {
+                            value: serde_json::Value::from(d - 1),
+                            raw: None,
+                        }),
+                        computed: true,
+                        optional: false,
+                    }),
+                    right: Box::new(str_lit("")),
+                })
+            } else {
+                None
+            }
+        }
     }
 }
 

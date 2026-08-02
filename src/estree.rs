@@ -1224,10 +1224,13 @@ mod tests {
     fn dollardollar_stays_inside_redirect_target() {
         // `cmd 2>/tmp/x.$$`: the parser cuts the `$$` off the redirect target
         // and pushes it onto the args. The transform re-attaches it to the
-        // target (interpolation with getVar("$")) and drops the bogus arg.
-        let json = to_json("realpath /bin 2>/tmp/realpath_stderr.$$");
+        // target (interpolation with the pid) and drops the bogus arg.
+        let json = to_json("realpath /bin 2>/tmp/realpath_stderr.$$").replace('\\', "");
         assert!(json.contains("/tmp/realpath_stderr."));
-        assert!(json.contains("\"name\":\"getVar\""));
+        // `$$` lowers to a direct `String(process.pid)` read, no dispatch
+        assert!(json.contains("process"));
+        assert!(json.contains("pid"));
+        assert!(!json.contains("\"name\":\"getVar\""));
         // the exec args must NOT contain the bare `$` expansion anymore
         let args = json
             .split("\"name\":\"exec\"")
@@ -1242,9 +1245,12 @@ mod tests {
     fn dollardollar_arg_joins_into_one_word() {
         // `cat /tmp/x.$$` — the `$$` arg is re-joined with the literal prefix
         // into a single interpolated word (one exec arg, not two).
-        let json = to_json("cat /tmp/realpath_stderr.$$");
+        let json = to_json("cat /tmp/realpath_stderr.$$").replace('\\', "");
         assert!(json.contains("/tmp/realpath_stderr."));
-        assert!(json.contains("\"name\":\"getVar\""));
+        // `$$` lowers to a direct `String(process.pid)` read, no dispatch
+        assert!(json.contains("process"));
+        assert!(json.contains("pid"));
+        assert!(!json.contains("\"name\":\"getVar\""));
         assert!(!json.contains("\"name\":\"unsupported\""));
     }
 
