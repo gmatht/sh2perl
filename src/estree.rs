@@ -927,6 +927,39 @@ pub(crate) fn str_lit(s: &str) -> Expr {
     }
 }
 
+/// `obj.name(args...)` — a method call on an arbitrary object expression
+/// (the native string-op chains of the capture lifts).
+pub(crate) fn method_call(obj: Expr, name: &str, args: Vec<Expr>) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: args,
+        optional: false,
+    }
+}
+
+/// A bare identifier expression.
+pub(crate) fn ident(name: &str) -> Expr {
+    Expr::Identifier {
+        name: name.to_string(),
+    }
+}
+
+/// An integer literal expression.
+pub(crate) fn int_lit_expr(i: i64) -> Expr {
+    Expr::Literal {
+        value: serde_json::Value::from(i),
+        raw: None,
+        regex: None,
+    }
+}
+
 /// A JS regex literal (`/\s+/`) — the ESTree `Literal`-with-`regex` shape
 /// (value: {} like the spec's RegExp literal). Printed by estree-gen.mjs
 /// as `/pattern/flags`.
