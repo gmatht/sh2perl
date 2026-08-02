@@ -76,7 +76,7 @@ static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
 /// expansion, identical builtin function, minus the async exec machinery
 /// (the whileLoopSync pattern — same semantics, no per-call promises).
 const SYNC_BUILTINS: &[&str] = &[
-    ".", ":", "basename", "break", "cd", "cmp", "comm", "continue", "declare",
+    ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "declare",
     "dirname", "echo", "eval", "exit", "export", "false", "head", "let", "local",
     "mapfile", "mktemp", "printf", "pwd", "read", "readarray", "readonly", "return", "seq",
     "set", "shift", "sort", "source", "stat", "tail", "test", "touch", "trap",
@@ -4647,7 +4647,22 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::Return(opt) => Stmt::ReturnStatement {
             argument: opt.as_ref().map(expr_to_estree),
         },
-        IrStmt::Exec { cmd, args, capture: _, redirects: _, env } => {
+        IrStmt::Exec { cmd, args, capture: _, redirects, env } => {
+            // `rm` / `mkdir` with plain args: a native `sh2.fs.*` promise
+            // chain — no spawn, no dispatch (see `try_native_fs_exec`).
+            // Redirects/env forms keep the runtime (the redirect wrapper
+            // around the statement is an IrStmt::Redirect — its inner Exec
+            // still hits this arm, and the fd plumbing stays vacuous for a
+            // write-free native rm/mkdir, so the wrapper can stay).
+            if env.is_empty() && redirects.is_empty() {
+                if let IrExpr::Str(name, _) = cmd {
+                    if let Some(native) = try_native_fs_exec(name, args) {
+                        return Some(Stmt::ExpressionStatement {
+                            expression: await_expr(native),
+                        });
+                    }
+                }
+            }
             let mut call_args = vec![
                 expr_to_estree(cmd),
                 expr_to_estree(&IrExpr::Array(args.clone())),
@@ -5197,6 +5212,14 @@ fn sh2_fs_call(name: &str, args: Vec<Expr>) -> Expr {
 /// status (`$?` reads lastExit after the cmdsub: bash yields the spawned
 /// binary's code — 0 on success, 1 on a missing/unreadable file).
 fn read_file_value(path: Expr, encoding: Option<&'static str>, ok: i64, err: i64) -> Expr {
+    await_expr(read_file_promise(path, encoding, ok, err))
+}
+
+/// The un-awaited `sh2.fs.readFile(path, enc?)` promise with the runtime's
+/// exit-status recording chained on — `read_file_value` awaits it; the
+/// capture-pipeline lifts chain their own `.then(...)` transform on it
+/// before the single await.
+fn read_file_promise(path: Expr, encoding: Option<&'static str>, ok: i64, err: i64) -> Expr {
     let mut args = vec![path];
     if let Some(enc) = encoding {
         args.push(str_lit(enc));
@@ -5251,7 +5274,7 @@ fn read_file_value(path: Expr, encoding: Option<&'static str>, ok: i64, err: i64
         }],
         optional: false,
     };
-    await_expr(catch)
+    catch
 }
 
 /// A plain literal path arg the native readers accept: non-empty, no
@@ -5405,6 +5428,312 @@ fn native_capture_sort(cmd_args: &[IrExpr], stdin_file: Option<&IrExpr>) -> Opti
         arguments: vec![str_lit("\n")],
         optional: false,
     })
+}
+
+/// A pipeline stage that is exactly `Arrow([Expr(exec NAME ARGS)])` — a
+/// bare command with no redirects (redirects arrive as a `redirect` call,
+/// which does not match). Script-defined functions shadow builtins — bail.
+fn pipeline_stage_exec(stage: &IrExpr) -> Option<(&str, &[IrExpr])> {
+    let IrExpr::Arrow(stmts) = stage else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+        return None;
+    };
+    if func != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() else {
+        return None;
+    };
+    if program_defines_function(name) {
+        return None;
+    }
+    Some((name, a))
+}
+
+/// A grep pattern liftable to a native string predicate: an optional
+/// leading `^` anchor becomes `startsWith` (the ERE anchor), anything else
+/// is a plain substring `includes`. No other BRE metacharacters, no
+/// newline, no leading `-` (would parse as an option).
+#[derive(Debug, Clone, PartialEq)]
+enum GrepPat {
+    Prefix(String),
+    Substr(String),
+}
+
+fn classify_grep_pat(pat: &str) -> Option<GrepPat> {
+    let meta = |s: &str| {
+        s.chars()
+            .any(|c| matches!(c, '^' | '$' | '.' | '[' | ']' | '*' | '\\' | '\n'))
+    };
+    if let Some(rest) = pat.strip_prefix('^') {
+        if rest.is_empty() || meta(rest) {
+            return None;
+        }
+        Some(GrepPat::Prefix(rest.to_string()))
+    } else if pat.starts_with('-') || meta(pat) {
+        None
+    } else {
+        Some(GrepPat::Substr(pat.to_string()))
+    }
+}
+
+/// `$(grep [-v] PAT FILE | cut -d D -f F)` — the classic passwd/group
+/// parse: read the file, keep the lines the literal pattern selects, slice
+/// each to one `-d`-delimited field, join with newlines. The capture
+/// strips (NULs + trailing newlines) apply via `sh2.trimCapture`; both
+/// commands exit 0 on the lifted shapes, so the chain records 0/0 (the
+/// runtime pipeline's status is the LAST stage's — cut's — which is 0
+/// even when grep found nothing). The field rules mirror GNU cut exactly:
+/// a line with NO delimiter passes through whole (cut treats it as field
+/// 1 for any `-f`), a missing field (fewer delimiters than the field
+/// index) is empty. The trailing empty line from the file's final newline
+/// is filtered by the same predicate (it matches neither a prefix nor a
+/// non-empty substring pattern) and its joined "\n" is stripped by
+/// trimCapture — byte-identical to grep's passthrough of the final
+/// newline.
+fn native_capture_grep_cut(stages: &[IrExpr]) -> Option<Expr> {
+    if stages.len() != 2 {
+        return None;
+    }
+    let (name1, a1) = pipeline_stage_exec(&stages[0])?;
+    let (name2, a2) = pipeline_stage_exec(&stages[1])?;
+    if name1 != "grep" || name2 != "cut" {
+        return None;
+    }
+    let (invert, pat, file): (bool, &str, &IrExpr) = match a1 {
+        [IrExpr::Str(pat, _), file] => (false, pat, file),
+        [IrExpr::Str(v, _), IrExpr::Str(pat, _), file] if v == "-v" => (true, pat, file),
+        _ => return None,
+    };
+    let gpat = classify_grep_pat(pat)?;
+    let [IrExpr::Str(d, _), IrExpr::Str(dv, _), IrExpr::Str(f, _), IrExpr::Str(ff, _)] = a2
+    else {
+        return None;
+    };
+    if d != "-d" || f != "-f" {
+        return None;
+    }
+    let d = dv;
+    let mut cs = ff.chars();
+    let field: usize = match (cs.next(), cs.next()) {
+        (Some(c), None) => c.to_digit(10)? as usize,
+        _ => return None, // multi-field `-f 1,3` keeps the runtime
+    };
+    if field == 0 {
+        return None;
+    }
+    let mut dc = d.chars();
+    let dch = dc.next()?;
+    if dc.next().is_some() || dch == '\n' {
+        return None; // multi-char / newline delimiters keep the runtime
+    }
+    let file_expr = native_fs_path_arg(file)?;
+    let s = read_file_promise(file_expr, Some("utf8"), 0, 0);
+    // l => KEEP
+    let keep = |l: Expr| {
+        let pred = match &gpat {
+            GrepPat::Prefix(p) => method_call(l.clone(), "startsWith", vec![str_lit(p)]),
+            GrepPat::Substr(p) => method_call(l.clone(), "includes", vec![str_lit(p)]),
+        };
+        if invert {
+            Expr::UnaryExpression {
+                operator: "!",
+                prefix: true,
+                argument: Box::new(pred),
+            }
+        } else {
+            pred
+        }
+    };
+    // l => l.includes(D) ? (l.split(D)[F-1] ?? "") : l
+    let field_of = |l: Expr| {
+        let split = method_call(l.clone(), "split", vec![str_lit(d)]);
+        let idx = Expr::MemberExpression {
+            object: Box::new(split),
+            property: Box::new(Expr::Literal {
+                value: serde_json::Value::from(field - 1),
+                raw: None,
+            regex: None,
+            }),
+            computed: true,
+            optional: false,
+        };
+        let picked = Expr::LogicalExpression {
+            operator: "??",
+            left: Box::new(idx),
+            right: Box::new(str_lit("")),
+        };
+        Expr::ConditionalExpression {
+            test: Box::new(method_call(l.clone(), "includes", vec![str_lit(d)])),
+            consequent: Box::new(picked),
+            alternate: Box::new(l),
+        }
+    };
+    let body = method_call(
+        method_call(
+            method_call(method_call(ident("t"), "split", vec![str_lit("\n")]), "filter", vec![sync_arrow_expr_param("l", keep(ident("l")))]),
+            "map",
+            vec![sync_arrow_expr_param("l", field_of(ident("l")))],
+        ),
+        "join",
+        vec![str_lit("\n")],
+    );
+    let chained = method_call(s, "then", vec![sync_arrow_expr_param("t", body)]);
+    Some(sh2_call("trimCapture", vec![await_expr(chained)]))
+}
+
+/// `l => l.includes(D) ? (l.split(D)[F-1] ?? "") : l` — the GNU-cut field
+/// slice shared by the grep|cut and cut|sort lifts: a line with no
+/// delimiter passes through whole (GNU cut treats it as field 1 for any
+/// `-f`); a missing field (fewer delimiters than the field index) is
+/// empty.
+fn cut_field_of(l: Expr, delim: &str, field: usize) -> Expr {
+    let split = method_call(l.clone(), "split", vec![str_lit(delim)]);
+    let idx = Expr::MemberExpression {
+        object: Box::new(split),
+        property: Box::new(Expr::Literal {
+            value: serde_json::Value::from(field - 1),
+            raw: None,
+        regex: None,
+        }),
+        computed: true,
+        optional: false,
+    };
+    let picked = Expr::LogicalExpression {
+        operator: "??",
+        left: Box::new(idx),
+        right: Box::new(str_lit("")),
+    };
+    Expr::ConditionalExpression {
+        test: Box::new(method_call(l.clone(), "includes", vec![str_lit(delim)])),
+        consequent: Box::new(picked),
+        alternate: Box::new(l),
+    }
+}
+
+/// `$(cut -d D -f F FILE | sort [-n])` — field-slice then sort: the file's
+/// lines are sliced to one field (GNU cut rules — see `cut_field_of`),
+/// sorted (C-locale string order for plain `sort`, the runtime sort
+/// builtin's exact `parseFloat||0` comparator for `sort -n`), and joined.
+/// The trailing empty line from the file's final newline is dropped before
+/// sorting (GNU sort's input has no phantom empty line; its output always
+/// ends with a newline, which trimCapture strips — byte-identical). Both
+/// commands exit 0 on these shapes, so the chain records 0/0.
+fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
+    if stages.len() != 2 {
+        return None;
+    }
+    let (name1, a1) = pipeline_stage_exec(&stages[0])?;
+    let (name2, a2) = pipeline_stage_exec(&stages[1])?;
+    if name1 != "cut" || name2 != "sort" {
+        return None;
+    }
+    // cut -d D -f F FILE — the file-arg form (stdin form means the cut
+    // stage of grep|cut, which native_capture_grep_cut handles)
+    let [IrExpr::Str(d, _), IrExpr::Str(dv, _), IrExpr::Str(f, _), IrExpr::Str(ff, _), file] = a1
+    else {
+        return None;
+    };
+    if d != "-d" || f != "-f" {
+        return None;
+    }
+    let d = dv;
+    let mut cs = ff.chars();
+    let field: usize = match (cs.next(), cs.next()) {
+        (Some(c), None) => c.to_digit(10)? as usize,
+        _ => return None,
+    };
+    if field == 0 {
+        return None;
+    }
+    let mut dc = d.chars();
+    let dch = dc.next()?;
+    if dc.next().is_some() || dch == '\n' {
+        return None;
+    }
+    // sort: no args (C-locale string order) or -n (numeric)
+    let numeric = match a2 {
+        [] => false,
+        [IrExpr::Str(sv, _)] if sv == "-n" => true,
+        _ => return None,
+    };
+    let file_expr = native_fs_path_arg(file)?;
+    let s = read_file_promise(file_expr, Some("utf8"), 0, 0);
+    // (t.endsWith("\n") ? t.slice(0, -1) : t).split("\n").map(l => …).sort(…).join("\n")
+    let t = ident("t");
+    let no_trailing_nl = Expr::ConditionalExpression {
+        test: Box::new(method_call(t.clone(), "endsWith", vec![str_lit("\n")])),
+        consequent: Box::new(method_call(
+            t.clone(),
+            "slice",
+            vec![int_lit_expr(0), Expr::UnaryExpression {
+                operator: "-",
+                prefix: true,
+                argument: Box::new(int_lit_expr(1)),
+            }],
+        )),
+        alternate: Box::new(t.clone()),
+    };
+    let lines = method_call(no_trailing_nl, "split", vec![str_lit("\n")]);
+    let fields = method_call(lines, "map", vec![sync_arrow_expr_param("l", cut_field_of(ident("l"), d, field))]);
+    let sorted = if numeric {
+        // (a, b) => ((parseFloat(a) || 0) < (parseFloat(b) || 0) ? -1 :
+        //            (parseFloat(a) || 0) > (parseFloat(b) || 0) ? 1 : 0)
+        let num = |x: Expr| Expr::LogicalExpression {
+            operator: "||",
+            left: Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "parseFloat".to_string(),
+                }),
+                arguments: vec![x.clone()],
+                optional: false,
+            }),
+            right: Box::new(int_lit_expr(0)),
+        };
+        let a = ident("a");
+        let b = ident("b");
+        let na = num(a.clone());
+        let nb = num(b.clone());
+        let lt = Expr::BinaryExpression {
+            operator: "<",
+            left: Box::new(na.clone()),
+            right: Box::new(nb.clone()),
+        };
+        let gt = Expr::BinaryExpression {
+            operator: ">",
+            left: Box::new(na),
+            right: Box::new(nb),
+        };
+        method_call(
+            fields,
+            "sort",
+            vec![Expr::ArrowFunctionExpression {
+                params: vec![a, b],
+                body: ArrowBody::Expr(Box::new(Expr::ConditionalExpression {
+                    test: Box::new(lt),
+                    consequent: Box::new(Expr::UnaryExpression {
+                        operator: "-",
+                        prefix: true,
+                        argument: Box::new(int_lit_expr(1)),
+                    }),
+                    alternate: Box::new(Expr::ConditionalExpression {
+                        test: Box::new(gt),
+                        consequent: Box::new(int_lit_expr(1)),
+                        alternate: Box::new(int_lit_expr(0)),
+                    }),
+                })),
+                expression: true,
+                r#async: false,
+            }],
+        )
+    } else {
+        method_call(fields, "sort", vec![])
+    };
+    let joined = method_call(sorted, "join", vec![str_lit("\n")]);
+    let chained = method_call(s, "then", vec![sync_arrow_expr_param("t", joined)]);
+    Some(sh2_call("trimCapture", vec![await_expr(chained)]))
 }
 
 /// `$(wc -l < f)` / `$(wc -c < f)` — newline count / byte count of the
@@ -5653,6 +5982,18 @@ fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
                     _ => None,
                 }
             }
+            // `$(grep [-v] PAT FILE | cut -d D -f F)` and
+            // `$(cut -d D -f F FILE | sort [-n])` — the read/filter/field
+            // capture pipelines (see `native_capture_grep_cut` and
+            // `native_capture_cut_sort`): the whole pipeline collapses to
+            // a readFile + string-op chain — no spawns, no pipeline
+            // machinery, no capture arrow.
+            IrExpr::Call { func, args } if func == "pipeline" => {
+                let [IrExpr::Array(stages)] = args.as_slice() else {
+                    return None;
+                };
+                native_capture_grep_cut(stages).or_else(|| native_capture_cut_sort(stages))
+            }
             _ => None,
         },
         // Statement-form redirect (reachable when a capture body lowers via
@@ -5731,6 +6072,325 @@ fn ir_expr_needs_runtime(e: &IrExpr) -> bool {
         }
         _ => false,
     }
+}
+
+/// `rm` / `mkdir` with only the simple flags and plain path args: a native
+/// `sh2.fs.*` promise chain — no subprocess spawn, no exec dispatch. The
+/// chain records `sh2.lastExit` exactly like the spawned binary would and
+/// resolves to the same truthiness `await sh2.exec(...)` yields (guard /
+/// `&&` / `||` / `!` branch on it identically). The stderr message text
+/// the real binary prints on failure is skipped — the corpus gate compares
+/// stdout only; `$?` and the branch chains observe the STATUS, which the
+/// chain records (the same trade the `$(cat f)` / `$(sort f)` capture
+/// lifts already make).
+///
+/// rm: `-f`/`--force`, `-r`/`-R`/`--recursive` (and combined `-rf`/`-fr`),
+/// `--` end-of-flags. Any other option (`-i`/`-d`/`-v`...), a glob/
+/// process-substitution path, or the env-carrying form keeps the runtime
+/// spawn. Statuses mirror GNU rm (verified against the real binary):
+/// without `-f` a failed path (missing file, directory without `-r`)
+/// makes the exit status 1 while the REMAINING paths are still processed
+/// (Promise.all — GNU rm continues after an error); `-f` ignores ENOENT
+/// but still fails on a directory (EISDIR) like GNU; `-r` recurses via
+/// fs.rm.
+///
+/// mkdir: `-p`/`--parents` → recursive mkdir (existing dirs are fine,
+/// exactly `mkdir -p`; EEXIST without `-p` fails like bash). Any other
+/// option keeps the runtime.
+fn try_native_fs_exec(name: &str, args: &[IrExpr]) -> Option<Expr> {
+    match name {
+        "rm" => try_native_rm(args),
+        "mkdir" => try_native_mkdir(args),
+        _ => None,
+    }
+}
+
+/// The `sh2.fs.unlink(p)` / `sh2.fs.rm(p, opts)` per-path promise (not yet
+/// chained with .then/.catch — see `native_fs_status_chain`).
+fn native_fs_remove_op(path: Expr, recursive: bool, force: bool) -> Expr {
+    if recursive {
+        // fs.rm({recursive, force}) — recursive dir/file removal; force
+        // suppresses the ENOENT of a missing path (GNU `rm -rf missing`
+        // exits 0), force:false keeps it failing (GNU `rm -r missing`
+        // exits 1).
+        sh2_fs_call(
+            "rm",
+            vec![
+                path,
+                Expr::ObjectExpression {
+                    properties: vec![
+                        prop("recursive", bool_lit(true)),
+                        prop("force", bool_lit(force)),
+                    ],
+                },
+            ],
+        )
+    } else {
+        sh2_fs_call("unlink", vec![path])
+    }
+}
+
+/// The promise a per-path removal yields: 0 on success, 1 on failure.
+/// With `-f`, an ENOENT (missing file) is not a failure — but a directory
+/// (EISDIR/EPERM) still is, exactly GNU `rm -f DIR` → exit 1.
+fn native_fs_remove_result(op: Expr, force: bool) -> Expr {
+    let ok = Expr::ArrowFunctionExpression {
+        params: vec![],
+        body: ArrowBody::Expr(Box::new(Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+        regex: None,
+        })),
+        expression: true,
+        r#async: false,
+    };
+    let err = if force {
+        // (e) => (e && e.code === 'ENOENT') ? 0 : 1
+        Expr::ArrowFunctionExpression {
+            params: vec![Expr::Identifier {
+                name: "e".to_string(),
+            }],
+            body: ArrowBody::Expr(Box::new(Expr::ConditionalExpression {
+                test: Box::new(Expr::LogicalExpression {
+                    operator: "&&",
+                    left: Box::new(Expr::Identifier {
+                        name: "e".to_string(),
+                    }),
+                    right: Box::new(Expr::BinaryExpression {
+                        operator: "===",
+                        left: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "e".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "code".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        right: Box::new(str_lit("ENOENT")),
+                    }),
+                }),
+                consequent: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                regex: None,
+                }),
+                alternate: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(1),
+                    raw: None,
+                regex: None,
+                }),
+            })),
+            expression: true,
+            r#async: false,
+        }
+    } else {
+        Expr::ArrowFunctionExpression {
+            params: vec![],
+            body: ArrowBody::Expr(Box::new(Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+            regex: None,
+            })),
+            expression: true,
+            r#async: false,
+        }
+    };
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(op),
+            property: Box::new(Expr::Identifier {
+                name: "then".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![ok, err],
+        optional: false,
+    }
+}
+
+/// `Promise.all([...]).then(s => (sh2.lastExit = s.includes(1) ? 1 : 0,
+/// sh2.lastExit === 0))` — aggregate the per-path statuses into the exit
+/// status bash reports (any failure → 1) and resolve to the truthiness
+/// `await sh2.exec(...)` would have returned.
+fn native_fs_status_chain(results: Vec<Expr>) -> Expr {
+    let all = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::Identifier {
+                name: "Promise".to_string(),
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "all".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![Expr::ArrayExpression {
+            elements: results.into_iter().map(Some).collect(),
+        }],
+        optional: false,
+    };
+    let s = Expr::Identifier {
+        name: "s".to_string(),
+    };
+    let no_failure = Expr::UnaryExpression {
+        operator: "!",
+        prefix: true,
+        argument: Box::new(Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(s.clone()),
+                property: Box::new(Expr::Identifier {
+                    name: "includes".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+            regex: None,
+            }],
+            optional: false,
+        }),
+    };
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(all),
+            property: Box::new(Expr::Identifier {
+                name: "then".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![Expr::ArrowFunctionExpression {
+            params: vec![s.clone()],
+            body: ArrowBody::Expr(Box::new(seq(vec![
+                Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(sh2_member("lastExit")),
+                    right: Box::new(Expr::ConditionalExpression {
+                        test: Box::new(no_failure),
+                        consequent: Box::new(Expr::Literal {
+                            value: serde_json::Value::from(0),
+                            raw: None,
+                        regex: None,
+                        }),
+                        alternate: Box::new(Expr::Literal {
+                            value: serde_json::Value::from(1),
+                            raw: None,
+                        regex: None,
+                        }),
+                    }),
+                },
+                last_exit_eq_zero(),
+            ]))),
+            expression: true,
+            r#async: false,
+        }],
+        optional: false,
+    }
+}
+
+/// A plain path arg the native fs commands accept: lowers to a JS
+/// expression with no await and no runtime markers (GLOB_MAGIC — the
+/// runtime would glob-expand it; PS_MAGIC — a materialized /dev/fd path;
+/// raw-byte private-use chars — decodeRawBytes territory).
+fn native_fs_path_arg(a: &IrExpr) -> Option<Expr> {
+    if let IrExpr::Str(sv, _) = a {
+        if sv.contains(GLOB_MAGIC) || sv.contains(PS_MAGIC) {
+            return None;
+        }
+        if sv.chars().any(|c| (0xF800..=0xF8FF).contains(&(c as u32))) {
+            return None;
+        }
+    }
+    let pe = expr_to_estree(a);
+    if expr_has_await(&pe) {
+        return None;
+    }
+    Some(pe)
+}
+
+fn try_native_rm(args: &[IrExpr]) -> Option<Expr> {
+    let mut force = false;
+    let mut recursive = false;
+    let mut no_more_flags = false;
+    let mut paths: Vec<&IrExpr> = Vec::new();
+    for a in args {
+        if let IrExpr::Str(sv, _) = a {
+            if !no_more_flags && sv.starts_with('-') && sv != "-" {
+                match sv.as_str() {
+                    "-f" | "--force" => force = true,
+                    "-r" | "-R" | "--recursive" => recursive = true,
+                    "-rf" | "-fr" => {
+                        force = true;
+                        recursive = true;
+                    }
+                    "--" => no_more_flags = true,
+                    _ => return None, // -i/-d/-v/... keep the runtime spawn
+                }
+                continue;
+            }
+        }
+        paths.push(a);
+    }
+    if paths.is_empty() {
+        return None; // `rm` with no args: GNU usage error — keep the spawn
+    }
+    let mut results: Vec<Expr> = Vec::new();
+    for p in paths {
+        let pe = native_fs_path_arg(p)?;
+        results.push(native_fs_remove_result(
+            native_fs_remove_op(pe, recursive, force),
+            force,
+        ));
+    }
+    Some(native_fs_status_chain(results))
+}
+
+fn try_native_mkdir(args: &[IrExpr]) -> Option<Expr> {
+    let mut parents = false;
+    let mut paths: Vec<&IrExpr> = Vec::new();
+    for a in args {
+        if let IrExpr::Str(sv, _) = a {
+            if sv.starts_with('-') && sv != "-" {
+                match sv.as_str() {
+                    "-p" | "--parents" => parents = true,
+                    "--" => {}
+                    _ => return None, // -m/-v/... keep the runtime spawn
+                }
+                continue;
+            }
+        }
+        paths.push(a);
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    let mut results: Vec<Expr> = Vec::new();
+    for p in paths {
+        let pe = native_fs_path_arg(p)?;
+        let op = if parents {
+            // mkdir -p: recursive — existing dirs and missing parents are
+            // fine (EEXIST resolves), exactly `mkdir -p`.
+            sh2_fs_call(
+                "mkdir",
+                vec![
+                    pe,
+                    Expr::ObjectExpression {
+                        properties: vec![prop("recursive", bool_lit(true))],
+                    },
+                ],
+            )
+        } else {
+            sh2_fs_call("mkdir", vec![pe])
+        };
+        // plain mkdir on an existing dir → EEXIST → 1, like bash
+        results.push(native_fs_remove_result(op, false));
+    }
+    Some(native_fs_status_chain(results))
 }
 
 /// `grep -q PAT FILE` — a pure substring test over a file's contents: the
@@ -9309,6 +9969,18 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
+            // `rm` / `mkdir` with plain args (expr position — && / ||
+            // operands, if-conditions, capture bodies): native `sh2.fs.*`
+            // promise chain, no spawn (see `try_native_fs_exec`). The
+            // env-carrying 3-arg form does not match this arm and keeps
+            // the runtime dispatch.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
+                    if let Some(native) = try_native_fs_exec(name, a) {
+                        return await_expr(native);
+                    }
+                }
+            }
             let callee_name = exec_or_builtin(func, args);
             let call = sh2_call(callee_name, mapped_args);
             if is_async_call(callee_name) {
@@ -9484,6 +10156,20 @@ fn await_call(name: &str, args: Vec<Expr>) -> Expr {
 fn sync_arrow_expr(expr: Expr) -> Expr {
     Expr::ArrowFunctionExpression {
         params: vec![],
+        body: ArrowBody::Expr(Box::new(expr)),
+        expression: true,
+        r#async: false,
+    }
+}
+
+/// Plain (non-async) expression arrow with one parameter — the filter/map
+/// callbacks of the native capture-pipeline lifts (`t => …` over the
+/// readFile value, `l => …` over lines).
+fn sync_arrow_expr_param(param: &str, expr: Expr) -> Expr {
+    Expr::ArrowFunctionExpression {
+        params: vec![Expr::Identifier {
+            name: param.to_string(),
+        }],
         body: ArrowBody::Expr(Box::new(expr)),
         expression: true,
         r#async: false,
