@@ -2010,7 +2010,59 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             }),
         },
         ArithAst::Bin { op, lhs, rhs } => {
-            if *op == "&&" || *op == "||" {
+            if *op == "/" || *op == "%" {
+                // bash arithmetic is INTEGER division (truncating toward
+                // zero); a zero divisor must abort the whole expansion, and
+                // JS bitwise ops would silently absorb a NaN — so the
+                // general form throws from the runtime helper (caught by
+                // arithEval). When the divisor is PROVABLY nonzero (a
+                // non-zero numeric literal, optionally sign-flipped — the
+                // abort can never fire), the operation is plain native
+                // JS: no idiv/imod dispatch, no zero check per evaluation.
+                let r = arith_to_estree(rhs);
+                if arith_is_nonzero(rhs) {
+                    if *op == "/" {
+                        // Math.trunc(l / r) — bash integer division
+                        // (truncating toward zero) with a provably-nonzero
+                        // divisor (no zero-divisor abort possible, so no
+                        // idiv dispatch). The truncation wraps the WHOLE
+                        // division — truncating the dividend first would
+                        // change the quotient (7/2 → 3.5).
+                        Expr::CallExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(Expr::Identifier {
+                                    name: "Math".to_string(),
+                                }),
+                                property: Box::new(Expr::Identifier {
+                                    name: "trunc".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: vec![Expr::BinaryExpression {
+                                operator: "/",
+                                left: Box::new(arith_to_estree(lhs)),
+                                right: Box::new(r),
+                            }],
+                            optional: false,
+                        }
+                    } else {
+                        Expr::BinaryExpression {
+                            operator: "%",
+                            left: Box::new(arith_to_estree(lhs)),
+                            right: Box::new(r),
+                        }
+                    }
+                } else if *op == "/" {
+                    // zero divisor must abort the whole expansion, and
+                    // JS bitwise ops would silently absorb a NaN — so throw
+                    // from the runtime helper (caught by arithEval).
+                    sh2_call("idiv", vec![arith_to_estree(lhs), r])
+                } else {
+                    // modulo by zero aborts the expansion too (bash "division by 0")
+                    sh2_call("imod", vec![arith_to_estree(lhs), r])
+                }
+            } else if *op == "&&" || *op == "||" {
                 // bash yields 0/1; JS logicals yield one of the operands
                 Expr::ConditionalExpression {
                     test: Box::new(Expr::LogicalExpression {
@@ -2027,15 +2079,6 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                         raw: None,
                     }),
                 }
-            } else if *op == "/" {
-                // bash arithmetic is INTEGER division (truncating toward
-                // zero); zero divisor must abort the whole expansion, and
-                // JS bitwise ops would silently absorb a NaN — so throw
-                // from the runtime helper (caught by arithEval).
-                sh2_call("idiv", vec![arith_to_estree(lhs), arith_to_estree(rhs)])
-            } else if *op == "%" {
-                // modulo by zero aborts the expansion too (bash "division by 0")
-                sh2_call("imod", vec![arith_to_estree(lhs), arith_to_estree(rhs)])
             } else if matches!(*op, "<" | "<=" | ">" | ">=" | "==" | "!=") {
                 // bash comparisons yield 0/1; JS yields booleans
                 Expr::ConditionalExpression {
@@ -6433,6 +6476,42 @@ fn try_native_test(s: &str) -> Option<Expr> {
                     }
                     let l = str_operand(lhs)?;
                     let r = str_operand(rhs)?;
+                    // `nocasematch` makes `==`/`!=` (and `[[ ]]` glob
+                    // matches) case-insensitive: the runtime lowercases
+                    // BOTH sides (evalTest `=`/`==`/`!=`). A native bare
+                    // `===` would be case-sensitive — lowercase both
+                    // operands under a possible nocasematch (mirrors the
+                    // glob path in try_native_glob_test).
+                    if CASE_NOCASE.lock().unwrap().unwrap_or(false) {
+                        // the runtime compares `String(ast.l).toLowerCase()`
+                        // — wrap both sides in String(...) so the operand
+                        // shape matches the gate's allowed string-op
+                        // objects (Identifier operands are not gate-listed
+                        // directly).
+                        let lc = |e: Expr| Expr::CallExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(Expr::CallExpression {
+                                    callee: Box::new(Expr::Identifier {
+                                        name: "String".to_string(),
+                                    }),
+                                    arguments: vec![e],
+                                    optional: false,
+                                }),
+                                property: Box::new(Expr::Identifier {
+                                    name: "toLowerCase".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: vec![],
+                            optional: false,
+                        };
+                        return Some(Expr::BinaryExpression {
+                            operator: js,
+                            left: Box::new(lc(l)),
+                            right: Box::new(lc(r)),
+                        });
+                    }
                     return Some(Expr::BinaryExpression {
                         operator: js,
                         left: Box::new(l),
@@ -7497,6 +7576,42 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         if let Some(native) = try_native_test(sv) {
                             return native;
                         }
+                    } else if let Some(native) = try_native_test(sv) {
+                        // Inside `&&`/`||` the chain links branch on
+                        // `sh2.lastExit`, which a native comparison never
+                        // sets (the reason tests there normally stay
+                        // runtime calls) — record the status the runtime
+                        // test would have set, then yield the value:
+                        // `(sh2.lastExit = t ? 0 : 1, t)`. The native
+                        // operands are pure reads, so evaluating `t` twice
+                        // is side-effect-free; the chain's lastExit checks
+                        // then work with NO dispatch and NO string re-parse
+                        // per evaluation. Only sh2-argument-FREE natives
+                        // qualify: a store-var operand would lower to
+                        // getVar calls (the runtime test is ONE call —
+                        // converting it into several getVars is a net
+                        // metric loss, and the sync getVars gain nothing
+                        // over the runtime test's single store read).
+                        if !expr_contains_sh2(&native) {
+                            return seq(vec![
+                                Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(sh2_member("lastExit")),
+                                    right: Box::new(Expr::ConditionalExpression {
+                                        test: Box::new(native.clone()),
+                                        consequent: Box::new(Expr::Literal {
+                                            value: serde_json::Value::from(0),
+                                            raw: None,
+                                        }),
+                                        alternate: Box::new(Expr::Literal {
+                                            value: serde_json::Value::from(1),
+                                            raw: None,
+                                        }),
+                                    }),
+                                },
+                                native,
+                            ]);
+                        }
                     }
                     if let Some(tpl) = test_str_to_estree(sv) {
                         // the injected template is the ARGUMENT to the
@@ -7999,6 +8114,19 @@ fn expr_has_await(e: &Expr) -> bool {
         .unwrap_or(true)
 }
 
+/// Does the lowered expression contain ANY `sh2.*` call (a dispatch)? Used
+/// to keep the and/or test lowering a NET win: a native test whose operand
+/// reads are store vars would trade one `sh2.test` call for several
+/// `sh2.getVar` calls.
+fn expr_contains_sh2(e: &Expr) -> bool {
+    serde_json::to_string(e)
+        .map(|s| {
+            s.contains("\"object\":{\"type\":\"Identifier\",\"name\":\"sh2\"}")
+                || s.contains("\"name\":\"sh2\",\"type\":\"Identifier\"")
+        })
+        .unwrap_or(true)
+}
+
 fn stmts_have_await(stmts: &[Stmt]) -> bool {
     serde_json::to_string(stmts)
         .map(|s| s.contains("\"type\":\"AwaitExpression\""))
@@ -8110,6 +8238,19 @@ fn native_special_var(name: &str) -> Option<Expr> {
                 None
             }
         }
+    }
+}
+
+/// Is an arithmetic divisor provably nonzero? `Num(v)` with `v != 0`, or a
+/// sign-flipped nonzero literal (`-2`, `+3` — unary minus/plus on a nonzero
+/// Num never reaches zero). Everything else (vars, `$((...))` results,
+/// arithmetic products) is conservatively NOT provable, so the runtime
+/// idiv/imod zero-divisor throw stays for those.
+fn arith_is_nonzero(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Num(v) => *v != 0,
+        ArithAst::Un { op, arg } => matches!(*op, "-" | "+") && arith_is_nonzero(arg),
+        _ => false,
     }
 }
 
