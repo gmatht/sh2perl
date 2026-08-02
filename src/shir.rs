@@ -78,7 +78,7 @@ static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
 const SYNC_BUILTINS: &[&str] = &[
     ".", ":", "basename", "break", "cd", "cmp", "comm", "continue", "declare",
     "dirname", "echo", "eval", "exit", "export", "false", "head", "let", "local",
-    "mapfile", "printf", "pwd", "read", "readarray", "readonly", "return", "seq",
+    "mapfile", "mktemp", "printf", "pwd", "read", "readarray", "readonly", "return", "seq",
     "set", "shift", "sort", "source", "stat", "tail", "test", "touch", "trap",
     "true", "type", "typeset", "uniq", "unset", "wc",
 ];
@@ -5514,37 +5514,156 @@ fn native_capture_path(cmd: &str, cmd_args: &[IrExpr]) -> Option<Expr> {
 /// runtime capture machinery.
 fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
     match stmts {
-        [IrStmt::Expr(inner)] => {
-            let IrExpr::Call { func, args } = inner else {
-                return None;
-            };
-            if func != "exec" {
-                return None;
-            }
-            let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice() else {
-                return None;
-            };
-            if program_defines_function(name) {
-                return None; // a script function shadows the builtin
-            }
-            match name.as_str() {
-                "cat" => native_capture_cat(cmd_args, None),
-                "sort" => native_capture_sort(cmd_args, None),
-                "dirname" | "basename" | "pwd" => {
-                    native_capture_path(name, cmd_args)
+        [IrStmt::Expr(inner)] => match inner {
+            // `$(cmd < f)` — an EXPRESSION-level redirect: capture bodies
+            // lower redirects as calls (`command_arrow_stmts` →
+            // `command_to_ir` → `sh2.redirect`), NOT the IrStmt::Redirect
+            // statement form. The spec object carries fd/mode/target
+            // (interpolate only for heredoc modes).
+            IrExpr::Call { func, args } if func == "redirect" => {
+                let [IrExpr::Arrow(inner_stmts), IrExpr::Array(specs)] = args.as_slice()
+                else {
+                    return None;
+                };
+                let [IrExpr::Object(props)] = specs.as_slice() else {
+                    return None;
+                };
+                let mut fd: Option<i64> = None;
+                let mut mode: Option<&str> = None;
+                let mut target: Option<&IrExpr> = None;
+                let mut interpolate = false;
+                for (k, v) in props {
+                    match (k.as_str(), v) {
+                        ("fd", IrExpr::Int(i)) => fd = Some(*i),
+                        ("mode", IrExpr::Str(m, _)) => mode = Some(m.as_str()),
+                        ("target", t) => target = Some(t),
+                        ("interpolate", IrExpr::Bool(b)) => interpolate = *b,
+                        _ => {}
+                    }
                 }
-                _ => None,
+                let mode = mode?;
+                // `$(< f)` / `$(cat < f)` / `$(sort < f)` / `$(wc -l < f)`:
+                // a fd-0 input redirect supplies stdin, which the native
+                // readFile replaces wholesale. The target renders as a path
+                // expression (store refs become getVar calls — exactly what
+                // the runtime's expandWord would read), so `interpolate`
+                // (heredoc-only) never blocks this. A redirect-only command
+                // (`$(< f)` — bash copies the file to stdout) arrives as an
+                // exec with an EMPTY name; the lift treats it like `cat < f`
+                // (bash-correct file content; the runtime's no-op exec
+                // yields "" — corpus-neutral either way).
+                if mode == "r" && fd == Some(0) {
+                    let [IrStmt::Expr(inner_e)] = inner_stmts.as_slice() else {
+                        return None;
+                    };
+                    let IrExpr::Call { func, args } = inner_e else {
+                        return None;
+                    };
+                    if func != "exec" {
+                        return None;
+                    }
+                    let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice()
+                    else {
+                        return None;
+                    };
+                    let target = target?;
+                    if name.is_empty() {
+                        // `$(< f)` — the file content, capture-stripped
+                        if !cmd_args.is_empty() {
+                            return None;
+                        }
+                        return Some(sh2_call(
+                            "trimCapture",
+                            vec![read_file_value(expr_to_estree(target), Some("utf8"), 0, 1)],
+                        ));
+                    }
+                    if program_defines_function(name) {
+                        return None;
+                    }
+                    return match name.as_str() {
+                        "cat" => native_capture_cat(cmd_args, Some(target)),
+                        "sort" => native_capture_sort(cmd_args, Some(target)),
+                        "wc" => native_capture_wc(cmd_args, target),
+                        _ => None,
+                    };
+                }
+                // `$(cat <<EOF ...)` — a fd-0 HEREDOC wrapping `cat` with
+                // no args: cat copies stdin (the heredoc body) to stdout,
+                // so the captured value is the body minus the capture
+                // strips. A non-interpolated body folds to a plain string
+                // LITERAL at emit time (zero runtime calls); an interpolated
+                // body (unquoted EOF with `$refs`) becomes
+                // `trimCapture(template)` — the template inlines lifted
+                // bindings, the runtime expandWord reads store refs exactly
+                // as it would inside the redirect. (The redirect target is
+                // the BODY here, not a path.)
+                if (mode == "heredoc" || mode == "heredoc-tabs") && fd == Some(0) {
+                    let [IrStmt::Expr(inner_e)] = inner_stmts.as_slice() else {
+                        return None;
+                    };
+                    let IrExpr::Call { func, args } = inner_e else {
+                        return None;
+                    };
+                    if !matches!(func.as_str(), "exec" | "builtin") {
+                        return None;
+                    }
+                    let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice()
+                    else {
+                        return None;
+                    };
+                    if name != "cat" || !cmd_args.is_empty() || program_defines_function("cat") {
+                        return None;
+                    }
+                    let IrExpr::Str(body, _) = target? else {
+                        return None;
+                    };
+                    if interpolate && body.contains('$') {
+                        // the runtime expands the body from the store — a
+                        // native template can only inline LIFTED refs
+                        // (fully_lifted_template rejects store-bound `$refs`)
+                        let tpl = fully_lifted_template(body)?;
+                        return Some(sh2_call("trimCapture", vec![tpl]));
+                    }
+                    // A `$`-free body (quoted EOF, or unquoted with no refs)
+                    // expands to itself: heredoc-tabs bodies are tab-stripped
+                    // by the runtime at execution time (a compile-time fold
+                    // would keep the tabs) — only plain heredocs fold to a
+                    // literal. (NULs cannot occur in parsed source text;
+                    // trailing newlines are the only capture strip.)
+                    if mode == "heredoc" {
+                        let stripped = body.trim_end_matches('\n').to_string();
+                        return Some(str_lit(&stripped));
+                    }
+                }
+                None
             }
-        }
-        // `$(wc -l < f)` — an input redirect wrapping the builtin: the
-        // redirect only supplies stdin (fd 0, mode "r"), which the native
-        // readFile replaces wholesale.
+            IrExpr::Call { func, args } if func == "exec" => {
+                let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice() else {
+                    return None;
+                };
+                if program_defines_function(name) {
+                    return None; // a script function shadows the builtin
+                }
+                match name.as_str() {
+                    "cat" => native_capture_cat(cmd_args, None),
+                    "sort" => native_capture_sort(cmd_args, None),
+                    "dirname" | "basename" | "pwd" => {
+                        native_capture_path(name, cmd_args)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        // Statement-form redirect (reachable when a capture body lowers via
+        // stmt_for_command rather than command_arrow_stmts): same lifts,
+        // IrStmt::Redirect shape.
         [IrStmt::Redirect { inner, redirects }] => {
             if redirects.len() != 1 {
                 return None;
             }
             let r = &redirects[0];
-            if r.mode != "r" || r.fd != Some(0) || r.interpolate {
+            if r.mode != "r" || r.fd != Some(0) {
                 return None;
             }
             let [IrStmt::Expr(inner_e)] = inner.as_slice() else {
@@ -6967,6 +7086,15 @@ fn native_capture_printf(e: &IrExpr) -> Option<Expr> {
 /// for anything else (falls back to the injected template / runtime).
 fn try_native_test(s: &str) -> Option<Expr> {
     let s = s.trim();
+    // file tests (`-f`/`-d`/`-e`/`-h`/`-s`/`-r`/`-w`/`-x`/`-b`/`-c`/`-p`/
+    // `-S`/`-u`/`-g`/`-k`/`-O`/`-G`/`-N`, optionally `!`-negated): the
+    // runtime's evalUnary is an lstat + flag check, so a native
+    // `await sh2.fs.lstat(p).then(s => <check>, () => false)` is the exact
+    // value minus the string parse + dispatch (and the runtime's BLOCKING
+    // lstatSync — the native chain is async).
+    if let Some(native) = try_native_file_test(s) {
+        return Some(native);
+    }
     // `-n` / `-z` unary string tests: `[ -n "$x" ]` → `String(x) !== ""`.
     // The runtime's evalUnary is a pure string-emptiness test for these
     // two flags (no stat), so a single-operand form lowers to a plain
@@ -7066,8 +7194,18 @@ fn try_native_test(s: &str) -> Option<Expr> {
                     return Some((arith_to_estree(&a), false));
                 }
                 let bare = e.strip_prefix('$').unwrap_or(e);
-                if is_lifted_num(bare) {
-                    return Some((Expr::Identifier { name: bare.to_string() }, false));
+                if is_lifted(bare) {
+                    // lifted NUMERIC vars are pure numbers (never NaN);
+                    // lifted STRING vars need the intVal guard like any
+                    // store var (Number("abc") → NaN → whole test false,
+                    // the runtime's intVal semantics). Reading the bare
+                    // binding is EXACTLY the value the runtime's test
+                    // would see with the value inlined (lifted vars are
+                    // not in the store — a getVar would read '').
+                    return Some((
+                        Expr::Identifier { name: bare.to_string() },
+                        !is_lifted_num(bare),
+                    ));
                 }
                 if let Ok(v) = e.parse::<i64>() {
                     return Some((
@@ -7627,6 +7765,222 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         // changes).
         _ => None,
     }
+}
+
+/// Native file-test lowering (`[ -f path ]` family). Mirrors the runtime's
+/// evalUnary (harness/sh2-namespace.mjs) EXACTLY for the flags below:
+/// lstat semantics (a symlink reports its own type — the runtime uses
+/// lstatSync, unlike bash's following stat), mode-bit checks, and the
+/// missing-path catch → false. The chain is
+/// `await sh2.fs.lstat(P).then(s => <check>, () => false)` — one async
+/// non-blocking fs call, no test-string parse, no dispatch.
+///
+/// Operand shapes: a literal path (quoted or bare, `$`-free, no
+/// whitespace/quotes/backslashes inside), a `$name`/`${name}` read
+/// (lifted binding → bare identifier, special var → field read, store var
+/// → getVar), or a `$(( ... ))` arith (native number). The operand must
+/// consume the WHOLE remainder (compounds `-a`/`-o`, parenthesized groups,
+/// cmdsubs, and the space-less `!-x` token shape stay on the runtime).
+fn try_native_file_test(s: &str) -> Option<Expr> {
+    // flags whose check is a pure stats-object expression (mode bits,
+    // size, uid/gid, times) — every one the runtime's evalUnary resolves
+    // from lstatSync; `-t` (constant false) and `-n`/`-z` (string tests,
+    // handled earlier) excluded.
+    let t = s.trim();
+    let (negate, rest) = match t.strip_prefix("! ") {
+        Some(r) => (true, r.trim()),
+        None => (false, t),
+    };
+    let flag = rest.split_whitespace().next()?;
+    if flag.len() != 2 || !flag.starts_with('-') {
+        return None;
+    }
+    let f = flag.as_bytes()[1] as char;
+    if !matches!(
+        f,
+        'f' | 'd' | 'e' | 'L' | 'h' | 's' | 'r' | 'w' | 'x' | 'b' | 'c' | 'p' | 'S' | 'u' | 'g'
+            | 'k' | 'O' | 'G' | 'N'
+    ) {
+        return None;
+    }
+    let operand = rest[flag.len()..].trim();
+    if operand.is_empty() || operand.contains(char::is_whitespace) {
+        return None; // extra tokens after the operand → a compound/other shape
+    }
+    let path = file_test_operand(operand)?;
+    let check = file_test_check(f, Expr::Identifier {
+        name: "s".to_string(),
+    })?;
+    let lstat = sh2_fs_call("lstat", vec![path]);
+    let then = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(lstat),
+            property: Box::new(Expr::Identifier {
+                name: "then".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![
+            Expr::ArrowFunctionExpression {
+                params: vec![Expr::Identifier {
+                    name: "s".to_string(),
+                }],
+                body: ArrowBody::Expr(Box::new(check)),
+                expression: true,
+                r#async: false,
+            },
+            Expr::ArrowFunctionExpression {
+                params: vec![],
+                body: ArrowBody::Expr(Box::new(bool_lit(false))),
+                expression: true,
+                r#async: false,
+            },
+        ],
+        optional: false,
+    };
+    let chain = await_expr(then);
+    if negate {
+        Some(Expr::UnaryExpression {
+            operator: "!",
+            argument: Box::new(chain),
+            prefix: true,
+        })
+    } else {
+        Some(chain)
+    }
+}
+
+/// The path operand expression for a file test (see `try_native_file_test`).
+fn file_test_operand(op: &str) -> Option<Expr> {
+    let quoted = op
+        .strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .or_else(|| op.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')));
+    let bare = quoted.unwrap_or(op);
+    if bare.is_empty() {
+        return Some(str_lit("")); // `-f ""` — lstat("") rejects → false, the runtime's empty-arg rule
+    }
+    if bare.contains('$') {
+        let name = bare
+            .strip_prefix("${")
+            .and_then(|x| x.strip_suffix('}'))
+            .or_else(|| bare.strip_prefix('$'));
+        let name = name?;
+        if name.starts_with('!') || name.starts_with('#') || name.contains('[') || name.contains('@')
+            || name.contains('*')
+        {
+            return None;
+        }
+        if is_lifted(name) {
+            return Some(Expr::Identifier { name: name.to_string() });
+        }
+        if let Some(native) = native_special_var(name) {
+            return Some(native);
+        }
+        if is_plain_ident(name) {
+            return Some(sh2_call("getVar", vec![str_lit(name)]));
+        }
+        return None;
+    }
+    if bare.chars().any(|c| matches!(c, '"' | '\'' | '\\' | '`' | '\n' | '\t' | '\r')) {
+        return None;
+    }
+    Some(str_lit(bare))
+}
+
+/// The stats-object check for a file-test flag — a pure expression over
+/// the `s` binding (mode bits use the exact S_IFMT values node's lstat
+/// reports, identical to the runtime's isFile()/isDirectory()/... which
+/// node implements the same way).
+fn file_test_check(f: char, s: Expr) -> Option<Expr> {
+    let member = |obj: Expr, prop: &str| Expr::MemberExpression {
+        object: Box::new(obj),
+        property: Box::new(Expr::Identifier {
+            name: prop.to_string(),
+        }),
+        computed: false,
+        optional: false,
+    };
+    let bin = |l: Expr, op: &'static str, r: Expr| Expr::BinaryExpression {
+        operator: op,
+        left: Box::new(l),
+        right: Box::new(r),
+    };
+    let int_lit = |i: i64| Expr::Literal {
+        value: serde_json::Value::from(i),
+        raw: None,
+        regex: None,
+    };
+    let mode_check = |want: i64| {
+        bin(
+            bin(member(s.clone(), "mode"), "&", int_lit(61440)),
+            "===",
+            int_lit(want),
+        )
+    };
+    let mode_any = |bits: i64| {
+        bin(
+            bin(member(s.clone(), "mode"), "&", int_lit(bits)),
+            "!==",
+            int_lit(0),
+        )
+    };
+    let getuid = || Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::Identifier {
+                name: "process".to_string(),
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "getuid".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![],
+        optional: false,
+    };
+    let getgid = || Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::Identifier {
+                name: "process".to_string(),
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "getgid".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![],
+        optional: false,
+    };
+    Some(match f {
+        'f' => mode_check(0o100000),
+        'd' => mode_check(0o040000),
+        'e' => bool_lit(true),
+        'L' | 'h' => mode_check(0o120000),
+        // `-s`: regular file with a nonzero size (the runtime's
+        // `st.isFile() && st.size > 0`)
+        's' => Expr::LogicalExpression {
+            operator: "&&",
+            left: Box::new(mode_check(0o100000)),
+            right: Box::new(bin(member(s, "size"), ">", int_lit(0))),
+        },
+        'b' => mode_check(0o060000),
+        'c' => mode_check(0o020000),
+        'p' => mode_check(0o010000),
+        'S' => mode_check(0o140000),
+        'r' => mode_any(0o444),
+        'w' => mode_any(0o222),
+        'x' => mode_any(0o111),
+        'u' => mode_any(0o4000),
+        'g' => mode_any(0o2000),
+        'k' => mode_any(0o1000),
+        'O' => bin(member(s, "uid"), "===", getuid()),
+        'G' => bin(member(s, "gid"), "===", getgid()),
+        'N' => bin(member(s.clone(), "mtimeMs"), ">", member(s, "atimeMs")),
+        _ => return None,
+    })
 }
 
 /// Conservative "always a string" analysis (slice 4). A variable lifts to a
