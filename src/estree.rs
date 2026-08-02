@@ -1017,10 +1017,19 @@ mod tests {
         let json2 = to_json("x=hello");
         assert!(json2.contains("\"type\":\"AssignmentExpression\""));
         assert!(!json2.contains("\"name\":\"setVar\""));
-        // a capture source (not liftable) stays in the runtime store
+        // a capture source LIFTS too: `x=$(cmd)` is a native assignment of
+        // the capture value (the runtime capture always yields a string) —
+        // no store round-trip. A pure echo capture lowers all the way to a
+        // native join; other captures keep the await sh2.capture call.
         let json3 = to_json("x=$(echo hi)");
-        assert!(json3.contains("\"name\":\"setVar\""));
+        assert!(json3.contains("\"type\":\"AssignmentExpression\""));
+        assert!(json3.contains("\"name\":\"join\""));
+        assert!(!json3.contains("\"name\":\"setVar\""));
         assert!(!json3.contains("unsupported"));
+        let json4 = to_json("x=$(date)");
+        assert!(json4.contains("\"type\":\"AssignmentExpression\""));
+        assert!(json4.contains("\"name\":\"capture\""));
+        assert!(!json4.contains("\"name\":\"setVar\""));
     }
 
     #[test]
@@ -1039,10 +1048,15 @@ mod tests {
         assert!(json.contains("\"type\":\"Identifier\""));
         assert!(!json.contains("\"name\":\"getVar\""));
         assert!(!json.contains("unsupported"));
-        // a non-liftable var (capture source) stays a store read in templates
+        // a CAPTURE source lifts to a native binding; a read/write-builtin
+        // var (read/declare/local/export...) stays a store read
         let json2 = to_json("name=$(echo world)\necho \"Hello $name\"");
-        assert!(json2.contains("\"name\":\"getVar\""));
+        assert!(!json2.contains("\"name\":\"getVar\""));
+        assert!(json2.contains("\"name\":\"join\""));
         assert!(!json2.contains("unsupported"));
+        let json3 = to_json("read name\necho \"Hello $name\"");
+        assert!(json3.contains("\"name\":\"getVar\""));
+        assert!(!json3.contains("unsupported"));
     }
 
     #[test]

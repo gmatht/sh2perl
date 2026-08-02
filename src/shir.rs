@@ -2565,6 +2565,197 @@ fn drop_externally_referenced_loop_vars(
     (num2, str2)
 }
 
+/// Precise store-read scan: which identifiers inside a runtime-consumed
+/// string does the runtime actually resolve from the STORE? Only
+/// `$name` / `${name...}` refs OUTSIDE `$(...)` command substitutions
+/// (those run in a subprocess — their `$refs` are bash's, not the store's),
+/// plus BARE identifiers inside `$((...))` arithmetic regions (evalArith
+/// resolves bare names). Plain words (`mktemp -d` → `d`, `echo hello` →
+/// `hello`) are literal text — marking them was pure over-conservatism
+/// that silently blocked lifting. Shared by the numeric and string lift
+/// walkers (they duplicate the surrounding analysis but must agree on
+/// what a store read is).
+fn mark_store_refs(s: &str, out: &mut HashSet<String>) {
+    fn is_ident(s: &str) -> bool {
+        let mut cs = s.chars();
+        match cs.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+            _ => false,
+        }
+    }
+    fn mark_arith_region(region: &str, out: &mut HashSet<String>) {
+        let bytes = region.as_bytes();
+        let n = bytes.len();
+        let mut i = 0;
+        while i < n {
+            let c = bytes[i] as char;
+            if c == '$' {
+                let mut skip = 1;
+                if i + 1 < n && bytes[i + 1] == b'{' {
+                    skip = 2;
+                }
+                let rest = &region[i + skip..];
+                let name_len = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .count();
+                if name_len > 0 {
+                    let name = &rest[..name_len];
+                    if is_ident(name) {
+                        out.insert(name.to_string());
+                    }
+                }
+                i += skip + name_len;
+                continue;
+            }
+            let prev_alnum = i > 0 && bytes[i - 1].is_ascii_alphanumeric();
+            if (c.is_ascii_alphabetic() || c == '_') && !prev_alnum {
+                let start = i;
+                while i < n && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let w = &region[start..i];
+                if is_ident(w) {
+                    out.insert(w.to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        // `$(( ... ))` — arith region: bare identifiers are store reads
+        // (evalArith resolves them).
+        if s[i..].starts_with("$((") {
+            let mut j = i + 3;
+            let mut depth = 2;
+            while j < n && depth > 0 {
+                if bytes[j] == b'(' {
+                    depth += 1;
+                } else if bytes[j] == b')' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                break;
+            }
+            mark_arith_region(&s[i + 3..j - 2], out);
+            i = j;
+            continue;
+        }
+        // `$( cmd )` / `$(cmd)` — command substitution runs in a
+        // SUBPROCESS; its inner `$refs` are bash's, never the runtime
+        // store's. Skip the whole region (quote/backtick aware so a `)`
+        // inside a quoted string doesn't end it early).
+        if s[i..].starts_with("$(") {
+            let mut j = i + 2;
+            let mut depth = 1;
+            let (mut in_sq, mut in_dq, mut in_bt) = (false, false, false);
+            while j < n && depth > 0 {
+                let cc = bytes[j];
+                if in_sq {
+                    if cc == b'\'' {
+                        in_sq = false;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if in_dq {
+                    if cc == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if cc == b'"' {
+                        in_dq = false;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if in_bt {
+                    if cc == b'`' {
+                        in_bt = false;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if cc == b'\'' {
+                    in_sq = true;
+                } else if cc == b'"' {
+                    in_dq = true;
+                } else if cc == b'`' {
+                    in_bt = true;
+                } else if cc == b'(' {
+                    depth += 1;
+                } else if cc == b')' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                break;
+            }
+            i = j;
+            continue;
+        }
+        // `$'...'` — ANSI-C quoting: not a store read.
+        if s[i..].starts_with("$'") {
+            let mut j = i + 2;
+            while j < n && bytes[j] != b'\'' {
+                if bytes[j] == b'\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        // `${name...}` — the identifier after `${` is the store read; keep
+        // scanning past the name so a body (`:-$y`, `//$a/$b`) is still
+        // checked (the runtime expands those too).
+        if i + 1 < n && bytes[i + 1] == b'{' {
+            let rest = &s[i + 2..];
+            let name_len = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            if name_len > 0 {
+                let name = &rest[..name_len];
+                if is_ident(name) {
+                    out.insert(name.to_string());
+                }
+            }
+            i += 2 + name_len;
+            continue;
+        }
+        // `$name` — plain ref.
+        let rest = &s[i + 1..];
+        let name_len = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if name_len > 0 {
+            let name = &rest[..name_len];
+            if is_ident(name) {
+                out.insert(name.to_string());
+            }
+            i += 1 + name_len;
+            continue;
+        }
+        // `$$` / `$?` / `$1` — specials; not liftable identifiers anyway.
+        i += 1;
+    }
+}
+
 /// Conservative "always a number" analysis for the ESTree backend.
 ///
 /// bash variables are strings; JS has real numbers. A variable whose every
@@ -2590,38 +2781,12 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
         }
     }
     fn mark_string_refs(s: &str, out: &mut HashSet<String>) {
-        // A var is read from the STORE whenever its name appears inside a
-        // string-parsed context (test/param/brace/caseMatch strings). Mark
-        // any identifier-like word, bare or $-prefixed (conservative: over-
-        // marking is safe — the var just stays in the store).
-        let bytes = s.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let mut c = bytes[i] as char;
-            // a `$` prefix starts a variable reference: skip it, then treat
-            // the following identifier as a STORE read (`$count` inside a
-            // test string resolves via the runtime store)
-            if c == '$' {
-                i += 1;
-                if i >= bytes.len() {
-                    break;
-                }
-                c = bytes[i] as char;
-            }
-            let prev_alnum = i > 0 && bytes[i - 1].is_ascii_alphanumeric();
-            if (c.is_ascii_alphabetic() || c == '_') && !prev_alnum {
-                let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let w = &s[start..i];
-                if is_ident(w) {
-                    out.insert(w.to_string());
-                }
-            } else {
-                i += 1;
-            }
-        }
+        // A var is read from the STORE only when the runtime would resolve
+        // it from a string: `$name` / `${name...}` refs outside `$(...)`
+        // subprocess regions, and bare identifiers inside `$((...))` arith
+        // regions. Plain words in strings are literal text (over-marking
+        // them kept `d` store-bound for `mktemp -d` etc.).
+        mark_store_refs(s, out);
     }
     fn mark_write_builtin_vars(e: &IrExpr, excluded: &mut HashSet<String>) {
         match e {
@@ -2634,6 +2799,7 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 let v = sv.split('=').next().unwrap_or("");
                 if is_ident(v) {
                     excluded.insert(v.to_string());
+
                 }
             }
             _ => {}
@@ -2694,6 +2860,27 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                     // identifier found there as store-read (not liftable).
                     for a in args {
                         mark_str_args(a, string_ctx);
+                    }
+                }
+                // `local i=3` / `read line` / `export FOO=x` in EXPRESSION
+                // position (inside function arrows / && chains the exec call
+                // arrives as IrStmt::Expr, not IrStmt::Exec): the runtime
+                // builtin WRITES the named vars into the STORE, so they must
+                // stay store-bound — a native binding would never see the
+                // write (and the native binding's value would be stale for
+                // every later read). Mirror of the string-lift walker.
+                if func == "exec" {
+                    if let Some(IrExpr::Str(cname, _)) = args.first() {
+                        if matches!(
+                            cname.as_str(),
+                            "read" | "declare" | "typeset" | "local" | "export" | "readonly"
+                                | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source"
+                                | "."
+                        ) {
+                            for a in &args[1..] {
+                                mark_write_builtin_vars(a, excluded);
+                            }
+                        }
                     }
                 }
                 if matches!(
@@ -4012,6 +4199,17 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
                         [IrExpr::Str(n, _)] => Expr::Identifier { name: n.clone() },
                         _ => unreachable!("lifted getVar source"),
+                    },
+                    // string-lifted capture source: `x=$(cmd)` →
+                    // `x = await sh2.capture(...)` (or the native
+                    // echo/tr/cat/sort/... capture lifts) — the runtime
+                    // capture always yields a string, exactly the setVar
+                    // path minus the store write + dispatch.
+                    IrExpr::Call { func, args } if func == "capture" => {
+                        expr_to_estree(&IrExpr::Call {
+                            func: func.clone(),
+                            args: args.clone(),
+                        })
                     },
                     // the for-loop numeric coercion (`i = Number(i)`)
                     IrExpr::Call { func, args } if func == "Number" => match args.as_slice() {
@@ -6544,31 +6742,10 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
         }
     }
     fn mark_string_refs(s: &str, out: &mut HashSet<String>) {
-        let bytes = s.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let mut c = bytes[i] as char;
-            if c == '$' {
-                i += 1;
-                if i >= bytes.len() {
-                    break;
-                }
-                c = bytes[i] as char;
-            }
-            let prev_alnum = i > 0 && bytes[i - 1].is_ascii_alphanumeric();
-            if (c.is_ascii_alphabetic() || c == '_') && !prev_alnum {
-                let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let w = &s[start..i];
-                if is_ident(w) {
-                    out.insert(w.to_string());
-                }
-            } else {
-                i += 1;
-            }
-        }
+        // Same precise store-read scan as the numeric-lift twin (the two
+        // walkers must agree): `$refs` outside `$(...)`, bare identifiers
+        // inside `$((...))`. See mark_store_refs.
+        mark_store_refs(s, out);
     }
     fn mark_str_args(e: &IrExpr, string_ctx: &mut HashSet<String>) {
         match e {
@@ -7003,6 +7180,16 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                 IrExpr::Var(n, _) => lifted.contains(n.as_str()),
                 IrExpr::Call { func, args } if func == "getVar" => {
                     matches!(args.as_slice(), [IrExpr::Str(n, _)] if lifted.contains(n.as_str()))
+                }
+                // `x=$(cmd)` — command substitution ALWAYS yields a string
+                // (the runtime capture strips NULs + trailing newlines and
+                // returns the buffer). The assignment lowers to a native
+                // `x = await sh2.capture(...)`, so the target can be a
+                // plain `let` binding. Exported/reflected vars stay
+                // excluded (mark_write_builtin_vars on export/declare/read
+                // ...); the runtime never sees a lifted var.
+                IrExpr::Call { func, args } if func == "capture" => {
+                    matches!(args.as_slice(), [IrExpr::Arrow(_)])
                 }
                 _ => false,
             });
