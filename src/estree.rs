@@ -1105,15 +1105,23 @@ mod tests {
 
     #[test]
     fn redirect_lowers_to_redirect_call() {
+        // `echo hi > out.txt` lowers ALL the way to a native file write
+        // (await sh2.fs.writeFile) — no redirect fd-swap, no dispatch.
         let json = to_json("echo hi > out.txt");
-        assert!(json.contains("\"name\":\"redirect\""));
-        // Property keys serialize as {key: Identifier{name}, value: Literal}.
-        assert!(json.contains("\"name\":\"mode\""));
-        assert!(json.contains("\"value\":\"w\""));
-        assert!(json.contains("\"name\":\"fd\""));
-        assert!(json.contains("\"value\":1"));
-        assert!(json.contains("\"type\":\"ObjectExpression\""));
+        assert!(json.contains("\"name\":\"writeFile\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
         assert!(!json.contains("unsupported"));
+        // non-echo bodies keep the runtime redirect
+        let json2 = to_json("ls > out.txt");
+        assert!(json2.contains("\"name\":\"redirect\""));
+        // Property keys serialize as {key: Identifier{name}, value: Literal}.
+        assert!(json2.contains("\"name\":\"mode\""));
+        assert!(json2.contains("\"value\":\"w\""));
+        assert!(json2.contains("\"name\":\"fd\""));
+        assert!(json2.contains("\"value\":1"));
+        assert!(json2.contains("\"type\":\"ObjectExpression\""));
+        assert!(!json2.contains("unsupported"));
     }
 
     #[test]
