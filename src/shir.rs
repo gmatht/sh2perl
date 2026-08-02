@@ -6921,6 +6921,46 @@ fn native_capture_seq_slice(pipe: &IrExpr) -> Option<Expr> {
     })
 }
 
+/// `$(printf FMT ARGS...)` with an all-static format and args: the
+/// capture's value is the formatted output minus the capture strips
+/// (NUL bytes + trailing newlines) — a compile-time constant, no capture
+/// machinery at all. The shared printf_parse/printf_apply chain is the
+/// one the native statement-form printf lowering already validates
+/// against the corpus.
+fn native_capture_printf(e: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if func != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(pargs)] = args.as_slice() else {
+        return None;
+    };
+    if name != "printf" {
+        return None;
+    }
+    let fmt = static_str(pargs.first()?)?;
+    let pf = printf_parse(&fmt)?;
+    let mut lit_args: Vec<String> = Vec::new();
+    for a in &pargs[1..] {
+        match a {
+            // brace arrays flatten into the arg list, exactly like the
+            // runtime's builtin() flattener
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    lit_args.push(static_str(el)?);
+                }
+            }
+            other => lit_args.push(static_str(other)?),
+        }
+    }
+    let out = printf_apply(&pf, &lit_args)?;
+    // the capture strips NUL bytes and trailing newlines
+    let out = out.replace('\0', "");
+    Some(str_lit(out.trim_end_matches('\n')))
+}
+
 /// Native lowering for a SIMPLE test expression whose operands are all
 /// lifted numeric variables (or integer literals): `"$count" -lt 100`
 /// becomes `count < 100` — no runtime test-string round-trip. Returns None
@@ -8499,6 +8539,18 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if let [IrExpr::Arrow(stmts)] = args.as_slice() {
                         if let [IrStmt::Expr(inner)] = stmts.as_slice() {
                             if let Some(value) = try_native_echo_capture(inner) {
+                                return value;
+                            }
+                        }
+                    }
+                }
+                // `$(printf FMT ARGS...)` with all-static args: the value
+                // is the formatted output minus the capture strips — a
+                // compile-time constant (see `native_capture_printf`).
+                if !program_defines_function("printf") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(inner)] = stmts.as_slice() {
+                            if let Some(value) = native_capture_printf(inner) {
                                 return value;
                             }
                         }
