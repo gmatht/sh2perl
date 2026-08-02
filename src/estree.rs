@@ -156,6 +156,9 @@ pub enum Expr {
         argument: Box<Expr>,
         prefix: bool,
     },
+    SequenceExpression {
+        expressions: Vec<Expr>,
+    },
 }
 
 /// Arrow function body: an expression (`x => expr`) or a block
@@ -493,6 +496,12 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             operator,
             argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
             prefix,
+        },
+        Expr::SequenceExpression { expressions } => Expr::SequenceExpression {
+            expressions: expressions
+                .into_iter()
+                .map(|e| fix_expr(e, in_arrow, in_func))
+                .collect(),
         },
         other => other,
     }
@@ -1127,9 +1136,16 @@ mod tests {
     #[test]
     fn env_var_prefix_is_exec_env_arg() {
         let json = to_json("FOO=bar echo hi");
-        assert!(json.contains("\"name\":\"exec\""));
+        // `echo` is a sync builtin, so the env-carrying exec lowers to the
+        // sync twin `sh2.builtin(..., {FOO: ...})` (the runtime applies the
+        // command-scoped env exactly like the async exec path); a NON-builtin
+        // name keeps the async exec call.
+        assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("FOO"));
         assert!(!json.contains("unsupported"));
+        let json2 = to_json("FOO=bar grep x");
+        assert!(json2.contains("\"name\":\"exec\""));
+        assert!(json2.contains("FOO"));
     }
 
     #[test]
