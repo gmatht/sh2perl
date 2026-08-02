@@ -1062,9 +1062,12 @@ mod tests {
 
     #[test]
     fn if_then_else_lowers_to_if_statement() {
+        // `[ -f /tmp/x ]` is a file test — a native async lstat chain
+        // (no sh2.test string parse, no dispatch, no blocking lstatSync).
         let json = to_json("if [ -f /tmp/x ]; then echo yes; else echo no; fi");
         assert!(json.contains("\"type\":\"IfStatement\""));
-        assert!(json.contains("\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"lstat\""));
+        assert!(!json.contains("\"name\":\"test\""));
         assert!(!json.contains("unsupported"));
     }
 
@@ -1378,9 +1381,12 @@ mod tests {
         assert!(!json.contains("\"name\":\"trimCapture\""));
         assert!(json.contains("\"name\":\"exec\""));
         // mapfile is stdin-only: no appended path argument, still no gate leak
+        // (the producer's capture is lowered as a here-string fd-0 redirect
+        // feeding the sync mapfile builtin — no async capture machinery).
         let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");
         assert!(!json2.contains("\"name\":\"unsupported\""));
         assert!(!json2.contains("\"value\":\"unsupported\""));
-        assert!(json2.contains("\"name\":\"capture\""));
+        assert!(json2.contains("\"name\":\"redirect\""));
+        assert!(json2.contains("\"name\":\"builtin\""));
     }
 }
