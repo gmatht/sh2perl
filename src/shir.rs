@@ -4201,12 +4201,343 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
     None
 }
 
+/// A shell variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_plain_ident(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+/// Decode `tr`'s backslash escapes in a set argument (`\n` → newline,
+/// `\\` → backslash, `\0` → NUL, `\xHH`, ...). Returns None on an
+/// unrecognized escape (the lift bails to the runtime).
+fn tr_decode_escapes(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some('0') => out.push('\0'),
+            Some('a') => out.push('\x07'),
+            Some('b') => out.push('\x08'),
+            Some('f') => out.push('\x0c'),
+            Some('r') => out.push('\r'),
+            Some('v') => out.push('\x0b'),
+            Some('x') => {
+                let h1 = chars.next()?;
+                let h2 = chars.next()?;
+                let v = u8::from_str_radix(&format!("{h1}{h2}"), 16).ok()?;
+                out.push(v as char);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// `$(echo args...)` — a capture whose ONLY statement is the sync `echo`
+/// builtin (no spawns, no pipeline). The captured value is exactly
+/// `echo`'s joined output minus the capture strips: `args.join(" ")` with
+/// the `-e` escape interpretation (`\n`/`\t` — the runtime's builtin echo
+/// interprets exactly these two), wrapped in `sh2.trimCapture` (NUL +
+/// trailing-newline strips — `-n` is a no-op under capture: the missing
+/// trailing newline is stripped anyway). Conservative: no flags other
+/// than `-e`/`-n` at position 0, no glob-tagged args (the runtime would
+/// expand them), no env. A script-defined `echo` keeps the runtime path.
+fn try_native_echo_capture(e: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if func != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args.as_slice() else {
+        return None;
+    };
+    if name != "echo" {
+        return None;
+    }
+    for a in echo_args {
+        if let IrExpr::Str(sv, _) = a {
+            if sv.starts_with(GLOB_MAGIC) {
+                return None;
+            }
+        }
+    }
+    let mut arg_exprs: Vec<Expr> = Vec::new();
+    let mut esc = false;
+    for a in echo_args {
+        match a {
+            // flag args (only at position 0, only -e/-n)
+            IrExpr::Str(sv, _) if arg_exprs.is_empty() && (sv == "-e" || sv == "-n") => {
+                esc = sv == "-e";
+            }
+            // plain literal — skip the String() wrap
+            IrExpr::Str(sv, _) => arg_exprs.push(str_lit(sv)),
+            other => arg_exprs.push(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![expr_to_estree(other)],
+                optional: false,
+            }),
+        }
+    }
+    let mut joined: Expr = if arg_exprs.is_empty() {
+        str_lit("")
+    } else {
+        Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::ArrayExpression {
+                    elements: arg_exprs.into_iter().map(Some).collect(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "join".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![str_lit(" ")],
+            optional: false,
+        }
+    };
+    if esc {
+        // the runtime's builtin echo -e: global `\n` → newline, `\t` →
+        // tab (exactly these two) — a split/join chain is the exact
+        // global replace
+        for (from, to) in [("\\n", "\n"), ("\\t", "\t")] {
+            let split = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(joined),
+                    property: Box::new(Expr::Identifier {
+                        name: "split".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![str_lit(from)],
+                optional: false,
+            };
+            joined = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(split),
+                    property: Box::new(Expr::Identifier {
+                        name: "join".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![str_lit(to)],
+                optional: false,
+            };
+        }
+    }
+    Some(sh2_call("trimCapture", vec![joined]))
+}
+
+/// `$(echo X | tr SET1 SET2)` / `$(echo X | tr -d SET` — a pure string
+/// transform: tr reads the single echoed line (echo adds exactly one
+/// trailing newline, which no SET maps) and maps/deletes chars. Lifts to a
+/// native JS expression over `String(X)` — no echo/tr spawns, no pipeline
+/// machinery. Case maps → `toUpperCase`/`toLowerCase`; single-char maps →
+/// `split(c1).join(c2)`; `-d` → a chained split/join("") per set char
+/// (exactly tr's char-wise deletion). Conservative: exactly two pipeline
+/// stages, plain `echo` with exactly ONE arg (no flags — `-n`/`-e` change
+/// the byte stream), `tr` with exactly two set args or `-d` + one set, no
+/// redirects anywhere, no glob-tagged echo arg (the runtime would expand
+/// it), unrecognized tr escapes bail. The result is the line CONTENT
+/// (without echo's trailing newline): statement position wraps it back in
+/// `echo` (identical bytes), capture position wraps it in `sh2.trimCapture`
+/// (the capture's NUL + trailing-newline strips).
+fn try_native_tr_pipeline(pipe: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if f1 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(n1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
+        return None;
+    };
+    if n1 != "echo" || echo_args.len() != 1 {
+        return None;
+    }
+    // a GLOB_MAGIC echo arg glob-expands in the runtime — the transform
+    // would see the pattern, not the hits
+    if let IrExpr::Str(sv, _) = &echo_args[0] {
+        if sv.starts_with(GLOB_MAGIC) {
+            return None;
+        }
+    }
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(n2, _), IrExpr::Array(tr_args)] = a2.as_slice() else {
+        return None;
+    };
+    if n2 != "tr" {
+        return None;
+    }
+    // base = String(arg) — echo String()-coerces its args before emitting
+    let base = Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        arguments: vec![expr_to_estree(&echo_args[0])],
+        optional: false,
+    };
+    let method = |obj: Expr, name: &str, margs: Vec<Expr>| Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: margs,
+        optional: false,
+    };
+    match tr_args.as_slice() {
+        [IrExpr::Str(sa, _), IrExpr::Str(sb, _)] => {
+            match (sa.as_str(), sb.as_str()) {
+                ("a-z", "A-Z") | ("[a-z]", "[A-Z]") | ("[:lower:]", "[:upper:]") => {
+                    Some(method(base, "toUpperCase", vec![]))
+                }
+                ("A-Z", "a-z") | ("[A-Z]", "[a-z]") | ("[:upper:]", "[:lower:]") => {
+                    Some(method(base, "toLowerCase", vec![]))
+                }
+                _ => {
+                    let c1 = tr_decode_escapes(sa)?;
+                    let c2 = tr_decode_escapes(sb)?;
+                    if c1.chars().count() == 1 && c2.chars().count() == 1 {
+                        Some(method(
+                            method(base, "split", vec![str_lit(&c1)]),
+                            "join",
+                            vec![str_lit(&c2)],
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        [IrExpr::Str(flag, _), IrExpr::Str(set, _)] if flag == "-d" => {
+            let set = tr_decode_escapes(set)?;
+            let mut e = base;
+            for c in set.chars() {
+                e = method(
+                    method(e, "split", vec![str_lit(&c.to_string())]),
+                    "join",
+                    vec![str_lit("")],
+                );
+            }
+            Some(e)
+        }
+        _ => None,
+    }
+}
+
+
 /// Native lowering for a SIMPLE test expression whose operands are all
 /// lifted numeric variables (or integer literals): `"$count" -lt 100`
 /// becomes `count < 100` — no runtime test-string round-trip. Returns None
 /// for anything else (falls back to the injected template / runtime).
 fn try_native_test(s: &str) -> Option<Expr> {
     let s = s.trim();
+    // `-n` / `-z` unary string tests: `[ -n "$x" ]` → `String(x) !== ""`.
+    // The runtime's evalUnary is a pure string-emptiness test for these
+    // two flags (no stat), so a single-operand form lowers to a plain
+    // comparison. Operand shapes: `$name` / `${name}` (quoted or bare —
+    // a var read, store or lifted) or a literal with no expansion chars.
+    // Compound tests (`-n "$a" -a -z "$b"`) and command substitutions
+    // stay on the runtime (the operand must consume the whole string).
+    for (flag, want_empty) in [("-n", false), ("-z", true)] {
+        if let Some(rest) = s.strip_prefix(flag) {
+            let operand = rest.trim();
+            let read: Option<Expr> = (|| {
+                let bare = operand
+                    .strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .unwrap_or(operand);
+                // `$name` / `${name}` — the runtime expands the operand
+                // from the store; lifted bindings read natively.
+                if let Some(name) = bare
+                    .strip_prefix("${")
+                    .and_then(|x| x.strip_suffix('}'))
+                    .or_else(|| bare.strip_prefix('$'))
+                {
+                    if name.starts_with('!') || name.starts_with('#')
+                        || name.contains('[') || name.contains('@') || name.contains('*')
+                    {
+                        return None;
+                    }
+                    if is_lifted(name) {
+                        return Some(Expr::Identifier { name: name.to_string() });
+                    }
+                    if let Some(native) = native_special_var(name) {
+                        return Some(native);
+                    }
+                    if !is_plain_ident(name) {
+                        return None;
+                    }
+                    return Some(sh2_call("getVar", vec![str_lit(name)]));
+                }
+                // literal operand — no `$`, backtick, backslash, quotes or
+                // whitespace (the tokenizer would split on those)
+                if !bare.is_empty()
+                    && !bare
+                        .chars()
+                        .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\'' | ' ' | '\t'))
+                {
+                    return Some(str_lit(bare));
+                }
+                None
+            })();
+            if let Some(read) = read {
+                let val = Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "String".to_string(),
+                    }),
+                    arguments: vec![read],
+                    optional: false,
+                };
+                return Some(Expr::BinaryExpression {
+                    operator: if want_empty { "===" } else { "!==" },
+                    left: Box::new(val),
+                    right: Box::new(str_lit("")),
+                });
+            }
+        }
+    }
     // numeric ops first (their standalone tokens are unambiguous)
     let numeric_ops: [(&str, &str); 6] = [
         ("-eq", "==="),
@@ -4221,25 +4552,113 @@ fn try_native_test(s: &str) -> Option<Expr> {
         let pat = format!(" {op} ");
         if let Some(p) = s.find(&pat) {
             let (lhs, rhs) = (&s[..p], &s[p + 2 + op.len()..]);
-            // numeric comparison: operands must be numeric-lifted or ints
-            fn num_operand(e: &str) -> Option<Expr> {
+            // numeric comparison operands. Each lowers to (expr, mayNaN):
+            // a MAY-NaN operand (store var / positional string) needs the
+            // runtime's intVal guard (bash `[ $x -ne 5 ]` with x="abc" is
+            // an "integer expression expected" error → the whole test is
+            // FALSE, never `NaN !== 5` → true).
+            fn num_operand(e: &str) -> Option<(Expr, bool)> {
                 let e = e.trim();
-                let e = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(e);
-                let e = e.strip_prefix('$').unwrap_or(e);
-                if is_lifted_num(e) {
-                    return Some(Expr::Identifier { name: e.to_string() });
+                let e = e
+                    .strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .unwrap_or(e);
+                // `$(( ... ))` — parsed natively; arith always yields a
+                // number (store vars inside coerce via Number()||0, the
+                // arith semantics — the test sees a number, never NaN).
+                if let Some(inner) = e.strip_prefix("$((").and_then(|x| x.strip_suffix("))"))
+                {
+                    let a = parse_arith(inner)?;
+                    return Some((arith_to_estree(&a), false));
+                }
+                let bare = e.strip_prefix('$').unwrap_or(e);
+                if is_lifted_num(bare) {
+                    return Some((Expr::Identifier { name: bare.to_string() }, false));
                 }
                 if let Ok(v) = e.parse::<i64>() {
-                    return Some(Expr::Literal { value: serde_json::Value::from(v), raw: None });
+                    return Some((
+                        Expr::Literal {
+                            value: serde_json::Value::from(v),
+                            raw: None,
+                        },
+                        false,
+                    ));
+                }
+                // `$?` / `$#` / `$$` are the runtime's own numeric state
+                // fields; other special vars (`$1`..`$9`, `$@`, `$-`) are
+                // strings (NaN-risky, like store vars).
+                if let Some(native) = native_special_var(bare) {
+                    let risky = !matches!(bare, "?" | "#" | "$");
+                    return Some((native, risky));
+                }
+                if is_plain_ident(bare) {
+                    // a plain store var is a string read (risky)
+                    return Some((sh2_call("getVar", vec![str_lit(bare)]), true));
                 }
                 None
             }
-            let l = num_operand(lhs)?;
-            let r = num_operand(rhs)?;
-            return Some(Expr::BinaryExpression {
+            let (l, l_risky) = num_operand(lhs)?;
+            let (r, r_risky) = num_operand(rhs)?;
+            if !l_risky && !r_risky {
+                return Some(Expr::BinaryExpression {
+                    operator: js,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                });
+            }
+            // NaN-guarded form: guard ONLY the NaN-risky operand(s) (store
+            // vars / positionals — the runtime's intVal returns null for
+            // non-numeric strings and the WHOLE test is false, even for
+            // `-ne`). Safe operands (int literals, `$?`, `$#`, lifted
+            // nums, `$((...))`) compare directly. The operand reads are
+            // pure (getVar / positional / state fields), so duplicating
+            // them is side-effect-free.
+            let num = |e: Expr| -> Expr {
+                Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "Number".to_string(),
+                    }),
+                    arguments: vec![e],
+                    optional: false,
+                }
+            };
+            let nan_ok = |e: &Expr| -> Expr {
+                Expr::UnaryExpression {
+                    operator: "!",
+                    argument: Box::new(Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "Number".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "isNaN".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![num(e.clone())],
+                        optional: false,
+                    }),
+                    prefix: true,
+                }
+            };
+            let mut guarded = nan_ok(&l);
+            if r_risky {
+                guarded = Expr::LogicalExpression {
+                    operator: "&&",
+                    left: Box::new(guarded),
+                    right: Box::new(nan_ok(&r)),
+                };
+            }
+            let cmp = Expr::BinaryExpression {
                 operator: js,
-                left: Box::new(l),
-                right: Box::new(r),
+                left: Box::new(num(l)),
+                right: Box::new(num(r)),
+            };
+            return Some(Expr::LogicalExpression {
+                operator: "&&",
+                left: Box::new(guarded),
+                right: Box::new(cmp),
             });
         }
     }
@@ -5412,6 +5831,84 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                             "cstyleForSync",
                             vec![str_lit(header), sync_arrow_block(body_e)],
                         );
+                    }
+                }
+            }
+            // Expression-position `while` (pipeline stages, `&&`/`||`
+            // operands, conditions): `command_to_ir` emits these as a
+            // `whileLoop` CALL (the stmt-level IrStmt::While gets the sync
+            // fast path in stmt_to_estree). Same semantics, same
+            // eligibility — a provably-sync loop (cond + body contain no
+            // awaits) lowers to the sync runtime twin, no per-iteration
+            // promises (`while read ... done < f | sort` loops).
+            if func == "whileLoop" {
+                if let [IrExpr::Arrow(cond_stmts), IrExpr::Arrow(body_stmts)] = args.as_slice()
+                {
+                    // command_to_ir wraps the cond as a single Expr stmt
+                    if let [IrStmt::Expr(cond)] = cond_stmts.as_slice() {
+                        let cond_e = expr_to_estree(cond);
+                        let body_e: Vec<Stmt> =
+                            body_stmts.iter().filter_map(stmt_to_estree).collect();
+                        if !expr_has_await(&cond_e) && !stmts_have_await(&body_e) {
+                            return sh2_call(
+                                "whileLoopSync",
+                                vec![
+                                    sync_arrow_expr(cond_e),
+                                    sync_arrow_block(body_e),
+                                ],
+                            );
+                        }
+                    }
+                }
+            }
+            // `echo X | tr SET1 SET2` — a pure string transform: lift the
+            // whole pipeline to `sh2.builtin("echo", [String(X).toUpper
+            // Case()])` etc. — the emitted bytes are IDENTICAL (echo adds
+            // the trailing newline tr's passthrough preserves; tr's exit
+            // is 0 for the fixed sets, same as echo's), and the spawns +
+            // pipeline machinery disappear. Script-defined `echo`/`tr`
+            // functions would shadow the builtins — keep the pipeline
+            // then (the runtime dispatches to the function).
+            if func == "pipeline" {
+                if !program_defines_function("echo") && !program_defines_function("tr") {
+                    if let Some(transform) = try_native_tr_pipeline(e) {
+                        return sh2_call(
+                            "builtin",
+                            vec![
+                                str_lit("echo"),
+                                array(vec![transform]),
+                            ],
+                        );
+                    }
+                }
+            }
+            // `$(echo X | tr ...)` (QUOTED capture): the transform replaces
+            // the whole capture — no spawns, no pipeline, no async. The
+            // runtime capture strips NULs + trailing newlines from the
+            // captured buffer; `sh2.trimCapture` applies the same strips to
+            // the transformed line content (echo's own trailing newline
+            // would be stripped anyway).
+            if func == "capture" {
+                if !program_defines_function("echo") && !program_defines_function("tr") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                            if let Some(transform) = try_native_tr_pipeline(pipe) {
+                                return sh2_call("trimCapture", vec![transform]);
+                            }
+                        }
+                    }
+                }
+                // `$(echo args...)` — the capture's only statement is the
+                // sync echo builtin: the value is the joined args (with
+                // the runtime's `-e` interpretation) plus the capture
+                // strips — no async capture machinery at all.
+                if !program_defines_function("echo") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(inner)] = stmts.as_slice() {
+                            if let Some(value) = try_native_echo_capture(inner) {
+                                return value;
+                            }
+                        }
                     }
                 }
             }
