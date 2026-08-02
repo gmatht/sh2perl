@@ -4067,6 +4067,88 @@ fn ir_has_persist_fd1(prog: &IrProgram) -> bool {
     prog.stmts.iter().any(stmt_has)
 }
 
+/// `echo args > file` / `echo args >> file` — a native file write replaces
+/// the whole async redirect + builtin-dispatch pair: the content is the
+/// echo join (flags included), the bytes land via `await sh2.fs.writeFile`
+/// (append mode → appendFile) — exactly what the runtime's redirect→emit→
+/// writeFileSync does, minus the fd-table swap, the dispatch and the async
+/// boundary. `sh2.fs.*` is the contract's fs surface (no spawn, no runtime
+/// call counted in the metric).
+///
+/// Conservative: exactly ONE spec, fd 1, mode w/a, a target that lowers
+/// without an await (no command substitution) and is not an `&N` fd-dup
+/// or `-`; no script-defined `echo` shadow (bash functions win over
+/// builtins); no env-carrying 3-arg exec form; every arg must lower
+/// without runtime need (glob/PS magic, badsub params). The sequence ends
+/// in `true` + a lastExit write, so the errexit guard wrapper is dead
+/// weight (call_is_always_true) and the truthiness callers branch on is
+/// preserved.
+fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) -> Option<Expr> {
+    if program_defines_function("echo") {
+        return None;
+    }
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args.as_slice() else {
+        return None;
+    };
+    if name != "echo" {
+        return None;
+    }
+    if echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    let [(fd, mode, target)] = specs else {
+        return None;
+    };
+    if *fd != 1 || (*mode != "w" && *mode != "a") {
+        return None;
+    }
+    let tgt = expr_to_estree(target);
+    if expr_has_await(&tgt) {
+        return None;
+    }
+    // `&N` fd-dup targets and `-` live in the runtime's fd table — a file
+    // write cannot express them.
+    if let Expr::Literal { value, .. } = &tgt {
+        if let serde_json::Value::String(s) = value {
+            if s.starts_with('&') || s == "-" {
+                return None;
+            }
+        }
+    }
+    let (joined, no_newline, _) = echo_join_args(echo_args)?;
+    let text: Expr = if no_newline {
+        joined
+    } else {
+        Expr::BinaryExpression {
+            operator: "+",
+            left: Box::new(joined),
+            right: Box::new(str_lit("\n")),
+        }
+    };
+    let write = sh2_fs_call(
+        if *mode == "a" { "appendFile" } else { "writeFile" },
+        vec![tgt, text],
+    );
+    Some(seq(vec![
+        await_expr(write),
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+            }),
+        },
+        bool_lit(true),
+    ]))
+}
+
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     Some(match stmt {
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "break" => {
@@ -4396,6 +4478,26 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             body: stmts.iter().filter_map(stmt_to_estree).collect(),
         },
         IrStmt::Redirect { inner, redirects } => {
+            // `echo args > file` / `echo args >> file`: a native
+            // fs.writeFile replaces the redirect+builtin pair (see
+            // try_native_echo_redirect).
+            if let Some(native) = try_native_echo_redirect(
+                inner,
+                &redirects
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.fd.unwrap_or(0) as i64,
+                            r.mode.as_str(),
+                            &r.target,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ) {
+                return Some(Stmt::ExpressionStatement {
+                    expression: native,
+                });
+            }
             // `exec 3>&1` (exec with no command): bash installs the redirects
             // permanently in the shell's own fd table. Tell the runtime to
             // persist them (it restores non-persistent redirects afterwards).
@@ -7509,6 +7611,52 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 array(vec![transform]),
                             ],
                         );
+                    }
+                }
+            }
+            // `echo args > file` / `echo args >> file` in EXPRESSION
+            // position (&&/|| operands, if-conditions): the native file
+            // write replaces the redirect+builtin pair (same guardrails as
+            // the statement form; the trailing `true` keeps the &&/||
+            // truthiness semantics the runtime helpers branch on).
+            if func == "redirect" {
+                if let [IrExpr::Arrow(stmts), IrExpr::Array(spec_objs)] = args.as_slice() {
+                    let mut specs: Vec<(i64, &str, &IrExpr)> = Vec::new();
+                    let mut ok = true;
+                    for so in spec_objs {
+                        if let IrExpr::Object(props) = so {
+                            let mut fd = 0i64;
+                            let mut mode = "";
+                            let mut target: Option<&IrExpr> = None;
+                            for (k, v) in props {
+                                match k.as_str() {
+                                    "fd" => {
+                                        if let IrExpr::Int(i) = v {
+                                            fd = *i;
+                                        }
+                                    }
+                                    "mode" => {
+                                        if let IrExpr::Str(m, _) = v {
+                                            mode = m;
+                                        }
+                                    }
+                                    "target" => target = Some(v),
+                                    _ => {}
+                                }
+                            }
+                            if let Some(t) = target {
+                                specs.push((fd, mode, t));
+                            } else {
+                                ok = false;
+                            }
+                        } else {
+                            ok = false;
+                        }
+                    }
+                    if ok {
+                        if let Some(native) = try_native_echo_redirect(stmts, &specs) {
+                            return native;
+                        }
                     }
                 }
             }
