@@ -41,18 +41,19 @@ static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
 /// that provably never enable it.
 static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
 /// Builtins the runtime implements as SYNC functions (harness
-/// sh2-namespace.mjs `builtins.*` — every non-async entry of builtins.json;
-/// `wait`/`exec`/`sleep`/`command` are async and stay on the async exec
-/// path). `sh2.exec("echo", args)` lowers to a sync `sh2.builtin("echo",
-/// args)` dispatch: identical arg flattening/glob expansion, identical
-/// builtin function, minus the async exec machinery (the whileLoopSync
-/// pattern — same semantics, no per-call promises).
+/// sh2-namespace.mjs `builtins.*` — every non-async entry of builtins.json
+/// plus `test`, the bash test builtin the runtime implements on top of its
+/// own test parser; `wait`/`exec`/`sleep`/`command` are async and stay on
+/// the async exec path). `sh2.exec("echo", args)` lowers to a sync
+/// `sh2.builtin("echo", args)` dispatch: identical arg flattening/glob
+/// expansion, identical builtin function, minus the async exec machinery
+/// (the whileLoopSync pattern — same semantics, no per-call promises).
 const SYNC_BUILTINS: &[&str] = &[
     ".", ":", "basename", "break", "cd", "cmp", "comm", "continue", "declare",
     "dirname", "echo", "eval", "exit", "export", "false", "head", "let", "local",
     "mapfile", "printf", "pwd", "read", "readarray", "readonly", "return", "seq",
-    "set", "shift", "sort", "source", "stat", "tail", "touch", "trap", "true",
-    "type", "typeset", "uniq", "unset", "wc",
+    "set", "shift", "sort", "source", "stat", "tail", "test", "touch", "trap",
+    "true", "type", "typeset", "uniq", "unset", "wc",
 ];
 /// Names of every function the program defines (IrStmt::Function), set per
 /// compilation by `shir_to_estree` under COMPILE_LOCK. A script-defined
@@ -2038,16 +2039,25 @@ fn is_async_call(name: &str) -> bool {
 /// the async wait/exec/sleep/command) AND no script-defined function
 /// shadows it (bash: a function named like a builtin wins — the runtime's
 /// exec dispatch consults its function map first, so a shadowed name must
-/// keep the async exec path). Env-carrying exec calls stay async (the
-/// builtin twin takes no env). The sync twin skips the async exec
-/// machinery (arg flattening/glob expansion happen identically inside it),
-/// the whileLoopSync pattern: same semantics, no per-call promises.
+/// keep the async exec path). Env-carrying exec calls (`IFS=: read ...`,
+/// the 3-arg form) lower too — the runtime `builtin` twin applies the
+/// command-scoped env exactly like the async exec path. The sync twin
+/// skips the async exec machinery (arg flattening/glob expansion happen
+/// identically inside it), the whileLoopSync pattern: same semantics, no
+/// per-call promises.
 fn exec_or_builtin<'a>(func: &'a str, args: &[IrExpr]) -> &'a str {
     if func == "exec" {
-        if let [IrExpr::Str(name, _), IrExpr::Array(_)] = args {
-            if SYNC_BUILTINS.contains(&name.as_str()) && !program_defines_function(name) {
-                return "builtin";
+        let sync_name = |name: &str| {
+            SYNC_BUILTINS.contains(&name) && !program_defines_function(name)
+        };
+        match args {
+            [IrExpr::Str(name, _), IrExpr::Array(_)]
+            | [IrExpr::Str(name, _), IrExpr::Array(_), IrExpr::Object(_)] => {
+                if sync_name(name) {
+                    return "builtin";
+                }
             }
+            _ => {}
         }
     }
     func
@@ -3598,6 +3608,97 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 argument: args.first().map(expr_to_estree),
             }
         }
+        // bash `a && b` / `a || b` at STATEMENT level: run a, then run b
+        // only if a's exit status decides. Both operands are runtime calls
+        // (tests inside &&/|| stay runtime calls via AND_OR_DEPTH — a
+        // native comparison never records lastExit, so the chain links
+        // would branch on a stale status), so lastExit is live after each
+        // operand — a plain if on `sh2.lastExit === 0` is the runtime
+        // helper's exact decision minus the async arrows + dispatch.
+        IrStmt::Expr(IrExpr::BinOp {
+            op: op @ (BinOpKind::And | BinOpKind::Or),
+            lhs,
+            rhs,
+        }) => {
+            *AND_OR_DEPTH.lock().unwrap() += 1;
+            let l = expr_to_estree(lhs);
+            let r = expr_to_estree(rhs);
+            *AND_OR_DEPTH.lock().unwrap() -= 1;
+            if !expr_has_await(&l) && !expr_has_await(&r) {
+                let is_and = matches!(op, BinOpKind::And);
+                let test = if is_and {
+                    last_exit_eq_zero()
+                } else {
+                    // `a || b`: run b only when a FAILED
+                    Expr::BinaryExpression {
+                        operator: "!==",
+                        left: Box::new(sh2_member("lastExit")),
+                        right: Box::new(Expr::Literal {
+                            value: serde_json::Value::from(0),
+                            raw: None,
+                        }),
+                    }
+                };
+                return Some(Stmt::BlockStatement {
+                    body: vec![
+                        Stmt::ExpressionStatement { expression: l },
+                        Stmt::IfStatement {
+                            test,
+                            consequent: Box::new(Stmt::BlockStatement {
+                                body: vec![Stmt::ExpressionStatement {
+                                    expression: r,
+                                }],
+                            }),
+                            alternate: None,
+                        },
+                    ],
+                });
+            }
+            Stmt::ExpressionStatement {
+                expression: await_call(
+                    if matches!(op, BinOpKind::And) { "and" } else { "or" },
+                    vec![
+                        arrow(vec![], IrExpr::Arrow(vec![IrStmt::Expr((**lhs).clone())])),
+                        arrow(vec![], IrExpr::Arrow(vec![IrStmt::Expr((**rhs).clone())])),
+                    ],
+                ),
+            }
+        }
+        // bash `! cmd` at STATEMENT level: run cmd, then flip the recorded
+        // status (bash `$?` after `! cmd` is 1 - status(cmd)). Only valid
+        // when the inner statement actually RECORDS a status (a native
+        // comparison never does — those stay on the runtime `not` helper,
+        // which inverts the VALUE).
+        IrStmt::Expr(IrExpr::BinOp { op: BinOpKind::Not, lhs, .. }) => {
+            let inner = expr_to_estree(lhs);
+            if !expr_has_await(&inner) && sets_last_exit(&inner) {
+                return Some(Stmt::BlockStatement {
+                    body: vec![
+                        Stmt::ExpressionStatement { expression: inner },
+                        Stmt::ExpressionStatement {
+                            expression: Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_member("lastExit")),
+                                right: Box::new(Expr::ConditionalExpression {
+                                    test: Box::new(last_exit_eq_zero()),
+                                    consequent: Box::new(Expr::Literal {
+                                        value: serde_json::Value::from(1),
+                                        raw: None,
+                                    }),
+                                    alternate: Box::new(Expr::Literal {
+                                        value: serde_json::Value::from(0),
+                                        raw: None,
+                                    }),
+                                }),
+                            },
+                        },
+                    ],
+                });
+            }
+            Stmt::ExpressionStatement {
+                expression: sh2_call("not", vec![inner]),
+            }
+        }
         IrStmt::Expr(e) => Stmt::ExpressionStatement {
             expression: expr_to_estree(e),
         },
@@ -3903,14 +4004,14 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 });
             }
             // sync-builtin dispatch (the expr_to_estree rewrite, for the
-            // statement-form Exec): env-carrying calls stay async.
-            let callee = if env.is_empty() {
-                if let IrExpr::Str(name, _) = cmd {
-                    if SYNC_BUILTINS.contains(&name.as_str()) && !program_defines_function(name) {
-                        "builtin"
-                    } else {
-                        "exec"
-                    }
+            // statement-form Exec): env-carrying calls (`IFS=: read ...`)
+            // lower to the sync builtin too — the runtime twin applies the
+            // command-scoped env exactly like the async exec path (see
+            // sh2-namespace.mjs `builtin`). Script-defined function
+            // shadows keep the async exec dispatch (the function map).
+            let callee = if let IrExpr::Str(name, _) = cmd {
+                if SYNC_BUILTINS.contains(&name.as_str()) && !program_defines_function(name) {
+                    "builtin"
                 } else {
                     "exec"
                 }
@@ -5124,6 +5225,61 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     };
                 }
             }
+            // `sh2.block(stmts)` in EXPRESSION position (a `{ ...; }` group
+            // used as a while/until/if cond or an &&/|| operand): the helper
+            // runs the stmts and returns `lastExit === 0`. When every stmt
+            // lowers to a bare expression statement (no if/while/break/
+            // return inside) and none needs an await, the whole thing is a
+            // native sequence `(e1, ..., sh2.lastExit === 0)` — the helper's
+            // exact value minus the async arrow + dispatch. Statement-form
+            // blocks lower to plain BlockStatements already (IrStmt::Block).
+            if func == "block" {
+                if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                    // Every stmt must lower to a bare expression: IrStmt::Expr
+                    // via expr_to_estree (binop &&/|| chains become native
+                    // sequences, `sh2.break()`/`sh2.return()` stay Signal
+                    // THROWS — never native break/return statements, which
+                    // would exit the IIFE instead of the enclosing loop/
+                    // function), IrStmt::Assign via stmt_to_estree (always
+                    // an ExpressionStatement). Anything else (if/while/
+                    // native break/return) falls back to the runtime block.
+                    let mut exprs: Vec<Expr> = Vec::new();
+                    let mut ok = true;
+                    for st in stmts {
+                        match st {
+                            IrStmt::Expr(e) => {
+                                let e2 = expr_to_estree(e);
+                                if expr_has_await(&e2) {
+                                    ok = false;
+                                    break;
+                                }
+                                exprs.push(e2);
+                            }
+                            IrStmt::Assign { .. } => match stmt_to_estree(st) {
+                                Some(Stmt::ExpressionStatement { expression }) => {
+                                    if expr_has_await(&expression) {
+                                        ok = false;
+                                        break;
+                                    }
+                                    exprs.push(expression);
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        exprs.push(last_exit_eq_zero());
+                        return seq(exprs);
+                    }
+                }
+            }
             // setArray/setArrayAppend ELEMENT strings are expandWord'd by
             // the runtime from the STORE — inject lifted values as template
             // literals (the parser keeps elements as raw text, so
@@ -5259,23 +5415,36 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // A native JS `&&` would consult the return VALUE of the left
             // operand instead — capture() returns the captured STRING and
             // assign() returns true, so `r=$(cmd) || ...` (and friends) would
-            // branch on the wrong thing. The runtime helper sequences both
-            // sides and checks lastExit.
+            // branch on the wrong thing. When BOTH operands lower without an
+            // await, the runtime helpers' exact decision is a native
+            // sequence on the recorded status (see native_and_or); the
+            // runtime helper sequences both sides and checks lastExit
+            // otherwise (operands with awaits stay async arrows).
             *AND_OR_DEPTH.lock().unwrap() += 1;
+            let l = expr_to_estree(lhs);
+            let r = expr_to_estree(rhs);
+            *AND_OR_DEPTH.lock().unwrap() -= 1;
+            if !expr_has_await(&l) && !expr_has_await(&r) {
+                return native_and_or(BinOpKind::And, l, r);
+            }
             let e = await_call(
                 "and",
                 vec![arrow(vec![], (**lhs).clone()), arrow(vec![], (**rhs).clone())],
             );
-            *AND_OR_DEPTH.lock().unwrap() -= 1;
             e
         }
         IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs } => {
             *AND_OR_DEPTH.lock().unwrap() += 1;
+            let l = expr_to_estree(lhs);
+            let r = expr_to_estree(rhs);
+            *AND_OR_DEPTH.lock().unwrap() -= 1;
+            if !expr_has_await(&l) && !expr_has_await(&r) {
+                return native_and_or(BinOpKind::Or, l, r);
+            }
             let e = await_call(
                 "or",
                 vec![arrow(vec![], (**lhs).clone()), arrow(vec![], (**rhs).clone())],
             );
-            *AND_OR_DEPTH.lock().unwrap() -= 1;
             e
         }
         // `! cmd` — bash inverts the exit STATUS (so `$?` flips too); a pure
@@ -5415,6 +5584,95 @@ fn stmts_have_await(stmts: &[Stmt]) -> bool {
 fn await_expr(inner: Expr) -> Expr {
     Expr::AwaitExpression {
         argument: Box::new(inner),
+    }
+}
+
+/// `sh2.lastExit === 0` — the native status check the runtime `and`/`or`/
+/// `block`/`not` helpers branch on. Native runtime-call operands (builtin/
+/// test/exec/...) record their status in `sh2.lastExit`, so a native
+/// branch on the field is EXACTLY the runtime helper's decision — minus
+/// the dispatch (the whileLoopSync precedent).
+fn last_exit_eq_zero() -> Expr {
+    Expr::BinaryExpression {
+        operator: "===",
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+        }),
+    }
+}
+
+fn seq(expressions: Vec<Expr>) -> Expr {
+    Expr::SequenceExpression { expressions }
+}
+
+fn bool_lit(b: bool) -> Expr {
+    Expr::Literal {
+        value: serde_json::Value::Bool(b),
+        raw: None,
+    }
+}
+
+/// Is the lowered expression a single runtime call whose runtime impl
+/// RECORDS the exit status in `sh2.lastExit`? The native `! cmd` statement
+/// lowering inverts lastExit after the inner statement — only valid when
+/// the inner statement actually wrote it (a native comparison like `i < 5`
+/// never does; the runtime `not(v)` uses the VALUE instead, so those stay
+/// on the runtime helper).
+fn sets_last_exit(e: &Expr) -> bool {
+    match e {
+        Expr::CallExpression { callee, .. } => match callee.as_ref() {
+            Expr::MemberExpression { object, property, .. } => {
+                matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
+                    && !matches!(
+                        property.as_ref(),
+                        Expr::Identifier { name } if matches!(
+                            name.as_str(),
+                            "getVar" | "setVar" | "param" | "arithEval" | "join"
+                                | "contains" | "arrayLen" | "arrayItems" | "arrayIndex"
+                                | "listVar" | "brace" | "define" | "shopt"
+                                | "setLastExit" | "assign" | "setArray"
+                                | "setArrayAppend" | "caseMatch" | "idiv" | "imod"
+                        )
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Native `a && b` / `a || b` when BOTH operands lower without an await.
+/// The runtime helpers branch on `lastExit`, which every runtime call in
+/// the operands records — so the native form is exactly the helper minus
+/// the async arrows + dispatch:
+///   And: (lhs, sh2.lastExit === 0 ? (rhs, sh2.lastExit === 0) : false)
+///   Or:  (lhs, sh2.lastExit === 0 ? true : (rhs, sh2.lastExit === 0))
+/// The `(rhs, sh2.lastExit === 0)` tail mirrors the runtime's
+/// `await fnB(); return this.lastExit === 0` (a non-status operand like
+/// setVar leaves lastExit untouched — same stale read as the helper).
+fn native_and_or(op: BinOpKind, l: Expr, r: Expr) -> Expr {
+    let then_branch = seq(vec![r, last_exit_eq_zero()]);
+    let cond = last_exit_eq_zero();
+    match op {
+        BinOpKind::And => seq(vec![
+            l,
+            Expr::ConditionalExpression {
+                test: Box::new(cond),
+                consequent: Box::new(then_branch),
+                alternate: Box::new(bool_lit(false)),
+            },
+        ]),
+        BinOpKind::Or => seq(vec![
+            l,
+            Expr::ConditionalExpression {
+                test: Box::new(cond),
+                consequent: Box::new(bool_lit(true)),
+                alternate: Box::new(then_branch),
+            },
+        ]),
+        _ => unreachable!("native_and_or: only And/Or"),
     }
 }
 
